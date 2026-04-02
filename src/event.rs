@@ -58,6 +58,19 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // When the settings overlay is open, only ? and Escape close it.
+    // All other keys are ignored.
+    if app.show_settings {
+        if matches!(
+            (key.modifiers, key.code),
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?'))
+                | (_, KeyCode::Esc)
+        ) {
+            app.show_settings = false;
+        }
+        return;
+    }
+
     // Any key other than the expected confirmation clears pending confirmations.
     let is_quit_confirm = app.confirm_quit
         && matches!(
@@ -157,6 +170,10 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 // Status bar visibility changed - resize PTY to match.
                 sync_layout(app);
             }
+        }
+        // ? - toggle settings overlay
+        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
+            app.show_settings = !app.show_settings;
         }
         _ => {}
     }

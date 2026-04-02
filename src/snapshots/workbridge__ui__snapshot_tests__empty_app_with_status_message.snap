@@ -1,5 +1,6 @@
 ---
 source: src/ui.rs
+assertion_line: 342
 expression: "render(&app, 80, 24)"
 ---
 ┌ Tabs ────────────┐┌ Claude Code ─────────────────────────────────────────────┐
@@ -11,8 +12,8 @@ expression: "render(&app, 80, 24)"
 │                  ││  Enter     - Focus right panel                           │
 │                  ││  Ctrl+]    - Return to tab list                          │
 │                  ││  Ctrl+D    - Delete selected tab                         │
+│                  ││  ?         - Settings                                    │
 │                  ││  Q/Ctrl+Q  - Quit                                        │
-│                  ││                                                          │
 │                  ││                                                          │
 │                  ││                                                          │
 │                  ││                                                          │

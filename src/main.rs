@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod event;
 mod layout;
 mod session;
@@ -44,7 +45,126 @@ impl Drop for TerminalGuard {
 }
 
 fn main() -> io::Result<()> {
-    let app = App::new();
+    let args: Vec<String> = std::env::args().collect();
+
+    // CLI subcommands: handle before TUI setup.
+    match args.get(1).map(|s| s.as_str()) {
+        Some("add") => {
+            let Some(path) = args.get(2) else {
+                eprintln!("Usage: workbridge add <path>");
+                std::process::exit(1);
+            };
+            let mut cfg = config::Config::load().unwrap_or_else(|e| {
+                eprintln!("Error loading config: {e}");
+                std::process::exit(1);
+            });
+            match cfg.add_path(path) {
+                Ok(config::AddResult::Repo(display)) => {
+                    cfg.save().unwrap_or_else(|e| {
+                        eprintln!("Error saving config: {e}");
+                        std::process::exit(1);
+                    });
+                    println!("Added repo: {display}");
+                }
+                Ok(config::AddResult::BaseDir(display, count)) => {
+                    cfg.save().unwrap_or_else(|e| {
+                        eprintln!("Error saving config: {e}");
+                        std::process::exit(1);
+                    });
+                    println!("Added base directory: {display} ({count} repos found)");
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+        Some("remove") => {
+            let Some(path) = args.get(2) else {
+                eprintln!("Usage: workbridge remove <path>");
+                std::process::exit(1);
+            };
+            let mut cfg = config::Config::load().unwrap_or_else(|e| {
+                eprintln!("Error loading config: {e}");
+                std::process::exit(1);
+            });
+            if cfg.remove_path(path) {
+                cfg.save().unwrap_or_else(|e| {
+                    eprintln!("Error saving config: {e}");
+                    std::process::exit(1);
+                });
+                println!("Removed: {path}");
+            } else {
+                println!("Path not found in config: {path}");
+            }
+            return Ok(());
+        }
+        Some("repos") => {
+            let cfg = config::Config::load().unwrap_or_else(|e| {
+                eprintln!("Error loading config: {e}");
+                std::process::exit(1);
+            });
+            let entries = cfg.all_repos();
+            if entries.is_empty() {
+                println!("No repositories configured.");
+                println!("Use 'workbridge add <path>' to add one.");
+            } else {
+                println!("{:<60} {:<12} AVAILABLE", "PATH", "SOURCE");
+                println!("{}", "-".repeat(80));
+                for entry in &entries {
+                    let source = match entry.source {
+                        config::RepoSource::Explicit => "explicit",
+                        config::RepoSource::Discovered => "discovered",
+                    };
+                    let avail = if entry.available { "yes" } else { "no" };
+                    println!("{:<60} {:<12} {}", entry.path.display(), source, avail);
+                }
+            }
+            return Ok(());
+        }
+        Some("config") => {
+            match config::config_path() {
+                Ok(path) => {
+                    println!("Config file: {}", path.display());
+                    if path.exists() {
+                        let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                            eprintln!("Error reading config: {e}");
+                            std::process::exit(1);
+                        });
+                        println!();
+                        print!("{contents}");
+                    } else {
+                        println!("(no config file yet)");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+        _ => {
+            // No recognized subcommand - fall through to launch TUI.
+        }
+    }
+
+    // Load config and discover repos for the TUI.
+    let (cfg, config_error) = match config::Config::load() {
+        Ok(c) => (c, None),
+        Err(e) => {
+            let msg = format!("Config error: {e} (using defaults)");
+            eprintln!("workbridge: {msg}");
+            (config::Config::default(), Some(msg))
+        }
+    };
+    let discovered = cfg.discover_repos();
+    let mut app = App::with_config(cfg, discovered);
+    // Surface config load errors in the TUI status bar so the user sees them.
+    if let Some(msg) = config_error {
+        app.status_message = Some(msg);
+    }
 
     // Install a panic hook that restores the terminal before printing the panic.
     // Child processes are cleaned up automatically when the PTY master fd closes

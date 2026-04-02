@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::config::Config;
 use crate::session::Session;
 
 /// Which panel currently has keyboard focus.
@@ -47,10 +48,24 @@ pub struct App {
     pub pane_cols: u16,
     /// The terminal rows available for the right panel (PTY pane).
     pub pane_rows: u16,
+    /// The loaded configuration (repo paths, base dirs, defaults).
+    pub config: Config,
+    /// Repos discovered by scanning base_dirs at startup.
+    pub discovered_repos: Vec<PathBuf>,
+    /// Whether to show the settings overlay.
+    pub show_settings: bool,
 }
 
 impl App {
+    /// Create a new App with default (empty) config and no discovered repos.
+    /// Used by tests as a convenience constructor.
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_config(Config::default(), Vec::new())
+    }
+
+    /// Create a new App with the given config and pre-discovered repos.
+    pub fn with_config(config: Config, discovered_repos: Vec<PathBuf>) -> Self {
         Self {
             tabs: Vec::new(),
             selected_tab: None,
@@ -64,6 +79,9 @@ impl App {
             next_id: 0,
             pane_cols: 80,
             pane_rows: 24,
+            config,
+            discovered_repos,
+            show_settings: false,
         }
     }
 

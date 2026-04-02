@@ -10,6 +10,9 @@ tui-term = "0.2"
 vt100 = "0.15"
 libc = "0.2"
 signal-hook = "0.3"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "5"
 
 [dev-dependencies]
 insta = "1"

@@ -1,13 +1,14 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, FocusPanel};
+use crate::config;
 use crate::layout;
 
 /// Render the entire UI: left panel (tab list) and right panel (session output),
@@ -52,6 +53,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         };
         let status = Paragraph::new(msg.as_str()).style(style);
         frame.render_widget(status, vertical[1]);
+    }
+
+    // Settings overlay (rendered on top of everything).
+    if app.show_settings {
+        draw_settings_overlay(frame, app, area);
     }
 }
 
@@ -182,6 +188,7 @@ fn draw_pane_output(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 Line::from("  Enter     - Focus right panel"),
                 Line::from("  Ctrl+]    - Return to tab list"),
                 Line::from("  Ctrl+D    - Delete selected tab"),
+                Line::from("  ?         - Settings"),
                 Line::from("  Q/Ctrl+Q  - Quit"),
             ]);
             let paragraph = Paragraph::new(text)
@@ -190,6 +197,94 @@ fn draw_pane_output(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             frame.render_widget(paragraph, area);
         }
     }
+}
+
+/// Return a centered rect using the given percentage of the outer rect.
+fn centered_rect(percent_x: u16, percent_y: u16, outer: Rect) -> Rect {
+    let popup_width = outer.width * percent_x / 100;
+    let popup_height = outer.height * percent_y / 100;
+    let x = outer.x + (outer.width.saturating_sub(popup_width)) / 2;
+    let y = outer.y + (outer.height.saturating_sub(popup_height)) / 2;
+    Rect::new(x, y, popup_width, popup_height)
+}
+
+/// Draw the settings overlay: a centered popup showing config info.
+fn draw_settings_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect(70, 80, area);
+
+    // Clear the area behind the popup.
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Settings (press ? or Esc to close) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Build the content lines.
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    // Config file path.
+    let config_path_str = match config::config_path() {
+        Ok(p) => format!("{}", p.display()),
+        Err(_) => "(unknown)".into(),
+    };
+    lines.push(Line::styled("Config file:", Style::default().fg(Color::Cyan)));
+    lines.push(Line::from(format!("  {config_path_str}")));
+    lines.push(Line::from(""));
+
+    // Base directories.
+    lines.push(Line::styled("Base directories:", Style::default().fg(Color::Cyan)));
+    if app.config.base_dirs.is_empty() {
+        lines.push(Line::styled("  (none)", Style::default().fg(Color::DarkGray)));
+    } else {
+        for dir in &app.config.base_dirs {
+            let expanded = config::expand_tilde(dir);
+            let marker = if expanded.is_dir() { "+" } else { "-" };
+            lines.push(Line::from(format!("  {marker} {dir}")));
+        }
+    }
+    lines.push(Line::from(""));
+
+    // Explicit repos.
+    lines.push(Line::styled("Repos (explicit):", Style::default().fg(Color::Cyan)));
+    if app.config.repos.is_empty() {
+        lines.push(Line::styled("  (none)", Style::default().fg(Color::DarkGray)));
+    } else {
+        for repo in &app.config.repos {
+            let expanded = config::expand_tilde(repo);
+            let marker = if expanded.join(".git").exists() { "+" } else { "-" };
+            lines.push(Line::from(format!("  {marker} {repo}")));
+        }
+    }
+    lines.push(Line::from(""));
+
+    // Discovered repos.
+    lines.push(Line::styled("Repos (discovered):", Style::default().fg(Color::Cyan)));
+    if app.discovered_repos.is_empty() {
+        lines.push(Line::styled("  (none)", Style::default().fg(Color::DarkGray)));
+    } else {
+        for path in &app.discovered_repos {
+            lines.push(Line::from(format!("  {}", path.display())));
+        }
+    }
+    lines.push(Line::from(""));
+
+    // Defaults.
+    lines.push(Line::styled("Defaults:", Style::default().fg(Color::Cyan)));
+    lines.push(Line::from(format!(
+        "  worktree_dir: {}",
+        app.config.defaults.worktree_dir
+    )));
+    lines.push(Line::from(format!(
+        "  branch_issue_pattern: {}",
+        app.config.defaults.branch_issue_pattern
+    )));
+
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, inner);
 }
 
 #[cfg(test)]
