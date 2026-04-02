@@ -1,0 +1,1319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WorkBridge - Work Items Sidebar Playground</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --bg: #1a1a2e;
+    --bg-panel: #0f0f1a;
+    --bg-item: #16213e;
+    --bg-item-hover: #1a2744;
+    --bg-item-selected: #0a1628;
+    --border: #2a2a4a;
+    --border-cyan: #00d4ff;
+    --border-green: #00ff88;
+    --text: #c8c8d4;
+    --text-dim: #6a6a8a;
+    --text-bright: #e8e8f0;
+    --cyan: #00d4ff;
+    --green: #00ff88;
+    --yellow: #ffcc00;
+    --red: #ff4466;
+    --orange: #ff8844;
+    --magenta: #cc66ff;
+    --blue: #4488ff;
+    --badge-issue: #44aa44;
+    --badge-worktree: #4488ff;
+    --badge-pr: #cc66ff;
+  }
+
+  body {
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'JetBrains Mono', 'Menlo', 'Monaco', 'Consolas', monospace;
+    background: #111;
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    overflow: hidden;
+    font-size: 13px;
+  }
+
+  /* === CONTROLS PANEL === */
+  .controls-panel {
+    width: 260px;
+    min-width: 260px;
+    background: #0d0d14;
+    border-right: 1px solid var(--border);
+    padding: 12px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .controls-panel h2 {
+    color: var(--cyan);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 4px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .control-group { display: flex; flex-direction: column; gap: 6px; }
+
+  .control-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .control-row label {
+    font-size: 11px;
+    color: var(--text-dim);
+    min-width: 60px;
+  }
+
+  select, button.ctrl-btn {
+    font-family: inherit;
+    font-size: 11px;
+    background: var(--bg-item);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 4px 8px;
+    border-radius: 2px;
+    cursor: pointer;
+  }
+  select:hover, button.ctrl-btn:hover {
+    border-color: var(--cyan);
+    color: var(--text-bright);
+  }
+  button.ctrl-btn.active {
+    border-color: var(--cyan);
+    color: var(--cyan);
+    background: rgba(0, 212, 255, 0.08);
+  }
+
+  .btn-row { display: flex; gap: 4px; flex-wrap: wrap; }
+
+  .preset-btn {
+    font-family: inherit;
+    font-size: 10px;
+    background: var(--bg-item);
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    padding: 3px 8px;
+    border-radius: 2px;
+    cursor: pointer;
+  }
+  .preset-btn:hover {
+    border-color: var(--yellow);
+    color: var(--yellow);
+  }
+  .preset-btn.active {
+    border-color: var(--yellow);
+    color: var(--yellow);
+    background: rgba(255, 204, 0, 0.08);
+  }
+
+  .piece-editor {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    padding: 8px;
+    border-radius: 2px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .piece-editor .piece-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .piece-editor .piece-title {
+    font-size: 11px;
+    font-weight: bold;
+  }
+
+  .piece-toggle {
+    font-family: inherit;
+    font-size: 10px;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: 2px 6px;
+    border-radius: 2px;
+    cursor: pointer;
+  }
+  .piece-toggle.on {
+    border-color: var(--green);
+    color: var(--green);
+  }
+  .piece-toggle.off {
+    border-color: var(--red);
+    color: var(--red);
+  }
+
+  .piece-field {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+  .piece-field label {
+    font-size: 10px;
+    color: var(--text-dim);
+    min-width: 50px;
+  }
+  .piece-field input, .piece-field select {
+    font-family: inherit;
+    font-size: 10px;
+    background: var(--bg-item);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 2px 4px;
+    border-radius: 2px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  /* === MAIN PREVIEW AREA === */
+  .preview-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    overflow: hidden;
+  }
+
+  .tui-mockup {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+    padding: 8px;
+    gap: 0;
+  }
+
+  /* === TUI SIDEBAR === */
+  .tui-sidebar {
+    width: 340px;
+    min-width: 280px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .tui-box {
+    border: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .tui-sidebar .tui-box {
+    flex: 1;
+    border-color: var(--border-cyan);
+  }
+
+  .tui-box-title {
+    position: relative;
+    height: 0;
+    overflow: visible;
+  }
+  .tui-box-title span {
+    position: absolute;
+    top: -9px;
+    left: 8px;
+    background: var(--bg);
+    padding: 0 6px;
+    font-size: 11px;
+    color: var(--cyan);
+    font-weight: bold;
+  }
+
+  .tui-sidebar-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 8px 6px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .sort-indicator {
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-left: auto;
+  }
+
+  .filter-pills {
+    display: flex;
+    gap: 3px;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+  .filter-pill {
+    font-family: inherit;
+    font-size: 9px;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: 1px 6px;
+    border-radius: 2px;
+    cursor: pointer;
+  }
+  .filter-pill.active {
+    border-color: var(--cyan);
+    color: var(--cyan);
+    background: rgba(0, 212, 255, 0.06);
+  }
+
+  .work-items-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 0;
+  }
+
+  .group-header {
+    font-size: 10px;
+    color: var(--text-dim);
+    padding: 8px 10px 3px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  .work-item {
+    padding: 6px 10px;
+    cursor: pointer;
+    border-left: 2px solid transparent;
+    transition: all 0.1s;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .work-item:hover {
+    background: var(--bg-item-hover);
+  }
+  .work-item.selected {
+    background: var(--bg-item-selected);
+    border-left-color: var(--cyan);
+  }
+
+  .work-item-row1 {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .work-item-indicator {
+    font-size: 10px;
+    flex-shrink: 0;
+  }
+
+  .work-item-title {
+    font-size: 12px;
+    color: var(--text-bright);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .work-item.selected .work-item-title {
+    color: var(--cyan);
+  }
+
+  .work-item-row2 {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding-left: 2px;
+  }
+
+  .piece-badge {
+    font-size: 9px;
+    padding: 1px 5px;
+    border-radius: 2px;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    white-space: nowrap;
+  }
+
+  .piece-badge.issue {
+    background: rgba(68, 170, 68, 0.15);
+    color: var(--badge-issue);
+    border: 1px solid rgba(68, 170, 68, 0.3);
+  }
+  .piece-badge.worktree {
+    background: rgba(68, 136, 255, 0.15);
+    color: var(--badge-worktree);
+    border: 1px solid rgba(68, 136, 255, 0.3);
+  }
+  .piece-badge.pr {
+    background: rgba(204, 102, 255, 0.15);
+    color: var(--badge-pr);
+    border: 1px solid rgba(204, 102, 255, 0.3);
+  }
+
+  .status-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .status-dot.alive { background: var(--green); }
+  .status-dot.dead { background: var(--red); }
+  .status-dot.idle { background: var(--yellow); }
+
+  /* Compact mode */
+  .work-item.compact { padding: 3px 10px; gap: 0; }
+  .work-item.compact .work-item-title { font-size: 11px; }
+  .work-item.compact .work-item-row2 { display: none; }
+  .work-item.compact .piece-badge { font-size: 8px; padding: 0 3px; }
+
+  /* Expanded mode */
+  .work-item.expanded { padding: 8px 10px; gap: 4px; }
+  .work-item.expanded .work-item-row2 { flex-wrap: wrap; }
+
+  /* === TUI DETAIL PANEL === */
+  .tui-detail {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    margin-left: -1px;
+  }
+
+  .tui-detail .tui-box {
+    flex: 1;
+    border-color: var(--border);
+    overflow-y: auto;
+  }
+
+  .detail-content {
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .detail-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-dim);
+    font-size: 12px;
+    text-align: center;
+    padding: 20px;
+    line-height: 1.6;
+  }
+
+  .detail-header {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .detail-title {
+    font-size: 16px;
+    color: var(--text-bright);
+    font-weight: bold;
+  }
+
+  .detail-meta {
+    font-size: 10px;
+    color: var(--text-dim);
+  }
+
+  .detail-flow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    flex-wrap: wrap;
+  }
+
+  .flow-node {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    border-radius: 2px;
+    font-size: 10px;
+    font-weight: bold;
+  }
+  .flow-node.issue { background: rgba(68, 170, 68, 0.2); color: var(--badge-issue); border: 1px solid rgba(68, 170, 68, 0.3); }
+  .flow-node.worktree { background: rgba(68, 136, 255, 0.2); color: var(--badge-worktree); border: 1px solid rgba(68, 136, 255, 0.3); }
+  .flow-node.pr { background: rgba(204, 102, 255, 0.2); color: var(--badge-pr); border: 1px solid rgba(204, 102, 255, 0.3); }
+  .flow-node.empty { background: rgba(100, 100, 100, 0.1); color: var(--text-dim); border: 1px dashed var(--border); }
+
+  .flow-arrow { color: var(--text-dim); font-size: 11px; }
+
+  .detail-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .detail-section-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    padding-bottom: 3px;
+    border-bottom: 1px solid var(--border);
+  }
+  .detail-section-title.issue { color: var(--badge-issue); }
+  .detail-section-title.worktree { color: var(--badge-worktree); }
+  .detail-section-title.pr { color: var(--badge-pr); }
+  .detail-section-title.absent { color: var(--text-dim); }
+
+  .detail-field {
+    display: flex;
+    gap: 8px;
+    font-size: 11px;
+  }
+  .detail-field .field-label {
+    color: var(--text-dim);
+    min-width: 70px;
+    flex-shrink: 0;
+  }
+  .detail-field .field-value {
+    color: var(--text);
+    word-break: break-word;
+  }
+
+  .label-tag {
+    display: inline-block;
+    font-size: 9px;
+    padding: 1px 5px;
+    border-radius: 2px;
+    margin-right: 3px;
+  }
+  .label-tag.bug { background: rgba(255, 68, 102, 0.2); color: var(--red); border: 1px solid rgba(255, 68, 102, 0.3); }
+  .label-tag.feature { background: rgba(68, 136, 255, 0.2); color: var(--blue); border: 1px solid rgba(68, 136, 255, 0.3); }
+  .label-tag.enhancement { background: rgba(0, 255, 136, 0.2); color: var(--green); border: 1px solid rgba(0, 255, 136, 0.3); }
+  .label-tag.docs { background: rgba(255, 204, 0, 0.2); color: var(--yellow); border: 1px solid rgba(255, 204, 0, 0.3); }
+  .label-tag.urgent { background: rgba(255, 136, 68, 0.2); color: var(--orange); border: 1px solid rgba(255, 136, 68, 0.3); }
+  .label-tag.refactor { background: rgba(204, 102, 255, 0.2); color: var(--magenta); border: 1px solid rgba(204, 102, 255, 0.3); }
+
+  .pr-status-tag {
+    display: inline-block;
+    font-size: 9px;
+    padding: 1px 6px;
+    border-radius: 2px;
+    font-weight: bold;
+  }
+  .pr-status-tag.draft { background: rgba(106, 106, 138, 0.2); color: var(--text-dim); border: 1px solid var(--border); }
+  .pr-status-tag.review { background: rgba(255, 204, 0, 0.2); color: var(--yellow); border: 1px solid rgba(255, 204, 0, 0.3); }
+  .pr-status-tag.approved { background: rgba(0, 255, 136, 0.2); color: var(--green); border: 1px solid rgba(0, 255, 136, 0.3); }
+  .pr-status-tag.merged { background: rgba(204, 102, 255, 0.2); color: var(--magenta); border: 1px solid rgba(204, 102, 255, 0.3); }
+  .pr-status-tag.changes { background: rgba(255, 136, 68, 0.2); color: var(--orange); border: 1px solid rgba(255, 136, 68, 0.3); }
+
+  .session-status-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 9px;
+    padding: 1px 6px;
+    border-radius: 2px;
+  }
+  .session-status-tag.alive { background: rgba(0, 255, 136, 0.1); color: var(--green); border: 1px solid rgba(0, 255, 136, 0.2); }
+  .session-status-tag.dead { background: rgba(255, 68, 102, 0.1); color: var(--red); border: 1px solid rgba(255, 68, 102, 0.2); }
+  .session-status-tag.idle { background: rgba(255, 204, 0, 0.1); color: var(--yellow); border: 1px solid rgba(255, 204, 0, 0.2); }
+
+  /* === STATUS BAR === */
+  .tui-statusbar {
+    height: 22px;
+    background: #2a2a3a;
+    border-top: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 10px;
+    font-size: 10px;
+    color: var(--yellow);
+    margin: 0 8px 8px;
+    flex-shrink: 0;
+  }
+
+  .statusbar-left { flex: 1; }
+  .statusbar-right { color: var(--text-dim); }
+
+  /* === PROMPT OUTPUT === */
+  .prompt-output {
+    border-top: 1px solid var(--border);
+    background: #0a0a12;
+    padding: 10px 14px;
+    flex-shrink: 0;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+
+  .prompt-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+
+  .prompt-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  .copy-btn {
+    font-family: inherit;
+    font-size: 10px;
+    background: var(--bg-item);
+    color: var(--cyan);
+    border: 1px solid var(--cyan);
+    padding: 2px 10px;
+    border-radius: 2px;
+    cursor: pointer;
+  }
+  .copy-btn:hover { background: rgba(0, 212, 255, 0.1); }
+
+  .prompt-text {
+    font-size: 11px;
+    color: var(--text);
+    line-height: 1.5;
+    white-space: pre-wrap;
+  }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+</style>
+</head>
+<body>
+
+<!-- CONTROLS -->
+<div class="controls-panel">
+  <div class="control-group">
+    <h2>Display Mode</h2>
+    <div class="btn-row">
+      <button class="ctrl-btn active" onclick="setDisplayMode('normal')" id="mode-normal">Normal</button>
+      <button class="ctrl-btn" onclick="setDisplayMode('compact')" id="mode-compact">Compact</button>
+      <button class="ctrl-btn" onclick="setDisplayMode('expanded')" id="mode-expanded">Expanded</button>
+    </div>
+  </div>
+
+  <div class="control-group">
+    <h2>Sort By</h2>
+    <div class="btn-row">
+      <button class="ctrl-btn active" onclick="setSortBy('status')" id="sort-status">Status</button>
+      <button class="ctrl-btn" onclick="setSortBy('recency')" id="sort-recency">Recency</button>
+      <button class="ctrl-btn" onclick="setSortBy('type')" id="sort-type">Type</button>
+    </div>
+  </div>
+
+  <div class="control-group">
+    <h2>Group Items</h2>
+    <div class="btn-row">
+      <button class="ctrl-btn active" onclick="setGrouping('none')" id="group-none">None</button>
+      <button class="ctrl-btn" onclick="setGrouping('status')" id="group-status">By Status</button>
+      <button class="ctrl-btn" onclick="setGrouping('pieces')" id="group-pieces">By Pieces</button>
+    </div>
+  </div>
+
+  <div class="control-group">
+    <h2>Presets</h2>
+    <div class="btn-row">
+      <button class="preset-btn" onclick="loadPreset('sprint')">Sprint Board</button>
+      <button class="preset-btn" onclick="loadPreset('review')">Review Queue</button>
+      <button class="preset-btn" onclick="loadPreset('triage')">Triage</button>
+      <button class="preset-btn" onclick="loadPreset('minimal')">Minimal</button>
+    </div>
+  </div>
+
+  <div class="control-group">
+    <h2>Edit Selected Item</h2>
+    <div id="piece-editors">
+      <div style="font-size: 10px; color: var(--text-dim); padding: 8px;">Select a work item to edit its pieces</div>
+    </div>
+  </div>
+
+  <div class="control-group">
+    <h2>Add Work Item</h2>
+    <div class="btn-row">
+      <button class="ctrl-btn" onclick="addWorkItem('issue')">+ Issue Only</button>
+      <button class="ctrl-btn" onclick="addWorkItem('worktree')">+ Worktree Only</button>
+      <button class="ctrl-btn" onclick="addWorkItem('full')">+ Full (All 3)</button>
+    </div>
+  </div>
+</div>
+
+<!-- PREVIEW -->
+<div class="preview-area">
+  <div class="tui-mockup">
+    <!-- SIDEBAR -->
+    <div class="tui-sidebar">
+      <div class="tui-box">
+        <div class="tui-box-title"><span>Work Items</span></div>
+        <div class="tui-sidebar-header">
+          <span id="item-count" style="font-size: 10px; color: var(--text-dim);">8 items</span>
+          <span class="sort-indicator" id="sort-indicator">sorted: status</span>
+        </div>
+        <div class="filter-pills" id="filter-pills">
+          <button class="filter-pill active" onclick="toggleFilter('all')">All</button>
+          <button class="filter-pill" onclick="toggleFilter('issue')">Issues</button>
+          <button class="filter-pill" onclick="toggleFilter('worktree')">Worktrees</button>
+          <button class="filter-pill" onclick="toggleFilter('pr')">PRs</button>
+          <button class="filter-pill" onclick="toggleFilter('active')">Active</button>
+        </div>
+        <div class="work-items-list" id="work-items-list"></div>
+      </div>
+    </div>
+
+    <!-- DETAIL -->
+    <div class="tui-detail">
+      <div class="tui-box">
+        <div class="tui-box-title"><span id="detail-panel-title">Details</span></div>
+        <div id="detail-content" class="detail-content" style="display:none;"></div>
+        <div id="detail-empty" class="detail-empty">
+          Select a work item to see details.<br><br>
+          <span style="color: var(--text-dim); font-size: 10px;">
+            Ctrl+N  new item  |  Up/Down  navigate  |  Enter  focus session
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- STATUS BAR -->
+  <div class="tui-statusbar">
+    <span class="statusbar-left" id="statusbar-text">3 sessions active | 2 PRs in review | 1 issue unstarted</span>
+    <span class="statusbar-right">WorkBridge v0.2.0</span>
+  </div>
+
+  <!-- PROMPT OUTPUT -->
+  <div class="prompt-output">
+    <div class="prompt-header">
+      <span class="prompt-label">Generated Prompt</span>
+      <button class="copy-btn" onclick="copyPrompt()">Copy Prompt</button>
+    </div>
+    <div class="prompt-text" id="prompt-text"></div>
+  </div>
+</div>
+
+<script>
+// === STATE ===
+const DEFAULTS = { displayMode: 'normal', sortBy: 'status', grouping: 'none', filter: 'all' };
+
+const state = {
+  displayMode: 'normal',
+  sortBy: 'status',
+  grouping: 'none',
+  filter: 'all',
+  selectedId: null,
+  workItems: []
+};
+
+// === SAMPLE DATA ===
+function initSampleData() {
+  state.workItems = [
+    {
+      id: 'wi-1',
+      issue: { number: 42, title: 'Add multi-session layout persistence', labels: ['feature', 'enhancement'], status: 'open', repo: 'workbridge' },
+      worktree: { branch: 'feature/layout-persistence', session: 'alive', lastActive: '2 min ago' },
+      pr: { number: 15, title: 'feat: persist layout across restarts', status: 'review', checks: 'passing', reviewers: ['alex'] },
+      createdAt: Date.now() - 3600000
+    },
+    {
+      id: 'wi-2',
+      issue: { number: 38, title: 'Session output garbled after resize', labels: ['bug', 'urgent'], status: 'open', repo: 'workbridge' },
+      worktree: { branch: 'fix/resize-output', session: 'alive', lastActive: 'just now' },
+      pr: null,
+      createdAt: Date.now() - 1800000
+    },
+    {
+      id: 'wi-3',
+      issue: { number: 51, title: 'Support custom keybindings config', labels: ['feature'], status: 'open', repo: 'workbridge' },
+      worktree: null,
+      pr: null,
+      createdAt: Date.now() - 86400000
+    },
+    {
+      id: 'wi-4',
+      issue: null,
+      worktree: { branch: 'refactor/backend-trait', session: 'alive', lastActive: '10 min ago' },
+      pr: { number: 14, title: 'refactor: extract SessionBackend trait', status: 'approved', checks: 'passing', reviewers: ['maria'] },
+      createdAt: Date.now() - 7200000
+    },
+    {
+      id: 'wi-5',
+      issue: null,
+      worktree: { branch: 'experiment/zellij-backend', session: 'dead', lastActive: '3 hours ago' },
+      pr: null,
+      createdAt: Date.now() - 10800000
+    },
+    {
+      id: 'wi-6',
+      issue: { number: 29, title: 'Document tmux session management', labels: ['docs'], status: 'open', repo: 'workbridge' },
+      worktree: { branch: 'docs/tmux-management', session: 'idle', lastActive: '45 min ago' },
+      pr: { number: 12, title: 'docs: tmux session lifecycle', status: 'draft', checks: 'pending', reviewers: [] },
+      createdAt: Date.now() - 14400000
+    },
+    {
+      id: 'wi-7',
+      issue: null,
+      worktree: null,
+      pr: { number: 16, title: 'fix: handle tmux socket cleanup on crash', status: 'changes', checks: 'failing', reviewers: ['chen'] },
+      createdAt: Date.now() - 5400000
+    },
+    {
+      id: 'wi-8',
+      issue: { number: 44, title: 'Tab reordering via drag in TUI', labels: ['feature', 'enhancement'], status: 'open', repo: 'workbridge' },
+      worktree: { branch: 'feature/tab-reorder', session: 'alive', lastActive: '5 min ago' },
+      pr: { number: 17, title: 'feat: tab drag reorder with Shift+arrows', status: 'draft', checks: 'passing', reviewers: [] },
+      createdAt: Date.now() - 900000
+    }
+  ];
+}
+
+// === HELPERS ===
+function getItemTitle(item) {
+  if (item.issue) return item.issue.title;
+  if (item.pr) return item.pr.title;
+  if (item.worktree) return item.worktree.branch;
+  return 'Untitled';
+}
+
+function getItemStatus(item) {
+  if (item.worktree && item.worktree.session === 'alive') return 'active';
+  if (item.worktree && item.worktree.session === 'idle') return 'idle';
+  if (item.worktree && item.worktree.session === 'dead') return 'dead';
+  if (item.pr && item.pr.status === 'review') return 'in-review';
+  if (item.pr && item.pr.status === 'approved') return 'approved';
+  if (item.pr && item.pr.status === 'merged') return 'merged';
+  if (item.pr && item.pr.status === 'changes') return 'changes-requested';
+  if (item.issue && !item.worktree && !item.pr) return 'unstarted';
+  if (item.pr && item.pr.status === 'draft') return 'draft';
+  return 'unknown';
+}
+
+function getStatusLabel(s) {
+  const map = {
+    'active': 'Active', 'idle': 'Idle', 'dead': 'Dead',
+    'in-review': 'In Review', 'approved': 'Approved', 'merged': 'Merged',
+    'changes-requested': 'Changes Req', 'unstarted': 'Not Started',
+    'draft': 'Draft', 'unknown': 'Unknown'
+  };
+  return map[s] || s;
+}
+
+function getPieceTypes(item) {
+  const types = [];
+  if (item.issue) types.push('issue');
+  if (item.worktree) types.push('worktree');
+  if (item.pr) types.push('pr');
+  return types;
+}
+
+function getPieceGroupLabel(item) {
+  const p = getPieceTypes(item);
+  if (p.length === 3) return 'Issue + Worktree + PR';
+  if (p.length === 2) return p.map(t => t === 'issue' ? 'Issue' : t === 'worktree' ? 'Worktree' : 'PR').join(' + ');
+  return p[0] === 'issue' ? 'Issue Only' : p[0] === 'worktree' ? 'Worktree Only' : 'PR Only';
+}
+
+// === SORTING ===
+function sortItems(items) {
+  const statusOrder = { 'active': 0, 'idle': 1, 'in-review': 2, 'changes-requested': 3, 'approved': 4, 'draft': 5, 'unstarted': 6, 'dead': 7, 'merged': 8, 'unknown': 9 };
+
+  return [...items].sort((a, b) => {
+    if (state.sortBy === 'status') {
+      return (statusOrder[getItemStatus(a)] || 9) - (statusOrder[getItemStatus(b)] || 9);
+    } else if (state.sortBy === 'recency') {
+      return b.createdAt - a.createdAt;
+    } else if (state.sortBy === 'type') {
+      return getPieceTypes(b).length - getPieceTypes(a).length;
+    }
+    return 0;
+  });
+}
+
+// === FILTERING ===
+function filterItems(items) {
+  if (state.filter === 'all') return items;
+  if (state.filter === 'issue') return items.filter(i => i.issue);
+  if (state.filter === 'worktree') return items.filter(i => i.worktree);
+  if (state.filter === 'pr') return items.filter(i => i.pr);
+  if (state.filter === 'active') return items.filter(i => i.worktree && i.worktree.session === 'alive');
+  return items;
+}
+
+// === GROUPING ===
+function groupItems(items) {
+  if (state.grouping === 'none') return [{ label: null, items }];
+
+  const groups = {};
+  items.forEach(item => {
+    let key;
+    if (state.grouping === 'status') {
+      key = getStatusLabel(getItemStatus(item));
+    } else if (state.grouping === 'pieces') {
+      key = getPieceGroupLabel(item);
+    }
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(item);
+  });
+
+  return Object.entries(groups).map(([label, items]) => ({ label, items }));
+}
+
+// === RENDER SIDEBAR ===
+function renderSidebar() {
+  const list = document.getElementById('work-items-list');
+  let filtered = filterItems(state.workItems);
+  let sorted = sortItems(filtered);
+  let groups = groupItems(sorted);
+
+  let html = '';
+  groups.forEach(group => {
+    if (group.label) {
+      html += `<div class="group-header">${group.label}</div>`;
+    }
+    group.items.forEach(item => {
+      const sel = state.selectedId === item.id ? 'selected' : '';
+      const mode = state.displayMode;
+      const status = getItemStatus(item);
+      const title = getItemTitle(item);
+
+      let indicator = '';
+      if (item.worktree) {
+        const cls = item.worktree.session;
+        indicator = `<span class="status-dot ${cls}"></span>`;
+      }
+
+      let badges = '';
+      if (item.issue) {
+        const short = mode === 'compact' ? `#${item.issue.number}` : `#${item.issue.number}`;
+        badges += `<span class="piece-badge issue">${short}</span>`;
+      }
+      if (item.worktree) {
+        const icon = item.worktree.session === 'alive' ? '>' : item.worktree.session === 'dead' ? 'x' : '~';
+        if (mode !== 'compact') {
+          badges += `<span class="piece-badge worktree">${icon} ${item.worktree.branch.split('/').pop()}</span>`;
+        } else {
+          badges += `<span class="piece-badge worktree">${icon}</span>`;
+        }
+      }
+      if (item.pr) {
+        const prIcon = item.pr.status === 'merged' ? '*' : item.pr.status === 'draft' ? '~' : '#';
+        badges += `<span class="piece-badge pr">PR${prIcon}${item.pr.number}</span>`;
+      }
+
+      let titleBadges = '';
+      if (mode === 'compact') {
+        titleBadges = badges;
+        badges = '';
+      }
+
+      html += `<div class="work-item ${sel} ${mode}" onclick="selectItem('${item.id}')">
+        <div class="work-item-row1">
+          ${indicator}
+          <span class="work-item-title">${title}</span>
+          ${mode === 'compact' ? `<span style="display:flex;gap:2px;">${titleBadges}</span>` : ''}
+        </div>
+        ${mode !== 'compact' ? `<div class="work-item-row2">${badges}</div>` : ''}
+      </div>`;
+    });
+  });
+
+  list.innerHTML = html;
+
+  // Update counts
+  const activeCount = state.workItems.filter(i => i.worktree && i.worktree.session === 'alive').length;
+  const reviewCount = state.workItems.filter(i => i.pr && i.pr.status === 'review').length;
+  const unstartedCount = state.workItems.filter(i => i.issue && !i.worktree && !i.pr).length;
+  document.getElementById('item-count').textContent = `${filtered.length} items`;
+  document.getElementById('sort-indicator').textContent = `sorted: ${state.sortBy}`;
+  document.getElementById('statusbar-text').textContent =
+    `${activeCount} session${activeCount !== 1 ? 's' : ''} active | ${reviewCount} PR${reviewCount !== 1 ? 's' : ''} in review | ${unstartedCount} issue${unstartedCount !== 1 ? 's' : ''} unstarted`;
+}
+
+// === RENDER DETAIL ===
+function renderDetail() {
+  const contentEl = document.getElementById('detail-content');
+  const emptyEl = document.getElementById('detail-empty');
+  const titleEl = document.getElementById('detail-panel-title');
+
+  if (!state.selectedId) {
+    contentEl.style.display = 'none';
+    emptyEl.style.display = 'flex';
+    titleEl.textContent = 'Details';
+    return;
+  }
+
+  const item = state.workItems.find(i => i.id === state.selectedId);
+  if (!item) {
+    contentEl.style.display = 'none';
+    emptyEl.style.display = 'flex';
+    return;
+  }
+
+  contentEl.style.display = 'flex';
+  emptyEl.style.display = 'none';
+  titleEl.textContent = 'Details - ' + getItemTitle(item);
+
+  let html = '';
+
+  // Header
+  html += `<div class="detail-header">
+    <div class="detail-title">${getItemTitle(item)}</div>
+    <div class="detail-meta">Status: ${getStatusLabel(getItemStatus(item))} | Pieces: ${getPieceTypes(item).join(', ')}</div>
+  </div>`;
+
+  // Flow visualization
+  html += `<div class="detail-flow">`;
+  if (item.issue) {
+    html += `<div class="flow-node issue">#${item.issue.number} Issue</div>`;
+  } else {
+    html += `<div class="flow-node empty">No Issue</div>`;
+  }
+  html += `<span class="flow-arrow">-></span>`;
+  if (item.worktree) {
+    html += `<div class="flow-node worktree">${item.worktree.branch.split('/').pop()}</div>`;
+  } else {
+    html += `<div class="flow-node empty">No Worktree</div>`;
+  }
+  html += `<span class="flow-arrow">-></span>`;
+  if (item.pr) {
+    html += `<div class="flow-node pr">PR #${item.pr.number}</div>`;
+  } else {
+    html += `<div class="flow-node empty">No PR</div>`;
+  }
+  html += `</div>`;
+
+  // Issue section
+  if (item.issue) {
+    const labels = item.issue.labels.map(l => `<span class="label-tag ${l}">${l}</span>`).join('');
+    html += `<div class="detail-section">
+      <div class="detail-section-title issue">GitHub Issue</div>
+      <div class="detail-field"><span class="field-label">Number</span><span class="field-value">#${item.issue.number}</span></div>
+      <div class="detail-field"><span class="field-label">Title</span><span class="field-value">${item.issue.title}</span></div>
+      <div class="detail-field"><span class="field-label">Labels</span><span class="field-value">${labels}</span></div>
+      <div class="detail-field"><span class="field-label">Status</span><span class="field-value">${item.issue.status}</span></div>
+      <div class="detail-field"><span class="field-label">Repo</span><span class="field-value">${item.issue.repo}</span></div>
+    </div>`;
+  } else {
+    html += `<div class="detail-section">
+      <div class="detail-section-title absent">GitHub Issue - Not Linked</div>
+      <div style="font-size: 10px; color: var(--text-dim); padding: 4px 0;">No issue associated with this work item</div>
+    </div>`;
+  }
+
+  // Worktree section
+  if (item.worktree) {
+    const sessionTag = `<span class="session-status-tag ${item.worktree.session}"><span class="status-dot ${item.worktree.session}"></span>${item.worktree.session}</span>`;
+    html += `<div class="detail-section">
+      <div class="detail-section-title worktree">Local Worktree</div>
+      <div class="detail-field"><span class="field-label">Branch</span><span class="field-value">${item.worktree.branch}</span></div>
+      <div class="detail-field"><span class="field-label">Session</span><span class="field-value">${sessionTag}</span></div>
+      <div class="detail-field"><span class="field-label">Last Active</span><span class="field-value">${item.worktree.lastActive}</span></div>
+    </div>`;
+  } else {
+    html += `<div class="detail-section">
+      <div class="detail-section-title absent">Local Worktree - Not Created</div>
+      <div style="font-size: 10px; color: var(--text-dim); padding: 4px 0;">No local session for this work item</div>
+    </div>`;
+  }
+
+  // PR section
+  if (item.pr) {
+    const prTag = `<span class="pr-status-tag ${item.pr.status}">${item.pr.status}</span>`;
+    const reviewersList = item.pr.reviewers.length ? item.pr.reviewers.join(', ') : 'none';
+    html += `<div class="detail-section">
+      <div class="detail-section-title pr">Pull Request</div>
+      <div class="detail-field"><span class="field-label">Number</span><span class="field-value">#${item.pr.number}</span></div>
+      <div class="detail-field"><span class="field-label">Title</span><span class="field-value">${item.pr.title}</span></div>
+      <div class="detail-field"><span class="field-label">Status</span><span class="field-value">${prTag}</span></div>
+      <div class="detail-field"><span class="field-label">Checks</span><span class="field-value">${item.pr.checks}</span></div>
+      <div class="detail-field"><span class="field-label">Reviewers</span><span class="field-value">${reviewersList}</span></div>
+    </div>`;
+  } else {
+    html += `<div class="detail-section">
+      <div class="detail-section-title absent">Pull Request - Not Opened</div>
+      <div style="font-size: 10px; color: var(--text-dim); padding: 4px 0;">No PR associated with this work item</div>
+    </div>`;
+  }
+
+  contentEl.innerHTML = html;
+}
+
+// === RENDER PIECE EDITORS ===
+function renderEditors() {
+  const el = document.getElementById('piece-editors');
+  if (!state.selectedId) {
+    el.innerHTML = '<div style="font-size: 10px; color: var(--text-dim); padding: 8px;">Select a work item to edit its pieces</div>';
+    return;
+  }
+  const item = state.workItems.find(i => i.id === state.selectedId);
+  if (!item) return;
+
+  let html = '';
+
+  // Issue editor
+  html += `<div class="piece-editor">
+    <div class="piece-header">
+      <span class="piece-title" style="color: var(--badge-issue);">Issue</span>
+      <button class="piece-toggle ${item.issue ? 'on' : 'off'}" onclick="togglePiece('issue')">${item.issue ? 'ON' : 'OFF'}</button>
+    </div>
+    ${item.issue ? `
+      <div class="piece-field"><label>#</label><input type="number" value="${item.issue.number}" onchange="updatePiece('issue','number',this.value)"></div>
+      <div class="piece-field"><label>Status</label>
+        <select onchange="updatePiece('issue','status',this.value)">
+          <option ${item.issue.status === 'open' ? 'selected' : ''}>open</option>
+          <option ${item.issue.status === 'closed' ? 'selected' : ''}>closed</option>
+        </select>
+      </div>
+    ` : ''}
+  </div>`;
+
+  // Worktree editor
+  html += `<div class="piece-editor">
+    <div class="piece-header">
+      <span class="piece-title" style="color: var(--badge-worktree);">Worktree</span>
+      <button class="piece-toggle ${item.worktree ? 'on' : 'off'}" onclick="togglePiece('worktree')">${item.worktree ? 'ON' : 'OFF'}</button>
+    </div>
+    ${item.worktree ? `
+      <div class="piece-field"><label>Session</label>
+        <select onchange="updatePiece('worktree','session',this.value)">
+          <option ${item.worktree.session === 'alive' ? 'selected' : ''}>alive</option>
+          <option ${item.worktree.session === 'idle' ? 'selected' : ''}>idle</option>
+          <option ${item.worktree.session === 'dead' ? 'selected' : ''}>dead</option>
+        </select>
+      </div>
+    ` : ''}
+  </div>`;
+
+  // PR editor
+  html += `<div class="piece-editor">
+    <div class="piece-header">
+      <span class="piece-title" style="color: var(--badge-pr);">PR</span>
+      <button class="piece-toggle ${item.pr ? 'on' : 'off'}" onclick="togglePiece('pr')">${item.pr ? 'ON' : 'OFF'}</button>
+    </div>
+    ${item.pr ? `
+      <div class="piece-field"><label>#</label><input type="number" value="${item.pr.number}" onchange="updatePiece('pr','number',this.value)"></div>
+      <div class="piece-field"><label>Status</label>
+        <select onchange="updatePiece('pr','status',this.value)">
+          <option ${item.pr.status === 'draft' ? 'selected' : ''}>draft</option>
+          <option ${item.pr.status === 'review' ? 'selected' : ''}>review</option>
+          <option ${item.pr.status === 'approved' ? 'selected' : ''}>approved</option>
+          <option ${item.pr.status === 'changes' ? 'selected' : ''}>changes</option>
+          <option ${item.pr.status === 'merged' ? 'selected' : ''}>merged</option>
+        </select>
+      </div>
+      <div class="piece-field"><label>Checks</label>
+        <select onchange="updatePiece('pr','checks',this.value)">
+          <option ${item.pr.checks === 'passing' ? 'selected' : ''}>passing</option>
+          <option ${item.pr.checks === 'failing' ? 'selected' : ''}>failing</option>
+          <option ${item.pr.checks === 'pending' ? 'selected' : ''}>pending</option>
+        </select>
+      </div>
+    ` : ''}
+  </div>`;
+
+  el.innerHTML = html;
+}
+
+// === PROMPT ===
+function updatePrompt() {
+  const parts = [];
+
+  // Describe display choices
+  if (state.displayMode !== DEFAULTS.displayMode) {
+    parts.push(`Use ${state.displayMode} display mode for work items in the sidebar`);
+  }
+
+  if (state.sortBy !== DEFAULTS.sortBy) {
+    parts.push(`sort items by ${state.sortBy}`);
+  }
+
+  if (state.grouping !== DEFAULTS.grouping) {
+    parts.push(`group items by ${state.grouping}`);
+  }
+
+  // Describe the data model
+  const pieceCombos = {};
+  state.workItems.forEach(item => {
+    const key = getPieceGroupLabel(item);
+    pieceCombos[key] = (pieceCombos[key] || 0) + 1;
+  });
+
+  const comboDesc = Object.entries(pieceCombos)
+    .map(([k, v]) => `${v}x ${k}`)
+    .join(', ');
+
+  parts.push(`The sidebar contains ${state.workItems.length} work items with these piece combinations: ${comboDesc}`);
+
+  // Describe unique statuses present
+  const statuses = [...new Set(state.workItems.map(getItemStatus))].map(getStatusLabel);
+  parts.push(`Work item statuses present: ${statuses.join(', ')}`);
+
+  const prompt = `Implement the WorkBridge TUI sidebar as a "Work Items" view where each item is composed of puzzle pieces (GitHub Issue, Local Worktree, Open PR) - at least one piece must be present. ${parts.join('. ')}. Each piece type has a colored badge (green for issues, blue for worktrees, purple for PRs). Active sessions show a green dot, idle shows yellow, dead shows red. The detail panel shows a flow visualization (Issue -> Worktree -> PR) with absent pieces shown as dashed outlines. Use ratatui with cyan borders for the focused sidebar, matching the existing WorkBridge color scheme.`;
+
+  document.getElementById('prompt-text').textContent = prompt;
+}
+
+// === ACTIONS ===
+function selectItem(id) {
+  state.selectedId = state.selectedId === id ? null : id;
+  updateAll();
+}
+
+function setDisplayMode(mode) {
+  state.displayMode = mode;
+  document.querySelectorAll('[id^="mode-"]').forEach(b => b.classList.remove('active'));
+  document.getElementById('mode-' + mode).classList.add('active');
+  updateAll();
+}
+
+function setSortBy(sort) {
+  state.sortBy = sort;
+  document.querySelectorAll('[id^="sort-"]').forEach(b => {
+    if (b.id.startsWith('sort-') && b.id !== 'sort-indicator') b.classList.remove('active');
+  });
+  document.getElementById('sort-' + sort).classList.add('active');
+  updateAll();
+}
+
+function setGrouping(group) {
+  state.grouping = group;
+  document.querySelectorAll('[id^="group-"]').forEach(b => b.classList.remove('active'));
+  document.getElementById('group-' + group).classList.add('active');
+  updateAll();
+}
+
+function toggleFilter(f) {
+  state.filter = f;
+  document.querySelectorAll('.filter-pill').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+  updateAll();
+}
+
+function togglePiece(pieceType) {
+  const item = state.workItems.find(i => i.id === state.selectedId);
+  if (!item) return;
+
+  // Ensure at least one piece remains
+  const currentPieces = getPieceTypes(item);
+  if (item[pieceType] && currentPieces.length <= 1) {
+    return; // Can't remove the last piece
+  }
+
+  if (item[pieceType]) {
+    item[pieceType] = null;
+  } else {
+    if (pieceType === 'issue') {
+      item.issue = { number: Math.floor(Math.random() * 100) + 50, title: 'New issue', labels: ['feature'], status: 'open', repo: 'workbridge' };
+    } else if (pieceType === 'worktree') {
+      item.worktree = { branch: 'feature/new-branch', session: 'alive', lastActive: 'just now' };
+    } else if (pieceType === 'pr') {
+      item.pr = { number: Math.floor(Math.random() * 20) + 18, title: 'New PR', status: 'draft', checks: 'pending', reviewers: [] };
+    }
+  }
+  updateAll();
+}
+
+function updatePiece(pieceType, field, value) {
+  const item = state.workItems.find(i => i.id === state.selectedId);
+  if (!item || !item[pieceType]) return;
+  if (field === 'number') value = parseInt(value) || 0;
+  item[pieceType][field] = value;
+  updateAll();
+}
+
+function addWorkItem(type) {
+  const id = 'wi-' + Date.now();
+  const item = { id, issue: null, worktree: null, pr: null, createdAt: Date.now() };
+
+  if (type === 'issue' || type === 'full') {
+    item.issue = { number: Math.floor(Math.random() * 100) + 50, title: 'New issue ' + id.slice(-4), labels: ['feature'], status: 'open', repo: 'workbridge' };
+  }
+  if (type === 'worktree' || type === 'full') {
+    item.worktree = { branch: 'feature/new-' + id.slice(-4), session: 'alive', lastActive: 'just now' };
+  }
+  if (type === 'full') {
+    item.pr = { number: Math.floor(Math.random() * 20) + 18, title: 'feat: new feature ' + id.slice(-4), status: 'draft', checks: 'pending', reviewers: [] };
+  }
+
+  state.workItems.push(item);
+  state.selectedId = id;
+  updateAll();
+}
+
+function loadPreset(name) {
+  document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+
+  if (name === 'sprint') {
+    setDisplayMode('normal');
+    setSortBy('status');
+    setGrouping('status');
+    state.filter = 'all';
+  } else if (name === 'review') {
+    setDisplayMode('expanded');
+    setSortBy('status');
+    setGrouping('none');
+    state.filter = 'pr';
+  } else if (name === 'triage') {
+    setDisplayMode('expanded');
+    setSortBy('recency');
+    setGrouping('pieces');
+    state.filter = 'all';
+  } else if (name === 'minimal') {
+    setDisplayMode('compact');
+    setSortBy('recency');
+    setGrouping('none');
+    state.filter = 'active';
+  }
+
+  // Sync UI buttons
+  document.querySelectorAll('.filter-pill').forEach(b => {
+    b.classList.toggle('active', b.textContent.toLowerCase().replace(/s$/, '') === state.filter || (state.filter === 'all' && b.textContent === 'All') || (state.filter === 'active' && b.textContent === 'Active') || (state.filter === 'pr' && b.textContent === 'PRs') || (state.filter === 'issue' && b.textContent === 'Issues') || (state.filter === 'worktree' && b.textContent === 'Worktrees'));
+  });
+
+  updateAll();
+}
+
+function copyPrompt() {
+  const text = document.getElementById('prompt-text').textContent;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.querySelector('.copy-btn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = 'Copy Prompt', 1500);
+  });
+}
+
+// === UPDATE ALL ===
+function updateAll() {
+  renderSidebar();
+  renderDetail();
+  renderEditors();
+  updatePrompt();
+}
+
+// === INIT ===
+initSampleData();
+updateAll();
+</script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+---
+source: src/ui.rs
+expression: "render(&app, 80, 24)"
+---
+┌ Tabs ────────────┐┌ Claude Code ─────────────────────────────────────────────┐
+│                  ││                                                          │
+│  No tabs.        ││  Welcome to workbridge                                   │
+│                  ││                                                          │
+│  Press Ctrl+N    ││  Ctrl+N    - Create a new tab                            │
+│  to create one.  ││  Up/Down   - Navigate tabs                               │
+│                  ││  Enter     - Focus right panel                           │
+│                  ││  Ctrl+]    - Return to tab list                          │
+│                  ││  Ctrl+D    - Delete selected tab                         │
+│                  ││  Q/Ctrl+Q  - Quit                                        │
+│                  ││                                                          │
+│                  ││                                                          │
+│                  ││                                                          │
+│                  ││                                                          │
+│                  ││                                                          │
+│                  ││                                                          │
+│                  ││                                                          │
+│                  ││                                                          │
+│                  ││                                                          │
+│                  ││                                                          │
+│                  ││                                                          │
+│                  ││                                                          │
+└──────────────────┘└──────────────────────────────────────────────────────────┘
+Press Ctrl+N to create a new tab

@@ -1,0 +1,15 @@
+[package]
+name = "workbridge"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tui-term = "0.2"
+vt100 = "0.15"
+libc = "0.2"
+signal-hook = "0.3"
+
+[dev-dependencies]
+insta = "1"
