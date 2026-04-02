@@ -1,19 +1,20 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
     text::{Line, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, FocusPanel};
+use crate::app::{App, FocusPanel, SettingsListFocus};
 use crate::config;
 use crate::layout;
+use crate::theme::Theme;
 
 /// Render the entire UI: left panel (tab list) and right panel (session output),
 /// plus an optional status bar at the bottom.
 pub fn draw(frame: &mut Frame, app: &App) {
+    let theme = Theme::default_theme();
     let area = frame.area();
 
     // Vertical split: main area + optional 1-row status bar.
@@ -39,17 +40,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ])
         .split(main_area);
 
-    draw_tab_list(frame, app, chunks[0]);
-    draw_pane_output(frame, app, chunks[1]);
+    draw_tab_list(frame, app, &theme, chunks[0]);
+    draw_pane_output(frame, app, &theme, chunks[1]);
 
     // Status bar.
     if has_status
         && let Some(msg) = &app.status_message
     {
         let style = if app.shutting_down {
-            Style::default().fg(Color::White).bg(Color::Red)
+            theme.style_status_shutdown()
         } else {
-            Style::default().fg(Color::Yellow).bg(Color::DarkGray)
+            theme.style_status()
         };
         let status = Paragraph::new(msg.as_str()).style(style);
         frame.render_widget(status, vertical[1]);
@@ -57,22 +58,27 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     // Settings overlay (rendered on top of everything).
     if app.show_settings {
-        draw_settings_overlay(frame, app, area);
+        draw_settings_overlay(frame, app, &theme, area);
     }
 }
 
 /// Draw the left panel containing the tab list.
-fn draw_tab_list(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let border_color = if app.focus == FocusPanel::Left {
-        Color::Cyan
+fn draw_tab_list(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    // When the settings overlay is open, dim background panels so the
+    // overlay is the clear focal point.
+    let border_style = if app.show_settings {
+        theme.style_border_unfocused()
+    } else if app.focus == FocusPanel::Left {
+        theme.style_border_focused()
     } else {
-        Color::DarkGray
+        theme.style_border_unfocused()
     };
 
     let block = Block::default()
         .title(" Tabs ")
+        .title_style(theme.style_title())
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(border_style);
 
     if app.tabs.is_empty() {
         let text = Text::from(vec![
@@ -84,7 +90,7 @@ fn draw_tab_list(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ]);
         let paragraph = Paragraph::new(text)
             .block(block)
-            .style(Style::default().fg(Color::DarkGray));
+            .style(theme.style_text_muted());
         frame.render_widget(paragraph, area);
         return;
     }
@@ -95,23 +101,17 @@ fn draw_tab_list(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .map(|tab| {
             if !tab.alive {
                 let label = format!(" {} [dead] ", tab.name);
-                let style = Style::default().fg(Color::Red);
-                ListItem::new(label).style(style)
+                ListItem::new(label).style(theme.style_tab_dead())
             } else {
                 let label = format!(" {} ", tab.name);
-                ListItem::new(label).style(Style::default())
+                ListItem::new(label).style(theme.style_text())
             }
         })
         .collect();
 
     let list = List::new(items)
         .block(block)
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(theme.style_tab_highlight())
         .highlight_symbol("> ");
 
     let mut state = ListState::default();
@@ -122,11 +122,14 @@ fn draw_tab_list(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 /// Draw the right panel showing captured PTY output.
 /// Uses vt100::Parser + tui-term PseudoTerminal for full ANSI color rendering.
-fn draw_pane_output(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let border_color = if app.focus == FocusPanel::Right {
-        Color::Green
+fn draw_pane_output(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    // When the settings overlay is open, dim background panels.
+    let border_style = if app.show_settings {
+        theme.style_border_unfocused()
+    } else if app.focus == FocusPanel::Right {
+        theme.style_border_input()
     } else {
-        Color::White
+        theme.style_border_default()
     };
 
     let title = if app.focus == FocusPanel::Right {
@@ -137,8 +140,9 @@ fn draw_pane_output(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let block = Block::default()
         .title(title)
+        .title_style(theme.style_title())
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(border_style);
 
     let active_tab = app
         .selected_tab
@@ -155,7 +159,7 @@ fn draw_pane_output(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             ]);
             let paragraph = Paragraph::new(text)
                 .block(block)
-                .style(Style::default().fg(Color::Red));
+                .style(theme.style_error());
             frame.render_widget(paragraph, area);
         }
         Some(tab) => {
@@ -174,7 +178,7 @@ fn draw_pane_output(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 ]);
                 let paragraph = Paragraph::new(text)
                     .block(block)
-                    .style(Style::default().fg(Color::Red));
+                    .style(theme.style_error());
                 frame.render_widget(paragraph, area);
             }
         }
@@ -193,7 +197,7 @@ fn draw_pane_output(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             ]);
             let paragraph = Paragraph::new(text)
                 .block(block)
-                .style(Style::default().fg(Color::DarkGray));
+                .style(theme.style_text_muted());
             frame.render_widget(paragraph, area);
         }
     }
@@ -208,79 +212,206 @@ fn centered_rect(percent_x: u16, percent_y: u16, outer: Rect) -> Rect {
     Rect::new(x, y, popup_width, popup_height)
 }
 
-/// Draw the settings overlay: a centered popup showing config info.
-fn draw_settings_overlay(frame: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(70, 80, area);
+/// Maximum visible rows in each repo list before scrolling kicks in.
+const REPOS_LIST_MAX_ROWS: u16 = 6;
 
-    // Clear the area behind the popup.
+/// Draw the settings overlay: a centered popup with structured sections.
+///
+/// Layout (top to bottom):
+///   - Config source (2 lines)
+///   - Base directories (header + entries)
+///   - Repos section: horizontal split of Active and Excluded lists
+///   - Defaults (2 lines)
+///   - Hint line
+fn draw_settings_overlay(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let popup = centered_rect(70, 80, area);
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
         .title(" Settings (press ? or Esc to close) ")
+        .title_style(theme.style_title())
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(theme.style_border_overlay());
 
-    let inner = block.inner(popup);
+    let block_inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    // Build the content lines.
-    let mut lines: Vec<Line<'_>> = Vec::new();
+    // Add 1-cell padding inside the overlay border on all sides.
+    let inner = Rect {
+        x: block_inner.x + 1,
+        y: block_inner.y + 1,
+        width: block_inner.width.saturating_sub(2),
+        height: block_inner.height.saturating_sub(2),
+    };
 
-    // Config source.
-    lines.push(Line::styled("Config source:", Style::default().fg(Color::Cyan)));
-    lines.push(Line::from(format!("  {}", app.config.source)));
-    lines.push(Line::from(""));
+    // Build managed repo items.
+    let managed_repos = &app.active_repo_cache;
+    let mut managed_items: Vec<ListItem<'_>> = Vec::new();
+    for entry in managed_repos {
+        let source_label = match entry.source {
+            config::RepoSource::Explicit => "explicit",
+            config::RepoSource::Discovered => "discovered",
+        };
+        let marker = if entry.git_dir_present { "+" } else { "-" };
+        managed_items.push(
+            ListItem::new(format!(" {marker} {} ({source_label})", entry.path.display()))
+                .style(theme.style_text()),
+        );
+    }
 
-    // Base directories.
-    lines.push(Line::styled("Base directories:", Style::default().fg(Color::Cyan)));
+    // Build available repo items (discovered but not managed).
+    let available_entries = app.available_repos();
+    let mut available_items: Vec<ListItem<'_>> = Vec::new();
+    for entry in &available_entries {
+        let marker = if entry.git_dir_present { "+" } else { "-" };
+        available_items.push(
+            ListItem::new(format!(" {marker} {}", entry.path.display()))
+                .style(theme.style_text()),
+        );
+    }
+
+    // Compute repos section height.
+    let managed_count = managed_items.len();
+    let available_count = available_items.len();
+    let max_count = managed_count.max(available_count);
+    let repos_visible = if max_count == 0 {
+        1
+    } else {
+        (max_count as u16).min(REPOS_LIST_MAX_ROWS)
+    };
+    let repos_section_height = repos_visible + 2; // +2 for block borders
+
+    // Count base_dirs lines.
+    let base_dirs_lines: u16 = if app.config.base_dirs.is_empty() {
+        1
+    } else {
+        app.config.base_dirs.len() as u16
+    };
+
+    let source_height = 2;
+    let base_dirs_height = 1 + base_dirs_lines + 1;
+    let defaults_height = 3;
+    let hint_height = 1;
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(source_height),
+            Constraint::Length(base_dirs_height),
+            Constraint::Length(repos_section_height),
+            Constraint::Length(1), // blank
+            Constraint::Length(defaults_height),
+            Constraint::Length(hint_height),
+            Constraint::Min(0), // absorb remaining space
+        ])
+        .split(inner);
+
+    // Section 0: Config source.
+    let source_text = Text::from(vec![
+        Line::styled("Config source:", theme.style_heading()),
+        Line::from(format!("  {}", app.config.source)),
+    ]);
+    frame.render_widget(Paragraph::new(source_text), sections[0]);
+
+    // Section 1: Base directories.
+    let mut base_lines = vec![Line::styled("Base directories:", theme.style_heading())];
     if app.config.base_dirs.is_empty() {
-        lines.push(Line::styled("  (none)", Style::default().fg(Color::DarkGray)));
+        base_lines.push(Line::styled("  (none)", theme.style_text_muted()));
     } else {
         for dir in &app.config.base_dirs {
             let expanded = config::expand_tilde(dir);
             let marker = if expanded.is_dir() { "+" } else { "-" };
-            lines.push(Line::from(format!("  {marker} {dir}")));
+            base_lines.push(Line::from(format!("  {marker} {dir}")));
         }
     }
-    lines.push(Line::from(""));
+    frame.render_widget(Paragraph::new(Text::from(base_lines)), sections[1]);
 
-    // Explicit repos.
-    lines.push(Line::styled("Repos (explicit):", Style::default().fg(Color::Cyan)));
-    if app.config.repos.is_empty() {
-        lines.push(Line::styled("  (none)", Style::default().fg(Color::DarkGray)));
+    // Section 2: Repos - horizontal split of Active and Excluded lists.
+    let repo_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(sections[2]);
+
+    // Managed repos list (left).
+    let managed_border = if app.settings_list_focus == SettingsListFocus::Managed {
+        theme.style_border_focused()
     } else {
-        for repo in &app.config.repos {
-            let expanded = config::expand_tilde(repo);
-            let marker = if expanded.join(".git").exists() { "+" } else { "-" };
-            lines.push(Line::from(format!("  {marker} {repo}")));
-        }
-    }
-    lines.push(Line::from(""));
+        theme.style_border_subtle()
+    };
+    let managed_title = format!(" Managed repos ({}) ", managed_count);
+    let managed_block = Block::default()
+        .title(managed_title.as_str())
+        .title_style(theme.style_title())
+        .borders(Borders::ALL)
+        .border_style(managed_border);
 
-    // Discovered repos.
-    lines.push(Line::styled("Repos (discovered):", Style::default().fg(Color::Cyan)));
-    if app.discovered_repos.is_empty() {
-        lines.push(Line::styled("  (none)", Style::default().fg(Color::DarkGray)));
+    if managed_items.is_empty() {
+        let empty = Paragraph::new(Line::styled("  (none)", theme.style_text_muted()))
+            .block(managed_block);
+        frame.render_widget(empty, repo_cols[0]);
     } else {
-        for path in &app.discovered_repos {
-            lines.push(Line::from(format!("  {}", path.display())));
+        let list = List::new(managed_items)
+            .block(managed_block)
+            .highlight_style(theme.style_tab_highlight())
+            .highlight_symbol("> ");
+        let mut state = ListState::default();
+        if app.settings_list_focus == SettingsListFocus::Managed {
+            state.select(Some(app.settings_repo_selected.min(managed_count.saturating_sub(1))));
         }
+        frame.render_stateful_widget(list, repo_cols[0], &mut state);
     }
-    lines.push(Line::from(""));
 
-    // Defaults.
-    lines.push(Line::styled("Defaults:", Style::default().fg(Color::Cyan)));
-    lines.push(Line::from(format!(
-        "  worktree_dir: {}",
-        app.config.defaults.worktree_dir
-    )));
-    lines.push(Line::from(format!(
-        "  branch_issue_pattern: {}",
-        app.config.defaults.branch_issue_pattern
-    )));
+    // Available repos list (right).
+    let available_border = if app.settings_list_focus == SettingsListFocus::Available {
+        theme.style_border_focused()
+    } else {
+        theme.style_border_subtle()
+    };
+    let available_title = format!(" Available ({}) ", available_count);
+    let available_block = Block::default()
+        .title(available_title.as_str())
+        .title_style(theme.style_title())
+        .borders(Borders::ALL)
+        .border_style(available_border);
 
-    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, inner);
+    if available_items.is_empty() {
+        let empty = Paragraph::new(Line::styled("  (none)", theme.style_text_muted()))
+            .block(available_block);
+        frame.render_widget(empty, repo_cols[1]);
+    } else {
+        let list = List::new(available_items)
+            .block(available_block)
+            .highlight_style(theme.style_tab_highlight())
+            .highlight_symbol("> ");
+        let mut state = ListState::default();
+        if app.settings_list_focus == SettingsListFocus::Available {
+            state.select(Some(
+                app.settings_available_selected.min(available_count.saturating_sub(1)),
+            ));
+        }
+        frame.render_stateful_widget(list, repo_cols[1], &mut state);
+    }
+
+    // Section 4: Defaults.
+    let defaults_text = Text::from(vec![
+        Line::styled("Defaults:", theme.style_heading()),
+        Line::from(format!(
+            "  worktree_dir: {}",
+            app.config.defaults.worktree_dir
+        )),
+        Line::from(format!(
+            "  branch_issue_pattern: {}",
+            app.config.defaults.branch_issue_pattern
+        )),
+    ]);
+    frame.render_widget(Paragraph::new(defaults_text), sections[4]);
+
+    // Section 5: Hint line.
+    let hint = Line::styled(
+        "Tab: switch list, Enter: move, Up/Down: navigate",
+        theme.style_text_muted(),
+    );
+    frame.render_widget(Paragraph::new(hint), sections[5]);
 }
 
 #[cfg(test)]
@@ -297,8 +428,6 @@ mod snapshot_tests {
         terminal
             .draw(|frame| draw(frame, app))
             .unwrap();
-        // Collect each row from the buffer, trimming trailing whitespace
-        // to keep snapshots readable.
         let buf = terminal.backend().buffer().clone();
         let mut lines = Vec::new();
         for y in 0..height {
@@ -308,7 +437,6 @@ mod snapshot_tests {
             }
             lines.push(line.trim_end().to_string());
         }
-        // Trim trailing empty lines
         while lines.last().is_some_and(|l| l.is_empty()) {
             lines.pop();
         }
@@ -384,20 +512,29 @@ mod snapshot_tests {
 
     #[test]
     fn settings_overlay_with_config() {
-        use crate::config::{Config, Defaults};
+        use crate::config::Config;
 
-        let mut app = App::new();
-        app.config = Config {
-            base_dirs: vec!["~/Projects".into()],
+        // Use real temp dirs so Config::all_repos() can discover them.
+        let base = std::env::temp_dir().join("workbridge-test-settings-overlay");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("discovered-a/.git")).unwrap();
+        std::fs::create_dir_all(base.join("discovered-b/.git")).unwrap();
+
+        let base_str = base.display().to_string();
+        let discovered_a = base.join("discovered-a").display().to_string();
+
+        let config = Config {
+            base_dirs: vec![base_str],
             repos: vec!["~/Forks/special-repo".into()],
-            defaults: Defaults::default(),
-            source: "in-memory (test)".into(),
+            included_repos: vec![discovered_a],
+            ..Config::for_test()
         };
-        app.discovered_repos = vec![
-            std::path::PathBuf::from("/tmp/discovered-a"),
-            std::path::PathBuf::from("/tmp/discovered-b"),
-        ];
+        let mut app = App::with_config(config);
         app.show_settings = true;
-        insta::assert_snapshot!(render(&app, 80, 24));
+        let output = render(&app, 80, 24);
+
+        let _ = std::fs::remove_dir_all(&base);
+
+        insta::assert_snapshot!(output);
     }
 }

@@ -3,6 +3,7 @@ mod config;
 mod event;
 mod layout;
 mod session;
+mod theme;
 mod ui;
 
 use std::io;
@@ -104,24 +105,12 @@ fn handle_repos_subcommand(args: &[String]) {
                 println!("Path not found in config: {path}");
             }
         }
-        Some("list") | None => {
-            let cfg = load_config_or_exit();
-            let entries = cfg.all_repos();
-            if entries.is_empty() {
-                println!("No repositories configured.");
-                println!("Use 'workbridge repos add <path>' to add one.");
-            } else {
-                println!("{:<60} {:<12} AVAILABLE", "PATH", "SOURCE");
-                println!("{}", "-".repeat(80));
-                for entry in &entries {
-                    let source = match entry.source {
-                        config::RepoSource::Explicit => "explicit",
-                        config::RepoSource::Discovered => "discovered",
-                    };
-                    let avail = if entry.available { "yes" } else { "no" };
-                    println!("{:<60} {:<12} {}", entry.path.display(), source, avail);
-                }
-            }
+        Some("list") => {
+            let show_all = args.get(3).is_some_and(|a| a == "--all");
+            print_repo_list(&load_config_or_exit(), show_all);
+        }
+        None => {
+            print_repo_list(&load_config_or_exit(), false);
         }
         Some(unknown) => {
             eprintln!("Unknown repos subcommand: {unknown}");
@@ -167,6 +156,57 @@ fn save_config_or_exit(cfg: &config::Config) {
     });
 }
 
+fn print_repo_list(cfg: &config::Config, show_all: bool) {
+    let active = cfg.active_repos();
+    let entries = if show_all {
+        cfg.all_repos()
+    } else {
+        active.clone()
+    };
+    if entries.is_empty() {
+        if show_all {
+            println!("No repositories configured.");
+            println!("Use 'workbridge repos add <path>' to add one.");
+        } else {
+            println!("No managed repositories.");
+            println!("Use 'workbridge repos list --all' to see all,");
+            println!("or 'workbridge repos add <path>' to add one.");
+        }
+    } else {
+        let label = if show_all { "ALL" } else { "MANAGED" };
+        println!("{label} {:<57} {:<12} AVAILABLE", "PATH", "SOURCE");
+        println!("{}", "-".repeat(85));
+        let active_paths: Vec<_> = active.iter().map(|e| &e.path).collect();
+        for entry in &entries {
+            let source = match entry.source {
+                config::RepoSource::Explicit => "explicit",
+                config::RepoSource::Discovered => "discovered",
+            };
+            let avail = if entry.git_dir_present { "yes" } else { "no" };
+            let status = if show_all && !active_paths.contains(&&entry.path) {
+                " [unmanaged]"
+            } else {
+                ""
+            };
+            println!(
+                "     {:<57} {:<12} {}{status}",
+                entry.path.display(),
+                source,
+                avail,
+            );
+        }
+        if !show_all {
+            let all_count = cfg.all_repos().len();
+            let unmanaged = all_count.saturating_sub(active.len());
+            if unmanaged > 0 {
+                println!(
+                    "\n{unmanaged} repo(s) available but unmanaged. Use --all to see all."
+                );
+            }
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -184,8 +224,7 @@ fn main() -> io::Result<()> {
             (config::Config::default(), Some(msg))
         }
     };
-    let discovered = cfg.discover_repos();
-    let mut app = App::with_config(cfg, discovered);
+    let mut app = App::with_config(cfg);
     // Surface config load errors in the TUI status bar so the user sees them.
     if let Some(msg) = config_error {
         app.status_message = Some(msg);

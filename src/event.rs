@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 
-use crate::app::{App, FocusPanel};
+use crate::app::{App, FocusPanel, SettingsListFocus};
 use crate::layout;
 
 /// The tick interval for periodic updates (reading PTY output).
@@ -58,15 +58,57 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // When the settings overlay is open, only ? and Escape close it.
-    // All other keys are ignored.
+    // When the settings overlay is open, handle overlay-specific keys.
     if app.show_settings {
-        if matches!(
-            (key.modifiers, key.code),
+        match (key.modifiers, key.code) {
             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?'))
-                | (_, KeyCode::Esc)
-        ) {
-            app.show_settings = false;
+            | (_, KeyCode::Esc) => {
+                app.show_settings = false;
+                app.settings_repo_selected = 0;
+                app.settings_available_selected = 0;
+                app.settings_list_focus = SettingsListFocus::Managed;
+            }
+            (_, KeyCode::Up) => match app.settings_list_focus {
+                SettingsListFocus::Managed => {
+                    app.settings_repo_selected =
+                        app.settings_repo_selected.saturating_sub(1);
+                }
+                SettingsListFocus::Available => {
+                    app.settings_available_selected =
+                        app.settings_available_selected.saturating_sub(1);
+                }
+            },
+            (_, KeyCode::Down) => match app.settings_list_focus {
+                SettingsListFocus::Managed => {
+                    let max = app.total_repos().saturating_sub(1);
+                    if app.settings_repo_selected < max {
+                        app.settings_repo_selected += 1;
+                    }
+                }
+                SettingsListFocus::Available => {
+                    let max = app.available_repos().len().saturating_sub(1);
+                    if app.settings_available_selected < max {
+                        app.settings_available_selected += 1;
+                    }
+                }
+            },
+            (_, KeyCode::Tab) => {
+                app.settings_list_focus = match app.settings_list_focus {
+                    SettingsListFocus::Managed => SettingsListFocus::Available,
+                    SettingsListFocus::Available => SettingsListFocus::Managed,
+                };
+            }
+            (_, KeyCode::Enter) | (_, KeyCode::Right)
+                if app.settings_list_focus == SettingsListFocus::Managed =>
+            {
+                app.unmanage_selected_repo();
+            }
+            (_, KeyCode::Enter) | (_, KeyCode::Left)
+                if app.settings_list_focus == SettingsListFocus::Available =>
+            {
+                app.manage_selected_repo();
+            }
+            _ => {}
         }
         return;
     }

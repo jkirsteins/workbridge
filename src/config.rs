@@ -17,6 +17,10 @@ pub struct Config {
     /// Individual repo paths (explicit additions).
     #[serde(default)]
     pub repos: Vec<String>,
+    /// Repo paths opted-in from discovery. A discovered repo is only active
+    /// if it appears here. Explicit repos (in `repos`) are always active.
+    #[serde(default)]
+    pub included_repos: Vec<String>,
     /// Fallback settings for repos that don't specify overrides.
     #[serde(default)]
     pub defaults: Defaults,
@@ -66,7 +70,8 @@ pub enum RepoSource {
 pub struct RepoEntry {
     pub path: PathBuf,
     pub source: RepoSource,
-    pub available: bool,
+    /// Whether the .git directory exists on disk right now.
+    pub git_dir_present: bool,
 }
 
 /// Errors from config operations.
@@ -134,7 +139,26 @@ fn collapse_home(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// Normalize a repo path to a consistent form: expand tilde, canonicalize
+/// if possible, then collapse back to ~/... for storage. This ensures that
+/// `./repo`, `~/repo`, and `/abs/path/repo` all produce the same string.
+fn normalize_repo_path(path: &str) -> String {
+    let expanded = expand_tilde(path);
+    let canonical = fs::canonicalize(&expanded).unwrap_or(expanded);
+    collapse_home(&canonical)
+}
+
 impl Config {
+    /// Create a Config for tests with sensible defaults and "in-memory (test)"
+    /// as the source. Avoids tests needing to specify every field.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Config {
+            source: "in-memory (test)".into(),
+            ..Config::default()
+        }
+    }
+
     /// Load config from the default path. Returns a default (empty) config
     /// if the file does not exist. Returns an error if the file exists but
     /// cannot be parsed.
@@ -150,6 +174,13 @@ impl Config {
         let contents = fs::read_to_string(&path)?;
         let mut cfg: Config = toml::from_str(&contents).map_err(ConfigError::Parse)?;
         cfg.source = source;
+        // Normalize included_repos so hand-edited paths (relative, non-canonical)
+        // match correctly in active_repos() filtering.
+        cfg.included_repos = cfg
+            .included_repos
+            .into_iter()
+            .map(|p| normalize_repo_path(&p))
+            .collect();
         Ok(cfg)
     }
 
@@ -167,6 +198,7 @@ impl Config {
     }
 
     /// Add an individual repo path. Validates that it contains `.git/`.
+    /// Explicit repos are always active (no need to also include them).
     pub fn add_repo(&mut self, raw: &str) -> Result<String, ConfigError> {
         let expanded = expand_tilde(raw);
         let canonical = fs::canonicalize(&expanded)
@@ -184,7 +216,8 @@ impl Config {
     }
 
     /// Add a base directory for auto-discovery. Validates that it exists
-    /// and is a directory.
+    /// and is a directory. Discovered repos start unmanaged by default -
+    /// the user opts in via `include_repo`.
     pub fn add_base_dir(&mut self, raw: &str) -> Result<(String, usize), ConfigError> {
         let expanded = expand_tilde(raw);
         let canonical = fs::canonicalize(&expanded)
@@ -198,29 +231,39 @@ impl Config {
         if !self.base_dirs.contains(&display) {
             self.base_dirs.push(display.clone());
         }
-        let count = discover_git_repos_in(&canonical).len();
+        let discovered = discover_git_repos_in(&canonical);
+        let count = discovered.len();
         Ok((display, count))
     }
 
-    /// Remove a path from both repos and base_dirs.
+    /// Remove a path from repos, base_dirs, and included_repos.
     pub fn remove_path(&mut self, raw: &str) -> bool {
-        let expanded = expand_tilde(raw);
-        let canonical = fs::canonicalize(&expanded).ok();
+        let target = expand_tilde(raw);
+        let target_canonical = fs::canonicalize(&target).ok();
 
-        let before = self.repos.len() + self.base_dirs.len();
+        let before = self.repos.len() + self.base_dirs.len() + self.included_repos.len();
 
-        self.repos.retain(|r| {
-            let r_expanded = expand_tilde(r);
-            let r_canonical = fs::canonicalize(&r_expanded).ok();
-            r_expanded != expanded && r_canonical != canonical
-        });
-        self.base_dirs.retain(|b| {
-            let b_expanded = expand_tilde(b);
-            let b_canonical = fs::canonicalize(&b_expanded).ok();
-            b_expanded != expanded && b_canonical != canonical
-        });
+        let matches_target = |stored: &str| -> bool {
+            let stored_expanded = expand_tilde(stored);
+            // Always compare expanded paths (string equality).
+            if stored_expanded == target {
+                return true;
+            }
+            // Only compare canonical paths when BOTH sides succeed.
+            // If either fails to canonicalize (e.g., unmounted drive),
+            // we cannot conclude they match - this prevents removing
+            // unrelated entries that also happen to be inaccessible.
+            if let (Some(tc), Ok(sc)) = (&target_canonical, fs::canonicalize(&stored_expanded)) {
+                return sc == *tc;
+            }
+            false
+        };
 
-        let after = self.repos.len() + self.base_dirs.len();
+        self.repos.retain(|r| !matches_target(r));
+        self.base_dirs.retain(|b| !matches_target(b));
+        self.included_repos.retain(|i| !matches_target(i));
+
+        let after = self.repos.len() + self.base_dirs.len() + self.included_repos.len();
         after < before
     }
 
@@ -236,17 +279,34 @@ impl Config {
         found
     }
 
+    /// Add a repo path to the inclusion list (opt-in from discovery).
+    /// Normalizes the path so different representations of the same path
+    /// (relative, absolute, ~/) all produce the same stored entry.
+    pub fn include_repo(&mut self, path: &str) {
+        let normalized = normalize_repo_path(path);
+        if !self.included_repos.contains(&normalized) {
+            self.included_repos.push(normalized);
+        }
+    }
+
+    /// Remove a repo path from the inclusion list. Matches by normalized
+    /// path so `./repo`, `~/repo`, and `/abs/repo` all resolve the same entry.
+    pub fn uninclude_repo(&mut self, path: &str) {
+        let target = normalize_repo_path(path);
+        self.included_repos.retain(|p| normalize_repo_path(p) != target);
+    }
+
     /// Return all repos (explicit + discovered) with metadata.
     pub fn all_repos(&self) -> Vec<RepoEntry> {
         let mut entries = Vec::new();
 
         for repo in &self.repos {
             let path = expand_tilde(repo);
-            let available = path.join(".git").exists();
+            let git_dir_present = path.join(".git").exists();
             entries.push(RepoEntry {
                 path,
                 source: RepoSource::Explicit,
-                available,
+                git_dir_present,
             });
         }
 
@@ -255,15 +315,39 @@ impl Config {
             if entries.iter().any(|e| e.path == path) {
                 continue;
             }
-            let available = path.join(".git").exists();
+            let git_dir_present = path.join(".git").exists();
             entries.push(RepoEntry {
                 path,
                 source: RepoSource::Discovered,
-                available,
+                git_dir_present,
             });
         }
 
         entries
+    }
+
+    /// Return active repos: explicit repos (always active) plus discovered
+    /// repos that appear in `included_repos`. This is the authoritative
+    /// "what repos are active" query for both CLI and TUI.
+    /// Both sides are normalized before comparison so hand-edited,
+    /// relative, or non-canonical config paths still match correctly.
+    pub fn active_repos(&self) -> Vec<RepoEntry> {
+        // included_repos are normalized both on insert (include_repo) and
+        // on load (Config::load), so we compare directly.
+        self.all_repos()
+            .into_iter()
+            .filter(|entry| {
+                // Explicit repos are always active.
+                if entry.source == RepoSource::Explicit {
+                    return true;
+                }
+                // Discovered repos are active only if opted-in.
+                let entry_normalized = normalize_repo_path(
+                    &entry.path.display().to_string(),
+                );
+                self.included_repos.contains(&entry_normalized)
+            })
+            .collect()
     }
 }
 
@@ -344,8 +428,7 @@ mod tests {
         let config = Config {
             base_dirs: vec!["~/Projects".into()],
             repos: vec!["~/Forks/repo".into()],
-            defaults: Defaults::default(),
-            source: "test".into(),
+            ..Config::for_test()
         };
 
         let contents = toml::to_string_pretty(&config).unwrap();

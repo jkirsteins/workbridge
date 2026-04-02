@@ -36,9 +36,15 @@ base_dirs = [
     "~/Work",
 ]
 
-# Individual repo paths (explicit additions)
+# Individual repo paths (explicit additions, always active)
 repos = [
     "~/Forks/some-repo",
+]
+
+# Discovered repos opted-in for management
+included_repos = [
+    "~/Projects/my-app",
+    "~/Work/backend",
 ]
 
 [defaults]
@@ -53,7 +59,11 @@ directory is scanned one level deep for subdirectories containing `.git/`.
 Paths support `~` for the home directory.
 
 **repos**: List of individual repo paths. Each must contain `.git/`. Paths
-support `~` for the home directory.
+support `~` for the home directory. Explicit repos are always active.
+
+**included_repos**: List of discovered repo paths that the user has opted
+in to manage. Discovered repos not in this list are "available" but not
+active.
 
 **defaults.worktree_dir**: Directory for managed worktrees, relative to the
 repo root. Defaults to `.worktrees`.
@@ -70,17 +80,19 @@ data loss if the process is killed mid-write.
 ## CLI Commands
 
 ```
-workbridge                          # launch TUI
-workbridge config                   # print config file path and contents
-workbridge repos list               # list all repos (explicit + discovered)
-workbridge repos add <path>         # add individual repo
-workbridge repos add-base <path>    # add base directory for auto-discovery
-workbridge repos remove <path>      # remove from config
+workbridge                              # launch TUI
+workbridge config                       # print config file path and contents
+workbridge repos list                   # list managed repos (explicit + included)
+workbridge repos list --all             # list all repos with [unmanaged] markers
+workbridge repos add <path>             # add individual repo (always active)
+workbridge repos add-base <path>        # add base directory (repos start unmanaged)
+workbridge repos remove <path>          # remove from config entirely
 ```
 
 ### workbridge repos add
 
-Adds an individual repo. The path must contain `.git/`.
+Adds an individual repo. The path must contain `.git/`. Explicit repos
+are always active - no need to also include them.
 
 ```
 workbridge repos add .                    # register current directory
@@ -89,30 +101,28 @@ workbridge repos add ~/Projects/backend   # register a specific repo
 
 ### workbridge repos add-base
 
-Adds a base directory. WorkBridge scans it one level deep for git repos
-on startup.
+Adds a base directory. WorkBridge scans it one level deep for git repos.
+Discovered repos start **unmanaged** by default. Use the TUI settings
+overlay (press `?`) to manage/unmanage discovered repos, or add them
+explicitly with `repos add`.
 
 ```
-workbridge repos add-base ~/Projects      # discovers repos under ~/Projects
+workbridge repos add-base ~/Projects      # discovers repos, all start unmanaged
+workbridge repos add ~/Projects/foo       # explicitly add foo (always active)
 ```
 
 ### workbridge repos remove
 
-Removes a path from both `repos` and `base_dirs`. Compares by canonical
-path to handle symlinks and relative paths.
+Removes a path from `repos`, `base_dirs`, and `included_repos`. Compares
+by canonical path to handle symlinks and relative paths.
 
 ### workbridge repos list
 
-Lists all repos (explicit + discovered) with their source and availability.
-This is the default when running `workbridge repos` with no subcommand.
+Lists managed repos (explicit + included). This is the default when
+running `workbridge repos` with no subcommand.
 
-```
-PATH                                                         SOURCE       AVAILABLE
---------------------------------------------------------------------------------
-~/Projects/workbridge                                        explicit     yes
-~/Projects/backend-api                                       discovered   yes
-~/Projects/old-project                                       discovered   no
-```
+Use `--all` to see all repos including unmanaged ones (marked with
+`[unmanaged]`).
 
 ### workbridge config
 

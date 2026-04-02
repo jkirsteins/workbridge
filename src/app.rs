@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::config::Config;
+use crate::config::{Config, RepoEntry, RepoSource};
 use crate::session::Session;
 
 /// Which panel currently has keyboard focus.
@@ -10,6 +10,13 @@ use crate::session::Session;
 pub enum FocusPanel {
     Left,
     Right,
+}
+
+/// Which list has focus inside the settings overlay.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingsListFocus {
+    Managed,
+    Available,
 }
 
 /// Tab represents a single Claude Code session backed by a PTY.
@@ -50,22 +57,30 @@ pub struct App {
     pub pane_rows: u16,
     /// The loaded configuration (repo paths, base dirs, defaults).
     pub config: Config,
-    /// Repos discovered by scanning base_dirs at startup.
-    pub discovered_repos: Vec<PathBuf>,
     /// Whether to show the settings overlay.
     pub show_settings: bool,
+    /// Cached active repo entries (explicit + included). Rebuilt when
+    /// inclusions change, not on every frame or keypress.
+    pub active_repo_cache: Vec<RepoEntry>,
+    /// Cursor position in the managed repos list.
+    pub settings_repo_selected: usize,
+    /// Cursor position in the available repos list.
+    pub settings_available_selected: usize,
+    /// Which list has focus inside the settings overlay.
+    pub settings_list_focus: SettingsListFocus,
 }
 
 impl App {
-    /// Create a new App with default (empty) config and no discovered repos.
+    /// Create a new App with default (empty) config.
     /// Used by tests as a convenience constructor.
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::with_config(Config::default(), Vec::new())
+        Self::with_config(Config::default())
     }
 
-    /// Create a new App with the given config and pre-discovered repos.
-    pub fn with_config(config: Config, discovered_repos: Vec<PathBuf>) -> Self {
+    /// Create a new App with the given config.
+    pub fn with_config(config: Config) -> Self {
+        let active_repo_cache = config.active_repos();
         Self {
             tabs: Vec::new(),
             selected_tab: None,
@@ -80,8 +95,106 @@ impl App {
             pane_cols: 80,
             pane_rows: 24,
             config,
-            discovered_repos,
             show_settings: false,
+            active_repo_cache,
+            settings_repo_selected: 0,
+            settings_available_selected: 0,
+            settings_list_focus: SettingsListFocus::Managed,
+        }
+    }
+
+    /// Rebuild the cached active repo list after inclusion changes.
+    fn refresh_repo_cache(&mut self) {
+        self.active_repo_cache = self.config.active_repos();
+    }
+
+    /// Total number of active repos for scroll bounds.
+    pub fn total_repos(&self) -> usize {
+        self.active_repo_cache.len()
+    }
+
+    /// Build the list of available (unmanaged) repos: all repos minus active.
+    /// Used by the settings overlay to show what can be managed.
+    pub fn available_repos(&self) -> Vec<RepoEntry> {
+        let active_paths: Vec<_> = self
+            .active_repo_cache
+            .iter()
+            .map(|e| &e.path)
+            .collect();
+        self.config
+            .all_repos()
+            .into_iter()
+            .filter(|entry| !active_paths.contains(&&entry.path))
+            .collect()
+    }
+
+    /// Unmanage the currently selected managed repo and save config.
+    /// Removes from included_repos. Explicit repos cannot be unmanaged
+    /// this way (they must be removed via `remove_path`).
+    /// If the save fails, the in-memory mutation is rolled back so the
+    /// UI stays consistent with what is persisted on disk.
+    pub fn unmanage_selected_repo(&mut self) {
+        if self.active_repo_cache.is_empty() {
+            return;
+        }
+        let idx = self
+            .settings_repo_selected
+            .min(self.active_repo_cache.len().saturating_sub(1));
+        let entry = &self.active_repo_cache[idx];
+        if entry.source == RepoSource::Explicit {
+            self.status_message =
+                Some("Explicit repos cannot be unmanaged (use 'repos remove')".into());
+            return;
+        }
+        let path = entry.path.display().to_string();
+        self.config.uninclude_repo(&path);
+        if let Err(e) = self.config.save() {
+            // Rollback: re-add the inclusion since save failed.
+            self.config.include_repo(&path);
+            self.status_message = Some(format!("Error saving config: {e}"));
+            return;
+        }
+        self.status_message = Some(format!("Unmanaged: {path}"));
+        self.refresh_repo_cache();
+        // Adjust cursor if it went past the end.
+        if !self.active_repo_cache.is_empty() {
+            self.settings_repo_selected = self
+                .settings_repo_selected
+                .min(self.active_repo_cache.len() - 1);
+        } else {
+            self.settings_repo_selected = 0;
+        }
+    }
+
+    /// Manage the currently selected available repo and save config.
+    /// Adds to included_repos.
+    /// If the save fails, the in-memory mutation is rolled back.
+    pub fn manage_selected_repo(&mut self) {
+        let available = self.available_repos();
+        if available.is_empty() {
+            return;
+        }
+        let idx = self
+            .settings_available_selected
+            .min(available.len().saturating_sub(1));
+        let path = available[idx].path.display().to_string();
+        self.config.include_repo(&path);
+        if let Err(e) = self.config.save() {
+            // Rollback: remove the inclusion since save failed.
+            self.config.uninclude_repo(&path);
+            self.status_message = Some(format!("Error saving config: {e}"));
+            return;
+        }
+        self.status_message = Some(format!("Managed: {path}"));
+        self.refresh_repo_cache();
+        // Adjust cursor if it went past the end.
+        let new_available = self.available_repos();
+        let new_len = new_available.len();
+        if new_len > 0 {
+            self.settings_available_selected =
+                self.settings_available_selected.min(new_len - 1);
+        } else {
+            self.settings_available_selected = 0;
         }
     }
 

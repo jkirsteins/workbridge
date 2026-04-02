@@ -1,26 +1,26 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 24)"
+expression: output
 ---
 ┌ Tabs ────────────┐┌ Claude Code ─────────────────────────────────────────────┐
 │                  ││                                                          │
 │  No tabs. ┌ Settings (press ? or Esc to close) ──────────────────┐           │
-│           │Config source:                                        │           │
-│  Press Ctr│  in-memory (test)                                    │           │
-│  to create│                                                      │           │
-│           │Base directories:                                     │           │
-│           │  + ~/Projects                                        │           │
 │           │                                                      │           │
-│           │Repos (explicit):                                     │           │
-│           │  - ~/Forks/special-repo                              │           │
+│  Press Ctr│ Config source:                                       │           │
+│  to create│   in-memory (test)                                   │           │
+│           │ Base directories:                                    │           │
+│           │   + /var/folders/zn/cd1tlf854yjfplfm1hx7f8q40000gn/T │           │
 │           │                                                      │           │
-│           │Repos (discovered):                                   │           │
-│           │  /tmp/discovered-a                                   │           │
-│           │  /tmp/discovered-b                                   │           │
+│           │ ┌ Managed repos (1) ─────┐┌ Available (2) ─────────┐ │           │
+│           │ │>  - /Users/janiskirstei││ + /var/folders/zn/cd1tl│ │           │
+│           │ │                        ││ + /var/folders/zn/cd1tl│ │           │
+│           │ └────────────────────────┘└────────────────────────┘ │           │
 │           │                                                      │           │
-│           │Defaults:                                             │           │
-│           │  worktree_dir: .worktrees                            │           │
-│           │  branch_issue_pattern: ^(\d+)-                       │           │
+│           │ Defaults:                                            │           │
+│           │   worktree_dir: .worktrees                           │           │
+│           │   branch_issue_pattern: ^(\d+)-                      │           │
+│           │ Tab: switch list, Enter: move, Up/Down: navigate     │           │
+│           │                                                      │           │
 │           │                                                      │           │
 │           └──────────────────────────────────────────────────────┘           │
 │                  ││                                                          │
