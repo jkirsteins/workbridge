@@ -1,0 +1,28 @@
+---
+source: src/ui.rs
+expression: "render(&app, 80, 24)"
+---
+┌ Tabs ────────────┐┌ Claude Code ─────────────────────────────────────────────┐
+│                  ││                                                          │
+│  No tabs. ┌ Settings (press ? or Esc to close) ──────────────────┐           │
+│           │Config source:                                        │           │
+│  Press Ctr│  in-memory (test)                                    │           │
+│  to create│                                                      │           │
+│           │Base directories:                                     │           │
+│           │  + ~/Projects                                        │           │
+│           │                                                      │           │
+│           │Repos (explicit):                                     │           │
+│           │  - ~/Forks/special-repo                              │           │
+│           │                                                      │           │
+│           │Repos (discovered):                                   │           │
+│           │  /tmp/discovered-a                                   │           │
+│           │  /tmp/discovered-b                                   │           │
+│           │                                                      │           │
+│           │Defaults:                                             │           │
+│           │  worktree_dir: .worktrees                            │           │
+│           │  branch_issue_pattern: ^(\d+)-                       │           │
+│           │                                                      │           │
+│           └──────────────────────────────────────────────────────┘           │
+│                  ││                                                          │
+│                  ││                                                          │
+└──────────────────┘└──────────────────────────────────────────────────────────┘

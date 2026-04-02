@@ -226,13 +226,9 @@ fn draw_settings_overlay(frame: &mut Frame, app: &App, area: Rect) {
     // Build the content lines.
     let mut lines: Vec<Line<'_>> = Vec::new();
 
-    // Config file path.
-    let config_path_str = match config::config_path() {
-        Ok(p) => format!("{}", p.display()),
-        Err(_) => "(unknown)".into(),
-    };
-    lines.push(Line::styled("Config file:", Style::default().fg(Color::Cyan)));
-    lines.push(Line::from(format!("  {config_path_str}")));
+    // Config source.
+    lines.push(Line::styled("Config source:", Style::default().fg(Color::Cyan)));
+    lines.push(Line::from(format!("  {}", app.config.source)));
     lines.push(Line::from(""));
 
     // Base directories.
@@ -383,6 +379,25 @@ mod snapshot_tests {
         app.tabs.push(make_tab("Tab 0", true, 58, 22));
         app.selected_tab = Some(0);
         app.focus = FocusPanel::Right;
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn settings_overlay_with_config() {
+        use crate::config::{Config, Defaults};
+
+        let mut app = App::new();
+        app.config = Config {
+            base_dirs: vec!["~/Projects".into()],
+            repos: vec!["~/Forks/special-repo".into()],
+            defaults: Defaults::default(),
+            source: "in-memory (test)".into(),
+        };
+        app.discovered_repos = vec![
+            std::path::PathBuf::from("/tmp/discovered-a"),
+            std::path::PathBuf::from("/tmp/discovered-b"),
+        ];
+        app.show_settings = true;
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 }

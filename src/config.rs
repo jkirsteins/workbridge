@@ -20,6 +20,10 @@ pub struct Config {
     /// Fallback settings for repos that don't specify overrides.
     #[serde(default)]
     pub defaults: Defaults,
+    /// Human-readable description of where this config came from.
+    /// Set by the loader - not serialized to the TOML file.
+    #[serde(skip)]
+    pub source: String,
 }
 
 /// Default settings applied to repos that don't override them.
@@ -136,11 +140,17 @@ impl Config {
     /// cannot be parsed.
     pub fn load() -> Result<Self, ConfigError> {
         let path = config_path()?;
+        let source = format!("{}", path.display());
         if !path.exists() {
-            return Ok(Config::default());
+            return Ok(Config {
+                source: format!("{source} (not yet created)"),
+                ..Config::default()
+            });
         }
         let contents = fs::read_to_string(&path)?;
-        toml::from_str(&contents).map_err(ConfigError::Parse)
+        let mut cfg: Config = toml::from_str(&contents).map_err(ConfigError::Parse)?;
+        cfg.source = source;
+        Ok(cfg)
     }
 
     /// Save config to the default path, creating parent directories if needed.
@@ -156,35 +166,40 @@ impl Config {
         Ok(())
     }
 
-    /// Add a path as a repo (if it contains .git/) or as a base_dir (if it
-    /// contains git repos one level down). Returns what was added.
-    pub fn add_path(&mut self, raw: &str) -> Result<AddResult, ConfigError> {
+    /// Add an individual repo path. Validates that it contains `.git/`.
+    pub fn add_repo(&mut self, raw: &str) -> Result<String, ConfigError> {
         let expanded = expand_tilde(raw);
         let canonical = fs::canonicalize(&expanded)
             .map_err(|_| ConfigError::PathNotFound(raw.to_string()))?;
 
-        // Check if it's a git repo itself.
-        if canonical.join(".git").exists() {
-            let display = collapse_home(&canonical);
-            if !self.repos.contains(&display) {
-                self.repos.push(display.clone());
-            }
-            return Ok(AddResult::Repo(display));
+        if !canonical.join(".git").exists() {
+            return Err(ConfigError::NotAGitRepo(raw.to_string()));
         }
 
-        // Check if it contains git repos one level down.
-        if canonical.is_dir() {
-            let children = discover_git_repos_in(&canonical);
-            if !children.is_empty() {
-                let display = collapse_home(&canonical);
-                if !self.base_dirs.contains(&display) {
-                    self.base_dirs.push(display.clone());
-                }
-                return Ok(AddResult::BaseDir(display, children.len()));
-            }
+        let display = collapse_home(&canonical);
+        if !self.repos.contains(&display) {
+            self.repos.push(display.clone());
+        }
+        Ok(display)
+    }
+
+    /// Add a base directory for auto-discovery. Validates that it exists
+    /// and is a directory.
+    pub fn add_base_dir(&mut self, raw: &str) -> Result<(String, usize), ConfigError> {
+        let expanded = expand_tilde(raw);
+        let canonical = fs::canonicalize(&expanded)
+            .map_err(|_| ConfigError::PathNotFound(raw.to_string()))?;
+
+        if !canonical.is_dir() {
+            return Err(ConfigError::PathNotFound(raw.to_string()));
         }
 
-        Err(ConfigError::NotAGitRepo(raw.to_string()))
+        let display = collapse_home(&canonical);
+        if !self.base_dirs.contains(&display) {
+            self.base_dirs.push(display.clone());
+        }
+        let count = discover_git_repos_in(&canonical).len();
+        Ok((display, count))
     }
 
     /// Remove a path from both repos and base_dirs.
@@ -250,12 +265,6 @@ impl Config {
 
         entries
     }
-}
-
-/// What was added by add_path.
-pub enum AddResult {
-    Repo(String),
-    BaseDir(String, usize),
 }
 
 /// Write data to a file atomically by writing to a temp file in the same
@@ -336,6 +345,7 @@ mod tests {
             base_dirs: vec!["~/Projects".into()],
             repos: vec!["~/Forks/repo".into()],
             defaults: Defaults::default(),
+            source: "test".into(),
         };
 
         let contents = toml::to_string_pretty(&config).unwrap();
@@ -383,44 +393,45 @@ mod tests {
     }
 
     #[test]
-    fn add_path_detects_git_repo() {
+    fn add_repo_validates_git_dir() {
         let dir = std::env::temp_dir().join("workbridge-test-add-repo");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(".git")).unwrap();
 
         let mut config = Config::default();
-        let result = config.add_path(dir.to_str().unwrap());
+        let result = config.add_repo(dir.to_str().unwrap());
         assert!(result.is_ok());
         assert_eq!(config.repos.len(), 1);
-        assert!(config.base_dirs.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn add_path_detects_base_dir() {
-        let dir = std::env::temp_dir().join("workbridge-test-add-base");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("child-repo/.git")).unwrap();
-
-        let mut config = Config::default();
-        let result = config.add_path(dir.to_str().unwrap());
-        assert!(result.is_ok());
-        assert!(config.repos.is_empty());
-        assert_eq!(config.base_dirs.len(), 1);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn add_path_rejects_non_repo() {
+    fn add_repo_rejects_non_repo() {
         let dir = std::env::temp_dir().join("workbridge-test-add-fail");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
         let mut config = Config::default();
-        let result = config.add_path(dir.to_str().unwrap());
+        let result = config.add_repo(dir.to_str().unwrap());
         assert!(result.is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_base_dir_accepts_directory() {
+        let dir = std::env::temp_dir().join("workbridge-test-add-base");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("child-repo/.git")).unwrap();
+
+        let mut config = Config::default();
+        let result = config.add_base_dir(dir.to_str().unwrap());
+        assert!(result.is_ok());
+        assert!(config.repos.is_empty());
+        assert_eq!(config.base_dirs.len(), 1);
+        let (_, count) = result.unwrap();
+        assert_eq!(count, 1);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -432,7 +443,7 @@ mod tests {
         fs::create_dir_all(dir.join(".git")).unwrap();
 
         let mut config = Config::default();
-        config.add_path(dir.to_str().unwrap()).unwrap();
+        config.add_repo(dir.to_str().unwrap()).unwrap();
         assert_eq!(config.repos.len(), 1);
 
         let removed = config.remove_path(dir.to_str().unwrap());

@@ -44,71 +44,72 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn main() -> io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-
-    // CLI subcommands: handle before TUI setup.
+/// Handle CLI subcommands. Returns true if a subcommand was handled (caller
+/// should exit), false if the TUI should launch.
+fn handle_cli(args: &[String]) -> bool {
     match args.get(1).map(|s| s.as_str()) {
+        Some("repos") => handle_repos_subcommand(args),
+        Some("config") => handle_config_subcommand(),
+        _ => return false,
+    }
+    true
+}
+
+fn handle_repos_subcommand(args: &[String]) {
+    match args.get(2).map(|s| s.as_str()) {
         Some("add") => {
-            let Some(path) = args.get(2) else {
-                eprintln!("Usage: workbridge add <path>");
+            let Some(path) = args.get(3) else {
+                eprintln!("Usage: workbridge repos add <path>");
                 std::process::exit(1);
             };
-            let mut cfg = config::Config::load().unwrap_or_else(|e| {
-                eprintln!("Error loading config: {e}");
-                std::process::exit(1);
-            });
-            match cfg.add_path(path) {
-                Ok(config::AddResult::Repo(display)) => {
-                    cfg.save().unwrap_or_else(|e| {
-                        eprintln!("Error saving config: {e}");
-                        std::process::exit(1);
-                    });
+            let mut cfg = load_config_or_exit();
+            match cfg.add_repo(path) {
+                Ok(display) => {
+                    save_config_or_exit(&cfg);
                     println!("Added repo: {display}");
-                }
-                Ok(config::AddResult::BaseDir(display, count)) => {
-                    cfg.save().unwrap_or_else(|e| {
-                        eprintln!("Error saving config: {e}");
-                        std::process::exit(1);
-                    });
-                    println!("Added base directory: {display} ({count} repos found)");
                 }
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
             }
-            return Ok(());
         }
-        Some("remove") => {
-            let Some(path) = args.get(2) else {
-                eprintln!("Usage: workbridge remove <path>");
+        Some("add-base") => {
+            let Some(path) = args.get(3) else {
+                eprintln!("Usage: workbridge repos add-base <path>");
                 std::process::exit(1);
             };
-            let mut cfg = config::Config::load().unwrap_or_else(|e| {
-                eprintln!("Error loading config: {e}");
-                std::process::exit(1);
-            });
-            if cfg.remove_path(path) {
-                cfg.save().unwrap_or_else(|e| {
-                    eprintln!("Error saving config: {e}");
+            let mut cfg = load_config_or_exit();
+            match cfg.add_base_dir(path) {
+                Ok((display, count)) => {
+                    save_config_or_exit(&cfg);
+                    println!("Added base directory: {display} ({count} repos discovered)");
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
                     std::process::exit(1);
-                });
+                }
+            }
+        }
+        Some("remove") => {
+            let Some(path) = args.get(3) else {
+                eprintln!("Usage: workbridge repos remove <path>");
+                std::process::exit(1);
+            };
+            let mut cfg = load_config_or_exit();
+            if cfg.remove_path(path) {
+                save_config_or_exit(&cfg);
                 println!("Removed: {path}");
             } else {
                 println!("Path not found in config: {path}");
             }
-            return Ok(());
         }
-        Some("repos") => {
-            let cfg = config::Config::load().unwrap_or_else(|e| {
-                eprintln!("Error loading config: {e}");
-                std::process::exit(1);
-            });
+        Some("list") | None => {
+            let cfg = load_config_or_exit();
             let entries = cfg.all_repos();
             if entries.is_empty() {
                 println!("No repositories configured.");
-                println!("Use 'workbridge add <path>' to add one.");
+                println!("Use 'workbridge repos add <path>' to add one.");
             } else {
                 println!("{:<60} {:<12} AVAILABLE", "PATH", "SOURCE");
                 println!("{}", "-".repeat(80));
@@ -121,33 +122,57 @@ fn main() -> io::Result<()> {
                     println!("{:<60} {:<12} {}", entry.path.display(), source, avail);
                 }
             }
-            return Ok(());
         }
-        Some("config") => {
-            match config::config_path() {
-                Ok(path) => {
-                    println!("Config file: {}", path.display());
-                    if path.exists() {
-                        let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                            eprintln!("Error reading config: {e}");
-                            std::process::exit(1);
-                        });
-                        println!();
-                        print!("{contents}");
-                    } else {
-                        println!("(no config file yet)");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error: {e}");
+        Some(unknown) => {
+            eprintln!("Unknown repos subcommand: {unknown}");
+            eprintln!("Usage: workbridge repos [list|add|add-base|remove]");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_config_subcommand() {
+    match config::config_path() {
+        Ok(path) => {
+            println!("Config file: {}", path.display());
+            if path.exists() {
+                let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    eprintln!("Error reading config: {e}");
                     std::process::exit(1);
-                }
+                });
+                println!();
+                print!("{contents}");
+            } else {
+                println!("(no config file yet)");
             }
-            return Ok(());
         }
-        _ => {
-            // No recognized subcommand - fall through to launch TUI.
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
         }
+    }
+}
+
+fn load_config_or_exit() -> config::Config {
+    config::Config::load().unwrap_or_else(|e| {
+        eprintln!("Error loading config: {e}");
+        std::process::exit(1);
+    })
+}
+
+fn save_config_or_exit(cfg: &config::Config) {
+    cfg.save().unwrap_or_else(|e| {
+        eprintln!("Error saving config: {e}");
+        std::process::exit(1);
+    });
+}
+
+fn main() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // CLI subcommands: handle before TUI setup.
+    if handle_cli(&args) {
+        return Ok(());
     }
 
     // Load config and discover repos for the TUI.

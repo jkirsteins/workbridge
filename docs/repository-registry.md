@@ -70,36 +70,41 @@ data loss if the process is killed mid-write.
 ## CLI Commands
 
 ```
-workbridge add <path>     # auto-detect: repo or base directory
-workbridge remove <path>  # remove from config
-workbridge repos          # list all repos with source and availability
-workbridge config         # print config file path and contents
+workbridge                          # launch TUI
+workbridge config                   # print config file path and contents
+workbridge repos list               # list all repos (explicit + discovered)
+workbridge repos add <path>         # add individual repo
+workbridge repos add-base <path>    # add base directory for auto-discovery
+workbridge repos remove <path>      # remove from config
 ```
 
-### workbridge add
+### workbridge repos add
 
-Auto-detects what to register:
-
-- If `<path>/.git` exists: adds to `repos` as an individual repo
-- If `<path>` contains git repos one level down: adds to `base_dirs`
-- Otherwise: error
-
-Examples:
+Adds an individual repo. The path must contain `.git/`.
 
 ```
-workbridge add .                    # register current directory as a repo
-workbridge add ~/Projects/backend   # register a specific repo
-workbridge add ~/Projects           # register as base dir (discovers repos under it)
+workbridge repos add .                    # register current directory
+workbridge repos add ~/Projects/backend   # register a specific repo
 ```
 
-### workbridge remove
+### workbridge repos add-base
+
+Adds a base directory. WorkBridge scans it one level deep for git repos
+on startup.
+
+```
+workbridge repos add-base ~/Projects      # discovers repos under ~/Projects
+```
+
+### workbridge repos remove
 
 Removes a path from both `repos` and `base_dirs`. Compares by canonical
 path to handle symlinks and relative paths.
 
-### workbridge repos
+### workbridge repos list
 
-Lists all repos (explicit + discovered) with their source and availability:
+Lists all repos (explicit + discovered) with their source and availability.
+This is the default when running `workbridge repos` with no subcommand.
 
 ```
 PATH                                                         SOURCE       AVAILABLE
