@@ -1,10 +1,11 @@
 # Invariants
 
-> STATUS: NOT IMPLEMENTED. This document describes the target design.
-
 Invariants are the non-negotiable rules of the system. They define what
 WorkBridge considers valid. Code must enforce them. If reality violates
 an invariant, the system surfaces an error rather than guessing.
+
+These are requirements, not features. All implementation decisions should
+be evaluated against these rules.
 
 ## The Rules
 
