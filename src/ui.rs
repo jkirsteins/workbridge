@@ -64,23 +64,23 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_pane_output(frame, app, &theme, chunks[1]);
 
     // Context bar (persistent work-item info).
-    if let Some(area) = context_area {
-        if let Some(ctx) = app.selected_work_item_context() {
-            draw_context_bar(frame, ctx, &theme, area);
-        }
+    if let Some(area) = context_area
+        && let Some(ctx) = app.selected_work_item_context()
+    {
+        draw_context_bar(frame, ctx, &theme, area);
     }
 
     // Status bar (transient messages).
-    if let Some(area) = status_area {
-        if let Some(msg) = &app.status_message {
-            let style = if app.shutting_down {
-                theme.style_status_shutdown()
-            } else {
-                theme.style_status()
-            };
-            let status = Paragraph::new(msg.as_str()).style(style);
-            frame.render_widget(status, area);
-        }
+    if let Some(area) = status_area
+        && let Some(msg) = &app.status_message
+    {
+        let style = if app.shutting_down {
+            theme.style_status_shutdown()
+        } else {
+            theme.style_status()
+        };
+        let status = Paragraph::new(msg.as_str()).style(style);
+        frame.render_widget(status, area);
     }
 
     // Settings overlay (rendered on top of everything).
