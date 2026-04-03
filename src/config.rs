@@ -2,6 +2,72 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Abstracts config persistence so tests can use an in-memory store
+/// instead of writing to the real config file.
+pub trait ConfigProvider {
+    /// Load the persisted config. Used by FileConfigProvider at startup
+    /// and by InMemoryConfigProvider in tests.
+    #[allow(dead_code)]
+    fn load(&self) -> Result<Config, ConfigError>;
+    fn save(&self, config: &Config) -> Result<(), ConfigError>;
+}
+
+/// Production config provider that reads/writes the platform config file.
+pub struct FileConfigProvider;
+
+impl ConfigProvider for FileConfigProvider {
+    fn load(&self) -> Result<Config, ConfigError> {
+        Config::load()
+    }
+
+    fn save(&self, config: &Config) -> Result<(), ConfigError> {
+        let path = config_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let contents = toml::to_string_pretty(config).map_err(ConfigError::Serialize)?;
+        atomic_write(&path, contents.as_bytes())?;
+        Ok(())
+    }
+}
+
+/// In-memory config provider for tests. Never touches disk.
+/// Constructed only in `#[cfg(test)]` code.
+#[allow(dead_code)]
+pub struct InMemoryConfigProvider {
+    data: Mutex<Option<String>>,
+}
+
+impl InMemoryConfigProvider {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self {
+            data: Mutex::new(None),
+        }
+    }
+}
+
+impl ConfigProvider for InMemoryConfigProvider {
+    fn load(&self) -> Result<Config, ConfigError> {
+        let guard = self.data.lock().unwrap();
+        match &*guard {
+            Some(contents) => {
+                let cfg: Config = toml::from_str(contents).map_err(ConfigError::Parse)?;
+                Ok(cfg)
+            }
+            None => Ok(Config::default()),
+        }
+    }
+
+    fn save(&self, config: &Config) -> Result<(), ConfigError> {
+        let contents = toml::to_string_pretty(config).map_err(ConfigError::Serialize)?;
+        let mut guard = self.data.lock().unwrap();
+        *guard = Some(contents);
+        Ok(())
+    }
+}
 
 /// Get the user's home directory using the directories crate.
 fn home_dir() -> Option<PathBuf> {
@@ -182,19 +248,6 @@ impl Config {
             .map(|p| normalize_repo_path(&p))
             .collect();
         Ok(cfg)
-    }
-
-    /// Save config to the default path, creating parent directories if needed.
-    /// Uses atomic write (write to temp file, then rename) to prevent data
-    /// loss if the process is killed mid-write.
-    pub fn save(&self) -> Result<(), ConfigError> {
-        let path = config_path()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let contents = toml::to_string_pretty(self).map_err(ConfigError::Serialize)?;
-        atomic_write(&path, contents.as_bytes())?;
-        Ok(())
     }
 
     /// Add an individual repo path. Validates that it contains `.git/`.

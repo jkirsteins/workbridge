@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::assembly;
-use crate::config::{Config, RepoEntry, RepoSource};
+use crate::config::{Config, ConfigProvider, RepoEntry, RepoSource};
 use crate::session::Session;
 use crate::github_client::GithubError;
 use crate::work_item::{
@@ -79,6 +79,8 @@ pub struct App {
     pub pane_rows: u16,
     /// The loaded configuration (repo paths, base dirs, defaults).
     pub config: Config,
+    /// Abstracts config persistence so tests use an in-memory store.
+    pub config_provider: Box<dyn ConfigProvider>,
     /// Whether to show the settings overlay.
     pub show_settings: bool,
     /// Cached active repo entries (explicit + included). Rebuilt when
@@ -145,29 +147,40 @@ pub struct App {
 
 impl App {
     /// Create a new App with default (empty) config and a stub backend.
-    /// Used by tests as a convenience constructor.
+    /// Uses InMemoryConfigProvider so tests never touch the real config.
     #[cfg(test)]
     pub fn new() -> Self {
+        use crate::config::InMemoryConfigProvider;
         Self::with_config_and_worktree_service(
             Config::default(),
             Box::new(StubBackend),
             Arc::new(StubWorktreeService),
+            Box::new(InMemoryConfigProvider::new()),
         )
     }
 
     /// Create a new App with the given config and backend.
+    /// Uses InMemoryConfigProvider so tests never touch the real config.
     /// Uses a no-op worktree service. Call `with_config_and_worktree_service`
     /// to provide a real or mock worktree service.
     #[cfg(test)]
     pub fn with_config(config: Config, backend: Box<dyn WorkItemBackend>) -> Self {
-        Self::with_config_and_worktree_service(config, backend, Arc::new(StubWorktreeService))
+        use crate::config::InMemoryConfigProvider;
+        Self::with_config_and_worktree_service(
+            config,
+            backend,
+            Arc::new(StubWorktreeService),
+            Box::new(InMemoryConfigProvider::new()),
+        )
     }
 
-    /// Create a new App with the given config, backend, and worktree service.
+    /// Create a new App with the given config, backend, worktree service,
+    /// and config provider.
     pub fn with_config_and_worktree_service(
         config: Config,
         backend: Box<dyn WorkItemBackend>,
         worktree_service: Arc<dyn WorktreeService + Send + Sync>,
+        config_provider: Box<dyn ConfigProvider>,
     ) -> Self {
         let active_repo_cache = canonicalize_repo_entries(config.active_repos());
         let mut app = Self {
@@ -181,6 +194,7 @@ impl App {
             pane_cols: 80,
             pane_rows: 24,
             config,
+            config_provider,
             show_settings: false,
             active_repo_cache,
             settings_repo_selected: 0,
@@ -309,7 +323,7 @@ impl App {
         }
         let path = entry.path.display().to_string();
         self.config.uninclude_repo(&path);
-        if let Err(e) = self.config.save() {
+        if let Err(e) = self.config_provider.save(&self.config) {
             // Rollback: re-add the inclusion since save failed.
             self.config.include_repo(&path);
             self.status_message = Some(format!("Error saving config: {e}"));
@@ -341,7 +355,7 @@ impl App {
             .min(available.len().saturating_sub(1));
         let path = available[idx].path.display().to_string();
         self.config.include_repo(&path);
-        if let Err(e) = self.config.save() {
+        if let Err(e) = self.config_provider.save(&self.config) {
             // Rollback: remove the inclusion since save failed.
             self.config.uninclude_repo(&path);
             self.status_message = Some(format!("Error saving config: {e}"));
@@ -2210,6 +2224,7 @@ mod tests {
             Config::default(),
             Box::new(backend),
             Arc::clone(&mock_ws) as Arc<dyn WorktreeService + Send + Sync>,
+            Box::new(crate::config::InMemoryConfigProvider::new()),
         );
 
         // Set up an unlinked PR to import.
@@ -2394,6 +2409,7 @@ mod tests {
             Config::default(),
             Box::new(backend),
             Arc::clone(&mock_ws) as Arc<dyn WorktreeService + Send + Sync>,
+            Box::new(crate::config::InMemoryConfigProvider::new()),
         );
 
         // Set up an unlinked PR to import (simulates a fork PR).
@@ -2607,6 +2623,7 @@ mod tests {
             config,
             Box::new(backend),
             Arc::clone(&mock_ws) as Arc<dyn WorktreeService + Send + Sync>,
+            Box::new(crate::config::InMemoryConfigProvider::new()),
         );
 
         // Set up an unlinked PR with a branch containing /.

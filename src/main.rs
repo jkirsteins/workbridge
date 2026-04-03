@@ -25,6 +25,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use app::App;
+use config::{ConfigProvider, FileConfigProvider};
 use github_client::GhCliClient;
 use worktree_service::GitWorktreeService;
 
@@ -159,7 +160,7 @@ fn load_config_or_exit() -> config::Config {
 }
 
 fn save_config_or_exit(cfg: &config::Config) {
-    cfg.save().unwrap_or_else(|e| {
+    FileConfigProvider.save(cfg).unwrap_or_else(|e| {
         eprintln!("Error saving config: {e}");
         std::process::exit(1);
     });
@@ -245,7 +246,12 @@ fn main() -> io::Result<()> {
     let worktree_service: Arc<dyn worktree_service::WorktreeService + Send + Sync> =
         Arc::new(GitWorktreeService);
 
-    let mut app = App::with_config_and_worktree_service(cfg, backend, Arc::clone(&worktree_service));
+    let mut app = App::with_config_and_worktree_service(
+        cfg,
+        backend,
+        Arc::clone(&worktree_service),
+        Box::new(FileConfigProvider),
+    );
     // Surface config/backend load errors in the TUI status bar so the user sees them.
     if let Some(msg) = config_error {
         app.status_message = Some(msg);

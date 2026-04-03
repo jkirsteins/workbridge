@@ -124,3 +124,11 @@ These invariants have direct consequences for the user:
 The system trades flexibility for predictability. Every work item behaves
 the same way. Every branch follows the same rules. There are no special
 cases.
+
+### 9. Tests must not modify production state
+
+All persistence in tests uses mocks or temp directories. Tests must never
+read or write the real config file, the real backend data directory, or
+any other production path. Config persistence in tests uses
+`InMemoryConfigProvider`. Filesystem operations use `std::env::temp_dir()`
+with cleanup. A test that touches production state is a bug.
