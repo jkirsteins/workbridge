@@ -19,6 +19,21 @@ pub enum SettingsListFocus {
     Available,
 }
 
+/// Lightweight display data for the work-item context bar.
+///
+/// This is a placeholder populated manually until the full WorkItem
+/// pipeline (docs/work-items.md) is implemented. When that lands,
+/// this struct becomes a projection derived from WorkItem fields.
+#[derive(Clone, Debug)]
+pub struct WorkItemContext {
+    /// The work item title (e.g., issue title or branch-derived name).
+    pub title: String,
+    /// The repository path on disk (from RepoAssociation.repo_path).
+    pub repo_path: String,
+    /// Issue labels (from IssueInfo.labels). Empty if no issue linked.
+    pub labels: Vec<String>,
+}
+
 /// Tab represents a single Claude Code session backed by a PTY.
 pub struct Tab {
     pub name: String,
@@ -30,6 +45,9 @@ pub struct Tab {
     pub alive: bool,
     /// The PTY session. None if the session failed to spawn.
     pub session: Option<Session>,
+    /// Work item context for the context bar. None if this tab is not
+    /// associated with a work item (e.g., a scratch session).
+    pub work_item_context: Option<WorkItemContext>,
 }
 
 /// App holds the entire application state.
@@ -128,6 +146,13 @@ impl App {
             .collect()
     }
 
+    /// Return the work item context for the currently selected tab, if any.
+    pub fn selected_work_item_context(&self) -> Option<&WorkItemContext> {
+        self.selected_tab
+            .and_then(|idx| self.tabs.get(idx))
+            .and_then(|tab| tab.work_item_context.as_ref())
+    }
+
     /// Unmanage the currently selected managed repo and save config.
     /// Removes from included_repos. Explicit repos cannot be unmanaged
     /// this way (they must be removed via `remove_path`).
@@ -215,6 +240,7 @@ impl App {
                     parser,
                     alive: true,
                     session: Some(session),
+                    work_item_context: None,
                 };
 
                 self.tabs.push(tab);

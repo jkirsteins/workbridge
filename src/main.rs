@@ -273,8 +273,9 @@ fn main() -> io::Result<()> {
     // Set initial pane dimensions from the terminal size.
     let size = terminal.size()?;
     let app = guard.app_mut();
-    let has_status = app.status_message.is_some();
-    let pl = layout::compute(size.width, size.height, has_status);
+    let bottom_rows = u16::from(app.status_message.is_some())
+        + u16::from(app.selected_work_item_context().is_some());
+    let pl = layout::compute(size.width, size.height, bottom_rows);
     app.pane_cols = pl.pane_cols;
     app.pane_rows = pl.pane_rows;
 

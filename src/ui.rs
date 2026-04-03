@@ -6,32 +6,52 @@ use ratatui::{
 };
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, FocusPanel, SettingsListFocus};
+use crate::app::{App, FocusPanel, SettingsListFocus, WorkItemContext};
 use crate::config;
 use crate::layout;
 use crate::theme::Theme;
 
 /// Render the entire UI: left panel (tab list) and right panel (session output),
-/// plus an optional status bar at the bottom.
+/// plus optional context bar and status bar at the bottom.
 pub fn draw(frame: &mut Frame, app: &App) {
     let theme = Theme::default_theme();
     let area = frame.area();
 
-    // Vertical split: main area + optional 1-row status bar.
+    // Vertical split: main area + optional 1-row context bar + optional 1-row status bar.
+    let has_context = app.selected_work_item_context().is_some();
     let has_status = app.status_message.is_some();
+
+    let mut constraints = vec![Constraint::Min(0)];
+    if has_context {
+        constraints.push(Constraint::Length(1));
+    }
+    if has_status {
+        constraints.push(Constraint::Length(1));
+    }
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if has_status {
-            vec![Constraint::Min(0), Constraint::Length(1)]
-        } else {
-            vec![Constraint::Min(0)]
-        })
+        .constraints(constraints)
         .split(area);
 
     let main_area = vertical[0];
+    let mut next_slot = 1;
+
+    let context_area = if has_context {
+        let a = vertical[next_slot];
+        next_slot += 1;
+        Some(a)
+    } else {
+        None
+    };
+
+    let status_area = if has_status {
+        Some(vertical[next_slot])
+    } else {
+        None
+    };
 
     // Horizontal split: left panel, right panel.
-    let pl = layout::compute(main_area.width, main_area.height, false);
+    let pl = layout::compute(main_area.width, main_area.height, 0);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -43,17 +63,24 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_tab_list(frame, app, &theme, chunks[0]);
     draw_pane_output(frame, app, &theme, chunks[1]);
 
-    // Status bar.
-    if has_status
-        && let Some(msg) = &app.status_message
-    {
-        let style = if app.shutting_down {
-            theme.style_status_shutdown()
-        } else {
-            theme.style_status()
-        };
-        let status = Paragraph::new(msg.as_str()).style(style);
-        frame.render_widget(status, vertical[1]);
+    // Context bar (persistent work-item info).
+    if let Some(area) = context_area {
+        if let Some(ctx) = app.selected_work_item_context() {
+            draw_context_bar(frame, ctx, &theme, area);
+        }
+    }
+
+    // Status bar (transient messages).
+    if let Some(area) = status_area {
+        if let Some(msg) = &app.status_message {
+            let style = if app.shutting_down {
+                theme.style_status_shutdown()
+            } else {
+                theme.style_status()
+            };
+            let status = Paragraph::new(msg.as_str()).style(style);
+            frame.render_widget(status, area);
+        }
     }
 
     // Settings overlay (rendered on top of everything).
@@ -201,6 +228,33 @@ fn draw_pane_output(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             frame.render_widget(paragraph, area);
         }
     }
+}
+
+/// Draw the work-item context bar showing title, repo path, and labels.
+fn draw_context_bar(frame: &mut Frame, ctx: &WorkItemContext, theme: &Theme, area: Rect) {
+    let labels_part = if ctx.labels.is_empty() {
+        String::new()
+    } else {
+        format!(" | {}", ctx.labels.join(", "))
+    };
+
+    let full = format!("{} | {}{}", ctx.title, ctx.repo_path, labels_part);
+
+    // Truncate to fit width. Use char-based indexing for multi-byte safety.
+    let width = area.width as usize;
+    let display = if full.chars().count() > width {
+        if width > 3 {
+            let truncated: String = full.chars().take(width - 3).collect();
+            format!("{truncated}...")
+        } else {
+            full.chars().take(width).collect()
+        }
+    } else {
+        full
+    };
+
+    let paragraph = Paragraph::new(display).style(theme.style_context());
+    frame.render_widget(paragraph, area);
 }
 
 /// Return a centered rect using the given percentage of the outer rect.
@@ -418,7 +472,7 @@ fn draw_settings_overlay(frame: &mut Frame, app: &App, theme: &Theme, area: Rect
 mod snapshot_tests {
     use std::sync::{Arc, Mutex};
     use ratatui::{Terminal, backend::TestBackend};
-    use crate::app::{App, FocusPanel, Tab};
+    use crate::app::{App, FocusPanel, Tab, WorkItemContext};
     use super::draw;
 
     /// Helper: render the app into a TestBackend and return the buffer as a string.
@@ -450,6 +504,7 @@ mod snapshot_tests {
             parser: Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0))),
             alive,
             session: None,
+            work_item_context: None,
         }
     }
 
@@ -507,6 +562,55 @@ mod snapshot_tests {
         app.tabs.push(make_tab("Tab 0", true, 58, 22));
         app.selected_tab = Some(0);
         app.focus = FocusPanel::Right;
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn tab_with_work_item_context() {
+        let mut app = App::new();
+        app.pane_cols = 58;
+        app.pane_rows = 21;
+        let mut tab = make_tab("Tab 0", true, 58, 21);
+        tab.work_item_context = Some(WorkItemContext {
+            title: "Fix resize bug".into(),
+            repo_path: "~/Projects/myapp".into(),
+            labels: vec!["bug".into(), "P1".into()],
+        });
+        app.tabs.push(tab);
+        app.selected_tab = Some(0);
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn tab_with_work_item_no_labels() {
+        let mut app = App::new();
+        app.pane_cols = 58;
+        app.pane_rows = 21;
+        let mut tab = make_tab("Tab 0", true, 58, 21);
+        tab.work_item_context = Some(WorkItemContext {
+            title: "Add authentication".into(),
+            repo_path: "~/Projects/webapp".into(),
+            labels: vec![],
+        });
+        app.tabs.push(tab);
+        app.selected_tab = Some(0);
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn tab_with_work_item_and_status() {
+        let mut app = App::new();
+        app.pane_cols = 58;
+        app.pane_rows = 20;
+        let mut tab = make_tab("Tab 0", true, 58, 20);
+        tab.work_item_context = Some(WorkItemContext {
+            title: "Fix resize bug".into(),
+            repo_path: "~/Projects/myapp".into(),
+            labels: vec!["bug".into()],
+        });
+        app.tabs.push(tab);
+        app.selected_tab = Some(0);
+        app.status_message = Some("Right panel focused - press Ctrl+] to return".into());
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 
