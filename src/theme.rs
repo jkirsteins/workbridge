@@ -51,6 +51,12 @@ pub struct Theme {
     pub status_shutdown_fg: Color,
     /// Shutdown status bar background.
     pub status_shutdown_bg: Color,
+
+    // -- Context bar --
+    /// Work-item context bar foreground (title and repo path).
+    pub context_fg: Color,
+    /// Work-item context bar background.
+    pub context_bg: Color,
 }
 
 impl Theme {
@@ -83,6 +89,9 @@ impl Theme {
             status_bg: Color::Reset,
             status_shutdown_fg: Color::Red,
             status_shutdown_bg: Color::Reset,
+
+            context_fg: Color::Cyan,
+            context_bg: Color::Reset,
         }
     }
 }
@@ -159,4 +168,9 @@ impl Theme {
             .fg(self.status_shutdown_fg)
             .bg(self.status_shutdown_bg)
     }
+
+    pub fn style_context(&self) -> Style {
+        Style::default().fg(self.context_fg).bg(self.context_bg)
+    }
+
 }

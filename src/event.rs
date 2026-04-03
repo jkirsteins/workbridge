@@ -166,9 +166,12 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
         // Ctrl+N - new tab (inherits parent's working directory)
         (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
             let had_status = app.status_message.is_some();
+            let had_context = app.selected_work_item_context().is_some();
             let cwd = std::env::current_dir().ok();
             app.new_tab(cwd.as_deref());
-            if app.status_message.is_some() != had_status {
+            if app.status_message.is_some() != had_status
+                || app.selected_work_item_context().is_some() != had_context
+            {
                 sync_layout(app);
             }
         }
@@ -183,8 +186,11 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
             if app.confirm_delete {
                 app.confirm_delete = false;
                 let had_status = app.status_message.is_some();
+                let had_context = app.selected_work_item_context().is_some();
                 app.delete_tab();
-                if app.status_message.is_some() != had_status {
+                if app.status_message.is_some() != had_status
+                    || app.selected_work_item_context().is_some() != had_context
+                {
                     sync_layout(app);
                 }
             } else {
@@ -195,11 +201,19 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
         }
         // Up arrow - previous tab
         (_, KeyCode::Up) => {
+            let had_context = app.selected_work_item_context().is_some();
             app.prev_tab();
+            if app.selected_work_item_context().is_some() != had_context {
+                sync_layout(app);
+            }
         }
         // Down arrow - next tab
         (_, KeyCode::Down) => {
+            let had_context = app.selected_work_item_context().is_some();
             app.next_tab();
+            if app.selected_work_item_context().is_some() != had_context {
+                sync_layout(app);
+            }
         }
         // Enter - focus right panel (if a tab is selected and alive)
         (_, KeyCode::Enter) => {
@@ -407,8 +421,9 @@ fn f_key_sequence(n: u8) -> String {
 
 /// Handle a terminal resize event by updating pane dimensions and resizing PTY.
 fn handle_resize(app: &mut App, cols: u16, rows: u16) {
-    let has_status = app.status_message.is_some();
-    let pl = layout::compute(cols, rows, has_status);
+    let bottom_rows = u16::from(app.status_message.is_some())
+        + u16::from(app.selected_work_item_context().is_some());
+    let pl = layout::compute(cols, rows, bottom_rows);
     app.pane_cols = pl.pane_cols;
     app.pane_rows = pl.pane_rows;
     app.resize_pty_panes();
