@@ -58,17 +58,20 @@ pub enum BackendType {
 }
 
 /// High-level status of a work item.
+///
+/// `Done` is derived by the assembly layer when any repo association has a
+/// merged PR. It is never stored in backend records - if the PR is reopened,
+/// the item reverts to `InProgress`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WorkItemStatus {
     Todo,
     InProgress,
+    Done,
 }
 
 /// A fully assembled work item with backend data and derived metadata.
 pub struct WorkItem {
     pub id: WorkItemId,
-    /// Used by assembly tests and future backend-type indicator in UI.
-    #[allow(dead_code)]
     pub backend_type: BackendType,
     pub title: String,
     pub status: WorkItemStatus,
@@ -79,17 +82,11 @@ pub struct WorkItem {
 /// A repo associated with a work item, with derived metadata filled in
 /// by the assembly layer.
 pub struct RepoAssociation {
-    /// Read by assembly tests; will be shown in detail views.
-    #[allow(dead_code)]
     pub repo_path: PathBuf,
     /// None = pre-planning state: no worktree, no PR matching.
-    /// Read by assembly tests; will be shown in detail views.
-    #[allow(dead_code)]
     pub branch: Option<String>,
     pub worktree_path: Option<PathBuf>,
     pub pr: Option<PrInfo>,
-    /// Read by assembly tests; will be shown in detail views.
-    #[allow(dead_code)]
     pub issue: Option<IssueInfo>,
     /// Read by assembly tests; will be shown in detail views.
     #[allow(dead_code)]
@@ -162,10 +159,11 @@ pub struct PrInfo {
 /// Populated by assembly; fields read in tests. Title used for work item
 /// title derivation. Other fields shown in detail views when added.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct IssueInfo {
     pub number: u64,
     pub title: String,
+    /// Shown in detail views when issue state display is added.
+    #[allow(dead_code)]
     pub state: IssueState,
     pub labels: Vec<String>,
 }

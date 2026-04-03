@@ -18,7 +18,7 @@ use crate::config;
 use crate::create_dialog::{CreateDialog, CreateDialogFocus};
 use crate::layout;
 use crate::theme::Theme;
-use crate::work_item::{CheckStatus, PrState, WorkItemError};
+use crate::work_item::{BackendType, CheckStatus, PrState, WorkItemError, WorkItemStatus};
 
 /// Render the entire UI: left panel (work item list) and right panel
 /// (session output), plus optional context bar and status bar at the bottom.
@@ -212,6 +212,10 @@ fn format_unlinked_item<'a>(
 }
 
 /// Format a work item entry for the left panel list.
+///
+/// Returns a 2-line ListItem:
+///   Line 1: title (+ PR badge + CI badge if present)
+///   Line 2: repo-name  branch-name  [no wt] (all muted)
 fn format_work_item_entry<'a>(
     app: &App,
     idx: usize,
@@ -221,6 +225,8 @@ fn format_work_item_entry<'a>(
     let Some(wi) = app.work_items.get(idx) else {
         return ListItem::new(Line::from("  <invalid>"));
     };
+
+    // -- Line 1: title + badges --
 
     // Build the right-side badge string.
     let mut right_parts: Vec<(String, ratatui_core::style::Style)> = Vec::new();
@@ -270,16 +276,50 @@ fn format_work_item_entry<'a>(
     let padding = max_width.saturating_sub(prefix.len() + truncated_title.len() + right_text.len());
     let pad_str: String = " ".repeat(padding);
 
-    let mut spans = vec![
+    let title_style = if wi.status == WorkItemStatus::Done {
+        theme.style_done_item()
+    } else {
+        theme.style_text()
+    };
+    let mut line1_spans = vec![
         Span::raw(prefix.to_string()),
-        Span::styled(truncated_title, theme.style_text()),
+        Span::styled(truncated_title, title_style),
         Span::raw(pad_str),
     ];
     for (text, style) in right_parts {
-        spans.push(Span::styled(text, style));
+        line1_spans.push(Span::styled(text, style));
     }
+    let line1 = Line::from(line1_spans);
 
-    ListItem::new(Line::from(spans))
+    // -- Line 2: repo name, branch, worktree indicator (all muted) --
+
+    let first_assoc = wi.repo_associations.first();
+
+    let repo_name = first_assoc
+        .and_then(|a| {
+            a.repo_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+        })
+        .unwrap_or_default();
+
+    let branch_name = first_assoc
+        .and_then(|a| a.branch.as_deref())
+        .unwrap_or("[no branch]");
+
+    let has_worktree = first_assoc.is_some_and(|a| a.worktree_path.is_some());
+    let wt_indicator = if has_worktree { "" } else { " [no wt]" };
+
+    // Build line 2 content: "  repo  branch  [no wt]"
+    let line2_content = format!("{prefix}{repo_name}  {branch_name}{wt_indicator}");
+    let truncated_line2 = truncate_str(&line2_content, max_width);
+
+    let line2 = Line::from(vec![Span::styled(
+        truncated_line2,
+        theme.style_text_muted(),
+    )]);
+
+    ListItem::new(vec![line1, line2])
 }
 
 /// Truncate a string to fit within max_len characters.
@@ -344,6 +384,124 @@ fn format_work_item_error(error: &WorkItemError) -> (String, Option<String>) {
             Some("The worktree directory was removed from disk.".into()),
         ),
     }
+}
+
+/// Draw a structured detail view for a work item with no active session.
+///
+/// Shows title, status, backend type, repo, branch, worktree, PR, issue,
+/// and errors, followed by a prompt to start a session.
+fn draw_work_item_detail(
+    buf: &mut Buffer,
+    wi: Option<&crate::work_item::WorkItem>,
+    theme: &Theme,
+    block: Block<'_>,
+    area: Rect,
+) {
+    let Some(wi) = wi else {
+        let text = Text::from(vec![
+            Line::from(""),
+            Line::from("  Press Enter to start"),
+            Line::from("  a session."),
+        ]);
+        let paragraph = Paragraph::new(text)
+            .block(block)
+            .style(theme.style_text_muted());
+        paragraph.render(area, buf);
+        return;
+    };
+
+    let first_assoc = wi.repo_associations.first();
+    let label_style = theme.style_heading();
+    let none_style = theme.style_text_muted();
+
+    let status_str = match wi.status {
+        WorkItemStatus::Todo => "Todo",
+        WorkItemStatus::InProgress => "In Progress",
+        WorkItemStatus::Done => "Done",
+    };
+
+    let backend_str = match wi.backend_type {
+        BackendType::LocalFile => "Local file",
+        BackendType::GithubIssue => "GitHub issue",
+        BackendType::GithubProject => "GitHub project",
+    };
+
+    let repo_str = first_assoc
+        .map(|a| a.repo_path.display().to_string())
+        .unwrap_or_else(|| "(none)".to_string());
+
+    let branch_str = first_assoc
+        .and_then(|a| a.branch.as_deref())
+        .unwrap_or("(none)");
+
+    let worktree_str = first_assoc
+        .and_then(|a| a.worktree_path.as_ref())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(none)".to_string());
+
+    let pr_str = first_assoc
+        .and_then(|a| a.pr.as_ref())
+        .map(|pr| format!("#{} - {}", pr.number, pr.title))
+        .unwrap_or_else(|| "(none)".to_string());
+
+    let issue_str = first_assoc
+        .and_then(|a| a.issue.as_ref())
+        .map(|issue| format!("#{} - {}", issue.number, issue.title))
+        .unwrap_or_else(|| "(none)".to_string());
+
+    let errors_str = if wi.errors.is_empty() {
+        "(none)".to_string()
+    } else {
+        wi.errors
+            .iter()
+            .map(|e| format_work_item_error(e).0)
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    // Helper: style a value as muted if it is "(none)", otherwise default.
+    let val_style = |s: &str| -> ratatui_core::style::Style {
+        if s == "(none)" {
+            none_style
+        } else {
+            theme.style_text()
+        }
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(format!("  {}", wi.title), theme.style_text())),
+        Line::from(""),
+    ];
+
+    // Each detail row: "  Label:      value"
+    let fields: Vec<(&str, &str)> = vec![
+        ("Status", status_str),
+        ("Backend", backend_str),
+        ("Repo", &repo_str),
+        ("Branch", branch_str),
+        ("Worktree", &worktree_str),
+        ("PR", &pr_str),
+        ("Issue", &issue_str),
+        ("Errors", &errors_str),
+    ];
+
+    for (label, value) in &fields {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {label:<12}"), label_style),
+            Span::styled(value.to_string(), val_style(value)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press Enter to start a session.",
+        none_style,
+    )));
+
+    let text = Text::from(lines);
+    let paragraph = Paragraph::new(text).block(block);
+    paragraph.render(area, buf);
 }
 
 /// Draw the right panel showing captured PTY output.
@@ -442,16 +600,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                         let paragraph = Paragraph::new(text).block(block);
                         paragraph.render(area, buf);
                     } else {
-                        let text = Text::from(vec![
-                            Line::from(""),
-                            Line::from("  Press Enter to start"),
-                            Line::from("  a session for this"),
-                            Line::from("  work item."),
-                        ]);
-                        let paragraph = Paragraph::new(text)
-                            .block(block)
-                            .style(theme.style_text_muted());
-                        paragraph.render(area, buf);
+                        draw_work_item_detail(buf, wi, theme, block, area);
                     }
                 }
             }
@@ -1293,6 +1442,43 @@ mod snapshot_tests {
     #[test]
     fn work_item_list_empty_groups() {
         let app = app_with_items(vec![], vec![]);
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn work_item_list_with_done_group() {
+        let items = vec![
+            make_work_item(
+                "todo-1",
+                "Fix authentication bug",
+                WorkItemStatus::Todo,
+                Some(make_pr_info(14, CheckStatus::Passing)),
+                1,
+            ),
+            make_work_item(
+                "prog-1",
+                "Refactor backend API",
+                WorkItemStatus::InProgress,
+                Some(make_pr_info(88, CheckStatus::Failing)),
+                1,
+            ),
+            make_work_item(
+                "done-1",
+                "Update dependencies",
+                WorkItemStatus::Done,
+                Some(PrInfo {
+                    number: 50,
+                    title: "Update deps".to_string(),
+                    state: PrState::Merged,
+                    is_draft: false,
+                    review_decision: ReviewDecision::None,
+                    checks: CheckStatus::Passing,
+                    url: "https://github.com/o/r/pull/50".to_string(),
+                }),
+                1,
+            ),
+        ];
+        let app = app_with_items(items, vec![]);
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 

@@ -4,18 +4,18 @@ expression: "render(&app, 80, 24)"
 ---
 ┌ Work Items ──────┐┌ Claude Code ─────────────────────────────────────────────┐
 │  TODO (2)        ││                                                          │
-│>   Fix a.. PR#14 ││  Press Enter to start                                    │
-│    Add user sett.││  a session for this                                      │
-│  IN PROGRESS (2) ││  work item.                                              │
-│    PR#88 fail [2 ││                                                          │
-│    Upda.. PR#12 .││                                                          │
+│>   Fix a.. PR#14 ││  Fix authentication bug                                  │
+│    0  branch-todo││                                                          │
+│    Add user sett.││  Status      Todo                                        │
+│    0  branch-todo││  Backend     Local file                                  │
+│  IN PROGRESS (2) ││  Repo        /repo/todo-1/0                              │
+│    PR#88 fail [2 ││  Branch      branch-todo-1                               │
+│    0  branch-prog││  Worktree    (none)                                      │
+│    Upda.. PR#12 .││  PR          #14 - PR #14                                │
+│    0  branch-prog││  Issue       (none)                                      │
+│                  ││  Errors      (none)                                      │
 │                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
+│                  ││  Press Enter to start a session.                         │
 │                  ││                                                          │
 │                  ││                                                          │
 │                  ││                                                          │

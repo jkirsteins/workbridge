@@ -69,6 +69,8 @@ pub struct Theme {
     pub badge_ci_pending: Color,
     /// Unlinked item "?" marker color.
     pub unlinked_marker: Color,
+    /// Done item text color (muted, completed work is less prominent).
+    pub done_item: Color,
 }
 
 impl Theme {
@@ -110,6 +112,7 @@ impl Theme {
             badge_ci_fail: Color::Red,
             badge_ci_pending: Color::Yellow,
             unlinked_marker: Color::Yellow,
+            done_item: Color::Reset,
         }
     }
 }
@@ -211,5 +214,11 @@ impl Theme {
 
     pub fn style_unlinked_marker(&self) -> Style {
         Style::default().fg(self.unlinked_marker)
+    }
+
+    pub fn style_done_item(&self) -> Style {
+        Style::default()
+            .fg(self.done_item)
+            .add_modifier(Modifier::DIM)
     }
 }

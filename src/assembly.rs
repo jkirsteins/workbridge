@@ -6,7 +6,7 @@ use regex::Regex;
 use crate::github_client::{GithubIssue, GithubPr};
 use crate::work_item::{
     CheckStatus, GitState, IssueInfo, IssueState, PrInfo, PrState, RepoAssociation,
-    RepoFetchResult, ReviewDecision, UnlinkedPr, WorkItem, WorkItemError,
+    RepoFetchResult, ReviewDecision, UnlinkedPr, WorkItem, WorkItemError, WorkItemStatus,
 };
 use crate::work_item_backend::WorkItemRecord;
 use crate::worktree_service::WorktreeInfo;
@@ -315,7 +315,17 @@ pub fn reassemble(
         };
 
         // --- Status ---
-        let status = record.status.clone();
+        // Done is derived: if any repo association has a merged PR, the work
+        // item is Done regardless of the backend record's status. If the PR
+        // gets reopened, the item reverts to its backend status.
+        let has_merged_pr = assembled_associations
+            .iter()
+            .any(|a| a.pr.as_ref().is_some_and(|pr| pr.state == PrState::Merged));
+        let status = if has_merged_pr {
+            WorkItemStatus::Done
+        } else {
+            record.status.clone()
+        };
 
         work_items.push(WorkItem {
             id: record.id.clone(),
@@ -1254,6 +1264,109 @@ mod tests {
         assert_eq!(items[0].backend_type, BackendType::LocalFile);
         assert_eq!(items[1].backend_type, BackendType::GithubIssue);
         assert_eq!(items[2].backend_type, BackendType::GithubProject);
+    }
+
+    #[test]
+    fn merged_pr_derives_done_status() {
+        let rp = repo_path("alpha");
+        let branch = "feature-x";
+
+        // Backend record says InProgress, but the PR is merged.
+        let record = create_mock_record(
+            "wi-1",
+            "Ship it",
+            WorkItemStatus::InProgress,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+            }],
+        );
+
+        let mut pr = create_mock_pr(10, "Ship it", branch, "APPROVED", "SUCCESS");
+        pr.state = "MERGED".to_string();
+
+        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].status,
+            WorkItemStatus::Done,
+            "merged PR should derive Done status",
+        );
+    }
+
+    #[test]
+    fn open_pr_keeps_backend_status() {
+        let rp = repo_path("alpha");
+        let branch = "feature-x";
+
+        // Backend record says InProgress, PR is open -> stays InProgress.
+        let record = create_mock_record(
+            "wi-1",
+            "Work",
+            WorkItemStatus::InProgress,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+            }],
+        );
+
+        let pr = create_mock_pr(10, "Work", branch, "", "");
+
+        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].status,
+            WorkItemStatus::InProgress,
+            "open PR should keep backend InProgress status",
+        );
+    }
+
+    #[test]
+    fn multi_repo_one_merged_pr_derives_done() {
+        let rp_a = repo_path("alpha");
+        let rp_b = repo_path("beta");
+
+        let record = create_mock_record(
+            "wi-1",
+            "Cross-repo",
+            WorkItemStatus::InProgress,
+            vec![
+                RepoAssociationRecord {
+                    repo_path: rp_a.clone(),
+                    branch: Some("feature-x".to_string()),
+                },
+                RepoAssociationRecord {
+                    repo_path: rp_b.clone(),
+                    branch: Some("feature-x".to_string()),
+                },
+            ],
+        );
+
+        // alpha PR is open, beta PR is merged -> Done (any merged = Done).
+        let pr_a = create_mock_pr(10, "PR alpha", "feature-x", "", "");
+        let mut pr_b = create_mock_pr(20, "PR beta", "feature-x", "", "");
+        pr_b.state = "MERGED".to_string();
+
+        let (key_a, fetch_a) = create_mock_repo_data(rp_a, vec![], vec![pr_a], vec![]);
+        let (key_b, fetch_b) = create_mock_repo_data(rp_b, vec![], vec![pr_b], vec![]);
+        let repo_data = HashMap::from([(key_a, fetch_a), (key_b, fetch_b)]);
+
+        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].status,
+            WorkItemStatus::Done,
+            "any merged PR should derive Done status",
+        );
     }
 
     // -- Round 7 regression tests --

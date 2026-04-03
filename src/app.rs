@@ -624,6 +624,14 @@ impl App {
             .map(|(i, _)| i)
             .collect();
 
+        let done_indices: Vec<usize> = self
+            .work_items
+            .iter()
+            .enumerate()
+            .filter(|(_, wi)| wi.status == WorkItemStatus::Done)
+            .map(|(i, _)| i)
+            .collect();
+
         // TODO group.
         list.push(DisplayEntry::GroupHeader {
             label: "TODO".to_string(),
@@ -646,6 +654,17 @@ impl App {
             list.push(DisplayEntry::EmptyState("  No work items".to_string()));
         } else {
             for idx in in_progress_indices {
+                list.push(DisplayEntry::WorkItemEntry(idx));
+            }
+        }
+
+        // DONE group (hidden if empty).
+        if !done_indices.is_empty() {
+            list.push(DisplayEntry::GroupHeader {
+                label: "DONE".to_string(),
+                count: done_indices.len(),
+            });
+            for idx in done_indices {
                 list.push(DisplayEntry::WorkItemEntry(idx));
             }
         }
@@ -1299,6 +1318,7 @@ impl WorkItemBackend for StubBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::work_item::BackendType;
     use std::path::PathBuf;
 
     // -- F-1 regression test --
@@ -2900,6 +2920,68 @@ mod tests {
             repos[0],
             PathBuf::from("/repos/with-git"),
             "only the repo with git_dir_present should be included",
+        );
+    }
+
+    #[test]
+    fn display_list_includes_done_group_when_done_items_exist() {
+        let mut app = App::new();
+        app.work_items = vec![
+            WorkItem {
+                id: WorkItemId::LocalFile(PathBuf::from("/data/todo.json")),
+                backend_type: BackendType::LocalFile,
+                title: "Todo item".to_string(),
+                status: WorkItemStatus::Todo,
+                repo_associations: vec![],
+                errors: vec![],
+            },
+            WorkItem {
+                id: WorkItemId::LocalFile(PathBuf::from("/data/done.json")),
+                backend_type: BackendType::LocalFile,
+                title: "Done item".to_string(),
+                status: WorkItemStatus::Done,
+                repo_associations: vec![],
+                errors: vec![],
+            },
+        ];
+        app.build_display_list();
+
+        // Find the DONE group header.
+        let done_header = app
+            .display_list
+            .iter()
+            .find(|e| matches!(e, DisplayEntry::GroupHeader { label, .. } if label == "DONE"));
+        assert!(
+            done_header.is_some(),
+            "DONE group header should appear when there are Done items",
+        );
+
+        // Count Done items in the display list.
+        if let Some(DisplayEntry::GroupHeader { count, .. }) = done_header {
+            assert_eq!(*count, 1, "DONE group should show 1 item");
+        }
+    }
+
+    #[test]
+    fn display_list_hides_done_group_when_empty() {
+        let mut app = App::new();
+        app.work_items = vec![WorkItem {
+            id: WorkItemId::LocalFile(PathBuf::from("/data/todo.json")),
+            backend_type: BackendType::LocalFile,
+            title: "Todo item".to_string(),
+            status: WorkItemStatus::Todo,
+            repo_associations: vec![],
+            errors: vec![],
+        }];
+        app.build_display_list();
+
+        let done_header = app
+            .display_list
+            .iter()
+            .find(|e| matches!(e, DisplayEntry::GroupHeader { label, .. } if label == "DONE"));
+        assert!(
+            done_header.is_none(),
+            "DONE group header should be hidden when no Done items exist",
         );
     }
 
