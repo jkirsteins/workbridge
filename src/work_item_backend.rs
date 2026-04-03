@@ -21,6 +21,8 @@ pub enum BackendError {
     Serialize(String),
     /// Validation error (e.g., no repo associations).
     Validation(String),
+    /// The work item ID is not managed by this backend.
+    UnsupportedId(WorkItemId),
 }
 
 impl fmt::Display for BackendError {
@@ -38,6 +40,9 @@ impl fmt::Display for BackendError {
             }
             BackendError::Validation(msg) => {
                 write!(f, "validation error: {msg}")
+            }
+            BackendError::UnsupportedId(id) => {
+                write!(f, "work item {id:?} is not managed by this backend")
             }
         }
     }
@@ -111,6 +116,9 @@ pub trait WorkItemBackend: Send + Sync {
 
     /// Delete a work item by id.
     fn delete(&self, id: &WorkItemId) -> Result<(), BackendError>;
+
+    /// Update a work item's status.
+    fn update_status(&self, id: &WorkItemId, status: WorkItemStatus) -> Result<(), BackendError>;
 
     /// Import an unlinked PR as a new work item.
     fn import(&self, unlinked: &UnlinkedPr) -> Result<WorkItemRecord, BackendError>;
@@ -282,14 +290,38 @@ impl WorkItemBackend for LocalFileBackend {
                 })?;
                 Ok(())
             }
-            other => Err(BackendError::NotFound(other.clone())),
+            other => Err(BackendError::UnsupportedId(other.clone())),
+        }
+    }
+
+    fn update_status(&self, id: &WorkItemId, status: WorkItemStatus) -> Result<(), BackendError> {
+        match id {
+            WorkItemId::LocalFile(path) => {
+                if !path.exists() {
+                    return Err(BackendError::NotFound(id.clone()));
+                }
+                let contents = fs::read_to_string(path).map_err(|e| {
+                    BackendError::Io(format!("failed to read {}: {e}", path.display()))
+                })?;
+                let mut record: WorkItemRecord = serde_json::from_str(&contents).map_err(|e| {
+                    BackendError::Io(format!("failed to parse {}: {e}", path.display()))
+                })?;
+                record.status = status;
+                let json = serde_json::to_string_pretty(&record)
+                    .map_err(|e| BackendError::Serialize(format!("{e}")))?;
+                atomic_write(path, json.as_bytes()).map_err(|e| {
+                    BackendError::Io(format!("failed to write {}: {e}", path.display()))
+                })?;
+                Ok(())
+            }
+            other => Err(BackendError::UnsupportedId(other.clone())),
         }
     }
 
     fn import(&self, unlinked: &UnlinkedPr) -> Result<WorkItemRecord, BackendError> {
         let request = CreateWorkItem {
             title: unlinked.pr.title.clone(),
-            status: WorkItemStatus::InProgress,
+            status: WorkItemStatus::Implementing,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: unlinked.repo_path.clone(),
                 branch: Some(unlinked.branch.clone()),
@@ -322,7 +354,7 @@ mod tests {
         let record = backend
             .create(CreateWorkItem {
                 title: "Fix auth bug".into(),
-                status: WorkItemStatus::Todo,
+                status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/path/to/repo"),
                     branch: Some("42-fix-auth".into()),
@@ -331,7 +363,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(record.title, "Fix auth bug");
-        assert_eq!(record.status, WorkItemStatus::Todo);
+        assert_eq!(record.status, WorkItemStatus::Backlog);
         assert_eq!(record.repo_associations.len(), 1);
         assert_eq!(
             record.repo_associations[0].repo_path,
@@ -346,7 +378,7 @@ mod tests {
         assert!(result.corrupt.is_empty());
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.records[0].title, "Fix auth bug");
-        assert_eq!(result.records[0].status, WorkItemStatus::Todo);
+        assert_eq!(result.records[0].status, WorkItemStatus::Backlog);
         assert_eq!(result.records[0].repo_associations.len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
@@ -359,7 +391,7 @@ mod tests {
 
         let result = backend.create(CreateWorkItem {
             title: "No repos".into(),
-            status: WorkItemStatus::Todo,
+            status: WorkItemStatus::Backlog,
             repo_associations: vec![],
         });
 
@@ -386,7 +418,7 @@ mod tests {
         let record = backend
             .create(CreateWorkItem {
                 title: "To delete".into(),
-                status: WorkItemStatus::InProgress,
+                status: WorkItemStatus::Implementing,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,
@@ -426,7 +458,7 @@ mod tests {
             other => panic!("expected NotFound, got: {other}"),
         }
 
-        // Non-LocalFile ids should also return NotFound.
+        // Non-LocalFile ids should return UnsupportedId.
         let result = backend.delete(&WorkItemId::GithubIssue {
             owner: "foo".into(),
             repo: "bar".into(),
@@ -434,8 +466,8 @@ mod tests {
         });
         assert!(result.is_err());
         match result.unwrap_err() {
-            BackendError::NotFound(_) => {}
-            other => panic!("expected NotFound, got: {other}"),
+            BackendError::UnsupportedId(_) => {}
+            other => panic!("expected UnsupportedId, got: {other}"),
         }
 
         let _ = fs::remove_dir_all(&dir);
@@ -462,7 +494,7 @@ mod tests {
 
         let record = backend.import(&unlinked).unwrap();
         assert_eq!(record.title, "Fix the widget");
-        assert_eq!(record.status, WorkItemStatus::InProgress);
+        assert_eq!(record.status, WorkItemStatus::Implementing);
         assert_eq!(record.repo_associations.len(), 1);
         assert_eq!(
             record.repo_associations[0].repo_path,
@@ -493,7 +525,7 @@ mod tests {
         backend
             .create(CreateWorkItem {
                 title: "Valid item".into(),
-                status: WorkItemStatus::Todo,
+                status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: Some("main".into()),
@@ -531,5 +563,74 @@ mod tests {
         assert!(result.corrupt.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_status_persists() {
+        let dir = temp_dir("update-status");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Planning item".into(),
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: Some("42-feature".into()),
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(record.status, WorkItemStatus::Backlog);
+
+        backend
+            .update_status(&record.id, WorkItemStatus::Planning)
+            .unwrap();
+
+        let result = backend.list().unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].status, WorkItemStatus::Planning);
+
+        // Advance further.
+        backend
+            .update_status(&record.id, WorkItemStatus::Implementing)
+            .unwrap();
+
+        let result = backend.list().unwrap();
+        assert_eq!(result.records[0].status, WorkItemStatus::Implementing);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_status_not_found() {
+        let dir = temp_dir("update-notfound");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let result = backend.update_status(
+            &WorkItemId::LocalFile(dir.join("nonexistent.json")),
+            WorkItemStatus::Planning,
+        );
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BackendError::NotFound(_) => {}
+            other => panic!("expected NotFound, got: {other}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serde_migration_todo_to_backlog() {
+        let json = r#"{"id":{"LocalFile":"/tmp/test.json"},"title":"Test","status":"Todo","repo_associations":[]}"#;
+        let record: WorkItemRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.status, WorkItemStatus::Backlog);
+    }
+
+    #[test]
+    fn serde_migration_inprogress_to_implementing() {
+        let json = r#"{"id":{"LocalFile":"/tmp/test.json"},"title":"Test","status":"InProgress","repo_associations":[]}"#;
+        let record: WorkItemRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.status, WorkItemStatus::Implementing);
     }
 }

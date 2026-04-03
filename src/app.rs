@@ -56,6 +56,8 @@ pub enum DisplayEntry {
     /// A work item (index into App::work_items).
     WorkItemEntry(usize),
     /// Empty state message shown when a group has no items.
+    /// Retained for the UNLINKED group and future board view.
+    #[allow(dead_code)]
     EmptyState(String),
 }
 
@@ -607,66 +609,10 @@ impl App {
             }
         }
 
-        // Partition work items by status.
-        let todo_indices: Vec<usize> = self
-            .work_items
-            .iter()
-            .enumerate()
-            .filter(|(_, wi)| wi.status == WorkItemStatus::Todo)
-            .map(|(i, _)| i)
-            .collect();
-
-        let in_progress_indices: Vec<usize> = self
-            .work_items
-            .iter()
-            .enumerate()
-            .filter(|(_, wi)| wi.status == WorkItemStatus::InProgress)
-            .map(|(i, _)| i)
-            .collect();
-
-        let done_indices: Vec<usize> = self
-            .work_items
-            .iter()
-            .enumerate()
-            .filter(|(_, wi)| wi.status == WorkItemStatus::Done)
-            .map(|(i, _)| i)
-            .collect();
-
-        // TODO group.
-        list.push(DisplayEntry::GroupHeader {
-            label: "TODO".to_string(),
-            count: todo_indices.len(),
-        });
-        if todo_indices.is_empty() {
-            list.push(DisplayEntry::EmptyState("  No work items".to_string()));
-        } else {
-            for idx in todo_indices {
-                list.push(DisplayEntry::WorkItemEntry(idx));
-            }
-        }
-
-        // IN PROGRESS group.
-        list.push(DisplayEntry::GroupHeader {
-            label: "IN PROGRESS".to_string(),
-            count: in_progress_indices.len(),
-        });
-        if in_progress_indices.is_empty() {
-            list.push(DisplayEntry::EmptyState("  No work items".to_string()));
-        } else {
-            for idx in in_progress_indices {
-                list.push(DisplayEntry::WorkItemEntry(idx));
-            }
-        }
-
-        // DONE group (hidden if empty).
-        if !done_indices.is_empty() {
-            list.push(DisplayEntry::GroupHeader {
-                label: "DONE".to_string(),
-                count: done_indices.len(),
-            });
-            for idx in done_indices {
-                list.push(DisplayEntry::WorkItemEntry(idx));
-            }
+        // Flat list of all work items with stage badges (no grouping).
+        // Stage badge is rendered per-item by the UI layer.
+        for i in 0..self.work_items.len() {
+            list.push(DisplayEntry::WorkItemEntry(i));
         }
 
         self.display_list = list;
@@ -893,7 +839,19 @@ impl App {
             }
         };
 
-        match Session::spawn(self.pane_cols, self.pane_rows, Some(&cwd), &["claude"]) {
+        let system_prompt = self.stage_system_prompt(&work_item_id);
+        let cmd: Vec<String> = if let Some(ref prompt) = system_prompt {
+            vec![
+                "claude".to_string(),
+                "--system-prompt".to_string(),
+                prompt.clone(),
+            ]
+        } else {
+            vec!["claude".to_string()]
+        };
+        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+
+        match Session::spawn(self.pane_cols, self.pane_rows, Some(&cwd), &cmd_refs) {
             Ok(session) => {
                 let parser = Arc::clone(&session.parser);
                 let entry = SessionEntry {
@@ -909,6 +867,63 @@ impl App {
                 self.status_message = Some(format!("Error spawning session: {e}"));
             }
         }
+    }
+
+    /// Build a stage-specific system prompt for the Claude session.
+    fn stage_system_prompt(&self, work_item_id: &WorkItemId) -> Option<String> {
+        let wi = self.work_items.iter().find(|w| w.id == *work_item_id)?;
+        let title = &wi.title;
+        let repo_info = wi
+            .repo_associations
+            .first()
+            .map(|a| a.repo_path.display().to_string())
+            .unwrap_or_default();
+
+        let prompt = match wi.status {
+            WorkItemStatus::Backlog => {
+                return None;
+            }
+            WorkItemStatus::Planning => {
+                format!(
+                    "You are helping plan work item: \"{title}\". \
+                     Repo: {repo_info}. \
+                     Stage: Planning. \
+                     Help the user refine the plan for this work item. \
+                     Discuss approach, tradeoffs, and implementation details."
+                )
+            }
+            WorkItemStatus::Implementing => {
+                format!(
+                    "You are implementing work item: \"{title}\". \
+                     Repo: {repo_info}. \
+                     Stage: Implementing. \
+                     Implement the plan as discussed. \
+                     IMPORTANT: Commit all your work before finishing. \
+                     Do not leave uncommitted changes."
+                )
+            }
+            WorkItemStatus::Blocked => {
+                format!(
+                    "You are working on work item: \"{title}\". \
+                     Repo: {repo_info}. \
+                     Stage: Blocked - waiting for user input. \
+                     The user will provide guidance to unblock you."
+                )
+            }
+            WorkItemStatus::Review => {
+                format!(
+                    "You are in review for work item: \"{title}\". \
+                     Repo: {repo_info}. \
+                     Stage: Review. \
+                     Help the user address review feedback. \
+                     IMPORTANT: Commit all changes after addressing feedback."
+                )
+            }
+            WorkItemStatus::Done => {
+                return None;
+            }
+        };
+        Some(prompt)
     }
 
     /// Import the currently selected unlinked PR as a work item.
@@ -1004,7 +1019,7 @@ impl App {
 
         let request = CreateWorkItem {
             title: "New work item".to_string(),
-            status: WorkItemStatus::Todo,
+            status: WorkItemStatus::Backlog,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: repo_root,
                 branch: None,
@@ -1070,7 +1085,7 @@ impl App {
 
         let request = CreateWorkItem {
             title: title.clone(),
-            status: WorkItemStatus::Todo,
+            status: WorkItemStatus::Backlog,
             repo_associations,
         };
 
@@ -1154,6 +1169,58 @@ impl App {
 
         self.focus = FocusPanel::Left;
         self.status_message = Some("Work item deleted".into());
+    }
+
+    /// Advance the selected work item to the next workflow stage.
+    /// Persists the change via backend.update_status() and reassembles.
+    pub fn advance_stage(&mut self) {
+        let Some(wi_id) = self.selected_work_item_id() else {
+            return;
+        };
+        let Some(wi) = self.work_items.iter().find(|w| w.id == wi_id) else {
+            return;
+        };
+        if wi.status_derived {
+            self.status_message = Some("Status is derived from merged PR".into());
+            return;
+        }
+        let Some(new_status) = wi.status.next_stage() else {
+            self.status_message = Some("Already at final stage".into());
+            return;
+        };
+        if let Err(e) = self.backend.update_status(&wi_id, new_status.clone()) {
+            self.status_message = Some(format!("Stage update error: {e}"));
+            return;
+        }
+        self.reassemble_work_items();
+        self.build_display_list();
+        self.status_message = Some(format!("Moved to {}", new_status.badge_text()));
+    }
+
+    /// Retreat the selected work item to the previous workflow stage.
+    /// Persists the change via backend.update_status() and reassembles.
+    pub fn retreat_stage(&mut self) {
+        let Some(wi_id) = self.selected_work_item_id() else {
+            return;
+        };
+        let Some(wi) = self.work_items.iter().find(|w| w.id == wi_id) else {
+            return;
+        };
+        if wi.status_derived {
+            self.status_message = Some("Status is derived from merged PR".into());
+            return;
+        }
+        let Some(new_status) = wi.status.prev_stage() else {
+            self.status_message = Some("Already at first stage".into());
+            return;
+        };
+        if let Err(e) = self.backend.update_status(&wi_id, new_status.clone()) {
+            self.status_message = Some(format!("Stage update error: {e}"));
+            return;
+        }
+        self.reassemble_work_items();
+        self.build_display_list();
+        self.status_message = Some(format!("Moved to {}", new_status.badge_text()));
     }
 
     /// Get the SessionEntry for the currently selected work item, if any.
@@ -1298,6 +1365,10 @@ impl WorkItemBackend for StubBackend {
     }
 
     fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn update_status(&self, _id: &WorkItemId, _status: WorkItemStatus) -> Result<(), BackendError> {
         Ok(())
     }
 
@@ -1478,6 +1549,13 @@ mod tests {
                     Err(BackendError::NotFound(id.clone()))
                 }
             }
+            fn update_status(
+                &self,
+                _id: &WorkItemId,
+                _status: WorkItemStatus,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
             fn import(
                 &self,
                 unlinked: &crate::work_item::UnlinkedPr,
@@ -1485,7 +1563,7 @@ mod tests {
                 let record = crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/fake.json")),
                     title: unlinked.pr.title.clone(),
-                    status: WorkItemStatus::InProgress,
+                    status: WorkItemStatus::Implementing,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
@@ -1578,6 +1656,13 @@ mod tests {
                 })
             }
             fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn update_status(
+                &self,
+                _id: &WorkItemId,
+                _status: WorkItemStatus,
+            ) -> Result<(), BackendError> {
                 Ok(())
             }
             fn import(
@@ -1838,6 +1923,13 @@ mod tests {
             fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
                 Ok(())
             }
+            fn update_status(
+                &self,
+                _id: &WorkItemId,
+                _status: WorkItemStatus,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
             fn import(
                 &self,
                 _unlinked: &crate::work_item::UnlinkedPr,
@@ -1855,7 +1947,7 @@ mod tests {
         let record_a = crate::work_item_backend::WorkItemRecord {
             id: id_a.clone(),
             title: "Item A".into(),
-            status: WorkItemStatus::Todo,
+            status: WorkItemStatus::Backlog,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: PathBuf::from("/repo"),
                 branch: None,
@@ -1864,7 +1956,7 @@ mod tests {
         let record_b = crate::work_item_backend::WorkItemRecord {
             id: id_b.clone(),
             title: "Item B".into(),
-            status: WorkItemStatus::Todo,
+            status: WorkItemStatus::Backlog,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: PathBuf::from("/repo"),
                 branch: None,
@@ -1897,7 +1989,8 @@ mod tests {
                 id: id_b.clone(),
                 backend_type: crate::work_item::BackendType::LocalFile,
                 title: "Item B".into(),
-                status: WorkItemStatus::Todo,
+                status: WorkItemStatus::Backlog,
+                status_derived: false,
                 repo_associations: vec![crate::work_item::RepoAssociation {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,
@@ -1912,7 +2005,8 @@ mod tests {
                 id: id_a.clone(),
                 backend_type: crate::work_item::BackendType::LocalFile,
                 title: "Item A".into(),
-                status: WorkItemStatus::Todo,
+                status: WorkItemStatus::Backlog,
+                status_derived: false,
                 repo_associations: vec![crate::work_item::RepoAssociation {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,
@@ -1958,7 +2052,7 @@ mod tests {
             let record = crate::work_item_backend::WorkItemRecord {
                 id: WorkItemId::LocalFile(dir.join(name)),
                 title: format!("Item {name}"),
-                status: WorkItemStatus::Todo,
+                status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,
@@ -2346,6 +2440,13 @@ mod tests {
             fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
                 Ok(())
             }
+            fn update_status(
+                &self,
+                _id: &WorkItemId,
+                _status: WorkItemStatus,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
             fn import(
                 &self,
                 unlinked: &crate::work_item::UnlinkedPr,
@@ -2353,7 +2454,7 @@ mod tests {
                 let record = crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported.json")),
                     title: unlinked.pr.title.clone(),
-                    status: WorkItemStatus::InProgress,
+                    status: WorkItemStatus::Implementing,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
@@ -2529,6 +2630,13 @@ mod tests {
             fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
                 Ok(())
             }
+            fn update_status(
+                &self,
+                _id: &WorkItemId,
+                _status: WorkItemStatus,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
             fn import(
                 &self,
                 unlinked: &crate::work_item::UnlinkedPr,
@@ -2536,7 +2644,7 @@ mod tests {
                 let record = crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported.json")),
                     title: unlinked.pr.title.clone(),
-                    status: WorkItemStatus::InProgress,
+                    status: WorkItemStatus::Implementing,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
@@ -2734,6 +2842,13 @@ mod tests {
             fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
                 Ok(())
             }
+            fn update_status(
+                &self,
+                _id: &WorkItemId,
+                _status: WorkItemStatus,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
             fn import(
                 &self,
                 unlinked: &crate::work_item::UnlinkedPr,
@@ -2741,7 +2856,7 @@ mod tests {
                 let record = crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported.json")),
                     title: unlinked.pr.title.clone(),
-                    status: WorkItemStatus::InProgress,
+                    status: WorkItemStatus::Implementing,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
@@ -2856,6 +2971,13 @@ mod tests {
             fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
                 Ok(())
             }
+            fn update_status(
+                &self,
+                _id: &WorkItemId,
+                _status: WorkItemStatus,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
             fn import(
                 &self,
                 _unlinked: &crate::work_item::UnlinkedPr,
@@ -2924,14 +3046,15 @@ mod tests {
     }
 
     #[test]
-    fn display_list_includes_done_group_when_done_items_exist() {
+    fn display_list_flat_includes_all_items() {
         let mut app = App::new();
         app.work_items = vec![
             WorkItem {
-                id: WorkItemId::LocalFile(PathBuf::from("/data/todo.json")),
+                id: WorkItemId::LocalFile(PathBuf::from("/data/backlog.json")),
                 backend_type: BackendType::LocalFile,
-                title: "Todo item".to_string(),
-                status: WorkItemStatus::Todo,
+                title: "Backlog item".to_string(),
+                status: WorkItemStatus::Backlog,
+                status_derived: false,
                 repo_associations: vec![],
                 errors: vec![],
             },
@@ -2940,48 +3063,33 @@ mod tests {
                 backend_type: BackendType::LocalFile,
                 title: "Done item".to_string(),
                 status: WorkItemStatus::Done,
+                status_derived: false,
                 repo_associations: vec![],
                 errors: vec![],
             },
         ];
         app.build_display_list();
 
-        // Find the DONE group header.
-        let done_header = app
+        // Flat list: all work items appear as WorkItemEntry, no group headers.
+        let work_item_entries: Vec<_> = app
             .display_list
             .iter()
-            .find(|e| matches!(e, DisplayEntry::GroupHeader { label, .. } if label == "DONE"));
-        assert!(
-            done_header.is_some(),
-            "DONE group header should appear when there are Done items",
+            .filter(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
+            .collect();
+        assert_eq!(
+            work_item_entries.len(),
+            2,
+            "both items should appear in flat list"
         );
 
-        // Count Done items in the display list.
-        if let Some(DisplayEntry::GroupHeader { count, .. }) = done_header {
-            assert_eq!(*count, 1, "DONE group should show 1 item");
-        }
-    }
-
-    #[test]
-    fn display_list_hides_done_group_when_empty() {
-        let mut app = App::new();
-        app.work_items = vec![WorkItem {
-            id: WorkItemId::LocalFile(PathBuf::from("/data/todo.json")),
-            backend_type: BackendType::LocalFile,
-            title: "Todo item".to_string(),
-            status: WorkItemStatus::Todo,
-            repo_associations: vec![],
-            errors: vec![],
-        }];
-        app.build_display_list();
-
-        let done_header = app
+        let group_headers: Vec<_> = app
             .display_list
             .iter()
-            .find(|e| matches!(e, DisplayEntry::GroupHeader { label, .. } if label == "DONE"));
+            .filter(|e| matches!(e, DisplayEntry::GroupHeader { .. }))
+            .collect();
         assert!(
-            done_header.is_none(),
-            "DONE group header should be hidden when no Done items exist",
+            group_headers.is_empty(),
+            "flat list should not have group headers (no unlinked PRs)",
         );
     }
 

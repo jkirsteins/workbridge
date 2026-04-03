@@ -212,6 +212,22 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 _ => {}
             }
         }
+        // Shift+Right - advance to next workflow stage
+        (KeyModifiers::SHIFT, KeyCode::Right) => {
+            let had_status = app.status_message.is_some();
+            app.advance_stage();
+            if app.status_message.is_some() != had_status {
+                sync_layout(app);
+            }
+        }
+        // Shift+Left - retreat to previous workflow stage
+        (KeyModifiers::SHIFT, KeyCode::Left) => {
+            let had_status = app.status_message.is_some();
+            app.retreat_stage();
+            if app.status_message.is_some() != had_status {
+                sync_layout(app);
+            }
+        }
         // ? - toggle settings overlay
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
             app.show_settings = !app.show_settings;

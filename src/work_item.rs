@@ -57,16 +57,60 @@ pub enum BackendType {
     GithubProject,
 }
 
-/// High-level status of a work item.
+/// Workflow stage of a work item.
 ///
-/// `Done` is derived by the assembly layer when any repo association has a
-/// merged PR. It is never stored in backend records - if the PR is reopened,
-/// the item reverts to `InProgress`.
+/// Progresses: Backlog -> Planning -> Implementing -> Review -> Done.
+/// Blocked is a sub-state of Implementing (Claude needs user input).
+/// Done can also be derived by the assembly layer when any repo
+/// association has a merged PR.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WorkItemStatus {
-    Todo,
-    InProgress,
+    #[serde(alias = "Todo")]
+    Backlog,
+    Planning,
+    #[serde(alias = "InProgress")]
+    Implementing,
+    Blocked,
+    Review,
     Done,
+}
+
+impl WorkItemStatus {
+    /// The next stage in the workflow, or None if at the terminal stage.
+    pub fn next_stage(&self) -> Option<WorkItemStatus> {
+        match self {
+            Self::Backlog => Some(Self::Planning),
+            Self::Planning => Some(Self::Implementing),
+            Self::Implementing => Some(Self::Review),
+            Self::Blocked => Some(Self::Implementing),
+            Self::Review => Some(Self::Done),
+            Self::Done => None,
+        }
+    }
+
+    /// The previous stage in the workflow, or None if at the first stage.
+    pub fn prev_stage(&self) -> Option<WorkItemStatus> {
+        match self {
+            Self::Backlog => None,
+            Self::Planning => Some(Self::Backlog),
+            Self::Implementing => Some(Self::Planning),
+            Self::Blocked => None,
+            Self::Review => Some(Self::Implementing),
+            Self::Done => Some(Self::Review),
+        }
+    }
+
+    /// Short badge text for display in the work item list.
+    pub fn badge_text(&self) -> &'static str {
+        match self {
+            Self::Backlog => "[BL]",
+            Self::Planning => "[PL]",
+            Self::Implementing => "[IM]",
+            Self::Blocked => "[BK]",
+            Self::Review => "[RV]",
+            Self::Done => "[DN]",
+        }
+    }
 }
 
 /// A fully assembled work item with backend data and derived metadata.
@@ -75,6 +119,10 @@ pub struct WorkItem {
     pub backend_type: BackendType,
     pub title: String,
     pub status: WorkItemStatus,
+    /// True when the assembly layer derived the status (e.g. merged PR -> Done)
+    /// rather than using the backend record's status directly. Stage transitions
+    /// are blocked for derived statuses to prevent backend/display divergence.
+    pub status_derived: bool,
     pub repo_associations: Vec<RepoAssociation>,
     pub errors: Vec<WorkItemError>,
 }
@@ -256,5 +304,67 @@ pub struct FetcherHandle {
 impl Drop for FetcherHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_stage_progression() {
+        assert_eq!(
+            WorkItemStatus::Backlog.next_stage(),
+            Some(WorkItemStatus::Planning)
+        );
+        assert_eq!(
+            WorkItemStatus::Planning.next_stage(),
+            Some(WorkItemStatus::Implementing)
+        );
+        assert_eq!(
+            WorkItemStatus::Implementing.next_stage(),
+            Some(WorkItemStatus::Review)
+        );
+        assert_eq!(
+            WorkItemStatus::Blocked.next_stage(),
+            Some(WorkItemStatus::Implementing)
+        );
+        assert_eq!(
+            WorkItemStatus::Review.next_stage(),
+            Some(WorkItemStatus::Done)
+        );
+        assert_eq!(WorkItemStatus::Done.next_stage(), None);
+    }
+
+    #[test]
+    fn prev_stage_regression() {
+        assert_eq!(WorkItemStatus::Backlog.prev_stage(), None);
+        assert_eq!(
+            WorkItemStatus::Planning.prev_stage(),
+            Some(WorkItemStatus::Backlog)
+        );
+        assert_eq!(
+            WorkItemStatus::Implementing.prev_stage(),
+            Some(WorkItemStatus::Planning)
+        );
+        assert_eq!(WorkItemStatus::Blocked.prev_stage(), None);
+        assert_eq!(
+            WorkItemStatus::Review.prev_stage(),
+            Some(WorkItemStatus::Implementing)
+        );
+        assert_eq!(
+            WorkItemStatus::Done.prev_stage(),
+            Some(WorkItemStatus::Review)
+        );
+    }
+
+    #[test]
+    fn badge_text_format() {
+        assert_eq!(WorkItemStatus::Backlog.badge_text(), "[BL]");
+        assert_eq!(WorkItemStatus::Planning.badge_text(), "[PL]");
+        assert_eq!(WorkItemStatus::Implementing.badge_text(), "[IM]");
+        assert_eq!(WorkItemStatus::Blocked.badge_text(), "[BK]");
+        assert_eq!(WorkItemStatus::Review.badge_text(), "[RV]");
+        assert_eq!(WorkItemStatus::Done.badge_text(), "[DN]");
     }
 }
