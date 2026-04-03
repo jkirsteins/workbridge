@@ -1,0 +1,1513 @@
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+use regex::Regex;
+
+use crate::github_client::{GithubIssue, GithubPr};
+use crate::work_item::{
+    CheckStatus, GitState, IssueInfo, IssueState, PrInfo, PrState, RepoAssociation,
+    RepoFetchResult, ReviewDecision, UnlinkedPr, WorkItem, WorkItemError,
+};
+use crate::work_item_backend::WorkItemRecord;
+use crate::worktree_service::WorktreeInfo;
+
+/// Convert a raw GithubPr into a display-ready PrInfo.
+fn convert_pr(pr: &GithubPr) -> PrInfo {
+    PrInfo {
+        number: pr.number,
+        title: pr.title.clone(),
+        state: convert_pr_state(&pr.state),
+        is_draft: pr.is_draft,
+        review_decision: convert_review_decision(&pr.review_decision),
+        checks: convert_check_status(&pr.status_check_rollup),
+        url: pr.url.clone(),
+    }
+}
+
+/// Convert a raw state string from GitHub into a PrState enum.
+fn convert_pr_state(raw: &str) -> PrState {
+    match raw.to_uppercase().as_str() {
+        "MERGED" => PrState::Merged,
+        "CLOSED" => PrState::Closed,
+        _ => PrState::Open,
+    }
+}
+
+/// Convert a raw review decision string from GitHub into a ReviewDecision enum.
+fn convert_review_decision(raw: &str) -> ReviewDecision {
+    match raw {
+        "APPROVED" => ReviewDecision::Approved,
+        "CHANGES_REQUESTED" => ReviewDecision::ChangesRequested,
+        "REVIEW_REQUIRED" => ReviewDecision::Pending,
+        _ => ReviewDecision::None,
+    }
+}
+
+/// Convert a raw status check rollup string into a CheckStatus enum.
+fn convert_check_status(raw: &str) -> CheckStatus {
+    match raw {
+        "SUCCESS" => CheckStatus::Passing,
+        "PENDING" => CheckStatus::Pending,
+        "FAILURE" => CheckStatus::Failing,
+        "" => CheckStatus::None,
+        _ => CheckStatus::Unknown,
+    }
+}
+
+/// Convert a raw GithubIssue into a display-ready IssueInfo.
+fn convert_issue(issue: &GithubIssue) -> IssueInfo {
+    let state = match issue.state.to_uppercase().as_str() {
+        "CLOSED" => IssueState::Closed,
+        _ => IssueState::Open,
+    };
+    IssueInfo {
+        number: issue.number,
+        title: issue.title.clone(),
+        state,
+        labels: issue.labels.clone(),
+    }
+}
+
+/// Extract an issue number from a branch name using the given regex pattern.
+///
+/// The pattern must contain a capture group; the first capture group's content
+/// is parsed as a u64 issue number. Returns None if the pattern does not match
+/// or the capture is not a valid number.
+fn extract_issue_number(branch: &str, pattern: &Regex) -> Option<u64> {
+    pattern
+        .captures(branch)
+        .and_then(|caps| caps.get(1))
+        .and_then(|m| m.as_str().parse::<u64>().ok())
+}
+
+/// Find a worktree matching the given branch in the repo's fetched worktree list.
+fn find_worktree_by_branch<'a>(
+    worktrees: &'a [WorktreeInfo],
+    branch: &str,
+) -> Option<&'a WorktreeInfo> {
+    worktrees
+        .iter()
+        .find(|w| w.branch.as_deref() == Some(branch))
+}
+
+/// Find all PRs matching the given branch in the repo's fetched PR list.
+///
+/// When `repo_owner` is provided, fork PRs (where `head_repo_owner` differs
+/// from the repo owner) are excluded. This prevents a fork PR from being
+/// incorrectly matched to a local branch with the same name. PRs where
+/// `head_repo_owner` is None (gh CLI did not return the field) are still
+/// included to preserve backwards compatibility.
+fn find_prs_by_branch<'a>(
+    prs: &'a [GithubPr],
+    branch: &str,
+    repo_owner: Option<&str>,
+) -> Vec<&'a GithubPr> {
+    prs.iter()
+        .filter(|p| {
+            if p.head_branch != branch {
+                return false;
+            }
+            // If we know both the repo owner and the PR's head repo owner,
+            // exclude fork PRs (where they differ).
+            if let Some(owner) = repo_owner
+                && let Some(ref pr_owner) = p.head_repo_owner
+            {
+                return pr_owner == owner;
+            }
+            true
+        })
+        .collect()
+}
+
+/// Look up an issue by number in the repo's fetched issue list.
+fn find_issue_in_fetch(
+    issues: &[(u64, Result<GithubIssue, crate::github_client::GithubError>)],
+    number: u64,
+) -> Option<&GithubIssue> {
+    issues.iter().find_map(|(n, result)| {
+        if *n == number {
+            result.as_ref().ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// Check whether the fetcher attempted to look up an issue number.
+///
+/// Returns true if the issue number appears in the fetched issues list
+/// (regardless of whether the result was Ok or Err). When true and
+/// `find_issue_in_fetch` returned None, it means the fetch failed
+/// (e.g. 404) and IssueNotFound is genuine. When false, the fetcher
+/// never tried to fetch this issue (e.g. no worktree had a branch
+/// matching this number), so we should not emit an error.
+fn issue_was_attempted(
+    issues: &[(u64, Result<GithubIssue, crate::github_client::GithubError>)],
+    number: u64,
+) -> bool {
+    issues.iter().any(|(n, _)| *n == number)
+}
+
+/// Reassemble work items from backend records and fetched repo data.
+///
+/// This is the core assembly function that bridges raw data sources and
+/// the display model. It:
+/// 1. Starts with backend records as skeleton work items
+/// 2. Fills in worktree paths, git state, PR info, and issue info by
+///    matching branch names against fetched repo data
+/// 3. Derives titles (PR title > issue title > backend title > branch > "untitled")
+/// 4. Collects errors (multiple PRs for branch, detached HEAD, issue not found)
+/// 5. Identifies unlinked PRs (PRs whose branch does not appear in any work item)
+pub fn reassemble(
+    backend_records: &[WorkItemRecord],
+    repo_data: &HashMap<PathBuf, RepoFetchResult>,
+    issue_pattern: &str,
+) -> (Vec<WorkItem>, Vec<UnlinkedPr>) {
+    let pattern = Regex::new(issue_pattern).ok();
+
+    // Track all branches claimed by work items so we can find unlinked PRs.
+    let mut claimed_branches: HashSet<(PathBuf, String)> = HashSet::new();
+
+    let mut work_items = Vec::new();
+
+    for record in backend_records {
+        let mut assembled_associations = Vec::new();
+        let mut errors: Vec<WorkItemError> = Vec::new();
+        let mut best_pr_title: Option<String> = None;
+        let mut best_issue_title: Option<String> = None;
+        let mut first_branch: Option<String> = None;
+
+        for assoc_record in &record.repo_associations {
+            let repo_path = &assoc_record.repo_path;
+
+            let branch = match &assoc_record.branch {
+                Some(b) => b,
+                None => {
+                    // branch=None: pre-planning state, skip all matching
+                    assembled_associations.push(RepoAssociation {
+                        repo_path: repo_path.clone(),
+                        branch: None,
+                        worktree_path: None,
+                        pr: None,
+                        issue: None,
+                        git_state: None,
+                    });
+                    continue;
+                }
+            };
+
+            if first_branch.is_none() {
+                first_branch = Some(branch.clone());
+            }
+
+            // Register this branch as claimed.
+            claimed_branches.insert((repo_path.clone(), branch.clone()));
+
+            let fetch = repo_data.get(repo_path);
+
+            // --- Worktree matching ---
+            let mut worktree_path: Option<PathBuf> = None;
+            let mut git_state: Option<GitState> = None;
+
+            // Detached worktrees (branch=None) simply don't match any
+            // work item by branch, so they are correctly excluded from
+            // associations. No explicit DetachedHead detection is needed
+            // because we cannot associate a detached worktree with a
+            // specific work item (there is no branch to match on).
+            if let Some(fetch) = fetch
+                && let Ok(worktrees) = &fetch.worktrees
+                && let Some(wt) = find_worktree_by_branch(worktrees, branch)
+            {
+                worktree_path = Some(wt.path.clone());
+                git_state = Some(GitState {
+                    dirty: false,
+                    ahead: 0,
+                    behind: 0,
+                    detached: false,
+                });
+            }
+
+            // --- PR matching ---
+            let mut pr_info: Option<PrInfo> = None;
+
+            // Extract repo owner from the fetch data for fork PR filtering.
+            let repo_owner_str: Option<String> = fetch
+                .and_then(|f| f.github_remote.as_ref())
+                .map(|(owner, _)| owner.clone());
+
+            if let Some(fetch) = fetch
+                && let Ok(prs) = &fetch.prs
+            {
+                let matching = find_prs_by_branch(prs, branch, repo_owner_str.as_deref());
+                if matching.len() > 1 {
+                    errors.push(WorkItemError::MultiplePrsForBranch {
+                        repo_path: repo_path.clone(),
+                        branch: branch.clone(),
+                        count: matching.len(),
+                    });
+                }
+                if let Some(first_pr) = matching.first() {
+                    let info = convert_pr(first_pr);
+                    if best_pr_title.is_none() {
+                        best_pr_title = Some(info.title.clone());
+                    }
+                    pr_info = Some(info);
+                }
+            }
+
+            // --- Issue matching ---
+            let mut issue_info: Option<IssueInfo> = None;
+
+            if let Some(pat) = &pattern
+                && let Some(issue_number) = extract_issue_number(branch, pat)
+                && let Some(fetch) = fetch
+            {
+                // Only evaluate IssueNotFound when fetch data exists for
+                // this repo. When fetch is None (startup, unfetched repo),
+                // we skip - the error will surface once the first fetch
+                // completes.
+                if let Some(gh_issue) = find_issue_in_fetch(&fetch.issues, issue_number)
+                {
+                    let info = convert_issue(gh_issue);
+                    if best_issue_title.is_none() {
+                        best_issue_title = Some(info.title.clone());
+                    }
+                    issue_info = Some(info);
+                } else if issue_was_attempted(&fetch.issues, issue_number) {
+                    // The fetcher tried to fetch this issue but got an error
+                    // (e.g. 404). Only emit IssueNotFound when the fetcher
+                    // actually attempted the lookup. If the issue number is
+                    // absent from fetch.issues entirely, the fetcher never
+                    // tried (e.g. no worktree for this branch), so we leave
+                    // issue as None without an error.
+                    errors.push(WorkItemError::IssueNotFound {
+                        repo_path: repo_path.clone(),
+                        issue_number,
+                    });
+                }
+            }
+
+            assembled_associations.push(RepoAssociation {
+                repo_path: repo_path.clone(),
+                branch: Some(branch.clone()),
+                worktree_path,
+                pr: pr_info,
+                issue: issue_info,
+                git_state,
+            });
+        }
+
+        // --- Title derivation ---
+        // Priority: PR title > issue title > backend title > branch > "untitled"
+        let title = if let Some(pr_title) = best_pr_title {
+            if !pr_title.is_empty() {
+                pr_title
+            } else {
+                derive_fallback_title(&record.title, &first_branch)
+            }
+        } else if let Some(issue_title) = best_issue_title {
+            if !issue_title.is_empty() {
+                issue_title
+            } else {
+                derive_fallback_title(&record.title, &first_branch)
+            }
+        } else {
+            derive_fallback_title(&record.title, &first_branch)
+        };
+
+        // --- Status ---
+        let status = record.status.clone();
+
+        work_items.push(WorkItem {
+            id: record.id.clone(),
+            backend_type: backend_type_from_id(&record.id),
+            title,
+            status,
+            repo_associations: assembled_associations,
+            errors,
+        });
+    }
+
+    // --- Collect unlinked PRs ---
+    let unlinked_prs = collect_unlinked_prs(repo_data, &claimed_branches);
+
+    (work_items, unlinked_prs)
+}
+
+/// Derive a fallback title from backend title or branch name.
+fn derive_fallback_title(backend_title: &str, first_branch: &Option<String>) -> String {
+    if !backend_title.is_empty() {
+        backend_title.to_string()
+    } else if let Some(branch) = first_branch {
+        branch.clone()
+    } else {
+        "untitled".to_string()
+    }
+}
+
+/// Derive the BackendType from a WorkItemId.
+fn backend_type_from_id(id: &crate::work_item::WorkItemId) -> crate::work_item::BackendType {
+    match id {
+        crate::work_item::WorkItemId::LocalFile(_) => crate::work_item::BackendType::LocalFile,
+        crate::work_item::WorkItemId::GithubIssue { .. } => {
+            crate::work_item::BackendType::GithubIssue
+        }
+        crate::work_item::WorkItemId::GithubProject { .. } => {
+            crate::work_item::BackendType::GithubProject
+        }
+    }
+}
+
+/// Collect PRs from all repos whose (repo_path, branch) is not already
+/// claimed by a work item. Fork PRs are excluded from auto-matching in
+/// `find_prs_by_branch` to prevent wrong association, but they ARE
+/// included here as importable - unless they have already been imported
+/// (i.e., their (repo_path, branch) appears in claimed_branches).
+fn collect_unlinked_prs(
+    repo_data: &HashMap<PathBuf, RepoFetchResult>,
+    claimed_branches: &HashSet<(PathBuf, String)>,
+) -> Vec<UnlinkedPr> {
+    let mut unlinked = Vec::new();
+    for (repo_path, fetch) in repo_data {
+        if let Ok(prs) = &fetch.prs {
+            for pr in prs {
+                if pr.head_branch.is_empty() {
+                    continue;
+                }
+                // Both fork and same-repo PRs are included only if their
+                // (repo_path, branch) is not already claimed by a work item.
+                // This prevents imported fork PRs from permanently
+                // re-appearing in the unlinked list.
+                if !claimed_branches
+                    .contains(&(repo_path.clone(), pr.head_branch.clone()))
+                {
+                    unlinked.push(UnlinkedPr {
+                        repo_path: repo_path.clone(),
+                        pr: convert_pr(pr),
+                        branch: pr.head_branch.clone(),
+                    });
+                }
+            }
+        }
+    }
+    unlinked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github_client::{GithubError, GithubIssue, GithubPr};
+    use crate::work_item::{
+        BackendType, CheckStatus, IssueState, PrState, ReviewDecision, WorkItemId, WorkItemStatus,
+    };
+    use crate::work_item_backend::{RepoAssociationRecord, WorkItemRecord};
+    use crate::worktree_service::WorktreeInfo;
+    use std::path::PathBuf;
+
+    // -----------------------------------------------------------------------
+    // Test helpers
+    // -----------------------------------------------------------------------
+
+    fn repo_path(name: &str) -> PathBuf {
+        PathBuf::from(format!("/repos/{name}"))
+    }
+
+    fn create_mock_record(
+        id_suffix: &str,
+        title: &str,
+        status: WorkItemStatus,
+        associations: Vec<RepoAssociationRecord>,
+    ) -> WorkItemRecord {
+        WorkItemRecord {
+            id: WorkItemId::LocalFile(PathBuf::from(format!("/data/{id_suffix}.json"))),
+            title: title.to_string(),
+            status,
+            repo_associations: associations,
+        }
+    }
+
+    fn create_mock_pr(
+        number: u64,
+        title: &str,
+        branch: &str,
+        review: &str,
+        checks: &str,
+    ) -> GithubPr {
+        GithubPr {
+            number,
+            title: title.to_string(),
+            state: "OPEN".to_string(),
+            is_draft: false,
+            head_branch: branch.to_string(),
+            url: format!("https://github.com/o/r/pull/{number}"),
+            review_decision: review.to_string(),
+            status_check_rollup: checks.to_string(),
+            head_repo_owner: None,
+        }
+    }
+
+    fn create_mock_pr_with_owner(
+        number: u64,
+        title: &str,
+        branch: &str,
+        review: &str,
+        checks: &str,
+        owner: Option<&str>,
+    ) -> GithubPr {
+        GithubPr {
+            number,
+            title: title.to_string(),
+            state: "OPEN".to_string(),
+            is_draft: false,
+            head_branch: branch.to_string(),
+            url: format!("https://github.com/o/r/pull/{number}"),
+            review_decision: review.to_string(),
+            status_check_rollup: checks.to_string(),
+            head_repo_owner: owner.map(|s| s.to_string()),
+        }
+    }
+
+    fn create_mock_issue(number: u64, title: &str) -> GithubIssue {
+        GithubIssue {
+            number,
+            title: title.to_string(),
+            state: "OPEN".to_string(),
+            labels: vec![],
+        }
+    }
+
+    fn create_mock_worktree(path: &str, branch: Option<&str>) -> WorktreeInfo {
+        WorktreeInfo {
+            path: PathBuf::from(path),
+            branch: branch.map(|s| s.to_string()),
+            is_main: false,
+        }
+    }
+
+    fn create_mock_repo_data(
+        path: PathBuf,
+        worktrees: Vec<WorktreeInfo>,
+        prs: Vec<GithubPr>,
+        issues: Vec<(u64, Result<GithubIssue, GithubError>)>,
+    ) -> (PathBuf, RepoFetchResult) {
+        let fetch = RepoFetchResult {
+            repo_path: path.clone(),
+            github_remote: Some(("owner".to_string(), "repo".to_string())),
+            worktrees: Ok(worktrees),
+            prs: Ok(prs),
+            issues,
+        };
+        (path, fetch)
+    }
+
+    const DEFAULT_ISSUE_PATTERN: &str = r"^(\d+)-";
+
+    // -----------------------------------------------------------------------
+    // Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn assembles_basic_work_item() {
+        let rp = repo_path("alpha");
+        let branch = "42-fix-bug";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Backend title",
+            WorkItemStatus::InProgress,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+            }],
+        );
+
+        let pr = create_mock_pr(10, "Fix the bug", branch, "APPROVED", "SUCCESS");
+        let issue = create_mock_issue(42, "Bug report");
+        let wt = create_mock_worktree("/worktrees/42-fix-bug", Some(branch));
+
+        let (rp_key, fetch) = create_mock_repo_data(
+            rp.clone(),
+            vec![wt],
+            vec![pr],
+            vec![(42, Ok(issue))],
+        );
+        let repo_data: HashMap<PathBuf, RepoFetchResult> =
+            HashMap::from([(rp_key, fetch)]);
+
+        let (items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(unlinked.len(), 0);
+
+        let item = &items[0];
+        // PR title wins over issue title and backend title.
+        assert_eq!(item.title, "Fix the bug");
+        assert_eq!(item.status, WorkItemStatus::InProgress);
+        assert!(item.errors.is_empty());
+
+        let assoc = &item.repo_associations[0];
+        assert_eq!(assoc.repo_path, rp);
+        assert_eq!(assoc.branch, Some(branch.to_string()));
+        assert_eq!(
+            assoc.worktree_path,
+            Some(PathBuf::from("/worktrees/42-fix-bug"))
+        );
+
+        let pr_info = assoc.pr.as_ref().expect("should have PR info");
+        assert_eq!(pr_info.number, 10);
+        assert_eq!(pr_info.title, "Fix the bug");
+        assert_eq!(pr_info.state, PrState::Open);
+        assert_eq!(pr_info.review_decision, ReviewDecision::Approved);
+        assert_eq!(pr_info.checks, CheckStatus::Passing);
+
+        let issue_info = assoc.issue.as_ref().expect("should have issue info");
+        assert_eq!(issue_info.number, 42);
+        assert_eq!(issue_info.title, "Bug report");
+        assert_eq!(issue_info.state, IssueState::Open);
+    }
+
+    #[test]
+    fn title_derivation_priority() {
+        let rp = repo_path("alpha");
+        let branch = "42-fix-bug";
+
+        // Level 1: PR title wins
+        {
+            let record = create_mock_record(
+                "wi-1",
+                "Backend title",
+                WorkItemStatus::Todo,
+                vec![RepoAssociationRecord {
+                    repo_path: rp.clone(),
+                    branch: Some(branch.to_string()),
+                }],
+            );
+            let pr = create_mock_pr(10, "PR title", branch, "", "");
+            let issue = create_mock_issue(42, "Issue title");
+            let (rp_key, fetch) =
+                create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![(42, Ok(issue))]);
+            let repo_data = HashMap::from([(rp_key, fetch)]);
+            let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            assert_eq!(items[0].title, "PR title");
+        }
+
+        // Level 2: Issue title (no PR)
+        {
+            let record = create_mock_record(
+                "wi-2",
+                "Backend title",
+                WorkItemStatus::Todo,
+                vec![RepoAssociationRecord {
+                    repo_path: rp.clone(),
+                    branch: Some(branch.to_string()),
+                }],
+            );
+            let issue = create_mock_issue(42, "Issue title");
+            let (rp_key, fetch) =
+                create_mock_repo_data(rp.clone(), vec![], vec![], vec![(42, Ok(issue))]);
+            let repo_data = HashMap::from([(rp_key, fetch)]);
+            let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            assert_eq!(items[0].title, "Issue title");
+        }
+
+        // Level 3: Backend title (no PR, no issue)
+        {
+            let record = create_mock_record(
+                "wi-3",
+                "Backend title",
+                WorkItemStatus::Todo,
+                vec![RepoAssociationRecord {
+                    repo_path: rp.clone(),
+                    branch: Some(branch.to_string()),
+                }],
+            );
+            let (rp_key, fetch) =
+                create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
+            let repo_data = HashMap::from([(rp_key, fetch)]);
+            let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            assert_eq!(items[0].title, "Backend title");
+        }
+
+        // Level 4: Branch name (no PR, no issue, empty backend title)
+        {
+            let record = create_mock_record(
+                "wi-4",
+                "",
+                WorkItemStatus::Todo,
+                vec![RepoAssociationRecord {
+                    repo_path: rp.clone(),
+                    branch: Some("my-feature".to_string()),
+                }],
+            );
+            let (rp_key, fetch) =
+                create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
+            let repo_data = HashMap::from([(rp_key, fetch)]);
+            // Use a pattern that won't match "my-feature"
+            let (items, _) = reassemble(&[record], &repo_data, r"^(\d+)-");
+            assert_eq!(items[0].title, "my-feature");
+        }
+
+        // Level 5: "untitled" (no PR, no issue, empty backend title, no branch)
+        {
+            let record = create_mock_record(
+                "wi-5",
+                "",
+                WorkItemStatus::Todo,
+                vec![RepoAssociationRecord {
+                    repo_path: rp.clone(),
+                    branch: None,
+                }],
+            );
+            let repo_data = HashMap::new();
+            let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            assert_eq!(items[0].title, "untitled");
+        }
+    }
+
+    #[test]
+    fn unlinked_pr_detection() {
+        let rp = repo_path("alpha");
+
+        // Work item claims branch "feature-a"
+        let record = create_mock_record(
+            "wi-1",
+            "My work",
+            WorkItemStatus::InProgress,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some("feature-a".to_string()),
+            }],
+        );
+
+        // Repo has PRs for "feature-a" (claimed) and "feature-b" (unlinked)
+        let pr_a = create_mock_pr(1, "PR A", "feature-a", "", "");
+        let pr_b = create_mock_pr(2, "PR B", "feature-b", "APPROVED", "SUCCESS");
+
+        let (rp_key, fetch) =
+            create_mock_repo_data(rp.clone(), vec![], vec![pr_a, pr_b], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(unlinked.len(), 1);
+        assert_eq!(unlinked[0].branch, "feature-b");
+        assert_eq!(unlinked[0].pr.number, 2);
+        assert_eq!(unlinked[0].pr.title, "PR B");
+        assert_eq!(unlinked[0].repo_path, rp);
+    }
+
+    #[test]
+    fn multi_repo_work_item() {
+        let rp_a = repo_path("alpha");
+        let rp_b = repo_path("beta");
+
+        let record = create_mock_record(
+            "wi-1",
+            "Cross-repo work",
+            WorkItemStatus::InProgress,
+            vec![
+                RepoAssociationRecord {
+                    repo_path: rp_a.clone(),
+                    branch: Some("feature-x".to_string()),
+                },
+                RepoAssociationRecord {
+                    repo_path: rp_b.clone(),
+                    branch: Some("feature-x".to_string()),
+                },
+            ],
+        );
+
+        let pr_a = create_mock_pr(10, "PR in alpha", "feature-x", "APPROVED", "SUCCESS");
+        let pr_b = create_mock_pr(20, "PR in beta", "feature-x", "", "PENDING");
+
+        let (key_a, fetch_a) =
+            create_mock_repo_data(rp_a.clone(), vec![], vec![pr_a], vec![]);
+        let (key_b, fetch_b) =
+            create_mock_repo_data(rp_b.clone(), vec![], vec![pr_b], vec![]);
+        let repo_data = HashMap::from([(key_a, fetch_a), (key_b, fetch_b)]);
+
+        let (items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(unlinked.len(), 0);
+
+        let item = &items[0];
+        assert_eq!(item.repo_associations.len(), 2);
+
+        // First association's PR title becomes the title.
+        assert_eq!(item.title, "PR in alpha");
+
+        // Each association has its own PR info.
+        let assoc_a = item
+            .repo_associations
+            .iter()
+            .find(|a| a.repo_path == rp_a)
+            .expect("should have alpha association");
+        assert_eq!(assoc_a.pr.as_ref().unwrap().number, 10);
+        assert_eq!(
+            assoc_a.pr.as_ref().unwrap().review_decision,
+            ReviewDecision::Approved
+        );
+
+        let assoc_b = item
+            .repo_associations
+            .iter()
+            .find(|a| a.repo_path == rp_b)
+            .expect("should have beta association");
+        assert_eq!(assoc_b.pr.as_ref().unwrap().number, 20);
+        assert_eq!(
+            assoc_b.pr.as_ref().unwrap().checks,
+            CheckStatus::Pending
+        );
+    }
+
+    #[test]
+    fn branch_none_skips_matching() {
+        let rp = repo_path("alpha");
+
+        let record = create_mock_record(
+            "wi-1",
+            "Planning item",
+            WorkItemStatus::Todo,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: None,
+            }],
+        );
+
+        // Repo has a PR and worktree, but none should match since branch is None.
+        let pr = create_mock_pr(1, "Some PR", "some-branch", "", "");
+        let wt = create_mock_worktree("/worktrees/some-branch", Some("some-branch"));
+
+        let (rp_key, fetch) =
+            create_mock_repo_data(rp.clone(), vec![wt], vec![pr], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        let assoc = &items[0].repo_associations[0];
+        assert_eq!(assoc.branch, None);
+        assert_eq!(assoc.worktree_path, None);
+        assert!(assoc.pr.is_none());
+        assert!(assoc.issue.is_none());
+        assert!(assoc.git_state.is_none());
+
+        // The PR on "some-branch" should be unlinked since no work item claims it.
+        assert_eq!(unlinked.len(), 1);
+        assert_eq!(unlinked[0].branch, "some-branch");
+    }
+
+    #[test]
+    fn multiple_prs_for_branch() {
+        let rp = repo_path("alpha");
+        let branch = "feature-x";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Work",
+            WorkItemStatus::InProgress,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+            }],
+        );
+
+        // Two PRs on the same branch.
+        let pr1 = create_mock_pr(1, "PR one", branch, "", "");
+        let pr2 = create_mock_pr(2, "PR two", branch, "", "");
+
+        let (rp_key, fetch) =
+            create_mock_repo_data(rp.clone(), vec![], vec![pr1, pr2], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+
+        // Should have a MultiplePrsForBranch error.
+        assert!(
+            item.errors.iter().any(|e| matches!(
+                e,
+                WorkItemError::MultiplePrsForBranch {
+                    branch: b,
+                    count: 2,
+                    ..
+                } if b == "feature-x"
+            )),
+            "expected MultiplePrsForBranch error, got: {:?}",
+            item.errors
+        );
+
+        // Should still fill the first PR.
+        assert!(item.repo_associations[0].pr.is_some());
+        assert_eq!(item.repo_associations[0].pr.as_ref().unwrap().number, 1);
+    }
+
+    /// A detached worktree (branch=None) does not match any work item and
+    /// is not associated with any work item. This is the correct behavior
+    /// since there is no branch to match on.
+    #[test]
+    fn detached_worktree_not_associated_with_work_item() {
+        let rp = repo_path("alpha");
+        let branch = "feature-x";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Work",
+            WorkItemStatus::InProgress,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+            }],
+        );
+
+        // Only a detached worktree exists - no worktree on feature-x.
+        let wt_detached =
+            create_mock_worktree("/worktrees/some-detached", None);
+
+        let (rp_key, fetch) = create_mock_repo_data(
+            rp.clone(),
+            vec![wt_detached],
+            vec![],
+            vec![],
+        );
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+
+        // The detached worktree should not be associated with the work item.
+        assert!(
+            item.repo_associations[0].worktree_path.is_none(),
+            "detached worktree should not match work item, got: {:?}",
+            item.repo_associations[0].worktree_path,
+        );
+        assert!(
+            item.repo_associations[0].git_state.is_none(),
+            "git_state should be None when no worktree matches",
+        );
+        // No errors should be produced.
+        assert!(
+            item.errors.is_empty(),
+            "no errors expected for detached worktrees, got: {:?}",
+            item.errors,
+        );
+    }
+
+    #[test]
+    fn empty_inputs() {
+        let repo_data: HashMap<PathBuf, RepoFetchResult> = HashMap::new();
+        let (items, unlinked) = reassemble(&[], &repo_data, DEFAULT_ISSUE_PATTERN);
+        assert!(items.is_empty());
+        assert!(unlinked.is_empty());
+    }
+
+    #[test]
+    fn issue_extraction_from_branch() {
+        let rp = repo_path("alpha");
+        let branch = "42-fix-bug";
+
+        let record = create_mock_record(
+            "wi-1",
+            "",
+            WorkItemStatus::Todo,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+            }],
+        );
+
+        let issue = create_mock_issue(42, "Fix the bug");
+
+        let (rp_key, fetch) =
+            create_mock_repo_data(rp.clone(), vec![], vec![], vec![(42, Ok(issue))]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _) = reassemble(&[record], &repo_data, r"^(\d+)-");
+
+        assert_eq!(items.len(), 1);
+        let assoc = &items[0].repo_associations[0];
+        let issue_info = assoc.issue.as_ref().expect("should have issue info");
+        assert_eq!(issue_info.number, 42);
+        assert_eq!(issue_info.title, "Fix the bug");
+
+        // Title should be the issue title (no PR available, empty backend title).
+        assert_eq!(items[0].title, "Fix the bug");
+    }
+
+    #[test]
+    fn issue_not_found_when_fetcher_attempted() {
+        // IssueNotFound should only fire when the fetcher attempted the
+        // lookup (issue number present in fetch.issues) but got an error.
+        let rp = repo_path("alpha");
+        let branch = "99-missing-issue";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Work",
+            WorkItemStatus::Todo,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+            }],
+        );
+
+        // Fetcher attempted issue #99 but got an error (not found).
+        let (rp_key, fetch) = create_mock_repo_data(
+            rp.clone(),
+            vec![],
+            vec![],
+            vec![(99, Err(GithubError::ApiError("not found".into())))],
+        );
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0].errors.iter().any(|e| matches!(
+                e,
+                WorkItemError::IssueNotFound {
+                    issue_number: 99,
+                    ..
+                }
+            )),
+            "expected IssueNotFound error, got: {:?}",
+            items[0].errors
+        );
+    }
+
+    #[test]
+    fn no_issue_not_found_when_fetcher_did_not_attempt() {
+        // When the issue number is NOT in fetch.issues at all (fetcher
+        // never tried, e.g. no worktree for this branch), we should NOT
+        // emit IssueNotFound - just leave issue as None.
+        let rp = repo_path("alpha");
+        let branch = "99-missing-issue";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Work",
+            WorkItemStatus::Todo,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+            }],
+        );
+
+        // Repo data exists but fetcher did not attempt issue #99.
+        let (rp_key, fetch) =
+            create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0].errors.is_empty(),
+            "expected no errors when fetcher did not attempt issue lookup, got: {:?}",
+            items[0].errors
+        );
+        assert!(items[0].repo_associations[0].issue.is_none());
+    }
+
+    #[test]
+    fn no_issue_not_found_when_fetch_data_absent() {
+        // When repo_data has no entry for the repo (e.g. startup, before
+        // first fetch), we must NOT produce an IssueNotFound error.
+        let rp = repo_path("alpha");
+        let branch = "99-missing-issue";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Work",
+            WorkItemStatus::Todo,
+            vec![RepoAssociationRecord {
+                repo_path: rp,
+                branch: Some(branch.to_string()),
+            }],
+        );
+
+        // Empty repo_data - simulates startup before any fetch completes.
+        let repo_data: HashMap<PathBuf, RepoFetchResult> = HashMap::new();
+        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0].errors.is_empty(),
+            "expected no errors when fetch data is absent, got: {:?}",
+            items[0].errors
+        );
+        // Issue info should be None (not yet available).
+        assert!(items[0].repo_associations[0].issue.is_none());
+    }
+
+    #[test]
+    fn convert_pr_state_variants() {
+        assert_eq!(convert_pr_state("OPEN"), PrState::Open);
+        assert_eq!(convert_pr_state("CLOSED"), PrState::Closed);
+        assert_eq!(convert_pr_state("MERGED"), PrState::Merged);
+        assert_eq!(convert_pr_state("open"), PrState::Open);
+        assert_eq!(convert_pr_state("merged"), PrState::Merged);
+        assert_eq!(convert_pr_state(""), PrState::Open);
+    }
+
+    #[test]
+    fn convert_review_decision_variants() {
+        assert_eq!(convert_review_decision("APPROVED"), ReviewDecision::Approved);
+        assert_eq!(
+            convert_review_decision("CHANGES_REQUESTED"),
+            ReviewDecision::ChangesRequested
+        );
+        assert_eq!(
+            convert_review_decision("REVIEW_REQUIRED"),
+            ReviewDecision::Pending
+        );
+        assert_eq!(convert_review_decision(""), ReviewDecision::None);
+        assert_eq!(convert_review_decision("UNKNOWN"), ReviewDecision::None);
+    }
+
+    #[test]
+    fn convert_check_status_variants() {
+        assert_eq!(convert_check_status("SUCCESS"), CheckStatus::Passing);
+        assert_eq!(convert_check_status("PENDING"), CheckStatus::Pending);
+        assert_eq!(convert_check_status("FAILURE"), CheckStatus::Failing);
+        assert_eq!(convert_check_status(""), CheckStatus::None);
+        assert_eq!(convert_check_status("SOMETHING"), CheckStatus::Unknown);
+    }
+
+    #[test]
+    fn convert_issue_states() {
+        let open_issue = GithubIssue {
+            number: 1,
+            title: "Open".to_string(),
+            state: "OPEN".to_string(),
+            labels: vec!["bug".to_string()],
+        };
+        let info = convert_issue(&open_issue);
+        assert_eq!(info.state, IssueState::Open);
+        assert_eq!(info.labels, vec!["bug"]);
+
+        let closed_issue = GithubIssue {
+            number: 2,
+            title: "Closed".to_string(),
+            state: "CLOSED".to_string(),
+            labels: vec![],
+        };
+        let info = convert_issue(&closed_issue);
+        assert_eq!(info.state, IssueState::Closed);
+    }
+
+    #[test]
+    fn extract_issue_number_various_patterns() {
+        let pat = Regex::new(r"^(\d+)-").unwrap();
+        assert_eq!(extract_issue_number("42-fix-bug", &pat), Some(42));
+        assert_eq!(extract_issue_number("123-add-feature", &pat), Some(123));
+        assert_eq!(extract_issue_number("no-number-here", &pat), None);
+        assert_eq!(extract_issue_number("", &pat), None);
+
+        // Pattern with different format.
+        let pat2 = Regex::new(r"issue-(\d+)").unwrap();
+        assert_eq!(extract_issue_number("issue-55-fix", &pat2), Some(55));
+        assert_eq!(extract_issue_number("feature-branch", &pat2), None);
+    }
+
+    #[test]
+    fn invalid_issue_pattern_does_not_panic() {
+        let rp = repo_path("alpha");
+        let record = create_mock_record(
+            "wi-1",
+            "Work",
+            WorkItemStatus::Todo,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some("42-fix-bug".to_string()),
+            }],
+        );
+        let (rp_key, fetch) =
+            create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        // Invalid regex pattern should not panic - just skip issue extraction.
+        let (items, _) = reassemble(&[record], &repo_data, "[invalid(");
+        assert_eq!(items.len(), 1);
+        assert!(items[0].repo_associations[0].issue.is_none());
+        // No IssueNotFound error either, since extraction was skipped.
+        assert!(items[0].errors.is_empty());
+    }
+
+    #[test]
+    fn unlinked_prs_from_multiple_repos() {
+        let rp_a = repo_path("alpha");
+        let rp_b = repo_path("beta");
+
+        // No work items at all.
+        let records: Vec<WorkItemRecord> = vec![];
+
+        let pr_a = create_mock_pr(1, "PR in alpha", "feature-a", "", "");
+        let pr_b = create_mock_pr(2, "PR in beta", "feature-b", "", "");
+
+        let (key_a, fetch_a) =
+            create_mock_repo_data(rp_a.clone(), vec![], vec![pr_a], vec![]);
+        let (key_b, fetch_b) =
+            create_mock_repo_data(rp_b.clone(), vec![], vec![pr_b], vec![]);
+        let repo_data = HashMap::from([(key_a, fetch_a), (key_b, fetch_b)]);
+
+        let (items, unlinked) = reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert!(items.is_empty());
+        assert_eq!(unlinked.len(), 2);
+
+        let branches: Vec<&str> = unlinked.iter().map(|u| u.branch.as_str()).collect();
+        assert!(branches.contains(&"feature-a"));
+        assert!(branches.contains(&"feature-b"));
+    }
+
+    #[test]
+    fn worktree_not_found_leaves_path_none() {
+        let rp = repo_path("alpha");
+        let branch = "feature-x";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Work",
+            WorkItemStatus::InProgress,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+            }],
+        );
+
+        // Repo data has a worktree on a different branch.
+        let wt = create_mock_worktree("/worktrees/other-branch", Some("other-branch"));
+
+        let (rp_key, fetch) =
+            create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        let assoc = &items[0].repo_associations[0];
+        assert_eq!(assoc.worktree_path, None);
+        assert!(assoc.git_state.is_none());
+        // No WorktreeGone error in v1 - just None.
+        assert!(items[0].errors.is_empty());
+    }
+
+    #[test]
+    fn status_derived_from_backend_record() {
+        let rp = repo_path("alpha");
+
+        let todo_record = create_mock_record(
+            "wi-1",
+            "Todo work",
+            WorkItemStatus::Todo,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: None,
+            }],
+        );
+
+        let in_progress_record = create_mock_record(
+            "wi-2",
+            "In progress work",
+            WorkItemStatus::InProgress,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: None,
+            }],
+        );
+
+        let repo_data = HashMap::new();
+        let (items, _) =
+            reassemble(&[todo_record, in_progress_record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].status, WorkItemStatus::Todo);
+        assert_eq!(items[1].status, WorkItemStatus::InProgress);
+    }
+
+    #[test]
+    fn backend_type_derived_from_id() {
+        let records = vec![
+            WorkItemRecord {
+                id: WorkItemId::LocalFile(PathBuf::from("/data/wi.json")),
+                title: "Local".to_string(),
+                status: WorkItemStatus::Todo,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: repo_path("alpha"),
+                    branch: None,
+                }],
+            },
+            WorkItemRecord {
+                id: WorkItemId::GithubIssue {
+                    owner: "o".to_string(),
+                    repo: "r".to_string(),
+                    number: 1,
+                },
+                title: "GH Issue".to_string(),
+                status: WorkItemStatus::Todo,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: repo_path("alpha"),
+                    branch: None,
+                }],
+            },
+            WorkItemRecord {
+                id: WorkItemId::GithubProject {
+                    node_id: "node123".to_string(),
+                },
+                title: "GH Project".to_string(),
+                status: WorkItemStatus::Todo,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: repo_path("alpha"),
+                    branch: None,
+                }],
+            },
+        ];
+
+        let repo_data = HashMap::new();
+        let (items, _) = reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items[0].backend_type, BackendType::LocalFile);
+        assert_eq!(items[1].backend_type, BackendType::GithubIssue);
+        assert_eq!(items[2].backend_type, BackendType::GithubProject);
+    }
+
+    // -- Round 7 regression tests --
+
+    /// F-1: Fork PRs with the same branch name as a local branch must not
+    /// be matched. Only same-repo PRs (where head_repo_owner matches the
+    /// repo owner) should match.
+    #[test]
+    fn fork_pr_not_matched_to_local_branch() {
+        let rp = repo_path("alpha");
+        let branch = "fix-typo";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Fix typo",
+            WorkItemStatus::InProgress,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+            }],
+        );
+
+        // Same-repo PR (owner matches).
+        let same_repo_pr = create_mock_pr_with_owner(
+            1, "Fix typo (same repo)", branch, "APPROVED", "SUCCESS",
+            Some("owner"),
+        );
+        // Fork PR (different owner, same branch name).
+        let fork_pr = create_mock_pr_with_owner(
+            2, "Fix typo (fork)", branch, "", "PENDING",
+            Some("contributor"),
+        );
+
+        let (rp_key, fetch) = create_mock_repo_data(
+            rp.clone(),
+            vec![],
+            vec![same_repo_pr, fork_pr],
+            vec![],
+        );
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+
+        // Only the same-repo PR should be matched.
+        let pr_info = item.repo_associations[0]
+            .pr
+            .as_ref()
+            .expect("should have PR info");
+        assert_eq!(pr_info.number, 1, "should match same-repo PR, not fork PR");
+        assert_eq!(pr_info.title, "Fix typo (same repo)");
+
+        // No MultiplePrsForBranch error since the fork PR is filtered out.
+        assert!(
+            item.errors.is_empty(),
+            "fork PR should be filtered out, no MultiplePrsForBranch: {:?}",
+            item.errors,
+        );
+
+        // After F-1 fix (Round 10): fork PR whose (repo_path, branch) is
+        // already claimed by a work item should NOT re-appear as unlinked.
+        // The branch "fix-typo" is claimed by wi-1, so the fork PR is
+        // excluded from the unlinked list.
+        assert_eq!(
+            unlinked.len(),
+            0,
+            "fork PR with a claimed branch should not appear as unlinked, got {} unlinked",
+            unlinked.len(),
+        );
+    }
+
+    /// F-1: When head_repo_owner is None (gh CLI did not return the field),
+    /// PRs are still matched (backwards compatibility).
+    #[test]
+    fn pr_without_head_repo_owner_still_matches() {
+        let rp = repo_path("alpha");
+        let branch = "fix-typo";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Fix typo",
+            WorkItemStatus::InProgress,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+            }],
+        );
+
+        // PR without head_repo_owner (None).
+        let pr = create_mock_pr(1, "Fix typo", branch, "", "");
+
+        let (rp_key, fetch) = create_mock_repo_data(
+            rp.clone(),
+            vec![],
+            vec![pr],
+            vec![],
+        );
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0].repo_associations[0].pr.is_some(),
+            "PR with no head_repo_owner should still match",
+        );
+    }
+
+    // -- Round 8 regression tests --
+
+    /// F-2 (Round 8) + F-1 fix (Round 10): Fork PRs appear in unlinked_prs
+    /// only when their (repo_path, branch) is NOT claimed by a work item.
+    /// Once imported, the fork PR's branch is claimed and it disappears
+    /// from the unlinked list.
+    #[test]
+    fn fork_pr_appears_in_unlinked_prs() {
+        let rp = repo_path("alpha");
+
+        // Work item claims branch "fix-readme".
+        let record = create_mock_record(
+            "wi-1",
+            "Fix readme",
+            WorkItemStatus::InProgress,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some("fix-readme".to_string()),
+            }],
+        );
+
+        // Same-repo PR on the claimed branch - should NOT be unlinked.
+        let same_repo_pr = create_mock_pr_with_owner(
+            1,
+            "Fix readme (same repo)",
+            "fix-readme",
+            "APPROVED",
+            "SUCCESS",
+            Some("owner"),
+        );
+        // Fork PR on a DIFFERENT branch - should appear as unlinked.
+        let fork_pr = create_mock_pr_with_owner(
+            2,
+            "Fix readme (fork)",
+            "fork-fix-readme",
+            "",
+            "PENDING",
+            Some("contributor"),
+        );
+
+        let (rp_key, fetch) = create_mock_repo_data(
+            rp.clone(),
+            vec![],
+            vec![same_repo_pr, fork_pr],
+            vec![],
+        );
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        // The work item should have the same-repo PR matched.
+        assert_eq!(items.len(), 1);
+        let pr_info = items[0].repo_associations[0]
+            .pr
+            .as_ref()
+            .expect("should have same-repo PR matched");
+        assert_eq!(pr_info.number, 1);
+
+        // The fork PR on a different branch should appear as unlinked.
+        assert_eq!(
+            unlinked.len(),
+            1,
+            "fork PR on unclaimed branch should appear in unlinked list, got {}",
+            unlinked.len(),
+        );
+        assert_eq!(unlinked[0].pr.number, 2);
+        assert_eq!(unlinked[0].pr.title, "Fix readme (fork)");
+        assert_eq!(unlinked[0].branch, "fork-fix-readme");
+    }
+
+    // -- Round 10 regression tests --
+
+    /// F-1 regression: After importing a fork PR, reassembling should NOT
+    /// show it as unlinked again. The import creates a work item that
+    /// claims the (repo_path, branch), so collect_unlinked_prs must
+    /// respect that claim for fork PRs too.
+    #[test]
+    fn imported_fork_pr_not_re_listed_as_unlinked() {
+        let rp = repo_path("alpha");
+        let fork_branch = "fix-typo";
+
+        // Simulate state AFTER importing the fork PR: a work item now
+        // claims (repo_path, fork_branch).
+        let record = create_mock_record(
+            "wi-imported",
+            "Fix typo (fork)",
+            WorkItemStatus::InProgress,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(fork_branch.to_string()),
+            }],
+        );
+
+        // The fork PR still exists in the fetched PR list.
+        let fork_pr = create_mock_pr_with_owner(
+            99,
+            "Fix typo (fork)",
+            fork_branch,
+            "",
+            "PENDING",
+            Some("contributor"),
+        );
+
+        let (rp_key, fetch) = create_mock_repo_data(
+            rp.clone(),
+            vec![],
+            vec![fork_pr],
+            vec![],
+        );
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (_items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        // The fork PR's branch is now claimed by the imported work item,
+        // so it must NOT appear as unlinked.
+        assert_eq!(
+            unlinked.len(),
+            0,
+            "imported fork PR should not re-appear as unlinked, got {} unlinked: {:?}",
+            unlinked.len(),
+            unlinked.iter().map(|u| &u.pr.title).collect::<Vec<_>>(),
+        );
+    }
+}

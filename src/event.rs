@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 
-use crate::app::{App, FocusPanel, SettingsListFocus};
+use crate::app::{App, DisplayEntry, FocusPanel, SettingsListFocus};
 use crate::layout;
 
 /// The tick interval for periodic updates (reading PTY output).
@@ -145,14 +145,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Key handling when left panel (tab list) is focused.
+/// Key handling when left panel (work item list) is focused.
 fn handle_key_left(app: &mut App, key: KeyEvent) {
     match (key.modifiers, key.code) {
         // Q/q (bare) or Ctrl+Q - quit with confirmation
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('q' | 'Q'))
         | (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
-            if app.tabs.is_empty() {
-                // No sessions to lose - quit immediately.
+            if !app.has_any_session() {
+                // No live sessions to lose - quit immediately.
                 app.should_quit = true;
             } else if app.confirm_quit {
                 app.should_quit = true;
@@ -163,31 +163,27 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 sync_layout(app);
             }
         }
-        // Ctrl+N - new tab (inherits parent's working directory)
+        // Ctrl+N - create a new work item
         (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
             let had_status = app.status_message.is_some();
             let had_context = app.selected_work_item_context().is_some();
-            let cwd = std::env::current_dir().ok();
-            app.new_tab(cwd.as_deref());
+            app.create_work_item();
             if app.status_message.is_some() != had_status
                 || app.selected_work_item_context().is_some() != had_context
             {
                 sync_layout(app);
             }
         }
-        // Ctrl+D or Delete - delete tab with confirmation
+        // Ctrl+D or Delete - delete work item with confirmation
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Delete) => {
-            let Some(idx) = app.selected_tab else {
-                return;
-            };
-            if idx >= app.tabs.len() {
+            if app.selected_work_item_id().is_none() {
                 return;
             }
             if app.confirm_delete {
                 app.confirm_delete = false;
                 let had_status = app.status_message.is_some();
                 let had_context = app.selected_work_item_context().is_some();
-                app.delete_tab();
+                app.delete_selected_work_item();
                 if app.status_message.is_some() != had_status
                     || app.selected_work_item_context().is_some() != had_context
                 {
@@ -195,36 +191,48 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 }
             } else {
                 app.confirm_delete = true;
-                app.status_message = Some("Press again to kill this session".into());
+                app.status_message = Some("Press again to delete this work item".into());
                 sync_layout(app);
             }
         }
-        // Up arrow - previous tab
+        // Up arrow - previous item (skipping non-selectable entries)
         (_, KeyCode::Up) => {
             let had_context = app.selected_work_item_context().is_some();
-            app.prev_tab();
+            app.select_prev_item();
             if app.selected_work_item_context().is_some() != had_context {
                 sync_layout(app);
             }
         }
-        // Down arrow - next tab
+        // Down arrow - next item (skipping non-selectable entries)
         (_, KeyCode::Down) => {
             let had_context = app.selected_work_item_context().is_some();
-            app.next_tab();
+            app.select_next_item();
             if app.selected_work_item_context().is_some() != had_context {
                 sync_layout(app);
             }
         }
-        // Enter - focus right panel (if a tab is selected and alive)
+        // Enter - context-dependent action
         (_, KeyCode::Enter) => {
-            if let Some(idx) = app.selected_tab
-                && idx < app.tabs.len()
-                && app.tabs[idx].alive
-            {
-                app.focus = FocusPanel::Right;
-                app.status_message = Some("Right panel focused - press Ctrl+] to return".into());
-                // Status bar visibility changed - resize PTY to match.
-                sync_layout(app);
+            let Some(idx) = app.selected_item else {
+                return;
+            };
+            let Some(entry) = app.display_list.get(idx).cloned() else {
+                return;
+            };
+            let had_status = app.status_message.is_some();
+            match entry {
+                DisplayEntry::WorkItemEntry(_) => {
+                    app.open_session_for_selected();
+                    // Status bar visibility may have changed - resize PTY.
+                    sync_layout(app);
+                }
+                DisplayEntry::UnlinkedItem(_) => {
+                    app.import_selected_unlinked();
+                    if app.status_message.is_some() != had_status {
+                        sync_layout(app);
+                    }
+                }
+                _ => {}
             }
         }
         // ? - toggle settings overlay
@@ -243,14 +251,19 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
 fn handle_key_right(app: &mut App, key: KeyEvent) {
     let had_status = app.status_message.is_some();
 
-    // Check if the active tab is dead before forwarding keys. If dead,
+    // Check if the active session is dead before forwarding keys. If dead,
     // auto-return focus to the left panel instead of spamming errors.
-    if let Some(idx) = app.selected_tab
-        && idx < app.tabs.len()
-        && !app.tabs[idx].alive
-    {
+    if let Some(entry) = app.active_session_entry() {
+        if !entry.alive {
+            app.focus = FocusPanel::Left;
+            app.status_message = Some("Session has ended - returned to work items".into());
+            sync_layout(app);
+            return;
+        }
+    } else {
+        // No session for this work item - return to left panel.
         app.focus = FocusPanel::Left;
-        app.status_message = Some("Session has ended - returned to tab list".into());
+        app.status_message = None;
         sync_layout(app);
         return;
     }

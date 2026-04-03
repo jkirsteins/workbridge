@@ -2,11 +2,11 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Tabs ────────────┐┌ Claude Code ─────────────────────────────────────────────┐
-│>  Tab 0          ││█                                                         │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
+┌ Work Items ──────┐┌ Claude Code ─────────────────────────────────────────────┐
+│  TODO (1)        ││                                                          │
+│>   Fix a.. PR#14 ││  Press Enter to start                                    │
+│  IN PROGRESS (0) ││  a session for this                                      │
+│    No work items ││  work item.                                              │
 │                  ││                                                          │
 │                  ││                                                          │
 │                  ││                                                          │
@@ -25,4 +25,4 @@ expression: "render(&app, 80, 24)"
 │                  ││                                                          │
 │                  ││                                                          │
 └──────────────────┘└──────────────────────────────────────────────────────────┘
-Fix resize bug | ~/Projects/myapp | bug, P1
+Fix authentication bug | /repo/todo-1/0

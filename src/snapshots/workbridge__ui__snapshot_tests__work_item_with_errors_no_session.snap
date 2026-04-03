@@ -2,18 +2,17 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Tabs ────────────┐┌ Claude Code ─────────────────────────────────────────────┐
-│   Tab 0          ││                                                          │
-│>  Tab 1 [dead]   ││  Session has ended.                                      │
+┌ Work Items ──────┐┌ Claude Code ─────────────────────────────────────────────┐
+│  TODO (0)        ││                                                          │
+│    No work items ││  Errors:                                                 │
+│  IN PROGRESS (1) ││                                                          │
+│>   Broken work i.││  - 2 open PRs for branch '42-fix-bug' in /repo/alpha     │
+│                  ││    Close duplicate PRs to resolve.                       │
 │                  ││                                                          │
-│                  ││  Press Ctrl+D or Delete                                  │
-│                  ││  to remove this tab.                                     │
+│                  ││  - Issue #42 not found in /repo/alpha                    │
+│                  ││    The issue may have been deleted or the number is wrong│
 │                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
+│                  ││  Press Enter to start a session.                         │
 │                  ││                                                          │
 │                  ││                                                          │
 │                  ││                                                          │
@@ -26,3 +25,4 @@ expression: "render(&app, 80, 24)"
 │                  ││                                                          │
 │                  ││                                                          │
 └──────────────────┘└──────────────────────────────────────────────────────────┘
+Broken work item | /repo/alpha

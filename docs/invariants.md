@@ -9,21 +9,28 @@ be evaluated against these rules.
 
 ## The Rules
 
-### 1. One worktree = one work item
+### 1. One work item = one or more repo associations
 
-A work item cannot exist without a worktree. A worktree always produces
-exactly one work item. There is no work item that spans multiple worktrees
-and no worktree that produces multiple work items.
+A work item is an independent entity anchored by a backend record (local
+file in v1, GitHub Issue/Project later). Each work item has one or more
+repo associations, where each association optionally has a worktree. A work
+item can exist before any worktree is created (pre-planning state), but it
+must always be associated with at least one repo. If no repo can be
+assigned, the work item cannot be created - an error is shown instead.
 
-If a worktree disappears (removed externally), the work item disappears
-on the next scan. No tombstone, no history. The PR and issue on GitHub
-are the permanent record.
+If a worktree disappears (removed externally), the repo association's
+worktree_path is cleared on the next scan. The work item persists because
+the backend record is the source of truth, not the worktree. The PR and
+issue on GitHub remain the permanent external record.
 
 ### 2. A worktree must be on a named branch
 
 Detached HEAD worktrees are not valid work items. The branch name is the
 identity of the work -- it drives issue linkage, PR discovery, and display.
 Without a branch name, none of the derivation chain works.
+
+This invariant applies to worktrees that exist. A repo association with
+branch: None and no worktree is a pre-planning state, not a violation.
 
 ### 3. A worktree must not be on the default branch
 
@@ -47,24 +54,34 @@ is no manual override for this at the UI level -- the override file
 (see [data-assembly.md](data-assembly.md)) exists for edge cases but is
 not a primary workflow.
 
-### 6. Derive, don't store
+This invariant does not apply when no branch exists. A repo association
+in pre-planning state (branch: None) has no issue linkage.
 
-WorkBridge does not maintain a database of work item state. All metadata
-is derived from git (worktrees, branches, remotes) and GitHub (PRs, issues)
-on every scan. The only persistent state is:
+### 6. Derive transient metadata, backends anchor identity
+
+Transient metadata (PR status, CI checks, git state) is derived on every
+scan from git and GitHub, never stored. However, work item identity, title,
+status, and repo associations are anchored by a backend record (local file
+in v1). The backend record is the persistent source of truth for what work
+items exist. Everything else is derived.
+
+The only persistent state is:
 
 - The list of registered repositories (config file)
+- Backend records (one per work item, stored in platform data directory)
 - Optional per-worktree override files (rare, for edge cases)
 
-If it can be derived, it must not be stored. Stored state drifts from
-reality. Derived state is reality.
+If it can be derived from git or GitHub, it must not be stored. Backend
+records store only identity and structural data that cannot be derived.
 
-### 7. Inbox items are not work items
+### 7. Unlinked PRs are not work items
 
-A remote PR without a local worktree appears in the inbox, not in the
-work items list. Inbox items cannot have sessions, cannot be edited,
-cannot be aggregated with work items. They become work items only when
-adopted (which creates a local worktree).
+A GitHub PR whose branch does not match any work item's repo associations
+is an "unlinked" PR. Unlinked PRs appear in a separate group in the left
+panel (hidden when empty) and can be imported into a work item via a
+backend record. They cannot have sessions and cannot be edited until
+imported. Importing creates a backend record and promotes the unlinked
+PR to a full work item.
 
 ### 8. One registered repo = one GitHub remote
 
@@ -98,11 +115,11 @@ These invariants have direct consequences for the user:
   (e.g., `42-followup`). It becomes a new work item. The aggregation view
   groups them by issue.
 
-- **Want to work on someone else's PR?** Adopt it from the inbox. This
-  creates a worktree. Now it's your work item.
+- **Want to work on someone else's PR?** Import it from the unlinked
+  group. This creates a backend record. Now it's your work item.
 
-- **Merged and done?** Remove the worktree. The work item vanishes. GitHub
-  has the history.
+- **Merged and done?** Delete the work item. The backend record is removed
+  and worktrees can be cleaned up. GitHub has the history.
 
 The system trades flexibility for predictability. Every work item behaves
 the same way. Every branch follows the same rules. There are no special

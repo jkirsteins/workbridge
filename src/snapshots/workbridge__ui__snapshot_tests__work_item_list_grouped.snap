@@ -2,13 +2,13 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Tabs ────────────┐┌ Claude Code ─────────────────────────────────────────────┐
-│>  Tab 0          ││█                                                         │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
+┌ Work Items ──────┐┌ Claude Code ─────────────────────────────────────────────┐
+│  TODO (2)        ││                                                          │
+│>   Fix a.. PR#14 ││  Press Enter to start                                    │
+│    Add user sett.││  a session for this                                      │
+│  IN PROGRESS (2) ││  work item.                                              │
+│    PR#88 fail [2 ││                                                          │
+│    Upda.. PR#12 .││                                                          │
 │                  ││                                                          │
 │                  ││                                                          │
 │                  ││                                                          │
@@ -25,4 +25,4 @@ expression: "render(&app, 80, 24)"
 │                  ││                                                          │
 │                  ││                                                          │
 └──────────────────┘└──────────────────────────────────────────────────────────┘
-Add authentication | ~/Projects/webapp
+Fix authentication bug | /repo/todo-1/0

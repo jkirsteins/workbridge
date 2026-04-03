@@ -1,12 +1,19 @@
 mod app;
+mod assembly;
 mod config;
 mod event;
+mod fetcher;
+mod github_client;
 mod layout;
 mod session;
 mod theme;
 mod ui;
+mod work_item;
+mod work_item_backend;
+mod worktree_service;
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -18,6 +25,8 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use app::App;
+use github_client::GhCliClient;
+use worktree_service::GitWorktreeService;
 
 /// RAII guard that restores the terminal on drop.
 ///
@@ -224,11 +233,72 @@ fn main() -> io::Result<()> {
             (config::Config::default(), Some(msg))
         }
     };
-    let mut app = App::with_config(cfg);
-    // Surface config load errors in the TUI status bar so the user sees them.
+    let (backend, backend_error): (Box<dyn work_item_backend::WorkItemBackend>, Option<String>) =
+        match work_item_backend::LocalFileBackend::new() {
+            Ok(b) => (Box::new(b), None),
+            Err(e) => {
+                let msg = format!("Backend error: {e} (using stub)");
+                eprintln!("workbridge: {msg}");
+                (Box::new(app::StubBackend), Some(msg))
+            }
+        };
+    let worktree_service: Arc<dyn worktree_service::WorktreeService + Send + Sync> =
+        Arc::new(GitWorktreeService);
+
+    let mut app = App::with_config_and_worktree_service(cfg, backend, Arc::clone(&worktree_service));
+    // Surface config/backend load errors in the TUI status bar so the user sees them.
     if let Some(msg) = config_error {
         app.status_message = Some(msg);
+    } else if let Some(msg) = backend_error {
+        app.status_message = Some(msg);
     }
+
+    // Validate branch_issue_pattern at startup. An invalid regex would
+    // cause every fetcher thread to exit immediately (the channel
+    // disconnects and background updates stop permanently). Catch it
+    // early, show an error, and fall back to an empty pattern (which
+    // disables issue extraction but keeps the fetcher alive).
+    if let Err(e) = regex::Regex::new(&app.config.defaults.branch_issue_pattern) {
+        let bad = app.config.defaults.branch_issue_pattern.clone();
+        app.config.defaults.branch_issue_pattern = String::new();
+        let msg = format!(
+            "Invalid branch_issue_pattern '{}': {} (issue extraction disabled)",
+            bad, e,
+        );
+        // Only overwrite if no higher-priority error is already shown.
+        if app.status_message.is_none() {
+            app.status_message = Some(msg);
+        } else {
+            app.pending_fetch_errors.push(msg);
+        }
+    }
+
+    // Start background fetcher for active repos with git directories.
+    // Use the canonicalized active_repo_cache so fetcher keys match
+    // assembly lookups (F-1 fix: symlinked paths resolve consistently).
+    let active_repos: Vec<PathBuf> = app
+        .active_repo_cache
+        .iter()
+        .filter(|r| r.git_dir_present)
+        .map(|r| r.path.clone())
+        .collect();
+    let github_client: Arc<dyn github_client::GithubClient + Send + Sync> =
+        Arc::new(GhCliClient);
+
+    let extra_branches = app.extra_branches_from_backend();
+    let mut fetcher_handle = if !active_repos.is_empty() {
+        let (rx, handle) = fetcher::start_with_extra_branches(
+            active_repos,
+            Arc::clone(&worktree_service),
+            Arc::clone(&github_client),
+            app.config.defaults.branch_issue_pattern.clone(),
+            extra_branches,
+        );
+        app.fetch_rx = Some(rx);
+        Some(handle)
+    } else {
+        None
+    };
 
     // Install a panic hook that restores the terminal before printing the panic.
     // Child processes are cleaned up automatically when the PTY master fd closes
@@ -297,6 +367,56 @@ fn main() -> io::Result<()> {
         // if child processes have exited.
         if tick_occurred {
             app.check_liveness();
+
+            // Drain fetch results and reassemble if new data arrived.
+            if app.drain_fetch_results() {
+                app.reassemble_work_items();
+                app.build_display_list();
+            }
+
+            // Surface any queued fetch errors now that the status bar
+            // may be free. Shows one per tick to avoid overwhelming.
+            app.drain_pending_fetch_errors();
+
+            // Restart the background fetcher if repo management changed.
+            if app.fetcher_repos_changed {
+                app.fetcher_repos_changed = false;
+                app.fetcher_disconnected = false;
+                // Stop the old fetcher.
+                if let Some(handle) = fetcher_handle.take() {
+                    handle.stop();
+                }
+                app.fetch_rx = None;
+                // Start a new fetcher with the updated repo list.
+                // Use active_repo_cache (already canonicalized) so fetcher
+                // keys match assembly lookups.
+                let new_repos: Vec<PathBuf> = app
+                    .active_repo_cache
+                    .iter()
+                    .filter(|r| r.git_dir_present)
+                    .map(|r| r.path.clone())
+                    .collect();
+                // Prune stale repo_data entries for repos that are no
+                // longer active. Without this, unmanaged repos keep
+                // rendering their old fetched data.
+                app.repo_data.retain(|k, _| new_repos.contains(k));
+                // Reassemble immediately so stale data is cleared from
+                // the display before the new fetcher sends fresh results.
+                app.reassemble_work_items();
+                app.build_display_list();
+                if !new_repos.is_empty() {
+                    let new_extra = app.extra_branches_from_backend();
+                    let (rx, handle) = fetcher::start_with_extra_branches(
+                        new_repos,
+                        Arc::clone(&worktree_service),
+                        Arc::clone(&github_client),
+                        app.config.defaults.branch_issue_pattern.clone(),
+                        new_extra,
+                    );
+                    app.fetch_rx = Some(rx);
+                    fetcher_handle = Some(handle);
+                }
+            }
         }
 
         // Check for external signals (SIGTERM, SIGINT).
@@ -358,6 +478,12 @@ fn main() -> io::Result<()> {
                 break;
             }
         }
+    }
+
+    // Stop the background fetcher before the TerminalGuard drops, so
+    // threads don't try to send on a dropped channel.
+    if let Some(handle) = fetcher_handle {
+        handle.stop();
     }
 
     Ok(())

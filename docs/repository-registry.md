@@ -141,15 +141,20 @@ On startup, WorkBridge:
 
 ## TUI Settings Overlay
 
-Press `?` in the left panel to open a read-only settings overlay showing:
+Press `?` in the left panel to open the settings overlay showing:
 
 - Config file path
 - Base directories (with + available / - unavailable markers)
-- Explicit repos (with availability markers)
-- Discovered repos
-- Default settings
+- Managed repos (explicit + included, with source labels)
+- Available repos (discovered but not managed)
+- Default settings (worktree_dir, branch_issue_pattern)
 
-Press `?` or `Escape` to close the overlay.
+Use Tab to switch between Managed and Available lists, Enter or arrow keys
+to move repos between lists. Press `?` or `Escape` to close the overlay.
+
+The main left panel now shows work items grouped by status (Unlinked, Todo,
+In Progress) rather than individual tabs. Work items are assembled from
+backend records combined with GitHub PR/issue data fetched in the background.
 
 ## Unavailable Repos
 
@@ -160,7 +165,6 @@ output with availability markers.
 
 ## Future Work
 
-- GitHub remote detection (parse origin URL for API calls)
-- Worktree discovery within registered repos
 - Per-repo setting overrides
 - Repo groups or tags
+- Multi-backend configuration (GitHub Issue, GitHub Project backends)

@@ -12,7 +12,7 @@ pub struct PanelLayout {
 
 /// Compute panel layout from total terminal dimensions.
 ///
-/// Left panel gets 20% of width (minimum 20 columns, capped at total width).
+/// Left panel gets 25% of width (minimum 30 columns, capped at total width).
 /// Right panel gets the remaining width minus 2 for borders.
 /// Pane rows = total rows minus 2 for borders, minus `bottom_bar_rows` for
 /// any bottom bars (context bar, status bar, etc.).

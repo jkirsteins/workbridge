@@ -23,8 +23,6 @@ pub struct Theme {
     pub tab_highlight_fg: Color,
     /// Highlight bar: background.
     pub tab_highlight_bg: Color,
-    /// Dead tab label.
-    pub tab_dead: Color,
 
     // -- Text --
     /// Primary text (readable on any terminal background).
@@ -57,6 +55,20 @@ pub struct Theme {
     pub context_fg: Color,
     /// Work-item context bar background.
     pub context_bg: Color,
+
+    // -- Work item groups and badges --
+    /// Group header text color (e.g., "TODO (2)").
+    pub group_header: Color,
+    /// PR badge color (open PR).
+    pub badge_pr: Color,
+    /// CI passing badge color.
+    pub badge_ci_pass: Color,
+    /// CI failing badge color.
+    pub badge_ci_fail: Color,
+    /// CI pending badge color.
+    pub badge_ci_pending: Color,
+    /// Unlinked item "?" marker color.
+    pub unlinked_marker: Color,
 }
 
 impl Theme {
@@ -75,7 +87,6 @@ impl Theme {
 
             tab_highlight_fg: Color::Black,
             tab_highlight_bg: Color::Cyan,
-            tab_dead: Color::Red,
 
             text: Color::Reset,
             text_muted: Color::Reset,
@@ -92,6 +103,13 @@ impl Theme {
 
             context_fg: Color::Cyan,
             context_bg: Color::Reset,
+
+            group_header: Color::Cyan,
+            badge_pr: Color::Green,
+            badge_ci_pass: Color::Green,
+            badge_ci_fail: Color::Red,
+            badge_ci_pending: Color::Yellow,
+            unlinked_marker: Color::Yellow,
         }
     }
 }
@@ -128,10 +146,6 @@ impl Theme {
             .fg(self.tab_highlight_fg)
             .bg(self.tab_highlight_bg)
             .add_modifier(Modifier::BOLD)
-    }
-
-    pub fn style_tab_dead(&self) -> Style {
-        Style::default().fg(self.tab_dead)
     }
 
     pub fn style_text(&self) -> Style {
@@ -173,4 +187,29 @@ impl Theme {
         Style::default().fg(self.context_fg).bg(self.context_bg)
     }
 
+    pub fn style_group_header(&self) -> Style {
+        Style::default()
+            .fg(self.group_header)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn style_badge_pr(&self) -> Style {
+        Style::default().fg(self.badge_pr)
+    }
+
+    pub fn style_badge_ci_pass(&self) -> Style {
+        Style::default().fg(self.badge_ci_pass)
+    }
+
+    pub fn style_badge_ci_fail(&self) -> Style {
+        Style::default().fg(self.badge_ci_fail)
+    }
+
+    pub fn style_badge_ci_pending(&self) -> Style {
+        Style::default().fg(self.badge_ci_pending)
+    }
+
+    pub fn style_unlinked_marker(&self) -> Style {
+        Style::default().fg(self.unlinked_marker)
+    }
 }

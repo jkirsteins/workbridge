@@ -1,49 +1,57 @@
 # Data Assembly
 
-> STATUS: NOT IMPLEMENTED. This document describes the target design.
-
-WorkBridge does not store metadata about work items. It assembles metadata
-on the fly from local git state and GitHub API calls, caches it in memory,
-and discards it when the process exits.
+WorkBridge assembles work item metadata from backend records, local git
+state, and GitHub API calls. Backend records (local files in v1) anchor
+work item identity and structure. Transient metadata (PR status, CI checks,
+git state) is derived on the fly, cached in memory, and discarded when
+the process exits.
 
 ## The Derivation Chain
 
-Starting from a worktree, WorkBridge derives everything else:
+Starting from a backend record, WorkBridge derives everything else:
 
 ```
-worktree exists on disk
-  -> git branch --show-current
-    -> branch name "42-resize-bug"
-      -> regex extracts "42"
-        -> GitHub API: get issue #42
-          -> title, labels, state, assignees
-      -> GitHub API: list PRs with head=42-resize-bug
-        -> PR number, title, state, checks, reviewers
-  -> git status
-    -> dirty/clean, staged files
-  -> git rev-list
-    -> ahead/behind remote
+backend record exists (work item id, title, status, repo associations)
+  -> for each repo association with a branch:
+    -> match worktree by branch name
+      -> worktree_path, git state (dirty, ahead/behind)
+    -> GitHub API: list PRs with head=branch
+      -> PR number, title, state, checks, reviewers
+    -> regex extracts issue number from branch name
+      -> GitHub API: get issue #N
+        -> title, labels, state
+  -> for each repo association without a branch:
+    -> pre-planning state, no derivation possible
 ```
 
-Every piece of metadata is derived from something that already exists.
-Nothing is entered by the user except the branch name (at worktree creation
-time) and the one-time repo registration.
+Backend records provide identity and structure. Everything else is derived
+from git and GitHub. The user creates work items (which creates a backend
+record) and sets the branch name. All other metadata is assembled
+automatically.
 
 ## Data Tiers
 
 Data is grouped into tiers by how it is obtained:
 
+### Tier -1: Backend records (instant, always available)
+
+- Work item id, title, status
+- Repo associations (repo path, branch name)
+
+This data comes from local file reads (v1) and is always available. It
+defines what work items exist and their structure. The UI can render a
+work item list immediately from backend records alone, before any git
+or GitHub data is fetched.
+
 ### Tier 0: Local git (instant, always available)
 
-- Worktree path and existence
-- Branch name
-- Last commit time
+- Worktree path and existence (matched by branch name)
 - Dirty/clean status
 - Ahead/behind remote tracking branch
 
 This data comes from local git operations that complete in milliseconds.
-It is always available, even offline. The UI renders with this data
-immediately on startup.
+It is always available, even offline. Combined with Tier -1 data, the UI
+renders the sidebar with work item names and local git status on startup.
 
 ### Tier 1: Git remote (fast, usually available)
 
@@ -77,10 +85,10 @@ upstream tier updates.
 
 ### On Startup
 
-1. Enumerate all worktrees across registered repos (Tier 0, sync)
-2. Render the sidebar immediately with branch names and local status
-3. Spawn async tasks per worktree for Tier 1 and Tier 2 data
-4. As each task completes, update the work item and re-render
+1. Load backend records for all backends (Tier -1, sync, fast local I/O)
+2. Render the sidebar immediately with work item titles and statuses
+3. Spawn background threads per registered repo for Tier 0, 1, and 2 data
+4. As each thread sends results, assemble full work items and re-render
 
 ### Periodic Refresh
 
@@ -139,12 +147,12 @@ This file contains only the fields that override automatic derivation:
 }
 ```
 
-This is the ONLY stored metadata in the system. It is optional, local to
-the machine, never committed, and cleaned up automatically when the
-worktree is removed.
-
-The override file should be a last resort. If the branch name can encode
-the issue number, it should.
+Note: with the backend-anchored model, the override file is even less
+necessary since work item identity and repo associations are stored in
+backend records. The override file remains for edge cases where the
+branch name does not encode the correct issue number. It is optional,
+local to the machine, never committed, and cleaned up automatically when
+the worktree is removed.
 
 ## API Budget
 
@@ -176,7 +184,7 @@ active, and deprioritize items that are scrolled off-screen or idle.
   architecturally clean (swap the Tier 2 data source) but adds complexity.
   Defer to v2.
 
-- Should WorkBridge pre-fetch data for inbox items (remote PRs without
-  local worktrees)? These are Tier 2 only (no local worktree to derive
-  from). The cost is additional API calls for items the user might never
-  adopt.
+- Should WorkBridge pre-fetch data for unlinked PRs (GitHub PRs without
+  a matching work item)? These are discovered as part of the regular PR
+  list fetch per repo, so they come "for free." The only cost is
+  displaying them in the UI.
