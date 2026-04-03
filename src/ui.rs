@@ -1,23 +1,32 @@
-use ratatui::{
-    Frame,
+use ratatui_core::{
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{StatefulWidget, Widget},
+};
+use ratatui_widgets::{
+    block::Block,
+    borders::Borders,
+    clear::Clear,
+    list::{List, ListItem, ListState},
+    paragraph::Paragraph,
 };
 use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, DisplayEntry, FocusPanel, SettingsListFocus, WorkItemContext};
 use crate::config;
+use crate::create_dialog::{CreateDialog, CreateDialogFocus};
 use crate::layout;
 use crate::theme::Theme;
 use crate::work_item::{CheckStatus, PrState, WorkItemError};
 
 /// Render the entire UI: left panel (work item list) and right panel
 /// (session output), plus optional context bar and status bar at the bottom.
-pub fn draw(frame: &mut Frame, app: &App) {
-    let theme = Theme::default_theme();
-    let area = frame.area();
-
+///
+/// Buffer-based rendering entry point. Called by the rat-salsa render
+/// callback. All rendering uses Widget::render(area, buf) and
+/// StatefulWidget::render(widget, area, buf, &mut state) directly.
+pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
     // Vertical split: main area + optional 1-row context bar + optional 1-row status bar.
     let has_context = app.selected_work_item_context().is_some();
     let has_status = app.status_message.is_some();
@@ -55,20 +64,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let pl = layout::compute(main_area.width, main_area.height, 0);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(pl.left_width),
-            Constraint::Min(0),
-        ])
+        .constraints([Constraint::Length(pl.left_width), Constraint::Min(0)])
         .split(main_area);
 
-    draw_work_item_list(frame, app, &theme, chunks[0]);
-    draw_pane_output(frame, app, &theme, chunks[1]);
+    draw_work_item_list(buf, app, theme, chunks[0]);
+    draw_pane_output(buf, app, theme, chunks[1]);
 
     // Context bar (persistent work-item info).
     if let Some(area) = context_area
         && let Some(ctx) = app.selected_work_item_context()
     {
-        draw_context_bar(frame, &ctx, &theme, area);
+        draw_context_bar(buf, &ctx, theme, area);
     }
 
     // Status bar (transient messages).
@@ -81,17 +87,22 @@ pub fn draw(frame: &mut Frame, app: &App) {
             theme.style_status()
         };
         let status = Paragraph::new(msg.as_str()).style(style);
-        frame.render_widget(status, area);
+        status.render(area, buf);
     }
 
     // Settings overlay (rendered on top of everything).
     if app.show_settings {
-        draw_settings_overlay(frame, app, &theme, area);
+        draw_settings_overlay(buf, app, theme, area);
+    }
+
+    // Create dialog overlay (rendered on top of everything).
+    if app.create_dialog.visible {
+        draw_create_dialog(buf, &app.create_dialog, theme, area);
     }
 }
 
 /// Draw the left panel containing the grouped work item list.
-fn draw_work_item_list(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // When the settings overlay is open, dim background panels so the
     // overlay is the clear focal point.
     let border_style = if app.show_settings {
@@ -119,7 +130,7 @@ fn draw_work_item_list(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
         let paragraph = Paragraph::new(text)
             .block(block)
             .style(theme.style_text_muted());
-        frame.render_widget(paragraph, area);
+        paragraph.render(area, buf);
         return;
     }
 
@@ -137,15 +148,11 @@ fn draw_work_item_list(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
                     theme.style_group_header(),
                 )]))
             }
-            DisplayEntry::EmptyState(msg) => {
-                ListItem::new(Line::from(vec![Span::styled(
-                    msg.clone(),
-                    theme.style_text_muted(),
-                )]))
-            }
-            DisplayEntry::UnlinkedItem(idx) => {
-                format_unlinked_item(app, *idx, inner_width, theme)
-            }
+            DisplayEntry::EmptyState(msg) => ListItem::new(Line::from(vec![Span::styled(
+                msg.clone(),
+                theme.style_text_muted(),
+            )])),
+            DisplayEntry::UnlinkedItem(idx) => format_unlinked_item(app, *idx, inner_width, theme),
             DisplayEntry::WorkItemEntry(idx) => {
                 format_work_item_entry(app, *idx, inner_width, theme)
             }
@@ -160,7 +167,7 @@ fn draw_work_item_list(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
     let mut state = ListState::default();
     state.select(app.selected_item);
 
-    frame.render_stateful_widget(list, area, &mut state);
+    StatefulWidget::render(list, area, buf, &mut state);
 }
 
 /// Format an unlinked PR entry for the left panel list.
@@ -193,8 +200,7 @@ fn format_unlinked_item<'a>(
         .saturating_sub(1);
     let truncated_title = truncate_str(title, available);
 
-    let padding =
-        max_width.saturating_sub(prefix.len() + truncated_title.len() + right.len());
+    let padding = max_width.saturating_sub(prefix.len() + truncated_title.len() + right.len());
     let pad_str: String = " ".repeat(padding);
 
     ListItem::new(Line::from(vec![
@@ -217,13 +223,10 @@ fn format_work_item_entry<'a>(
     };
 
     // Build the right-side badge string.
-    let mut right_parts: Vec<(String, ratatui::style::Style)> = Vec::new();
+    let mut right_parts: Vec<(String, ratatui_core::style::Style)> = Vec::new();
 
     // PR badge: show first PR if any.
-    let first_pr = wi
-        .repo_associations
-        .iter()
-        .find_map(|a| a.pr.as_ref());
+    let first_pr = wi.repo_associations.iter().find_map(|a| a.pr.as_ref());
     if let Some(pr) = first_pr {
         let pr_text = format!("PR#{}", pr.number);
         let pr_style = if pr.state == PrState::Merged {
@@ -264,8 +267,7 @@ fn format_work_item_entry<'a>(
         .saturating_sub(1);
     let truncated_title = truncate_str(&wi.title, available);
 
-    let padding =
-        max_width.saturating_sub(prefix.len() + truncated_title.len() + right_text.len());
+    let padding = max_width.saturating_sub(prefix.len() + truncated_title.len() + right_text.len());
     let pad_str: String = " ".repeat(padding);
 
     let mut spans = vec![
@@ -323,10 +325,7 @@ fn format_work_item_error(error: &WorkItemError) -> (String, Option<String>) {
             repo_path,
             issue_number,
         } => (
-            format!(
-                "Issue #{issue_number} not found in {}",
-                repo_path.display()
-            ),
+            format!("Issue #{issue_number} not found in {}", repo_path.display()),
             Some("The issue may have been deleted or the number is wrong.".into()),
         ),
         WorkItemError::CorruptBackendRecord { reason, backend } => (
@@ -355,7 +354,7 @@ fn format_work_item_error(error: &WorkItemError) -> (String, Option<String>) {
 /// - If selected item is a work item without a session -> prompt to start
 /// - If selected item is an unlinked PR -> prompt to import
 /// - If nothing selected -> show welcome message
-fn draw_pane_output(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // When the settings overlay is open, dim background panels.
     let border_style = if app.show_settings {
         theme.style_border_unfocused()
@@ -378,9 +377,7 @@ fn draw_pane_output(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         .border_style(border_style);
 
     // Determine what to show based on the selected display list entry.
-    let selected_entry = app
-        .selected_item
-        .and_then(|idx| app.display_list.get(idx));
+    let selected_entry = app.selected_item.and_then(|idx| app.display_list.get(idx));
 
     match selected_entry {
         Some(DisplayEntry::WorkItemEntry(wi_idx)) => {
@@ -396,27 +393,20 @@ fn draw_pane_output(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                         Line::from("  Press Enter to start"),
                         Line::from("  a new session."),
                     ]);
-                    let paragraph = Paragraph::new(text)
-                        .block(block)
-                        .style(theme.style_error());
-                    frame.render_widget(paragraph, area);
+                    let paragraph = Paragraph::new(text).block(block).style(theme.style_error());
+                    paragraph.render(area, buf);
                 }
                 Some(entry) => {
                     // Lock the shared parser to get the current screen state.
                     if let Ok(parser) = entry.parser.lock() {
-                        let pseudo_term = PseudoTerminal::new(parser.screen())
-                            .block(block);
-                        frame.render_widget(pseudo_term, area);
+                        let pseudo_term = PseudoTerminal::new(parser.screen()).block(block);
+                        pseudo_term.render(area, buf);
                     } else {
                         // Parser lock poisoned - show a fallback message.
-                        let text = Text::from(vec![
-                            Line::from(""),
-                            Line::from("  [render error]"),
-                        ]);
-                        let paragraph = Paragraph::new(text)
-                            .block(block)
-                            .style(theme.style_error());
-                        frame.render_widget(paragraph, area);
+                        let text = Text::from(vec![Line::from(""), Line::from("  [render error]")]);
+                        let paragraph =
+                            Paragraph::new(text).block(block).style(theme.style_error());
+                        paragraph.render(area, buf);
                     }
                 }
                 None => {
@@ -427,10 +417,7 @@ fn draw_pane_output(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     if has_errors {
                         let mut lines = vec![
                             Line::from(""),
-                            Line::from(Span::styled(
-                                "  Errors:",
-                                theme.style_error(),
-                            )),
+                            Line::from(Span::styled("  Errors:", theme.style_error())),
                         ];
                         for error in errors.unwrap() {
                             lines.push(Line::from(""));
@@ -453,7 +440,7 @@ fn draw_pane_output(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                         )));
                         let text = Text::from(lines);
                         let paragraph = Paragraph::new(text).block(block);
-                        frame.render_widget(paragraph, area);
+                        paragraph.render(area, buf);
                     } else {
                         let text = Text::from(vec![
                             Line::from(""),
@@ -464,7 +451,7 @@ fn draw_pane_output(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                         let paragraph = Paragraph::new(text)
                             .block(block)
                             .style(theme.style_text_muted());
-                        frame.render_widget(paragraph, area);
+                        paragraph.render(area, buf);
                     }
                 }
             }
@@ -478,7 +465,7 @@ fn draw_pane_output(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             let paragraph = Paragraph::new(text)
                 .block(block)
                 .style(theme.style_text_muted());
-            frame.render_widget(paragraph, area);
+            paragraph.render(area, buf);
         }
         _ => {
             // Nothing selected or non-selectable entry.
@@ -497,13 +484,13 @@ fn draw_pane_output(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             let paragraph = Paragraph::new(text)
                 .block(block)
                 .style(theme.style_text_muted());
-            frame.render_widget(paragraph, area);
+            paragraph.render(area, buf);
         }
     }
 }
 
 /// Draw the work-item context bar showing title, repo path, and labels.
-fn draw_context_bar(frame: &mut Frame, ctx: &WorkItemContext, theme: &Theme, area: Rect) {
+fn draw_context_bar(buf: &mut Buffer, ctx: &WorkItemContext, theme: &Theme, area: Rect) {
     let labels_part = if ctx.labels.is_empty() {
         String::new()
     } else {
@@ -526,7 +513,7 @@ fn draw_context_bar(frame: &mut Frame, ctx: &WorkItemContext, theme: &Theme, are
     };
 
     let paragraph = Paragraph::new(display).style(theme.style_context());
-    frame.render_widget(paragraph, area);
+    paragraph.render(area, buf);
 }
 
 /// Return a centered rect using the given percentage of the outer rect.
@@ -549,9 +536,9 @@ const REPOS_LIST_MAX_ROWS: u16 = 6;
 ///   - Repos section: horizontal split of Active and Excluded lists
 ///   - Defaults (2 lines)
 ///   - Hint line
-fn draw_settings_overlay(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     let popup = centered_rect(70, 80, area);
-    frame.render_widget(Clear, popup);
+    Clear.render(popup, buf);
 
     let block = Block::default()
         .title(" Settings (press ? or Esc to close) ")
@@ -560,7 +547,7 @@ fn draw_settings_overlay(frame: &mut Frame, app: &App, theme: &Theme, area: Rect
         .border_style(theme.style_border_overlay());
 
     let block_inner = block.inner(popup);
-    frame.render_widget(block, popup);
+    block.render(popup, buf);
 
     // Add 1-cell padding inside the overlay border on all sides.
     let inner = Rect {
@@ -580,8 +567,11 @@ fn draw_settings_overlay(frame: &mut Frame, app: &App, theme: &Theme, area: Rect
         };
         let marker = if entry.git_dir_present { "+" } else { "-" };
         managed_items.push(
-            ListItem::new(format!(" {marker} {} ({source_label})", entry.path.display()))
-                .style(theme.style_text()),
+            ListItem::new(format!(
+                " {marker} {} ({source_label})",
+                entry.path.display()
+            ))
+            .style(theme.style_text()),
         );
     }
 
@@ -591,8 +581,7 @@ fn draw_settings_overlay(frame: &mut Frame, app: &App, theme: &Theme, area: Rect
     for entry in &available_entries {
         let marker = if entry.git_dir_present { "+" } else { "-" };
         available_items.push(
-            ListItem::new(format!(" {marker} {}", entry.path.display()))
-                .style(theme.style_text()),
+            ListItem::new(format!(" {marker} {}", entry.path.display())).style(theme.style_text()),
         );
     }
 
@@ -637,7 +626,7 @@ fn draw_settings_overlay(frame: &mut Frame, app: &App, theme: &Theme, area: Rect
         Line::styled("Config source:", theme.style_heading()),
         Line::from(format!("  {}", app.config.source)),
     ]);
-    frame.render_widget(Paragraph::new(source_text), sections[0]);
+    Paragraph::new(source_text).render(sections[0], buf);
 
     // Section 1: Base directories.
     let mut base_lines = vec![Line::styled("Base directories:", theme.style_heading())];
@@ -650,7 +639,7 @@ fn draw_settings_overlay(frame: &mut Frame, app: &App, theme: &Theme, area: Rect
             base_lines.push(Line::from(format!("  {marker} {dir}")));
         }
     }
-    frame.render_widget(Paragraph::new(Text::from(base_lines)), sections[1]);
+    Paragraph::new(Text::from(base_lines)).render(sections[1], buf);
 
     // Section 2: Repos - horizontal split of Active and Excluded lists.
     let repo_cols = Layout::default()
@@ -672,9 +661,9 @@ fn draw_settings_overlay(frame: &mut Frame, app: &App, theme: &Theme, area: Rect
         .border_style(managed_border);
 
     if managed_items.is_empty() {
-        let empty = Paragraph::new(Line::styled("  (none)", theme.style_text_muted()))
-            .block(managed_block);
-        frame.render_widget(empty, repo_cols[0]);
+        let empty =
+            Paragraph::new(Line::styled("  (none)", theme.style_text_muted())).block(managed_block);
+        empty.render(repo_cols[0], buf);
     } else {
         let list = List::new(managed_items)
             .block(managed_block)
@@ -682,9 +671,12 @@ fn draw_settings_overlay(frame: &mut Frame, app: &App, theme: &Theme, area: Rect
             .highlight_symbol("> ");
         let mut state = ListState::default();
         if app.settings_list_focus == SettingsListFocus::Managed {
-            state.select(Some(app.settings_repo_selected.min(managed_count.saturating_sub(1))));
+            state.select(Some(
+                app.settings_repo_selected
+                    .min(managed_count.saturating_sub(1)),
+            ));
         }
-        frame.render_stateful_widget(list, repo_cols[0], &mut state);
+        StatefulWidget::render(list, repo_cols[0], buf, &mut state);
     }
 
     // Available repos list (right).
@@ -703,7 +695,7 @@ fn draw_settings_overlay(frame: &mut Frame, app: &App, theme: &Theme, area: Rect
     if available_items.is_empty() {
         let empty = Paragraph::new(Line::styled("  (none)", theme.style_text_muted()))
             .block(available_block);
-        frame.render_widget(empty, repo_cols[1]);
+        empty.render(repo_cols[1], buf);
     } else {
         let list = List::new(available_items)
             .block(available_block)
@@ -712,10 +704,11 @@ fn draw_settings_overlay(frame: &mut Frame, app: &App, theme: &Theme, area: Rect
         let mut state = ListState::default();
         if app.settings_list_focus == SettingsListFocus::Available {
             state.select(Some(
-                app.settings_available_selected.min(available_count.saturating_sub(1)),
+                app.settings_available_selected
+                    .min(available_count.saturating_sub(1)),
             ));
         }
-        frame.render_stateful_widget(list, repo_cols[1], &mut state);
+        StatefulWidget::render(list, repo_cols[1], buf, &mut state);
     }
 
     // Section 4: Defaults.
@@ -730,35 +723,270 @@ fn draw_settings_overlay(frame: &mut Frame, app: &App, theme: &Theme, area: Rect
             app.config.defaults.branch_issue_pattern
         )),
     ]);
-    frame.render_widget(Paragraph::new(defaults_text), sections[4]);
+    Paragraph::new(defaults_text).render(sections[4], buf);
 
     // Section 5: Hint line.
     let hint = Line::styled(
         "Tab: switch list, Enter: move, Up/Down: navigate",
         theme.style_text_muted(),
     );
-    frame.render_widget(Paragraph::new(hint), sections[5]);
+    Paragraph::new(hint).render(sections[5], buf);
+}
+
+/// Draw the work item creation dialog as a centered popup overlay.
+///
+/// Layout:
+///   +-- Create Work Item ---------------------------------+
+///   |                                                     |
+///   |  Title:                                             |
+///   |  [_______________________________________________]  |
+///   |                                                     |
+///   |  Repos:                                             |
+///   |  [x] /path/to/repo-a                                |
+///   |  [ ] /path/to/repo-b                                |
+///   |                                                     |
+///   |  Branch (optional):                                 |
+///   |  [_______________________________________________]  |
+///   |                                                     |
+///   |  [error message if any]                             |
+///   |  Enter: Create  |  Esc: Cancel  |  Tab: Next field  |
+///   +-----------------------------------------------------+
+fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, area: Rect) {
+    // Compute dialog height based on content.
+    // Rows: border(1) + blank(1) + "Title:" label(1) + input(1) + blank(1)
+    //   + "Repos:" label(1) + repo_lines(max 6) + blank(1)
+    //   + "Branch:" label(1) + input(1) + blank(1)
+    //   + error_line(1) + hint(1) + border(1)
+    let repo_lines = dialog.repo_list.len().clamp(1, 6) as u16;
+    let dialog_height = 2 + 2 + 1 + 1 + repo_lines + 1 + 2 + 1 + 2 + 2;
+    let dialog_width = (area.width * 60 / 100).max(40).min(area.width);
+
+    let popup = centered_rect_fixed(dialog_width, dialog_height, area);
+    Clear.render(popup, buf);
+
+    let block = Block::default()
+        .title(" Create Work Item ")
+        .title_style(theme.style_title())
+        .borders(Borders::ALL)
+        .border_style(theme.style_border_overlay());
+
+    let block_inner = block.inner(popup);
+    block.render(popup, buf);
+
+    // Inner area with 1-cell padding.
+    let inner = Rect {
+        x: block_inner.x + 1,
+        y: block_inner.y + 1,
+        width: block_inner.width.saturating_sub(2),
+        height: block_inner.height.saturating_sub(2),
+    };
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),          // Title label
+            Constraint::Length(1),          // Title input
+            Constraint::Length(1),          // blank
+            Constraint::Length(1),          // Repos label
+            Constraint::Length(repo_lines), // Repos list
+            Constraint::Length(1),          // blank
+            Constraint::Length(1),          // Branch label
+            Constraint::Length(1),          // Branch input
+            Constraint::Length(1),          // blank
+            Constraint::Length(1),          // error / blank
+            Constraint::Length(1),          // hint line
+            Constraint::Min(0),             // absorb remaining
+        ])
+        .split(inner);
+
+    // Title label
+    let title_label_style = if dialog.focus_field == CreateDialogFocus::Title {
+        theme.style_heading()
+    } else {
+        theme.style_text()
+    };
+    Paragraph::new(Line::styled("Title:", title_label_style)).render(sections[0], buf);
+
+    // Title input
+    draw_text_input_field(
+        buf,
+        &dialog.title_input,
+        theme,
+        sections[1],
+        dialog.focus_field == CreateDialogFocus::Title,
+    );
+
+    // Repos label
+    let repos_label_style = if dialog.focus_field == CreateDialogFocus::Repos {
+        theme.style_heading()
+    } else {
+        theme.style_text()
+    };
+    Paragraph::new(Line::styled("Repos:", repos_label_style)).render(sections[3], buf);
+
+    // Repos list
+    if dialog.repo_list.is_empty() {
+        let msg = Line::styled("  (no repos configured)", theme.style_text_muted());
+        Paragraph::new(msg).render(sections[4], buf);
+    } else {
+        let items: Vec<ListItem<'_>> = dialog
+            .repo_list
+            .iter()
+            .map(|(path, selected)| {
+                let marker = if *selected { "[x]" } else { "[ ]" };
+                let line = format!(" {marker} {}", path.display());
+                ListItem::new(Line::from(line)).style(theme.style_text())
+            })
+            .collect();
+
+        let list = List::new(items)
+            .highlight_style(theme.style_tab_highlight())
+            .highlight_symbol("> ");
+
+        let mut state = ListState::default();
+        if dialog.focus_field == CreateDialogFocus::Repos {
+            state.select(Some(dialog.repo_cursor));
+        }
+
+        StatefulWidget::render(list, sections[4], buf, &mut state);
+    }
+
+    // Branch label
+    let branch_label_style = if dialog.focus_field == CreateDialogFocus::Branch {
+        theme.style_heading()
+    } else {
+        theme.style_text()
+    };
+    Paragraph::new(Line::styled("Branch (optional):", branch_label_style)).render(sections[6], buf);
+
+    // Branch input
+    draw_text_input_field(
+        buf,
+        &dialog.branch_input,
+        theme,
+        sections[7],
+        dialog.focus_field == CreateDialogFocus::Branch,
+    );
+
+    // Error message (if any)
+    if let Some(ref err) = dialog.error_message {
+        Paragraph::new(Line::styled(err.as_str(), theme.style_error())).render(sections[9], buf);
+    }
+
+    // Hint line
+    let hint = Line::styled(
+        "Enter: Create | Esc: Cancel | Tab: Next field | Space: Toggle repo",
+        theme.style_text_muted(),
+    );
+    Paragraph::new(hint).render(sections[10], buf);
+}
+
+/// Draw a simple text input field with a visual cursor indicator.
+///
+/// When focused, the text is rendered with a cursor position marker.
+/// When unfocused, just the text is shown dimmed.
+fn draw_text_input_field(
+    buf: &mut Buffer,
+    input: &crate::create_dialog::SimpleTextInput,
+    theme: &Theme,
+    area: Rect,
+    focused: bool,
+) {
+    let text = input.text();
+    let inner_width = area.width.saturating_sub(2) as usize; // 1 char padding each side
+
+    if focused {
+        let cursor_pos = input.cursor_char_pos();
+        // Build the display: text with a cursor block character.
+        let before: String = text.chars().take(cursor_pos).collect();
+        let cursor_char: String = text
+            .chars()
+            .nth(cursor_pos)
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| " ".to_string());
+        let after: String = text.chars().skip(cursor_pos + 1).collect();
+
+        // Truncate to fit. Simple approach: if text is longer than inner_width,
+        // scroll so cursor is visible.
+        let total_chars = text.chars().count().max(cursor_pos + 1);
+        let (display_before, display_cursor, display_after) = if total_chars <= inner_width {
+            (before, cursor_char, after)
+        } else {
+            // Scroll window to keep cursor visible.
+            let start = if cursor_pos >= inner_width {
+                cursor_pos - inner_width + 1
+            } else {
+                0
+            };
+            let b: String = text.chars().skip(start).take(cursor_pos - start).collect();
+            let c: String = text
+                .chars()
+                .nth(cursor_pos)
+                .map(|ch| ch.to_string())
+                .unwrap_or_else(|| " ".to_string());
+            let remaining = inner_width.saturating_sub(cursor_pos - start + 1);
+            let a: String = text.chars().skip(cursor_pos + 1).take(remaining).collect();
+            (b, c, a)
+        };
+
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(display_before, theme.style_text()),
+            Span::styled(
+                display_cursor,
+                ratatui_core::style::Style::default()
+                    .fg(theme.tab_highlight_fg)
+                    .bg(theme.tab_highlight_bg),
+            ),
+            Span::styled(display_after, theme.style_text()),
+        ]);
+        Paragraph::new(line).render(area, buf);
+    } else {
+        // Unfocused: show text dimmed.
+        let display: String = if text.is_empty() {
+            "(empty)".to_string()
+        } else {
+            text.chars().take(inner_width).collect()
+        };
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(display, theme.style_text_muted()),
+        ]);
+        Paragraph::new(line).render(area, buf);
+    }
+}
+
+/// Return a centered rect with fixed width and height within the outer rect.
+fn centered_rect_fixed(width: u16, height: u16, outer: Rect) -> Rect {
+    let w = width.min(outer.width);
+    let h = height.min(outer.height);
+    let x = outer.x + (outer.width.saturating_sub(w)) / 2;
+    let y = outer.y + (outer.height.saturating_sub(h)) / 2;
+    Rect::new(x, y, w, h)
 }
 
 #[cfg(test)]
 mod snapshot_tests {
-    use std::path::PathBuf;
-    use ratatui::{Terminal, backend::TestBackend};
+    use super::draw_to_buffer;
     use crate::app::{App, FocusPanel, StubBackend};
+    use crate::theme::Theme;
     use crate::work_item::{
-        BackendType, CheckStatus, PrInfo, PrState, RepoAssociation, ReviewDecision,
-        UnlinkedPr, WorkItem, WorkItemError, WorkItemId, WorkItemStatus,
+        BackendType, CheckStatus, PrInfo, PrState, RepoAssociation, ReviewDecision, UnlinkedPr,
+        WorkItem, WorkItemError, WorkItemId, WorkItemStatus,
     };
-    use crate::work_item_backend::{BackendError, WorkItemBackend, WorkItemRecord,
-        CreateWorkItem};
-    use super::draw;
+    use crate::work_item_backend::{BackendError, CreateWorkItem, WorkItemBackend, WorkItemRecord};
+    use ratatui_core::{backend::TestBackend, terminal::Terminal};
+    use std::path::PathBuf;
 
     /// Helper: render the app into a TestBackend and return the buffer as a string.
     fn render(app: &App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default_theme();
         terminal
-            .draw(|frame| draw(frame, app))
+            .draw(|frame: &mut ratatui_core::terminal::Frame<'_>| {
+                draw_to_buffer(frame.area(), frame.buffer_mut(), app, &theme)
+            })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         let mut lines = Vec::new();
@@ -803,10 +1031,7 @@ mod snapshot_tests {
 
     /// Create an App with predefined work items and unlinked PRs
     /// without going through the backend.
-    fn app_with_items(
-        work_items: Vec<WorkItem>,
-        unlinked_prs: Vec<UnlinkedPr>,
-    ) -> App {
+    fn app_with_items(work_items: Vec<WorkItem>, unlinked_prs: Vec<UnlinkedPr>) -> App {
         let mut app = App::new();
         app.work_items = work_items;
         app.unlinked_prs = unlinked_prs;
@@ -885,15 +1110,13 @@ mod snapshot_tests {
 
     #[test]
     fn work_item_selected_no_session() {
-        let items = vec![
-            make_work_item(
-                "todo-1",
-                "Fix authentication bug",
-                WorkItemStatus::Todo,
-                Some(make_pr_info(14, CheckStatus::Passing)),
-                1,
-            ),
-        ];
+        let items = vec![make_work_item(
+            "todo-1",
+            "Fix authentication bug",
+            WorkItemStatus::Todo,
+            Some(make_pr_info(14, CheckStatus::Passing)),
+            1,
+        )];
         let mut app = app_with_items(items, vec![]);
         // Select the first work item entry (index 1, since index 0 is the
         // TODO group header).
@@ -903,18 +1126,14 @@ mod snapshot_tests {
 
     #[test]
     fn unlinked_pr_selected() {
-        let items = vec![
-            make_work_item(
-                "prog-1",
-                "Active feature",
-                WorkItemStatus::InProgress,
-                Some(make_pr_info(30, CheckStatus::Passing)),
-                1,
-            ),
-        ];
-        let unlinked = vec![
-            make_unlinked_pr("fix-typo", 45, false),
-        ];
+        let items = vec![make_work_item(
+            "prog-1",
+            "Active feature",
+            WorkItemStatus::InProgress,
+            Some(make_pr_info(30, CheckStatus::Passing)),
+            1,
+        )];
+        let unlinked = vec![make_unlinked_pr("fix-typo", 45, false)];
         let mut app = app_with_items(items, unlinked);
         // Select the unlinked item (index 1, since index 0 is UNLINKED header).
         app.selected_item = Some(1);
@@ -926,15 +1145,13 @@ mod snapshot_tests {
         // We cannot easily create a real session in tests, so we test the
         // "no session" case and the welcome message case instead.
         // The focused border styling is tested here via focus state.
-        let items = vec![
-            make_work_item(
-                "todo-1",
-                "Fix authentication bug",
-                WorkItemStatus::Todo,
-                None,
-                1,
-            ),
-        ];
+        let items = vec![make_work_item(
+            "todo-1",
+            "Fix authentication bug",
+            WorkItemStatus::Todo,
+            None,
+            1,
+        )];
         let mut app = app_with_items(items, vec![]);
         app.selected_item = Some(1);
         app.focus = FocusPanel::Right;
@@ -945,13 +1162,7 @@ mod snapshot_tests {
     fn work_item_with_context_bar() {
         use crate::work_item::IssueInfo;
         use crate::work_item::IssueState;
-        let mut wi = make_work_item(
-            "ctx-1",
-            "Fix resize bug",
-            WorkItemStatus::Todo,
-            None,
-            1,
-        );
+        let mut wi = make_work_item("ctx-1", "Fix resize bug", WorkItemStatus::Todo, None, 1);
         // Add issue with labels to trigger the context bar.
         wi.repo_associations[0].issue = Some(IssueInfo {
             number: 42,
@@ -983,13 +1194,7 @@ mod snapshot_tests {
     fn work_item_context_bar_with_status() {
         use crate::work_item::IssueInfo;
         use crate::work_item::IssueState;
-        let mut wi = make_work_item(
-            "ctx-3",
-            "Fix resize bug",
-            WorkItemStatus::Todo,
-            None,
-            1,
-        );
+        let mut wi = make_work_item("ctx-3", "Fix resize bug", WorkItemStatus::Todo, None, 1);
         wi.repo_associations[0].issue = Some(IssueInfo {
             number: 42,
             title: "Fix resize bug".into(),
@@ -1070,15 +1275,13 @@ mod snapshot_tests {
 
     #[test]
     fn work_item_list_with_unlinked() {
-        let items = vec![
-            make_work_item(
-                "prog-1",
-                "Active feature",
-                WorkItemStatus::InProgress,
-                Some(make_pr_info(30, CheckStatus::Passing)),
-                1,
-            ),
-        ];
+        let items = vec![make_work_item(
+            "prog-1",
+            "Active feature",
+            WorkItemStatus::InProgress,
+            Some(make_pr_info(30, CheckStatus::Passing)),
+            1,
+        )];
         let unlinked = vec![
             make_unlinked_pr("fix-typo", 45, false),
             make_unlinked_pr("update-deps", 12, true),
@@ -1126,6 +1329,53 @@ mod snapshot_tests {
         // Actually: TODO(0) header at 0, empty at 1, IN PROGRESS(1) header
         // at 2, work item at 3.
         app.selected_item = Some(3);
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn create_dialog_default_view() {
+        use crate::create_dialog::CreateDialogFocus;
+
+        let mut app = App::new();
+        let repos = vec![
+            PathBuf::from("/Volumes/X10/Projects/workbridge"),
+            PathBuf::from("/Volumes/X10/Projects/other-repo"),
+        ];
+        app.create_dialog.open(
+            &repos,
+            Some(&PathBuf::from("/Volumes/X10/Projects/workbridge")),
+        );
+        assert!(app.create_dialog.visible);
+        assert_eq!(app.create_dialog.focus_field, CreateDialogFocus::Title);
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn create_dialog_with_input_and_repos_focused() {
+        use crate::create_dialog::CreateDialogFocus;
+
+        let mut app = App::new();
+        let repos = vec![
+            PathBuf::from("/repo/alpha"),
+            PathBuf::from("/repo/beta"),
+            PathBuf::from("/repo/gamma"),
+        ];
+        app.create_dialog
+            .open(&repos, Some(&PathBuf::from("/repo/beta")));
+        // Type a title
+        app.create_dialog.title_input.set_text("My feature");
+        // Focus on repos
+        app.create_dialog.focus_field = CreateDialogFocus::Repos;
+        app.create_dialog.repo_cursor = 1; // beta is selected
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn create_dialog_with_error() {
+        let mut app = App::new();
+        let repos = vec![PathBuf::from("/repo/only")];
+        app.create_dialog.open(&repos, None);
+        app.create_dialog.error_message = Some("Title cannot be empty".to_string());
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 }

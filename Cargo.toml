@@ -4,9 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = "0.28"
-tui-term = "0.2"
+tui-term = "0.3"
 vt100 = "0.15"
 libc = "0.2"
 signal-hook = "0.3"
@@ -16,6 +14,14 @@ toml = "0.8"
 regex = "1"
 uuid = { version = "1", features = ["v4"] }
 directories = "5"
+rat-salsa = "4"
+rat-widget = "3"
+rat-event = "2"
+rat-focus = "2"
+crossbeam-channel = "0.5"
+ratatui-core = "0.1"
+ratatui-crossterm = "0.1"
+ratatui-widgets = "0.3"
 
 [dev-dependencies]
 insta = "1"

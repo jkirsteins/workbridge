@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Check for unstaged changes
+if ! git diff --quiet; then
+    echo "ERROR: You have unstaged changes. Please stage or stash them before pushing."
+    git diff --stat
+    exit 1
+fi
+
+# Check for untracked files
+untracked=$(git ls-files --others --exclude-standard)
+if [ -n "$untracked" ]; then
+    echo "ERROR: You have untracked files. Please add, stash, or .gitignore them before pushing."
+    echo "$untracked"
+    exit 1
+fi
+
+echo "=== pre-push: running tests ==="
+cargo test --all-features
+echo "All tests passed."

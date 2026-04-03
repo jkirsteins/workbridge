@@ -1,10 +1,12 @@
 mod app;
 mod assembly;
 mod config;
+mod create_dialog;
 mod event;
 mod fetcher;
 mod github_client;
 mod layout;
+mod salsa;
 mod session;
 mod theme;
 mod ui;
@@ -12,48 +14,17 @@ mod work_item;
 mod work_item_backend;
 mod worktree_service;
 
-use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicBool;
 
-use crossterm::{
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{Terminal, backend::CrosstermBackend};
+use rat_salsa::RunConfig;
+use rat_salsa::poll::{PollCrossterm, PollRendered, PollTimers};
 
 use app::App;
 use config::{ConfigProvider, FileConfigProvider};
 use github_client::GhCliClient;
+use salsa::{AppError, AppEvent, Global};
 use worktree_service::GitWorktreeService;
-
-/// RAII guard that restores the terminal on drop.
-///
-/// Session cleanup is handled by the graceful shutdown flow in the main
-/// loop. This guard only restores the terminal. If we reach Drop via a
-/// panic, individual Session Drop impls will SIGKILL their children.
-struct TerminalGuard {
-    app: Option<App>,
-}
-
-impl TerminalGuard {
-    fn app_mut(&mut self) -> &mut App {
-        self.app.as_mut().expect("TerminalGuard must always own an App")
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        // Restore the terminal so the user gets a usable shell back.
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        // Sessions are cleaned up by their own Drop impls (SIGKILL)
-        // if we reach here via panic. Normal exit already handled
-        // shutdown in the main loop.
-    }
-}
 
 /// Handle CLI subcommands. Returns true if a subcommand was handled (caller
 /// should exit), false if the TUI should launch.
@@ -209,15 +180,13 @@ fn print_repo_list(cfg: &config::Config, show_all: bool) {
             let all_count = cfg.all_repos().len();
             let unmanaged = all_count.saturating_sub(active.len());
             if unmanaged > 0 {
-                println!(
-                    "\n{unmanaged} repo(s) available but unmanaged. Use --all to see all."
-                );
+                println!("\n{unmanaged} repo(s) available but unmanaged. Use --all to see all.");
             }
         }
     }
 }
 
-fn main() -> io::Result<()> {
+fn main() -> Result<(), AppError> {
     let args: Vec<String> = std::env::args().collect();
 
     // CLI subcommands: handle before TUI setup.
@@ -245,6 +214,7 @@ fn main() -> io::Result<()> {
         };
     let worktree_service: Arc<dyn worktree_service::WorktreeService + Send + Sync> =
         Arc::new(GitWorktreeService);
+    let github_client: Arc<dyn github_client::GithubClient + Send + Sync> = Arc::new(GhCliClient);
 
     let mut app = App::with_config_and_worktree_service(
         cfg,
@@ -279,219 +249,58 @@ fn main() -> io::Result<()> {
         }
     }
 
-    // Start background fetcher for active repos with git directories.
-    // Use the canonicalized active_repo_cache so fetcher keys match
-    // assembly lookups (F-1 fix: symlinked paths resolve consistently).
-    let active_repos: Vec<PathBuf> = app
-        .active_repo_cache
-        .iter()
-        .filter(|r| r.git_dir_present)
-        .map(|r| r.path.clone())
-        .collect();
-    let github_client: Arc<dyn github_client::GithubClient + Send + Sync> =
-        Arc::new(GhCliClient);
-
-    let extra_branches = app.extra_branches_from_backend();
-    let mut fetcher_handle = if !active_repos.is_empty() {
-        let (rx, handle) = fetcher::start_with_extra_branches(
-            active_repos,
-            Arc::clone(&worktree_service),
-            Arc::clone(&github_client),
-            app.config.defaults.branch_issue_pattern.clone(),
-            extra_branches,
-        );
-        app.fetch_rx = Some(rx);
-        Some(handle)
-    } else {
-        None
-    };
-
-    // Install a panic hook that restores the terminal before printing the panic.
-    // Child processes are cleaned up automatically when the PTY master fd closes
-    // (the OS sends SIGHUP to the process group).
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        // Best-effort terminal restore - ignore errors since we are panicking.
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-
-        // Invoke the default panic handler so the user sees the backtrace.
-        default_hook(info);
-    }));
-
     // Install SIGTERM and SIGINT handlers using an atomic flag.
-    // When either signal is received, the flag is set and the main loop
-    // initiates the same graceful shutdown path as keyboard quit.
+    // When either signal is received, the flag is set and the timer
+    // callback initiates the same graceful shutdown path as keyboard quit.
     //
     // Note: AtomicBool can coalesce two rapid signals into one observed
-    // event (both set the flag before the main loop reads it). This means
+    // event (both set the flag before the timer reads it). This means
     // two quick SIGTERMs could start graceful shutdown instead of force-
     // killing. This is acceptable because the 10-second shutdown deadline
-    // handles escalation automatically - a supervisor that sends SIGTERM
-    // and then waits will see the process exit within 10s regardless.
+    // handles escalation automatically.
     let signal_received = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&signal_received))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&signal_received))?;
 
-    // Create the RAII guard BEFORE enabling raw mode so that any failure during
-    // terminal setup triggers cleanup on early return via ?.
-    let mut guard = TerminalGuard {
-        app: Some(app),
+    let mut global = Global {
+        ctx: Default::default(),
+        theme: theme::Theme::default_theme(),
+        signal_received,
+        worktree_service,
+        github_client,
     };
 
-    // Terminal setup: enable raw mode and switch to alternate screen.
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // Disable mouse capture and keyboard enhancements. Workbridge doesn't
+    // use mouse input, and PTY programs may expect mouse events. Keyboard
+    // enhancements change how Ctrl+] is reported and would break the
+    // existing key handling.
+    let term_init = rat_salsa::TermInit {
+        mouse_capture: false,
+        keyboard_enhancements: ratatui_crossterm::crossterm::event::KeyboardEnhancementFlags::empty(
+        ),
+        ..Default::default()
+    };
 
-    // Set initial pane dimensions from the terminal size.
-    let size = terminal.size()?;
-    let app = guard.app_mut();
-    let bottom_rows = u16::from(app.status_message.is_some())
-        + u16::from(app.selected_work_item_context().is_some());
-    let pl = layout::compute(size.width, size.height, bottom_rows);
-    app.pane_cols = pl.pane_cols;
-    app.pane_rows = pl.pane_rows;
-
-    let mut last_tick = Instant::now();
-
-    loop {
-        let app = guard.app_mut();
-
-        // Render the UI.
-        terminal.draw(|frame| ui::draw(frame, app))?;
-
-        let app = guard.app_mut();
-
-        // Poll for events or tick.
-        let tick_occurred = event::poll_and_handle(app, &mut last_tick)?;
-
-        // Liveness check runs on periodic ticks. Reader threads handle
-        // PTY output continuously - the UI thread only needs to check
-        // if child processes have exited.
-        if tick_occurred {
-            app.check_liveness();
-
-            // Drain fetch results and reassemble if new data arrived.
-            if app.drain_fetch_results() {
-                app.reassemble_work_items();
-                app.build_display_list();
-            }
-
-            // Surface any queued fetch errors now that the status bar
-            // may be free. Shows one per tick to avoid overwhelming.
-            app.drain_pending_fetch_errors();
-
-            // Restart the background fetcher if repo management changed.
-            if app.fetcher_repos_changed {
-                app.fetcher_repos_changed = false;
-                app.fetcher_disconnected = false;
-                // Stop the old fetcher (non-blocking: just sets stop flag).
-                // Old threads will exit when they check the flag or when
-                // their channel send fails (receiver dropped below).
-                if let Some(handle) = fetcher_handle.take() {
-                    handle.stop();
-                }
-                app.fetch_rx = None;
-                // Start a new fetcher with the updated repo list.
-                // Use active_repo_cache (already canonicalized) so fetcher
-                // keys match assembly lookups.
-                let new_repos: Vec<PathBuf> = app
-                    .active_repo_cache
-                    .iter()
-                    .filter(|r| r.git_dir_present)
-                    .map(|r| r.path.clone())
-                    .collect();
-                // Prune stale repo_data entries for repos that are no
-                // longer active. Without this, unmanaged repos keep
-                // rendering their old fetched data.
-                app.repo_data.retain(|k, _| new_repos.contains(k));
-                // Reassemble immediately so stale data is cleared from
-                // the display before the new fetcher sends fresh results.
-                app.reassemble_work_items();
-                app.build_display_list();
-                if !new_repos.is_empty() {
-                    let new_extra = app.extra_branches_from_backend();
-                    let (rx, handle) = fetcher::start_with_extra_branches(
-                        new_repos,
-                        Arc::clone(&worktree_service),
-                        Arc::clone(&github_client),
-                        app.config.defaults.branch_issue_pattern.clone(),
-                        new_extra,
-                    );
-                    app.fetch_rx = Some(rx);
-                    fetcher_handle = Some(handle);
-                }
-            }
-        }
-
-        // Check for external signals (SIGTERM, SIGINT).
-        if signal_received.swap(false, Ordering::Relaxed) {
-            if app.shutting_down {
-                // Second signal during shutdown - force kill and exit.
-                app.force_kill_all();
-                break;
-            } else {
-                // First signal - initiate graceful shutdown.
-                app.send_sigterm_all();
-                app.shutting_down = true;
-                app.shutdown_started = Some(Instant::now());
-                app.status_message =
-                    Some("Waiting for sessions (force quit in 10s, or press Q)".into());
-                if app.all_dead() {
-                    break;
-                }
-            }
-        }
-
-        if app.shutting_down {
-            // During shutdown, exit once all sessions have died.
-            if app.all_dead() {
-                break;
-            }
-            // Force quit (Q during shutdown) sets should_quit.
-            if app.should_quit {
-                break;
-            }
-            // Check the 10-second deadline. If elapsed, force-kill and exit.
-            if let Some(started) = app.shutdown_started {
-                let elapsed = started.elapsed();
-                if elapsed >= Duration::from_secs(10) {
-                    app.force_kill_all();
-                    break;
-                }
-                // Update the status bar with remaining seconds.
-                let remaining = 10u64.saturating_sub(elapsed.as_secs());
-                app.status_message = Some(format!(
-                    "Waiting for sessions (force quit in {remaining}s, or press Q)"
-                ));
-            }
-            continue;
-        }
-
-        if app.should_quit {
-            // Initiate graceful shutdown: send SIGTERM to all sessions,
-            // then continue the main loop so the UI stays responsive
-            // while children handle the signal.
-            app.send_sigterm_all();
-            app.shutting_down = true;
-            app.shutdown_started = Some(Instant::now());
-            app.should_quit = false;
-            app.status_message =
-                Some("Waiting for sessions (force quit in 10s, or press Q)".into());
-            // If all sessions are already dead (or none exist), exit now.
-            if app.all_dead() {
-                break;
-            }
-        }
-    }
+    // Run the rat-salsa event loop. This handles terminal setup/teardown
+    // automatically (raw mode, alternate screen, panic hook for restore).
+    rat_salsa::run_tui(
+        salsa::app_init,
+        salsa::app_render,
+        salsa::app_event,
+        salsa::app_error,
+        &mut global,
+        &mut app,
+        RunConfig::<AppEvent, AppError>::default()?
+            .poll(PollCrossterm)
+            .poll(PollTimers::default())
+            .poll(PollRendered)
+            .term_init(term_init),
+    )?;
 
     // Stop the background fetcher (non-blocking: just sets stop flag).
     // Threads will exit on their own when they check the flag or when
     // their channel send fails. No joining - no UI freeze on quit.
-    if let Some(handle) = fetcher_handle {
+    if let Some(handle) = app.fetcher_handle.take() {
         handle.stop();
     }
 

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== pre-commit: checking format ==="
+cargo fmt -- --check
+echo "Format OK."
+
+echo "=== pre-commit: running clippy ==="
+cargo clippy --all-targets --all-features -- -D warnings
+echo "Clippy OK."

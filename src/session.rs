@@ -428,20 +428,26 @@ mod tests {
     fn kill_is_idempotent() {
         // Spawn a real child process (sleep) so we can test the full
         // kill -> reap -> child=None -> second call is no-op flow.
-        let mut session = Session::spawn(80, 24, None, &["sleep", "60"])
-            .expect("failed to spawn session");
+        let mut session =
+            Session::spawn(80, 24, None, &["sleep", "60"]).expect("failed to spawn session");
 
         // Precondition: child starts as Some.
         assert!(session.child.is_some(), "child should start as Some");
 
         // First kill: should signal and reap the child, then set child to None.
         session.kill();
-        assert!(session.child.is_none(), "child should be None after first kill()");
+        assert!(
+            session.child.is_none(),
+            "child should be None after first kill()"
+        );
 
         // Second kill: should return immediately without signaling.
         // If this were not idempotent, it could signal a reused PID/PGID.
         session.kill();
-        assert!(session.child.is_none(), "child should remain None after second kill()");
+        assert!(
+            session.child.is_none(),
+            "child should remain None after second kill()"
+        );
 
         // Drop will call kill() a third time - also a no-op.
     }
@@ -449,8 +455,8 @@ mod tests {
     #[test]
     fn is_alive_lifecycle() {
         // Spawn a short-lived process so we can observe alive -> dead.
-        let mut session = Session::spawn(80, 24, None, &["sleep", "0"])
-            .expect("failed to spawn session");
+        let mut session =
+            Session::spawn(80, 24, None, &["sleep", "0"]).expect("failed to spawn session");
 
         // Right after spawn the child should still be alive (or may have
         // already exited - sleep 0 is instant). Either way, after waiting
@@ -460,12 +466,21 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
 
         // After the process exits, is_alive should return false.
-        assert!(!session.is_alive(), "child should be dead after sleep 0 exits");
+        assert!(
+            !session.is_alive(),
+            "child should be dead after sleep 0 exits"
+        );
 
         // Once dead, child should be consumed (taken).
-        assert!(session.child.is_none(), "child should be None after confirmed dead");
+        assert!(
+            session.child.is_none(),
+            "child should be None after confirmed dead"
+        );
 
         // Calling is_alive again on a reaped child should return false.
-        assert!(!session.is_alive(), "is_alive should return false after reap");
+        assert!(
+            !session.is_alive(),
+            "is_alive should return false after reap"
+        );
     }
 }

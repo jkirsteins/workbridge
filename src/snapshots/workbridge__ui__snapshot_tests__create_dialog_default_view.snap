@@ -1,0 +1,28 @@
+---
+source: src/ui.rs
+expression: "render(&app, 80, 24)"
+---
+┌ Work Items ──────┐┌ Claude Code ─────────────────────────────────────────────┐
+│TODO (0)          ││                                                          │
+│  No work items   ││  Welcome to workbridge                                   │
+│IN PROGRESS (0)   ││                                                          │
+│  No work items┌ Create Work Item ────────────────────────────┐               │
+│               │                                              │               │
+│               │ Title:                                       │               │
+│               │                                              │               │
+│               │                                              │               │
+│               │ Repos:                                       │               │
+│               │  [x] /Volumes/X10/Projects/workbridge        │               │
+│               │  [ ] /Volumes/X10/Projects/other-repo        │               │
+│               │                                              │               │
+│               │ Branch (optional):                           │               │
+│               │  (empty)                                     │               │
+│               │                                              │               │
+│               │                                              │               │
+│               │ Enter: Create | Esc: Cancel | Tab: Next fiel │               │
+│               │                                              │               │
+│               └──────────────────────────────────────────────┘               │
+│                  ││                                                          │
+│                  ││                                                          │
+│                  ││                                                          │
+└──────────────────┘└──────────────────────────────────────────────────────────┘

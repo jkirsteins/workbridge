@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Instant;
 
 use crate::assembly;
 use crate::config::{Config, ConfigProvider, RepoEntry, RepoSource};
-use crate::session::Session;
+use crate::create_dialog::CreateDialog;
 use crate::github_client::GithubError;
+use crate::session::Session;
 use crate::work_item::{
-    FetchMessage, RepoFetchResult, SessionEntry, UnlinkedPr, WorkItem, WorkItemId, WorkItemStatus,
+    FetchMessage, FetcherHandle, RepoFetchResult, SessionEntry, UnlinkedPr, WorkItem, WorkItemId,
+    WorkItemStatus,
 };
 use crate::work_item_backend::{
     BackendError, CreateWorkItem, RepoAssociationRecord, WorkItemBackend,
@@ -92,6 +94,8 @@ pub struct App {
     pub settings_available_selected: usize,
     /// Which list has focus inside the settings overlay.
     pub settings_list_focus: SettingsListFocus,
+    /// State for the work item creation modal dialog.
+    pub create_dialog: CreateDialog,
 
     // -- Work item state --
     /// Backend for persisting work item records.
@@ -143,6 +147,10 @@ pub struct App {
     /// sender threads exited). Surfaced in the status bar so the user
     /// knows background updates have stopped.
     pub fetcher_disconnected: bool,
+    /// Handle to the background fetcher threads. Used to stop the fetcher
+    /// when repos change or when the app shuts down. Managed by the
+    /// rat-salsa event callback in salsa.rs.
+    pub fetcher_handle: Option<FetcherHandle>,
 }
 
 impl App {
@@ -200,6 +208,7 @@ impl App {
             settings_repo_selected: 0,
             settings_available_selected: 0,
             settings_list_focus: SettingsListFocus::Managed,
+            create_dialog: CreateDialog::new(),
             backend,
             worktree_service,
             work_items: Vec::new(),
@@ -217,6 +226,7 @@ impl App {
             selected_unlinked_branch: None,
             pending_fetch_errors: Vec::new(),
             fetcher_disconnected: false,
+            fetcher_handle: None,
         };
         app.reassemble_work_items();
         app.build_display_list();
@@ -262,11 +272,7 @@ impl App {
     /// Build the list of available (unmanaged) repos: all repos minus active.
     /// Used by the settings overlay to show what can be managed.
     pub fn available_repos(&self) -> Vec<RepoEntry> {
-        let active_paths: Vec<_> = self
-            .active_repo_cache
-            .iter()
-            .map(|e| &e.path)
-            .collect();
+        let active_paths: Vec<_> = self.active_repo_cache.iter().map(|e| &e.path).collect();
         self.config
             .all_repos()
             .into_iter()
@@ -368,8 +374,7 @@ impl App {
         let new_available = self.available_repos();
         let new_len = new_available.len();
         if new_len > 0 {
-            self.settings_available_selected =
-                self.settings_available_selected.min(new_len - 1);
+            self.settings_available_selected = self.settings_available_selected.min(new_len - 1);
         } else {
             self.settings_available_selected = 0;
         }
@@ -490,17 +495,15 @@ impl App {
                             GithubError::CliNotFound => {
                                 if !self.gh_cli_not_found_shown {
                                     self.gh_cli_not_found_shown = true;
-                                    self.status_message = Some(
-                                        "gh CLI not found - GitHub features disabled".into(),
-                                    );
+                                    self.status_message =
+                                        Some("gh CLI not found - GitHub features disabled".into());
                                 }
                             }
                             GithubError::AuthRequired => {
                                 if !self.gh_auth_required_shown {
                                     self.gh_auth_required_shown = true;
-                                    self.status_message = Some(
-                                        "gh auth required - run 'gh auth login'".into(),
-                                    );
+                                    self.status_message =
+                                        Some("gh auth required - run 'gh auth login'".into());
                                 }
                             }
                             _ => {
@@ -665,9 +668,7 @@ impl App {
                 }
             }
         }
-        if !restored
-            && let Some(ref target) = self.selected_unlinked_branch
-        {
+        if !restored && let Some(ref target) = self.selected_unlinked_branch {
             let (target_repo, target_branch) = target;
             for (i, entry) in self.display_list.iter().enumerate() {
                 if let DisplayEntry::UnlinkedItem(ul_idx) = entry
@@ -707,8 +708,7 @@ impl App {
             }
             Some(DisplayEntry::UnlinkedItem(ul_idx)) => {
                 if let Some(ul) = self.unlinked_prs.get(*ul_idx) {
-                    self.selected_unlinked_branch =
-                        Some((ul.repo_path.clone(), ul.branch.clone()));
+                    self.selected_unlinked_branch = Some((ul.repo_path.clone(), ul.branch.clone()));
                 }
             }
             _ => {}
@@ -811,8 +811,7 @@ impl App {
                 .is_some_and(|entry| entry.alive);
             if is_alive {
                 self.focus = FocusPanel::Right;
-                self.status_message =
-                    Some("Right panel focused - press Ctrl+] to return".into());
+                self.status_message = Some("Right panel focused - press Ctrl+] to return".into());
                 return;
             }
             self.sessions.remove(&work_item_id);
@@ -830,17 +829,18 @@ impl App {
             None => {
                 // Try to find an association with a branch name and auto-create
                 // a worktree for it.
-                let branch_assoc = wi
-                    .repo_associations
-                    .iter()
-                    .find(|a| a.branch.is_some());
+                let branch_assoc = wi.repo_associations.iter().find(|a| a.branch.is_some());
                 match branch_assoc {
                     Some(assoc) => {
                         let branch = assoc.branch.as_ref().unwrap();
                         let repo_path = &assoc.repo_path;
                         // Fetch the branch from origin first to ensure the
                         // local ref points at the correct commit.
-                        if self.worktree_service.fetch_branch(repo_path, branch).is_err() {
+                        if self
+                            .worktree_service
+                            .fetch_branch(repo_path, branch)
+                            .is_err()
+                        {
                             self.status_message = Some(format!(
                                 "Could not fetch branch '{}' from origin. Manual checkout required.",
                                 branch,
@@ -852,7 +852,10 @@ impl App {
                             branch,
                             &self.config.defaults.worktree_dir,
                         );
-                        match self.worktree_service.create_worktree(repo_path, branch, &wt_target) {
+                        match self
+                            .worktree_service
+                            .create_worktree(repo_path, branch, &wt_target)
+                        {
                             Ok(wt_info) => wt_info.path,
                             Err(e) => {
                                 self.status_message = Some(format!(
@@ -864,9 +867,7 @@ impl App {
                         }
                     }
                     None => {
-                        self.status_message = Some(
-                            "Set a branch name to start working".into(),
-                        );
+                        self.status_message = Some("Set a branch name to start working".into());
                         return;
                     }
                 }
@@ -883,8 +884,7 @@ impl App {
                 };
                 self.sessions.insert(work_item_id, entry);
                 self.focus = FocusPanel::Right;
-                self.status_message =
-                    Some("Right panel focused - press Ctrl+] to return".into());
+                self.status_message = Some("Right panel focused - press Ctrl+] to return".into());
             }
             Err(e) => {
                 self.status_message = Some(format!("Error spawning session: {e}"));
@@ -929,7 +929,10 @@ impl App {
                             &branch,
                             &self.config.defaults.worktree_dir,
                         );
-                        match self.worktree_service.create_worktree(&repo_path, &branch, &wt_target) {
+                        match self
+                            .worktree_service
+                            .create_worktree(&repo_path, &branch, &wt_target)
+                        {
                             Ok(_) => format!("Imported: {title} (worktree created)"),
                             Err(e) => format!("Imported: {title} (worktree not created: {e})"),
                         }
@@ -955,12 +958,15 @@ impl App {
     /// Create a new work item with the current working directory as the
     /// repo association. Validates that the CWD is inside a managed repo
     /// before persisting.
+    ///
+    /// Note: the TUI now uses `create_work_item_with()` via the creation
+    /// dialog. This method is retained for tests and potential CLI use.
+    #[allow(dead_code)]
     pub fn create_work_item(&mut self) {
         let cwd = match std::env::current_dir() {
             Ok(p) => p,
             Err(e) => {
-                self.status_message =
-                    Some(format!("Cannot determine working directory: {e}"));
+                self.status_message = Some(format!("Cannot determine working directory: {e}"));
                 return;
             }
         };
@@ -995,6 +1001,74 @@ impl App {
             }
             Err(e) => {
                 self.status_message = Some(format!("Create error: {e}"));
+            }
+        }
+    }
+
+    /// Create a new work item with explicit parameters from the creation
+    /// dialog. Unlike `create_work_item()` which uses CWD and a hardcoded
+    /// title, this accepts user-provided title, selected repos, and an
+    /// optional branch name.
+    pub fn create_work_item_with(
+        &mut self,
+        title: String,
+        repos: Vec<PathBuf>,
+        branch: Option<String>,
+    ) -> Result<(), String> {
+        if repos.is_empty() {
+            let msg = "No repos selected".to_string();
+            self.status_message = Some(msg.clone());
+            return Err(msg);
+        }
+
+        // Filter out repos whose git directory is missing. This guards
+        // against stale cache entries or repos selected before their
+        // .git dir disappeared.
+        let valid_repos: Vec<PathBuf> = repos
+            .into_iter()
+            .filter(|repo_path| {
+                self.active_repo_cache
+                    .iter()
+                    .any(|r| r.path == *repo_path && r.git_dir_present)
+            })
+            .collect();
+
+        if valid_repos.is_empty() {
+            let msg = "No selected repos have a git directory".to_string();
+            self.status_message = Some(msg.clone());
+            return Err(msg);
+        }
+
+        let has_branch = branch.is_some();
+
+        let repo_associations: Vec<RepoAssociationRecord> = valid_repos
+            .into_iter()
+            .map(|repo_path| RepoAssociationRecord {
+                repo_path,
+                branch: branch.clone(),
+            })
+            .collect();
+
+        let request = CreateWorkItem {
+            title: title.clone(),
+            status: WorkItemStatus::Todo,
+            repo_associations,
+        };
+
+        match self.backend.create(request) {
+            Ok(_record) => {
+                self.reassemble_work_items();
+                self.build_display_list();
+                if has_branch {
+                    self.fetcher_repos_changed = true;
+                }
+                self.status_message = Some(format!("Created: {title}"));
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("Create error: {e}");
+                self.status_message = Some(msg.clone());
+                Err(msg)
             }
         }
     }
@@ -1078,9 +1152,7 @@ impl App {
     /// path. These are branches recorded in work items that may not have
     /// worktrees yet. The fetcher uses them to also extract and fetch
     /// issue metadata for branch-only work items.
-    pub fn extra_branches_from_backend(
-        &self,
-    ) -> std::collections::HashMap<PathBuf, Vec<String>> {
+    pub fn extra_branches_from_backend(&self) -> std::collections::HashMap<PathBuf, Vec<String>> {
         let mut map: std::collections::HashMap<PathBuf, Vec<String>> =
             std::collections::HashMap::new();
         let list_result = match self.backend.list() {
@@ -1137,7 +1209,8 @@ impl WorktreeService for StubWorktreeService {
     fn list_worktrees(
         &self,
         _repo_path: &std::path::Path,
-    ) -> Result<Vec<crate::worktree_service::WorktreeInfo>, crate::worktree_service::WorktreeError> {
+    ) -> Result<Vec<crate::worktree_service::WorktreeInfo>, crate::worktree_service::WorktreeError>
+    {
         Ok(Vec::new())
     }
 
@@ -1340,7 +1413,8 @@ mod tests {
         let root = root.unwrap();
         let canonical_dir = std::fs::canonicalize(&dir).unwrap();
         assert_eq!(
-            root, canonical_dir,
+            root,
+            canonical_dir,
             "managed_repo_root should return the repo root {}, not the subdir {}",
             canonical_dir.display(),
             subdir.display(),
@@ -1354,9 +1428,7 @@ mod tests {
     /// be restarted to pick up new/removed extra branches.
     #[test]
     fn import_and_delete_set_fetcher_repos_changed() {
-        use crate::work_item::{
-            CheckStatus, PrInfo, PrState, ReviewDecision,
-        };
+        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
         use crate::work_item_backend::ListResult;
 
         /// Test backend that supports import and delete.
@@ -1458,6 +1530,78 @@ mod tests {
         );
     }
 
+    /// F-1: fetcher_repos_changed is set after creating a work item with a
+    /// branch. Without this, the fetcher never picks up the new branch for
+    /// issue metadata.
+    #[test]
+    fn create_with_branch_sets_fetcher_repos_changed() {
+        use crate::work_item_backend::ListResult;
+
+        struct CreateBackend;
+
+        impl WorkItemBackend for CreateBackend {
+            fn list(&self) -> Result<ListResult, BackendError> {
+                Ok(ListResult {
+                    records: Vec::new(),
+                    corrupt: Vec::new(),
+                })
+            }
+            fn create(
+                &self,
+                req: CreateWorkItem,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Ok(crate::work_item_backend::WorkItemRecord {
+                    id: WorkItemId::LocalFile(PathBuf::from("/tmp/new.json")),
+                    title: req.title.clone(),
+                    status: req.status.clone(),
+                    repo_associations: req.repo_associations,
+                })
+            }
+            fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn import(
+                &self,
+                _unlinked: &crate::work_item::UnlinkedPr,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not used".into()))
+            }
+            fn backend_type(&self) -> crate::work_item::BackendType {
+                crate::work_item::BackendType::LocalFile
+            }
+        }
+
+        let mut app = App::with_config(Config::default(), Box::new(CreateBackend));
+        app.active_repo_cache = vec![RepoEntry {
+            path: PathBuf::from("/repo"),
+            source: RepoSource::Explicit,
+            git_dir_present: true,
+        }];
+
+        // Create with a branch - flag should be set.
+        assert!(!app.fetcher_repos_changed);
+        let result = app.create_work_item_with(
+            "With branch".into(),
+            vec![PathBuf::from("/repo")],
+            Some("feature/test".into()),
+        );
+        assert!(result.is_ok());
+        assert!(
+            app.fetcher_repos_changed,
+            "fetcher_repos_changed should be true after creating with a branch",
+        );
+
+        // Reset and create without a branch - flag should NOT be set.
+        app.fetcher_repos_changed = false;
+        let result =
+            app.create_work_item_with("No branch".into(), vec![PathBuf::from("/repo")], None);
+        assert!(result.is_ok());
+        assert!(
+            !app.fetcher_repos_changed,
+            "fetcher_repos_changed should remain false when creating without a branch",
+        );
+    }
+
     /// F-3: PR list limit is 500, not the original 100.
     /// This is a documentation test - the actual limit is a string in
     /// the gh CLI command. We verify the constant through the source.
@@ -1467,7 +1611,7 @@ mod tests {
         // against regressions back to 100.
         let source = include_str!("github_client.rs");
         assert!(
-            source.contains(r#""--limit", "500""#),
+            source.contains(r#""500""#) && source.contains(r#""--limit""#),
             "PR list limit should be 500 to avoid silent truncation in busy repos",
         );
     }
@@ -1508,7 +1652,8 @@ mod tests {
         let cached_path = &app.active_repo_cache[0].path;
         let canonical_real = std::fs::canonicalize(&real_path).unwrap();
         assert_eq!(
-            *cached_path, canonical_real,
+            *cached_path,
+            canonical_real,
             "active_repo_cache should contain canonical path {}, got {}",
             canonical_real.display(),
             cached_path.display(),
@@ -1602,9 +1747,7 @@ mod tests {
         tx.send(FetchMessage::RepoData(crate::work_item::RepoFetchResult {
             repo_path: repo_path.clone(),
             github_remote: None,
-            worktrees: Err(WorktreeError::GitError(
-                "not a git repository".into(),
-            )),
+            worktrees: Err(WorktreeError::GitError("not a git repository".into())),
             prs: Ok(vec![]),
             issues: vec![],
         }))
@@ -1632,9 +1775,7 @@ mod tests {
         tx.send(FetchMessage::RepoData(crate::work_item::RepoFetchResult {
             repo_path: repo_path.clone(),
             github_remote: None,
-            worktrees: Err(WorktreeError::GitError(
-                "still broken".into(),
-            )),
+            worktrees: Err(WorktreeError::GitError("still broken".into())),
             prs: Ok(vec![]),
             issues: vec![],
         }))
@@ -1788,8 +1929,7 @@ mod tests {
     fn backend_list_returns_sorted_records() {
         let dir = std::env::temp_dir().join("workbridge-test-r5-f1-sorted");
         let _ = std::fs::remove_dir_all(&dir);
-        let backend =
-            crate::work_item_backend::LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = crate::work_item_backend::LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         // Create items with names that would sort differently than creation order.
         // File names are UUIDs, so we write files directly with known names.
@@ -1901,10 +2041,7 @@ mod tests {
         app.drain_fetch_results();
 
         // The status should remain unchanged.
-        assert_eq!(
-            app.status_message.as_deref(),
-            Some("something important"),
-        );
+        assert_eq!(app.status_message.as_deref(), Some("something important"),);
         // The error should be queued.
         assert_eq!(app.pending_fetch_errors.len(), 1);
         assert!(
@@ -1932,9 +2069,7 @@ mod tests {
     /// reassembly, selection must stay on the correct repo's PR.
     #[test]
     fn unlinked_selection_disambiguates_by_repo_path() {
-        use crate::work_item::{
-            CheckStatus, PrInfo, PrState, ReviewDecision,
-        };
+        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
 
         let mut app = App::new();
 
@@ -2102,9 +2237,7 @@ mod tests {
     /// branch, making the work item immediately sessionable.
     #[test]
     fn import_creates_worktree_for_branch() {
-        use crate::work_item::{
-            CheckStatus, PrInfo, PrState, ReviewDecision,
-        };
+        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
         use crate::work_item_backend::ListResult;
         use crate::worktree_service::{WorktreeError, WorktreeInfo};
 
@@ -2285,9 +2418,7 @@ mod tests {
     /// exists, but the user is told to check out manually.
     #[test]
     fn import_skips_worktree_when_fetch_fails() {
-        use crate::work_item::{
-            CheckStatus, PrInfo, PrState, ReviewDecision,
-        };
+        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
         use crate::work_item_backend::ListResult;
         use crate::worktree_service::{WorktreeError, WorktreeInfo};
 
@@ -2481,10 +2612,7 @@ mod tests {
 
         // Custom worktree_dir
         let path = App::worktree_target_path(&repo, "fix/auth-bug", "wt");
-        assert_eq!(
-            path,
-            PathBuf::from("/repos/myrepo/wt/fix-auth-bug"),
-        );
+        assert_eq!(path, PathBuf::from("/repos/myrepo/wt/fix-auth-bug"),);
 
         // Branch with no slashes
         let path = App::worktree_target_path(&repo, "simple-branch", ".worktrees");
@@ -2498,9 +2626,7 @@ mod tests {
     /// repo_path/worktree_dir/branch, not repo_path.parent()/<repo>-wt-<branch>.
     #[test]
     fn import_creates_worktree_under_config_worktree_dir() {
-        use crate::work_item::{
-            CheckStatus, PrInfo, PrState, ReviewDecision,
-        };
+        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
         use crate::work_item_backend::ListResult;
         use crate::worktree_service::{WorktreeError, WorktreeInfo};
 
@@ -2665,6 +2791,144 @@ mod tests {
             created[0].2,
             PathBuf::from("/repos/myrepo/my-worktrees/feature-login-page"),
             "worktree should be under repo_path/worktree_dir/sanitized-branch",
+        );
+    }
+
+    // -- Codex round regression tests --
+
+    /// F-3: create_work_item_with rejects repos where git_dir_present is false.
+    /// Even if a repo path is passed in the repos list, it should be filtered
+    /// out when the corresponding active_repo_cache entry has git_dir_present
+    /// set to false.
+    #[test]
+    fn create_work_item_with_rejects_repos_without_git_dir() {
+        use crate::work_item_backend::ListResult;
+
+        /// Backend that records create calls via a shared Arc.
+        struct RecordingBackend {
+            last_repos: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+        }
+
+        impl WorkItemBackend for RecordingBackend {
+            fn list(&self) -> Result<ListResult, BackendError> {
+                Ok(ListResult {
+                    records: Vec::new(),
+                    corrupt: Vec::new(),
+                })
+            }
+            fn create(
+                &self,
+                req: CreateWorkItem,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                *self.last_repos.lock().unwrap() = req
+                    .repo_associations
+                    .iter()
+                    .map(|r| r.repo_path.clone())
+                    .collect();
+                let record = crate::work_item_backend::WorkItemRecord {
+                    id: WorkItemId::LocalFile(PathBuf::from("/tmp/new.json")),
+                    title: req.title.clone(),
+                    status: req.status.clone(),
+                    repo_associations: req.repo_associations,
+                };
+                Ok(record)
+            }
+            fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn import(
+                &self,
+                _unlinked: &crate::work_item::UnlinkedPr,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not used".into()))
+            }
+            fn backend_type(&self) -> crate::work_item::BackendType {
+                crate::work_item::BackendType::LocalFile
+            }
+        }
+
+        let last_repos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut app = App::with_config(
+            Config::default(),
+            Box::new(RecordingBackend {
+                last_repos: Arc::clone(&last_repos),
+            }),
+        );
+
+        // Populate active_repo_cache with one repo that has git_dir and one
+        // that does not.
+        app.active_repo_cache = vec![
+            RepoEntry {
+                path: PathBuf::from("/repos/with-git"),
+                source: RepoSource::Explicit,
+                git_dir_present: true,
+            },
+            RepoEntry {
+                path: PathBuf::from("/repos/no-git"),
+                source: RepoSource::Explicit,
+                git_dir_present: false,
+            },
+        ];
+
+        // Attempt to create with both repos selected.
+        let result = app.create_work_item_with(
+            "Test item".into(),
+            vec![
+                PathBuf::from("/repos/with-git"),
+                PathBuf::from("/repos/no-git"),
+            ],
+            None,
+        );
+        assert!(result.is_ok(), "create should succeed for valid repos");
+
+        // The status message should indicate success.
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("Created"),
+            "expected success message, got: {msg}",
+        );
+
+        // Verify only the repo with git_dir_present was sent to the backend.
+        let repos = last_repos.lock().unwrap();
+        assert_eq!(
+            repos.len(),
+            1,
+            "backend should receive exactly one repo, got {}",
+            repos.len(),
+        );
+        assert_eq!(
+            repos[0],
+            PathBuf::from("/repos/with-git"),
+            "only the repo with git_dir_present should be included",
+        );
+    }
+
+    /// F-3: create_work_item_with returns error when ALL repos lack git_dir.
+    #[test]
+    fn create_work_item_with_errors_when_all_repos_lack_git_dir() {
+        let mut app = App::new();
+
+        // Populate cache with only repos missing git dirs.
+        app.active_repo_cache = vec![RepoEntry {
+            path: PathBuf::from("/repos/no-git"),
+            source: RepoSource::Explicit,
+            git_dir_present: false,
+        }];
+
+        let result = app.create_work_item_with(
+            "Test item".into(),
+            vec![PathBuf::from("/repos/no-git")],
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "create should fail when all repos lack git dir"
+        );
+
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("No selected repos have a git directory"),
+            "expected git directory error in status, got: {msg}",
         );
     }
 }

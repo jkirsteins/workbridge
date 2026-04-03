@@ -42,10 +42,7 @@ pub struct WorktreeInfo {
 /// GitWorktreeService (shells out to git CLI) and test mocks.
 pub trait WorktreeService: Send + Sync {
     /// List all worktrees for a repo.
-    fn list_worktrees(
-        &self,
-        repo_path: &Path,
-    ) -> Result<Vec<WorktreeInfo>, WorktreeError>;
+    fn list_worktrees(&self, repo_path: &Path) -> Result<Vec<WorktreeInfo>, WorktreeError>;
 
     /// Create a new worktree for a branch at the given target directory.
     /// Called when opening a session for a work item that has a branch but
@@ -69,25 +66,15 @@ pub trait WorktreeService: Send + Sync {
     ) -> Result<(), WorktreeError>;
 
     /// Get the default branch name (main, master, or configured) for a repo.
-    fn default_branch(
-        &self,
-        repo_path: &Path,
-    ) -> Result<String, WorktreeError>;
+    fn default_branch(&self, repo_path: &Path) -> Result<String, WorktreeError>;
 
     /// Get the GitHub remote (owner, repo) for a repo, if any.
-    fn github_remote(
-        &self,
-        repo_path: &Path,
-    ) -> Result<Option<(String, String)>, WorktreeError>;
+    fn github_remote(&self, repo_path: &Path) -> Result<Option<(String, String)>, WorktreeError>;
 
     /// Fetch a branch from origin so the local ref points at the correct
     /// commit. Returns Ok(()) if the fetch succeeds, Err if it fails
     /// (branch does not exist on origin, fork PR, network error, etc.).
-    fn fetch_branch(
-        &self,
-        repo_path: &Path,
-        branch: &str,
-    ) -> Result<(), WorktreeError>;
+    fn fetch_branch(&self, repo_path: &Path, branch: &str) -> Result<(), WorktreeError>;
 }
 
 /// GitWorktreeService shells out to the git CLI for worktree operations.
@@ -95,10 +82,7 @@ pub struct GitWorktreeService;
 
 impl GitWorktreeService {
     /// Run a git command with `-C repo_path` and return stdout on success.
-    fn run_git(
-        repo_path: &Path,
-        args: &[&str],
-    ) -> Result<String, WorktreeError> {
+    fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, WorktreeError> {
         let output = Command::new("git")
             .arg("-C")
             .arg(repo_path)
@@ -157,8 +141,12 @@ impl GitWorktreeService {
                 current_path = Some(PathBuf::from(path_str));
             } else if let Some(branch_ref) = line.strip_prefix("branch ") {
                 // Strip refs/heads/ prefix to get the short branch name.
-                current_branch =
-                    Some(branch_ref.strip_prefix("refs/heads/").unwrap_or(branch_ref).to_string());
+                current_branch = Some(
+                    branch_ref
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(branch_ref)
+                        .to_string(),
+                );
             } else if line == "detached" {
                 current_branch = None;
             }
@@ -188,7 +176,9 @@ impl GitWorktreeService {
         let worktrees = Self::parse_porcelain(&output);
         // Canonicalize the target path to handle symlinks (e.g. /tmp ->
         // /private/tmp on macOS) so it matches the paths git reports.
-        let canonical_target = worktree_path.canonicalize().unwrap_or_else(|_| worktree_path.to_path_buf());
+        let canonical_target = worktree_path
+            .canonicalize()
+            .unwrap_or_else(|_| worktree_path.to_path_buf());
         Ok(worktrees
             .into_iter()
             .find(|w| {
@@ -200,10 +190,7 @@ impl GitWorktreeService {
 }
 
 impl WorktreeService for GitWorktreeService {
-    fn list_worktrees(
-        &self,
-        repo_path: &Path,
-    ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+    fn list_worktrees(&self, repo_path: &Path) -> Result<Vec<WorktreeInfo>, WorktreeError> {
         let output = Self::run_git(repo_path, &["worktree", "list", "--porcelain"])?;
         let mut worktrees = Self::parse_porcelain(&output);
 
@@ -286,10 +273,7 @@ impl WorktreeService for GitWorktreeService {
         Ok(())
     }
 
-    fn default_branch(
-        &self,
-        repo_path: &Path,
-    ) -> Result<String, WorktreeError> {
+    fn default_branch(&self, repo_path: &Path) -> Result<String, WorktreeError> {
         match Self::run_git(repo_path, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
             Ok(output) => {
                 let trimmed = output.trim();
@@ -303,19 +287,14 @@ impl WorktreeService for GitWorktreeService {
                 // No origin/HEAD available. Check which of "main" or "master"
                 // exists as a local branch. If both exist, prefer "main". If
                 // neither exists, fall back to "main" as a convention default.
-                let main_exists = Self::run_git(
-                    repo_path,
-                    &["rev-parse", "--verify", "refs/heads/main"],
-                )
-                .is_ok();
+                let main_exists =
+                    Self::run_git(repo_path, &["rev-parse", "--verify", "refs/heads/main"]).is_ok();
                 if main_exists {
                     return Ok("main".to_string());
                 }
-                let master_exists = Self::run_git(
-                    repo_path,
-                    &["rev-parse", "--verify", "refs/heads/master"],
-                )
-                .is_ok();
+                let master_exists =
+                    Self::run_git(repo_path, &["rev-parse", "--verify", "refs/heads/master"])
+                        .is_ok();
                 if master_exists {
                     return Ok("master".to_string());
                 }
@@ -325,10 +304,7 @@ impl WorktreeService for GitWorktreeService {
         }
     }
 
-    fn github_remote(
-        &self,
-        repo_path: &Path,
-    ) -> Result<Option<(String, String)>, WorktreeError> {
+    fn github_remote(&self, repo_path: &Path) -> Result<Option<(String, String)>, WorktreeError> {
         match Self::run_git(repo_path, &["remote", "get-url", "origin"]) {
             Ok(url) => Ok(parse_github_remote(url.trim())),
             Err(WorktreeError::GitError(ref msg))
@@ -341,11 +317,7 @@ impl WorktreeService for GitWorktreeService {
         }
     }
 
-    fn fetch_branch(
-        &self,
-        repo_path: &Path,
-        branch: &str,
-    ) -> Result<(), WorktreeError> {
+    fn fetch_branch(&self, repo_path: &Path, branch: &str) -> Result<(), WorktreeError> {
         // Fetch the branch from origin into a local branch of the same name.
         // Uses the refspec <branch>:<branch> so that on success the local
         // ref points at the same commit as origin.
@@ -383,11 +355,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to run {:?}: {e}", args));
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!(
-                "command {:?} failed in {}:\n{stderr}",
-                args,
-                dir.display()
-            );
+            panic!("command {:?} failed in {}:\n{stderr}", args, dir.display());
         }
     }
 
@@ -469,9 +437,12 @@ mod tests {
         run_in(
             &repo_dir,
             &[
-                "git", "worktree", "add",
+                "git",
+                "worktree",
+                "add",
                 wt_dir.to_str().unwrap(),
-                "-b", "feature-branch",
+                "-b",
+                "feature-branch",
             ],
         );
 
@@ -482,8 +453,7 @@ mod tests {
         // improved fallback, default_branch detects the local "master"
         // branch, so the main worktree IS filtered out. Only the feature
         // worktree should remain.
-        let branches: Vec<Option<&str>> =
-            worktrees.iter().map(|w| w.branch.as_deref()).collect();
+        let branches: Vec<Option<&str>> = worktrees.iter().map(|w| w.branch.as_deref()).collect();
         assert!(
             branches.contains(&Some("feature-branch")),
             "feature-branch should be listed, got: {:?}",
@@ -628,7 +598,13 @@ mod tests {
         setup_git_repo(&repo_dir);
         run_in(
             &repo_dir,
-            &["git", "remote", "add", "origin", remote_dir.to_str().unwrap()],
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                remote_dir.to_str().unwrap(),
+            ],
         );
         // Rename the default branch to "develop" to test non-standard names.
         run_in(&repo_dir, &["git", "branch", "-m", "develop"]);
@@ -636,7 +612,12 @@ mod tests {
         // Set the remote HEAD.
         run_in(
             &repo_dir,
-            &["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop"],
+            &[
+                "git",
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/develop",
+            ],
         );
 
         let svc = GitWorktreeService;
@@ -654,7 +635,13 @@ mod tests {
         // Add a GitHub-style remote.
         run_in(
             &repo_dir,
-            &["git", "remote", "add", "origin", "git@github.com:myorg/myrepo.git"],
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:myorg/myrepo.git",
+            ],
         );
 
         let svc = GitWorktreeService;
@@ -671,7 +658,13 @@ mod tests {
 
         run_in(
             &repo_dir,
-            &["git", "remote", "add", "origin", "git@gitlab.com:myorg/myrepo.git"],
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                "git@gitlab.com:myorg/myrepo.git",
+            ],
         );
 
         let svc = GitWorktreeService;
@@ -755,7 +748,13 @@ mod tests {
         run_in(&source_dir, &["git", "branch", "-m", "main"]);
         run_in(
             &source_dir,
-            &["git", "remote", "add", "origin", remote_dir.to_str().unwrap()],
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                remote_dir.to_str().unwrap(),
+            ],
         );
         run_in(&source_dir, &["git", "push", "-u", "origin", "main"]);
         // Create a feature branch with a unique commit.
@@ -785,7 +784,13 @@ mod tests {
         run_in(&local_dir, &["git", "branch", "-m", "main"]);
         run_in(
             &local_dir,
-            &["git", "remote", "add", "origin", remote_dir.to_str().unwrap()],
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                remote_dir.to_str().unwrap(),
+            ],
         );
 
         let svc = GitWorktreeService;
@@ -804,13 +809,11 @@ mod tests {
         svc.fetch_branch(&local_dir, "pr-branch").unwrap();
 
         // After fetch: pr-branch should exist locally at the correct SHA.
-        let actual_sha = GitWorktreeService::run_git(
-            &local_dir,
-            &["rev-parse", "refs/heads/pr-branch"],
-        )
-        .unwrap()
-        .trim()
-        .to_string();
+        let actual_sha =
+            GitWorktreeService::run_git(&local_dir, &["rev-parse", "refs/heads/pr-branch"])
+                .unwrap()
+                .trim()
+                .to_string();
         assert_eq!(
             actual_sha, expected_sha,
             "local pr-branch should point at the same commit as origin",
@@ -836,7 +839,13 @@ mod tests {
         run_in(&repo_dir, &["git", "branch", "-m", "main"]);
         run_in(
             &repo_dir,
-            &["git", "remote", "add", "origin", remote_dir.to_str().unwrap()],
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                remote_dir.to_str().unwrap(),
+            ],
         );
         run_in(&repo_dir, &["git", "push", "-u", "origin", "main"]);
 

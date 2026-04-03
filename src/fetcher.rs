@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -28,7 +28,13 @@ pub fn start(
     github_client: Arc<dyn GithubClient + Send + Sync>,
     issue_pattern: String,
 ) -> (mpsc::Receiver<FetchMessage>, FetcherHandle) {
-    start_with_extra_branches(repos, worktree_service, github_client, issue_pattern, HashMap::new())
+    start_with_extra_branches(
+        repos,
+        worktree_service,
+        github_client,
+        issue_pattern,
+        HashMap::new(),
+    )
 }
 
 /// Like `start`, but accepts extra branch names per repo path. These
@@ -142,8 +148,7 @@ fn fetcher_loop(
                                 && let Ok(num) = m.as_str().parse::<u64>()
                                 && seen.insert(num)
                             {
-                                let result =
-                                    github_client.get_issue(owner, repo, num);
+                                let result = github_client.get_issue(owner, repo, num);
                                 issues.push((num, result));
                             }
                         }
@@ -159,8 +164,7 @@ fn fetcher_loop(
                         && let Ok(num) = m.as_str().parse::<u64>()
                         && seen.insert(num)
                     {
-                        let result =
-                            github_client.get_issue(owner, repo, num);
+                        let result = github_client.get_issue(owner, repo, num);
                         issues.push((num, result));
                     }
                 }
@@ -237,10 +241,7 @@ mod tests {
     }
 
     impl WorktreeService for MockWorktreeService {
-        fn list_worktrees(
-            &self,
-            _repo_path: &Path,
-        ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+        fn list_worktrees(&self, _repo_path: &Path) -> Result<Vec<WorktreeInfo>, WorktreeError> {
             Ok(self.worktrees.clone())
         }
 
@@ -266,10 +267,7 @@ mod tests {
             ))
         }
 
-        fn default_branch(
-            &self,
-            _repo_path: &Path,
-        ) -> Result<String, WorktreeError> {
+        fn default_branch(&self, _repo_path: &Path) -> Result<String, WorktreeError> {
             Ok("main".to_string())
         }
 
@@ -280,11 +278,7 @@ mod tests {
             Ok(self.github_remote.clone())
         }
 
-        fn fetch_branch(
-            &self,
-            _repo_path: &Path,
-            _branch: &str,
-        ) -> Result<(), WorktreeError> {
+        fn fetch_branch(&self, _repo_path: &Path, _branch: &str) -> Result<(), WorktreeError> {
             Ok(())
         }
     }
@@ -329,9 +323,9 @@ mod tests {
         );
 
         // Wait for a message (with timeout to avoid hanging)
-        let msg = rx.recv_timeout(Duration::from_secs(5)).expect(
-            "should receive a FetchMessage within 5 seconds",
-        );
+        let msg = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("should receive a FetchMessage within 5 seconds");
 
         match msg {
             FetchMessage::RepoData(result) => {
@@ -343,10 +337,7 @@ mod tests {
 
                 let worktrees = result.worktrees.expect("worktrees should be Ok");
                 assert_eq!(worktrees.len(), 1);
-                assert_eq!(
-                    worktrees[0].branch,
-                    Some("42-fix-bug".to_string()),
-                );
+                assert_eq!(worktrees[0].branch, Some("42-fix-bug".to_string()),);
 
                 let prs = result.prs.expect("prs should be Ok");
                 assert_eq!(prs.len(), 1);
@@ -355,10 +346,7 @@ mod tests {
                 assert_eq!(result.issues.len(), 1);
                 assert_eq!(result.issues[0].0, 42);
                 assert!(result.issues[0].1.is_ok());
-                assert_eq!(
-                    result.issues[0].1.as_ref().unwrap().title,
-                    "Fix the bug",
-                );
+                assert_eq!(result.issues[0].1.as_ref().unwrap().title, "Fix the bug",);
             }
             FetchMessage::FetcherError { error, .. } => {
                 panic!("unexpected FetcherError: {error}");
@@ -404,16 +392,13 @@ mod tests {
             r"^(\d+)-".to_string(),
         );
 
-        let msg = rx.recv_timeout(Duration::from_secs(5)).expect(
-            "should receive a FetchMessage within 5 seconds",
-        );
+        let msg = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("should receive a FetchMessage within 5 seconds");
 
         match msg {
             FetchMessage::RepoData(result) => {
-                assert_eq!(
-                    result.repo_path,
-                    PathBuf::from("/tmp/no-github-repo"),
-                );
+                assert_eq!(result.repo_path, PathBuf::from("/tmp/no-github-repo"),);
                 assert_eq!(result.github_remote, None);
 
                 let prs = result.prs.expect("prs should be Ok");
@@ -464,9 +449,9 @@ mod tests {
             extra,
         );
 
-        let msg = rx.recv_timeout(Duration::from_secs(5)).expect(
-            "should receive a FetchMessage within 5 seconds",
-        );
+        let msg = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("should receive a FetchMessage within 5 seconds");
 
         match msg {
             FetchMessage::RepoData(result) => {

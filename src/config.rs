@@ -175,8 +175,8 @@ impl From<std::io::Error> for ConfigError {
 /// macOS: ~/Library/Application Support/workbridge/config.toml
 /// Linux: ~/.config/workbridge/config.toml
 pub fn config_path() -> Result<PathBuf, ConfigError> {
-    let proj = directories::ProjectDirs::from("", "", "workbridge")
-        .ok_or(ConfigError::NoConfigDir)?;
+    let proj =
+        directories::ProjectDirs::from("", "", "workbridge").ok_or(ConfigError::NoConfigDir)?;
     Ok(proj.config_dir().join("config.toml"))
 }
 
@@ -254,8 +254,8 @@ impl Config {
     /// Explicit repos are always active (no need to also include them).
     pub fn add_repo(&mut self, raw: &str) -> Result<String, ConfigError> {
         let expanded = expand_tilde(raw);
-        let canonical = fs::canonicalize(&expanded)
-            .map_err(|_| ConfigError::PathNotFound(raw.to_string()))?;
+        let canonical =
+            fs::canonicalize(&expanded).map_err(|_| ConfigError::PathNotFound(raw.to_string()))?;
 
         if !canonical.join(".git").exists() {
             return Err(ConfigError::NotAGitRepo(raw.to_string()));
@@ -273,8 +273,8 @@ impl Config {
     /// the user opts in via `include_repo`.
     pub fn add_base_dir(&mut self, raw: &str) -> Result<(String, usize), ConfigError> {
         let expanded = expand_tilde(raw);
-        let canonical = fs::canonicalize(&expanded)
-            .map_err(|_| ConfigError::PathNotFound(raw.to_string()))?;
+        let canonical =
+            fs::canonicalize(&expanded).map_err(|_| ConfigError::PathNotFound(raw.to_string()))?;
 
         if !canonical.is_dir() {
             return Err(ConfigError::PathNotFound(raw.to_string()));
@@ -346,7 +346,8 @@ impl Config {
     /// path so `./repo`, `~/repo`, and `/abs/repo` all resolve the same entry.
     pub fn uninclude_repo(&mut self, path: &str) {
         let target = normalize_repo_path(path);
-        self.included_repos.retain(|p| normalize_repo_path(p) != target);
+        self.included_repos
+            .retain(|p| normalize_repo_path(p) != target);
     }
 
     /// Return all repos (explicit + discovered) with metadata.
@@ -395,9 +396,7 @@ impl Config {
                     return true;
                 }
                 // Discovered repos are active only if opted-in.
-                let entry_normalized = normalize_repo_path(
-                    &entry.path.display().to_string(),
-                );
+                let entry_normalized = normalize_repo_path(&entry.path.display().to_string());
                 self.included_repos.contains(&entry_normalized)
             })
             .collect()

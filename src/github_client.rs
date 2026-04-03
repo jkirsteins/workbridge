@@ -64,19 +64,10 @@ pub struct GithubIssue {
 /// tests).
 pub trait GithubClient: Send + Sync {
     /// List all open PRs for a given owner/repo.
-    fn list_open_prs(
-        &self,
-        owner: &str,
-        repo: &str,
-    ) -> Result<Vec<GithubPr>, GithubError>;
+    fn list_open_prs(&self, owner: &str, repo: &str) -> Result<Vec<GithubPr>, GithubError>;
 
     /// Get a single issue by number.
-    fn get_issue(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: u64,
-    ) -> Result<GithubIssue, GithubError>;
+    fn get_issue(&self, owner: &str, repo: &str, number: u64) -> Result<GithubIssue, GithubError>;
 }
 
 /// Mock GitHub client for tests. Returns configurable fixture data.
@@ -101,11 +92,7 @@ impl MockGithubClient {
 
 #[cfg(test)]
 impl GithubClient for MockGithubClient {
-    fn list_open_prs(
-        &self,
-        _owner: &str,
-        _repo: &str,
-    ) -> Result<Vec<GithubPr>, GithubError> {
+    fn list_open_prs(&self, _owner: &str, _repo: &str) -> Result<Vec<GithubPr>, GithubError> {
         if let Some(ref err) = self.error {
             return Err(err.clone());
         }
@@ -141,16 +128,13 @@ impl GhCliClient {
     /// GithubError::AuthRequired if the error output mentions authentication,
     /// and GithubError::ApiError for other non-zero exits.
     fn run_gh(&self, args: &[&str]) -> Result<String, GithubError> {
-        let output = Command::new("gh")
-            .args(args)
-            .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    GithubError::CliNotFound
-                } else {
-                    GithubError::ApiError(format!("failed to run gh: {e}"))
-                }
-            })?;
+        let output = Command::new("gh").args(args).output().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                GithubError::CliNotFound
+            } else {
+                GithubError::ApiError(format!("failed to run gh: {e}"))
+            }
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -166,20 +150,20 @@ impl GhCliClient {
 }
 
 impl GithubClient for GhCliClient {
-    fn list_open_prs(
-        &self,
-        owner: &str,
-        repo: &str,
-    ) -> Result<Vec<GithubPr>, GithubError> {
+    fn list_open_prs(&self, owner: &str, repo: &str) -> Result<Vec<GithubPr>, GithubError> {
         let repo_arg = format!("{owner}/{repo}");
-        let json_fields =
-            "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner";
+        let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner";
         let stdout = self.run_gh(&[
-            "pr", "list",
-            "--repo", &repo_arg,
-            "--state", "open",
-            "--json", json_fields,
-            "--limit", "500",
+            "pr",
+            "list",
+            "--repo",
+            &repo_arg,
+            "--state",
+            "open",
+            "--json",
+            json_fields,
+            "--limit",
+            "500",
         ])?;
 
         let items: Vec<Value> = serde_json::from_str(&stdout)
@@ -188,25 +172,21 @@ impl GithubClient for GhCliClient {
         items.iter().map(parse_pr_from_value).collect()
     }
 
-    fn get_issue(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: u64,
-    ) -> Result<GithubIssue, GithubError> {
+    fn get_issue(&self, owner: &str, repo: &str, number: u64) -> Result<GithubIssue, GithubError> {
         let repo_arg = format!("{owner}/{repo}");
         let number_str = number.to_string();
         let stdout = self.run_gh(&[
-            "issue", "view",
+            "issue",
+            "view",
             &number_str,
-            "--repo", &repo_arg,
-            "--json", "number,title,state,labels",
+            "--repo",
+            &repo_arg,
+            "--json",
+            "number,title,state,labels",
         ])?;
 
         let value: Value = serde_json::from_str(&stdout)
-            .map_err(|e| {
-                GithubError::ParseError(format!("failed to parse issue JSON: {e}"))
-            })?;
+            .map_err(|e| GithubError::ParseError(format!("failed to parse issue JSON: {e}")))?;
 
         parse_issue_from_value(&value)
     }
@@ -218,30 +198,33 @@ impl GithubClient for GhCliClient {
 
 /// Parse a single PR JSON object (from gh pr list --json) into a GithubPr.
 fn parse_pr_from_value(v: &Value) -> Result<GithubPr, GithubError> {
-    let number = v.get("number")
+    let number = v
+        .get("number")
         .and_then(|n| n.as_u64())
         .ok_or_else(|| GithubError::ParseError("PR missing 'number' field".into()))?;
 
-    let title = v.get("title")
+    let title = v
+        .get("title")
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
 
-    let head_branch = v.get("headRefName")
+    let head_branch = v
+        .get("headRefName")
         .and_then(|h| h.as_str())
         .unwrap_or("")
         .to_string();
 
-    let state = v.get("state")
+    let state = v
+        .get("state")
         .and_then(|s| s.as_str())
         .unwrap_or("OPEN")
         .to_string();
 
-    let is_draft = v.get("isDraft")
-        .and_then(|d| d.as_bool())
-        .unwrap_or(false);
+    let is_draft = v.get("isDraft").and_then(|d| d.as_bool()).unwrap_or(false);
 
-    let url = v.get("url")
+    let url = v
+        .get("url")
         .and_then(|u| u.as_str())
         .unwrap_or("")
         .to_string();
@@ -251,7 +234,8 @@ fn parse_pr_from_value(v: &Value) -> Result<GithubPr, GithubError> {
 
     // headRepositoryOwner is an object with a "login" field, e.g.
     // {"login": "contributor"}. It may be null or absent.
-    let head_repo_owner = v.get("headRepositoryOwner")
+    let head_repo_owner = v
+        .get("headRepositoryOwner")
         .and_then(|o| o.get("login"))
         .and_then(|l| l.as_str())
         .map(|s| s.to_string());
@@ -271,27 +255,32 @@ fn parse_pr_from_value(v: &Value) -> Result<GithubPr, GithubError> {
 
 /// Parse a single issue JSON object (from gh issue view --json) into a GithubIssue.
 fn parse_issue_from_value(v: &Value) -> Result<GithubIssue, GithubError> {
-    let number = v.get("number")
+    let number = v
+        .get("number")
         .and_then(|n| n.as_u64())
         .ok_or_else(|| GithubError::ParseError("issue missing 'number' field".into()))?;
 
-    let title = v.get("title")
+    let title = v
+        .get("title")
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
 
-    let state = v.get("state")
+    let state = v
+        .get("state")
         .and_then(|s| s.as_str())
         .unwrap_or("OPEN")
         .to_string();
 
-    let labels = v.get("labels")
+    let labels = v
+        .get("labels")
         .and_then(|l| l.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|label| {
                     // gh returns labels as objects with a "name" field
-                    label.get("name")
+                    label
+                        .get("name")
                         .and_then(|n| n.as_str())
                         .or_else(|| label.as_str())
                         .map(|s| s.to_string())
@@ -332,23 +321,23 @@ fn parse_check_status_raw(v: &Value) -> String {
         // gh returns each check with either "conclusion" (completed checks)
         // or "status" (in-progress checks). conclusion can be null for
         // in-progress checks.
-        let conclusion = check.get("conclusion")
+        let conclusion = check
+            .get("conclusion")
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        let status = check.get("status")
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
+        let status = check.get("status").and_then(|s| s.as_str()).unwrap_or("");
 
         match conclusion {
             "SUCCESS" | "NEUTRAL" | "SKIPPED" => has_success = true,
-            "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED"
-            | "STARTUP_FAILURE" | "STALE" => has_failure = true,
+            "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE"
+            | "STALE" => has_failure = true,
             _ => {
                 // No conclusion yet - check the status field
                 match status {
                     "COMPLETED" => has_success = true,
-                    "IN_PROGRESS" | "QUEUED" | "PENDING" | "WAITING"
-                    | "REQUESTED" => has_pending = true,
+                    "IN_PROGRESS" | "QUEUED" | "PENDING" | "WAITING" | "REQUESTED" => {
+                        has_pending = true
+                    }
                     _ => has_pending = true,
                 }
             }
@@ -768,8 +757,14 @@ mod tests {
     fn parse_review_decision_variants() {
         let cases = vec![
             (r#"{"reviewDecision": "APPROVED"}"#, "APPROVED"),
-            (r#"{"reviewDecision": "CHANGES_REQUESTED"}"#, "CHANGES_REQUESTED"),
-            (r#"{"reviewDecision": "REVIEW_REQUIRED"}"#, "REVIEW_REQUIRED"),
+            (
+                r#"{"reviewDecision": "CHANGES_REQUESTED"}"#,
+                "CHANGES_REQUESTED",
+            ),
+            (
+                r#"{"reviewDecision": "REVIEW_REQUIRED"}"#,
+                "REVIEW_REQUIRED",
+            ),
             (r#"{"reviewDecision": ""}"#, ""),
             (r#"{"reviewDecision": null}"#, ""),
             (r#"{}"#, ""),
@@ -840,7 +835,10 @@ mod tests {
         ]"#;
 
         let items: Vec<Value> = serde_json::from_str(json).unwrap();
-        let prs: Vec<GithubPr> = items.iter().map(|v| parse_pr_from_value(v).unwrap()).collect();
+        let prs: Vec<GithubPr> = items
+            .iter()
+            .map(|v| parse_pr_from_value(v).unwrap())
+            .collect();
 
         assert_eq!(prs.len(), 2);
         assert_eq!(prs[0].number, 1);

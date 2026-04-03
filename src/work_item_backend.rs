@@ -142,16 +142,21 @@ impl LocalFileBackend {
         let proj = directories::ProjectDirs::from("", "", "workbridge")
             .ok_or_else(|| BackendError::Io("could not determine data directory".into()))?;
         let data_dir = proj.data_dir().join("work-items");
-        fs::create_dir_all(&data_dir)
-            .map_err(|e| BackendError::Io(format!("failed to create data dir {}: {e}", data_dir.display())))?;
+        fs::create_dir_all(&data_dir).map_err(|e| {
+            BackendError::Io(format!(
+                "failed to create data dir {}: {e}",
+                data_dir.display()
+            ))
+        })?;
         Ok(Self { data_dir })
     }
 
     /// Create a LocalFileBackend with a custom directory (for tests).
     #[cfg(test)]
     pub fn with_dir(dir: PathBuf) -> Result<Self, BackendError> {
-        fs::create_dir_all(&dir)
-            .map_err(|e| BackendError::Io(format!("failed to create dir {}: {e}", dir.display())))?;
+        fs::create_dir_all(&dir).map_err(|e| {
+            BackendError::Io(format!("failed to create dir {}: {e}", dir.display()))
+        })?;
         Ok(Self { data_dir: dir })
     }
 }
@@ -174,8 +179,12 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 impl WorkItemBackend for LocalFileBackend {
     fn list(&self) -> Result<ListResult, BackendError> {
-        let entries = fs::read_dir(&self.data_dir)
-            .map_err(|e| BackendError::Io(format!("failed to read dir {}: {e}", self.data_dir.display())))?;
+        let entries = fs::read_dir(&self.data_dir).map_err(|e| {
+            BackendError::Io(format!(
+                "failed to read dir {}: {e}",
+                self.data_dir.display()
+            ))
+        })?;
 
         let mut records = Vec::new();
         let mut corrupt = Vec::new();
@@ -268,8 +277,9 @@ impl WorkItemBackend for LocalFileBackend {
                 if !path.exists() {
                     return Err(BackendError::NotFound(id.clone()));
                 }
-                fs::remove_file(path)
-                    .map_err(|e| BackendError::Io(format!("failed to delete {}: {e}", path.display())))?;
+                fs::remove_file(path).map_err(|e| {
+                    BackendError::Io(format!("failed to delete {}: {e}", path.display()))
+                })?;
                 Ok(())
             }
             other => Err(BackendError::NotFound(other.clone())),
@@ -357,7 +367,10 @@ mod tests {
         let err = result.unwrap_err();
         match err {
             BackendError::Validation(msg) => {
-                assert!(msg.contains("at least one repo association"), "unexpected message: {msg}");
+                assert!(
+                    msg.contains("at least one repo association"),
+                    "unexpected message: {msg}"
+                );
             }
             other => panic!("expected Validation error, got: {other}"),
         }

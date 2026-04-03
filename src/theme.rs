@@ -1,4 +1,4 @@
-use ratatui::style::{Color, Modifier, Style};
+use ratatui_core::style::{Color, Modifier, Style};
 
 /// All colors used by the TUI, in one place. Swap this struct to change
 /// the entire look. Every color in ui.rs comes from here - no inline

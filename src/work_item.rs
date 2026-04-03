@@ -25,9 +25,7 @@ pub enum WorkItemId {
         number: u64,
     },
     /// Backed by a GitHub project item (tracked by node id).
-    GithubProject {
-        node_id: String,
-    },
+    GithubProject { node_id: String },
 }
 
 impl Hash for WorkItemId {
@@ -37,7 +35,11 @@ impl Hash for WorkItemId {
         std::mem::discriminant(self).hash(state);
         match self {
             WorkItemId::LocalFile(path) => path.hash(state),
-            WorkItemId::GithubIssue { owner, repo, number } => {
+            WorkItemId::GithubIssue {
+                owner,
+                repo,
+                number,
+            } => {
                 owner.hash(state);
                 repo.hash(state);
                 number.hash(state);

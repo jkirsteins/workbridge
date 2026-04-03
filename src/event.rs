@@ -1,56 +1,26 @@
-use std::io;
-use std::time::{Duration, Instant};
-
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal;
+use crate::salsa::ct::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::{App, DisplayEntry, FocusPanel, SettingsListFocus};
+use crate::create_dialog::CreateDialogFocus;
 use crate::layout;
 
-/// The tick interval for periodic updates (reading PTY output).
-const TICK_RATE: Duration = Duration::from_millis(200);
-
-/// Poll for the next event and handle it. Blocks for at most the remaining
-/// time until the next tick.
-///
-/// Returns `Ok(true)` if a tick boundary was crossed during this call (i.e.,
-/// `last_tick` was reset). The caller can use this to gate periodic work
-/// that should happen at tick frequency rather than on every loop iteration.
-///
-/// Returns `Err` if the terminal event stream fails, so the caller can exit
-/// through the normal teardown path instead of spinning silently.
-pub fn poll_and_handle(app: &mut App, last_tick: &mut Instant) -> io::Result<bool> {
-    let timeout = TICK_RATE.saturating_sub(last_tick.elapsed());
-
-    if event::poll(timeout)? {
-        let ev = event::read()?;
-        match ev {
-            Event::Key(key) => {
-                handle_key(app, key);
-            }
-            Event::Resize(cols, rows) => {
-                handle_resize(app, cols, rows);
-            }
-            _ => {}
-        }
-    }
-
-    if last_tick.elapsed() >= TICK_RATE {
-        *last_tick = Instant::now();
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
 /// Handle a key event by dispatching based on focus panel.
-fn handle_key(app: &mut App, key: KeyEvent) {
+/// Called from the rat-salsa event callback in salsa.rs.
+pub fn handle_key(app: &mut App, key: KeyEvent) {
     // During shutdown, only Q triggers force quit. All other keys are ignored.
+    // Check this before the create dialog so users cannot create work items
+    // while sessions are winding down.
     if app.shutting_down {
+        // Close the create dialog if it was open when shutdown began.
+        if app.create_dialog.visible {
+            app.create_dialog.close();
+        }
         if matches!(
             (key.modifiers, key.code),
-            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('q' | 'Q'))
-                | (KeyModifiers::CONTROL, KeyCode::Char('q'))
+            (
+                KeyModifiers::NONE | KeyModifiers::SHIFT,
+                KeyCode::Char('q' | 'Q')
+            ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
         ) {
             app.force_kill_all();
             app.should_quit = true;
@@ -58,11 +28,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // When the create dialog is open, route all keys to it.
+    if app.create_dialog.visible {
+        handle_create_dialog(app, key);
+        return;
+    }
+
     // When the settings overlay is open, handle overlay-specific keys.
     if app.show_settings {
         match (key.modifiers, key.code) {
-            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?'))
-            | (_, KeyCode::Esc) => {
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) | (_, KeyCode::Esc) => {
                 app.show_settings = false;
                 app.settings_repo_selected = 0;
                 app.settings_available_selected = 0;
@@ -70,8 +45,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
             (_, KeyCode::Up) => match app.settings_list_focus {
                 SettingsListFocus::Managed => {
-                    app.settings_repo_selected =
-                        app.settings_repo_selected.saturating_sub(1);
+                    app.settings_repo_selected = app.settings_repo_selected.saturating_sub(1);
                 }
                 SettingsListFocus::Available => {
                     app.settings_available_selected =
@@ -117,8 +91,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     let is_quit_confirm = app.confirm_quit
         && matches!(
             (key.modifiers, key.code),
-            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('q' | 'Q'))
-                | (KeyModifiers::CONTROL, KeyCode::Char('q'))
+            (
+                KeyModifiers::NONE | KeyModifiers::SHIFT,
+                KeyCode::Char('q' | 'Q')
+            ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
         );
     let is_delete_confirm = app.confirm_delete
         && (key.code == KeyCode::Delete
@@ -158,21 +134,22 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 app.should_quit = true;
             } else {
                 app.confirm_quit = true;
-                app.status_message =
-                    Some("Press Q again to quit and kill all sessions".into());
+                app.status_message = Some("Press Q again to quit and kill all sessions".into());
                 sync_layout(app);
             }
         }
-        // Ctrl+N - create a new work item
+        // Ctrl+N - open the work item creation dialog
         (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
-            let had_status = app.status_message.is_some();
-            let had_context = app.selected_work_item_context().is_some();
-            app.create_work_item();
-            if app.status_message.is_some() != had_status
-                || app.selected_work_item_context().is_some() != had_context
-            {
-                sync_layout(app);
-            }
+            let active_repos: Vec<std::path::PathBuf> = app
+                .active_repo_cache
+                .iter()
+                .filter(|r| r.git_dir_present)
+                .map(|r| r.path.clone())
+                .collect();
+            let cwd_repo = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| app.managed_repo_root(&cwd));
+            app.create_dialog.open(&active_repos, cwd_repo.as_ref());
         }
         // Ctrl+D or Delete - delete work item with confirmation
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Delete) => {
@@ -294,7 +271,9 @@ fn handle_key_right(app: &mut App, key: KeyEvent) {
         KeyCode::Char(c) => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 // Ctrl+A = 0x01, Ctrl+B = 0x02, ..., Ctrl+Z = 0x1A
-                let byte = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
+                let byte = (c.to_ascii_lowercase() as u8)
+                    .wrapping_sub(b'a')
+                    .wrapping_add(1);
                 if byte <= 26 {
                     app.send_bytes_to_active(&[byte]);
                 }
@@ -433,7 +412,8 @@ fn f_key_sequence(n: u8) -> String {
 }
 
 /// Handle a terminal resize event by updating pane dimensions and resizing PTY.
-fn handle_resize(app: &mut App, cols: u16, rows: u16) {
+/// Called from the rat-salsa event callback in salsa.rs.
+pub fn handle_resize(app: &mut App, cols: u16, rows: u16) {
     let bottom_rows = u16::from(app.status_message.is_some())
         + u16::from(app.selected_work_item_context().is_some());
     let pl = layout::compute(cols, rows, bottom_rows);
@@ -442,11 +422,159 @@ fn handle_resize(app: &mut App, cols: u16, rows: u16) {
     app.resize_pty_panes();
 }
 
+/// Handle key events when the create dialog is open.
+///
+/// Tab/Shift+Tab cycle focus between Title, Repos, and Branch fields.
+/// When a text field is focused, character keys go to the text input.
+/// When Repos is focused, Up/Down navigate and Space toggles selection.
+/// Enter validates and creates the work item. Esc cancels.
+fn handle_create_dialog(app: &mut App, key: KeyEvent) {
+    // Clear validation error on any keypress (will re-show on Enter if still invalid).
+    app.create_dialog.error_message = None;
+
+    match (key.modifiers, key.code) {
+        // Esc - cancel the dialog
+        (_, KeyCode::Esc) => {
+            app.create_dialog.close();
+        }
+
+        // Tab - cycle focus forward
+        (KeyModifiers::NONE, KeyCode::Tab) => {
+            app.create_dialog.focus_next();
+        }
+
+        // Shift+Tab / BackTab - cycle focus backward
+        (KeyModifiers::SHIFT, KeyCode::Tab) | (_, KeyCode::BackTab) => {
+            app.create_dialog.focus_prev();
+        }
+
+        // Enter - validate and create
+        (_, KeyCode::Enter) => match app.create_dialog.validate() {
+            Ok((title, repos, branch)) => {
+                let had_status = app.status_message.is_some();
+                let had_context = app.selected_work_item_context().is_some();
+                match app.create_work_item_with(title, repos, branch) {
+                    Ok(()) => {
+                        app.create_dialog.close();
+                        if app.status_message.is_some() != had_status
+                            || app.selected_work_item_context().is_some() != had_context
+                        {
+                            sync_layout(app);
+                        }
+                    }
+                    Err(msg) => {
+                        app.create_dialog.error_message = Some(msg);
+                    }
+                }
+            }
+            Err(msg) => {
+                app.create_dialog.error_message = Some(msg);
+            }
+        },
+
+        // Keys handled differently depending on focused field
+        _ => {
+            match app.create_dialog.focus_field {
+                CreateDialogFocus::Title | CreateDialogFocus::Branch => {
+                    // Forward to the focused text input
+                    handle_text_input_key(app, key);
+                }
+                CreateDialogFocus::Repos => match (key.modifiers, key.code) {
+                    (_, KeyCode::Up) => app.create_dialog.repo_up(),
+                    (_, KeyCode::Down) => app.create_dialog.repo_down(),
+                    (_, KeyCode::Char(' ')) => app.create_dialog.toggle_repo(),
+                    _ => {}
+                },
+            }
+        }
+    }
+}
+
+/// Forward a key event to the currently focused text input in the create dialog.
+fn handle_text_input_key(app: &mut App, key: KeyEvent) {
+    let Some(input) = app.create_dialog.focused_input_mut() else {
+        return;
+    };
+
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Char(c)) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.insert_char(c);
+        }
+        (_, KeyCode::Backspace) => {
+            input.backspace();
+        }
+        (_, KeyCode::Delete) => {
+            input.delete();
+        }
+        (_, KeyCode::Left) => {
+            input.move_left();
+        }
+        (_, KeyCode::Right) => {
+            input.move_right();
+        }
+        (_, KeyCode::Home) => {
+            input.home();
+        }
+        (_, KeyCode::End) => {
+            input.end();
+        }
+        _ => {}
+    }
+}
+
 /// Recalculate layout from the current terminal size and resize PTY panes.
 /// Called when the status bar visibility changes to keep the PTY pane
 /// dimensions in sync with the actual display area.
 fn sync_layout(app: &mut App) {
-    if let Ok((cols, rows)) = terminal::size() {
+    if let Ok((cols, rows)) = ratatui_crossterm::crossterm::terminal::size() {
         handle_resize(app, cols, rows);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::salsa::ct::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::path::PathBuf;
+
+    /// F-2: Create dialog is unreachable during shutdown.
+    /// When shutting_down is true, handle_key must ignore all keys except
+    /// Q (force quit). Even if the create dialog was open when shutdown
+    /// began, it should be closed and no input should reach it.
+    #[test]
+    fn create_dialog_closed_during_shutdown() {
+        let mut app = App::new();
+
+        // Open the create dialog.
+        app.create_dialog.open(&[PathBuf::from("/repo/a")], None);
+        assert!(app.create_dialog.visible, "dialog should be open");
+
+        // Begin shutdown.
+        app.shutting_down = true;
+
+        // Send a key event (anything, e.g. Enter). handle_key should close
+        // the dialog and ignore the key.
+        let enter_key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(&mut app, enter_key);
+
+        assert!(
+            !app.create_dialog.visible,
+            "create dialog should be closed during shutdown",
+        );
+    }
+
+    /// F-2: Ctrl+N does NOT open the create dialog during shutdown.
+    #[test]
+    fn ctrl_n_blocked_during_shutdown() {
+        let mut app = App::new();
+        app.shutting_down = true;
+
+        let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        handle_key(&mut app, ctrl_n);
+
+        assert!(
+            !app.create_dialog.visible,
+            "Ctrl+N should not open create dialog during shutdown",
+        );
     }
 }
