@@ -382,7 +382,9 @@ fn main() -> io::Result<()> {
             if app.fetcher_repos_changed {
                 app.fetcher_repos_changed = false;
                 app.fetcher_disconnected = false;
-                // Stop the old fetcher.
+                // Stop the old fetcher (non-blocking: just sets stop flag).
+                // Old threads will exit when they check the flag or when
+                // their channel send fails (receiver dropped below).
                 if let Some(handle) = fetcher_handle.take() {
                     handle.stop();
                 }
@@ -480,8 +482,9 @@ fn main() -> io::Result<()> {
         }
     }
 
-    // Stop the background fetcher before the TerminalGuard drops, so
-    // threads don't try to send on a dropped channel.
+    // Stop the background fetcher (non-blocking: just sets stop flag).
+    // Threads will exit on their own when they check the flag or when
+    // their channel send fails. No joining - no UI freeze on quit.
     if let Some(handle) = fetcher_handle {
         handle.stop();
     }

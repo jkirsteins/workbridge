@@ -1,8 +1,7 @@
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize};
 
@@ -246,9 +245,16 @@ pub enum FetchMessage {
     },
 }
 
-/// Handle to background fetcher threads. Holds join handles and a shared
-/// stop flag for clean shutdown.
+/// Handle to background fetcher threads. Holds a shared stop flag for
+/// clean shutdown. Threads are fully independent once spawned - we do
+/// not store JoinHandles or join on stop. Threads exit on their own
+/// when the stop flag is set or when their channel send fails.
 pub struct FetcherHandle {
-    pub threads: Vec<JoinHandle<()>>,
     pub stop: Arc<AtomicBool>,
+}
+
+impl Drop for FetcherHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }

@@ -1,14 +1,45 @@
 # Worktree Management
 
-> STATUS: NOT IMPLEMENTED. This document describes the target design.
+WorkBridge manages the creation, listing, and removal of git worktrees
+through the WorktreeService trait and its GitWorktreeService implementation.
 
-WorkBridge owns the creation, placement, and removal of git worktrees.
-This is the mechanical layer that turns "I want to work on this" into a
-directory on disk with a branch checked out.
+## What Is Implemented
+
+### WorktreeService trait
+
+The `WorktreeService` trait (in `worktree_service.rs`) defines the API for
+worktree operations:
+
+- `list_worktrees(repo_path)` - List all worktrees for a repo (parses
+  `git worktree list --porcelain`)
+- `create_worktree(repo_path, branch, target_dir)` - Create a new worktree
+  for a branch at a given directory
+- `remove_worktree(repo_path, worktree_path, delete_branch)` - Remove a
+  worktree and optionally delete the branch
+- `default_branch(repo_path)` - Get the default branch name (checks
+  symbolic-ref, falls back to local main/master)
+- `github_remote(repo_path)` - Get the GitHub remote owner/repo pair
+- `fetch_branch(repo_path, branch)` - Fetch a branch from origin
+
+`GitWorktreeService` implements this trait by shelling out to the git CLI.
+A `StubWorktreeService` exists for tests.
+
+### Auto-create on import
+
+When an unlinked PR is imported, WorkBridge automatically:
+1. Fetches the branch from origin (`fetch_branch`)
+2. Creates a worktree for the branch (`create_worktree`)
+3. Creates a backend record linking the work item to the repo and branch
+
+### Auto-create on session spawn
+
+When a session is spawned for a work item that has a branch but no worktree,
+WorkBridge creates the worktree automatically before launching the Claude
+Code session.
 
 ## Placement Convention
 
-All worktrees created by WorkBridge live under a `.worktrees/` directory
+Worktrees created by WorkBridge live under a `.worktrees/` directory
 at the root of the repository:
 
 ```
@@ -16,15 +47,10 @@ at the root of the repository:
 /Projects/workbridge/.worktrees/    <- managed worktrees live here
   42-resize-bug/
   refactor-backend/
-  docs-tmux/
 ```
 
 The `.worktrees/` directory is added to `.gitignore` by WorkBridge on
-first use. This keeps worktree directories out of version control.
-
-The placement directory is configurable per-repo for users who prefer a
-different layout (e.g., sibling directories or a bare-repo workflow).
-See [repository-registry.md](repository-registry.md) for configuration.
+first use. The placement directory is configurable per-repo.
 
 ## Branch Naming
 
@@ -34,128 +60,44 @@ to derive issue linkage:
 - Branch names starting with a number are parsed as `<issue-number>-<slug>`.
   Example: `42-resize-bug` links to issue #42.
 - Branch names without a leading number have no automatic issue linkage.
-  Example: `refactor-backend` has no linked issue.
 
-This convention is the contract for issue linkage. It is simple, visible in
-every git log, and requires no external metadata.
+The issue number extraction pattern is configurable per-repo (default:
+`^(\d+)-`).
 
-The pattern for extracting issue numbers is configurable per-repo for teams
-that use different conventions (e.g., `JIRA-123-description` or
-`feature/123/description`). The default pattern is `^(\d+)-`.
+## What Is Planned
 
-## Worktree Creation
+The following features are defined in the API but lack full UI flows:
 
-When the user creates a new work item, WorkBridge determines the branch
-state and acts accordingly:
+### Worktree removal UI
 
-### Branch States
+The `remove_worktree` method exists and is tested, but the TUI does not
+yet expose a delete-worktree action (e.g., Ctrl+D). Deleting a work item
+currently removes the backend record but does not remove the worktree
+from disk.
 
-| State | Local branch | Remote branch | Worktree | Action |
-|-------|-------------|---------------|----------|--------|
-| Fresh | no | no | no | `git worktree add <path> -b <branch>` |
-| Remote only | no | yes | no | `git fetch` then `git worktree add <path> --track origin/<branch>` |
-| Local only | yes | no | no | `git worktree add <path> <branch>` |
-| Already checked out | yes | - | yes | Error: "Branch is already checked out at <path>" |
-| Diverged | yes | yes (different) | no | `git worktree add <path> <branch>` + warning badge |
+### Divergence handling
 
-The "Fresh" state is the normal case: the user is starting new work.
-The "Remote only" state is the adoption case: picking up work from another
-machine or from the inbox.
+When local and remote branches point to different commits, WorkBridge
+should create the worktree from the local branch and flag the work item
+with a "diverged" warning. This requires real git state derivation (dirty,
+ahead/behind), which is not yet implemented.
 
-### Diverged Branches
+### Post-merge cleanup
 
-When local and remote branches point to different commits, WorkBridge creates
-the worktree from the local branch and flags the work item with a "diverged"
-warning. It does NOT auto-rebase or auto-merge. The user resolves the
-divergence inside the Claude Code session.
+After a PR is merged, WorkBridge should detect it and offer to clean up
+the worktree and optionally prune the branch. This is not yet implemented.
 
-This is consistent with the principle of surfacing problems rather than
-guessing at solutions.
+### Branch state detection on creation
 
-## Worktree Removal
-
-Work items end when their worktree is removed. Removal can happen:
-
-- **Manually**: user presses Ctrl+D in the TUI, or runs `workbridge rm <branch>`
-- **After merge**: WorkBridge detects the PR was merged and offers to clean up
-
-WorkBridge should confirm before removal, since the worktree may contain
-uncommitted or unpushed work. The confirmation message should state what
-would be lost:
-
-```
-Remove worktree 42-resize-bug?
-  Branch: 42-resize-bug
-  Uncommitted changes: 3 files modified
-  Unpushed commits: 0
-  PR #15: merged
-
-  Press Ctrl+D again to confirm.
-```
-
-If the branch has been merged and there are no uncommitted changes, removal
-is low-risk and the confirmation can be lighter.
-
-After removal, the worktree directory is deleted and the branch is optionally
-pruned (deleted locally and from the remote). Branch pruning should be a
-separate explicit action, not automatic -- the user may want to keep the
-branch for reference.
+The full matrix of branch states (fresh, remote-only, local-only, already
+checked out, diverged) is not yet handled in the UI. Currently
+`create_worktree` handles the common cases (fresh branch, existing local
+branch) and `fetch_branch` + `create_worktree` handles the remote-only
+case during import.
 
 ## Multi-Machine Workflow
 
-WorkBridge does not synchronize state between machines. Instead, it relies
-on git remotes and GitHub as the shared state layer.
-
-### Scenario: Continuing Work on Another Machine
-
-```
-Machine A:
-  1. Creates worktree for 42-resize-bug
-  2. Works, commits, pushes
-  3. Opens PR #15
-  4. Stops working (closes laptop, etc.)
-
-Machine B:
-  1. Has the same repo registered
-  2. On startup, scans GitHub -> finds PR #15 on branch 42-resize-bug
-  3. PR appears in the Inbox (no local worktree)
-  4. User adopts it -> WorkBridge fetches branch, creates worktree
-  5. Work continues. Pushes go to the same remote branch.
-
-Machine A (later):
-  1. On startup, finds existing worktree for 42-resize-bug
-  2. Worktree is behind remote (Machine B pushed new commits)
-  3. Work item shows "behind 3" indicator
-  4. User pulls inside the session
-```
-
-No sync protocol needed. Git push/pull is the protocol.
-
-### Stale Worktrees
-
-If a worktree exists locally but the remote branch has been deleted (e.g.,
-after merge + branch cleanup on GitHub), WorkBridge flags the work item:
-
-```
-42-resize-bug [remote deleted]
-  PR #15: merged
-  Local branch still exists with 0 unpushed commits.
-  Ctrl+D to clean up.
-```
-
-This is an informational nudge, not an error. The worktree is still usable.
-
-## Open Questions
-
-- Should WorkBridge ever create worktrees outside the configured directory?
-  For example, if the user clones a repo and starts working in the main
-  worktree, should that count as a work item? Current stance: no, the main
-  worktree is special and not tracked as a work item.
-
-- Should WorkBridge support converting an existing checkout (not a worktree)
-  into a managed worktree? This would require moving files, which is risky.
-  Current stance: no, create a fresh worktree instead.
-
-- What about submodules? A worktree in a repo with submodules needs
-  `git submodule update --init` after creation. Should WorkBridge handle
-  this automatically? Probably yes, but it adds failure modes.
+WorkBridge does not synchronize state between machines. It relies on git
+remotes and GitHub as the shared state layer. Work started on Machine A
+appears as an unlinked PR on Machine B, which can import it to continue
+working.

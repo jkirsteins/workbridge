@@ -46,12 +46,16 @@ or GitHub data is fetched.
 ### Tier 0: Local git (instant, always available)
 
 - Worktree path and existence (matched by branch name)
-- Dirty/clean status
-- Ahead/behind remote tracking branch
+- Dirty/clean status (not yet implemented - hardcoded to false)
+- Ahead/behind remote tracking branch (not yet implemented - hardcoded to 0/0)
 
 This data comes from local git operations that complete in milliseconds.
 It is always available, even offline. Combined with Tier -1 data, the UI
 renders the sidebar with work item names and local git status on startup.
+
+Note: the GitState struct exists in the data model and is populated during
+assembly, but dirty/ahead/behind values are currently hardcoded placeholders.
+Real git state derivation is planned.
 
 ### Tier 1: Git remote (fast, usually available)
 
@@ -121,13 +125,13 @@ The UI should distinguish between "no PR exists" and "couldn't check for
 PRs." A missing badge means no PR. A badge with a stale/error indicator
 means the data couldn't be refreshed.
 
-## The Override File
+## The Override File (planned, not yet implemented)
 
 In rare cases, automatic derivation fails or is wrong. The branch name
 might not encode an issue number, or the user wants to associate a branch
 with a different issue than what the name suggests.
 
-For these cases, a per-worktree override file can be placed at:
+The planned design is a per-worktree override file at:
 
 ```
 .git/worktrees/<worktree-name>/workbridge.json
@@ -139,7 +143,7 @@ For the main worktree (if tracked):
 .git/workbridge.json
 ```
 
-This file contains only the fields that override automatic derivation:
+This file would contain only the fields that override automatic derivation:
 
 ```json
 {
@@ -147,10 +151,10 @@ This file contains only the fields that override automatic derivation:
 }
 ```
 
-Note: with the backend-anchored model, the override file is even less
+Note: with the backend-anchored model, the override file is less
 necessary since work item identity and repo associations are stored in
-backend records. The override file remains for edge cases where the
-branch name does not encode the correct issue number. It is optional,
+backend records. The override file would remain for edge cases where the
+branch name does not encode the correct issue number. It would be optional,
 local to the machine, never committed, and cleaned up automatically when
 the worktree is removed.
 

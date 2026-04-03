@@ -43,7 +43,6 @@ pub fn start_with_extra_branches(
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
 
-    let mut threads = Vec::with_capacity(repos.len());
     for repo_path in repos {
         let tx = tx.clone();
         let stop = Arc::clone(&stop);
@@ -52,13 +51,15 @@ pub fn start_with_extra_branches(
         let pattern = issue_pattern.clone();
         let extras = extra_branches.get(&repo_path).cloned().unwrap_or_default();
 
-        let handle = thread::spawn(move || {
+        // Threads are fully independent - we don't store JoinHandles.
+        // They exit on their own when the stop flag is set or when the
+        // channel receiver is dropped (send returns Err).
+        thread::spawn(move || {
             fetcher_loop(repo_path, tx, stop, ws, gc, &pattern, extras);
         });
-        threads.push(handle);
     }
 
-    (rx, FetcherHandle { threads, stop })
+    (rx, FetcherHandle { stop })
 }
 
 /// Main loop for a single repo fetcher thread.
@@ -201,12 +202,14 @@ fn interruptible_sleep(stop: &AtomicBool, seconds: u64) -> bool {
 }
 
 impl FetcherHandle {
-    /// Signal all fetcher threads to stop and wait for them to join.
+    /// Signal all fetcher threads to stop. Does NOT join threads - they
+    /// will exit on their own when they check the stop flag (every 1s
+    /// during sleep) or when their channel send fails (receiver dropped).
+    /// Consumes self to prevent reuse after stopping.
     pub fn stop(self) {
         self.stop.store(true, Ordering::Relaxed);
-        for handle in self.threads {
-            let _ = handle.join();
-        }
+        // Drop impl also sets the flag, but setting it here explicitly
+        // makes the intent clear and is a no-op for Drop.
     }
 }
 

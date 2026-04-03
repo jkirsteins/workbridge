@@ -1,81 +1,54 @@
-# Inbox
+# Unlinked PRs
 
-> STATUS: NOT IMPLEMENTED. This document describes the target design.
+When WorkBridge fetches open PRs from GitHub for registered repositories,
+some PRs may not match any work item's repo associations. These are called
+"unlinked PRs" and appear in a separate "Unlinked" group in the sidebar.
 
-The inbox contains remote work that has no local worktree. These are NOT
-work items -- they are candidates that can become work items when the user
-adopts them.
+## How Unlinked PRs Are Identified
 
-## What Appears in the Inbox
-
-The inbox is populated by querying GitHub for the user's open PRs across
-all registered repositories:
+During assembly, WorkBridge tracks which (repo_path, branch) pairs are
+claimed by work items. Any PR whose branch is not claimed by a work item
+is collected as an unlinked PR.
 
 ```
 for each registered repo:
-  gh pr list --author @me --json headRefName,number,title,state,...
-  
+  fetch open PRs from GitHub
+
   for each PR:
-    if no local worktree exists for this branch:
-      -> add to inbox
+    if (repo_path, head_branch) is claimed by a work item:
+      -> attached to that work item, skip
     else:
-      -> already a work item, skip
+      -> unlinked PR, shown in the Unlinked group
 ```
 
-An inbox item is a PR that exists on GitHub but has no corresponding local
-worktree. Common reasons:
+Common reasons a PR is unlinked:
 
-- The work was started on another machine
-- A collaborator opened a PR and requested review
-- The local worktree was removed but the PR is still open
+- The work was started on another machine and no local work item exists
+- The local work item was deleted but the PR is still open
+- A collaborator opened a PR that has no corresponding work item
 
-## Inbox vs. Work Items
+## Importing Unlinked PRs
 
-Inbox items are fundamentally different from work items:
+An unlinked PR can be imported into the backend, which creates a new work
+item with status InProgress, associates it with the PR's repo and branch,
+and (if no local worktree exists) creates a worktree by fetching the branch
+from origin.
 
-| | Work Item | Inbox Item |
-|---|---|---|
-| Local worktree | yes (mandatory) | no |
-| Claude Code session | yes | no |
-| Editable | yes | no (read-only) |
-| Tier 0 data (git) | yes | no |
-| Tier 2 data (GitHub) | yes | yes |
-| Can be adopted | n/a | yes |
+After import, the PR's (repo_path, branch) is claimed by the new work item
+and it no longer appears in the Unlinked group.
 
-An inbox item becomes a work item when the user adopts it, which creates
-a local worktree for the PR's branch (see
-[worktree-management.md](worktree-management.md) for the adoption flow).
+Fork PRs (where the PR's repository owner differs from the local repo's
+owner) are handled correctly: they appear as unlinked when their branch is
+not claimed, and disappear once imported.
 
-## Inbox Scope
+## Scope
 
-The inbox only shows PRs from registered repositories. If the user has
-open PRs on repos not registered with WorkBridge, those PRs do not appear.
+The Unlinked group only shows PRs from registered repositories. PRs on
+repos not registered with WorkBridge do not appear. This is intentional -
+WorkBridge cannot create worktrees for repos it does not know about.
 
-This is intentional. WorkBridge cannot create worktrees for repos it
-doesn't know about. Showing PRs the user can't act on is noise.
+## Planned
 
-## Filtering
-
-Not all of the user's PRs are relevant to the inbox. PRs that already
-have a local worktree are excluded. Beyond that, filtering options:
-
-- By review state (draft, review requested, approved, changes requested)
-- By repo
-
-The inbox is a secondary UI element. It should not compete with work items
-for attention. It is a queue of things that might need action, not an
-active workspace.
-
-## Open Questions
-
-- Should the inbox include PRs where the user is a reviewer, not the
-  author? These are "someone else's work that needs my attention." They
-  can't be adopted in the same way (the user probably doesn't want to
-  check out someone else's branch). They might warrant a separate section
-  like "Review Requests."
-
-- Should the inbox include GitHub Issues assigned to the user that have
-  no branch yet? These are "work I should start." They're not PRs, so
-  the adoption flow is different (create a new branch, not fetch an
-  existing one). This could be useful but expands the inbox concept
-  significantly.
+- Filtering unlinked PRs by review state, repo, or author
+- Showing PRs where the user is a reviewer (not the author)
+- Showing GitHub Issues assigned to the user that have no branch yet

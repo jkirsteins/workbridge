@@ -1,10 +1,7 @@
 # Error States
 
-> STATUS: NOT IMPLEMENTED. This document describes the target design.
-
-When a work item violates an invariant (see [invariants.md](invariants.md)),
-it enters an error state. This document describes how errors are detected,
-presented, and resolved.
+When a work item encounters an inconsistency, it is flagged with an error.
+Errors are orthogonal to status - a Todo or InProgress item can have errors.
 
 ## Error Presentation
 
@@ -12,93 +9,78 @@ Errors are shown inline on the affected work item, not in a separate error
 log or modal. The work item appears in the sidebar with a visual error
 indicator, and selecting it shows the error details in the detail panel.
 
-```
-Sidebar:
-  42-resize-bug          #42  PR#15 review
-  refactor-backend       !    ERROR
-  docs-tmux              #29  PR#12 draft
-
-Detail panel (refactor-backend selected):
-  refactor-backend [ERROR]
-  
-  Multiple open PRs detected on this branch:
-    PR #14: refactor: extract SessionBackend trait (open)
-    PR #19: refactor: backend trait v2 (open, draft)
-  
-  Close one of these PRs to resolve.
-```
-
 The error message must:
-1. State what is wrong (the violated invariant)
+1. State what is wrong
 2. Show the conflicting data (what was found)
 3. Suggest how to fix it (what the user should do)
 
-## Error States by Invariant
+## Error Types
 
-### Multiple Open PRs
+### MultiplePrsForBranch (implemented)
 
-**Detection**: GitHub API returns >1 open PR for the branch.
+**Detection**: GitHub API returns >1 open PR for the branch (after filtering
+out fork PRs from different repo owners).
 
-**Message**: "Multiple open PRs detected on branch X. PR #A: <title>. PR #B: <title>. Close one to resolve."
+**Presentation**: The work item shows an error badge. The detail panel lists
+the conflicting PRs by number and title, and suggests closing one.
 
-**Severity**: Error. The work item is still usable (the worktree works fine) but the PR piece is ambiguous and not shown.
+**Severity**: Error. The work item is still usable (the worktree works fine)
+but the PR piece is ambiguous and not shown.
 
-### Issue Not Found
+### IssueNotFound (implemented)
 
-**Detection**: Branch name matches the issue pattern, extracting number N, but GitHub API returns 404 for issue #N.
+**Detection**: Branch name matches the issue pattern (e.g., `42-fix-bug`),
+extracting issue number 42, but GitHub API returns 404 for that issue. Only
+fires when the fetcher actually attempted the lookup - before the first
+fetch completes, no error is shown.
 
-**Message**: "Issue #N not found in <owner/repo>. The branch name suggests issue #N but it does not exist. Rename the branch or create the issue."
+**Presentation**: Warning badge with the issue number and repo. Suggests
+renaming the branch or creating the issue.
 
-**Severity**: Warning. The work item is fully usable; it just has no issue piece. The warning nudges the user to fix the naming mismatch.
+**Severity**: Warning. The work item is fully usable; it just has no issue
+piece.
 
-### Detached HEAD
+### DetachedHead (defined, not currently produced)
 
-**Detection**: `git branch --show-current` returns empty for the worktree.
+**Detection**: Would fire when a worktree has no branch. Currently, detached
+worktrees simply do not match any work item by branch, so no error is
+produced - the worktree is silently excluded.
 
-**Message**: "Detached HEAD. Checkout a branch to track this work item."
+The variant exists in the WorkItemError enum for display completeness but
+the assembly layer does not produce it.
 
-**Severity**: Error. No branch means no PR lookup, no issue linkage. The worktree exists and the session works, but the work item is not trackable.
+### CorruptBackendRecord (defined, not currently produced)
 
-### Worktree on Default Branch
+**Detection**: Would fire when backend.list() encounters a parseable but
+invalid record. In v1, the LocalFileBackend skips corrupt files entirely
+rather than producing this error.
 
-**Detection**: Worktree's branch matches the repo's default branch (main, master, or configured).
+### WorktreeGone (defined, not currently produced)
 
-**Message**: "Worktree is on the default branch (main). Work items must be on feature branches."
+**Detection**: Would fire when a work item references a worktree path that
+no longer exists on disk. Detection is deferred to a future assembly pass.
+Currently, the worktree_path is simply set to None when no match is found.
 
-**Severity**: Error. This worktree should not be a work item.
+## Planned Error Types
 
-### Diverged Branch
+The following error conditions from the original design are not yet
+implemented but remain planned:
 
-**Detection**: Local and remote branch exist but point to different commits and neither is an ancestor of the other.
-
-**Message**: "Branch has diverged from remote. N commits ahead, M commits behind. Pull or rebase to resolve."
-
-**Severity**: Warning. The worktree is fully usable. The warning prevents the user from being surprised by a conflict later.
-
-### Repository Unavailable
-
-**Detection**: Registered repo path does not exist or is not accessible.
-
-**Message**: "Repository path not found: /path/to/repo. Is the drive mounted?"
-
-**Severity**: Info. All work items from this repo are hidden. The repo appears dimmed in any repo-level UI.
-
-### GitHub API Unreachable
-
-**Detection**: API calls fail (network error, auth expired, rate limited).
-
-**Message**: Per work item: issue and PR badges show a stale indicator. Globally: status bar shows "GitHub: offline" or "GitHub: rate limited (resets in Xm)".
-
-**Severity**: Info. Local data (Tier 0, Tier 1) is unaffected. The system continues working with degraded metadata.
+- **Diverged Branch**: Local and remote branch point to different commits
+  and neither is an ancestor of the other. Requires real git state
+  derivation (currently hardcoded).
+- **Repository Unavailable**: Registered repo path does not exist or is
+  not accessible.
+- **GitHub API Unreachable**: API calls fail (network error, auth expired,
+  rate limited). Per-item stale indicators and a global status bar message.
 
 ## Philosophy
 
-Every error state listed above was chosen because the alternative was
-worse:
+Every error state was chosen because the alternative was worse:
 
 - Guessing which PR is correct risks showing wrong data.
 - Silently dropping the issue link hides a naming mistake.
-- Allowing detached HEAD worktrees creates items that can't be enriched.
+- Allowing detached HEAD worktrees creates items that cannot be enriched.
 - Auto-rebasing diverged branches can destroy work.
 
 The cost of showing an error is low: the user reads a message and takes
