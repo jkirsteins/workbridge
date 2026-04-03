@@ -17,7 +17,7 @@ pub struct PanelLayout {
 /// Pane rows = total rows minus 2 for borders, minus `bottom_bar_rows` for
 /// any bottom bars (context bar, status bar, etc.).
 pub fn compute(cols: u16, rows: u16, bottom_bar_rows: u16) -> PanelLayout {
-    let left_width = std::cmp::max(cols / 5, 20).min(cols);
+    let left_width = std::cmp::max(cols / 4, 30).min(cols);
     let right_raw = cols.saturating_sub(left_width).saturating_sub(2);
     let pane_cols = if right_raw > 0 { right_raw } else { 1 };
 
@@ -38,10 +38,10 @@ mod tests {
     #[test]
     fn standard_terminal_80x24() {
         let pl = compute(80, 24, 0);
-        // 80 / 5 = 16, but minimum is 20
-        assert_eq!(pl.left_width, 20);
-        // right = 80 - 20 - 2 (borders) = 58
-        assert_eq!(pl.pane_cols, 58);
+        // 80 / 4 = 20, but minimum is 30
+        assert_eq!(pl.left_width, 30);
+        // right = 80 - 30 - 2 (borders) = 48
+        assert_eq!(pl.pane_cols, 48);
         // rows = 24 - 2 (borders) = 22
         assert_eq!(pl.pane_rows, 22);
     }
@@ -49,8 +49,8 @@ mod tests {
     #[test]
     fn standard_terminal_with_one_bottom_bar() {
         let pl = compute(80, 24, 1);
-        assert_eq!(pl.left_width, 20);
-        assert_eq!(pl.pane_cols, 58);
+        assert_eq!(pl.left_width, 30);
+        assert_eq!(pl.pane_cols, 48);
         // rows = 24 - 2 (borders) - 1 (bar) = 21
         assert_eq!(pl.pane_rows, 21);
     }
@@ -58,8 +58,8 @@ mod tests {
     #[test]
     fn standard_terminal_with_two_bottom_bars() {
         let pl = compute(80, 24, 2);
-        assert_eq!(pl.left_width, 20);
-        assert_eq!(pl.pane_cols, 58);
+        assert_eq!(pl.left_width, 30);
+        assert_eq!(pl.pane_cols, 48);
         // rows = 24 - 2 (borders) - 2 (bars) = 20
         assert_eq!(pl.pane_rows, 20);
     }
@@ -67,10 +67,10 @@ mod tests {
     #[test]
     fn wide_terminal_200x50() {
         let pl = compute(200, 50, 0);
-        // 200 / 5 = 40, above minimum of 20
-        assert_eq!(pl.left_width, 40);
-        // right = 200 - 40 - 2 = 158
-        assert_eq!(pl.pane_cols, 158);
+        // 200 / 4 = 50, above minimum of 30
+        assert_eq!(pl.left_width, 50);
+        // right = 200 - 50 - 2 = 148
+        assert_eq!(pl.pane_cols, 148);
         // rows = 50 - 2 = 48
         assert_eq!(pl.pane_rows, 48);
     }

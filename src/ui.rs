@@ -310,8 +310,18 @@ fn format_work_item_entry<'a>(
     let has_worktree = first_assoc.is_some_and(|a| a.worktree_path.is_some());
     let wt_indicator = if has_worktree { "" } else { " [no wt]" };
 
-    // Build line 2 content: "  repo  branch  [no wt]"
-    let line2_content = format!("{prefix}{repo_name}  {branch_name}{wt_indicator}");
+    // Build line 2: show branch first (more useful), then repo in parens.
+    // Truncate to fit within max_width.
+    let branch_display = if branch_name.len() > 20 {
+        // Shorten long branch names: show last segment after /
+        branch_name
+            .rsplit_once('/')
+            .map(|(_, tail)| tail)
+            .unwrap_or(branch_name)
+    } else {
+        branch_name
+    };
+    let line2_content = format!("{prefix}{branch_display} ({repo_name}){wt_indicator}");
     let truncated_line2 = truncate_str(&line2_content, max_width);
 
     let line2 = Line::from(vec![Span::styled(

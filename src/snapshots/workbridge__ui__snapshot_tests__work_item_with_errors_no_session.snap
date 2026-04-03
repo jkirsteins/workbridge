@@ -2,27 +2,27 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items ──────┐┌ Claude Code ─────────────────────────────────────────────┐
-│  TODO (0)        ││                                                          │
-│    No work items ││  Errors:                                                 │
-│  IN PROGRESS (1) ││                                                          │
-│>   Broken work i.││  - 2 open PRs for branch '42-fix-bug' in /repo/alpha     │
-│    alpha  42-fix-││    Close duplicate PRs to resolve.                       │
-│                  ││                                                          │
-│                  ││  - Issue #42 not found in /repo/alpha                    │
-│                  ││    The issue may have been deleted or the number is wrong│
-│                  ││                                                          │
-│                  ││  Press Enter to start a session.                         │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-│                  ││                                                          │
-└──────────────────┘└──────────────────────────────────────────────────────────┘
+┌ Work Items ────────────────┐┌ Claude Code ───────────────────────────────────┐
+│  TODO (0)                  ││                                                │
+│    No work items           ││  Errors:                                       │
+│  IN PROGRESS (1)           ││                                                │
+│>   Broken work item        ││  - 2 open PRs for branch '42-fix-bug' in /repo/│
+│    42-fix-bug (alpha) [no w││    Close duplicate PRs to resolve.             │
+│                            ││                                                │
+│                            ││  - Issue #42 not found in /repo/alpha          │
+│                            ││    The issue may have been deleted or the numbe│
+│                            ││                                                │
+│                            ││  Press Enter to start a session.               │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+│                            ││                                                │
+└────────────────────────────┘└────────────────────────────────────────────────┘
 Broken work item | /repo/alpha
