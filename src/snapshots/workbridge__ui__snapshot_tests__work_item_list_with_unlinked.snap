@@ -2,27 +2,27 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items ────────────────┐┌ Claude Code ───────────────────────────────────┐
-│  UNLINKED (2)              ││                                                │
-│> ? fix-typo             PR#││  Press Enter to import                         │
-│  ? update-deps    PR#12 dra││  this PR as a work item.                       │
-│  TODO (0)                  ││                                                │
-│    No work items           ││                                                │
-│  IN PROGRESS (1)           ││                                                │
-│    Active feature    PR#30 ││                                                │
-│    branch-prog-1 (0) [no wt││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-└────────────────────────────┘└────────────────────────────────────────────────┘
+┌ Work Items ───────────┐┌ Claude Code ────────────────────────────────────────┐
+│  UNLINKED (2)         ││                                                     │
+│> ? fix-typo      PR#45││  Press Enter to import                              │
+│  ? updat.. PR#12 draft││  this PR as a work item.                            │
+│  TODO (0)             ││                                                     │
+│    No work items      ││                                                     │
+│  IN PROGRESS (1)      ││                                                     │
+│    Active f.. PR#30 ok││                                                     │
+│    branch-prog-1 (0)  ││                                                     │
+│      [no wt]          ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+└───────────────────────┘└─────────────────────────────────────────────────────┘

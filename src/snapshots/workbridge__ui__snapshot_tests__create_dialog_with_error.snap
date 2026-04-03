@@ -2,13 +2,13 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items ────────────────┐┌ Claude Code ───────────────────────────────────┐
-│TODO (0)                    ││                                                │
-│  No work items             ││  Welcome to workbridge                         │
-│IN PROGRESS (0)             ││                                                │
+┌ Work Items ───────────┐┌ Claude Code ────────────────────────────────────────┐
+│TODO (0)               ││                                                     │
+│  No work items        ││  Welcome to workbridge                              │
+│IN PROGRESS (0)        ││                                                     │
 │  No work items┌ Create Work Item ────────────────────────────┐               │
 │               │                                              │               │
-│               │ Title:                                       │rt             │
+│               │ Title:                                       │               │
 │               │                                              │               │
 │               │                                              │               │
 │               │ Repos:                                       │               │
@@ -21,8 +21,8 @@ expression: "render(&app, 80, 24)"
 │               │ Enter: Create | Esc: Cancel | Tab: Next fiel │               │
 │               │                                              │               │
 │               └──────────────────────────────────────────────┘               │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-└────────────────────────────┘└────────────────────────────────────────────────┘
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+└───────────────────────┘└─────────────────────────────────────────────────────┘

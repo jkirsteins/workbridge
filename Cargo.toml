@@ -22,6 +22,7 @@ crossbeam-channel = "0.5"
 ratatui-core = "0.1"
 ratatui-crossterm = "0.1"
 ratatui-widgets = "0.3"
+unicode-width = "0.2"
 
 [dev-dependencies]
 insta = "1"

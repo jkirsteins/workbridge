@@ -2,27 +2,27 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items ────────────────┐┌ Claude Code ───────────────────────────────────┐
-│  TODO (1)                  ││                                                │
-│>   Fix resize bug          ││  Fix resize bug                                │
-│    branch-ctx-3 (0) [no wt]││                                                │
-│  IN PROGRESS (0)           ││  Status      Todo                              │
-│    No work items           ││  Backend     Local file                        │
-│                            ││  Repo        /repo/ctx-3/0                     │
-│                            ││  Branch      branch-ctx-3                      │
-│                            ││  Worktree    (none)                            │
-│                            ││  PR          (none)                            │
-│                            ││  Issue       #42 - Fix resize bug              │
-│                            ││  Errors      (none)                            │
-│                            ││                                                │
-│                            ││  Press Enter to start a session.               │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-└────────────────────────────┘└────────────────────────────────────────────────┘
+┌ Work Items ───────────┐┌ Claude Code ────────────────────────────────────────┐
+│  TODO (1)             ││                                                     │
+│>   Fix resize bug     ││  Fix resize bug                                     │
+│    branch-ctx-3 (0)   ││                                                     │
+│      [no wt]          ││  Status      Todo                                   │
+│  IN PROGRESS (0)      ││  Backend     Local file                             │
+│    No work items      ││  Repo        /repo/ctx-3/0                          │
+│                       ││  Branch      branch-ctx-3                           │
+│                       ││  Worktree    (none)                                 │
+│                       ││  PR          (none)                                 │
+│                       ││  Issue       #42 - Fix resize bug                   │
+│                       ││  Errors      (none)                                 │
+│                       ││                                                     │
+│                       ││  Press Enter to start a session.                    │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+└───────────────────────┘└─────────────────────────────────────────────────────┘
 Fix resize bug | /repo/ctx-3/0 | bug
 Right panel focused - press Ctrl+] to return

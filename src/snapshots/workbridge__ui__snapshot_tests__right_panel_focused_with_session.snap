@@ -2,27 +2,27 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items ────────────────┐┌ Claude Code [INPUT] ───────────────────────────┐
-│  TODO (1)                  ││                                                │
-│>   Fix authentication bug  ││  Fix authentication bug                        │
-│    branch-todo-1 (0) [no wt││                                                │
-│  IN PROGRESS (0)           ││  Status      Todo                              │
-│    No work items           ││  Backend     Local file                        │
-│                            ││  Repo        /repo/todo-1/0                    │
-│                            ││  Branch      branch-todo-1                     │
-│                            ││  Worktree    (none)                            │
-│                            ││  PR          (none)                            │
-│                            ││  Issue       (none)                            │
-│                            ││  Errors      (none)                            │
-│                            ││                                                │
-│                            ││  Press Enter to start a session.               │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-│                            ││                                                │
-└────────────────────────────┘└────────────────────────────────────────────────┘
+┌ Work Items ───────────┐┌ Claude Code [INPUT] ────────────────────────────────┐
+│  TODO (1)             ││                                                     │
+│>   Fix authenticatio..││  Fix authentication bug                             │
+│    branch-todo-1 (0)  ││                                                     │
+│      [no wt]          ││  Status      Todo                                   │
+│  IN PROGRESS (0)      ││  Backend     Local file                             │
+│    No work items      ││  Repo        /repo/todo-1/0                         │
+│                       ││  Branch      branch-todo-1                          │
+│                       ││  Worktree    (none)                                 │
+│                       ││  PR          (none)                                 │
+│                       ││  Issue       (none)                                 │
+│                       ││  Errors      (none)                                 │
+│                       ││                                                     │
+│                       ││  Press Enter to start a session.                    │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+└───────────────────────┘└─────────────────────────────────────────────────────┘
 Fix authentication bug | /repo/todo-1/0

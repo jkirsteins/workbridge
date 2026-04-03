@@ -12,6 +12,7 @@ use ratatui_widgets::{
     paragraph::Paragraph,
 };
 use tui_term::widget::PseudoTerminal;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, DisplayEntry, FocusPanel, SettingsListFocus, WorkItemContext};
 use crate::config;
@@ -134,8 +135,9 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         return;
     }
 
-    // Available width inside the block borders.
-    let inner_width = area.width.saturating_sub(2) as usize;
+    // Available width inside the block borders, minus highlight symbol space.
+    // The List widget reserves space for the highlight symbol ("> ") on all rows.
+    let inner_width = area.width.saturating_sub(2).saturating_sub(2) as usize;
 
     let items: Vec<ListItem> = app
         .display_list
@@ -195,12 +197,13 @@ fn format_unlinked_item<'a>(
     // Reserve space: 2 for "? " prefix, right.len() for badge, 1 for gap.
     let prefix = "? ";
     let available = max_width
-        .saturating_sub(prefix.len())
-        .saturating_sub(right.len())
+        .saturating_sub(prefix.width())
+        .saturating_sub(right.width())
         .saturating_sub(1);
     let truncated_title = truncate_str(title, available);
 
-    let padding = max_width.saturating_sub(prefix.len() + truncated_title.len() + right.len());
+    let padding =
+        max_width.saturating_sub(prefix.width() + truncated_title.width() + right.width());
     let pad_str: String = " ".repeat(padding);
 
     ListItem::new(Line::from(vec![
@@ -263,17 +266,39 @@ fn format_work_item_entry<'a>(
         right_parts.push((format!(" [{repo_count} repos]"), theme.style_text_muted()));
     }
 
-    let right_text: String = right_parts.iter().map(|(s, _)| s.as_str()).collect();
-
     // Title.
     let prefix = "  ";
-    let available = max_width
-        .saturating_sub(prefix.len())
-        .saturating_sub(right_text.len())
-        .saturating_sub(1);
+    // Minimum number of display columns reserved for the title so it never
+    // vanishes when badges consume all available width.
+    const MIN_TITLE_BUDGET: usize = 5;
+
+    let space_for_content = max_width.saturating_sub(prefix.width());
+
+    // Drop badges from the right until the title gets at least MIN_TITLE_BUDGET
+    // columns (or we run out of badges to drop).
+    let mut visible_badge_count = right_parts.len();
+    let mut right_text: String = right_parts.iter().map(|(s, _)| s.as_str()).collect();
+    while visible_badge_count > 0 {
+        let title_budget = space_for_content
+            .saturating_sub(right_text.width())
+            .saturating_sub(1); // gap between title and badges
+        if title_budget >= MIN_TITLE_BUDGET {
+            break;
+        }
+        visible_badge_count -= 1;
+        right_text = right_parts[..visible_badge_count]
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect();
+    }
+
+    let available = space_for_content
+        .saturating_sub(right_text.width())
+        .saturating_sub(if right_text.is_empty() { 0 } else { 1 });
     let truncated_title = truncate_str(&wi.title, available);
 
-    let padding = max_width.saturating_sub(prefix.len() + truncated_title.len() + right_text.len());
+    let padding =
+        max_width.saturating_sub(prefix.width() + truncated_title.width() + right_text.width());
     let pad_str: String = " ".repeat(padding);
 
     let title_style = if wi.status == WorkItemStatus::Done {
@@ -286,64 +311,177 @@ fn format_work_item_entry<'a>(
         Span::styled(truncated_title, title_style),
         Span::raw(pad_str),
     ];
-    for (text, style) in right_parts {
-        line1_spans.push(Span::styled(text, style));
+    for (text, style) in &right_parts[..visible_badge_count] {
+        line1_spans.push(Span::styled(text.clone(), *style));
     }
     let line1 = Line::from(line1_spans);
 
-    // -- Line 2: repo name, branch, worktree indicator (all muted) --
+    // -- Line 2+: metadata (only if the work item has meaningful context) --
+    //
+    // A work item can be in different states of completeness:
+    // - Has branch + worktree + PR: show branch (repo) with all badges
+    // - Has branch but no worktree: show branch (repo) [no wt]
+    // - Has no branch (pre-planning): show just repo name, no tags
+    // - Has no repo associations: show nothing (shouldn't happen per invariant 1)
 
     let first_assoc = wi.repo_associations.first();
-
-    let repo_name = first_assoc
-        .and_then(|a| {
-            a.repo_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-        })
-        .unwrap_or_default();
-
-    let branch_name = first_assoc
-        .and_then(|a| a.branch.as_deref())
-        .unwrap_or("[no branch]");
-
+    let has_branch = first_assoc.is_some_and(|a| a.branch.is_some());
     let has_worktree = first_assoc.is_some_and(|a| a.worktree_path.is_some());
-    let wt_indicator = if has_worktree { "" } else { " [no wt]" };
 
-    // Build line 2: show branch first (more useful), then repo in parens.
-    // Truncate to fit within max_width.
-    let branch_display = if branch_name.len() > 20 {
-        // Shorten long branch names: show last segment after /
-        branch_name
-            .rsplit_once('/')
-            .map(|(_, tail)| tail)
-            .unwrap_or(branch_name)
-    } else {
-        branch_name
-    };
-    let line2_content = format!("{prefix}{branch_display} ({repo_name}){wt_indicator}");
-    let truncated_line2 = truncate_str(&line2_content, max_width);
+    let mut lines = vec![line1];
 
-    let line2 = Line::from(vec![Span::styled(
-        truncated_line2,
-        theme.style_text_muted(),
-    )]);
+    if has_branch {
+        // Full metadata: branch (repo) [no wt]
+        let branch_name = first_assoc.and_then(|a| a.branch.as_deref()).unwrap_or("");
+        let repo_name = first_assoc
+            .and_then(|a| {
+                a.repo_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+            })
+            .unwrap_or_default();
+        let wt_indicator = if has_worktree { "" } else { " [no wt]" };
 
-    ListItem::new(vec![line1, line2])
+        let meta_content = format!("{prefix}{branch_name} ({repo_name}){wt_indicator}");
+        let wrapped = wrap_text(&meta_content, max_width);
+        for wrapped_line in wrapped {
+            lines.push(Line::from(vec![Span::styled(
+                wrapped_line,
+                theme.style_text_muted(),
+            )]));
+        }
+    } else if let Some(assoc) = first_assoc {
+        // Pre-planning: just show repo name, no tags
+        let repo_name = assoc
+            .repo_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !repo_name.is_empty() {
+            let meta_content = format!("{prefix}{repo_name}");
+            let wrapped = wrap_text(&meta_content, max_width);
+            for wrapped_line in wrapped {
+                lines.push(Line::from(vec![Span::styled(
+                    wrapped_line,
+                    theme.style_text_muted(),
+                )]));
+            }
+        }
+    }
+    // No repo associations = no line 2 (invariant 1 violation, but render gracefully)
+
+    ListItem::new(lines)
 }
 
-/// Truncate a string to fit within max_len characters.
+/// Word-wrap a string to fit within max_width display columns.
+/// Breaks at word boundaries (space, /, -, paren) when possible.
+/// Wraps to as many lines as needed - no artificial cap.
+/// Continuation lines are indented with 4 spaces.
+/// Every output line is guaranteed to be <= max_width display columns.
+fn wrap_text(s: &str, max_width: usize) -> Vec<String> {
+    const INDENT: &str = "    ";
+    let indent_width = INDENT.width();
+
+    if max_width == 0 {
+        return vec![];
+    }
+
+    if s.width() <= max_width {
+        return vec![s.to_string()];
+    }
+
+    let mut lines = Vec::new();
+    let mut remaining = s;
+
+    while !remaining.is_empty() {
+        // Continuation lines have less space due to indent
+        let effective_width = if lines.is_empty() {
+            max_width
+        } else {
+            max_width.saturating_sub(indent_width)
+        };
+
+        // Guard: if effective_width is 0 (max_width < indent), force at least 1 char
+        let effective_width = effective_width.max(1);
+
+        if remaining.width() <= effective_width {
+            lines.push(remaining.to_string());
+            break;
+        }
+
+        // Find the byte index where cumulative display width reaches effective_width
+        let byte_limit = remaining
+            .char_indices()
+            .scan(0usize, |acc, (i, c)| {
+                let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                *acc += w;
+                Some((i, *acc))
+            })
+            .take_while(|&(_, cum_w)| cum_w <= effective_width)
+            .last()
+            .map(|(i, _)| {
+                // Advance past this char to get the end byte index
+                i + remaining[i..].chars().next().map_or(0, |c| c.len_utf8())
+            })
+            .unwrap_or_else(|| {
+                // First char is already wider than effective_width; take it anyway
+                remaining.chars().next().map_or(0, |c| c.len_utf8())
+            });
+
+        // Try to break at a word boundary within the limit
+        let break_at = remaining[..byte_limit]
+            .rfind([' ', '/', '-', '('])
+            .map(|i| i + 1)
+            .unwrap_or(byte_limit);
+
+        let (line, rest) = remaining.split_at(break_at);
+        lines.push(line.to_string());
+
+        let trimmed = rest.trim_start();
+        if trimmed.is_empty() {
+            break;
+        }
+        remaining = trimmed;
+    }
+
+    // Prepend indent to continuation lines, but only if max_width can
+    // accommodate it without exceeding the width guarantee.
+    if max_width > indent_width {
+        for line in lines.iter_mut().skip(1) {
+            *line = format!("{INDENT}{line}");
+        }
+    }
+
+    lines
+}
+
+/// Truncate a string to fit within max_len display columns.
 /// If truncated, appends "..".
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.width() <= max_len {
         s.to_string()
     } else if max_len <= 2 {
-        s.chars().take(max_len).collect()
+        truncate_to_width(s, max_len)
     } else {
-        let mut result: String = s.chars().take(max_len - 2).collect();
+        let mut result = truncate_to_width(s, max_len - 2);
         result.push_str("..");
         result
     }
+}
+
+/// Take chars from `s` until their cumulative display width reaches `max_cols`.
+fn truncate_to_width(s: &str, max_cols: usize) -> String {
+    let mut width = 0;
+    let mut result = String::new();
+    for c in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + cw > max_cols {
+            break;
+        }
+        width += cw;
+        result.push(c);
+    }
+    result
 }
 
 /// Format a WorkItemError into a user-facing message and optional suggestion.
@@ -1122,6 +1260,338 @@ fn centered_rect_fixed(width: u16, height: u16, outer: Rect) -> Rect {
     let x = outer.x + (outer.width.saturating_sub(w)) / 2;
     let y = outer.y + (outer.height.saturating_sub(h)) / 2;
     Rect::new(x, y, w, h)
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::wrap_text;
+
+    /// Every output line must fit within max_width (measured in display columns).
+    fn assert_all_lines_fit(lines: &[String], max_width: usize) {
+        use unicode_width::UnicodeWidthStr;
+        for (i, line) in lines.iter().enumerate() {
+            let display_width = line.width();
+            assert!(
+                display_width <= max_width,
+                "line {i} is {display_width} cols but max_width is {max_width}: {:?}",
+                line,
+            );
+        }
+    }
+
+    #[test]
+    fn short_string_no_wrap() {
+        let result = wrap_text("hello", 20);
+        assert_eq!(result, vec!["hello"]);
+        assert_all_lines_fit(&result, 20);
+    }
+
+    #[test]
+    fn exact_fit_no_wrap() {
+        let s = "exactly twenty chars";
+        assert_eq!(s.len(), 20);
+        let result = wrap_text(s, 20);
+        assert_eq!(result.len(), 1);
+        assert_all_lines_fit(&result, 20);
+    }
+
+    #[test]
+    fn wraps_at_word_boundary() {
+        let result = wrap_text("  hello world foo bar", 14);
+        assert_all_lines_fit(&result, 14);
+        assert!(result.len() >= 2, "should wrap: {:?}", result);
+    }
+
+    #[test]
+    fn wraps_at_slash_boundary() {
+        // Simulates a branch like "janiskirsteins/agent-specific-labels"
+        let result = wrap_text("  janiskirsteins/agent-specific-labels (walleyboard)", 25);
+        assert_all_lines_fit(&result, 25);
+        assert!(result.len() >= 2, "should wrap: {:?}", result);
+    }
+
+    #[test]
+    fn continuation_lines_indented() {
+        let result = wrap_text("  long content that must wrap to next line", 20);
+        assert_all_lines_fit(&result, 20);
+        if result.len() > 1 {
+            assert!(
+                result[1].starts_with("    "),
+                "continuation should be indented: {:?}",
+                result[1]
+            );
+        }
+    }
+
+    #[test]
+    fn all_content_preserved() {
+        let input = "  [no branch] (workbridge) [no wt]";
+        let result = wrap_text(input, 20);
+        assert_all_lines_fit(&result, 20);
+        // All key content words must appear somewhere in the output.
+        // Words may be split across lines by the wrapper.
+        let flat: String = result
+            .iter()
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for word in ["no", "branch", "workbridge", "wt"] {
+            assert!(flat.contains(word), "missing '{word}': {flat}");
+        }
+    }
+
+    #[test]
+    fn very_narrow_width() {
+        let result = wrap_text("  hello world", 8);
+        assert_all_lines_fit(&result, 8);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn empty_string() {
+        let result = wrap_text("", 20);
+        assert_eq!(result, vec![""]);
+    }
+
+    #[test]
+    fn zero_width() {
+        let result = wrap_text("hello", 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn realistic_workitem_narrow_panel() {
+        // 23 chars inner width (100 col terminal, 25% left panel)
+        let input = "  [no branch] (workbridge) [no wt]";
+        let result = wrap_text(input, 23);
+        assert_all_lines_fit(&result, 23);
+        let joined: String = result
+            .iter()
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("[no wt]"), "must not clip [no wt]");
+    }
+
+    #[test]
+    fn realistic_branch_narrow_panel() {
+        let input = "  janiskirsteins/agent-specific-labels (walleyboard)";
+        let result = wrap_text(input, 23);
+        assert_all_lines_fit(&result, 23);
+        let joined: String = result
+            .iter()
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("walleyboard"), "must not clip repo name");
+    }
+
+    #[test]
+    fn multibyte_utf8_no_panic() {
+        // Accented chars (2 bytes each in UTF-8), must not panic on slice
+        let input = "  feature/korrektur-andern-loschen (projekt)";
+        let result = wrap_text(input, 20);
+        assert_all_lines_fit(&result, 20);
+        assert!(!result.is_empty());
+        let joined: String = result
+            .iter()
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("projekt"), "must preserve repo name");
+    }
+
+    #[test]
+    fn wide_cjk_characters_respect_display_width() {
+        use unicode_width::UnicodeWidthStr;
+        // CJK ideographs: each is 2 display columns, 1 char, 3 bytes
+        // \u{4e16}\u{754c} = 2 chars, 4 display columns
+        let input = "  \u{4e16}\u{754c}/test (repo)";
+        assert!(
+            input.width() > input.chars().count(),
+            "CJK should be wider than char count: width={}, chars={}",
+            input.width(),
+            input.chars().count()
+        );
+        let result = wrap_text(input, 12);
+        assert_all_lines_fit(&result, 12);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn emoji_display_width() {
+        // \u{1f600} = grinning face, 2 display columns, 1 char, 4 bytes
+        let input = "  fix/\u{1f600}bug (my-repo)";
+        let result = wrap_text(input, 14);
+        assert_all_lines_fit(&result, 14);
+        assert!(!result.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod format_entry_tests {
+    use super::format_work_item_entry;
+    use crate::app::{App, StubBackend};
+    use crate::theme::Theme;
+    use crate::work_item::*;
+    use std::path::PathBuf;
+    use unicode_width::UnicodeWidthStr;
+
+    /// Render a ListItem to a string by putting it in a List widget and
+    /// rendering to a buffer.
+    fn render_list_item_to_string(
+        item: ratatui_widgets::list::ListItem<'_>,
+        width: usize,
+    ) -> String {
+        use ratatui_core::buffer::Buffer;
+        use ratatui_core::layout::Rect;
+        use ratatui_core::widgets::Widget;
+        let height = item.height() as u16;
+        let area = Rect::new(0, 0, width as u16, height);
+        let list = ratatui_widgets::list::List::new(vec![item]);
+        let mut buf = Buffer::empty(area);
+        list.render(area, &mut buf);
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width as u16 {
+                if let Some(cell) = buf.cell((x, y)) {
+                    line.push_str(cell.symbol());
+                }
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    fn make_app_with_work_item(wi: WorkItem) -> App {
+        let mut app = App::with_config(crate::config::Config::default(), Box::new(StubBackend));
+        app.work_items = vec![wi];
+        app
+    }
+
+    /// Pre-planning items (no branch, no worktree) should NOT show
+    /// [no branch] or [no wt] tags. They just show the repo name.
+    #[test]
+    fn pre_planning_item_no_tags() {
+        let wi = WorkItem {
+            id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
+            backend_type: BackendType::LocalFile,
+            title: "Fix auth bug".to_string(),
+            status: WorkItemStatus::Todo,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/Projects/myrepo"),
+                branch: None,
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        };
+        let app = make_app_with_work_item(wi);
+        let theme = Theme::default_theme();
+        let item = format_work_item_entry(&app, 0, 40, &theme);
+        let text = render_list_item_to_string(item, 40);
+
+        assert!(
+            !text.contains("[no branch]"),
+            "should not show [no branch] tag: {text}"
+        );
+        assert!(
+            !text.contains("[no wt]"),
+            "should not show [no wt] tag: {text}"
+        );
+        assert!(text.contains("myrepo"), "should show repo name: {text}");
+    }
+
+    /// Work items with a branch should show branch and repo on line 2.
+    #[test]
+    fn item_with_branch_shows_metadata() {
+        let wi = WorkItem {
+            id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
+            backend_type: BackendType::LocalFile,
+            title: "Fix auth bug".to_string(),
+            status: WorkItemStatus::InProgress,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/Projects/myrepo"),
+                branch: Some("42-fix-auth".to_string()),
+                worktree_path: Some(PathBuf::from("/Projects/myrepo/.worktrees/42-fix-auth")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        };
+        let app = make_app_with_work_item(wi);
+        let theme = Theme::default_theme();
+        let item = format_work_item_entry(&app, 0, 40, &theme);
+        let text = render_list_item_to_string(item, 40);
+
+        assert!(text.contains("42-fix-auth"), "should show branch: {text}");
+        assert!(text.contains("myrepo"), "should show repo: {text}");
+        assert!(!text.contains("[no wt]"), "has worktree, no tag: {text}");
+    }
+
+    /// Work items with branch but no worktree show [no wt].
+    #[test]
+    fn item_with_branch_no_worktree_shows_no_wt() {
+        let wi = WorkItem {
+            id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
+            backend_type: BackendType::LocalFile,
+            title: "Planned work".to_string(),
+            status: WorkItemStatus::Todo,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/Projects/myrepo"),
+                branch: Some("feature-x".to_string()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        };
+        let app = make_app_with_work_item(wi);
+        let theme = Theme::default_theme();
+        let item = format_work_item_entry(&app, 0, 40, &theme);
+        let text = render_list_item_to_string(item, 40);
+
+        assert!(text.contains("feature-x"), "should show branch: {text}");
+        assert!(text.contains("[no wt]"), "should show [no wt]: {text}");
+    }
+
+    /// Every line in the rendered item must fit within max_width.
+    #[test]
+    fn all_lines_fit_within_max_width() {
+        let wi = WorkItem {
+            id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
+            backend_type: BackendType::LocalFile,
+            title: "A very long title that should be truncated properly".to_string(),
+            status: WorkItemStatus::InProgress,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/Projects/walleyboard"),
+                branch: Some("janiskirsteins/agent-specific-labels".to_string()),
+                worktree_path: Some(PathBuf::from("/Projects/walleyboard")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        };
+        let app = make_app_with_work_item(wi);
+        let theme = Theme::default_theme();
+        let max_width = 21; // Narrow panel (100 col terminal)
+        let item = format_work_item_entry(&app, 0, max_width, &theme);
+        let text = render_list_item_to_string(item, max_width);
+        for (i, line) in text.lines().enumerate() {
+            let line_width = line.width();
+            assert!(
+                line_width <= max_width,
+                "line {i} is {line_width} cols but max is {max_width}: {:?}",
+                line,
+            );
+        }
+    }
 }
 
 #[cfg(test)]
