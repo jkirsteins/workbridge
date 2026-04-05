@@ -1794,6 +1794,28 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn panel_title_contains_exact_count() {
+        let items = vec![
+            make_work_item("a", "First", WorkItemStatus::Backlog, None, 1),
+            make_work_item("b", "Second", WorkItemStatus::Implementing, None, 1),
+        ];
+        let app = app_with_items(items, vec![]);
+        let output = render(&app, 80, 24);
+        assert!(
+            output.contains("Work Items (2)"),
+            "expected title to contain 'Work Items (2)', got:\n{output}"
+        );
+
+        // Empty list should show (0).
+        let empty_app = app_with_items(vec![], vec![]);
+        let empty_output = render(&empty_app, 80, 24);
+        assert!(
+            empty_output.contains("Work Items (0)"),
+            "expected title to contain 'Work Items (0)', got:\n{empty_output}"
+        );
+    }
+
+    #[test]
     fn work_item_selected_no_session() {
         let items = vec![make_work_item(
             "todo-1",

@@ -1,3 +1,4 @@
 /target
 REVIEW_LOG.md
 .worktrees/
+.mcp.json
