@@ -342,11 +342,10 @@ impl WorktreeService for GitWorktreeService {
             return Ok(()); // Branch already exists locally.
         }
 
-        // Try to base the new branch on the default branch.
-        let base = self
-            .default_branch(repo_path)
-            .unwrap_or_else(|_| "HEAD".to_string());
-        Self::run_git(repo_path, &["branch", branch, &base])?;
+        // Base the new branch on the current HEAD (the checked-out branch).
+        // This ensures new feature branches start from the latest code,
+        // not from the default branch which may be behind.
+        Self::run_git(repo_path, &["branch", branch, "HEAD"])?;
         Ok(())
     }
 }

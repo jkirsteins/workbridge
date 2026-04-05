@@ -1783,6 +1783,17 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn panel_title_shows_item_count() {
+        let items = vec![
+            make_work_item("a", "First item", WorkItemStatus::Backlog, None, 1),
+            make_work_item("b", "Second item", WorkItemStatus::Implementing, None, 1),
+            make_work_item("c", "Third item", WorkItemStatus::Backlog, None, 1),
+        ];
+        let app = app_with_items(items, vec![]);
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
     fn work_item_selected_no_session() {
         let items = vec![make_work_item(
             "todo-1",
