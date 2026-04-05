@@ -2,21 +2,21 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items ───────────┐┌ Claude Code ────────────────────────────────────────┐
-│  TODO (2)             ││                                                     │
-│>   Fix auth.. PR#14 ok││  Fix authentication bug                             │
-│    branch-todo-1 (0)  ││                                                     │
-│      [no wt]          ││  Status      Todo                                   │
-│    Add user settings..││  Backend     Local file                             │
-│    branch-todo-2 (0)  ││  Repo        /repo/todo-1/0                         │
-│      [no wt]          ││  Branch      branch-todo-1                          │
-│  IN PROGRESS (2)      ││  Worktree    (none)                                 │
-│    Refact.. PR#88 fail││  PR          #14 - PR #14                           │
-│    branch-prog-1 (0)  ││  Issue       (none)                                 │
-│      [no wt]          ││  Errors      (none)                                 │
-│    Update .. PR#12 ...││                                                     │
-│    branch-prog-2 (0)  ││  Press Enter to start a session.                    │
-│      [no wt]          ││                                                     │
+┌ Work Items (4) ───────┐┌ Claude Code ────────────────────────────────────────┐
+│>   [BL] Fix.. PR#14 ok││                                                     │
+│    [BL] branch-todo-1 ││  Fix authentication bug                             │
+│      (0) [no wt]      ││                                                     │
+│    [BL] Add user set..││  Status      Backlog                                │
+│    [BL] branch-todo-2 ││  Backend     Local file                             │
+│      (0) [no wt]      ││  Repo        /repo/todo-1/0                         │
+│    [IM] Refact.. PR#88││  Branch      branch-todo-1                          │
+│    [IM] branch-prog-1 ││  Worktree    (none)                                 │
+│      (0) [no wt]      ││  PR          #14 - PR #14                           │
+│    [IM] Update.. PR#12││  Issue       (none)                                 │
+│    [IM] branch-prog-2 ││  Errors      (none)                                 │
+│      (0) [no wt]      ││                                                     │
+│                       ││  Press Enter to start a session.                    │
+│                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
@@ -25,4 +25,4 @@ expression: "render(&app, 80, 24)"
 │                       ││                                                     │
 │                       ││                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
-Fix authentication bug | /repo/todo-1/0
+Fix authentication bug | [Backlog] | /repo/todo-1/0
