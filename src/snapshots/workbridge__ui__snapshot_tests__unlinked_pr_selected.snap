@@ -2,7 +2,7 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items ───────────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Work Items (3) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  UNLINKED (1)         ││                                                     │
 │> ? fix-typo      PR#45││  Press Enter to import                              │
 │    [IM] Act.. PR#30 ok││  this PR as a work item.                            │

@@ -115,7 +115,7 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     };
 
     let block = Block::default()
-        .title(" Work Items ")
+        .title(format!(" Work Items ({}) ", app.display_list.len()))
         .title_style(theme.style_title())
         .borders(Borders::ALL)
         .border_style(border_style);

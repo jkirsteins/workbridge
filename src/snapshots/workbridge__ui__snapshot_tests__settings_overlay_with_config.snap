@@ -2,7 +2,7 @@
 source: src/ui.rs
 expression: output
 ---
-┌ Work Items ───────────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │                       ││                                                     │
 │  No work i┌ Settings (press ? or Esc to close) ──────────────────┐           │
 │           │                                                      │           │

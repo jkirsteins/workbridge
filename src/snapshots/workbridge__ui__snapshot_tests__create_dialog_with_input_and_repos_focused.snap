@@ -2,7 +2,7 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items ───────────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │                       ││                                                     │
 │  No work items.       ││  Welcome to workbridge                              │
 │               ┌ Create Work Item ────────────────────────────┐               │

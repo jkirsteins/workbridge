@@ -2,7 +2,7 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items ───────────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │>   [BL] Add authenti..││                                                     │
 │    [BL] branch-ctx-2 (││  Add authentication                                 │
 │      0) [no wt]       ││                                                     │

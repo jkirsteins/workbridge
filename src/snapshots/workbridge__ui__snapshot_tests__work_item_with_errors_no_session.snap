@@ -2,7 +2,7 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items ───────────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │>   [IM] Broken work ..││                                                     │
 │    [IM] 42-fix-bug (  ││  Errors:                                            │
 │      alpha) [no wt]   ││                                                     │

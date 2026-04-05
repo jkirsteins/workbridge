@@ -2,7 +2,7 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items ───────────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Work Items (3) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │>   [BL] Fix.. PR#14 ok││                                                     │
 │    [BL] branch-todo-1 ││  Fix authentication bug                             │
 │      (0) [no wt]      ││                                                     │

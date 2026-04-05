@@ -2,7 +2,7 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items ───────────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │>   [BL] Fix resize bug││                                                     │
 │    [BL] branch-ctx-3 (││  Fix resize bug                                     │
 │      0) [no wt]       ││                                                     │
