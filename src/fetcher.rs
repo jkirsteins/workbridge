@@ -281,6 +281,10 @@ mod tests {
         fn fetch_branch(&self, _repo_path: &Path, _branch: &str) -> Result<(), WorktreeError> {
             Ok(())
         }
+
+        fn create_branch(&self, _repo_path: &Path, _branch: &str) -> Result<(), WorktreeError> {
+            Ok(())
+        }
     }
 
     #[test]

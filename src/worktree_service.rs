@@ -75,6 +75,11 @@ pub trait WorktreeService: Send + Sync {
     /// commit. Returns Ok(()) if the fetch succeeds, Err if it fails
     /// (branch does not exist on origin, fork PR, network error, etc.).
     fn fetch_branch(&self, repo_path: &Path, branch: &str) -> Result<(), WorktreeError>;
+
+    /// Create a new local branch from the repo's default branch (or HEAD).
+    /// Used as a fallback when fetch_branch fails (e.g., the branch does
+    /// not exist on origin yet).
+    fn create_branch(&self, repo_path: &Path, branch: &str) -> Result<(), WorktreeError>;
 }
 
 /// GitWorktreeService shells out to the git CLI for worktree operations.
@@ -323,6 +328,25 @@ impl WorktreeService for GitWorktreeService {
         // ref points at the same commit as origin.
         let refspec = format!("{branch}:{branch}");
         Self::run_git(repo_path, &["fetch", "origin", &refspec])?;
+        Ok(())
+    }
+
+    fn create_branch(&self, repo_path: &Path, branch: &str) -> Result<(), WorktreeError> {
+        // Check if the branch already exists.
+        if Self::run_git(
+            repo_path,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        )
+        .is_ok()
+        {
+            return Ok(()); // Branch already exists locally.
+        }
+
+        // Try to base the new branch on the default branch.
+        let base = self
+            .default_branch(repo_path)
+            .unwrap_or_else(|_| "HEAD".to_string());
+        Self::run_git(repo_path, &["branch", branch, &base])?;
         Ok(())
     }
 }
@@ -858,5 +882,59 @@ mod tests {
             "fetch_branch should fail for a branch not on origin, got: {:?}",
             result,
         );
+    }
+
+    #[test]
+    fn create_branch_creates_from_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        setup_git_repo(&repo_dir);
+        // Normalize to "master" (git init default).
+        run_in(&repo_dir, &["git", "branch", "-m", "master"]);
+
+        let svc = GitWorktreeService;
+
+        // Verify the branch does not exist yet.
+        let before = GitWorktreeService::run_git(
+            &repo_dir,
+            &["rev-parse", "--verify", "refs/heads/my-feature"],
+        );
+        assert!(
+            before.is_err(),
+            "my-feature should not exist before create_branch",
+        );
+
+        // Create the branch.
+        svc.create_branch(&repo_dir, "my-feature").unwrap();
+
+        // Verify it now exists.
+        let after = GitWorktreeService::run_git(
+            &repo_dir,
+            &["rev-parse", "--verify", "refs/heads/my-feature"],
+        );
+        assert!(after.is_ok(), "my-feature should exist after create_branch",);
+    }
+
+    #[test]
+    fn create_branch_noop_if_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        setup_git_repo(&repo_dir);
+
+        // Create the branch first.
+        run_in(&repo_dir, &["git", "branch", "existing-branch"]);
+
+        let svc = GitWorktreeService;
+        // Should succeed without error (no-op).
+        svc.create_branch(&repo_dir, "existing-branch").unwrap();
+
+        // Branch should still exist.
+        let check = GitWorktreeService::run_git(
+            &repo_dir,
+            &["rev-parse", "--verify", "refs/heads/existing-branch"],
+        );
+        assert!(check.is_ok(), "branch should still exist");
     }
 }

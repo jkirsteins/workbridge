@@ -21,6 +21,8 @@ pub enum BackendError {
     Serialize(String),
     /// Validation error (e.g., no repo associations).
     Validation(String),
+    /// The work item ID is not managed by this backend.
+    UnsupportedId(WorkItemId),
 }
 
 impl fmt::Display for BackendError {
@@ -39,6 +41,9 @@ impl fmt::Display for BackendError {
             BackendError::Validation(msg) => {
                 write!(f, "validation error: {msg}")
             }
+            BackendError::UnsupportedId(id) => {
+                write!(f, "work item {id:?} is not managed by this backend")
+            }
         }
     }
 }
@@ -52,6 +57,21 @@ pub struct WorkItemRecord {
     pub title: String,
     pub status: WorkItemStatus,
     pub repo_associations: Vec<RepoAssociationRecord>,
+    /// Implementation plan text. None means no plan has been set yet.
+    /// Defaults to None for migration compatibility with existing records.
+    #[serde(default)]
+    pub plan: Option<String>,
+}
+
+/// An entry in a work item's append-only activity log.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ActivityEntry {
+    /// Timestamp in ISO 8601 format (or epoch seconds with Z suffix).
+    pub timestamp: String,
+    /// Type of event (e.g., "stage_change", "note", "review_gate").
+    pub event_type: String,
+    /// Arbitrary JSON payload for the event.
+    pub payload: serde_json::Value,
 }
 
 /// A repo association as stored by a backend. Minimal: just the repo path
@@ -112,8 +132,27 @@ pub trait WorkItemBackend: Send + Sync {
     /// Delete a work item by id.
     fn delete(&self, id: &WorkItemId) -> Result<(), BackendError>;
 
+    /// Update a work item's status.
+    fn update_status(&self, id: &WorkItemId, status: WorkItemStatus) -> Result<(), BackendError>;
+
     /// Import an unlinked PR as a new work item.
     fn import(&self, unlinked: &UnlinkedPr) -> Result<WorkItemRecord, BackendError>;
+
+    /// Append an activity entry to a work item's activity log.
+    fn append_activity(&self, id: &WorkItemId, entry: &ActivityEntry) -> Result<(), BackendError>;
+
+    /// Read all activity entries for a work item.
+    fn read_activity(&self, id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError>;
+
+    /// Update the implementation plan for a work item.
+    fn update_plan(&self, id: &WorkItemId, plan: &str) -> Result<(), BackendError>;
+
+    /// Read the implementation plan for a work item.
+    fn read_plan(&self, id: &WorkItemId) -> Result<Option<String>, BackendError>;
+
+    /// Get the activity log file path for a work item. Returns None if the
+    /// backend does not support file-based activity logs.
+    fn activity_path_for(&self, id: &WorkItemId) -> Option<PathBuf>;
 
     /// Which backend type this implementation represents.
     /// Not called in v1 (assembly derives it from WorkItemId); kept for
@@ -158,6 +197,63 @@ impl LocalFileBackend {
             BackendError::Io(format!("failed to create dir {}: {e}", dir.display()))
         })?;
         Ok(Self { data_dir: dir })
+    }
+
+    /// Compute the activity log file path for a work item.
+    /// The activity log is stored as a .jsonl file next to the work item's
+    /// JSON file, with the same UUID but an "activity-" prefix.
+    fn activity_path(&self, id: &WorkItemId) -> Result<PathBuf, BackendError> {
+        match id {
+            WorkItemId::LocalFile(path) => {
+                let file_name = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+                    BackendError::Io(format!("invalid work item path: {}", path.display()))
+                })?;
+                Ok(self.data_dir.join(format!("activity-{file_name}.jsonl")))
+            }
+            other => Err(BackendError::UnsupportedId(other.clone())),
+        }
+    }
+
+    /// Read and deserialize a work item record from disk.
+    fn read_record(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
+        match id {
+            WorkItemId::LocalFile(path) => {
+                if !path.exists() {
+                    return Err(BackendError::NotFound(id.clone()));
+                }
+                let contents = fs::read_to_string(path).map_err(|e| {
+                    BackendError::Io(format!("failed to read {}: {e}", path.display()))
+                })?;
+                serde_json::from_str(&contents).map_err(|e| {
+                    BackendError::Io(format!("failed to parse {}: {e}", path.display()))
+                })
+            }
+            other => Err(BackendError::UnsupportedId(other.clone())),
+        }
+    }
+
+    /// Read-modify-write helper for a work item record.
+    /// Reads the record from disk, applies the mutation, serializes, and
+    /// writes back atomically. Deduplicates the boilerplate shared by
+    /// update_status and update_plan.
+    fn modify_record(
+        &self,
+        id: &WorkItemId,
+        f: impl FnOnce(&mut WorkItemRecord),
+    ) -> Result<(), BackendError> {
+        let mut record = self.read_record(id)?;
+        f(&mut record);
+        match id {
+            WorkItemId::LocalFile(path) => {
+                let json = serde_json::to_string_pretty(&record)
+                    .map_err(|e| BackendError::Serialize(format!("{e}")))?;
+                atomic_write(path, json.as_bytes()).map_err(|e| {
+                    BackendError::Io(format!("failed to write {}: {e}", path.display()))
+                })?;
+                Ok(())
+            }
+            other => Err(BackendError::UnsupportedId(other.clone())),
+        }
     }
 }
 
@@ -260,6 +356,7 @@ impl WorkItemBackend for LocalFileBackend {
             title: request.title,
             status: request.status,
             repo_associations: request.repo_associations,
+            plan: None,
         };
 
         let json = serde_json::to_string_pretty(&record)
@@ -280,22 +377,102 @@ impl WorkItemBackend for LocalFileBackend {
                 fs::remove_file(path).map_err(|e| {
                     BackendError::Io(format!("failed to delete {}: {e}", path.display()))
                 })?;
+                // Also remove the activity log file if it exists.
+                if let Ok(activity_path) = self.activity_path(id) {
+                    let _ = fs::remove_file(&activity_path);
+                }
                 Ok(())
             }
-            other => Err(BackendError::NotFound(other.clone())),
+            other => Err(BackendError::UnsupportedId(other.clone())),
         }
+    }
+
+    fn update_status(&self, id: &WorkItemId, status: WorkItemStatus) -> Result<(), BackendError> {
+        self.modify_record(id, |record| {
+            record.status = status;
+        })
     }
 
     fn import(&self, unlinked: &UnlinkedPr) -> Result<WorkItemRecord, BackendError> {
         let request = CreateWorkItem {
             title: unlinked.pr.title.clone(),
-            status: WorkItemStatus::InProgress,
+            status: WorkItemStatus::Implementing,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: unlinked.repo_path.clone(),
                 branch: Some(unlinked.branch.clone()),
             }],
         };
         self.create(request)
+    }
+
+    fn append_activity(&self, id: &WorkItemId, entry: &ActivityEntry) -> Result<(), BackendError> {
+        let activity_path = self.activity_path(id)?;
+        let mut line =
+            serde_json::to_string(entry).map_err(|e| BackendError::Serialize(format!("{e}")))?;
+        line.push('\n');
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&activity_path)
+            .map_err(|e| {
+                BackendError::Io(format!(
+                    "failed to open activity log {}: {e}",
+                    activity_path.display()
+                ))
+            })?;
+        file.write_all(line.as_bytes()).map_err(|e| {
+            BackendError::Io(format!(
+                "failed to write activity log {}: {e}",
+                activity_path.display()
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn read_activity(&self, id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
+        let activity_path = self.activity_path(id)?;
+        if !activity_path.exists() {
+            return Ok(Vec::new());
+        }
+        let contents = fs::read_to_string(&activity_path).map_err(|e| {
+            BackendError::Io(format!(
+                "failed to read activity log {}: {e}",
+                activity_path.display()
+            ))
+        })?;
+        let mut entries = Vec::new();
+        for line in contents.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<ActivityEntry>(line) {
+                Ok(entry) => entries.push(entry),
+                Err(e) => {
+                    return Err(BackendError::Io(format!(
+                        "corrupt activity log line in {}: {e}",
+                        activity_path.display()
+                    )));
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    fn update_plan(&self, id: &WorkItemId, plan: &str) -> Result<(), BackendError> {
+        let plan = plan.to_string();
+        self.modify_record(id, |record| {
+            record.plan = Some(plan);
+        })
+    }
+
+    fn read_plan(&self, id: &WorkItemId) -> Result<Option<String>, BackendError> {
+        Ok(self.read_record(id)?.plan)
+    }
+
+    fn activity_path_for(&self, id: &WorkItemId) -> Option<PathBuf> {
+        self.activity_path(id).ok()
     }
 
     fn backend_type(&self) -> BackendType {
@@ -322,7 +499,7 @@ mod tests {
         let record = backend
             .create(CreateWorkItem {
                 title: "Fix auth bug".into(),
-                status: WorkItemStatus::Todo,
+                status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/path/to/repo"),
                     branch: Some("42-fix-auth".into()),
@@ -331,7 +508,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(record.title, "Fix auth bug");
-        assert_eq!(record.status, WorkItemStatus::Todo);
+        assert_eq!(record.status, WorkItemStatus::Backlog);
         assert_eq!(record.repo_associations.len(), 1);
         assert_eq!(
             record.repo_associations[0].repo_path,
@@ -346,7 +523,7 @@ mod tests {
         assert!(result.corrupt.is_empty());
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.records[0].title, "Fix auth bug");
-        assert_eq!(result.records[0].status, WorkItemStatus::Todo);
+        assert_eq!(result.records[0].status, WorkItemStatus::Backlog);
         assert_eq!(result.records[0].repo_associations.len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
@@ -359,7 +536,7 @@ mod tests {
 
         let result = backend.create(CreateWorkItem {
             title: "No repos".into(),
-            status: WorkItemStatus::Todo,
+            status: WorkItemStatus::Backlog,
             repo_associations: vec![],
         });
 
@@ -386,7 +563,7 @@ mod tests {
         let record = backend
             .create(CreateWorkItem {
                 title: "To delete".into(),
-                status: WorkItemStatus::InProgress,
+                status: WorkItemStatus::Implementing,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,
@@ -426,7 +603,7 @@ mod tests {
             other => panic!("expected NotFound, got: {other}"),
         }
 
-        // Non-LocalFile ids should also return NotFound.
+        // Non-LocalFile ids should return UnsupportedId.
         let result = backend.delete(&WorkItemId::GithubIssue {
             owner: "foo".into(),
             repo: "bar".into(),
@@ -434,8 +611,8 @@ mod tests {
         });
         assert!(result.is_err());
         match result.unwrap_err() {
-            BackendError::NotFound(_) => {}
-            other => panic!("expected NotFound, got: {other}"),
+            BackendError::UnsupportedId(_) => {}
+            other => panic!("expected UnsupportedId, got: {other}"),
         }
 
         let _ = fs::remove_dir_all(&dir);
@@ -462,7 +639,7 @@ mod tests {
 
         let record = backend.import(&unlinked).unwrap();
         assert_eq!(record.title, "Fix the widget");
-        assert_eq!(record.status, WorkItemStatus::InProgress);
+        assert_eq!(record.status, WorkItemStatus::Implementing);
         assert_eq!(record.repo_associations.len(), 1);
         assert_eq!(
             record.repo_associations[0].repo_path,
@@ -493,7 +670,7 @@ mod tests {
         backend
             .create(CreateWorkItem {
                 title: "Valid item".into(),
-                status: WorkItemStatus::Todo,
+                status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: Some("main".into()),
@@ -529,6 +706,225 @@ mod tests {
         let result = backend.list().unwrap();
         assert!(result.records.is_empty());
         assert!(result.corrupt.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_status_persists() {
+        let dir = temp_dir("update-status");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Planning item".into(),
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: Some("42-feature".into()),
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(record.status, WorkItemStatus::Backlog);
+
+        backend
+            .update_status(&record.id, WorkItemStatus::Planning)
+            .unwrap();
+
+        let result = backend.list().unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].status, WorkItemStatus::Planning);
+
+        // Advance further.
+        backend
+            .update_status(&record.id, WorkItemStatus::Implementing)
+            .unwrap();
+
+        let result = backend.list().unwrap();
+        assert_eq!(result.records[0].status, WorkItemStatus::Implementing);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_status_not_found() {
+        let dir = temp_dir("update-notfound");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let result = backend.update_status(
+            &WorkItemId::LocalFile(dir.join("nonexistent.json")),
+            WorkItemStatus::Planning,
+        );
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BackendError::NotFound(_) => {}
+            other => panic!("expected NotFound, got: {other}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serde_migration_todo_to_backlog() {
+        let json = r#"{"id":{"LocalFile":"/tmp/test.json"},"title":"Test","status":"Todo","repo_associations":[]}"#;
+        let record: WorkItemRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.status, WorkItemStatus::Backlog);
+    }
+
+    #[test]
+    fn serde_migration_inprogress_to_implementing() {
+        let json = r#"{"id":{"LocalFile":"/tmp/test.json"},"title":"Test","status":"InProgress","repo_associations":[]}"#;
+        let record: WorkItemRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.status, WorkItemStatus::Implementing);
+    }
+
+    #[test]
+    fn serde_migration_plan_defaults_to_none() {
+        // Old records without plan field should deserialize with plan: None.
+        let json = r#"{"id":{"LocalFile":"/tmp/test.json"},"title":"Test","status":"Backlog","repo_associations":[]}"#;
+        let record: WorkItemRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.plan, None);
+    }
+
+    #[test]
+    fn activity_log_append_and_read_roundtrip() {
+        let dir = temp_dir("activity-roundtrip");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Activity test".into(),
+                status: WorkItemStatus::Implementing,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: Some("main".into()),
+                }],
+            })
+            .unwrap();
+
+        // Append two entries.
+        let entry1 = ActivityEntry {
+            timestamp: "1000Z".into(),
+            event_type: "stage_change".into(),
+            payload: serde_json::json!({"from": "Backlog", "to": "Implementing"}),
+        };
+        let entry2 = ActivityEntry {
+            timestamp: "2000Z".into(),
+            event_type: "note".into(),
+            payload: serde_json::json!({"message": "started work"}),
+        };
+        backend.append_activity(&record.id, &entry1).unwrap();
+        backend.append_activity(&record.id, &entry2).unwrap();
+
+        // Read back and verify.
+        let entries = backend.read_activity(&record.id).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].event_type, "stage_change");
+        assert_eq!(entries[0].timestamp, "1000Z");
+        assert_eq!(entries[1].event_type, "note");
+        assert_eq!(entries[1].timestamp, "2000Z");
+        assert_eq!(entries[1].payload["message"], "started work");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn activity_log_empty_for_new_item() {
+        let dir = temp_dir("activity-empty");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "No activity".into(),
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: None,
+                }],
+            })
+            .unwrap();
+
+        let entries = backend.read_activity(&record.id).unwrap();
+        assert!(entries.is_empty(), "new item should have no activity");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_storage_roundtrip() {
+        let dir = temp_dir("plan-roundtrip");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Plan test".into(),
+                status: WorkItemStatus::Planning,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: Some("feature/plan".into()),
+                }],
+            })
+            .unwrap();
+
+        // Initially no plan.
+        let plan = backend.read_plan(&record.id).unwrap();
+        assert_eq!(plan, None, "new item should have no plan");
+
+        // Set a plan.
+        backend
+            .update_plan(&record.id, "Step 1: implement feature\nStep 2: test")
+            .unwrap();
+
+        // Read it back.
+        let plan = backend.read_plan(&record.id).unwrap();
+        assert_eq!(
+            plan,
+            Some("Step 1: implement feature\nStep 2: test".to_string()),
+        );
+
+        // Update the plan.
+        backend.update_plan(&record.id, "Revised plan").unwrap();
+        let plan = backend.read_plan(&record.id).unwrap();
+        assert_eq!(plan, Some("Revised plan".to_string()));
+
+        // Verify the plan persists through list().
+        let result = backend.list().unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].plan, Some("Revised plan".to_string()),);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn activity_path_for_returns_path() {
+        let dir = temp_dir("activity-path");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Path test".into(),
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: None,
+                }],
+            })
+            .unwrap();
+
+        let path = backend.activity_path_for(&record.id);
+        assert!(path.is_some(), "should return an activity log path");
+        let path = path.unwrap();
+        assert!(
+            path.to_string_lossy().contains("activity-"),
+            "path should contain 'activity-' prefix, got: {}",
+            path.display(),
+        );
+        assert!(
+            path.to_string_lossy().ends_with(".jsonl"),
+            "path should end with .jsonl, got: {}",
+            path.display(),
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
