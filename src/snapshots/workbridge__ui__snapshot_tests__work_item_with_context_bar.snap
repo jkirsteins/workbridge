@@ -25,4 +25,4 @@ expression: "render(&app, 80, 24)"
 │                       ││                                                     │
 │                       ││                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
-Fix resize bug | /repo/ctx-1/0 | bug, P1
+Fix resize bug | [Backlog] | /repo/ctx-1/0 | bug, P1

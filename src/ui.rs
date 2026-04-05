@@ -801,7 +801,10 @@ fn draw_context_bar(buf: &mut Buffer, ctx: &WorkItemContext, theme: &Theme, area
         format!(" | {}", ctx.labels.join(", "))
     };
 
-    let full = format!("{} | {}{}", ctx.title, ctx.repo_path, labels_part);
+    let full = format!(
+        "{} | [{}] | {}{}",
+        ctx.title, ctx.stage, ctx.repo_path, labels_part
+    );
 
     // Truncate to fit width. Use char-based indexing for multi-byte safety.
     let width = area.width as usize;

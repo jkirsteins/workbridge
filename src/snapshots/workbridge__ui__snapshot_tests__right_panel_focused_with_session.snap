@@ -25,4 +25,4 @@ expression: "render(&app, 80, 24)"
 │                       ││                                                     │
 │                       ││                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
-Fix authentication bug | /repo/todo-1/0
+Fix authentication bug | [Backlog] | /repo/todo-1/0

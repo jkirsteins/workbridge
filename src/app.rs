@@ -40,6 +40,8 @@ pub enum SettingsListFocus {
 pub struct WorkItemContext {
     /// The work item title (e.g., issue title or branch-derived name).
     pub title: String,
+    /// The current workflow stage name (e.g., "Implementing", "Review").
+    pub stage: String,
     /// The repository path on disk (from RepoAssociation.repo_path).
     pub repo_path: String,
     /// Issue labels (from IssueInfo.labels). Empty if no issue linked.
@@ -301,8 +303,18 @@ impl App {
                     .find_map(|a| a.issue.as_ref())
                     .map(|issue| issue.labels.clone())
                     .unwrap_or_default();
+                let stage = match wi.status {
+                    WorkItemStatus::Backlog => "Backlog",
+                    WorkItemStatus::Planning => "Planning",
+                    WorkItemStatus::Implementing => "Implementing",
+                    WorkItemStatus::Blocked => "Blocked",
+                    WorkItemStatus::Review => "Review",
+                    WorkItemStatus::Done => "Done",
+                }
+                .to_string();
                 Some(WorkItemContext {
                     title: wi.title.clone(),
+                    stage,
                     repo_path,
                     labels,
                 })
