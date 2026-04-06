@@ -3,7 +3,9 @@
     "allow": [
       "Bash(git checkout:*)",
       "Bash(git merge:*)",
-      "Bash(git commit -m ':*)"
+      "Bash(git commit -m ':*)",
+      "Bash(git -C /Volumes/X10/Projects/workbridge add -A)",
+      "Bash(git -C /Volumes/X10/Projects/workbridge commit --amend --no-edit)"
     ]
   }
 }

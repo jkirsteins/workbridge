@@ -1,5 +1,7 @@
 use ratatui_core::style::{Color, Modifier, Style};
 
+use crate::work_item::WorkItemStatus;
+
 /// All colors used by the TUI, in one place. Swap this struct to change
 /// the entire look. Every color in ui.rs comes from here - no inline
 /// Color:: literals.
@@ -71,6 +73,20 @@ pub struct Theme {
     pub unlinked_marker: Color,
     /// Done item text color (muted, completed work is less prominent).
     pub done_item: Color,
+
+    // -- Stage badges --
+    /// Backlog stage badge color.
+    pub badge_backlog: Color,
+    /// Planning stage badge color.
+    pub badge_planning: Color,
+    /// Implementing stage badge color.
+    pub badge_implementing: Color,
+    /// Blocked stage badge color.
+    pub badge_blocked: Color,
+    /// Review stage badge color.
+    pub badge_review: Color,
+    /// Done stage badge color.
+    pub badge_done: Color,
 }
 
 impl Theme {
@@ -113,6 +129,13 @@ impl Theme {
             badge_ci_pending: Color::Yellow,
             unlinked_marker: Color::Yellow,
             done_item: Color::Reset,
+
+            badge_backlog: Color::Reset,
+            badge_planning: Color::Cyan,
+            badge_implementing: Color::Green,
+            badge_blocked: Color::Red,
+            badge_review: Color::Yellow,
+            badge_done: Color::Reset,
         }
     }
 }
@@ -220,5 +243,24 @@ impl Theme {
         Style::default()
             .fg(self.done_item)
             .add_modifier(Modifier::DIM)
+    }
+
+    pub fn style_stage_badge(&self, status: &WorkItemStatus) -> Style {
+        let color = match status {
+            WorkItemStatus::Backlog => self.badge_backlog,
+            WorkItemStatus::Planning => self.badge_planning,
+            WorkItemStatus::Implementing => self.badge_implementing,
+            WorkItemStatus::Blocked => self.badge_blocked,
+            WorkItemStatus::Review => self.badge_review,
+            WorkItemStatus::Done => self.badge_done,
+        };
+        let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+        if *status == WorkItemStatus::Blocked {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        if *status == WorkItemStatus::Done {
+            style = style.add_modifier(Modifier::DIM);
+        }
+        style
     }
 }
