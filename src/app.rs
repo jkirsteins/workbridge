@@ -684,12 +684,12 @@ impl App {
         self.unlinked_prs = unlinked;
     }
 
-    /// Build the flat display list from current work_items and unlinked_prs.
+    /// Build the display list from current work_items and unlinked_prs.
     ///
-    /// Groups:
-    /// 1. UNLINKED (hidden if empty)
-    /// 2. TODO (shown even if empty)
-    /// 3. IN PROGRESS (shown even if empty)
+    /// Groups (each hidden if empty):
+    /// 1. UNLINKED - PRs not yet imported as work items
+    /// 2. ACTIVE - all non-Backlog work items (Planning, Implementing, Blocked, Review, Done)
+    /// 3. BACKLOGGED - work items with Backlog status
     pub fn build_display_list(&mut self) {
         let mut list = Vec::new();
 
@@ -704,10 +704,37 @@ impl App {
             }
         }
 
-        // Flat list of all work items with stage badges (no grouping).
-        // Stage badge is rendered per-item by the UI layer.
+        // Partition work items into active vs backlogged.
+        let mut active: Vec<usize> = Vec::new();
+        let mut backlogged: Vec<usize> = Vec::new();
         for i in 0..self.work_items.len() {
-            list.push(DisplayEntry::WorkItemEntry(i));
+            if self.work_items[i].status == WorkItemStatus::Backlog {
+                backlogged.push(i);
+            } else {
+                active.push(i);
+            }
+        }
+
+        // ACTIVE group (hidden if empty).
+        if !active.is_empty() {
+            list.push(DisplayEntry::GroupHeader {
+                label: "ACTIVE".to_string(),
+                count: active.len(),
+            });
+            for i in active {
+                list.push(DisplayEntry::WorkItemEntry(i));
+            }
+        }
+
+        // BACKLOGGED group (hidden if empty).
+        if !backlogged.is_empty() {
+            list.push(DisplayEntry::GroupHeader {
+                label: "BACKLOGGED".to_string(),
+                count: backlogged.len(),
+            });
+            for i in backlogged {
+                list.push(DisplayEntry::WorkItemEntry(i));
+            }
         }
 
         self.display_list = list;
@@ -4227,7 +4254,7 @@ mod tests {
     }
 
     #[test]
-    fn display_list_flat_includes_all_items() {
+    fn display_list_groups_by_stage() {
         let mut app = App::new();
         app.work_items = vec![
             WorkItem {
@@ -4251,27 +4278,156 @@ mod tests {
         ];
         app.build_display_list();
 
-        // Flat list: all work items appear as WorkItemEntry, no group headers.
         let work_item_entries: Vec<_> = app
             .display_list
             .iter()
             .filter(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
             .collect();
-        assert_eq!(
-            work_item_entries.len(),
-            2,
-            "both items should appear in flat list"
-        );
+        assert_eq!(work_item_entries.len(), 2, "both items should appear");
 
         let group_headers: Vec<_> = app
             .display_list
             .iter()
-            .filter(|e| matches!(e, DisplayEntry::GroupHeader { .. }))
+            .filter_map(|e| match e {
+                DisplayEntry::GroupHeader { label, count } => Some((label.as_str(), *count)),
+                _ => None,
+            })
             .collect();
-        assert!(
-            group_headers.is_empty(),
-            "flat list should not have group headers (no unlinked PRs)",
-        );
+        assert_eq!(group_headers.len(), 2, "should have ACTIVE and BACKLOGGED");
+        assert_eq!(group_headers[0], ("ACTIVE", 1));
+        assert_eq!(group_headers[1], ("BACKLOGGED", 1));
+    }
+
+    #[test]
+    fn display_list_all_backlog_only_shows_backlogged_group() {
+        let mut app = App::new();
+        app.work_items = vec![
+            WorkItem {
+                id: WorkItemId::LocalFile(PathBuf::from("/data/a.json")),
+                backend_type: BackendType::LocalFile,
+                title: "Item A".to_string(),
+                status: WorkItemStatus::Backlog,
+                status_derived: false,
+                repo_associations: vec![],
+                errors: vec![],
+            },
+            WorkItem {
+                id: WorkItemId::LocalFile(PathBuf::from("/data/b.json")),
+                backend_type: BackendType::LocalFile,
+                title: "Item B".to_string(),
+                status: WorkItemStatus::Backlog,
+                status_derived: false,
+                repo_associations: vec![],
+                errors: vec![],
+            },
+        ];
+        app.build_display_list();
+
+        let headers: Vec<_> = app
+            .display_list
+            .iter()
+            .filter_map(|e| match e {
+                DisplayEntry::GroupHeader { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers, vec!["BACKLOGGED"]);
+    }
+
+    #[test]
+    fn display_list_all_active_only_shows_active_group() {
+        let mut app = App::new();
+        app.work_items = vec![
+            WorkItem {
+                id: WorkItemId::LocalFile(PathBuf::from("/data/a.json")),
+                backend_type: BackendType::LocalFile,
+                title: "Implementing item".to_string(),
+                status: WorkItemStatus::Implementing,
+                status_derived: false,
+                repo_associations: vec![],
+                errors: vec![],
+            },
+            WorkItem {
+                id: WorkItemId::LocalFile(PathBuf::from("/data/b.json")),
+                backend_type: BackendType::LocalFile,
+                title: "Review item".to_string(),
+                status: WorkItemStatus::Review,
+                status_derived: false,
+                repo_associations: vec![],
+                errors: vec![],
+            },
+        ];
+        app.build_display_list();
+
+        let headers: Vec<_> = app
+            .display_list
+            .iter()
+            .filter_map(|e| match e {
+                DisplayEntry::GroupHeader { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers, vec!["ACTIVE"]);
+    }
+
+    #[test]
+    fn display_list_no_items_no_groups() {
+        let mut app = App::new();
+        app.build_display_list();
+        assert!(app.display_list.is_empty());
+    }
+
+    #[test]
+    fn display_list_unlinked_with_grouped_items() {
+        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
+        let mut app = App::new();
+        app.unlinked_prs = vec![UnlinkedPr {
+            repo_path: PathBuf::from("/repo"),
+            branch: "fix-typo".to_string(),
+            pr: PrInfo {
+                number: 1,
+                title: "Fix typo".to_string(),
+                state: PrState::Open,
+                is_draft: false,
+                review_decision: ReviewDecision::None,
+                checks: CheckStatus::None,
+                url: String::new(),
+            },
+        }];
+        app.work_items = vec![
+            WorkItem {
+                id: WorkItemId::LocalFile(PathBuf::from("/data/active.json")),
+                backend_type: BackendType::LocalFile,
+                title: "Active item".to_string(),
+                status: WorkItemStatus::Implementing,
+                status_derived: false,
+                repo_associations: vec![],
+                errors: vec![],
+            },
+            WorkItem {
+                id: WorkItemId::LocalFile(PathBuf::from("/data/backlog.json")),
+                backend_type: BackendType::LocalFile,
+                title: "Backlog item".to_string(),
+                status: WorkItemStatus::Backlog,
+                status_derived: false,
+                repo_associations: vec![],
+                errors: vec![],
+            },
+        ];
+        app.build_display_list();
+
+        let headers: Vec<_> = app
+            .display_list
+            .iter()
+            .filter_map(|e| match e {
+                DisplayEntry::GroupHeader { label, count } => Some((label.as_str(), *count)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers[0], ("UNLINKED", 1));
+        assert_eq!(headers[1], ("ACTIVE", 1));
+        assert_eq!(headers[2], ("BACKLOGGED", 1));
     }
 
     /// F-3: create_work_item_with returns error when ALL repos lack git_dir.

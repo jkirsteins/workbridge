@@ -3,10 +3,10 @@ source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
-│>   [BL] Add authenti..││                                                     │
-│    [BL] branch-ctx-2 (││  Add authentication                                 │
-│      0) [no wt]       ││                                                     │
-│                       ││  Status      Backlog                                │
+│  BACKLOGGED (1)       ││                                                     │
+│> [BL] Add authentica..││  Add authentication                                 │
+│       branch-ctx-2 (  ││                                                     │
+│      0) [no wt]       ││  Status      Backlog                                │
 │                       ││  Backend     Local file                             │
 │                       ││  Repo        /repo/ctx-2/0                          │
 │                       ││  Branch      branch-ctx-2                           │

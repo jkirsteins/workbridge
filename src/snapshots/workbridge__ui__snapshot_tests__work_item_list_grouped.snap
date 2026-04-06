@@ -3,20 +3,20 @@ source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
 ┌ Work Items (4) ───────┐┌ Claude Code ────────────────────────────────────────┐
-│>   [BL] Fix.. PR#14 ok││                                                     │
-│    [BL] branch-todo-1 ││  Fix authentication bug                             │
-│      (0) [no wt]      ││                                                     │
-│    [BL] Add user set..││  Status      Backlog                                │
-│    [BL] branch-todo-2 ││  Backend     Local file                             │
-│      (0) [no wt]      ││  Repo        /repo/todo-1/0                         │
-│    [IM] Refact.. PR#88││  Branch      branch-todo-1                          │
-│    [IM] branch-prog-1 ││  Worktree    (none)                                 │
-│      (0) [no wt]      ││  PR          #14 - PR #14                           │
-│    [IM] Update.. PR#12││  Issue       (none)                                 │
-│    [IM] branch-prog-2 ││  Errors      (none)                                 │
-│      (0) [no wt]      ││                                                     │
-│                       ││  Press Enter to start a session.                    │
-│                       ││                                                     │
+│  ACTIVE (2)           ││                                                     │
+│> [IM] Ref.. PR#88 fail││  Refactor backend API                               │
+│       branch-prog-1 ( ││                                                     │
+│      0) [no wt]       ││  Status      Implementing                           │
+│  [IM] Upda.. PR#12 ...││  Backend     Local file                             │
+│       branch-prog-2 ( ││  Repo        /repo/prog-1/0                         │
+│      0) [no wt]       ││  Branch      branch-prog-1                          │
+│  BACKLOGGED (2)       ││  Worktree    (none)                                 │
+│  [BL] Fix a.. PR#14 ok││  PR          #88 - PR #88                           │
+│       branch-todo-1 ( ││  Issue       (none)                                 │
+│      0) [no wt]       ││  Errors      (none)                                 │
+│  [BL] Add user setti..││                                                     │
+│       branch-todo-2 ( ││  Press Enter to start a session.                    │
+│      0) [no wt]       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
@@ -25,4 +25,4 @@ expression: "render(&app, 80, 24)"
 │                       ││                                                     │
 │                       ││                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
-Fix authentication bug | [Backlog] | /repo/todo-1/0
+Refactor backend API | [Implementing] | /repo/prog-1/0

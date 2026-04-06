@@ -222,7 +222,7 @@ fn format_work_item_entry<'a>(
     theme: &Theme,
 ) -> ListItem<'a> {
     let Some(wi) = app.work_items.get(idx) else {
-        return ListItem::new(Line::from("  <invalid>"));
+        return ListItem::new(Line::from("<invalid>"));
     };
 
     // -- Line 1: title + badges --
@@ -264,7 +264,8 @@ fn format_work_item_entry<'a>(
 
     // Stage badge + title.
     let badge = wi.status.badge_text();
-    let prefix = format!("  {badge} ");
+    let prefix = format!("{badge} ");
+    let meta_indent = " ".repeat(prefix.width());
     // Minimum number of display columns reserved for the title so it never
     // vanishes when badges consume all available width.
     const MIN_TITLE_BUDGET: usize = 5;
@@ -305,7 +306,6 @@ fn format_work_item_entry<'a>(
     };
     let badge_style = theme.style_stage_badge(&wi.status);
     let mut line1_spans = vec![
-        Span::raw("  "),
         Span::styled(badge.to_string(), badge_style),
         Span::raw(" "),
         Span::styled(truncated_title, title_style),
@@ -342,7 +342,7 @@ fn format_work_item_entry<'a>(
             .unwrap_or_default();
         let wt_indicator = if has_worktree { "" } else { " [no wt]" };
 
-        let meta_content = format!("{prefix}{branch_name} ({repo_name}){wt_indicator}");
+        let meta_content = format!("{meta_indent}{branch_name} ({repo_name}){wt_indicator}");
         let wrapped = wrap_text(&meta_content, max_width);
         for wrapped_line in wrapped {
             lines.push(Line::from(vec![Span::styled(
@@ -358,7 +358,7 @@ fn format_work_item_entry<'a>(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         if !repo_name.is_empty() {
-            let meta_content = format!("{prefix}{repo_name}");
+            let meta_content = format!("{meta_indent}{repo_name}");
             let wrapped = wrap_text(&meta_content, max_width);
             for wrapped_line in wrapped {
                 lines.push(Line::from(vec![Span::styled(
@@ -1612,7 +1612,7 @@ mod format_entry_tests {
 #[cfg(test)]
 mod snapshot_tests {
     use super::draw_to_buffer;
-    use crate::app::{App, FocusPanel, StubBackend};
+    use crate::app::{is_selectable, App, FocusPanel, StubBackend};
     use crate::theme::Theme;
     use crate::work_item::{
         BackendType, CheckStatus, PrInfo, PrState, RepoAssociation, ReviewDecision, UnlinkedPr,
@@ -1803,8 +1803,8 @@ mod snapshot_tests {
             1,
         )];
         let mut app = app_with_items(items, vec![]);
-        // Select the first work item entry (index 0 in flat list).
-        app.selected_item = Some(0);
+        // Select the first selectable work item entry.
+        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 
@@ -1837,7 +1837,7 @@ mod snapshot_tests {
             1,
         )];
         let mut app = app_with_items(items, vec![]);
-        app.selected_item = Some(0);
+        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
         app.focus = FocusPanel::Right;
         insta::assert_snapshot!(render(&app, 80, 24));
     }
@@ -1855,8 +1855,8 @@ mod snapshot_tests {
             labels: vec!["bug".into(), "P1".into()],
         });
         let mut app = app_with_items(vec![wi], vec![]);
-        // Select the work item entry (index 0 in flat list).
-        app.selected_item = Some(0);
+        // Select the first selectable work item entry.
+        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 
@@ -1870,7 +1870,7 @@ mod snapshot_tests {
             1,
         )];
         let mut app = app_with_items(items, vec![]);
-        app.selected_item = Some(0);
+        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 
@@ -1886,7 +1886,7 @@ mod snapshot_tests {
             labels: vec!["bug".into()],
         });
         let mut app = app_with_items(vec![wi], vec![]);
-        app.selected_item = Some(0);
+        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
         app.status_message = Some("Right panel focused - press Ctrl+] to return".into());
         insta::assert_snapshot!(render(&app, 80, 24));
     }
@@ -2046,10 +2046,8 @@ mod snapshot_tests {
             ],
         }];
         let mut app = app_with_items(items, vec![]);
-        // Select the work item entry (index 2: header at 0, empty-todo at 1,
-        // IN PROGRESS header at 2, work item at 3).
-        // Flat list: work item is at index 0.
-        app.selected_item = Some(0);
+        // Select the first selectable work item entry (skipping group headers).
+        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 
