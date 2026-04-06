@@ -174,6 +174,14 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    /// Background-only highlight for the List widget. Per-span fg colors
+    /// set inside ListItems are preserved; spans apply their own fg
+    /// (including highlight-aware overrides) instead of being forced to
+    /// a single color by Cell::set_style.
+    pub fn style_tab_highlight_bg(&self) -> Style {
+        Style::default().bg(self.tab_highlight_bg)
+    }
+
     pub fn style_text(&self) -> Style {
         Style::default().fg(self.text)
     }

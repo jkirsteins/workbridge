@@ -142,7 +142,8 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     let items: Vec<ListItem> = app
         .display_list
         .iter()
-        .map(|entry| match entry {
+        .enumerate()
+        .map(|(i, entry)| match entry {
             DisplayEntry::GroupHeader { label, count } => {
                 let text = format!("{label} ({count})");
                 ListItem::new(Line::from(vec![Span::styled(
@@ -152,14 +153,15 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
             }
             DisplayEntry::UnlinkedItem(idx) => format_unlinked_item(app, *idx, inner_width, theme),
             DisplayEntry::WorkItemEntry(idx) => {
-                format_work_item_entry(app, *idx, inner_width, theme)
+                let selected = app.selected_item == Some(i);
+                format_work_item_entry(app, *idx, inner_width, theme, selected)
             }
         })
         .collect();
 
     let list = List::new(items)
         .block(block)
-        .highlight_style(theme.style_tab_highlight())
+        .highlight_style(theme.style_tab_highlight_bg())
         .highlight_symbol("> ");
 
     let mut state = ListState::default();
@@ -220,6 +222,7 @@ fn format_work_item_entry<'a>(
     idx: usize,
     max_width: usize,
     theme: &Theme,
+    is_selected: bool,
 ) -> ListItem<'a> {
     let Some(wi) = app.work_items.get(idx) else {
         return ListItem::new(Line::from("<invalid>"));
@@ -292,26 +295,50 @@ fn format_work_item_entry<'a>(
     let available = space_for_content
         .saturating_sub(right_text.width())
         .saturating_sub(if right_text.is_empty() { 0 } else { 1 });
-    let truncated_title = truncate_str(&wi.title, available);
+
+    // When selected, the List widget only sets bg (via style_tab_highlight_bg).
+    // We apply fg per-span here so title+badge get the original highlight look
+    // (Black + BOLD) while branch metadata stays muted (DarkGray).
+    let hl = theme.style_tab_highlight();
+    let (title_style, badge_style, right_badge_style, meta_style) = if is_selected {
+        (
+            hl,
+            hl,
+            hl,
+            ratatui_core::style::Style::default().fg(ratatui_core::style::Color::DarkGray),
+        )
+    } else {
+        let ts = if wi.status == WorkItemStatus::Done {
+            theme.style_done_item()
+        } else {
+            theme.style_text()
+        };
+        (
+            ts,
+            theme.style_stage_badge(&wi.status),
+            ratatui_core::style::Style::default(), // right badges have their own per-part styles
+            theme.style_text_muted(),
+        )
+    };
+
+    // Wrap the title: first line shares space with badge + right badges,
+    // continuation lines get the full panel width with no indent.
+    let title_lines = wrap_two_widths(&wi.title, available.max(1), max_width);
+    let first_title = title_lines.first().cloned().unwrap_or_default();
 
     let padding =
-        max_width.saturating_sub(prefix.width() + truncated_title.width() + right_text.width());
+        max_width.saturating_sub(prefix.width() + first_title.width() + right_text.width());
     let pad_str: String = " ".repeat(padding);
 
-    let title_style = if wi.status == WorkItemStatus::Done {
-        theme.style_done_item()
-    } else {
-        theme.style_text()
-    };
-    let badge_style = theme.style_stage_badge(&wi.status);
     let mut line1_spans = vec![
         Span::styled(badge.to_string(), badge_style),
         Span::raw(" "),
-        Span::styled(truncated_title, title_style),
+        Span::styled(first_title, title_style),
         Span::raw(pad_str),
     ];
     for (text, style) in &right_parts[..visible_badge_count] {
-        line1_spans.push(Span::styled(text.clone(), *style));
+        let s = if is_selected { right_badge_style } else { *style };
+        line1_spans.push(Span::styled(text.clone(), s));
     }
     let line1 = Line::from(line1_spans);
 
@@ -329,47 +356,25 @@ fn format_work_item_entry<'a>(
 
     let mut lines = vec![line1];
 
+    // Title continuation lines (no indent).
+    for title_cont in title_lines.iter().skip(1) {
+        lines.push(Line::from(vec![Span::styled(
+            title_cont.clone(),
+            title_style,
+        )]));
+    }
+
     if has_branch {
-        // Full metadata: branch (repo) [no wt]
+        // Branch + [no wt] indicator. Repo is shown in the group header.
         let branch_name = first_assoc.and_then(|a| a.branch.as_deref()).unwrap_or("");
-        let repo_name = first_assoc
-            .and_then(|a| {
-                a.repo_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-            })
-            .unwrap_or_default();
         let wt_indicator = if has_worktree { "" } else { " [no wt]" };
 
-        // Branch and repo on separate lines; only line-broken
-        // continuations are indented.
-        for meta_line in [
-            format!("Branch: {branch_name}"),
-            format!("Repo: {repo_name}{wt_indicator}"),
-        ] {
-            for wrapped_line in wrap_text(&meta_line, max_width) {
-                lines.push(Line::from(vec![Span::styled(
-                    wrapped_line,
-                    theme.style_text_muted(),
-                )]));
-            }
-        }
-    } else if let Some(assoc) = first_assoc {
-        // Pre-planning: just show repo name, no tags
-        let repo_name = assoc
-            .repo_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if !repo_name.is_empty() {
-            let meta_content = format!("Repo: {repo_name}");
-            let wrapped = wrap_text(&meta_content, max_width);
-            for wrapped_line in wrapped {
-                lines.push(Line::from(vec![Span::styled(
-                    wrapped_line,
-                    theme.style_text_muted(),
-                )]));
-            }
+        let meta_content = format!("{branch_name}{wt_indicator}");
+        for wrapped_line in wrap_text(&meta_content, max_width) {
+            lines.push(Line::from(vec![Span::styled(
+                wrapped_line,
+                meta_style,
+            )]));
         }
     }
     // No repo associations = no line 2 (invariant 1 violation, but render gracefully)
@@ -380,11 +385,11 @@ fn format_work_item_entry<'a>(
 /// Word-wrap a string to fit within max_width display columns.
 /// Breaks at word boundaries (space, /, -, paren) when possible.
 /// Wraps to as many lines as needed - no artificial cap.
-/// Continuation lines are indented with 4 spaces.
+/// When `indent` is true, continuation lines are indented with 4 spaces.
 /// Every output line is guaranteed to be <= max_width display columns.
-fn wrap_text(s: &str, max_width: usize) -> Vec<String> {
-    const INDENT: &str = "    ";
-    let indent_width = INDENT.width();
+fn wrap_text_impl(s: &str, max_width: usize, indent: bool) -> Vec<String> {
+    const INDENT_STR: &str = "    ";
+    let indent_width = if indent { INDENT_STR.width() } else { 0 };
 
     if max_width == 0 {
         return vec![];
@@ -450,12 +455,46 @@ fn wrap_text(s: &str, max_width: usize) -> Vec<String> {
 
     // Prepend indent to continuation lines, but only if max_width can
     // accommodate it without exceeding the width guarantee.
-    if max_width > indent_width {
+    if indent && max_width > indent_width {
         for line in lines.iter_mut().skip(1) {
-            *line = format!("{INDENT}{line}");
+            *line = format!("{INDENT_STR}{line}");
         }
     }
 
+    lines
+}
+
+/// Word-wrap with 4-space continuation indent (default behavior).
+fn wrap_text(s: &str, max_width: usize) -> Vec<String> {
+    wrap_text_impl(s, max_width, true)
+}
+
+/// Word-wrap with no continuation indent.
+fn wrap_text_flat(s: &str, max_width: usize) -> Vec<String> {
+    wrap_text_impl(s, max_width, false)
+}
+
+/// Word-wrap where the first line has a narrower budget than subsequent lines.
+/// Used for titles where line 1 shares space with badge + right badges.
+fn wrap_two_widths(s: &str, first_width: usize, rest_width: usize) -> Vec<String> {
+    if first_width == 0 || s.is_empty() {
+        return vec![];
+    }
+    // If it fits on the first line, done.
+    if s.width() <= first_width {
+        return vec![s.to_string()];
+    }
+    // Break the first line at first_width.
+    let first_lines = wrap_text_flat(s, first_width);
+    let first = first_lines[0].clone();
+    // Reconstruct the remainder from the original string.
+    let used_bytes = first.trim_end().len();
+    let rest = s[used_bytes..].trim_start();
+    if rest.is_empty() {
+        return vec![first];
+    }
+    let mut lines = vec![first];
+    lines.extend(wrap_text_flat(rest, rest_width));
     lines
 }
 
@@ -1444,6 +1483,51 @@ mod wrap_tests {
 }
 
 #[cfg(test)]
+mod wrap_variant_tests {
+    use super::{wrap_text_flat, wrap_two_widths};
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn wrap_text_flat_no_indent_on_continuation() {
+        let result = wrap_text_flat("hello world foo bar baz", 12);
+        assert_eq!(result[0], "hello world ");
+        // Continuation has no leading spaces
+        assert!(!result[1].starts_with(' '));
+    }
+
+    #[test]
+    fn wrap_two_widths_first_line_narrow() {
+        // First line budget 10, rest budget 25
+        let result = wrap_two_widths(
+            "Add Kanban board view with column-based work item organization",
+            10,
+            25,
+        );
+        // First line fits within 10 columns
+        assert!(result[0].width() <= 10, "first line too wide: {:?}", result[0]);
+        // Continuation lines use the wider budget
+        for line in result.iter().skip(1) {
+            assert!(line.width() <= 25, "continuation too wide: {:?}", line);
+        }
+        // All words present
+        let joined: String = result.join(" ");
+        assert!(joined.contains("organization"));
+    }
+
+    #[test]
+    fn wrap_two_widths_fits_first_line() {
+        let result = wrap_two_widths("Short title", 20, 40);
+        assert_eq!(result, vec!["Short title"]);
+    }
+
+    #[test]
+    fn wrap_two_widths_empty() {
+        let result = wrap_two_widths("", 10, 20);
+        assert!(result.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod format_entry_tests {
     use super::format_work_item_entry;
     use crate::app::{App, StubBackend};
@@ -1507,7 +1591,7 @@ mod format_entry_tests {
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
-        let item = format_work_item_entry(&app, 0, 40, &theme);
+        let item = format_work_item_entry(&app, 0, 40, &theme, false);
         let text = render_list_item_to_string(item, 40);
 
         assert!(
@@ -1518,10 +1602,11 @@ mod format_entry_tests {
             !text.contains("[no wt]"),
             "should not show [no wt] tag: {text}"
         );
-        assert!(text.contains("myrepo"), "should show repo name: {text}");
+        // Repo name is now in the group header, not per-item.
+        assert!(!text.contains("myrepo"), "repo should be in group header, not item: {text}");
     }
 
-    /// Work items with a branch should show branch and repo on line 2.
+    /// Work items with a branch should show branch on line 2.
     #[test]
     fn item_with_branch_shows_metadata() {
         let wi = WorkItem {
@@ -1542,11 +1627,11 @@ mod format_entry_tests {
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
-        let item = format_work_item_entry(&app, 0, 40, &theme);
+        let item = format_work_item_entry(&app, 0, 40, &theme, false);
         let text = render_list_item_to_string(item, 40);
 
         assert!(text.contains("42-fix-auth"), "should show branch: {text}");
-        assert!(text.contains("myrepo"), "should show repo: {text}");
+        // Repo name is now in the group header, not per-item.
         assert!(!text.contains("[no wt]"), "has worktree, no tag: {text}");
     }
 
@@ -1571,7 +1656,7 @@ mod format_entry_tests {
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
-        let item = format_work_item_entry(&app, 0, 40, &theme);
+        let item = format_work_item_entry(&app, 0, 40, &theme, false);
         let text = render_list_item_to_string(item, 40);
 
         assert!(text.contains("feature-x"), "should show branch: {text}");
@@ -1600,7 +1685,7 @@ mod format_entry_tests {
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
         let max_width = 21; // Narrow panel (100 col terminal)
-        let item = format_work_item_entry(&app, 0, max_width, &theme);
+        let item = format_work_item_entry(&app, 0, max_width, &theme, false);
         let text = render_list_item_to_string(item, max_width);
         for (i, line) in text.lines().enumerate() {
             let line_width = line.width();

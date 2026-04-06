@@ -3,17 +3,17 @@ source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
 ┌ Work Items (3) ───────┐┌ Claude Code ────────────────────────────────────────┐
-│  ACTIVE (1)           ││                                                     │
+│  ACTIVE (0) (1)       ││                                                     │
 │> [IM] Second item     ││  Second item                                        │
-│  Branch: branch-b     ││                                                     │
-│  Repo: 0 [no wt]      ││  Status      Implementing                           │
-│  BACKLOGGED (2)       ││  Backend     Local file                             │
-│  [BL] First item      ││  Repo        /repo/b/0                              │
-│  Branch: branch-a     ││  Branch      branch-b                               │
-│  Repo: 0 [no wt]      ││  Worktree    (none)                                 │
-│  [BL] Third item      ││  PR          (none)                                 │
-│  Branch: branch-c     ││  Issue       (none)                                 │
-│  Repo: 0 [no wt]      ││  Errors      (none)                                 │
+│  branch-b [no wt]     ││                                                     │
+│  BACKLOGGED (0) (2)   ││  Status      Implementing                           │
+│  [BL] First item      ││  Backend     Local file                             │
+│  branch-a [no wt]     ││  Repo        /repo/b/0                              │
+│  [BL] Third item      ││  Branch      branch-b                               │
+│  branch-c [no wt]     ││  Worktree    (none)                                 │
+│                       ││  PR          (none)                                 │
+│                       ││  Issue       (none)                                 │
+│                       ││  Errors      (none)                                 │
 │                       ││                                                     │
 │                       ││  Press Enter to start a session.                    │
 │                       ││                                                     │

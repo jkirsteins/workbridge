@@ -688,8 +688,8 @@ impl App {
     ///
     /// Groups (each hidden if empty):
     /// 1. UNLINKED - PRs not yet imported as work items
-    /// 2. ACTIVE - all non-Backlog work items (Planning, Implementing, Blocked, Review, Done)
-    /// 3. BACKLOGGED - work items with Backlog status
+    /// 2. ACTIVE (repo) - non-Backlog work items, grouped by repo
+    /// 3. BACKLOGGED (repo) - Backlog work items, grouped by repo
     pub fn build_display_list(&mut self) {
         let mut list = Vec::new();
 
@@ -704,7 +704,7 @@ impl App {
             }
         }
 
-        // Partition work items into active vs backlogged.
+        // Partition work items into active vs backlogged, then sub-group by repo.
         let mut active: Vec<usize> = Vec::new();
         let mut backlogged: Vec<usize> = Vec::new();
         for i in 0..self.work_items.len() {
@@ -715,27 +715,8 @@ impl App {
             }
         }
 
-        // ACTIVE group (hidden if empty).
-        if !active.is_empty() {
-            list.push(DisplayEntry::GroupHeader {
-                label: "ACTIVE".to_string(),
-                count: active.len(),
-            });
-            for i in active {
-                list.push(DisplayEntry::WorkItemEntry(i));
-            }
-        }
-
-        // BACKLOGGED group (hidden if empty).
-        if !backlogged.is_empty() {
-            list.push(DisplayEntry::GroupHeader {
-                label: "BACKLOGGED".to_string(),
-                count: backlogged.len(),
-            });
-            for i in backlogged {
-                list.push(DisplayEntry::WorkItemEntry(i));
-            }
-        }
+        Self::push_repo_groups(&self.work_items, &mut list, "ACTIVE", &active);
+        Self::push_repo_groups(&self.work_items, &mut list, "BACKLOGGED", &backlogged);
 
         self.display_list = list;
 
@@ -775,6 +756,48 @@ impl App {
             self.selected_work_item = None;
             self.selected_unlinked_branch = None;
             self.selected_item = self.display_list.iter().position(is_selectable);
+        }
+    }
+
+    /// Sub-group work item indices by repo and emit group headers + entries.
+    /// Each repo gets its own header: "ACTIVE (workbridge)" with a count.
+    /// If all items share the same repo, the header is just "ACTIVE (repo)".
+    fn push_repo_groups(
+        work_items: &[WorkItem],
+        list: &mut Vec<DisplayEntry>,
+        label: &str,
+        indices: &[usize],
+    ) {
+        if indices.is_empty() {
+            return;
+        }
+
+        // Collect unique repos in order of first appearance.
+        let mut repo_order: Vec<String> = Vec::new();
+        let mut by_repo: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for &i in indices {
+            let repo = work_items[i]
+                .repo_associations
+                .first()
+                .and_then(|a| a.repo_path.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "(none)".to_string());
+            by_repo.entry(repo.clone()).or_default().push(i);
+            if !repo_order.contains(&repo) {
+                repo_order.push(repo);
+            }
+        }
+
+        for repo in &repo_order {
+            let items = &by_repo[repo];
+            list.push(DisplayEntry::GroupHeader {
+                label: format!("{label} ({repo})"),
+                count: items.len(),
+            });
+            for &i in items {
+                list.push(DisplayEntry::WorkItemEntry(i));
+            }
         }
     }
 
@@ -4253,28 +4276,32 @@ mod tests {
         );
     }
 
+    fn make_work_item(path: &str, title: &str, status: WorkItemStatus) -> WorkItem {
+        use crate::work_item::RepoAssociation;
+        WorkItem {
+            id: WorkItemId::LocalFile(PathBuf::from(format!("/data/{title}.json"))),
+            backend_type: BackendType::LocalFile,
+            title: title.to_string(),
+            status,
+            status_derived: false,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from(path),
+                branch: None,
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        }
+    }
+
     #[test]
-    fn display_list_groups_by_stage() {
+    fn display_list_groups_by_stage_and_repo() {
         let mut app = App::new();
         app.work_items = vec![
-            WorkItem {
-                id: WorkItemId::LocalFile(PathBuf::from("/data/backlog.json")),
-                backend_type: BackendType::LocalFile,
-                title: "Backlog item".to_string(),
-                status: WorkItemStatus::Backlog,
-                status_derived: false,
-                repo_associations: vec![],
-                errors: vec![],
-            },
-            WorkItem {
-                id: WorkItemId::LocalFile(PathBuf::from("/data/done.json")),
-                backend_type: BackendType::LocalFile,
-                title: "Done item".to_string(),
-                status: WorkItemStatus::Done,
-                status_derived: false,
-                repo_associations: vec![],
-                errors: vec![],
-            },
+            make_work_item("/repos/alpha", "Backlog item", WorkItemStatus::Backlog),
+            make_work_item("/repos/alpha", "Done item", WorkItemStatus::Done),
         ];
         app.build_display_list();
 
@@ -4293,33 +4320,17 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(group_headers.len(), 2, "should have ACTIVE and BACKLOGGED");
-        assert_eq!(group_headers[0], ("ACTIVE", 1));
-        assert_eq!(group_headers[1], ("BACKLOGGED", 1));
+        assert_eq!(group_headers.len(), 2);
+        assert_eq!(group_headers[0], ("ACTIVE (alpha)", 1));
+        assert_eq!(group_headers[1], ("BACKLOGGED (alpha)", 1));
     }
 
     #[test]
     fn display_list_all_backlog_only_shows_backlogged_group() {
         let mut app = App::new();
         app.work_items = vec![
-            WorkItem {
-                id: WorkItemId::LocalFile(PathBuf::from("/data/a.json")),
-                backend_type: BackendType::LocalFile,
-                title: "Item A".to_string(),
-                status: WorkItemStatus::Backlog,
-                status_derived: false,
-                repo_associations: vec![],
-                errors: vec![],
-            },
-            WorkItem {
-                id: WorkItemId::LocalFile(PathBuf::from("/data/b.json")),
-                backend_type: BackendType::LocalFile,
-                title: "Item B".to_string(),
-                status: WorkItemStatus::Backlog,
-                status_derived: false,
-                repo_associations: vec![],
-                errors: vec![],
-            },
+            make_work_item("/repos/myrepo", "Item A", WorkItemStatus::Backlog),
+            make_work_item("/repos/myrepo", "Item B", WorkItemStatus::Backlog),
         ];
         app.build_display_list();
 
@@ -4331,31 +4342,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(headers, vec!["BACKLOGGED"]);
+        assert_eq!(headers, vec!["BACKLOGGED (myrepo)"]);
     }
 
     #[test]
     fn display_list_all_active_only_shows_active_group() {
         let mut app = App::new();
         app.work_items = vec![
-            WorkItem {
-                id: WorkItemId::LocalFile(PathBuf::from("/data/a.json")),
-                backend_type: BackendType::LocalFile,
-                title: "Implementing item".to_string(),
-                status: WorkItemStatus::Implementing,
-                status_derived: false,
-                repo_associations: vec![],
-                errors: vec![],
-            },
-            WorkItem {
-                id: WorkItemId::LocalFile(PathBuf::from("/data/b.json")),
-                backend_type: BackendType::LocalFile,
-                title: "Review item".to_string(),
-                status: WorkItemStatus::Review,
-                status_derived: false,
-                repo_associations: vec![],
-                errors: vec![],
-            },
+            make_work_item("/repos/myrepo", "Implementing item", WorkItemStatus::Implementing),
+            make_work_item("/repos/myrepo", "Review item", WorkItemStatus::Review),
         ];
         app.build_display_list();
 
@@ -4367,7 +4362,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(headers, vec!["ACTIVE"]);
+        assert_eq!(headers, vec!["ACTIVE (myrepo)"]);
     }
 
     #[test]
@@ -4395,24 +4390,8 @@ mod tests {
             },
         }];
         app.work_items = vec![
-            WorkItem {
-                id: WorkItemId::LocalFile(PathBuf::from("/data/active.json")),
-                backend_type: BackendType::LocalFile,
-                title: "Active item".to_string(),
-                status: WorkItemStatus::Implementing,
-                status_derived: false,
-                repo_associations: vec![],
-                errors: vec![],
-            },
-            WorkItem {
-                id: WorkItemId::LocalFile(PathBuf::from("/data/backlog.json")),
-                backend_type: BackendType::LocalFile,
-                title: "Backlog item".to_string(),
-                status: WorkItemStatus::Backlog,
-                status_derived: false,
-                repo_associations: vec![],
-                errors: vec![],
-            },
+            make_work_item("/repos/alpha", "Active item", WorkItemStatus::Implementing),
+            make_work_item("/repos/alpha", "Backlog item", WorkItemStatus::Backlog),
         ];
         app.build_display_list();
 
@@ -4426,8 +4405,32 @@ mod tests {
             .collect();
         assert_eq!(headers.len(), 3);
         assert_eq!(headers[0], ("UNLINKED", 1));
-        assert_eq!(headers[1], ("ACTIVE", 1));
-        assert_eq!(headers[2], ("BACKLOGGED", 1));
+        assert_eq!(headers[1], ("ACTIVE (alpha)", 1));
+        assert_eq!(headers[2], ("BACKLOGGED (alpha)", 1));
+    }
+
+    #[test]
+    fn display_list_multiple_repos_get_separate_groups() {
+        let mut app = App::new();
+        app.work_items = vec![
+            make_work_item("/repos/alpha", "Alpha task", WorkItemStatus::Implementing),
+            make_work_item("/repos/beta", "Beta task", WorkItemStatus::Implementing),
+            make_work_item("/repos/alpha", "Alpha backlog", WorkItemStatus::Backlog),
+        ];
+        app.build_display_list();
+
+        let headers: Vec<_> = app
+            .display_list
+            .iter()
+            .filter_map(|e| match e {
+                DisplayEntry::GroupHeader { label, count } => Some((label.as_str(), *count)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers[0], ("ACTIVE (alpha)", 1));
+        assert_eq!(headers[1], ("ACTIVE (beta)", 1));
+        assert_eq!(headers[2], ("BACKLOGGED (alpha)", 1));
     }
 
     /// F-3: create_work_item_with returns error when ALL repos lack git_dir.

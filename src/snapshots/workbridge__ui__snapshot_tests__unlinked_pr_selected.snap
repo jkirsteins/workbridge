@@ -5,10 +5,10 @@ expression: "render(&app, 80, 24)"
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  UNLINKED (1)         ││                                                     │
 │> ? fix-typo      PR#45││  Press Enter to import                              │
-│  ACTIVE (1)           ││  this PR as a work item.                            │
-│  [IM] Activ.. PR#30 ok││                                                     │
-│  Branch: branch-prog-1││                                                     │
-│  Repo: 0 [no wt]      ││                                                     │
+│  ACTIVE (0) (1)       ││  this PR as a work item.                            │
+│  [IM] Active  PR#30 ok││                                                     │
+│  feature              ││                                                     │
+│  branch-prog-1 [no wt]││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
