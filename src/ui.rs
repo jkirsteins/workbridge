@@ -262,8 +262,15 @@ fn format_work_item_entry<'a>(
         right_parts.push((format!(" [{repo_count} repos]"), theme.style_text_muted()));
     }
 
-    // Stage badge + title.
-    let badge = wi.status.badge_text();
+    // Stage badge + title. Show queue position for queued Implementing items.
+    let badge: String = if wi.status == WorkItemStatus::Implementing {
+        match app.implementing_queue_position(&wi.id) {
+            Some(pos) => format!("[IM:Q{pos}]"),
+            None => wi.status.badge_text().to_string(),
+        }
+    } else {
+        wi.status.badge_text().to_string()
+    };
     let prefix = format!("  {badge} ");
     // Minimum number of display columns reserved for the title so it never
     // vanishes when badges consume all available width.

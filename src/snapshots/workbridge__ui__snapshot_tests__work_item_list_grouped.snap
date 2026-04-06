@@ -9,14 +9,14 @@ expression: "render(&app, 80, 24)"
 │    [BL] Add user set..││  Status      Backlog                                │
 │    [BL] branch-todo-2 ││  Backend     Local file                             │
 │      (0) [no wt]      ││  Repo        /repo/todo-1/0                         │
-│    [IM] Refact.. PR#88││  Branch      branch-todo-1                          │
-│    [IM] branch-prog-1 ││  Worktree    (none)                                 │
-│      (0) [no wt]      ││  PR          #14 - PR #14                           │
-│    [IM] Update.. PR#12││  Issue       (none)                                 │
-│    [IM] branch-prog-2 ││  Errors      (none)                                 │
-│      (0) [no wt]      ││                                                     │
-│                       ││  Press Enter to start a session.                    │
-│                       ││                                                     │
+│    [IM:Q1] Ref.. PR#88││  Branch      branch-todo-1                          │
+│    [IM:Q1] branch-    ││  Worktree    (none)                                 │
+│      prog-1 (0) [no   ││  PR          #14 - PR #14                           │
+│      wt]              ││  Issue       (none)                                 │
+│    [IM:Q2] Upd.. PR#12││  Errors      (none)                                 │
+│    [IM:Q2] branch-    ││                                                     │
+│      prog-2 (0) [no   ││  Press Enter to start a session.                    │
+│      wt]              ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

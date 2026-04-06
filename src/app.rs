@@ -462,6 +462,7 @@ impl App {
     /// The reader threads handle PTY output continuously - no reading
     /// happens here. This only checks if child processes have exited.
     /// Also cleans up .mcp.json files and MCP servers for dead sessions.
+    /// After cleanup, promotes queued Implementing items if slots are free.
     pub fn check_liveness(&mut self) {
         let mut dead_ids: Vec<WorkItemId> = Vec::new();
         for (id, entry) in self.sessions.iter_mut() {
@@ -476,8 +477,56 @@ impl App {
             }
         }
         // Clean up MCP resources for newly dead sessions.
+        let had_dead = !dead_ids.is_empty();
         for id in dead_ids {
             self.cleanup_mcp_for(&id);
+        }
+        // When a session dies, check if a queued Implementing item can be promoted.
+        if had_dead {
+            self.promote_queued_implementing();
+        }
+    }
+
+    /// Auto-spawn sessions for queued Implementing items until the concurrency
+    /// limit is reached. Called when a session dies or when an item transitions
+    /// to Implementing.
+    fn promote_queued_implementing(&mut self) {
+        let max = self.config.defaults.max_implementing as usize;
+        loop {
+            let active = self.active_implementing_count();
+            if active >= max {
+                break;
+            }
+            // Find the first Implementing item without an alive session.
+            let next_id = self
+                .work_items
+                .iter()
+                .find(|w| {
+                    w.status == WorkItemStatus::Implementing
+                        && !self
+                            .sessions
+                            .get(&w.id)
+                            .is_some_and(|e| e.alive && e.session.is_some())
+                })
+                .map(|w| w.id.clone());
+
+            match next_id {
+                Some(id) => {
+                    let title = self
+                        .work_items
+                        .iter()
+                        .find(|w| w.id == id)
+                        .map(|w| w.title.clone())
+                        .unwrap_or_default();
+                    if self.spawn_session_for_item(&id) {
+                        self.status_message = Some(format!("Auto-started session for: {title}"));
+                    } else {
+                        // Spawn failed; stop trying to avoid an infinite loop.
+                        break;
+                    }
+                }
+                None => break,
+            }
         }
     }
 
@@ -489,6 +538,62 @@ impl App {
     /// Stop all MCP servers. Called on app exit.
     pub fn cleanup_all_mcp(&mut self) {
         self.mcp_servers.clear();
+    }
+
+    /// Count the number of Implementing work items that have an alive session.
+    fn active_implementing_count(&self) -> usize {
+        self.work_items
+            .iter()
+            .filter(|w| {
+                w.status == WorkItemStatus::Implementing
+                    && self
+                        .sessions
+                        .get(&w.id)
+                        .is_some_and(|e| e.alive && e.session.is_some())
+            })
+            .count()
+    }
+
+    /// Return the queue position for an Implementing work item, or `None` if
+    /// the item is actively running (has an alive session) or is not in the
+    /// Implementing stage at all.
+    ///
+    /// Position starts at 1 for the first queued item. The order follows
+    /// `self.work_items` order, which is stable across reassembly.
+    pub fn implementing_queue_position(&self, wi_id: &WorkItemId) -> Option<u32> {
+        let wi = self.work_items.iter().find(|w| w.id == *wi_id)?;
+        if wi.status != WorkItemStatus::Implementing {
+            return None;
+        }
+        // If this item already has an alive session, it's active (not queued).
+        if self
+            .sessions
+            .get(wi_id)
+            .is_some_and(|e| e.alive && e.session.is_some())
+        {
+            return None;
+        }
+
+        // Count how many Implementing items without alive sessions come
+        // before this one in the work_items list.
+        let mut pos = 0u32;
+        for w in &self.work_items {
+            if w.status != WorkItemStatus::Implementing {
+                continue;
+            }
+            let has_session = self
+                .sessions
+                .get(&w.id)
+                .is_some_and(|e| e.alive && e.session.is_some());
+            if has_session {
+                continue;
+            }
+            pos += 1;
+            if w.id == *wi_id {
+                return Some(pos);
+            }
+        }
+        None
     }
 
     /// Resize PTY sessions and vt100 parsers to match the current pane
@@ -877,6 +982,54 @@ impl App {
             self.sessions.remove(&work_item_id);
         }
 
+        // If the item is in Implementing and queued, don't spawn - show queue info.
+        if wi.status == WorkItemStatus::Implementing
+            && let Some(pos) = self.implementing_queue_position(&work_item_id)
+        {
+            self.status_message = Some(format!(
+                "Item is queued at position {pos}. Session will start automatically."
+            ));
+            return;
+        }
+
+        if self.spawn_session_for_item(&work_item_id) {
+            self.focus = FocusPanel::Right;
+            self.status_message = Some("Right panel focused - press Ctrl+] to return".into());
+        }
+    }
+
+    /// Spawn a Claude session for the given work item.
+    ///
+    /// Returns `true` if the session was spawned successfully. Errors and
+    /// status messages are set on `self` directly.
+    ///
+    /// This is the core session-spawning logic used by both
+    /// `open_session_for_selected` (user-initiated) and
+    /// `promote_queued_implementing` (automatic queue promotion).
+    fn spawn_session_for_item(&mut self, work_item_id: &WorkItemId) -> bool {
+        let wi = match self.work_items.iter().find(|w| w.id == *work_item_id) {
+            Some(w) => w,
+            None => return false,
+        };
+
+        // Clean up any dead session entry first.
+        if self
+            .sessions
+            .get(work_item_id)
+            .is_some_and(|e| !e.alive || e.session.is_none())
+        {
+            self.sessions.remove(work_item_id);
+        }
+
+        // If session is already alive, nothing to do.
+        if self
+            .sessions
+            .get(work_item_id)
+            .is_some_and(|e| e.alive && e.session.is_some())
+        {
+            return true;
+        }
+
         // Find the first worktree path among the work item's repo associations.
         // If none exists, try to auto-create one for the first association
         // that has a branch name.
@@ -911,7 +1064,7 @@ impl App {
                                     "Could not fetch or create branch '{}': {create_err}",
                                     branch,
                                 ));
-                                return;
+                                return false;
                             }
                         }
                         let wt_target = Self::worktree_target_path(
@@ -929,23 +1082,23 @@ impl App {
                                     "Failed to create worktree for '{}': {e}",
                                     branch,
                                 ));
-                                return;
+                                return false;
                             }
                         }
                     }
                     None => {
                         self.status_message = Some("Set a branch name to start working".into());
-                        return;
+                        return false;
                     }
                 }
             }
         };
 
         // Start MCP socket server for this session.
-        let mcp_result = self.start_mcp_for_session(&cwd, &work_item_id);
+        let mcp_result = self.start_mcp_for_session(&cwd, work_item_id);
 
         // Build the claude command with system prompt and MCP config.
-        let system_prompt = self.stage_system_prompt(&work_item_id);
+        let system_prompt = self.stage_system_prompt(work_item_id);
         let mut cmd: Vec<String> = vec!["claude".to_string()];
         if let Some(ref prompt) = system_prompt {
             cmd.push("--system-prompt".to_string());
@@ -990,19 +1143,18 @@ impl App {
                 self.sessions.insert(work_item_id.clone(), entry);
                 match mcp_result {
                     Ok((server, _)) => {
-                        self.mcp_servers.insert(work_item_id, server);
+                        self.mcp_servers.insert(work_item_id.clone(), server);
                     }
                     Err(msg) => {
                         self.status_message = Some(msg);
-                        self.focus = FocusPanel::Right;
-                        return;
+                        return true; // Session spawned even if MCP failed
                     }
                 }
-                self.focus = FocusPanel::Right;
-                self.status_message = Some("Right panel focused - press Ctrl+] to return".into());
+                true
             }
             Err(e) => {
                 self.status_message = Some(format!("Error spawning session: {e}"));
+                false
             }
         }
     }
@@ -1663,6 +1815,16 @@ impl App {
         if let Some(info) = pr_info {
             msg = format!("{msg} - {info}");
         }
+
+        // When entering Implementing, try to promote queued items (including
+        // this one if there's a free slot). Show queue position if queued.
+        if *new_status == WorkItemStatus::Implementing {
+            self.promote_queued_implementing();
+            if let Some(pos) = self.implementing_queue_position(wi_id) {
+                msg = format!("{msg} - queued at position {pos}");
+            }
+        }
+
         self.status_message = Some(msg);
     }
 

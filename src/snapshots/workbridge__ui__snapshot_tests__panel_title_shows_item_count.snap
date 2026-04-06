@@ -6,9 +6,9 @@ expression: "render(&app, 80, 24)"
 │>   [BL] First item    ││                                                     │
 │    [BL] branch-a (0)  ││  First item                                         │
 │      [no wt]          ││                                                     │
-│    [IM] Second item   ││  Status      Backlog                                │
-│    [IM] branch-b (0)  ││  Backend     Local file                             │
-│      [no wt]          ││  Repo        /repo/a/0                              │
+│    [IM:Q1] Second item││  Status      Backlog                                │
+│    [IM:Q1] branch-b ( ││  Backend     Local file                             │
+│      0) [no wt]       ││  Repo        /repo/a/0                              │
 │    [BL] Third item    ││  Branch      branch-a                               │
 │    [BL] branch-c (0)  ││  Worktree    (none)                                 │
 │      [no wt]          ││  PR          (none)                                 │

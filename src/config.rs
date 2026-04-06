@@ -105,6 +105,11 @@ pub struct Defaults {
     /// Regex for extracting issue identifiers from branch names.
     #[serde(default = "default_branch_issue_pattern")]
     pub branch_issue_pattern: String,
+    /// Maximum number of work items that can have active Claude sessions in
+    /// the Implementing stage at once. Additional items are queued and
+    /// auto-started when a slot becomes available. Default: 1.
+    #[serde(default = "default_max_implementing")]
+    pub max_implementing: u32,
 }
 
 fn default_worktree_dir() -> String {
@@ -115,11 +120,16 @@ fn default_branch_issue_pattern() -> String {
     r"^(\d+)-".into()
 }
 
+fn default_max_implementing() -> u32 {
+    1
+}
+
 impl Default for Defaults {
     fn default() -> Self {
         Self {
             worktree_dir: default_worktree_dir(),
             branch_issue_pattern: default_branch_issue_pattern(),
+            max_implementing: default_max_implementing(),
         }
     }
 }
