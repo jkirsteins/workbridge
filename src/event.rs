@@ -1,6 +1,6 @@
 use crate::salsa::ct::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, DisplayEntry, FocusPanel, SettingsListFocus};
+use crate::app::{App, BOARD_COLUMNS, DisplayEntry, FocusPanel, SettingsListFocus, ViewMode};
 use crate::create_dialog::CreateDialogFocus;
 use crate::layout;
 
@@ -139,9 +139,141 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         sync_layout(app);
     }
 
+    // Board mode (without drill-down) has its own key handler.
+    if app.view_mode == ViewMode::Board && !app.board_drill_down {
+        handle_key_board(app, key);
+        return;
+    }
+
     match app.focus {
         FocusPanel::Left => handle_key_left(app, key),
         FocusPanel::Right => handle_key_right(app, key),
+    }
+}
+
+/// Key handling when left panel (work item list) is focused.
+/// Key handling for the board (Kanban) view when not drilled down.
+fn handle_key_board(app: &mut App, key: KeyEvent) {
+    match (key.modifiers, key.code) {
+        // Tab - toggle back to flat list view
+        (KeyModifiers::NONE, KeyCode::Tab) => {
+            app.toggle_view_mode();
+        }
+        // Left arrow - move to previous column
+        (KeyModifiers::NONE, KeyCode::Left) => {
+            if app.board_cursor.column > 0 {
+                app.board_cursor.column -= 1;
+                let items = app.items_for_column(&BOARD_COLUMNS[app.board_cursor.column]);
+                app.board_cursor.row = if items.is_empty() {
+                    None
+                } else {
+                    Some(app.board_cursor.row.unwrap_or(0).min(items.len() - 1))
+                };
+                app.sync_selection_from_board();
+            }
+        }
+        // Right arrow - move to next column
+        (KeyModifiers::NONE, KeyCode::Right) => {
+            if app.board_cursor.column < BOARD_COLUMNS.len() - 1 {
+                app.board_cursor.column += 1;
+                let items = app.items_for_column(&BOARD_COLUMNS[app.board_cursor.column]);
+                app.board_cursor.row = if items.is_empty() {
+                    None
+                } else {
+                    Some(app.board_cursor.row.unwrap_or(0).min(items.len() - 1))
+                };
+                app.sync_selection_from_board();
+            }
+        }
+        // Up arrow - previous item in column
+        (KeyModifiers::NONE, KeyCode::Up) => {
+            if let Some(row) = app.board_cursor.row
+                && row > 0
+            {
+                app.board_cursor.row = Some(row - 1);
+                app.sync_selection_from_board();
+            }
+        }
+        // Down arrow - next item in column
+        (KeyModifiers::NONE, KeyCode::Down) => {
+            let items = app.items_for_column(&BOARD_COLUMNS[app.board_cursor.column]);
+            if let Some(row) = app.board_cursor.row
+                && row + 1 < items.len()
+            {
+                app.board_cursor.row = Some(row + 1);
+                app.sync_selection_from_board();
+            }
+        }
+        // Shift+Right - advance stage
+        (KeyModifiers::SHIFT, KeyCode::Right) => {
+            let had_status = app.status_message.is_some();
+            app.advance_stage();
+            if app.status_message.is_some() != had_status {
+                sync_layout(app);
+            }
+        }
+        // Shift+Left - retreat stage
+        (KeyModifiers::SHIFT, KeyCode::Left) => {
+            let had_status = app.status_message.is_some();
+            app.retreat_stage();
+            if app.status_message.is_some() != had_status {
+                sync_layout(app);
+            }
+        }
+        // Enter - drill down into item's stage (two-panel view)
+        (KeyModifiers::NONE, KeyCode::Enter) => {
+            if app.board_selected_work_item_id().is_some() {
+                let stage = BOARD_COLUMNS[app.board_cursor.column].clone();
+                app.board_drill_down = true;
+                app.board_drill_stage = Some(stage);
+                app.build_display_list();
+                app.open_session_for_selected();
+                sync_layout(app);
+            }
+        }
+        // Q/q/Ctrl+Q - quit with confirmation
+        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('q' | 'Q'))
+        | (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
+            if !app.has_any_session() || app.confirm_quit {
+                app.should_quit = true;
+            } else {
+                app.confirm_quit = true;
+                app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                sync_layout(app);
+            }
+        }
+        // Ctrl+N - open work item creation dialog
+        (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
+            let active_repos: Vec<std::path::PathBuf> = app
+                .active_repo_cache
+                .iter()
+                .filter(|r| r.git_dir_present)
+                .map(|r| r.path.clone())
+                .collect();
+            let cwd_repo = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| app.managed_repo_root(&cwd));
+            app.create_dialog.open(&active_repos, cwd_repo.as_ref());
+        }
+        // Ctrl+D or Delete - delete work item with confirmation
+        (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Delete) => {
+            if app.selected_work_item_id().is_none() {
+                return;
+            }
+            if app.confirm_delete {
+                app.confirm_delete = false;
+                app.delete_selected_work_item();
+            } else {
+                app.confirm_delete = true;
+                app.status_message = Some("Press again to delete this work item".into());
+                sync_layout(app);
+            }
+        }
+        // ? - toggle settings overlay
+        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
+            app.show_settings = !app.show_settings;
+        }
+        _ => {}
     }
 }
 
@@ -256,6 +388,10 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
         (KeyModifiers::CONTROL, KeyCode::Char('g')) => {
             app.toggle_global_drawer();
         }
+        // Tab - toggle to board view
+        (KeyModifiers::NONE, KeyCode::Tab) => {
+            app.toggle_view_mode();
+        }
         // ? - toggle settings overlay
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
             app.show_settings = !app.show_settings;
@@ -300,6 +436,12 @@ fn handle_key_right(app: &mut App, key: KeyEvent) {
         {
             app.focus = FocusPanel::Left;
             app.status_message = None;
+            // If returning from board drill-down, restore the full board view.
+            if app.board_drill_down {
+                app.board_drill_down = false;
+                app.board_drill_stage = None;
+                app.build_display_list();
+            }
             // Status bar visibility changed - resize PTY to match.
             sync_layout(app);
         }

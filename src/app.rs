@@ -26,6 +26,30 @@ pub enum FocusPanel {
     Right,
 }
 
+/// Which view mode the root overview is in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    FlatList,
+    Board,
+}
+
+/// Cursor state for the board view.
+/// Tracks which column is selected and which item within that column.
+pub struct BoardCursor {
+    /// Index into BOARD_COLUMNS (0=Backlog, 1=Planning, 2=Implementing, 3=Review).
+    pub column: usize,
+    /// Index of the selected item within the column, or None if column is empty.
+    pub row: Option<usize>,
+}
+
+/// The four visible columns in the board view (Done is hidden).
+pub const BOARD_COLUMNS: &[WorkItemStatus] = &[
+    WorkItemStatus::Backlog,
+    WorkItemStatus::Planning,
+    WorkItemStatus::Implementing,
+    WorkItemStatus::Review,
+];
+
 /// Which list has focus inside the settings overlay.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsListFocus {
@@ -232,6 +256,14 @@ pub struct App {
     pub selected_item: Option<usize>,
     /// Flat display list for the left panel.
     pub display_list: Vec<DisplayEntry>,
+    /// Which view mode the root overview is in.
+    pub view_mode: ViewMode,
+    /// Cursor state for the board view.
+    pub board_cursor: BoardCursor,
+    /// True when user pressed Enter from board view (shows filtered two-panel layout).
+    pub board_drill_down: bool,
+    /// The stage being drilled into (for filtering the left panel).
+    pub board_drill_stage: Option<WorkItemStatus>,
     /// Set when manage/unmanage changes active repos. The main loop checks
     /// this flag and restarts the background fetcher with the updated repo
     /// list so newly managed repos get fetched and removed repos stop.
@@ -425,6 +457,13 @@ impl App {
             worktree_errors_shown: std::collections::HashSet::new(),
             selected_item: None,
             display_list: Vec::new(),
+            view_mode: ViewMode::FlatList,
+            board_cursor: BoardCursor {
+                column: 0,
+                row: None,
+            },
+            board_drill_down: false,
+            board_drill_stage: None,
             fetcher_repos_changed: false,
             selected_work_item: None,
             selected_unlinked_branch: None,
@@ -997,65 +1036,81 @@ impl App {
     pub fn build_display_list(&mut self) {
         let mut list = Vec::new();
 
-        // Partition work items into blocked, active, backlogged, and done.
-        let mut blocked: Vec<usize> = Vec::new();
-        let mut active: Vec<usize> = Vec::new();
-        let mut backlogged: Vec<usize> = Vec::new();
-        let mut done: Vec<usize> = Vec::new();
-        for i in 0..self.work_items.len() {
-            if self.work_items[i].status == WorkItemStatus::Done {
-                done.push(i);
-            } else if self.work_items[i].status == WorkItemStatus::Backlog {
-                backlogged.push(i);
-            } else if self.work_items[i].status == WorkItemStatus::Blocked {
-                blocked.push(i);
-            } else {
-                active.push(i);
+        // When drilling down from board view, show only items matching
+        // the drill-down stage. Otherwise show the full grouped list.
+        if let Some(ref drill_stage) = self.board_drill_stage {
+            for i in 0..self.work_items.len() {
+                let matches = if *drill_stage == WorkItemStatus::Implementing {
+                    self.work_items[i].status == WorkItemStatus::Implementing
+                        || self.work_items[i].status == WorkItemStatus::Blocked
+                } else {
+                    self.work_items[i].status == *drill_stage
+                };
+                if matches {
+                    list.push(DisplayEntry::WorkItemEntry(i));
+                }
             }
-        }
-
-        // BLOCKED group first (red, attention-grabbing).
-        Self::push_repo_groups(
-            &self.work_items,
-            &mut list,
-            "BLOCKED",
-            &blocked,
-            GroupHeaderKind::Blocked,
-        );
-
-        // UNLINKED group (hidden if empty).
-        if !self.unlinked_prs.is_empty() {
-            list.push(DisplayEntry::GroupHeader {
-                label: "UNLINKED".to_string(),
-                count: self.unlinked_prs.len(),
-                kind: GroupHeaderKind::Normal,
-            });
-            for i in 0..self.unlinked_prs.len() {
-                list.push(DisplayEntry::UnlinkedItem(i));
+        } else {
+            // Partition work items into blocked, active, backlogged, and done.
+            let mut blocked: Vec<usize> = Vec::new();
+            let mut active: Vec<usize> = Vec::new();
+            let mut backlogged: Vec<usize> = Vec::new();
+            let mut done: Vec<usize> = Vec::new();
+            for i in 0..self.work_items.len() {
+                if self.work_items[i].status == WorkItemStatus::Done {
+                    done.push(i);
+                } else if self.work_items[i].status == WorkItemStatus::Backlog {
+                    backlogged.push(i);
+                } else if self.work_items[i].status == WorkItemStatus::Blocked {
+                    blocked.push(i);
+                } else {
+                    active.push(i);
+                }
             }
-        }
 
-        Self::push_repo_groups(
-            &self.work_items,
-            &mut list,
-            "ACTIVE",
-            &active,
-            GroupHeaderKind::Normal,
-        );
-        Self::push_repo_groups(
-            &self.work_items,
-            &mut list,
-            "BACKLOGGED",
-            &backlogged,
-            GroupHeaderKind::Normal,
-        );
-        Self::push_repo_groups(
-            &self.work_items,
-            &mut list,
-            "DONE",
-            &done,
-            GroupHeaderKind::Normal,
-        );
+            // BLOCKED group first (red, attention-grabbing).
+            Self::push_repo_groups(
+                &self.work_items,
+                &mut list,
+                "BLOCKED",
+                &blocked,
+                GroupHeaderKind::Blocked,
+            );
+
+            // UNLINKED group (hidden if empty).
+            if !self.unlinked_prs.is_empty() {
+                list.push(DisplayEntry::GroupHeader {
+                    label: "UNLINKED".to_string(),
+                    count: self.unlinked_prs.len(),
+                    kind: GroupHeaderKind::Normal,
+                });
+                for i in 0..self.unlinked_prs.len() {
+                    list.push(DisplayEntry::UnlinkedItem(i));
+                }
+            }
+
+            Self::push_repo_groups(
+                &self.work_items,
+                &mut list,
+                "ACTIVE",
+                &active,
+                GroupHeaderKind::Normal,
+            );
+            Self::push_repo_groups(
+                &self.work_items,
+                &mut list,
+                "BACKLOGGED",
+                &backlogged,
+                GroupHeaderKind::Normal,
+            );
+            Self::push_repo_groups(
+                &self.work_items,
+                &mut list,
+                "DONE",
+                &done,
+                GroupHeaderKind::Normal,
+            );
+        }
 
         self.display_list = list;
 
@@ -1096,6 +1151,9 @@ impl App {
             self.selected_unlinked_branch = None;
             self.selected_item = self.display_list.iter().position(is_selectable);
         }
+
+        // Keep board cursor in sync after reassembly.
+        self.sync_board_cursor();
     }
 
     /// Sub-group work item indices by repo and emit group headers + entries.
@@ -1210,13 +1268,113 @@ impl App {
 
     /// Get the WorkItemId for the currently selected work item, if any.
     /// Returns None if nothing is selected or the selection is an unlinked PR.
+    /// In board mode (without drill-down), delegates to the board cursor.
     pub fn selected_work_item_id(&self) -> Option<WorkItemId> {
+        if self.view_mode == ViewMode::Board && !self.board_drill_down {
+            return self.board_selected_work_item_id();
+        }
         let idx = self.selected_item?;
         match self.display_list.get(idx)? {
             DisplayEntry::WorkItemEntry(wi_idx) => {
                 self.work_items.get(*wi_idx).map(|wi| wi.id.clone())
             }
             _ => None,
+        }
+    }
+
+    // -- Board view helpers --
+
+    /// Get indices into `self.work_items` for items matching the given status.
+    /// For the Implementing column, also includes Blocked items.
+    pub fn items_for_column(&self, status: &WorkItemStatus) -> Vec<usize> {
+        self.work_items
+            .iter()
+            .enumerate()
+            .filter(|(_, wi)| {
+                if *status == WorkItemStatus::Implementing {
+                    wi.status == WorkItemStatus::Implementing
+                        || wi.status == WorkItemStatus::Blocked
+                } else {
+                    wi.status == *status
+                }
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Resolve the board cursor to a WorkItemId.
+    pub fn board_selected_work_item_id(&self) -> Option<WorkItemId> {
+        let col_status = BOARD_COLUMNS.get(self.board_cursor.column)?;
+        let items = self.items_for_column(col_status);
+        let row = self.board_cursor.row?;
+        let wi_idx = items.get(row)?;
+        self.work_items.get(*wi_idx).map(|wi| wi.id.clone())
+    }
+
+    /// Sync the board cursor after reassembly or stage changes.
+    /// Clamps row to the column's item count and tries to follow the
+    /// selected work item if it moved columns.
+    pub fn sync_board_cursor(&mut self) {
+        // If we have a selected work item, try to find it in the board.
+        if let Some(ref target_id) = self.selected_work_item {
+            for (col_idx, status) in BOARD_COLUMNS.iter().enumerate() {
+                let items = self.items_for_column(status);
+                for (row_idx, &wi_idx) in items.iter().enumerate() {
+                    if let Some(wi) = self.work_items.get(wi_idx)
+                        && wi.id == *target_id
+                    {
+                        self.board_cursor.column = col_idx;
+                        self.board_cursor.row = Some(row_idx);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Selected item not found in any column - clamp to current column.
+        let items = self.items_for_column(
+            BOARD_COLUMNS
+                .get(self.board_cursor.column)
+                .unwrap_or(&WorkItemStatus::Backlog),
+        );
+        if items.is_empty() {
+            self.board_cursor.row = None;
+        } else if let Some(row) = self.board_cursor.row {
+            self.board_cursor.row = Some(row.min(items.len() - 1));
+        } else {
+            self.board_cursor.row = Some(0);
+        }
+    }
+
+    /// Update `selected_work_item` from the board cursor position.
+    pub fn sync_selection_from_board(&mut self) {
+        self.selected_work_item = self.board_selected_work_item_id();
+    }
+
+    /// Toggle between flat list and board view, syncing cursor state.
+    pub fn toggle_view_mode(&mut self) {
+        match self.view_mode {
+            ViewMode::FlatList => {
+                self.view_mode = ViewMode::Board;
+                self.sync_board_cursor();
+            }
+            ViewMode::Board => {
+                self.view_mode = ViewMode::FlatList;
+                self.board_drill_down = false;
+                self.board_drill_stage = None;
+                // Sync flat list selection from board cursor.
+                if let Some(ref target_id) = self.selected_work_item {
+                    for (i, entry) in self.display_list.iter().enumerate() {
+                        if let DisplayEntry::WorkItemEntry(wi_idx) = entry
+                            && let Some(wi) = self.work_items.get(*wi_idx)
+                            && wi.id == *target_id
+                        {
+                            self.selected_item = Some(i);
+                            return;
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -130,6 +130,78 @@ Present results as a table:
 Include the raw captured pane output for any FAIL so the user can see what
 went wrong.
 
+#### Test 6: Board view toggle
+
+Send `Tab` to switch to board view:
+```bash
+tmux send-keys -t <session> Tab
+```
+Wait 1 second. Capture. Verify:
+- Four column headers visible: "Backlog", "Planning", "Implementing", "Review"
+- Column borders render correctly
+- Tab created in Test 2 is no longer visible (board view replaces flat list)
+
+#### Test 7: Board view - create and move item through all stages
+
+This test verifies no text clipping in any board column. Create a work item
+with a representative title, then move it through all stages:
+
+1. Press Tab to return to flat list view, then Ctrl+N to create:
+```bash
+tmux send-keys -t <session> Tab
+sleep 0.5
+tmux send-keys -t <session> C-n
+sleep 1
+tmux send-keys -t <session> -l "Add response caching layer"
+sleep 0.5
+tmux send-keys -t <session> Enter
+sleep 1
+```
+
+2. Switch to board view:
+```bash
+tmux send-keys -t <session> Tab
+sleep 1
+```
+Capture. Verify: "Add response caching layer" visible in Backlog column,
+not truncated.
+
+3. Move to Planning (Shift+Right):
+```bash
+tmux send-keys -t <session> S-Right
+sleep 1
+```
+Capture. Verify: title visible in Planning column, not truncated.
+
+4. Move to Implementing (Shift+Right):
+```bash
+tmux send-keys -t <session> S-Right
+sleep 1
+```
+Capture. Verify: title visible in Implementing column, not truncated.
+
+5. Move to Review (Shift+Right):
+```bash
+tmux send-keys -t <session> S-Right
+sleep 1
+```
+Capture. Verify: title visible in Review column, not truncated.
+
+At each step, assert the full string "Add response caching" appears in the
+captured pane output (the full title may wrap but must not be truncated with
+"..").
+
+#### Test 8: Board view - return to flat list
+
+Send Tab to return to flat list:
+```bash
+tmux send-keys -t <session> Tab
+sleep 1
+```
+Capture. Verify:
+- Left panel shows "Work Items" title (not column headers)
+- The work item is visible in the list
+
 ## What counts as PASS
 
 For each verification point, look for the described strings or patterns in the

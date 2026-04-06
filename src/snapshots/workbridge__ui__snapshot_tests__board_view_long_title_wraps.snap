@@ -1,0 +1,29 @@
+---
+source: src/ui.rs
+assertion_line: 2367
+expression: "render(&app, 80, 24)"
+---
+┌ Backlog (1) ─────┐┌ Planning (0) ────┐┌ Implementing (0) ┐┌ Review (0) ──────┐
+│> Add response    ││                  ││                  ││                  │
+│      caching     ││  No items        ││  No items        ││  No items        │
+│      layer with  ││                  ││                  ││                  │
+│      Redis       ││                  ││                  ││                  │
+│      integration ││                  ││                  ││                  │
+│      for the API ││                  ││                  ││                  │
+│      users       ││                  ││                  ││                  │
+│      endpoint    ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+└──────────────────┘└──────────────────┘└──────────────────┘└──────────────────┘
+Add response caching layer with Redis integration for the API users endpoint ...

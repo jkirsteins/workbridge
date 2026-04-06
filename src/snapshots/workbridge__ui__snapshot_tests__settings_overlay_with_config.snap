@@ -1,5 +1,6 @@
 ---
 source: src/ui.rs
+assertion_line: 2099
 expression: output
 ---
 ┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
@@ -9,11 +10,11 @@ expression: output
 │  Press Ctr│ Config source:                                       │           │
 │  to create│   in-memory (test)                                   │           │
 │           │ Base directories:                                    │           │
-│           │   + /var/folders/rv/dqk6jtx96153x987fl6416s40000gn/T │           │
+│           │   + /tmp/workbridge-test-settings-overlay            │           │
 │           │                                                      │           │
-│           │ ┌ Managed repos (1) ─────┐┌ Available (2) ─────────┐ │           │
-│           │ │>  - /Users/janis.kirste││ + /var/folders/rv/dqk6j│ │           │
-│           │ │                        ││ + /var/folders/rv/dqk6j│ │           │
+│           │ ┌ Managed repos (2) ─────┐┌ Available (1) ─────────┐ │           │
+│           │ │>  - /root/Forks/special││ + /tmp/workbridge-test-│ │           │
+│           │ │   + /tmp/workbridge-tes││                        │ │           │
 │           │ └────────────────────────┘└────────────────────────┘ │           │
 │           │                                                      │           │
 │           │ Defaults:                                            │           │

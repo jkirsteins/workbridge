@@ -62,6 +62,20 @@ pub fn compute_drawer(cols: u16, rows: u16) -> DrawerLayout {
     }
 }
 
+/// Column layout for the board (Kanban) view.
+pub struct BoardLayout {
+    /// Width of each of the four columns.
+    pub column_width: u16,
+}
+
+/// Compute board column layout from total terminal dimensions.
+///
+/// Four equal columns spanning the full width.
+pub fn compute_board(cols: u16) -> BoardLayout {
+    let column_width = if cols >= 4 { cols / 4 } else { cols.max(1) };
+    BoardLayout { column_width }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +178,32 @@ mod tests {
         let dl = compute_drawer(200, 2000);
         assert_eq!(dl.drawer_height, 1200);
         assert_eq!(dl.pane_rows, 1198);
+    }
+
+    // -- Board layout tests --
+
+    #[test]
+    fn board_120_cols() {
+        let bl = compute_board(120);
+        assert_eq!(bl.column_width, 30);
+    }
+
+    #[test]
+    fn board_80_cols() {
+        let bl = compute_board(80);
+        assert_eq!(bl.column_width, 20);
+    }
+
+    #[test]
+    fn board_remainder_cols() {
+        // 121 / 4 = 30; last column gets remainder via Min(0) in layout
+        let bl = compute_board(121);
+        assert_eq!(bl.column_width, 30);
+    }
+
+    #[test]
+    fn board_tiny_terminal() {
+        let bl = compute_board(4);
+        assert_eq!(bl.column_width, 1);
     }
 }

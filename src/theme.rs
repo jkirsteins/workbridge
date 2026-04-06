@@ -299,6 +299,30 @@ impl Theme {
             .add_modifier(Modifier::DIM)
     }
 
+    // -- Board view styles --
+    // Reuse existing colors for visual consistency.
+
+    pub fn style_board_column_focused(&self) -> Style {
+        Style::default().fg(self.border_focused)
+    }
+
+    pub fn style_board_column_unfocused(&self) -> Style {
+        Style::default().fg(self.border_unfocused)
+    }
+
+    pub fn style_board_column_header(&self) -> Style {
+        Style::default()
+            .fg(self.text_heading)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn style_board_item_highlight(&self) -> Style {
+        Style::default()
+            .fg(self.tab_highlight_fg)
+            .bg(self.tab_highlight_bg)
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn style_stage_badge(&self, status: &WorkItemStatus) -> Style {
         let color = match status {
             WorkItemStatus::Backlog => self.badge_backlog,
