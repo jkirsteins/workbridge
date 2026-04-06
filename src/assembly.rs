@@ -522,6 +522,7 @@ mod tests {
             kind: crate::work_item::WorkItemKind::Own,
             repo_associations: associations,
             plan: None,
+            done_at: None,
         }
     }
 
@@ -1350,6 +1351,7 @@ mod tests {
                     pr_identity: None,
                 }],
                 plan: None,
+                done_at: None,
             },
             WorkItemRecord {
                 id: WorkItemId::GithubIssue {
@@ -1367,6 +1369,7 @@ mod tests {
                     pr_identity: None,
                 }],
                 plan: None,
+                done_at: None,
             },
             WorkItemRecord {
                 id: WorkItemId::GithubProject {
@@ -1382,6 +1385,7 @@ mod tests {
                     pr_identity: None,
                 }],
                 plan: None,
+                done_at: None,
             },
         ];
 

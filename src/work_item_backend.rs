@@ -71,6 +71,11 @@ pub struct WorkItemRecord {
     /// Defaults to None for migration compatibility with existing records.
     #[serde(default)]
     pub plan: Option<String>,
+    /// Epoch seconds (UTC) when this item entered the Done state.
+    /// Used by auto-archival to determine when to delete completed items.
+    /// Defaults to None for migration compatibility with existing records.
+    #[serde(default)]
+    pub done_at: Option<u64>,
 }
 
 /// An entry in a work item's append-only activity log.
@@ -191,6 +196,10 @@ pub trait WorkItemBackend: Send + Sync {
 
     /// Read the implementation plan for a work item.
     fn read_plan(&self, id: &WorkItemId) -> Result<Option<String>, BackendError>;
+
+    /// Set or clear the done_at timestamp for a work item.
+    /// Called when a work item enters or leaves the Done state.
+    fn set_done_at(&self, id: &WorkItemId, done_at: Option<u64>) -> Result<(), BackendError>;
 
     /// Get the activity log file path for a work item. Returns None if the
     /// backend does not support file-based activity logs.
@@ -416,6 +425,7 @@ impl WorkItemBackend for LocalFileBackend {
             kind: request.kind,
             repo_associations: request.repo_associations,
             plan: None,
+            done_at: None,
         };
 
         let json = serde_json::to_string_pretty(&record)
@@ -553,6 +563,12 @@ impl WorkItemBackend for LocalFileBackend {
 
     fn read_plan(&self, id: &WorkItemId) -> Result<Option<String>, BackendError> {
         Ok(self.read_record(id)?.plan)
+    }
+
+    fn set_done_at(&self, id: &WorkItemId, done_at: Option<u64>) -> Result<(), BackendError> {
+        self.modify_record(id, |record| {
+            record.done_at = done_at;
+        })
     }
 
     fn activity_path_for(&self, id: &WorkItemId) -> Option<PathBuf> {
@@ -1051,6 +1067,53 @@ mod tests {
             "path should end with .jsonl, got: {}",
             path.display(),
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serde_migration_done_at_defaults_to_none() {
+        let json = r#"{"id":{"LocalFile":"/tmp/test.json"},"title":"Test","status":"Done","repo_associations":[]}"#;
+        let record: WorkItemRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.done_at, None);
+    }
+
+    #[test]
+    fn serde_done_at_roundtrip() {
+        let json = r#"{"id":{"LocalFile":"/tmp/test.json"},"title":"Test","status":"Done","repo_associations":[],"done_at":1712345678}"#;
+        let record: WorkItemRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.done_at, Some(1712345678));
+    }
+
+    #[test]
+    fn set_done_at_roundtrip() {
+        let dir = temp_dir("set-done-at");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Done test".into(),
+                status: WorkItemStatus::Done,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: Some("main".into()),
+                }],
+            })
+            .unwrap();
+
+        // Initially no done_at.
+        let result = backend.list().unwrap();
+        assert_eq!(result.records[0].done_at, None);
+
+        // Set done_at.
+        backend.set_done_at(&record.id, Some(1000000)).unwrap();
+        let result = backend.list().unwrap();
+        assert_eq!(result.records[0].done_at, Some(1000000));
+
+        // Clear done_at.
+        backend.set_done_at(&record.id, None).unwrap();
+        let result = backend.list().unwrap();
+        assert_eq!(result.records[0].done_at, None);
 
         let _ = fs::remove_dir_all(&dir);
     }
