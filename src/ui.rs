@@ -115,7 +115,7 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     };
 
     let block = Block::default()
-        .title(format!(" Work Items ({}) ", app.display_list.len()))
+        .title(" Work Items ")
         .title_style(theme.style_title())
         .borders(Borders::ALL)
         .border_style(border_style);
@@ -150,6 +150,10 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     theme.style_group_header(),
                 )]))
             }
+            DisplayEntry::EmptyState(msg) => ListItem::new(Line::from(vec![Span::styled(
+                msg.clone(),
+                theme.style_text_muted(),
+            )])),
             DisplayEntry::UnlinkedItem(idx) => format_unlinked_item(app, *idx, inner_width, theme),
             DisplayEntry::WorkItemEntry(idx) => {
                 format_work_item_entry(app, *idx, inner_width, theme)
@@ -262,9 +266,8 @@ fn format_work_item_entry<'a>(
         right_parts.push((format!(" [{repo_count} repos]"), theme.style_text_muted()));
     }
 
-    // Stage badge + title.
-    let badge = wi.status.badge_text();
-    let prefix = format!("  {badge} ");
+    // Title.
+    let prefix = "  ";
     // Minimum number of display columns reserved for the title so it never
     // vanishes when badges consume all available width.
     const MIN_TITLE_BUDGET: usize = 5;
@@ -303,11 +306,8 @@ fn format_work_item_entry<'a>(
     } else {
         theme.style_text()
     };
-    let badge_style = theme.style_stage_badge(&wi.status);
     let mut line1_spans = vec![
-        Span::raw("  "),
-        Span::styled(badge.to_string(), badge_style),
-        Span::raw(" "),
+        Span::raw(prefix.to_string()),
         Span::styled(truncated_title, title_style),
         Span::raw(pad_str),
     ];
@@ -563,11 +563,8 @@ fn draw_work_item_detail(
     let none_style = theme.style_text_muted();
 
     let status_str = match wi.status {
-        WorkItemStatus::Backlog => "Backlog",
-        WorkItemStatus::Planning => "Planning",
-        WorkItemStatus::Implementing => "Implementing",
-        WorkItemStatus::Blocked => "Blocked",
-        WorkItemStatus::Review => "Review",
+        WorkItemStatus::Todo => "Todo",
+        WorkItemStatus::InProgress => "In Progress",
         WorkItemStatus::Done => "Done",
     };
 
@@ -797,15 +794,7 @@ fn draw_context_bar(buf: &mut Buffer, ctx: &WorkItemContext, theme: &Theme, area
         format!(" | {}", ctx.labels.join(", "))
     };
 
-    let activity_part = match ctx.last_activity {
-        Some(ref a) => format!(" | {a}"),
-        None => String::new(),
-    };
-
-    let full = format!(
-        "{} | [{}] | {}{}{}",
-        ctx.title, ctx.stage, ctx.repo_path, labels_part, activity_part
-    );
+    let full = format!("{} | {}{}", ctx.title, ctx.repo_path, labels_part);
 
     // Truncate to fit width. Use char-based indexing for multi-byte safety.
     let width = area.width as usize;
@@ -1489,7 +1478,7 @@ mod format_entry_tests {
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             title: "Fix auth bug".to_string(),
-            status: WorkItemStatus::Backlog,
+            status: WorkItemStatus::Todo,
             repo_associations: vec![RepoAssociation {
                 repo_path: PathBuf::from("/Projects/myrepo"),
                 branch: None,
@@ -1498,7 +1487,6 @@ mod format_entry_tests {
                 issue: None,
                 git_state: None,
             }],
-            status_derived: false,
             errors: vec![],
         };
         let app = make_app_with_work_item(wi);
@@ -1524,7 +1512,7 @@ mod format_entry_tests {
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             title: "Fix auth bug".to_string(),
-            status: WorkItemStatus::Implementing,
+            status: WorkItemStatus::InProgress,
             repo_associations: vec![RepoAssociation {
                 repo_path: PathBuf::from("/Projects/myrepo"),
                 branch: Some("42-fix-auth".to_string()),
@@ -1533,7 +1521,6 @@ mod format_entry_tests {
                 issue: None,
                 git_state: None,
             }],
-            status_derived: false,
             errors: vec![],
         };
         let app = make_app_with_work_item(wi);
@@ -1553,7 +1540,7 @@ mod format_entry_tests {
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             title: "Planned work".to_string(),
-            status: WorkItemStatus::Backlog,
+            status: WorkItemStatus::Todo,
             repo_associations: vec![RepoAssociation {
                 repo_path: PathBuf::from("/Projects/myrepo"),
                 branch: Some("feature-x".to_string()),
@@ -1562,7 +1549,6 @@ mod format_entry_tests {
                 issue: None,
                 git_state: None,
             }],
-            status_derived: false,
             errors: vec![],
         };
         let app = make_app_with_work_item(wi);
@@ -1581,7 +1567,7 @@ mod format_entry_tests {
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             title: "A very long title that should be truncated properly".to_string(),
-            status: WorkItemStatus::Implementing,
+            status: WorkItemStatus::InProgress,
             repo_associations: vec![RepoAssociation {
                 repo_path: PathBuf::from("/Projects/walleyboard"),
                 branch: Some("janiskirsteins/agent-specific-labels".to_string()),
@@ -1590,7 +1576,6 @@ mod format_entry_tests {
                 issue: None,
                 git_state: None,
             }],
-            status_derived: false,
             errors: vec![],
         };
         let app = make_app_with_work_item(wi);
@@ -1665,37 +1650,8 @@ mod snapshot_tests {
         fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
             Ok(())
         }
-        fn update_status(
-            &self,
-            _id: &WorkItemId,
-            _status: WorkItemStatus,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
         fn import(&self, _unlinked: &UnlinkedPr) -> Result<WorkItemRecord, BackendError> {
             Err(BackendError::Validation("not implemented".into()))
-        }
-        fn append_activity(
-            &self,
-            _id: &WorkItemId,
-            _entry: &crate::work_item_backend::ActivityEntry,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn read_activity(
-            &self,
-            _id: &WorkItemId,
-        ) -> Result<Vec<crate::work_item_backend::ActivityEntry>, BackendError> {
-            Ok(Vec::new())
-        }
-        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
-            Ok(None)
-        }
-        fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
-            None
         }
         fn backend_type(&self) -> BackendType {
             BackendType::LocalFile
@@ -1735,7 +1691,6 @@ mod snapshot_tests {
             backend_type: BackendType::LocalFile,
             title: title.to_string(),
             status,
-            status_derived: false,
             repo_associations: associations,
             errors: Vec::new(),
         }
@@ -1783,28 +1738,18 @@ mod snapshot_tests {
     }
 
     #[test]
-    fn panel_title_shows_item_count() {
-        let items = vec![
-            make_work_item("a", "First item", WorkItemStatus::Backlog, None, 1),
-            make_work_item("b", "Second item", WorkItemStatus::Implementing, None, 1),
-            make_work_item("c", "Third item", WorkItemStatus::Backlog, None, 1),
-        ];
-        let app = app_with_items(items, vec![]);
-        insta::assert_snapshot!(render(&app, 80, 24));
-    }
-
-    #[test]
     fn work_item_selected_no_session() {
         let items = vec![make_work_item(
             "todo-1",
             "Fix authentication bug",
-            WorkItemStatus::Backlog,
+            WorkItemStatus::Todo,
             Some(make_pr_info(14, CheckStatus::Passing)),
             1,
         )];
         let mut app = app_with_items(items, vec![]);
-        // Select the first work item entry (index 0 in flat list).
-        app.selected_item = Some(0);
+        // Select the first work item entry (index 1, since index 0 is the
+        // TODO group header).
+        app.selected_item = Some(1);
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 
@@ -1813,7 +1758,7 @@ mod snapshot_tests {
         let items = vec![make_work_item(
             "prog-1",
             "Active feature",
-            WorkItemStatus::Implementing,
+            WorkItemStatus::InProgress,
             Some(make_pr_info(30, CheckStatus::Passing)),
             1,
         )];
@@ -1832,12 +1777,12 @@ mod snapshot_tests {
         let items = vec![make_work_item(
             "todo-1",
             "Fix authentication bug",
-            WorkItemStatus::Backlog,
+            WorkItemStatus::Todo,
             None,
             1,
         )];
         let mut app = app_with_items(items, vec![]);
-        app.selected_item = Some(0);
+        app.selected_item = Some(1);
         app.focus = FocusPanel::Right;
         insta::assert_snapshot!(render(&app, 80, 24));
     }
@@ -1846,7 +1791,7 @@ mod snapshot_tests {
     fn work_item_with_context_bar() {
         use crate::work_item::IssueInfo;
         use crate::work_item::IssueState;
-        let mut wi = make_work_item("ctx-1", "Fix resize bug", WorkItemStatus::Backlog, None, 1);
+        let mut wi = make_work_item("ctx-1", "Fix resize bug", WorkItemStatus::Todo, None, 1);
         // Add issue with labels to trigger the context bar.
         wi.repo_associations[0].issue = Some(IssueInfo {
             number: 42,
@@ -1855,8 +1800,8 @@ mod snapshot_tests {
             labels: vec!["bug".into(), "P1".into()],
         });
         let mut app = app_with_items(vec![wi], vec![]);
-        // Select the work item entry (index 0 in flat list).
-        app.selected_item = Some(0);
+        // Select the work item entry (index 1, after TODO header).
+        app.selected_item = Some(1);
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 
@@ -1865,12 +1810,12 @@ mod snapshot_tests {
         let items = vec![make_work_item(
             "ctx-2",
             "Add authentication",
-            WorkItemStatus::Backlog,
+            WorkItemStatus::Todo,
             None,
             1,
         )];
         let mut app = app_with_items(items, vec![]);
-        app.selected_item = Some(0);
+        app.selected_item = Some(1);
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 
@@ -1878,7 +1823,7 @@ mod snapshot_tests {
     fn work_item_context_bar_with_status() {
         use crate::work_item::IssueInfo;
         use crate::work_item::IssueState;
-        let mut wi = make_work_item("ctx-3", "Fix resize bug", WorkItemStatus::Backlog, None, 1);
+        let mut wi = make_work_item("ctx-3", "Fix resize bug", WorkItemStatus::Todo, None, 1);
         wi.repo_associations[0].issue = Some(IssueInfo {
             number: 42,
             title: "Fix resize bug".into(),
@@ -1886,7 +1831,7 @@ mod snapshot_tests {
             labels: vec!["bug".into()],
         });
         let mut app = app_with_items(vec![wi], vec![]);
-        app.selected_item = Some(0);
+        app.selected_item = Some(1);
         app.status_message = Some("Right panel focused - press Ctrl+] to return".into());
         insta::assert_snapshot!(render(&app, 80, 24));
     }
@@ -1927,28 +1872,28 @@ mod snapshot_tests {
             make_work_item(
                 "todo-1",
                 "Fix authentication bug",
-                WorkItemStatus::Backlog,
+                WorkItemStatus::Todo,
                 Some(make_pr_info(14, CheckStatus::Passing)),
                 1,
             ),
             make_work_item(
                 "todo-2",
                 "Add user settings page",
-                WorkItemStatus::Backlog,
+                WorkItemStatus::Todo,
                 None,
                 1,
             ),
             make_work_item(
                 "prog-1",
                 "Refactor backend API",
-                WorkItemStatus::Implementing,
+                WorkItemStatus::InProgress,
                 Some(make_pr_info(88, CheckStatus::Failing)),
                 2,
             ),
             make_work_item(
                 "prog-2",
                 "Update dependencies",
-                WorkItemStatus::Implementing,
+                WorkItemStatus::InProgress,
                 Some(make_pr_info(12, CheckStatus::Pending)),
                 1,
             ),
@@ -1962,7 +1907,7 @@ mod snapshot_tests {
         let items = vec![make_work_item(
             "prog-1",
             "Active feature",
-            WorkItemStatus::Implementing,
+            WorkItemStatus::InProgress,
             Some(make_pr_info(30, CheckStatus::Passing)),
             1,
         )];
@@ -1986,14 +1931,14 @@ mod snapshot_tests {
             make_work_item(
                 "todo-1",
                 "Fix authentication bug",
-                WorkItemStatus::Backlog,
+                WorkItemStatus::Todo,
                 Some(make_pr_info(14, CheckStatus::Passing)),
                 1,
             ),
             make_work_item(
                 "prog-1",
                 "Refactor backend API",
-                WorkItemStatus::Implementing,
+                WorkItemStatus::InProgress,
                 Some(make_pr_info(88, CheckStatus::Failing)),
                 1,
             ),
@@ -2023,8 +1968,7 @@ mod snapshot_tests {
             id: WorkItemId::LocalFile(PathBuf::from("/data/err.json")),
             backend_type: BackendType::LocalFile,
             title: "Broken work item".to_string(),
-            status: WorkItemStatus::Implementing,
-            status_derived: false,
+            status: WorkItemStatus::InProgress,
             repo_associations: vec![RepoAssociation {
                 repo_path: PathBuf::from("/repo/alpha"),
                 branch: Some("42-fix-bug".to_string()),
@@ -2048,8 +1992,9 @@ mod snapshot_tests {
         let mut app = app_with_items(items, vec![]);
         // Select the work item entry (index 2: header at 0, empty-todo at 1,
         // IN PROGRESS header at 2, work item at 3).
-        // Flat list: work item is at index 0.
-        app.selected_item = Some(0);
+        // Actually: TODO(0) header at 0, empty at 1, IN PROGRESS(1) header
+        // at 2, work item at 3.
+        app.selected_item = Some(3);
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 

@@ -103,22 +103,15 @@ ratatui-core.
 | UNLINKED (N)   |  [PTY output or placeholder]    |
 | ? pr-branch    |                                 |
 |                |                                 |
-| [BL] idea-1    |                                 |
-| [PL] plan-2    |                                 |
-| [IM] feature-3 |                                 |
-| [RV] fix-4     |                                 |
+| TODO (N)       |                                 |
+| work-item-1    |                                 |
+|                |                                 |
+| IN PROGRESS    |                                 |
+| work-item-2    |                                 |
 +----------------+---------------------------------+
-| Context bar: title | repo | labels               |
-+--------------------------------------------------+
 | Status bar message                               |
 +--------------------------------------------------+
 ```
-
-Work items are shown as a flat list with stage badges:
-- [BL] Backlog, [PL] Planning, [IM] Implementing
-- [BK] Blocked, [RV] Review, [DN] Done
-
-Stage transitions: Shift+Right to advance, Shift+Left to retreat.
 
 Left panel: 25% of width (min 30 columns)
 Right panel: remainder minus 2 for borders

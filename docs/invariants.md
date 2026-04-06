@@ -132,32 +132,3 @@ read or write the real config file, the real backend data directory, or
 any other production path. Config persistence in tests uses
 `InMemoryConfigProvider`. Filesystem operations use `std::env::temp_dir()`
 with cleanup. A test that touches production state is a bug.
-
-### 10. Backend determines available repos
-
-Every work item is tied to a backend, which exposes what repos are
-available. A work item must commit to one or more of the available repos
-at creation time. For example, a GitHub Issues backend always allows only
-one repo. The local backend can allow all known repos locally. This is a
-fundamental data model constraint.
-
-### 11. Plan storage is backend-polymorphic
-
-The plan is passed to the backend, and the backend decides where and how
-to store it. The local backend stores it in the work item JSON. A GitHub
-Issues backend would post it to the PR description or issue body. The
-caller does not choose the storage mechanism.
-
-### 12. Workflow stages are explicit
-
-Work items progress through explicit stages: Backlog, Planning,
-Implementing, Blocked, Review, Done. Stage transitions are user-initiated
-(MVP). The Blocked stage is a sub-state of Implementing where Claude needs
-user input. Done can also be derived from merged PRs (existing behavior).
-
-### 13. Fresh Claude session per stage
-
-Each stage transition that involves Claude spawns a fresh session. The plan
-is the handoff contract between stages. Different stages have different
-system prompts. All code-changing stages (Implementing, Review) must
-instruct Claude to commit all work before finishing.

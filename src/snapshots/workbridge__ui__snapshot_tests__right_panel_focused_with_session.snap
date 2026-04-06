@@ -2,13 +2,13 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items (1) ───────┐┌ Claude Code [INPUT] ────────────────────────────────┐
-│>   [BL] Fix authenti..││                                                     │
-│    [BL] branch-todo-1 ││  Fix authentication bug                             │
-│      (0) [no wt]      ││                                                     │
-│                       ││  Status      Backlog                                │
-│                       ││  Backend     Local file                             │
-│                       ││  Repo        /repo/todo-1/0                         │
+┌ Work Items ───────────┐┌ Claude Code [INPUT] ────────────────────────────────┐
+│  TODO (1)             ││                                                     │
+│>   Fix authenticatio..││  Fix authentication bug                             │
+│    branch-todo-1 (0)  ││                                                     │
+│      [no wt]          ││  Status      Todo                                   │
+│  IN PROGRESS (0)      ││  Backend     Local file                             │
+│    No work items      ││  Repo        /repo/todo-1/0                         │
 │                       ││  Branch      branch-todo-1                          │
 │                       ││  Worktree    (none)                                 │
 │                       ││  PR          (none)                                 │
@@ -25,4 +25,4 @@ expression: "render(&app, 80, 24)"
 │                       ││                                                     │
 │                       ││                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
-Fix authentication bug | [Backlog] | /repo/todo-1/0
+Fix authentication bug | /repo/todo-1/0

@@ -223,7 +223,6 @@ pub fn app_event(
             if state.should_quit && !state.shutting_down {
                 // Initiate graceful shutdown.
                 state.send_sigterm_all();
-                state.cleanup_all_mcp();
                 state.shutting_down = true;
                 state.shutdown_started = Some(std::time::Instant::now());
                 state.should_quit = false;
@@ -248,12 +247,6 @@ pub fn app_event(
                 state.build_display_list();
             }
 
-            // Poll MCP status updates from Claude sessions.
-            state.poll_mcp_status_updates();
-
-            // Poll async review gate result.
-            state.poll_review_gate();
-
             // Surface queued fetch errors.
             state.drain_pending_fetch_errors();
 
@@ -266,7 +259,6 @@ pub fn app_event(
                 } else {
                     // First signal - initiate graceful shutdown.
                     state.send_sigterm_all();
-                    state.cleanup_all_mcp();
                     state.shutting_down = true;
                     state.shutdown_started = Some(std::time::Instant::now());
                     state.status_message =

@@ -2,12 +2,12 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
-│                       ││                                                     │
-│  No work items.       ││  Welcome to workbridge                              │
-│                       ││                                                     │
-│  Press Ctrl+N         ││  Ctrl+N    - Create work item                       │
-│  to create one.       ││  Up/Down   - Navigate items                         │
+┌ Work Items ───────────┐┌ Claude Code ────────────────────────────────────────┐
+│TODO (0)               ││                                                     │
+│  No work items        ││  Welcome to workbridge                              │
+│IN PROGRESS (0)        ││                                                     │
+│  No work items        ││  Ctrl+N    - Create work item                       │
+│                       ││  Up/Down   - Navigate items                         │
 │                       ││  Enter     - Open session / Import                  │
 │                       ││  Ctrl+]    - Return to item list                    │
 │                       ││  Ctrl+D    - Delete work item                       │
