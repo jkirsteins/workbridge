@@ -3,10 +3,10 @@ source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
-│>   [BL] Fix.. PR#14 ok││                                                     │
-│    [BL] branch-todo-1 ││  Fix authentication bug                             │
-│      (0) [no wt]      ││                                                     │
-│                       ││  Status      Backlog                                │
+│  BACKLOGGED (0) (1)   ││                                                     │
+│> [BL] Fix     PR#14 ok││  Fix authentication bug                             │
+│  authentication bug   ││                                                     │
+│  branch-todo-1 [no wt]││  Status      Backlog                                │
 │                       ││  Backend     Local file                             │
 │                       ││  Repo        /repo/todo-1/0                         │
 │                       ││  Branch      branch-todo-1                          │

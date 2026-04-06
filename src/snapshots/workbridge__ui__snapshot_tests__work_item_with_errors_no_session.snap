@@ -3,9 +3,9 @@ source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
-│>   [IM] Broken work ..││                                                     │
-│    [IM] 42-fix-bug (  ││  Errors:                                            │
-│      alpha) [no wt]   ││                                                     │
+│  ACTIVE (alpha) (1)   ││                                                     │
+│> [IM] Broken work item││  Errors:                                            │
+│  42-fix-bug [no wt]   ││                                                     │
 │                       ││  - 2 open PRs for branch '42-fix-bug' in /repo/alpha│
 │                       ││    Close duplicate PRs to resolve.                  │
 │                       ││                                                     │

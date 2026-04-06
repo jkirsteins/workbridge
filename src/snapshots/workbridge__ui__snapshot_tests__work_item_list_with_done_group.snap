@@ -3,17 +3,17 @@ source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
 ┌ Work Items (3) ───────┐┌ Claude Code ────────────────────────────────────────┐
-│>   [BL] Fix.. PR#14 ok││                                                     │
-│    [BL] branch-todo-1 ││  Fix authentication bug                             │
-│      (0) [no wt]      ││                                                     │
-│    [IM] Refact.. PR#88││  Status      Backlog                                │
-│    [IM] branch-prog-1 ││  Backend     Local file                             │
-│      (0) [no wt]      ││  Repo        /repo/todo-1/0                         │
-│    [DN] Upd.. PR#50 ok││  Branch      branch-todo-1                          │
-│    [DN] branch-done-1 ││  Worktree    (none)                                 │
-│      (0) [no wt]      ││  PR          #14 - PR #14                           │
-│                       ││  Issue       (none)                                 │
-│                       ││  Errors      (none)                                 │
+│  ACTIVE (0) (2)       ││                                                     │
+│> [IM] Refac PR#88 fail││  Refactor backend API                               │
+│  tor backend API      ││                                                     │
+│  branch-prog-1 [no wt]││  Status      Implementing                           │
+│  [DN] Update  PR#50 ok││  Backend     Local file                             │
+│  dependencies         ││  Repo        /repo/prog-1/0                         │
+│  branch-done-1 [no wt]││  Branch      branch-prog-1                          │
+│  BACKLOGGED (0) (1)   ││  Worktree    (none)                                 │
+│  [BL] Fix     PR#14 ok││  PR          #88 - PR #88                           │
+│  authentication bug   ││  Issue       (none)                                 │
+│  branch-todo-1 [no wt]││  Errors      (none)                                 │
 │                       ││                                                     │
 │                       ││  Press Enter to start a session.                    │
 │                       ││                                                     │
@@ -25,4 +25,4 @@ expression: "render(&app, 80, 24)"
 │                       ││                                                     │
 │                       ││                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
-Fix authentication bug | [Backlog] | /repo/todo-1/0
+Refactor backend API | [Implementing] | /repo/prog-1/0
