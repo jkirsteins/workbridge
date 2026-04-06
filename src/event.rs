@@ -207,6 +207,9 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
         // Shift+Right - advance stage
         (KeyModifiers::SHIFT, KeyCode::Right) => {
             let had_status = app.status_message.is_some();
+            // Sync selected_work_item so sync_board_cursor can follow the item
+            // to its new column after the stage change.
+            app.sync_selection_from_board();
             app.advance_stage();
             if app.status_message.is_some() != had_status {
                 sync_layout(app);
@@ -215,6 +218,7 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
         // Shift+Left - retreat stage
         (KeyModifiers::SHIFT, KeyCode::Left) => {
             let had_status = app.status_message.is_some();
+            app.sync_selection_from_board();
             app.retreat_stage();
             if app.status_message.is_some() != had_status {
                 sync_layout(app);
