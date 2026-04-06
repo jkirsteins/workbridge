@@ -1,5 +1,6 @@
 ---
 source: src/ui.rs
+assertion_line: 1990
 expression: output
 ---
   List    Board                                                Tab: switch view

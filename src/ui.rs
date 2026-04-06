@@ -25,7 +25,9 @@ use crate::config;
 use crate::create_dialog::{CreateDialog, CreateDialogFocus};
 use crate::layout;
 use crate::theme::Theme;
-use crate::work_item::{BackendType, CheckStatus, PrState, WorkItemError, WorkItemStatus};
+use crate::work_item::{
+    BackendType, CheckStatus, PrState, WorkItemError, WorkItemKind, WorkItemStatus,
+};
 
 /// Braille-dot spinner frames for the activity indicator.
 /// 10 frames at 200ms per tick = 2-second full rotation.
@@ -426,6 +428,9 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 let selected = app.selected_item == Some(i);
                 format_unlinked_item(app, *idx, inner_width, theme, selected)
             }
+            DisplayEntry::ReviewRequestItem(idx) => {
+                format_review_request_item(app, *idx, inner_width, theme)
+            }
             DisplayEntry::WorkItemEntry(idx) => {
                 let selected = app.selected_item == Some(i);
                 format_work_item_entry(app, *idx, inner_width, theme, selected)
@@ -466,6 +471,46 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         let scrollbar_area = area.inner(Margin::new(0, 1));
         StatefulWidget::render(scrollbar, scrollbar_area, buf, &mut scrollbar_state);
     }
+}
+
+/// Format a review-requested PR entry for the left panel list.
+fn format_review_request_item<'a>(
+    app: &App,
+    idx: usize,
+    max_width: usize,
+    theme: &Theme,
+) -> ListItem<'a> {
+    let Some(rr) = app.review_requested_prs.get(idx) else {
+        return ListItem::new(Line::from("  R <invalid>"));
+    };
+
+    let pr_badge = format!("PR#{}", rr.pr.number);
+    let mut draft_suffix = String::new();
+    if rr.pr.is_draft {
+        draft_suffix.push_str(" draft");
+    }
+    let right = format!("{pr_badge}{draft_suffix}");
+
+    let title = &rr.pr.title;
+
+    // Layout: "R title    PR#N [draft]"
+    let prefix = "R ";
+    let available = max_width
+        .saturating_sub(prefix.width())
+        .saturating_sub(right.width())
+        .saturating_sub(1);
+    let truncated_title = truncate_str(title, available);
+
+    let padding =
+        max_width.saturating_sub(prefix.width() + truncated_title.width() + right.width());
+    let pad_str: String = " ".repeat(padding);
+
+    ListItem::new(Line::from(vec![
+        Span::styled(prefix.to_string(), theme.style_review_request_marker()),
+        Span::styled(truncated_title, theme.style_text()),
+        Span::raw(pad_str),
+        Span::styled(right, theme.style_badge_pr()),
+    ]))
 }
 
 /// Format an unlinked PR entry for the left panel list.
@@ -588,13 +633,24 @@ fn format_work_item_entry<'a>(
         right_parts.push((format!(" [{repo_count} repos]"), theme.style_text_muted()));
     }
 
-    // Stage badge + title. Done items omit the badge since the DONE group
-    // header already communicates their status.
+    // Stage badge + optional [RR] kind indicator + title. Done items omit the
+    // badge since the DONE group header already communicates their status.
     let badge = wi.status.badge_text();
-    let prefix = if wi.status == WorkItemStatus::Done {
-        String::new()
+    let kind_tag = if wi.kind == WorkItemKind::ReviewRequest {
+        "[RR]"
     } else {
+        ""
+    };
+    let prefix = if wi.status == WorkItemStatus::Done {
+        if kind_tag.is_empty() {
+            String::new()
+        } else {
+            format!("{kind_tag} ")
+        }
+    } else if kind_tag.is_empty() {
         format!("{badge} ")
+    } else {
+        format!("{kind_tag}{badge} ")
     };
     // Minimum number of display columns reserved for the title so it never
     // vanishes when badges consume all available width.
@@ -668,6 +724,13 @@ fn format_work_item_entry<'a>(
             Span::raw(pad_str),
         ]
     };
+    // Insert [RR] badge at the beginning of line1 for review-request items.
+    if wi.kind == WorkItemKind::ReviewRequest {
+        line1_spans.insert(
+            0,
+            Span::styled("[RR]".to_string(), theme.style_badge_review_request_kind()),
+        );
+    }
     for (text, style) in &right_parts[..visible_badge_count] {
         let s = if is_selected {
             right_badge_style
@@ -2129,6 +2192,7 @@ mod format_entry_tests {
         let wi = WorkItem {
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Fix auth bug".to_string(),
             description: None,
             status: WorkItemStatus::Backlog,
@@ -2169,6 +2233,7 @@ mod format_entry_tests {
         let wi = WorkItem {
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Fix auth bug".to_string(),
             description: None,
             status: WorkItemStatus::Implementing,
@@ -2199,6 +2264,7 @@ mod format_entry_tests {
         let wi = WorkItem {
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Planned work".to_string(),
             description: None,
             status: WorkItemStatus::Backlog,
@@ -2228,6 +2294,7 @@ mod format_entry_tests {
         let wi = WorkItem {
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "A very long title that should be truncated properly".to_string(),
             description: None,
             status: WorkItemStatus::Implementing,
@@ -2331,6 +2398,12 @@ mod snapshot_tests {
         fn import(&self, _unlinked: &UnlinkedPr) -> Result<WorkItemRecord, BackendError> {
             Err(BackendError::Validation("not implemented".into()))
         }
+        fn import_review_request(
+            &self,
+            _rr: &crate::work_item::ReviewRequestedPr,
+        ) -> Result<WorkItemRecord, BackendError> {
+            Err(BackendError::Validation("not supported in test".into()))
+        }
         fn append_activity(
             &self,
             _id: &WorkItemId,
@@ -2389,6 +2462,7 @@ mod snapshot_tests {
         WorkItem {
             id: WorkItemId::LocalFile(PathBuf::from(format!("/data/{id_suffix}.json"))),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: title.to_string(),
             description: None,
             status,
@@ -2767,6 +2841,7 @@ mod snapshot_tests {
         let items = vec![WorkItem {
             id: WorkItemId::LocalFile(PathBuf::from("/data/err.json")),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Broken work item".to_string(),
             description: None,
             status: WorkItemStatus::Implementing,

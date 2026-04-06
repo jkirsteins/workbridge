@@ -6,7 +6,8 @@ use regex::Regex;
 use crate::github_client::{GithubIssue, GithubPr};
 use crate::work_item::{
     CheckStatus, GitState, IssueInfo, IssueState, PrInfo, PrState, RepoAssociation,
-    RepoFetchResult, ReviewDecision, UnlinkedPr, WorkItem, WorkItemError, WorkItemStatus,
+    RepoFetchResult, ReviewDecision, ReviewRequestedPr, UnlinkedPr, WorkItem, WorkItemError,
+    WorkItemStatus,
 };
 use crate::work_item_backend::WorkItemRecord;
 use crate::worktree_service::WorktreeInfo;
@@ -162,7 +163,7 @@ pub fn reassemble(
     backend_records: &[WorkItemRecord],
     repo_data: &HashMap<PathBuf, RepoFetchResult>,
     issue_pattern: &str,
-) -> (Vec<WorkItem>, Vec<UnlinkedPr>) {
+) -> (Vec<WorkItem>, Vec<UnlinkedPr>, Vec<ReviewRequestedPr>) {
     let pattern = Regex::new(issue_pattern).ok();
 
     // Track all branches claimed by work items so we can find unlinked PRs.
@@ -354,6 +355,7 @@ pub fn reassemble(
         work_items.push(WorkItem {
             id: record.id.clone(),
             backend_type: backend_type_from_id(&record.id),
+            kind: record.kind.clone(),
             title,
             description: record.description.clone(),
             status,
@@ -363,10 +365,18 @@ pub fn reassemble(
         });
     }
 
-    // --- Collect unlinked PRs ---
-    let unlinked_prs = collect_unlinked_prs(repo_data, &claimed_branches);
+    // Determine authenticated user from any repo fetch result.
+    let authenticated_user: Option<&str> = repo_data
+        .values()
+        .find_map(|f| f.authenticated_user.as_deref());
 
-    (work_items, unlinked_prs)
+    // --- Collect unlinked PRs (only the user's own) ---
+    let unlinked_prs = collect_unlinked_prs(repo_data, &claimed_branches, authenticated_user);
+
+    // --- Collect review-requested PRs ---
+    let review_requested_prs = collect_review_requested_prs(repo_data, &claimed_branches);
+
+    (work_items, unlinked_prs, review_requested_prs)
 }
 
 /// Derive a fallback title from backend title or branch name.
@@ -393,14 +403,14 @@ fn backend_type_from_id(id: &crate::work_item::WorkItemId) -> crate::work_item::
     }
 }
 
-/// Collect PRs from all repos whose (repo_path, branch) is not already
-/// claimed by a work item. Fork PRs are excluded from auto-matching in
-/// `find_prs_by_branch` to prevent wrong association, but they ARE
-/// included here as importable - unless they have already been imported
-/// (i.e., their (repo_path, branch) appears in claimed_branches).
+/// Collect the user's own PRs from all repos whose (repo_path, branch) is
+/// not already claimed by a work item. Only PRs authored by the
+/// authenticated user are included so that other people's PRs do not
+/// appear in the UNLINKED group.
 fn collect_unlinked_prs(
     repo_data: &HashMap<PathBuf, RepoFetchResult>,
     claimed_branches: &HashSet<(PathBuf, String)>,
+    authenticated_user: Option<&str>,
 ) -> Vec<UnlinkedPr> {
     let mut unlinked = Vec::new();
     for (repo_path, fetch) in repo_data {
@@ -409,10 +419,16 @@ fn collect_unlinked_prs(
                 if pr.head_branch.is_empty() {
                     continue;
                 }
-                // Both fork and same-repo PRs are included only if their
-                // (repo_path, branch) is not already claimed by a work item.
-                // This prevents imported fork PRs from permanently
-                // re-appearing in the unlinked list.
+                // Only include PRs authored by the authenticated user.
+                // If we don't know the user, skip all unlinked PRs to
+                // avoid showing other people's work.
+                if let Some(user) = authenticated_user {
+                    if pr.author.as_deref() != Some(user) {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
                 if !claimed_branches.contains(&(repo_path.clone(), pr.head_branch.clone())) {
                     unlinked.push(UnlinkedPr {
                         repo_path: repo_path.clone(),
@@ -426,12 +442,39 @@ fn collect_unlinked_prs(
     unlinked
 }
 
+/// Collect PRs where the authenticated user has been requested as a
+/// reviewer. Skips PRs already claimed by a work item (imported).
+fn collect_review_requested_prs(
+    repo_data: &HashMap<PathBuf, RepoFetchResult>,
+    claimed_branches: &HashSet<(PathBuf, String)>,
+) -> Vec<ReviewRequestedPr> {
+    let mut result = Vec::new();
+    for (repo_path, fetch) in repo_data {
+        if let Ok(prs) = &fetch.review_requested_prs {
+            for pr in prs {
+                if pr.head_branch.is_empty() {
+                    continue;
+                }
+                if !claimed_branches.contains(&(repo_path.clone(), pr.head_branch.clone())) {
+                    result.push(ReviewRequestedPr {
+                        repo_path: repo_path.clone(),
+                        pr: convert_pr(pr),
+                        branch: pr.head_branch.clone(),
+                    });
+                }
+            }
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::github_client::{GithubError, GithubIssue, GithubPr};
     use crate::work_item::{
-        BackendType, CheckStatus, IssueState, PrState, ReviewDecision, WorkItemId, WorkItemStatus,
+        BackendType, CheckStatus, IssueState, PrState, ReviewDecision, WorkItemId, WorkItemKind,
+        WorkItemStatus,
     };
     use crate::work_item_backend::{RepoAssociationRecord, WorkItemRecord};
     use crate::worktree_service::WorktreeInfo;
@@ -456,6 +499,7 @@ mod tests {
             title: title.to_string(),
             description: None,
             status,
+            kind: crate::work_item::WorkItemKind::Own,
             repo_associations: associations,
             plan: None,
         }
@@ -478,6 +522,7 @@ mod tests {
             review_decision: review.to_string(),
             status_check_rollup: checks.to_string(),
             head_repo_owner: None,
+            author: Some("testuser".to_string()),
         }
     }
 
@@ -499,6 +544,7 @@ mod tests {
             review_decision: review.to_string(),
             status_check_rollup: checks.to_string(),
             head_repo_owner: owner.map(|s| s.to_string()),
+            author: Some("testuser".to_string()),
         }
     }
 
@@ -530,6 +576,8 @@ mod tests {
             github_remote: Some(("owner".to_string(), "repo".to_string())),
             worktrees: Ok(worktrees),
             prs: Ok(prs),
+            review_requested_prs: Ok(vec![]),
+            authenticated_user: Some("testuser".to_string()),
             issues,
         };
         (path, fetch)
@@ -565,7 +613,7 @@ mod tests {
             create_mock_repo_data(rp.clone(), vec![wt], vec![pr], vec![(42, Ok(issue))]);
         let repo_data: HashMap<PathBuf, RepoFetchResult> = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert_eq!(unlinked.len(), 0);
@@ -619,7 +667,7 @@ mod tests {
             let (rp_key, fetch) =
                 create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![(42, Ok(issue))]);
             let repo_data = HashMap::from([(rp_key, fetch)]);
-            let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
             assert_eq!(items[0].title, "PR title");
         }
 
@@ -639,7 +687,7 @@ mod tests {
             let (rp_key, fetch) =
                 create_mock_repo_data(rp.clone(), vec![], vec![], vec![(42, Ok(issue))]);
             let repo_data = HashMap::from([(rp_key, fetch)]);
-            let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
             assert_eq!(items[0].title, "Issue title");
         }
 
@@ -657,7 +705,7 @@ mod tests {
             );
             let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
             let repo_data = HashMap::from([(rp_key, fetch)]);
-            let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
             assert_eq!(items[0].title, "Backend title");
         }
 
@@ -676,7 +724,7 @@ mod tests {
             let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
             let repo_data = HashMap::from([(rp_key, fetch)]);
             // Use a pattern that won't match "my-feature"
-            let (items, _) = reassemble(&[record], &repo_data, r"^(\d+)-");
+            let (items, _, _) = reassemble(&[record], &repo_data, r"^(\d+)-");
             assert_eq!(items[0].title, "my-feature");
         }
 
@@ -693,7 +741,7 @@ mod tests {
                 }],
             );
             let repo_data = HashMap::new();
-            let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
             assert_eq!(items[0].title, "untitled");
         }
     }
@@ -721,7 +769,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr_a, pr_b], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert_eq!(unlinked.len(), 1);
@@ -761,7 +809,7 @@ mod tests {
         let (key_b, fetch_b) = create_mock_repo_data(rp_b.clone(), vec![], vec![pr_b], vec![]);
         let repo_data = HashMap::from([(key_a, fetch_a), (key_b, fetch_b)]);
 
-        let (items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert_eq!(unlinked.len(), 0);
@@ -815,7 +863,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let assoc = &items[0].repo_associations[0];
@@ -853,7 +901,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr1, pr2], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -902,7 +950,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt_detached], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -928,7 +976,7 @@ mod tests {
     #[test]
     fn empty_inputs() {
         let repo_data: HashMap<PathBuf, RepoFetchResult> = HashMap::new();
-        let (items, unlinked) = reassemble(&[], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _) = reassemble(&[], &repo_data, DEFAULT_ISSUE_PATTERN);
         assert!(items.is_empty());
         assert!(unlinked.is_empty());
     }
@@ -955,7 +1003,7 @@ mod tests {
             create_mock_repo_data(rp.clone(), vec![], vec![], vec![(42, Ok(issue))]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _) = reassemble(&[record], &repo_data, r"^(\d+)-");
+        let (items, _, _) = reassemble(&[record], &repo_data, r"^(\d+)-");
 
         assert_eq!(items.len(), 1);
         let assoc = &items[0].repo_associations[0];
@@ -994,7 +1042,7 @@ mod tests {
         );
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert!(
@@ -1033,7 +1081,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert!(
@@ -1064,7 +1112,7 @@ mod tests {
 
         // Empty repo_data - simulates startup before any fetch completes.
         let repo_data: HashMap<PathBuf, RepoFetchResult> = HashMap::new();
-        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert!(
@@ -1166,7 +1214,7 @@ mod tests {
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         // Invalid regex pattern should not panic - just skip issue extraction.
-        let (items, _) = reassemble(&[record], &repo_data, "[invalid(");
+        let (items, _, _) = reassemble(&[record], &repo_data, "[invalid(");
         assert_eq!(items.len(), 1);
         assert!(items[0].repo_associations[0].issue.is_none());
         // No IssueNotFound error either, since extraction was skipped.
@@ -1188,7 +1236,7 @@ mod tests {
         let (key_b, fetch_b) = create_mock_repo_data(rp_b.clone(), vec![], vec![pr_b], vec![]);
         let repo_data = HashMap::from([(key_a, fetch_a), (key_b, fetch_b)]);
 
-        let (items, unlinked) = reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _) = reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert!(items.is_empty());
         assert_eq!(unlinked.len(), 2);
@@ -1220,7 +1268,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let assoc = &items[0].repo_associations[0];
@@ -1257,7 +1305,7 @@ mod tests {
         );
 
         let repo_data = HashMap::new();
-        let (items, _) = reassemble(
+        let (items, _, _) = reassemble(
             &[todo_record, in_progress_record],
             &repo_data,
             DEFAULT_ISSUE_PATTERN,
@@ -1276,6 +1324,7 @@ mod tests {
                 title: "Local".to_string(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: WorkItemKind::Own,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: repo_path("alpha"),
                     branch: None,
@@ -1292,6 +1341,7 @@ mod tests {
                 title: "GH Issue".to_string(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: WorkItemKind::Own,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: repo_path("alpha"),
                     branch: None,
@@ -1306,6 +1356,7 @@ mod tests {
                 title: "GH Project".to_string(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: WorkItemKind::Own,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: repo_path("alpha"),
                     branch: None,
@@ -1316,7 +1367,7 @@ mod tests {
         ];
 
         let repo_data = HashMap::new();
-        let (items, _) = reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items[0].backend_type, BackendType::LocalFile);
         assert_eq!(items[1].backend_type, BackendType::GithubIssue);
@@ -1346,7 +1397,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1378,7 +1429,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1420,7 +1471,7 @@ mod tests {
         let (key_b, fetch_b) = create_mock_repo_data(rp_b, vec![], vec![pr_b], vec![]);
         let repo_data = HashMap::from([(key_a, fetch_a), (key_b, fetch_b)]);
 
-        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1474,7 +1525,7 @@ mod tests {
             create_mock_repo_data(rp.clone(), vec![], vec![same_repo_pr, fork_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -1530,7 +1581,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert!(
@@ -1584,7 +1635,7 @@ mod tests {
             create_mock_repo_data(rp.clone(), vec![], vec![same_repo_pr, fork_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         // The work item should have the same-repo PR matched.
         assert_eq!(items.len(), 1);
@@ -1784,7 +1835,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![fork_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (_items, unlinked) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (_items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         // The fork PR's branch is now claimed by the imported work item,
         // so it must NOT appear as unlinked.

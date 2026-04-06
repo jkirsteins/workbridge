@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::work_item::{BackendType, UnlinkedPr, WorkItemId, WorkItemStatus};
+use crate::work_item::{
+    BackendType, ReviewRequestedPr, UnlinkedPr, WorkItemId, WorkItemKind, WorkItemStatus,
+};
 
 /// Errors from backend operations.
 #[derive(Clone, Debug)]
@@ -60,6 +62,10 @@ pub struct WorkItemRecord {
     #[serde(default)]
     pub description: Option<String>,
     pub status: WorkItemStatus,
+    /// Distinguishes the user's own work from review requests.
+    /// Defaults to Own for migration compatibility with existing records.
+    #[serde(default)]
+    pub kind: WorkItemKind,
     pub repo_associations: Vec<RepoAssociationRecord>,
     /// Implementation plan text. None means no plan has been set yet.
     /// Defaults to None for migration compatibility with existing records.
@@ -124,6 +130,7 @@ pub struct CreateWorkItem {
     pub title: String,
     pub description: Option<String>,
     pub status: WorkItemStatus,
+    pub kind: WorkItemKind,
     pub repo_associations: Vec<RepoAssociationRecord>,
 }
 
@@ -168,6 +175,10 @@ pub trait WorkItemBackend: Send + Sync {
 
     /// Import an unlinked PR as a new work item.
     fn import(&self, unlinked: &UnlinkedPr) -> Result<WorkItemRecord, BackendError>;
+
+    /// Import a review-requested PR as a new work item.
+    fn import_review_request(&self, rr: &ReviewRequestedPr)
+    -> Result<WorkItemRecord, BackendError>;
 
     /// Append an activity entry to a work item's activity log.
     fn append_activity(&self, id: &WorkItemId, entry: &ActivityEntry) -> Result<(), BackendError>;
@@ -402,6 +413,7 @@ impl WorkItemBackend for LocalFileBackend {
             title: request.title,
             description: request.description,
             status: request.status,
+            kind: request.kind,
             repo_associations: request.repo_associations,
             plan: None,
         };
@@ -445,10 +457,28 @@ impl WorkItemBackend for LocalFileBackend {
             title: unlinked.pr.title.clone(),
             description: None,
             status: WorkItemStatus::Implementing,
+            kind: WorkItemKind::Own,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: unlinked.repo_path.clone(),
                 branch: Some(unlinked.branch.clone()),
                 pr_identity: None,
+            }],
+        };
+        self.create(request)
+    }
+
+    fn import_review_request(
+        &self,
+        rr: &ReviewRequestedPr,
+    ) -> Result<WorkItemRecord, BackendError> {
+        let request = CreateWorkItem {
+            title: rr.pr.title.clone(),
+            description: None,
+            status: WorkItemStatus::Backlog,
+            kind: WorkItemKind::ReviewRequest,
+            repo_associations: vec![RepoAssociationRecord {
+                repo_path: rr.repo_path.clone(),
+                branch: Some(rr.branch.clone()),
             }],
         };
         self.create(request)
@@ -570,6 +600,7 @@ mod tests {
                 title: "Fix auth bug".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: WorkItemKind::Own,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/path/to/repo"),
                     branch: Some("42-fix-auth".into()),
@@ -609,6 +640,7 @@ mod tests {
             title: "No repos".into(),
             description: None,
             status: WorkItemStatus::Backlog,
+            kind: WorkItemKind::Own,
             repo_associations: vec![],
         });
 
@@ -637,6 +669,7 @@ mod tests {
                 title: "To delete".into(),
                 description: None,
                 status: WorkItemStatus::Implementing,
+                kind: WorkItemKind::Own,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,
@@ -746,6 +779,7 @@ mod tests {
                 title: "Valid item".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: WorkItemKind::Own,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: Some("main".into()),
@@ -796,6 +830,7 @@ mod tests {
                 title: "Planning item".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: WorkItemKind::Own,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: Some("42-feature".into()),
@@ -875,6 +910,7 @@ mod tests {
                 title: "Activity test".into(),
                 description: None,
                 status: WorkItemStatus::Implementing,
+                kind: WorkItemKind::Own,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: Some("main".into()),
@@ -919,6 +955,7 @@ mod tests {
                 title: "No activity".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: WorkItemKind::Own,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,
@@ -943,6 +980,7 @@ mod tests {
                 title: "Plan test".into(),
                 description: None,
                 status: WorkItemStatus::Planning,
+                kind: WorkItemKind::Own,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: Some("feature/plan".into()),
@@ -990,6 +1028,7 @@ mod tests {
                 title: "Path test".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: WorkItemKind::Own,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,

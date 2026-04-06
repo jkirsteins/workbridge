@@ -48,6 +48,9 @@ pub struct GithubPr {
     /// did not return the field. For same-repo PRs this matches the
     /// repo owner; for fork PRs it is the fork owner's login.
     pub head_repo_owner: Option<String>,
+    /// The login of the PR author. None if the gh CLI did not return
+    /// the field (backwards compatibility with older fetch results).
+    pub author: Option<String>,
 }
 
 /// A raw issue as returned by the GitHub API (via gh CLI).
@@ -66,6 +69,16 @@ pub trait GithubClient: Send + Sync {
     /// List all open PRs for a given owner/repo.
     fn list_open_prs(&self, owner: &str, repo: &str) -> Result<Vec<GithubPr>, GithubError>;
 
+    /// List open PRs where the authenticated user is a requested reviewer.
+    fn list_review_requested_prs(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<GithubPr>, GithubError>;
+
+    /// Get the login of the currently authenticated GitHub user.
+    fn get_authenticated_user(&self) -> Result<String, GithubError>;
+
     /// Get a single issue by number.
     fn get_issue(&self, owner: &str, repo: &str, number: u64) -> Result<GithubIssue, GithubError>;
 
@@ -81,7 +94,9 @@ pub trait GithubClient: Send + Sync {
 #[cfg(test)]
 pub struct MockGithubClient {
     pub prs: Vec<GithubPr>,
+    pub review_requested_prs: Vec<GithubPr>,
     pub issues: Vec<GithubIssue>,
+    pub authenticated_user: String,
     /// If set, all calls return this error instead of fixture data.
     pub error: Option<GithubError>,
 }
@@ -91,7 +106,9 @@ impl MockGithubClient {
     pub fn new() -> Self {
         Self {
             prs: Vec::new(),
+            review_requested_prs: Vec::new(),
             issues: Vec::new(),
+            authenticated_user: "testuser".to_string(),
             error: None,
         }
     }
@@ -104,6 +121,24 @@ impl GithubClient for MockGithubClient {
             return Err(err.clone());
         }
         Ok(self.prs.clone())
+    }
+
+    fn list_review_requested_prs(
+        &self,
+        _owner: &str,
+        _repo: &str,
+    ) -> Result<Vec<GithubPr>, GithubError> {
+        if let Some(ref err) = self.error {
+            return Err(err.clone());
+        }
+        Ok(self.review_requested_prs.clone())
+    }
+
+    fn get_authenticated_user(&self) -> Result<String, GithubError> {
+        if let Some(ref err) = self.error {
+            return Err(err.clone());
+        }
+        Ok(self.authenticated_user.clone())
     }
 
     fn get_issue(
@@ -171,7 +206,7 @@ impl GhCliClient {
 impl GithubClient for GhCliClient {
     fn list_open_prs(&self, owner: &str, repo: &str) -> Result<Vec<GithubPr>, GithubError> {
         let repo_arg = format!("{owner}/{repo}");
-        let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner";
+        let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner,author";
         let stdout = self.run_gh(&[
             "pr",
             "list",
@@ -191,6 +226,45 @@ impl GithubClient for GhCliClient {
             .map_err(|e| GithubError::ParseError(format!("failed to parse PR list JSON: {e}")))?;
 
         items.iter().map(parse_pr_from_value).collect()
+    }
+
+    fn list_review_requested_prs(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<GithubPr>, GithubError> {
+        let repo_arg = format!("{owner}/{repo}");
+        let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner,author";
+        let stdout = self.run_gh(&[
+            "pr",
+            "list",
+            "--repo",
+            &repo_arg,
+            "--state",
+            "open",
+            "--search",
+            "review-requested:@me",
+            "--json",
+            json_fields,
+            "--limit",
+            "500",
+        ])?;
+
+        let items: Vec<Value> = serde_json::from_str(&stdout)
+            .map_err(|e| GithubError::ParseError(format!("failed to parse PR list JSON: {e}")))?;
+
+        items.iter().map(parse_pr_from_value).collect()
+    }
+
+    fn get_authenticated_user(&self) -> Result<String, GithubError> {
+        let stdout = self.run_gh(&["api", "user", "--json", "login"])?;
+        let value: Value = serde_json::from_str(&stdout)
+            .map_err(|e| GithubError::ParseError(format!("failed to parse user JSON: {e}")))?;
+        value
+            .get("login")
+            .and_then(|l| l.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| GithubError::ParseError("user response missing 'login' field".into()))
     }
 
     fn get_issue(&self, owner: &str, repo: &str, number: u64) -> Result<GithubIssue, GithubError> {
@@ -285,6 +359,13 @@ fn parse_pr_from_value(v: &Value) -> Result<GithubPr, GithubError> {
         .and_then(|l| l.as_str())
         .map(|s| s.to_string());
 
+    // author is an object with a "login" field, e.g. {"login": "user"}.
+    let author = v
+        .get("author")
+        .and_then(|o| o.get("login"))
+        .and_then(|l| l.as_str())
+        .map(|s| s.to_string());
+
     Ok(GithubPr {
         number,
         title,
@@ -295,6 +376,7 @@ fn parse_pr_from_value(v: &Value) -> Result<GithubPr, GithubError> {
         review_decision,
         status_check_rollup,
         head_repo_owner,
+        author,
     })
 }
 
@@ -512,8 +594,11 @@ mod tests {
                 review_decision: "APPROVED".into(),
                 status_check_rollup: "SUCCESS".into(),
                 head_repo_owner: None,
+                author: None,
             }],
             issues: Vec::new(),
+            review_requested_prs: Vec::new(),
+            authenticated_user: "testuser".to_string(),
             error: None,
         };
 
@@ -527,6 +612,8 @@ mod tests {
         let client = MockGithubClient {
             prs: Vec::new(),
             issues: Vec::new(),
+            review_requested_prs: Vec::new(),
+            authenticated_user: "testuser".to_string(),
             error: Some(GithubError::AuthRequired),
         };
 
@@ -544,6 +631,8 @@ mod tests {
                 state: "open".into(),
                 labels: vec!["enhancement".into()],
             }],
+            review_requested_prs: Vec::new(),
+            authenticated_user: "testuser".to_string(),
             error: None,
         };
 

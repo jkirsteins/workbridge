@@ -136,6 +136,17 @@ fn fetcher_loop(
             None => Ok(Vec::new()),
         };
 
+        // Step 3b: fetch review-requested PRs
+        let review_requested_prs = match &github_remote {
+            Some((owner, repo)) => github_client.list_review_requested_prs(owner, repo),
+            None => Ok(Vec::new()),
+        };
+
+        // Step 3c: fetch authenticated user (for author filtering)
+        let authenticated_user = github_remote
+            .as_ref()
+            .and_then(|_| github_client.get_authenticated_user().ok());
+
         // Step 4: extract issue numbers from worktree branch names AND
         // extra branches (backend records without worktrees) and fetch each
         let mut issues = Vec::new();
@@ -180,6 +191,8 @@ fn fetcher_loop(
             github_remote,
             worktrees,
             prs,
+            review_requested_prs,
+            authenticated_user,
             issues,
         };
 
@@ -378,6 +391,7 @@ mod tests {
                 review_decision: String::new(),
                 status_check_rollup: String::new(),
                 head_repo_owner: None,
+                author: None,
             }],
             issues: vec![GithubIssue {
                 number: 42,
@@ -385,6 +399,8 @@ mod tests {
                 state: "OPEN".into(),
                 labels: vec!["bug".into()],
             }],
+            review_requested_prs: vec![],
+            authenticated_user: "testuser".to_string(),
             error: None,
         });
 
@@ -502,6 +518,8 @@ mod tests {
 
         let gc = Arc::new(MockGithubClient {
             prs: vec![],
+            review_requested_prs: vec![],
+            authenticated_user: "testuser".to_string(),
             issues: vec![GithubIssue {
                 number: 55,
                 title: "Backend-only issue".into(),
