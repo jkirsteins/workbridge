@@ -55,11 +55,17 @@ the assembly layer does not produce it.
 invalid record. In v1, the LocalFileBackend skips corrupt files entirely
 rather than producing this error.
 
-### WorktreeGone (defined, not currently produced)
+### WorktreeGone (implemented)
 
-**Detection**: Would fire when a work item references a worktree path that
-no longer exists on disk. Detection is deferred to a future assembly pass.
-Currently, the worktree_path is simply set to None when no match is found.
+**Detection**: Fires when a work item's branch matches a worktree in git
+but the worktree directory no longer exists on disk (deleted externally).
+
+**Presentation**: Error badge on the work item. The detail panel shows the
+missing path and suggests re-creating the worktree or deleting the work
+item.
+
+**Severity**: Error. The work item cannot open a session until the worktree
+is restored.
 
 ## Planned Error Types
 

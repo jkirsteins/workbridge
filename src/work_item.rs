@@ -245,13 +245,21 @@ pub enum WorkItemError {
         backend: BackendType,
         reason: String,
     },
-    /// Constructed when a work item references a worktree path that no
-    /// longer exists on disk. Detection deferred to a future assembly pass.
-    #[allow(dead_code)]
+    /// Constructed when a work item's branch matches a worktree in git but
+    /// the worktree directory no longer exists on disk.
     WorktreeGone {
         repo_path: PathBuf,
         expected_path: PathBuf,
     },
+}
+
+/// A worktree that exists on disk but is not claimed by any work item.
+/// Detected during assembly by comparing actual worktrees against claimed
+/// branches.
+pub struct OrphanWorktree {
+    pub repo_path: PathBuf,
+    pub worktree_path: PathBuf,
+    pub branch: Option<String>,
 }
 
 /// A GitHub PR that does not match any work item's repo associations.

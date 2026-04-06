@@ -111,6 +111,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     let is_delete_confirm = app.confirm_delete
         && (key.code == KeyCode::Delete
             || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d')));
+    let is_prune_confirm = app.confirm_prune
+        && key.modifiers == KeyModifiers::CONTROL
+        && key.code == KeyCode::Char('p');
 
     let had_status = app.status_message.is_some();
     if app.confirm_quit && !is_quit_confirm {
@@ -119,6 +122,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
     if app.confirm_delete && !is_delete_confirm {
         app.confirm_delete = false;
+        app.status_message = None;
+    }
+    if app.confirm_prune && !is_prune_confirm {
+        app.confirm_prune = false;
         app.status_message = None;
     }
     // If cancelling a confirmation hid the status bar, resync layout so
@@ -237,6 +244,26 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
             let had_status = app.status_message.is_some();
             app.retreat_stage();
             if app.status_message.is_some() != had_status {
+                sync_layout(app);
+            }
+        }
+        // Ctrl+P - prune orphan worktrees with confirmation
+        (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
+            if app.orphan_worktrees.is_empty() {
+                app.status_message = Some("No orphan worktrees to prune".into());
+                sync_layout(app);
+                return;
+            }
+            if app.confirm_prune {
+                app.confirm_prune = false;
+                app.prune_orphan_worktrees();
+                sync_layout(app);
+            } else {
+                app.confirm_prune = true;
+                app.status_message = Some(format!(
+                    "Press Ctrl+P again to prune {} orphan worktree(s)",
+                    app.orphan_worktrees.len()
+                ));
                 sync_layout(app);
             }
         }

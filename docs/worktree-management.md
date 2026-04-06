@@ -71,9 +71,10 @@ The following features are defined in the API but lack full UI flows:
 ### Worktree removal UI
 
 The `remove_worktree` method exists and is tested, but the TUI does not
-yet expose a delete-worktree action (e.g., Ctrl+D). Deleting a work item
-currently removes the backend record but does not remove the worktree
-from disk.
+yet expose a per-item delete-worktree action (e.g., Ctrl+D). However,
+deleting a work item now removes its worktree from disk automatically.
+Orphan worktrees (those not claimed by any work item) are detected
+during assembly and can be pruned via Ctrl+P.
 
 ### Divergence handling
 
@@ -84,8 +85,10 @@ ahead/behind), which is not yet implemented.
 
 ### Post-merge cleanup
 
-After a PR is merged, WorkBridge should detect it and offer to clean up
-the worktree and optionally prune the branch. This is not yet implemented.
+When a PR is merged through the TUI, WorkBridge removes the worktree
+automatically. Orphan worktrees (created by external merges or manual
+git operations) are detected during assembly and surfaced in the status
+bar. Press Ctrl+P to prune all orphan worktrees.
 
 ### Branch state detection on creation
 

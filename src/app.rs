@@ -11,8 +11,8 @@ use crate::github_client::GithubError;
 use crate::mcp::{McpEvent, McpSocketServer};
 use crate::session::Session;
 use crate::work_item::{
-    FetchMessage, FetcherHandle, RepoFetchResult, SessionEntry, UnlinkedPr, WorkItem, WorkItemId,
-    WorkItemStatus,
+    FetchMessage, FetcherHandle, OrphanWorktree, RepoFetchResult, SessionEntry, UnlinkedPr,
+    WorkItem, WorkItemError, WorkItemId, WorkItemStatus,
 };
 use crate::work_item_backend::{
     ActivityEntry, BackendError, CreateWorkItem, RepoAssociationRecord, WorkItemBackend,
@@ -132,6 +132,8 @@ pub struct App {
     pub work_items: Vec<WorkItem>,
     /// PRs not linked to any work item.
     pub unlinked_prs: Vec<UnlinkedPr>,
+    /// Worktrees on disk not claimed by any work item.
+    pub orphan_worktrees: Vec<OrphanWorktree>,
     /// Sessions keyed by work item ID.
     pub sessions: HashMap<WorkItemId, SessionEntry>,
     /// Fetched data per repo path (populated by background fetcher).
@@ -150,6 +152,11 @@ pub struct App {
     /// Prevents flooding the status bar when every fetch cycle for the
     /// same repo returns an error.
     pub worktree_errors_shown: std::collections::HashSet<PathBuf>,
+    /// True once the orphan worktree status message has been shown.
+    /// Reset when orphans are pruned so new orphans trigger a fresh message.
+    pub orphan_worktrees_shown: bool,
+    /// True when waiting for a second Ctrl+P to confirm orphan prune.
+    pub confirm_prune: bool,
     /// Currently selected index in the display list (items only, not headers).
     pub selected_item: Option<usize>,
     /// Flat display list for the left panel.
@@ -276,12 +283,15 @@ impl App {
             worktree_service,
             work_items: Vec::new(),
             unlinked_prs: Vec::new(),
+            orphan_worktrees: Vec::new(),
             sessions: HashMap::new(),
             repo_data: HashMap::new(),
             fetch_rx: None,
             gh_available: Self::check_gh_available(),
             gh_cli_not_found_shown: false,
             gh_auth_required_shown: false,
+            orphan_worktrees_shown: false,
+            confirm_prune: false,
             worktree_errors_shown: std::collections::HashSet::new(),
             selected_item: None,
             display_list: Vec::new(),
@@ -678,10 +688,43 @@ impl App {
             ));
         }
         let issue_pattern = &self.config.defaults.branch_issue_pattern;
-        let (items, unlinked) =
+        let (mut items, unlinked, orphans) =
             assembly::reassemble(&list_result.records, &self.repo_data, issue_pattern);
+
+        // Detect worktrees that git knows about but whose directory is gone
+        // from disk. This check lives here (not in assembly) because
+        // assembly is a pure data transform and should not touch the filesystem.
+        for wi in &mut items {
+            for assoc in &mut wi.repo_associations {
+                if let Some(ref wt_path) = assoc.worktree_path
+                    && !wt_path.exists()
+                {
+                    wi.errors.push(WorkItemError::WorktreeGone {
+                        repo_path: assoc.repo_path.clone(),
+                        expected_path: wt_path.clone(),
+                    });
+                    assoc.worktree_path = None;
+                    assoc.git_state = None;
+                }
+            }
+        }
+
         self.work_items = items;
         self.unlinked_prs = unlinked;
+        if !orphans.is_empty() && !self.orphan_worktrees_shown {
+            let branches: Vec<&str> = orphans.iter().filter_map(|o| o.branch.as_deref()).collect();
+            let detail = if branches.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", branches.join(", "))
+            };
+            self.status_message = Some(format!(
+                "{} orphan worktree(s) found{detail}. Press Ctrl+P to prune.",
+                orphans.len()
+            ));
+            self.orphan_worktrees_shown = true;
+        }
+        self.orphan_worktrees = orphans;
     }
 
     /// Build the flat display list from current work_items and unlinked_prs.
@@ -1489,6 +1532,10 @@ impl App {
             return;
         }
 
+        // Remove worktrees associated with the deleted work item so they
+        // don't become orphans on disk.
+        self.cleanup_worktree_for_item(&work_item_id);
+
         // Backend delete succeeded - now kill any active session and
         // clean up MCP resources (.mcp.json, socket server).
         self.cleanup_mcp_for(&work_item_id);
@@ -1981,6 +2028,31 @@ impl App {
                 self.status_message = Some(format!("Worktree cleanup warning: {e}"));
             }
         }
+    }
+
+    /// Remove all orphan worktrees that are not claimed by any work item.
+    pub fn prune_orphan_worktrees(&mut self) {
+        let mut removed = 0usize;
+        let mut failed = 0usize;
+        for orphan in std::mem::take(&mut self.orphan_worktrees) {
+            match self.worktree_service.remove_worktree(
+                &orphan.repo_path,
+                &orphan.worktree_path,
+                false,
+            ) {
+                Ok(()) => removed += 1,
+                Err(_) => {
+                    failed += 1;
+                }
+            }
+        }
+        self.orphan_worktrees_shown = false;
+        self.status_message = Some(if failed > 0 {
+            format!("Pruned {removed} orphan worktree(s), {failed} failed")
+        } else {
+            format!("Pruned {removed} orphan worktree(s)")
+        });
+        self.reassemble_work_items();
     }
 
     /// Attempt to spawn the async review gate for the given work item.
