@@ -321,10 +321,10 @@ pub fn reassemble(
         let has_merged_pr = assembled_associations
             .iter()
             .any(|a| a.pr.as_ref().is_some_and(|pr| pr.state == PrState::Merged));
-        let status = if has_merged_pr {
-            WorkItemStatus::Done
+        let (status, status_derived) = if has_merged_pr {
+            (WorkItemStatus::Done, true)
         } else {
-            record.status.clone()
+            (record.status.clone(), false)
         };
 
         work_items.push(WorkItem {
@@ -332,6 +332,7 @@ pub fn reassemble(
             backend_type: backend_type_from_id(&record.id),
             title,
             status,
+            status_derived,
             repo_associations: assembled_associations,
             errors,
         });
@@ -430,6 +431,7 @@ mod tests {
             title: title.to_string(),
             status,
             repo_associations: associations,
+            plan: None,
         }
     }
 
@@ -521,7 +523,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Backend title",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
@@ -544,7 +546,7 @@ mod tests {
         let item = &items[0];
         // PR title wins over issue title and backend title.
         assert_eq!(item.title, "Fix the bug");
-        assert_eq!(item.status, WorkItemStatus::InProgress);
+        assert_eq!(item.status, WorkItemStatus::Implementing);
         assert!(item.errors.is_empty());
 
         let assoc = &item.repo_associations[0];
@@ -578,7 +580,7 @@ mod tests {
             let record = create_mock_record(
                 "wi-1",
                 "Backend title",
-                WorkItemStatus::Todo,
+                WorkItemStatus::Backlog,
                 vec![RepoAssociationRecord {
                     repo_path: rp.clone(),
                     branch: Some(branch.to_string()),
@@ -598,7 +600,7 @@ mod tests {
             let record = create_mock_record(
                 "wi-2",
                 "Backend title",
-                WorkItemStatus::Todo,
+                WorkItemStatus::Backlog,
                 vec![RepoAssociationRecord {
                     repo_path: rp.clone(),
                     branch: Some(branch.to_string()),
@@ -617,7 +619,7 @@ mod tests {
             let record = create_mock_record(
                 "wi-3",
                 "Backend title",
-                WorkItemStatus::Todo,
+                WorkItemStatus::Backlog,
                 vec![RepoAssociationRecord {
                     repo_path: rp.clone(),
                     branch: Some(branch.to_string()),
@@ -634,7 +636,7 @@ mod tests {
             let record = create_mock_record(
                 "wi-4",
                 "",
-                WorkItemStatus::Todo,
+                WorkItemStatus::Backlog,
                 vec![RepoAssociationRecord {
                     repo_path: rp.clone(),
                     branch: Some("my-feature".to_string()),
@@ -652,7 +654,7 @@ mod tests {
             let record = create_mock_record(
                 "wi-5",
                 "",
-                WorkItemStatus::Todo,
+                WorkItemStatus::Backlog,
                 vec![RepoAssociationRecord {
                     repo_path: rp.clone(),
                     branch: None,
@@ -672,7 +674,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "My work",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some("feature-a".to_string()),
@@ -704,7 +706,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Cross-repo work",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![
                 RepoAssociationRecord {
                     repo_path: rp_a.clone(),
@@ -763,7 +765,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Planning item",
-            WorkItemStatus::Todo,
+            WorkItemStatus::Backlog,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: None,
@@ -800,7 +802,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Work",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
@@ -849,7 +851,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Work",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
@@ -901,7 +903,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "",
-            WorkItemStatus::Todo,
+            WorkItemStatus::Backlog,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
@@ -936,7 +938,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Work",
-            WorkItemStatus::Todo,
+            WorkItemStatus::Backlog,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
@@ -979,7 +981,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Work",
-            WorkItemStatus::Todo,
+            WorkItemStatus::Backlog,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
@@ -1011,7 +1013,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Work",
-            WorkItemStatus::Todo,
+            WorkItemStatus::Backlog,
             vec![RepoAssociationRecord {
                 repo_path: rp,
                 branch: Some(branch.to_string()),
@@ -1111,7 +1113,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Work",
-            WorkItemStatus::Todo,
+            WorkItemStatus::Backlog,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some("42-fix-bug".to_string()),
@@ -1161,7 +1163,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Work",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
@@ -1191,7 +1193,7 @@ mod tests {
         let todo_record = create_mock_record(
             "wi-1",
             "Todo work",
-            WorkItemStatus::Todo,
+            WorkItemStatus::Backlog,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: None,
@@ -1201,7 +1203,7 @@ mod tests {
         let in_progress_record = create_mock_record(
             "wi-2",
             "In progress work",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: None,
@@ -1216,8 +1218,8 @@ mod tests {
         );
 
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].status, WorkItemStatus::Todo);
-        assert_eq!(items[1].status, WorkItemStatus::InProgress);
+        assert_eq!(items[0].status, WorkItemStatus::Backlog);
+        assert_eq!(items[1].status, WorkItemStatus::Implementing);
     }
 
     #[test]
@@ -1226,11 +1228,12 @@ mod tests {
             WorkItemRecord {
                 id: WorkItemId::LocalFile(PathBuf::from("/data/wi.json")),
                 title: "Local".to_string(),
-                status: WorkItemStatus::Todo,
+                status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: repo_path("alpha"),
                     branch: None,
                 }],
+                plan: None,
             },
             WorkItemRecord {
                 id: WorkItemId::GithubIssue {
@@ -1239,22 +1242,24 @@ mod tests {
                     number: 1,
                 },
                 title: "GH Issue".to_string(),
-                status: WorkItemStatus::Todo,
+                status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: repo_path("alpha"),
                     branch: None,
                 }],
+                plan: None,
             },
             WorkItemRecord {
                 id: WorkItemId::GithubProject {
                     node_id: "node123".to_string(),
                 },
                 title: "GH Project".to_string(),
-                status: WorkItemStatus::Todo,
+                status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: repo_path("alpha"),
                     branch: None,
                 }],
+                plan: None,
             },
         ];
 
@@ -1275,7 +1280,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Ship it",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
@@ -1307,7 +1312,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Work",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
@@ -1324,7 +1329,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(
             items[0].status,
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             "open PR should keep backend InProgress status",
         );
     }
@@ -1337,7 +1342,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Cross-repo",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![
                 RepoAssociationRecord {
                     repo_path: rp_a.clone(),
@@ -1382,7 +1387,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Fix typo",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
@@ -1454,7 +1459,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Fix typo",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
@@ -1490,7 +1495,7 @@ mod tests {
         let record = create_mock_record(
             "wi-1",
             "Fix readme",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some("fix-readme".to_string()),
@@ -1558,7 +1563,7 @@ mod tests {
         let record = create_mock_record(
             "wi-imported",
             "Fix typo (fork)",
-            WorkItemStatus::InProgress,
+            WorkItemStatus::Implementing,
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(fork_branch.to_string()),

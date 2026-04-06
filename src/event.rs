@@ -34,6 +34,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // When the rework reason prompt is visible, route keys to it.
+    if app.rework_prompt_visible {
+        handle_rework_prompt(app, key);
+        return;
+    }
+
+    // When the merge strategy prompt is visible, handle it.
+    if app.confirm_merge {
+        handle_merge_prompt(app, key);
+        return;
+    }
+
     // When the settings overlay is open, handle overlay-specific keys.
     if app.show_settings {
         match (key.modifiers, key.code) {
@@ -210,6 +222,22 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                     }
                 }
                 _ => {}
+            }
+        }
+        // Shift+Right - advance to next workflow stage
+        (KeyModifiers::SHIFT, KeyCode::Right) => {
+            let had_status = app.status_message.is_some();
+            app.advance_stage();
+            if app.status_message.is_some() != had_status {
+                sync_layout(app);
+            }
+        }
+        // Shift+Left - retreat to previous workflow stage
+        (KeyModifiers::SHIFT, KeyCode::Left) => {
+            let had_status = app.status_message.is_some();
+            app.retreat_stage();
+            if app.status_message.is_some() != had_status {
+                sync_layout(app);
             }
         }
         // ? - toggle settings overlay
@@ -422,6 +450,118 @@ pub fn handle_resize(app: &mut App, cols: u16, rows: u16) {
     app.resize_pty_panes();
 }
 
+/// Handle key events when the merge strategy prompt is visible.
+///
+/// 's' or Enter = squash merge, 'm' = normal merge, Esc = cancel.
+fn handle_merge_prompt(app: &mut App, key: KeyEvent) {
+    let had_status = app.status_message.is_some();
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Char('s')) | (_, KeyCode::Enter) => {
+            app.confirm_merge = false;
+            if let Some(wi_id) = app.merge_wi_id.take() {
+                app.execute_merge(&wi_id, "squash");
+            }
+        }
+        (_, KeyCode::Char('m')) => {
+            app.confirm_merge = false;
+            if let Some(wi_id) = app.merge_wi_id.take() {
+                app.execute_merge(&wi_id, "merge");
+            }
+        }
+        (_, KeyCode::Esc) => {
+            app.confirm_merge = false;
+            app.merge_wi_id = None;
+            app.status_message = None;
+        }
+        _ => {
+            // Unrecognized key - cancel.
+            app.confirm_merge = false;
+            app.merge_wi_id = None;
+            app.status_message = None;
+        }
+    }
+    if app.status_message.is_some() != had_status {
+        sync_layout(app);
+    }
+}
+
+/// Handle key events when the rework reason text input is visible.
+///
+/// All keys are routed to the text input. Enter submits the reason,
+/// Esc cancels and stays in Review.
+fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
+    let had_status = app.status_message.is_some();
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Esc) => {
+            app.rework_prompt_visible = false;
+            app.rework_prompt_input.clear();
+            app.rework_prompt_wi = None;
+            app.status_message = None;
+        }
+        (_, KeyCode::Enter) => {
+            let reason = app.rework_prompt_input.text().trim().to_string();
+            app.rework_prompt_visible = false;
+            app.rework_prompt_input.clear();
+            let wi_id = match app.rework_prompt_wi.take() {
+                Some(id) => id,
+                None => return,
+            };
+
+            // Store the rework reason for the implementing_rework prompt.
+            if !reason.is_empty() {
+                app.rework_reasons.insert(wi_id.clone(), reason.clone());
+            }
+
+            // Log the rework request to the activity log.
+            let log_entry = crate::work_item_backend::ActivityEntry {
+                timestamp: crate::app::now_iso8601_pub(),
+                event_type: "rework_requested".to_string(),
+                payload: serde_json::json!({ "reason": reason }),
+            };
+            if let Err(e) = app.backend.append_activity(&wi_id, &log_entry) {
+                app.status_message = Some(format!("Activity log error: {e}"));
+            }
+
+            // Complete the retreat from Review to Implementing.
+            app.apply_stage_change(
+                &wi_id,
+                &crate::work_item::WorkItemStatus::Review,
+                &crate::work_item::WorkItemStatus::Implementing,
+                "user_rework",
+            );
+        }
+        // Route text input keys to the SimpleTextInput.
+        (_, KeyCode::Char(c)) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.rework_prompt_input.insert_char(c);
+            app.status_message = Some(format!("Rework reason: {}", app.rework_prompt_input.text()));
+        }
+        (_, KeyCode::Backspace) => {
+            app.rework_prompt_input.backspace();
+            app.status_message = Some(format!("Rework reason: {}", app.rework_prompt_input.text()));
+        }
+        (_, KeyCode::Delete) => {
+            app.rework_prompt_input.delete();
+            app.status_message = Some(format!("Rework reason: {}", app.rework_prompt_input.text()));
+        }
+        (_, KeyCode::Left) => {
+            app.rework_prompt_input.move_left();
+        }
+        (_, KeyCode::Right) => {
+            app.rework_prompt_input.move_right();
+        }
+        (_, KeyCode::Home) => {
+            app.rework_prompt_input.home();
+        }
+        (_, KeyCode::End) => {
+            app.rework_prompt_input.end();
+        }
+        _ => {}
+    }
+    if app.status_message.is_some() != had_status {
+        sync_layout(app);
+    }
+}
+
 /// Handle key events when the create dialog is open.
 ///
 /// Tab/Shift+Tab cycle focus between Title, Repos, and Branch fields.
@@ -438,9 +578,13 @@ fn handle_create_dialog(app: &mut App, key: KeyEvent) {
             app.create_dialog.close();
         }
 
-        // Tab - cycle focus forward
+        // Tab - cycle focus forward; auto-fill branch when leaving Title.
         (KeyModifiers::NONE, KeyCode::Tab) => {
+            let was_title = matches!(app.create_dialog.focus_field, CreateDialogFocus::Title);
             app.create_dialog.focus_next();
+            if was_title {
+                app.create_dialog.auto_fill_branch();
+            }
         }
 
         // Shift+Tab / BackTab - cycle focus backward
@@ -492,9 +636,16 @@ fn handle_create_dialog(app: &mut App, key: KeyEvent) {
 
 /// Forward a key event to the currently focused text input in the create dialog.
 fn handle_text_input_key(app: &mut App, key: KeyEvent) {
+    let is_branch = matches!(app.create_dialog.focus_field, CreateDialogFocus::Branch);
+
     let Some(input) = app.create_dialog.focused_input_mut() else {
         return;
     };
+
+    let is_content_key = matches!(
+        key.code,
+        KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+    ) && !key.modifiers.contains(KeyModifiers::CONTROL);
 
     match (key.modifiers, key.code) {
         (_, KeyCode::Char(c)) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -519,6 +670,12 @@ fn handle_text_input_key(app: &mut App, key: KeyEvent) {
             input.end();
         }
         _ => {}
+    }
+
+    // Mark branch as user-edited when the user types, deletes, or backspaces
+    // in the Branch field. Navigation keys (arrows, Home, End) do not count.
+    if is_branch && is_content_key {
+        app.create_dialog.branch_user_edited = true;
     }
 }
 
@@ -575,6 +732,138 @@ mod tests {
         assert!(
             !app.create_dialog.visible,
             "Ctrl+N should not open create dialog during shutdown",
+        );
+    }
+
+    /// Merge prompt: Esc cancels the merge prompt.
+    #[test]
+    fn merge_prompt_esc_cancels() {
+        let mut app = App::new();
+        app.confirm_merge = true;
+        app.merge_wi_id = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
+            "/tmp/test.json",
+        )));
+        app.status_message = Some("Merge prompt".into());
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, esc);
+
+        assert!(!app.confirm_merge, "confirm_merge should be cleared");
+        assert!(app.merge_wi_id.is_none(), "merge_wi_id should be cleared");
+        assert!(
+            app.status_message.is_none(),
+            "status_message should be cleared",
+        );
+    }
+
+    /// Merge prompt: unrecognized key also cancels the prompt.
+    #[test]
+    fn merge_prompt_unknown_key_cancels() {
+        let mut app = App::new();
+        app.confirm_merge = true;
+        app.merge_wi_id = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
+            "/tmp/test.json",
+        )));
+        app.status_message = Some("Merge prompt".into());
+
+        let key_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        handle_key(&mut app, key_x);
+
+        assert!(!app.confirm_merge, "confirm_merge should be cleared");
+        assert!(app.merge_wi_id.is_none(), "merge_wi_id should be cleared");
+    }
+
+    /// Rework prompt: Esc cancels and stays in Review.
+    #[test]
+    fn rework_prompt_esc_cancels() {
+        let mut app = App::new();
+        app.rework_prompt_visible = true;
+        app.rework_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
+            "/tmp/test.json",
+        )));
+        app.status_message = Some("Rework reason: ".into());
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, esc);
+
+        assert!(
+            !app.rework_prompt_visible,
+            "rework_prompt_visible should be cleared",
+        );
+        assert!(
+            app.rework_prompt_wi.is_none(),
+            "rework_prompt_wi should be cleared",
+        );
+        assert!(
+            app.status_message.is_none(),
+            "status_message should be cleared",
+        );
+    }
+
+    /// Rework prompt: typing characters updates the status message.
+    #[test]
+    fn rework_prompt_typing_updates_status() {
+        let mut app = App::new();
+        app.rework_prompt_visible = true;
+        app.rework_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
+            "/tmp/test.json",
+        )));
+        app.status_message = Some("Rework reason: ".into());
+
+        // Type 'a'
+        let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        handle_key(&mut app, key_a);
+
+        assert!(app.rework_prompt_visible, "prompt should still be visible");
+        assert_eq!(app.rework_prompt_input.text(), "a");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Rework reason: a"),
+            "status should show typed text",
+        );
+    }
+
+    /// Rework prompt blocks other keys (settings, quit, etc.).
+    #[test]
+    fn rework_prompt_blocks_other_keys() {
+        let mut app = App::new();
+        app.rework_prompt_visible = true;
+        app.rework_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
+            "/tmp/test.json",
+        )));
+        app.status_message = Some("Rework reason: ".into());
+
+        // Press 'q' - should type 'q' into the input, not quit.
+        let key_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        handle_key(&mut app, key_q);
+
+        assert!(
+            !app.should_quit,
+            "should not quit while rework prompt is open"
+        );
+        assert_eq!(app.rework_prompt_input.text(), "q");
+    }
+
+    /// Merge prompt blocks other keys during shutdown check.
+    #[test]
+    fn merge_prompt_blocks_during_active() {
+        let mut app = App::new();
+        app.confirm_merge = true;
+        app.merge_wi_id = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
+            "/tmp/test.json",
+        )));
+
+        // Press 'q' - should cancel the merge prompt, not quit.
+        let key_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        handle_key(&mut app, key_q);
+
+        assert!(
+            !app.should_quit,
+            "should not quit while merge prompt is open"
+        );
+        assert!(
+            !app.confirm_merge,
+            "merge should be cancelled by unknown key"
         );
     }
 }

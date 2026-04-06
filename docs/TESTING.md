@@ -29,3 +29,36 @@ Tests must not leave side effects on the host system. This includes:
 - Creating persistent files outside of temp directories
 - Modifying environment variables without restoring them
 - Spawning processes that outlive the test
+
+## Never use `git config` in tests
+
+Tests must NEVER call `git config` to set values, even in temp directories.
+In git worktrees, `git config --local` writes to the PARENT repo's
+`.git/config`, not the worktree's. This means a test that calls
+`git config user.email` in a worktree can poison the real repo's config.
+
+Instead, use `-c` flags on git commands that need author identity:
+```
+git -c user.email=test@test.com -c user.name=Test commit -m "message"
+```
+
+This sets values for a single command without writing to any config file.
+
+## Integration tests
+
+Tests that shell out to real `git` commands (creating repos, worktrees,
+branches) are gated behind the `integration` Cargo feature. They do not
+run on `cargo test` by default.
+
+Run them explicitly:
+```sh
+cargo test --features integration
+```
+
+The pre-push hook runs `cargo test --all-features` which includes
+integration tests. This ensures they pass before code reaches the remote.
+
+Integration tests live in `src/worktree_service.rs` in the
+`integration_tests` module. Unit tests (like `parse_porcelain` tests that
+don't touch the filesystem) remain in the regular `tests` module and run
+on every `cargo test`.

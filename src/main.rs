@@ -6,6 +6,8 @@ mod event;
 mod fetcher;
 mod github_client;
 mod layout;
+mod mcp;
+mod prompts;
 mod salsa;
 mod session;
 mod theme;
@@ -189,6 +191,16 @@ fn print_repo_list(cfg: &config::Config, show_all: bool) {
 fn main() -> Result<(), AppError> {
     let args: Vec<String> = std::env::args().collect();
 
+    // MCP bridge mode: pipe stdin/stdout to/from a Unix socket.
+    if args.iter().any(|a| a == "--mcp-bridge") {
+        let bridge_args = mcp::BridgeArgs::parse(&args).unwrap_or_else(|| {
+            eprintln!("Usage: workbridge --mcp-bridge --socket <path>");
+            std::process::exit(1);
+        });
+        mcp::run_bridge(bridge_args.socket_path);
+        return Ok(());
+    }
+
     // CLI subcommands: handle before TUI setup.
     if handle_cli(&args) {
         return Ok(());
@@ -227,6 +239,9 @@ fn main() -> Result<(), AppError> {
         app.status_message = Some(msg);
     } else if let Some(msg) = backend_error {
         app.status_message = Some(msg);
+    } else if !app.gh_available {
+        app.status_message =
+            Some("Warning: 'gh' CLI not found. PR creation and merge features require it.".into());
     }
 
     // Validate branch_issue_pattern at startup. An invalid regex would

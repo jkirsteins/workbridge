@@ -133,6 +133,9 @@ pub struct CreateDialog {
     pub focus_field: CreateDialogFocus,
     /// Validation error message (shown inline, cleared on next input).
     pub error_message: Option<String>,
+    /// Whether the user has manually edited the branch field.
+    /// When true, auto_fill_branch() will not overwrite their input.
+    pub branch_user_edited: bool,
 }
 
 impl Default for CreateDialog {
@@ -145,6 +148,7 @@ impl Default for CreateDialog {
             repo_cursor: 0,
             focus_field: CreateDialogFocus::Title,
             error_message: None,
+            branch_user_edited: false,
         }
     }
 }
@@ -161,6 +165,7 @@ impl CreateDialog {
         self.title_input.clear();
         self.branch_input.clear();
         self.error_message = None;
+        self.branch_user_edited = false;
         self.focus_field = CreateDialogFocus::Title;
 
         self.repo_list = active_repos
@@ -256,6 +261,50 @@ impl CreateDialog {
             CreateDialogFocus::Repos => None,
         }
     }
+
+    /// Auto-fill the branch field from the title, unless the user has manually
+    /// edited the branch. Format: {username}/{slugified-title}.
+    pub fn auto_fill_branch(&mut self) {
+        if self.branch_user_edited {
+            return;
+        }
+        let slug = slugify(self.title_input.text());
+        if slug.is_empty() {
+            return;
+        }
+        let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+        self.branch_input.set_text(&format!("{username}/{slug}"));
+    }
+}
+
+/// Convert a title into a git-branch-safe slug.
+///
+/// Lowercases, replaces whitespace/hyphens/underscores with a single hyphen,
+/// strips non-ASCII-alphanumeric characters, collapses runs of hyphens, and
+/// trims leading/trailing hyphens.
+fn slugify(title: &str) -> String {
+    let lower = title.to_lowercase();
+    let mut result = String::with_capacity(lower.len());
+    let mut prev_hyphen = false;
+
+    for c in lower.chars() {
+        if c.is_ascii_alphanumeric() {
+            prev_hyphen = false;
+            result.push(c);
+        } else if (c.is_whitespace() || c == '-' || c == '_') && !prev_hyphen && !result.is_empty()
+        {
+            result.push('-');
+            prev_hyphen = true;
+        }
+        // All other characters are silently dropped.
+    }
+
+    // Trim trailing hyphen.
+    if result.ends_with('-') {
+        result.pop();
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -474,5 +523,87 @@ mod tests {
         // Past end does nothing
         dialog.repo_down();
         assert_eq!(dialog.repo_cursor, 1);
+    }
+
+    // -- slugify tests --
+
+    #[test]
+    fn slugify_basic_title() {
+        assert_eq!(slugify("Fix Login Bug"), "fix-login-bug");
+    }
+
+    #[test]
+    fn slugify_special_chars_stripped() {
+        assert_eq!(slugify("Fix Login Bug!!"), "fix-login-bug");
+    }
+
+    #[test]
+    fn slugify_collapses_whitespace() {
+        assert_eq!(slugify("a   b"), "a-b");
+    }
+
+    #[test]
+    fn slugify_underscores_and_hyphens() {
+        assert_eq!(slugify("my_cool--feature"), "my-cool-feature");
+    }
+
+    #[test]
+    fn slugify_empty_input() {
+        assert_eq!(slugify(""), "");
+    }
+
+    #[test]
+    fn slugify_all_special_chars() {
+        assert_eq!(slugify("!!!"), "");
+    }
+
+    #[test]
+    fn slugify_leading_trailing_whitespace() {
+        assert_eq!(slugify("  hello world  "), "hello-world");
+    }
+
+    // -- auto_fill_branch tests --
+
+    #[test]
+    fn auto_fill_branch_from_title() {
+        let mut dialog = CreateDialog::new();
+        dialog.open(&[PathBuf::from("/repo/a")], None);
+        dialog.title_input.set_text("Fix Login Bug");
+        dialog.auto_fill_branch();
+
+        let branch = dialog.branch_input.text().to_string();
+        // Should be {username}/fix-login-bug
+        assert!(branch.ends_with("/fix-login-bug"), "got: {branch}");
+        assert!(branch.contains('/'), "got: {branch}");
+    }
+
+    #[test]
+    fn auto_fill_branch_respects_user_edited() {
+        let mut dialog = CreateDialog::new();
+        dialog.open(&[PathBuf::from("/repo/a")], None);
+        dialog.title_input.set_text("Fix Login Bug");
+        dialog.branch_input.set_text("my-custom-branch");
+        dialog.branch_user_edited = true;
+
+        dialog.auto_fill_branch();
+        assert_eq!(dialog.branch_input.text(), "my-custom-branch");
+    }
+
+    #[test]
+    fn auto_fill_branch_skips_empty_slug() {
+        let mut dialog = CreateDialog::new();
+        dialog.open(&[PathBuf::from("/repo/a")], None);
+        dialog.title_input.set_text("!!!");
+
+        dialog.auto_fill_branch();
+        assert_eq!(dialog.branch_input.text(), "");
+    }
+
+    #[test]
+    fn open_resets_branch_user_edited() {
+        let mut dialog = CreateDialog::new();
+        dialog.branch_user_edited = true;
+        dialog.open(&[PathBuf::from("/repo/a")], None);
+        assert!(!dialog.branch_user_edited);
     }
 }

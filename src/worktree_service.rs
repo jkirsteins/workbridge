@@ -75,6 +75,11 @@ pub trait WorktreeService: Send + Sync {
     /// commit. Returns Ok(()) if the fetch succeeds, Err if it fails
     /// (branch does not exist on origin, fork PR, network error, etc.).
     fn fetch_branch(&self, repo_path: &Path, branch: &str) -> Result<(), WorktreeError>;
+
+    /// Create a new local branch from the repo's default branch (or HEAD).
+    /// Used as a fallback when fetch_branch fails (e.g., the branch does
+    /// not exist on origin yet).
+    fn create_branch(&self, repo_path: &Path, branch: &str) -> Result<(), WorktreeError>;
 }
 
 /// GitWorktreeService shells out to the git CLI for worktree operations.
@@ -325,42 +330,35 @@ impl WorktreeService for GitWorktreeService {
         Self::run_git(repo_path, &["fetch", "origin", &refspec])?;
         Ok(())
     }
+
+    fn create_branch(&self, repo_path: &Path, branch: &str) -> Result<(), WorktreeError> {
+        // Check if the branch already exists.
+        if Self::run_git(
+            repo_path,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        )
+        .is_ok()
+        {
+            return Ok(()); // Branch already exists locally.
+        }
+
+        // Base the new branch on the default branch (main/master) so that
+        // feature branches start from the canonical base, not whatever
+        // happens to be checked out.
+        let base = self
+            .default_branch(repo_path)
+            .unwrap_or_else(|_| "HEAD".to_string());
+        Self::run_git(repo_path, &["branch", branch, &base])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::Path;
-
-    /// Create a temporary git repo with an initial commit so worktree
-    /// operations work. Returns the path to the repo.
-    fn setup_git_repo(dir: &Path) {
-        run_in(dir, &["git", "init"]);
-        run_in(dir, &["git", "config", "user.email", "test@test.com"]);
-        run_in(dir, &["git", "config", "user.name", "Test"]);
-        // Create an initial commit so we can create worktrees.
-        let file_path = dir.join("README");
-        fs::write(&file_path, "init").unwrap();
-        run_in(dir, &["git", "add", "README"]);
-        run_in(dir, &["git", "commit", "-m", "initial commit"]);
-    }
-
-    /// Run a command in a given directory, panicking on failure.
-    fn run_in(dir: &Path, args: &[&str]) {
-        let output = Command::new(args[0])
-            .args(&args[1..])
-            .current_dir(dir)
-            .output()
-            .unwrap_or_else(|e| panic!("failed to run {:?}: {e}", args));
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!("command {:?} failed in {}:\n{stderr}", args, dir.display());
-        }
-    }
 
     // -----------------------------------------------------------------------
-    // parse_porcelain tests
+    // parse_porcelain tests (pure unit tests, no git CLI)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -420,10 +418,85 @@ mod tests {
         assert_eq!(result[0].path, PathBuf::from("/home/user/repo"));
         assert!(result[0].is_main);
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Integration tests with real git repos
-    // -----------------------------------------------------------------------
+/// Integration tests that shell out to real git. Gated behind the
+/// `integration` feature so they don't run on every `cargo test`.
+/// Run with: `cargo test --features integration`
+///
+/// These tests use environment variables (GIT_AUTHOR_EMAIL, etc.)
+/// instead of `git config` to avoid writing to any git config file.
+/// This prevents worktree config writes from poisoning the parent
+/// repo's .git/config (the root cause of the core.bare corruption).
+#[cfg(test)]
+#[cfg(feature = "integration")]
+mod integration_tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    /// Create a temporary git repo with an initial commit.
+    /// Uses env vars for author identity - NEVER calls `git config`.
+    fn setup_git_repo(dir: &Path) {
+        run_in(dir, &["git", "init"]);
+        let file_path = dir.join("README");
+        fs::write(&file_path, "init").unwrap();
+        run_in(dir, &["git", "add", "README"]);
+        // Use -c flags for author identity instead of git config.
+        let output = Command::new("git")
+            .args([
+                "-C",
+                dir.to_str().unwrap(),
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "initial commit",
+            ])
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("git commit failed in {}:\n{stderr}", dir.display());
+        }
+    }
+
+    fn run_in(dir: &Path, args: &[&str]) {
+        let output = Command::new(args[0])
+            .args(&args[1..])
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {:?}: {e}", args));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("command {:?} failed in {}:\n{stderr}", args, dir.display());
+        }
+    }
+
+    /// Helper for git commits that need author identity without git config.
+    fn commit_in(dir: &Path, message: &str) {
+        let output = Command::new("git")
+            .args([
+                "-C",
+                dir.to_str().unwrap(),
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                message,
+            ])
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("git commit failed in {}:\n{stderr}", dir.display());
+        }
+    }
 
     #[test]
     fn list_worktrees_returns_non_default_worktrees() {
@@ -762,7 +835,7 @@ mod tests {
         let pr_file = source_dir.join("pr-change.txt");
         fs::write(&pr_file, "PR content").unwrap();
         run_in(&source_dir, &["git", "add", "pr-change.txt"]);
-        run_in(&source_dir, &["git", "commit", "-m", "PR commit"]);
+        commit_in(&source_dir, "PR commit");
         run_in(&source_dir, &["git", "push", "origin", "pr-branch"]);
 
         // Get the commit SHA on pr-branch in source.
@@ -858,5 +931,83 @@ mod tests {
             "fetch_branch should fail for a branch not on origin, got: {:?}",
             result,
         );
+    }
+
+    #[test]
+    fn create_branch_creates_from_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        setup_git_repo(&repo_dir);
+        // Normalize to "master" (git init default).
+        run_in(&repo_dir, &["git", "branch", "-m", "master"]);
+
+        // Advance HEAD away from master so we can verify the new branch
+        // starts from master (default branch), not from HEAD.
+        run_in(&repo_dir, &["git", "checkout", "-b", "detour"]);
+        let detour_file = repo_dir.join("detour.txt");
+        fs::write(&detour_file, "detour content").unwrap();
+        run_in(&repo_dir, &["git", "add", "detour.txt"]);
+        commit_in(&repo_dir, "detour commit");
+
+        let master_sha =
+            GitWorktreeService::run_git(&repo_dir, &["rev-parse", "refs/heads/master"])
+                .unwrap()
+                .trim()
+                .to_string();
+        let head_sha = GitWorktreeService::run_git(&repo_dir, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        // HEAD should differ from master.
+        assert_ne!(master_sha, head_sha, "HEAD should differ from master");
+
+        let svc = GitWorktreeService;
+
+        // Verify the branch does not exist yet.
+        let before = GitWorktreeService::run_git(
+            &repo_dir,
+            &["rev-parse", "--verify", "refs/heads/my-feature"],
+        );
+        assert!(
+            before.is_err(),
+            "my-feature should not exist before create_branch",
+        );
+
+        // Create the branch - should be based on master, not HEAD.
+        svc.create_branch(&repo_dir, "my-feature").unwrap();
+
+        // Verify it now exists.
+        let feature_sha =
+            GitWorktreeService::run_git(&repo_dir, &["rev-parse", "refs/heads/my-feature"])
+                .unwrap()
+                .trim()
+                .to_string();
+        assert_eq!(
+            feature_sha, master_sha,
+            "new branch should start from default branch (master), not HEAD",
+        );
+    }
+
+    #[test]
+    fn create_branch_noop_if_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        setup_git_repo(&repo_dir);
+
+        // Create the branch first.
+        run_in(&repo_dir, &["git", "branch", "existing-branch"]);
+
+        let svc = GitWorktreeService;
+        // Should succeed without error (no-op).
+        svc.create_branch(&repo_dir, "existing-branch").unwrap();
+
+        // Branch should still exist.
+        let check = GitWorktreeService::run_git(
+            &repo_dir,
+            &["rev-parse", "--verify", "refs/heads/existing-branch"],
+        );
+        assert!(check.is_ok(), "branch should still exist");
     }
 }
