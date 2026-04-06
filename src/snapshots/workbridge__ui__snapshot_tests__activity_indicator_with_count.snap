@@ -1,0 +1,28 @@
+---
+source: src/ui.rs
+expression: "render(&app, 80, 24)"
+---
+┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
+│  ACTIVE (0) (1)       ││                                                     │
+│> [IM] Multi-task      ││  Multi-task                                         │
+│  branch-act-2 [no wt] ││                                                     │
+│                       ││  Status      Implementing                           │
+│                       ││  Backend     Local file                             │
+│                       ││  Repo        /repo/act-2/0                          │
+│                       ││  Branch      branch-act-2                           │
+│                       ││  Worktree    (none)                                 │
+│                       ││  PR          (none)                                 │
+│                       ││  Issue       (none)                                 │
+│                       ││  Errors      (none)                                 │
+│                       ││                                                     │
+│                       ││  Press Enter to start a session.                    │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+└───────────────────────┘└─────────────────────────────────────────────────────┘
+Multi-task | [Implementing] | /repo/act-2/0
+ ⠋ Creating pull request... (+1)

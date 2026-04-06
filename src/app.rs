@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -72,6 +72,72 @@ pub enum DisplayEntry {
     /// A work item (index into App::work_items).
     WorkItemEntry(usize),
 }
+
+/// A unique identifier for a tracked activity shown in the status bar.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ActivityId(u64);
+
+/// A currently running activity displayed in the status bar.
+#[derive(Clone, Debug)]
+pub struct Activity {
+    pub id: ActivityId,
+    pub message: String,
+}
+
+/// Result from the asynchronous review gate check.
+pub struct ReviewGateResult {
+    /// The work item that was being checked.
+    pub work_item_id: WorkItemId,
+    /// True if the gate approved the transition.
+    pub approved: bool,
+    /// Human-readable detail (approval note or rejection reason).
+    pub detail: String,
+}
+
+/// Result from the asynchronous PR creation thread.
+pub struct PrCreateResult {
+    /// The work item the PR was created for.
+    pub wi_id: WorkItemId,
+    /// Human-readable success info (e.g., "PR created: <url>").
+    pub info: Option<String>,
+    /// Human-readable error message.
+    pub error: Option<String>,
+    /// PR URL for activity log (separate from display info).
+    pub url: Option<String>,
+}
+
+/// Outcome of an asynchronous PR merge operation.
+pub enum PrMergeOutcome {
+    /// No PR found for this branch - advance to Done directly.
+    NoPr,
+    /// PR merged successfully.
+    Merged { strategy: String },
+    /// Merge failed due to conflicts - send back to Implementing.
+    Conflict { stderr: String },
+    /// Merge failed for another reason.
+    Failed { error: String },
+}
+
+/// Result from the asynchronous PR merge thread.
+pub struct PrMergeResult {
+    /// The work item the merge was attempted for.
+    pub wi_id: WorkItemId,
+    /// The branch that was being merged.
+    pub branch: String,
+    /// The outcome of the merge attempt.
+    pub outcome: PrMergeOutcome,
+}
+
+/// Result from the asynchronous worktree creation thread.
+pub struct WorktreeCreateResult {
+    /// The work item the worktree was created for.
+    pub wi_id: WorkItemId,
+    /// The worktree path on success.
+    pub path: Option<PathBuf>,
+    /// Human-readable error message on failure.
+    pub error: Option<String>,
+}
+
 
 /// App holds the entire application state.
 pub struct App {
@@ -198,15 +264,46 @@ pub struct App {
     /// Used to verify the gate result is still relevant (the user may have
     /// retreated the item while the gate was running).
     pub review_gate_wi: Option<WorkItemId>,
-    /// The MCP socket server for the review gate session. Kept alive until
-    /// the gate result arrives or the gate is cancelled.
-    pub review_gate_mcp: Option<McpSocketServer>,
-    /// The background Claude session running the review gate check. Not
-    /// displayed in the UI - a spinner is shown instead.
-    pub review_gate_session: Option<Session>,
-    /// Frame counter for the review gate spinner animation. Cycles through
-    /// |, /, -, \ characters on each timer tick while the gate is active.
-    pub review_gate_spinner_frame: u8,
+    /// Receiver for asynchronous review gate results.
+    pub review_gate_rx: Option<crossbeam_channel::Receiver<ReviewGateResult>>,
+    /// Activity ID for the running review gate indicator.
+    pub review_gate_activity: Option<ActivityId>,
+
+    // -- Activity indicator --
+    /// Monotonic counter for generating unique ActivityId values.
+    pub activity_counter: u64,
+    /// Currently running activities. The last entry is displayed in the
+    /// status bar. When empty, the normal status_message shows through.
+    pub activities: Vec<Activity>,
+    /// Spinner frame index, advanced on each 200ms timer tick when
+    /// activities are present.
+    pub spinner_tick: usize,
+
+    // -- Async PR creation --
+    /// Receiver for asynchronous PR creation results.
+    pub pr_create_rx: Option<crossbeam_channel::Receiver<PrCreateResult>>,
+    /// Activity ID for the running PR creation indicator.
+    pub pr_create_activity: Option<ActivityId>,
+    /// The work item ID that the current in-flight PR creation was spawned for.
+    pub pr_create_wi: Option<WorkItemId>,
+    /// Queued work item IDs waiting for PR creation when a creation is
+    /// already in-flight. Drained one at a time as each creation completes.
+    pub pr_create_pending: VecDeque<WorkItemId>,
+
+    // -- Async PR merge --
+    /// Receiver for asynchronous PR merge results.
+    pub pr_merge_rx: Option<crossbeam_channel::Receiver<PrMergeResult>>,
+    /// Activity ID for the running PR merge indicator.
+    pub pr_merge_activity: Option<ActivityId>,
+
+    // -- Async worktree creation --
+    /// Receiver for asynchronous worktree creation results.
+    pub worktree_create_rx: Option<crossbeam_channel::Receiver<WorktreeCreateResult>>,
+    /// Activity ID for the running worktree creation indicator.
+    pub worktree_create_activity: Option<ActivityId>,
+    /// The work item ID that the current worktree creation was spawned for.
+    pub worktree_create_wi: Option<WorkItemId>,
+
     /// Whether the global assistant drawer is open.
     pub global_drawer_open: bool,
     /// The global assistant PTY session (lazy, persistent).
@@ -329,9 +426,20 @@ impl App {
             mcp_rx: Some(mcp_rx),
             mcp_tx,
             review_gate_wi: None,
-            review_gate_mcp: None,
-            review_gate_session: None,
-            review_gate_spinner_frame: 0,
+            review_gate_rx: None,
+            review_gate_activity: None,
+            activity_counter: 0,
+            activities: Vec::new(),
+            spinner_tick: 0,
+            pr_create_rx: None,
+            pr_create_activity: None,
+            pr_create_wi: None,
+            pr_create_pending: VecDeque::new(),
+            pr_merge_rx: None,
+            pr_merge_activity: None,
+            worktree_create_rx: None,
+            worktree_create_activity: None,
+            worktree_create_wi: None,
             global_drawer_open: false,
             global_session: None,
             global_mcp_server: None,
@@ -345,6 +453,36 @@ impl App {
         app.reassemble_work_items();
         app.build_display_list();
         app
+    }
+
+    // -- Activity indicator API --
+
+    /// Start a new activity. Returns its ID for later removal.
+    /// The most recently started activity is displayed in the status bar.
+    pub fn start_activity(&mut self, message: impl Into<String>) -> ActivityId {
+        self.activity_counter += 1;
+        let id = ActivityId(self.activity_counter);
+        self.activities.push(Activity {
+            id,
+            message: message.into(),
+        });
+        id
+    }
+
+    /// End an activity by its ID. No-op if already ended.
+    pub fn end_activity(&mut self, id: ActivityId) {
+        self.activities.retain(|a| a.id != id);
+    }
+
+    /// Returns the activity message to display, or None if idle.
+    pub fn current_activity(&self) -> Option<&str> {
+        self.activities.last().map(|a| a.message.as_str())
+    }
+
+    /// Whether the status bar row should be visible. True when either
+    /// a status message or an activity indicator is present.
+    pub fn has_visible_status_bar(&self) -> bool {
+        self.status_message.is_some() || !self.activities.is_empty()
     }
 
     /// Check whether a path is inside (or equal to) one of the active
@@ -545,19 +683,6 @@ impl App {
             }
         }
 
-        // Check if the review gate session died without delivering a result.
-        // If Claude exits or crashes before calling the MCP tool, clear the
-        // gate state and surface an error so the spinner doesn't spin forever.
-        if let Some(ref mut session) = self.review_gate_session
-            && !session.is_alive()
-        {
-            self.review_gate_session = None;
-            self.review_gate_mcp = None;
-            self.review_gate_wi = None;
-            self.status_message =
-                Some("Review gate session exited without delivering a verdict".into());
-        }
-
         // Check global assistant session liveness.
         if let Some(ref mut entry) = self.global_session {
             if let Some(ref mut session) = entry.session {
@@ -624,9 +749,6 @@ impl App {
                 session.send_sigterm();
             }
         }
-        if let Some(ref mut session) = self.review_gate_session {
-            session.send_sigterm();
-        }
         if let Some(ref mut entry) = self.global_session
             && entry.alive
             && let Some(ref mut session) = entry.session
@@ -638,7 +760,6 @@ impl App {
     /// Check if all sessions are dead (or there are no sessions).
     pub fn all_dead(&self) -> bool {
         self.sessions.values().all(|entry| !entry.alive)
-            && self.review_gate_session.is_none()
             && self.global_session.as_ref().is_none_or(|s| !s.alive)
     }
 
@@ -651,12 +772,12 @@ impl App {
             }
             entry.alive = false;
         }
-        if let Some(ref mut session) = self.review_gate_session {
-            session.force_kill();
-        }
-        self.review_gate_session = None;
-        self.review_gate_mcp = None;
+        // Cancel any in-flight review gate.
+        self.review_gate_rx = None;
         self.review_gate_wi = None;
+        if let Some(aid) = self.review_gate_activity.take() {
+            self.end_activity(aid);
+        }
         if let Some(ref mut entry) = self.global_session {
             if let Some(ref mut session) = entry.session {
                 session.force_kill();
@@ -1120,75 +1241,111 @@ impl App {
             return;
         }
 
+        // If any worktree creation is already in progress, don't start another.
+        // Replacing worktree_create_rx while a thread is running would orphan
+        // the worktree on disk (the poll handler would never see the result).
+        if self.worktree_create_wi.is_some() {
+            self.status_message = Some("Worktree creation already in progress...".into());
+            return;
+        }
+
         // Find the first worktree path among the work item's repo associations.
-        // If none exists, try to auto-create one for the first association
-        // that has a branch name.
-        let cwd = match wi
+        // If none exists, spawn a background thread to auto-create one.
+        match wi
             .repo_associations
             .iter()
             .find_map(|a| a.worktree_path.clone())
         {
-            Some(path) => path,
+            Some(path) => {
+                // Worktree already exists - proceed to session spawn immediately.
+                self.complete_session_open(&work_item_id, &path);
+            }
             None => {
                 // Try to find an association with a branch name and auto-create
-                // a worktree for it.
+                // a worktree for it in the background.
                 let branch_assoc = wi.repo_associations.iter().find(|a| a.branch.is_some());
                 match branch_assoc {
                     Some(assoc) => {
-                        let branch = assoc.branch.as_ref().unwrap();
-                        let repo_path = &assoc.repo_path;
-                        // Fetch the branch from origin first to ensure the
-                        // local ref points at the correct commit.
-                        // If fetch fails, try to create a new local branch
-                        // from the default branch (or HEAD).
-                        if self
-                            .worktree_service
-                            .fetch_branch(repo_path, branch)
-                            .is_err()
-                        {
-                            // Try to create a local branch from the default branch.
-                            if let Err(create_err) =
-                                self.worktree_service.create_branch(repo_path, branch)
-                            {
-                                self.status_message = Some(format!(
-                                    "Could not fetch or create branch '{}': {create_err}",
-                                    branch,
-                                ));
-                                return;
-                            }
-                        }
+                        let branch = assoc.branch.as_ref().unwrap().clone();
+                        let repo_path = assoc.repo_path.clone();
                         let wt_target = Self::worktree_target_path(
-                            repo_path,
-                            branch,
+                            &repo_path,
+                            &branch,
                             &self.config.defaults.worktree_dir,
                         );
-                        match self
-                            .worktree_service
-                            .create_worktree(repo_path, branch, &wt_target)
-                        {
-                            Ok(wt_info) => wt_info.path,
-                            Err(e) => {
-                                self.status_message = Some(format!(
-                                    "Failed to create worktree for '{}': {e}",
-                                    branch,
-                                ));
+                        let ws = Arc::clone(&self.worktree_service);
+                        let wi_id_clone = work_item_id.clone();
+
+                        let (tx, rx) = crossbeam_channel::bounded(1);
+
+                        std::thread::spawn(move || {
+                            // Fetch the branch from origin first.
+                            // If fetch fails, try to create a new local branch.
+                            if ws.fetch_branch(&repo_path, &branch).is_err()
+                                && let Err(create_err) = ws.create_branch(&repo_path, &branch)
+                            {
+                                let _ = tx.send(WorktreeCreateResult {
+                                    wi_id: wi_id_clone,
+                                    path: None,
+                                    error: Some(format!(
+                                        "Could not fetch or create branch '{}': {create_err}",
+                                        branch,
+                                    )),
+                                });
                                 return;
                             }
+                            match ws.create_worktree(&repo_path, &branch, &wt_target) {
+                                Ok(wt_info) => {
+                                    let _ = tx.send(WorktreeCreateResult {
+                                        wi_id: wi_id_clone,
+                                        path: Some(wt_info.path),
+                                        error: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(WorktreeCreateResult {
+                                        wi_id: wi_id_clone,
+                                        path: None,
+                                        error: Some(format!(
+                                            "Failed to create worktree for '{}': {e}",
+                                            branch,
+                                        )),
+                                    });
+                                }
+                            }
+                        });
+
+                        self.worktree_create_rx = Some(rx);
+                        self.worktree_create_wi = Some(work_item_id);
+                        if let Some(aid) = self.worktree_create_activity.take() {
+                            self.end_activity(aid);
                         }
+                        self.worktree_create_activity =
+                            Some(self.start_activity("Initializing worktree..."));
                     }
                     None => {
                         self.status_message = Some("Set a branch name to start working".into());
-                        return;
                     }
                 }
             }
-        };
+        }
+    }
 
+    /// Complete session setup after the worktree path is known.
+    /// Shared by both the immediate path (worktree already exists) and
+    /// the deferred path (worktree was just created in a background thread).
+    fn complete_session_open(&mut self, work_item_id: &WorkItemId, cwd: &std::path::Path) {
         // Start MCP socket server for this session.
-        let mcp_result = self.start_mcp_for_session(&cwd, &work_item_id);
+        let mcp_result = self.start_mcp_for_session(cwd, work_item_id);
 
         // Build the claude command with system prompt and MCP config.
-        let system_prompt = self.stage_system_prompt(&work_item_id, &cwd);
+        let work_item_status = self
+            .work_items
+            .iter()
+            .find(|w| w.id == *work_item_id)
+            .map(|w| w.status.clone())
+            .unwrap_or(WorkItemStatus::Implementing);
+        let system_prompt = self.stage_system_prompt(work_item_id, cwd);
         let mut cmd = Self::build_claude_cmd(&work_item_status, system_prompt.as_deref());
 
         // Write MCP config as .mcp.json in the worktree AND pass via --mcp-config.
@@ -1282,7 +1439,7 @@ impl App {
 
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
 
-        match Session::spawn(self.pane_cols, self.pane_rows, Some(&cwd), &cmd_refs) {
+        match Session::spawn(self.pane_cols, self.pane_rows, Some(cwd), &cmd_refs) {
             Ok(session) => {
                 let parser = Arc::clone(&session.parser);
                 let entry = SessionEntry {
@@ -1293,7 +1450,7 @@ impl App {
                 self.sessions.insert(session_key.clone(), entry);
                 match mcp_result {
                     Ok((server, _)) => {
-                        self.mcp_servers.insert(work_item_id, server);
+                        self.mcp_servers.insert(work_item_id.clone(), server);
                     }
                     Err(msg) => {
                         self.status_message = Some(msg);
@@ -1339,6 +1496,60 @@ impl App {
             cmd.push("Explain who you are and start working.".to_string());
         }
         cmd
+    }
+
+    /// Poll the async worktree creation thread for a result. Called on each timer tick.
+    pub fn poll_worktree_creation(&mut self) {
+        let rx = match self.worktree_create_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.worktree_create_rx = None;
+                self.worktree_create_wi = None;
+                if let Some(aid) = self.worktree_create_activity.take() {
+                    self.end_activity(aid);
+                }
+                self.status_message =
+                    Some("Worktree creation: background thread exited unexpectedly".into());
+                return;
+            }
+        };
+
+        self.worktree_create_rx = None;
+        self.worktree_create_wi = None;
+        if let Some(aid) = self.worktree_create_activity.take() {
+            self.end_activity(aid);
+        }
+
+        match (result.path, result.error) {
+            (Some(path), _) => {
+                // Verify the work item still exists before opening a session.
+                // It may have been deleted while the background thread was running.
+                if !self.work_items.iter().any(|w| w.id == result.wi_id) {
+                    self.status_message = Some(
+                        "Worktree created but work item was deleted - skipping session".into(),
+                    );
+                    return;
+                }
+                // Worktree created successfully - continue with session setup.
+                // Reassemble so the new worktree path is visible in the data model.
+                self.reassemble_work_items();
+                self.build_display_list();
+                self.complete_session_open(&result.wi_id, &path);
+            }
+            (None, Some(error)) => {
+                self.status_message = Some(error);
+            }
+            (None, None) => {
+                // Unexpected - no path and no error.
+                self.status_message = Some("Worktree creation completed with no result".into());
+            }
+        }
     }
 
     /// Build a stage-specific system prompt for the Claude session.
@@ -1788,78 +1999,10 @@ impl App {
                         }
                     }
                 }
-                McpEvent::ReviewGateResult {
-                    work_item_id: wi_id_str,
-                    approved,
-                    detail,
-                } => {
-                    let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
-                            continue;
-                        }
-                    };
-
-                    // Only accept results when a gate is actually running for this work item.
-                    if self.review_gate_wi.as_ref() != Some(&wi_id) {
-                        continue;
-                    }
-
-                    // Clean up the review gate session and MCP server.
-                    self.review_gate_session = None;
-                    self.review_gate_mcp = None;
-                    self.review_gate_wi = None;
-
-                    // Verify the work item is still in Implementing before
-                    // applying the gate result. If the user retreated the item
-                    // while the gate was running, discard the result silently.
-                    let still_implementing = self
-                        .work_items
-                        .iter()
-                        .find(|w| w.id == wi_id)
-                        .map(|w| w.status == WorkItemStatus::Implementing)
-                        .unwrap_or(false);
-
-                    if !still_implementing {
-                        continue;
-                    }
-
-                    if approved {
-                        let entry = ActivityEntry {
-                            timestamp: now_iso8601(),
-                            event_type: "review_gate".to_string(),
-                            payload: serde_json::json!({
-                                "result": "approved",
-                                "response": detail
-                            }),
-                        };
-                        if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
-                            self.status_message = Some(format!("Activity log error: {e}"));
-                        }
-
-                        self.apply_stage_change(
-                            &wi_id,
-                            &WorkItemStatus::Implementing,
-                            &WorkItemStatus::Review,
-                            "review_gate",
-                        );
-                    } else {
-                        let entry = ActivityEntry {
-                            timestamp: now_iso8601(),
-                            event_type: "review_gate".to_string(),
-                            payload: serde_json::json!({
-                                "result": "rejected",
-                                "reason": detail
-                            }),
-                        };
-                        if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
-                            self.status_message = Some(format!("Activity log error: {e}"));
-                        }
-                        self.rework_reasons.insert(wi_id.clone(), detail.clone());
-                        self.status_message = Some(format!("Review gate rejected: {}", detail));
-                    }
-                }
+                // ReviewGateResult events from MCP are no longer used.
+                // The review gate now runs as a background thread and
+                // results are polled via poll_review_gate().
+                McpEvent::ReviewGateResult { .. } => {}
             }
         }
     }
@@ -2070,6 +2213,29 @@ impl App {
             session.kill();
         }
 
+        // Cancel in-flight worktree creation if it was for the deleted item.
+        // Dropping the receiver causes the background thread to silently exit
+        // when it tries to send its result.
+        if self.worktree_create_wi.as_ref() == Some(&work_item_id) {
+            self.worktree_create_rx = None;
+            self.worktree_create_wi = None;
+            if let Some(aid) = self.worktree_create_activity.take() {
+                self.end_activity(aid);
+            }
+        }
+
+        // Cancel in-flight PR creation if it was for the deleted item.
+        if self.pr_create_wi.as_ref() == Some(&work_item_id) {
+            self.pr_create_rx = None;
+            self.pr_create_wi = None;
+            if let Some(aid) = self.pr_create_activity.take() {
+                self.end_activity(aid);
+            }
+        }
+
+        // Remove the deleted item from the PR creation pending queue.
+        self.pr_create_pending.retain(|id| *id != work_item_id);
+
         // Clear identity trackers since the deleted item is gone.
         // build_display_list will fall back to the first selectable item.
         self.selected_work_item = None;
@@ -2192,9 +2358,37 @@ impl App {
         // If the retreating item has a pending review gate, cancel it.
         // The gate result would be stale since the user intentionally moved away.
         if self.review_gate_wi.as_ref() == Some(&wi_id) {
-            self.review_gate_session = None;
-            self.review_gate_mcp = None;
+            self.review_gate_rx = None;
             self.review_gate_wi = None;
+            if let Some(aid) = self.review_gate_activity.take() {
+                self.end_activity(aid);
+            }
+        }
+
+        // Cancel any in-flight PR merge. Merges are only spawned from Review,
+        // so when retreating from Review we drop the receiver to prevent
+        // poll_pr_merge from applying a stale result. The background thread
+        // will finish on its own; we just ignore its result.
+        if current_status == WorkItemStatus::Review && self.pr_merge_rx.is_some() {
+            self.pr_merge_rx = None;
+            if let Some(aid) = self.pr_merge_activity.take() {
+                self.end_activity(aid);
+            }
+        }
+
+        // Cancel any in-flight or pending PR creation for the retreating item.
+        // PR creation is spawned when entering Review; retreating means the user
+        // no longer wants the PR. Drop the receiver so poll_pr_creation ignores
+        // the result, and remove the item from the pending queue.
+        if current_status == WorkItemStatus::Review {
+            if self.pr_create_wi.as_ref() == Some(&wi_id) {
+                self.pr_create_rx = None;
+                self.pr_create_wi = None;
+                if let Some(aid) = self.pr_create_activity.take() {
+                    self.end_activity(aid);
+                }
+            }
+            self.pr_create_pending.retain(|id| *id != wi_id);
         }
 
         // Rework prompt: when retreating from Review to Implementing,
@@ -2269,24 +2463,18 @@ impl App {
             self.status_message = Some(format!("Activity log error: {e}"));
         }
 
-        // Feature 1: Auto-create PR when entering Review.
-        let pr_info = if *new_status == WorkItemStatus::Review {
-            self.try_create_pr(wi_id)
-        } else {
-            None
-        };
-
         if let Err(e) = self.backend.update_status(wi_id, new_status.clone()) {
             self.status_message = Some(format!("Stage update error: {e}"));
             return;
         }
         self.reassemble_work_items();
         self.build_display_list();
-        let mut msg = format!("Moved to {}", new_status.badge_text());
-        if let Some(info) = pr_info {
-            msg = format!("{msg} - {info}");
+        self.status_message = Some(format!("Moved to {}", new_status.badge_text()));
+
+        // Feature 1: Auto-create PR when entering Review (async).
+        if *new_status == WorkItemStatus::Review {
+            self.spawn_pr_creation(wi_id);
         }
-        self.status_message = Some(msg);
 
         // Auto-spawn a session for stages that have prompts.
         // The orphan cleanup in check_liveness handles killing the old session.
@@ -2295,129 +2483,241 @@ impl App {
         }
     }
 
-    /// Best-effort PR creation when entering Review.
+    /// Best-effort async PR creation when entering Review.
     ///
-    /// Looks up the branch and GitHub remote for the work item, checks if a PR
-    /// already exists, and creates one if not. Logs the result to the activity
-    /// log. Errors are shown in the status bar but do not block the transition.
-    fn try_create_pr(&mut self, wi_id: &WorkItemId) -> Option<String> {
-        let wi = self.work_items.iter().find(|w| w.id == *wi_id)?;
-        let assoc = wi.repo_associations.first()?;
+    /// Gathers the needed data, then spawns a background thread to run
+    /// the `gh` CLI commands. Results are polled by `poll_pr_creation()`
+    /// on each timer tick.
+    fn spawn_pr_creation(&mut self, wi_id: &WorkItemId) {
+        // If a PR creation is already in-flight, queue this one instead of
+        // silently dropping it. The queue is drained in poll_pr_creation.
+        if self.pr_create_rx.is_some() {
+            if !self.pr_create_pending.contains(wi_id) {
+                self.pr_create_pending.push_back(wi_id.clone());
+            }
+            return;
+        }
+
+        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
+            Some(w) => w,
+            None => return,
+        };
+        let assoc = match wi.repo_associations.first() {
+            Some(a) => a,
+            None => return,
+        };
         let branch = match assoc.branch.as_ref() {
             Some(b) => b.clone(),
-            None => return None,
+            None => return,
         };
         let repo_path = assoc.repo_path.clone();
         let title = wi.title.clone();
+        let wi_id = wi_id.clone();
 
-        // Get owner/repo from the worktree service.
+        // Get owner/repo from the worktree service (synchronous but fast).
         let (owner, repo_name) = match self.worktree_service.github_remote(&repo_path) {
             Ok(Some((o, r))) => (o, r),
             Ok(None) => {
                 self.status_message = Some("PR creation skipped: no GitHub remote".into());
-                return None;
+                return;
             }
             Err(e) => {
                 self.status_message =
                     Some(format!("PR creation skipped: could not read remote: {e}"));
-                return None;
+                return;
             }
         };
-
         let owner_repo = format!("{owner}/{repo_name}");
 
-        // Check if a PR already exists for this branch.
-        let check_output = std::process::Command::new("gh")
-            .args([
-                "pr",
-                "list",
-                "--head",
-                &branch,
-                "--json",
-                "number",
-                "--repo",
-                &owner_repo,
-            ])
-            .output();
-
-        match check_output {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                // Parse JSON array - if non-empty, a PR already exists.
-                if let Ok(arr) = serde_json::from_str::<serde_json::Value>(stdout.trim())
-                    && arr.as_array().is_some_and(|a| !a.is_empty())
-                {
-                    // PR exists - skip creation.
-                    return None;
-                }
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                self.status_message =
-                    Some(format!("PR check failed (continuing): {}", stderr.trim()));
-                return None;
-            }
-            Err(e) => {
-                self.status_message = Some(format!("PR check failed (continuing): {e}"));
-                return None;
-            }
-        }
-
-        // Get the plan text for PR body (best-effort).
-        let body = match self.backend.read_plan(wi_id) {
+        // Get plan text and default branch before spawning (needs &self).
+        let body = match self.backend.read_plan(&wi_id) {
             Ok(Some(plan)) if !plan.trim().is_empty() => plan,
             _ => String::new(),
         };
-
-        // Get the default branch for --base.
         let default_branch = self
             .worktree_service
             .default_branch(&repo_path)
             .unwrap_or_else(|_| "main".to_string());
 
-        // Create the PR.
-        let mut cmd = std::process::Command::new("gh");
-        cmd.args([
-            "pr",
-            "create",
-            "--title",
-            &title,
-            "--body",
-            &body,
-            "--head",
-            &branch,
-            "--base",
-            &default_branch,
-            "--repo",
-            &owner_repo,
-        ]);
-        match cmd.output() {
-            Ok(output) if output.status.success() => {
-                let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                // Log PR URL to activity log.
-                let log_entry = ActivityEntry {
-                    timestamp: now_iso8601(),
-                    event_type: "pr_created".to_string(),
-                    payload: serde_json::json!({ "url": url }),
-                };
-                if let Err(e) = self.backend.append_activity(wi_id, &log_entry) {
-                    self.status_message = Some(format!("Activity log error: {e}"));
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.pr_create_wi = Some(wi_id.clone());
+
+        std::thread::spawn(move || {
+            // Check if a PR already exists for this branch.
+            let check_output = std::process::Command::new("gh")
+                .args([
+                    "pr",
+                    "list",
+                    "--head",
+                    &branch,
+                    "--json",
+                    "number",
+                    "--repo",
+                    &owner_repo,
+                ])
+                .output();
+
+            match check_output {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if let Ok(arr) = serde_json::from_str::<serde_json::Value>(stdout.trim())
+                        && arr.as_array().is_some_and(|a| !a.is_empty())
+                    {
+                        // PR already exists - nothing to do.
+                        let _ = tx.send(PrCreateResult {
+                            wi_id,
+                            info: None,
+                            error: None,
+                            url: None,
+                        });
+                        return;
+                    }
                 }
-                let info = format!("PR created: {url}");
-                self.status_message = Some(info.clone());
-                Some(info)
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let _ = tx.send(PrCreateResult {
+                        wi_id,
+                        info: None,
+                        error: Some(format!("PR check failed (continuing): {stderr}")),
+                        url: None,
+                    });
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(PrCreateResult {
+                        wi_id,
+                        info: None,
+                        error: Some(format!("PR check failed (continuing): {e}")),
+                        url: None,
+                    });
+                    return;
+                }
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                self.status_message = Some(format!(
-                    "PR creation failed (continuing): {}",
-                    stderr.trim()
-                ));
-                None
+
+            // Create the PR.
+            let create_result = std::process::Command::new("gh")
+                .args([
+                    "pr",
+                    "create",
+                    "--title",
+                    &title,
+                    "--body",
+                    &body,
+                    "--head",
+                    &branch,
+                    "--base",
+                    &default_branch,
+                    "--repo",
+                    &owner_repo,
+                ])
+                .output();
+
+            let result = match create_result {
+                Ok(output) if output.status.success() => {
+                    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let info = format!("PR created: {url}");
+                    PrCreateResult {
+                        wi_id,
+                        info: Some(info),
+                        error: None,
+                        url: Some(url),
+                    }
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    PrCreateResult {
+                        wi_id,
+                        info: None,
+                        error: Some(format!("PR creation failed (continuing): {stderr}")),
+                        url: None,
+                    }
+                }
+                Err(e) => PrCreateResult {
+                    wi_id,
+                    info: None,
+                    error: Some(format!("PR creation failed (continuing): {e}")),
+                    url: None,
+                },
+            };
+            let _ = tx.send(result);
+        });
+
+        self.pr_create_rx = Some(rx);
+        if let Some(aid) = self.pr_create_activity.take() {
+            self.end_activity(aid);
+        }
+        self.pr_create_activity = Some(self.start_activity("Creating pull request..."));
+    }
+
+    /// Poll the async PR creation thread for a result. Called on each timer tick.
+    pub fn poll_pr_creation(&mut self) {
+        let rx = match self.pr_create_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.pr_create_rx = None;
+                self.pr_create_wi = None;
+                if let Some(aid) = self.pr_create_activity.take() {
+                    self.end_activity(aid);
+                }
+                self.status_message =
+                    Some("PR creation: background thread exited unexpectedly".into());
+                // Try next pending PR creation despite the failure.
+                // Skip items that were deleted or retreated from Review.
+                while let Some(next_id) = self.pr_create_pending.pop_front() {
+                    if self
+                        .work_items
+                        .iter()
+                        .any(|w| w.id == next_id && w.status == WorkItemStatus::Review)
+                    {
+                        self.spawn_pr_creation(&next_id);
+                        break;
+                    }
+                }
+                return;
             }
-            Err(e) => {
-                self.status_message = Some(format!("PR creation failed (continuing): {e}"));
-                None
+        };
+
+        self.pr_create_rx = None;
+        self.pr_create_wi = None;
+        if let Some(aid) = self.pr_create_activity.take() {
+            self.end_activity(aid);
+        }
+
+        // Log PR creation to activity log.
+        if let Some(ref url) = result.url {
+            let log_entry = ActivityEntry {
+                timestamp: now_iso8601(),
+                event_type: "pr_created".to_string(),
+                payload: serde_json::json!({ "url": url }),
+            };
+            if let Err(e) = self.backend.append_activity(&result.wi_id, &log_entry) {
+                self.status_message = Some(format!("Activity log error: {e}"));
+            }
+        }
+
+        // Update status message.
+        if let Some(info) = result.info {
+            self.status_message = Some(info);
+        } else if let Some(error) = result.error {
+            self.status_message = Some(error);
+        }
+
+        // Drain the pending queue: spawn the next queued PR creation if any.
+        // Skip items that were deleted or retreated from Review while queued.
+        while let Some(next_id) = self.pr_create_pending.pop_front() {
+            if self
+                .work_items
+                .iter()
+                .any(|w| w.id == next_id && w.status == WorkItemStatus::Review)
+            {
+                self.spawn_pr_creation(&next_id);
+                break;
             }
         }
     }
@@ -2427,7 +2727,20 @@ impl App {
     /// `strategy` is either "squash" or "merge". If no PR exists for the
     /// branch, the merge step is skipped and we go directly to Done.
     /// After a successful merge, the worktree directory is cleaned up.
+    /// Spawn an async PR merge for the given work item.
+    ///
+    /// Gathers the needed data synchronously, then spawns a background
+    /// thread to run `gh pr merge`. Results are polled by `poll_pr_merge()`
+    /// on each timer tick.
     pub fn execute_merge(&mut self, wi_id: &WorkItemId, strategy: &str) {
+        // If a PR merge is already in-flight, don't spawn another.
+        // The background thread may have already merged a PR on GitHub;
+        // replacing the receiver would silently lose its result.
+        if self.pr_merge_rx.is_some() {
+            self.status_message = Some("PR merge already in progress".into());
+            return;
+        }
+
         let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
             Some(w) => w,
             None => return,
@@ -2475,122 +2788,212 @@ impl App {
             }
         };
         let owner_repo = format!("{owner}/{repo_name}");
-
-        // Check if a PR exists for this branch.
-        let pr_exists = match std::process::Command::new("gh")
-            .args([
-                "pr",
-                "list",
-                "--head",
-                &branch,
-                "--json",
-                "number",
-                "--repo",
-                &owner_repo,
-            ])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                serde_json::from_str::<serde_json::Value>(stdout.trim())
-                    .ok()
-                    .and_then(|v| v.as_array().map(|a| !a.is_empty()))
-                    .unwrap_or(false)
-            }
-            _ => false,
-        };
-
-        if !pr_exists {
-            // No PR - skip merge, advance to Done directly.
-            self.apply_stage_change(
-                wi_id,
-                &WorkItemStatus::Review,
-                &WorkItemStatus::Done,
-                "user",
-            );
-            return;
-        }
-
-        // Run gh pr merge with the chosen strategy.
         let merge_flag = if strategy == "merge" {
             "--merge"
         } else {
             "--squash"
         };
-        let merge_result = std::process::Command::new("gh")
-            .args([
-                "pr",
-                "merge",
-                &branch,
-                merge_flag,
-                "--delete-branch",
-                "--repo",
-                &owner_repo,
-            ])
-            .output();
+        let strategy_owned = strategy.to_string();
+        let wi_id_clone = wi_id.clone();
+        let merge_flag_owned = merge_flag.to_string();
 
-        match merge_result {
-            Ok(output) if output.status.success() => {
-                // Log merge to activity log.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        std::thread::spawn(move || {
+            // Check if a PR exists for this branch.
+            let pr_exists = match std::process::Command::new("gh")
+                .args([
+                    "pr",
+                    "list",
+                    "--head",
+                    &branch,
+                    "--json",
+                    "number",
+                    "--repo",
+                    &owner_repo,
+                ])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    serde_json::from_str::<serde_json::Value>(stdout.trim())
+                        .ok()
+                        .and_then(|v| v.as_array().map(|a| !a.is_empty()))
+                        .unwrap_or(false)
+                }
+                _ => false,
+            };
+
+            if !pr_exists {
+                let _ = tx.send(PrMergeResult {
+                    wi_id: wi_id_clone,
+                    branch,
+                    outcome: PrMergeOutcome::NoPr,
+                });
+                return;
+            }
+
+            // Run gh pr merge.
+            let merge_result = std::process::Command::new("gh")
+                .args([
+                    "pr",
+                    "merge",
+                    &branch,
+                    &merge_flag_owned,
+                    "--delete-branch",
+                    "--repo",
+                    &owner_repo,
+                ])
+                .output();
+
+            let outcome = match merge_result {
+                Ok(output) if output.status.success() => PrMergeOutcome::Merged {
+                    strategy: strategy_owned,
+                },
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    if stderr.to_lowercase().contains("conflict") {
+                        PrMergeOutcome::Conflict { stderr }
+                    } else {
+                        PrMergeOutcome::Failed {
+                            error: format!("Merge failed: {}", stderr.trim()),
+                        }
+                    }
+                }
+                Err(e) => PrMergeOutcome::Failed {
+                    error: format!("Merge failed: {e}"),
+                },
+            };
+
+            let _ = tx.send(PrMergeResult {
+                wi_id: wi_id_clone,
+                branch,
+                outcome,
+            });
+        });
+
+        self.pr_merge_rx = Some(rx);
+        if let Some(aid) = self.pr_merge_activity.take() {
+            self.end_activity(aid);
+        }
+        self.pr_merge_activity = Some(self.start_activity("Merging pull request..."));
+    }
+
+    /// Poll the async PR merge thread for a result. Called on each timer tick.
+    pub fn poll_pr_merge(&mut self) {
+        let rx = match self.pr_merge_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.pr_merge_rx = None;
+                if let Some(aid) = self.pr_merge_activity.take() {
+                    self.end_activity(aid);
+                }
+                self.status_message =
+                    Some("PR merge: background thread exited unexpectedly".into());
+                return;
+            }
+        };
+
+        self.pr_merge_rx = None;
+        if let Some(aid) = self.pr_merge_activity.take() {
+            self.end_activity(aid);
+        }
+
+        // Guard: if the item's status changed while the merge was in-flight
+        // (e.g. user retreated to Implementing), discard the stale result to
+        // avoid forcing the item back to Done or deleting its worktree.
+        let actual_status = self
+            .work_items
+            .iter()
+            .find(|w| w.id == result.wi_id)
+            .map(|w| w.status.clone());
+
+        match result.outcome {
+            PrMergeOutcome::NoPr => {
+                if actual_status.as_ref() != Some(&WorkItemStatus::Review) {
+                    return;
+                }
+                // No PR - advance to Done directly.
+                self.apply_stage_change(
+                    &result.wi_id,
+                    &WorkItemStatus::Review,
+                    &WorkItemStatus::Done,
+                    "user",
+                );
+            }
+            PrMergeOutcome::Merged { ref strategy } => {
+                // Log merge to activity log (always - the merge happened on GitHub).
                 let log_entry = ActivityEntry {
                     timestamp: now_iso8601(),
                     event_type: "pr_merged".to_string(),
                     payload: serde_json::json!({
                         "strategy": strategy,
-                        "branch": branch
+                        "branch": result.branch
                     }),
                 };
-                if let Err(e) = self.backend.append_activity(wi_id, &log_entry) {
+                if let Err(e) = self.backend.append_activity(&result.wi_id, &log_entry) {
                     self.status_message = Some(format!("Activity log error: {e}"));
                 }
 
+                if actual_status.as_ref() != Some(&WorkItemStatus::Review) {
+                    // Item was moved away from Review while merge was in-flight.
+                    // The merge already happened on GitHub, but we do not change
+                    // the local status or delete the worktree.
+                    self.status_message = Some(
+                        "PR merged on GitHub, but item status was changed - not advancing to Done"
+                            .to_string(),
+                    );
+                    return;
+                }
+
                 // Clean up worktree directory.
-                self.cleanup_worktree_for_item(wi_id);
+                self.cleanup_worktree_for_item(&result.wi_id);
 
                 // Advance to Done.
                 self.apply_stage_change(
-                    wi_id,
+                    &result.wi_id,
                     &WorkItemStatus::Review,
                     &WorkItemStatus::Done,
                     "user",
                 );
                 self.status_message = Some(format!("PR merged ({strategy}) and moved to [DN]"));
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stderr_lower = stderr.to_lowercase();
-                if stderr_lower.contains("conflict") {
-                    // Merge failed due to conflicts - send back to Implementing
-                    // so the developer can rebase and resolve.
-                    let conflict_entry = ActivityEntry {
-                        timestamp: now_iso8601(),
-                        event_type: "merge_conflict".to_string(),
-                        payload: serde_json::json!({
-                            "branch": branch,
-                            "stderr": stderr.trim()
-                        }),
-                    };
-                    if let Err(e) = self.backend.append_activity(wi_id, &conflict_entry) {
-                        self.status_message = Some(format!("Activity log error: {e}"));
-                    }
-                    let reason = "Merge failed due to conflicts. Rebase onto the base branch and resolve all conflicts.".to_string();
-                    self.rework_reasons.insert(wi_id.clone(), reason);
-                    self.apply_stage_change(
-                        wi_id,
-                        &WorkItemStatus::Review,
-                        &WorkItemStatus::Implementing,
-                        "merge_conflict",
-                    );
-                    self.status_message = Some(
-                        "Merge conflict detected - moved back to [IM] for rebase/resolve"
-                            .to_string(),
-                    );
-                } else {
-                    self.status_message = Some(format!("Merge failed: {}", stderr.trim()));
+            PrMergeOutcome::Conflict { ref stderr } => {
+                if actual_status.as_ref() != Some(&WorkItemStatus::Review) {
+                    return;
                 }
+                // Log conflict to activity log.
+                let conflict_entry = ActivityEntry {
+                    timestamp: now_iso8601(),
+                    event_type: "merge_conflict".to_string(),
+                    payload: serde_json::json!({
+                        "branch": result.branch,
+                        "stderr": stderr.trim()
+                    }),
+                };
+                if let Err(e) = self.backend.append_activity(&result.wi_id, &conflict_entry) {
+                    self.status_message = Some(format!("Activity log error: {e}"));
+                }
+                let reason = "Merge failed due to conflicts. Rebase onto the base branch and resolve all conflicts.".to_string();
+                self.rework_reasons.insert(result.wi_id.clone(), reason);
+                self.apply_stage_change(
+                    &result.wi_id,
+                    &WorkItemStatus::Review,
+                    &WorkItemStatus::Implementing,
+                    "merge_conflict",
+                );
+                self.status_message = Some(
+                    "Merge conflict detected - moved back to [IM] for rebase/resolve".to_string(),
+                );
             }
-            Err(e) => {
-                self.status_message = Some(format!("Merge failed: {e}"));
+            PrMergeOutcome::Failed { ref error } => {
+                self.status_message = Some(error.clone());
             }
         }
     }
@@ -2683,100 +3086,156 @@ impl App {
             return false;
         }
 
-        // Build the review gate system prompt via the template.
-        let mut vars = std::collections::HashMap::new();
-        vars.insert("plan", plan.as_str());
-        vars.insert("diff", diff.as_str());
-        let system = crate::prompts::render("review_gate", &vars).unwrap_or_else(|| {
-            "Compare plan to diff. Call workbridge_review_gate_result with your verdict.".into()
+        // Spawn the claude --print check in a background thread.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let wi_id_clone = wi_id.clone();
+
+        std::thread::spawn(move || {
+            let mut vars = std::collections::HashMap::new();
+            vars.insert("plan", plan.as_str());
+            vars.insert("diff", diff.as_str());
+            let system = crate::prompts::render("review_gate", &vars).unwrap_or_else(|| {
+                "Compare plan to diff. Respond APPROVED or REJECTED: reason".into()
+            });
+            let prompt = format!("Plan:\n{plan}\n\nDiff:\n{diff}");
+
+            let result = match std::process::Command::new("claude")
+                .args(["--print", "-p", &prompt, "--system-prompt", &system])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if text.starts_with("APPROVED") {
+                        ReviewGateResult {
+                            work_item_id: wi_id_clone,
+                            approved: true,
+                            detail: text,
+                        }
+                    } else {
+                        let reason = text
+                            .strip_prefix("REJECTED:")
+                            .unwrap_or(&text)
+                            .trim()
+                            .to_string();
+                        ReviewGateResult {
+                            work_item_id: wi_id_clone,
+                            approved: false,
+                            detail: reason,
+                        }
+                    }
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    ReviewGateResult {
+                        work_item_id: wi_id_clone,
+                        approved: false,
+                        detail: format!("claude failed: {stderr}"),
+                    }
+                }
+                Err(e) => ReviewGateResult {
+                    work_item_id: wi_id_clone,
+                    approved: false,
+                    detail: format!("could not run claude: {e}"),
+                },
+            };
+            let _ = tx.send(result);
         });
 
-        // Start MCP socket server for the review gate session.
-        let socket_path = crate::mcp::socket_path_for_session();
-        let wi_id_str = match serde_json::to_string(wi_id) {
-            Ok(s) => s,
-            Err(e) => {
-                self.status_message = Some(format!(
-                    "Review gate: could not serialize work item ID: {e}"
-                ));
-                return false;
-            }
-        };
-        let context_json = serde_json::json!({
-            "work_item_id": wi_id_str,
-            "stage": "ReviewGate",
-            "title": wi.title,
-        })
-        .to_string();
+        self.review_gate_rx = Some(rx);
+        self.review_gate_wi = Some(wi_id.clone());
+        self.review_gate_activity = Some(self.start_activity("Running review gate..."));
+        true
+    }
 
-        let server = match McpSocketServer::start(
-            socket_path.clone(),
-            wi_id_str,
-            context_json,
-            None,
-            self.mcp_tx.clone(),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                self.status_message = Some(format!("Review gate: MCP server failed to start: {e}"));
-                return false;
-            }
+    /// Poll the async review gate for a result. Called on each timer tick.
+    /// If the gate has completed, processes the result: advances to Review
+    /// if approved, stays in Implementing if rejected.
+    pub fn poll_review_gate(&mut self) {
+        let rx = match self.review_gate_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
         };
 
-        // Build claude command with system prompt and MCP config.
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(crossbeam_channel::TryRecvError::Empty) => return, // Still running.
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                // Thread exited without sending - treat as gate error.
+                self.review_gate_rx = None;
+                self.review_gate_wi = None;
+                if let Some(aid) = self.review_gate_activity.take() {
+                    self.end_activity(aid);
+                }
                 self.status_message =
-                    Some(format!("Review gate: cannot resolve executable path: {e}"));
-                return false;
+                    Some("Review gate: background thread exited unexpectedly".into());
+                return;
             }
         };
-        let mcp_config = crate::mcp::build_mcp_config(&exe, &socket_path);
 
-        let mut cmd: Vec<String> = vec!["claude".to_string()];
-        cmd.push("--system-prompt".to_string());
-        cmd.push(system);
-
-        // Write MCP config to a temp file for --mcp-config.
-        let config_path = std::env::temp_dir().join(format!(
-            "workbridge-review-gate-mcp-{}.json",
-            uuid::Uuid::new_v4()
-        ));
-        if let Err(e) = std::fs::write(&config_path, &mcp_config) {
-            self.status_message = Some(format!("Review gate: MCP config write error: {e}"));
-            return false;
+        // Gate completed - clear the receiver and tracked work item.
+        self.review_gate_rx = None;
+        self.review_gate_wi = None;
+        if let Some(aid) = self.review_gate_activity.take() {
+            self.end_activity(aid);
         }
-        cmd.push("--mcp-config".to_string());
-        cmd.push(config_path.to_string_lossy().to_string());
 
-        // Do NOT write .mcp.json to the worktree cwd for the review gate.
-        // The gate session gets its MCP config via --mcp-config (temp file).
-        // Writing .mcp.json here would overwrite the implementing session's
-        // config and leave a stale pointer when the gate's socket is removed.
+        let wi_id = result.work_item_id.clone();
 
-        // Pass the prompt (plan + diff) as initial input via -p flag.
-        let prompt = format!("Plan:\n{plan}\n\nDiff:\n{diff}");
-        cmd.push("-p".to_string());
-        cmd.push(prompt);
-        cmd.push("--allowedTools".to_string());
-        cmd.push("mcp__workbridge__workbridge_review_gate_result".to_string());
+        // Verify the work item is still in Implementing before applying the
+        // gate result. If the user retreated the item while the gate was
+        // running, we discard the result silently - the user intentionally
+        // moved away.
+        let still_implementing = self
+            .work_items
+            .iter()
+            .find(|w| w.id == wi_id)
+            .map(|w| w.status == WorkItemStatus::Implementing)
+            .unwrap_or(false);
 
-        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        if !still_implementing {
+            // Work item is no longer in Implementing - discard the gate result.
+            return;
+        }
 
-        match Session::spawn(self.pane_cols, self.pane_rows, Some(&cwd), &cmd_refs) {
-            Ok(session) => {
-                self.review_gate_mcp = Some(server);
-                self.review_gate_session = Some(session);
-                self.review_gate_wi = Some(wi_id.clone());
-                self.review_gate_spinner_frame = 0;
-                self.status_message = Some("Running review gate...".into());
-                true
+        if result.approved {
+            // Log approval and advance to Review.
+            let entry = ActivityEntry {
+                timestamp: now_iso8601(),
+                event_type: "review_gate".to_string(),
+                payload: serde_json::json!({
+                    "result": "approved",
+                    "response": result.detail
+                }),
+            };
+            if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
+                self.status_message = Some(format!("Activity log error: {e}"));
             }
-            Err(e) => {
-                self.status_message = Some(format!("Review gate: session spawn error: {e}"));
-                false
+
+            self.apply_stage_change(
+                &wi_id,
+                &WorkItemStatus::Implementing,
+                &WorkItemStatus::Review,
+                "review_gate",
+            );
+        } else {
+            // Log rejection and stay in Implementing.
+            let entry = ActivityEntry {
+                timestamp: now_iso8601(),
+                event_type: "review_gate".to_string(),
+                payload: serde_json::json!({
+                    "result": "rejected",
+                    "reason": result.detail
+                }),
+            };
+            if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
+                self.status_message = Some(format!("Activity log error: {e}"));
             }
+            // Store the rejection reason so the next Claude session uses the
+            // implementing_rework prompt with specific feedback, rather than
+            // a generic implementing prompt.
+            self.rework_reasons
+                .insert(wi_id.clone(), result.detail.clone());
+            self.status_message = Some(format!("Review gate rejected: {}", result.detail));
         }
     }
 
@@ -5688,5 +6147,88 @@ mod tests {
             // Last arg should be the system prompt value, not a positional prompt.
             assert_eq!(cmd.last().unwrap(), "prompt");
         }
+    }
+
+    // -- Activity indicator tests --
+
+    #[test]
+    fn start_activity_returns_unique_ids() {
+        let mut app = App::new();
+        let id1 = app.start_activity("First");
+        let id2 = app.start_activity("Second");
+        assert_ne!(id1, id2);
+        assert_eq!(app.activities.len(), 2);
+    }
+
+    #[test]
+    fn end_activity_removes_by_id() {
+        let mut app = App::new();
+        let id1 = app.start_activity("First");
+        let id2 = app.start_activity("Second");
+        app.end_activity(id1);
+        assert_eq!(app.activities.len(), 1);
+        assert_eq!(app.current_activity(), Some("Second"));
+        app.end_activity(id2);
+        assert!(app.activities.is_empty());
+        assert_eq!(app.current_activity(), None);
+    }
+
+    #[test]
+    fn end_activity_noop_for_unknown_id() {
+        let mut app = App::new();
+        let id = app.start_activity("Test");
+        app.end_activity(ActivityId(999));
+        assert_eq!(app.activities.len(), 1);
+        app.end_activity(id);
+        assert!(app.activities.is_empty());
+    }
+
+    #[test]
+    fn current_activity_returns_last() {
+        let mut app = App::new();
+        assert_eq!(app.current_activity(), None);
+        app.start_activity("First");
+        assert_eq!(app.current_activity(), Some("First"));
+        app.start_activity("Second");
+        assert_eq!(app.current_activity(), Some("Second"));
+    }
+
+    #[test]
+    fn current_activity_pops_to_previous_on_end() {
+        let mut app = App::new();
+        let _id1 = app.start_activity("First");
+        let id2 = app.start_activity("Second");
+        app.end_activity(id2);
+        assert_eq!(app.current_activity(), Some("First"));
+    }
+
+    #[test]
+    fn has_visible_status_bar_with_activity() {
+        let mut app = App::new();
+        assert!(!app.has_visible_status_bar());
+        let id = app.start_activity("Working...");
+        assert!(app.has_visible_status_bar());
+        app.end_activity(id);
+        assert!(!app.has_visible_status_bar());
+    }
+
+    #[test]
+    fn has_visible_status_bar_with_message() {
+        let mut app = App::new();
+        app.status_message = Some("test".into());
+        assert!(app.has_visible_status_bar());
+    }
+
+    #[test]
+    fn has_visible_status_bar_activity_overrides_message() {
+        let mut app = App::new();
+        app.status_message = Some("test".into());
+        let id = app.start_activity("Working...");
+        assert!(app.has_visible_status_bar());
+        // Activity takes precedence in rendering, but bar is visible either way.
+        assert_eq!(app.current_activity(), Some("Working..."));
+        app.end_activity(id);
+        // Status message still keeps bar visible.
+        assert!(app.has_visible_status_bar());
     }
 }

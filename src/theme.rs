@@ -52,6 +52,14 @@ pub struct Theme {
     /// Shutdown status bar background.
     pub status_shutdown_bg: Color,
 
+    // -- Activity indicator --
+    /// Activity spinner character color.
+    pub activity_spinner: Color,
+    /// Activity message text color.
+    pub activity_fg: Color,
+    /// Activity indicator background.
+    pub activity_bg: Color,
+
     // -- Context bar --
     /// Work-item context bar foreground (title and repo path).
     pub context_fg: Color,
@@ -118,6 +126,10 @@ impl Theme {
             status_bg: Color::Reset,
             status_shutdown_fg: Color::Red,
             status_shutdown_bg: Color::Reset,
+
+            activity_spinner: Color::Cyan,
+            activity_fg: Color::Cyan,
+            activity_bg: Color::Reset,
 
             context_fg: Color::Cyan,
             context_bg: Color::Reset,
@@ -215,6 +227,17 @@ impl Theme {
         Style::default()
             .fg(self.status_shutdown_fg)
             .bg(self.status_shutdown_bg)
+    }
+
+    pub fn style_activity_spinner(&self) -> Style {
+        Style::default()
+            .fg(self.activity_spinner)
+            .bg(self.activity_bg)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn style_activity(&self) -> Style {
+        Style::default().fg(self.activity_fg).bg(self.activity_bg)
     }
 
     pub fn style_context(&self) -> Style {

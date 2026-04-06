@@ -152,7 +152,7 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
         let term = ctx.terminal();
         let term_ref = term.borrow();
         let size = term_ref.size().map_err(AppError::from)?;
-        let bottom_rows = u16::from(state.status_message.is_some())
+        let bottom_rows = u16::from(state.has_visible_status_bar())
             + u16::from(state.selected_work_item_context().is_some());
         let pl = layout::compute(size.width, size.height, bottom_rows);
         state.pane_cols = pl.pane_cols;
@@ -244,6 +244,11 @@ pub fn app_event(
             Ok(Control::Changed)
         }
         AppEvent::Timer(_) => {
+            // Advance spinner for activity indicator animation.
+            if !state.activities.is_empty() {
+                state.spinner_tick = state.spinner_tick.wrapping_add(1);
+            }
+
             // Poll MCP status updates BEFORE liveness check so that a
             // review gate verdict arriving in the same tick as session
             // exit is processed before check_liveness clears review_gate_wi.
@@ -267,13 +272,30 @@ pub fn app_event(
                 state.global_mcp_context_dirty = false;
             }
 
-            // Advance the review gate spinner animation.
-            if state.review_gate_wi.is_some() {
-                state.review_gate_spinner_frame = state.review_gate_spinner_frame.wrapping_add(1);
-            }
+            // Poll async operations. Capture status bar visibility before
+            // and after so we can sync layout if an activity started or ended.
+            let had_status = state.has_visible_status_bar();
+
+            // Poll async review gate result.
+            state.poll_review_gate();
+
+            // Poll async PR creation result.
+            state.poll_pr_creation();
+
+            // Poll async PR merge result.
+            state.poll_pr_merge();
+
+            // Poll async worktree creation result.
+            state.poll_worktree_creation();
 
             // Surface queued fetch errors.
             state.drain_pending_fetch_errors();
+
+            // If status bar visibility changed (activity started/ended),
+            // resync layout so pane dimensions match the actual display area.
+            if state.has_visible_status_bar() != had_status {
+                event::sync_layout(state);
+            }
 
             // Check for external signals (SIGTERM, SIGINT).
             if ctx.signal_received.swap(false, Ordering::Relaxed) {
