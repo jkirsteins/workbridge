@@ -5,15 +5,15 @@ expression: "render(&app, 80, 24)"
 ┌ Work Items (3) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  ACTIVE (1)           ││                                                     │
 │> [IM] Second item     ││  Second item                                        │
-│       branch-b (0)    ││                                                     │
-│      [no wt]          ││  Status      Implementing                           │
+│  Branch: branch-b     ││                                                     │
+│  Repo: 0 [no wt]      ││  Status      Implementing                           │
 │  BACKLOGGED (2)       ││  Backend     Local file                             │
 │  [BL] First item      ││  Repo        /repo/b/0                              │
-│       branch-a (0)    ││  Branch      branch-b                               │
-│      [no wt]          ││  Worktree    (none)                                 │
+│  Branch: branch-a     ││  Branch      branch-b                               │
+│  Repo: 0 [no wt]      ││  Worktree    (none)                                 │
 │  [BL] Third item      ││  PR          (none)                                 │
-│       branch-c (0)    ││  Issue       (none)                                 │
-│      [no wt]          ││  Errors      (none)                                 │
+│  Branch: branch-c     ││  Issue       (none)                                 │
+│  Repo: 0 [no wt]      ││  Errors      (none)                                 │
 │                       ││                                                     │
 │                       ││  Press Enter to start a session.                    │
 │                       ││                                                     │

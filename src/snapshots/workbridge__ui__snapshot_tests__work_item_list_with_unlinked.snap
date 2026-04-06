@@ -8,8 +8,8 @@ expression: "render(&app, 80, 24)"
 │  ? updat.. PR#12 draft││  this PR as a work item.                            │
 │  ACTIVE (1)           ││                                                     │
 │  [IM] Activ.. PR#30 ok││                                                     │
-│       branch-prog-1 ( ││                                                     │
-│      0) [no wt]       ││                                                     │
+│  Branch: branch-prog-1││                                                     │
+│  Repo: 0 [no wt]      ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

@@ -265,7 +265,6 @@ fn format_work_item_entry<'a>(
     // Stage badge + title.
     let badge = wi.status.badge_text();
     let prefix = format!("{badge} ");
-    let meta_indent = " ".repeat(prefix.width());
     // Minimum number of display columns reserved for the title so it never
     // vanishes when badges consume all available width.
     const MIN_TITLE_BUDGET: usize = 5;
@@ -342,13 +341,18 @@ fn format_work_item_entry<'a>(
             .unwrap_or_default();
         let wt_indicator = if has_worktree { "" } else { " [no wt]" };
 
-        let meta_content = format!("{meta_indent}{branch_name} ({repo_name}){wt_indicator}");
-        let wrapped = wrap_text(&meta_content, max_width);
-        for wrapped_line in wrapped {
-            lines.push(Line::from(vec![Span::styled(
-                wrapped_line,
-                theme.style_text_muted(),
-            )]));
+        // Branch and repo on separate lines; only line-broken
+        // continuations are indented.
+        for meta_line in [
+            format!("Branch: {branch_name}"),
+            format!("Repo: {repo_name}{wt_indicator}"),
+        ] {
+            for wrapped_line in wrap_text(&meta_line, max_width) {
+                lines.push(Line::from(vec![Span::styled(
+                    wrapped_line,
+                    theme.style_text_muted(),
+                )]));
+            }
         }
     } else if let Some(assoc) = first_assoc {
         // Pre-planning: just show repo name, no tags
@@ -358,7 +362,7 @@ fn format_work_item_entry<'a>(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         if !repo_name.is_empty() {
-            let meta_content = format!("{meta_indent}{repo_name}");
+            let meta_content = format!("Repo: {repo_name}");
             let wrapped = wrap_text(&meta_content, max_width);
             for wrapped_line in wrapped {
                 lines.push(Line::from(vec![Span::styled(

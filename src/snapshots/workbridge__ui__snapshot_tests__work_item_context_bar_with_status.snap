@@ -5,8 +5,8 @@ expression: "render(&app, 80, 24)"
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  BACKLOGGED (1)       ││                                                     │
 │> [BL] Fix resize bug  ││  Fix resize bug                                     │
-│       branch-ctx-3 (  ││                                                     │
-│      0) [no wt]       ││  Status      Backlog                                │
+│  Branch: branch-ctx-3 ││                                                     │
+│  Repo: 0 [no wt]      ││  Status      Backlog                                │
 │                       ││  Backend     Local file                             │
 │                       ││  Repo        /repo/ctx-3/0                          │
 │                       ││  Branch      branch-ctx-3                           │

@@ -5,8 +5,8 @@ expression: "render(&app, 80, 24)"
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  ACTIVE (1)           ││                                                     │
 │> [IM] Broken work item││  Errors:                                            │
-│       42-fix-bug (    ││                                                     │
-│      alpha) [no wt]   ││  - 2 open PRs for branch '42-fix-bug' in /repo/alpha│
+│  Branch: 42-fix-bug   ││                                                     │
+│  Repo: alpha [no wt]  ││  - 2 open PRs for branch '42-fix-bug' in /repo/alpha│
 │                       ││    Close duplicate PRs to resolve.                  │
 │                       ││                                                     │
 │                       ││  - Issue #42 not found in /repo/alpha               │

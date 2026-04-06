@@ -5,8 +5,8 @@ expression: "render(&app, 80, 24)"
 ┌ Work Items (1) ───────┐┌ Claude Code [INPUT] ────────────────────────────────┐
 │  BACKLOGGED (1)       ││                                                     │
 │> [BL] Fix authentica..││  Fix authentication bug                             │
-│       branch-todo-1 ( ││                                                     │
-│      0) [no wt]       ││  Status      Backlog                                │
+│  Branch: branch-todo-1││                                                     │
+│  Repo: 0 [no wt]      ││  Status      Backlog                                │
 │                       ││  Backend     Local file                             │
 │                       ││  Repo        /repo/todo-1/0                         │
 │                       ││  Branch      branch-todo-1                          │

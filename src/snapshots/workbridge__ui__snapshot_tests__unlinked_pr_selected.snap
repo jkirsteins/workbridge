@@ -7,8 +7,8 @@ expression: "render(&app, 80, 24)"
 │> ? fix-typo      PR#45││  Press Enter to import                              │
 │  ACTIVE (1)           ││  this PR as a work item.                            │
 │  [IM] Activ.. PR#30 ok││                                                     │
-│       branch-prog-1 ( ││                                                     │
-│      0) [no wt]       ││                                                     │
+│  Branch: branch-prog-1││                                                     │
+│  Repo: 0 [no wt]      ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
