@@ -270,6 +270,8 @@ pub struct App {
     pub review_gate_rx: Option<crossbeam_channel::Receiver<ReviewGateResult>>,
     /// Activity ID for the running review gate indicator.
     pub review_gate_activity: Option<ActivityId>,
+    /// Progress summary from the review gate, shown in the right panel.
+    pub review_gate_progress: Option<String>,
 
     // -- Activity indicator --
     /// Monotonic counter for generating unique ActivityId values.
@@ -430,6 +432,7 @@ impl App {
             review_gate_wi: None,
             review_gate_rx: None,
             review_gate_activity: None,
+            review_gate_progress: None,
             activity_counter: 0,
             activities: Vec::new(),
             spinner_tick: 0,
@@ -649,7 +652,8 @@ impl App {
     /// Also cleans up .mcp.json files and MCP servers for dead sessions.
     pub fn check_liveness(&mut self) {
         let mut dead_ids: Vec<WorkItemId> = Vec::new();
-        for ((wi_id, _stage), entry) in self.sessions.iter_mut() {
+        let mut dead_implementing: Vec<WorkItemId> = Vec::new();
+        for ((wi_id, stage), entry) in self.sessions.iter_mut() {
             let was_alive = entry.alive;
             if let Some(ref mut session) = entry.session {
                 entry.alive = session.is_alive();
@@ -658,11 +662,45 @@ impl App {
             }
             if was_alive && !entry.alive {
                 dead_ids.push(wi_id.clone());
+                if *stage == WorkItemStatus::Implementing {
+                    dead_implementing.push(wi_id.clone());
+                }
             }
         }
         // Clean up MCP resources for newly dead sessions.
-        for id in dead_ids {
-            self.cleanup_mcp_for(&id);
+        for id in &dead_ids {
+            self.cleanup_mcp_for(id);
+        }
+
+        // Auto-trigger review gate when an implementing session dies.
+        // If the session ended without calling workbridge_set_status("Review"),
+        // check for commits and run the gate automatically.
+        for wi_id in dead_implementing {
+            let wi = match self.work_items.iter().find(|w| w.id == wi_id) {
+                Some(w) => w,
+                None => continue,
+            };
+            if wi.status != WorkItemStatus::Implementing || self.review_gate_wi.is_some() {
+                continue;
+            }
+            // Extract paths before calling &mut self methods.
+            let paths = wi.repo_associations.first().and_then(|assoc| {
+                let wt = assoc.worktree_path.clone()?;
+                Some((wt, assoc.repo_path.clone()))
+            });
+            let has_commits = match paths {
+                Some((wt, repo)) => self.branch_has_commits(&wt, &repo),
+                None => false,
+            };
+            if has_commits {
+                if self.spawn_review_gate(&wi_id) {
+                    self.status_message =
+                        Some("Implementing session ended - running review gate...".into());
+                }
+            } else {
+                self.status_message =
+                    Some("Implementing session ended with no commits on branch".into());
+            }
         }
 
         // Kill sessions whose stage doesn't match the work item's current stage.
@@ -777,6 +815,7 @@ impl App {
         // Cancel any in-flight review gate.
         self.review_gate_rx = None;
         self.review_gate_wi = None;
+        self.review_gate_progress = None;
         if let Some(aid) = self.review_gate_activity.take() {
             self.end_activity(aid);
         }
@@ -1990,13 +2029,24 @@ impl App {
                         }
 
                         // Auto-advance from Planning to Implementing when plan is set.
-                        // The orphan cleanup in check_liveness will kill the Planning session.
-                        if let Some(wi) = self.work_items.iter().find(|w| w.id == wi_id)
-                            && wi.status == WorkItemStatus::Planning
-                        {
-                            let current = WorkItemStatus::Planning;
-                            let next = WorkItemStatus::Implementing;
-                            self.apply_stage_change(&wi_id, &current, &next, "mcp");
+                        // Read authoritative status from disk rather than the
+                        // in-memory cache, which may be stale. The orphan cleanup
+                        // in check_liveness will kill the Planning session.
+                        match self.backend.read(&wi_id) {
+                            Ok(record) if record.status == WorkItemStatus::Planning => {
+                                self.apply_stage_change(
+                                    &wi_id,
+                                    &WorkItemStatus::Planning,
+                                    &WorkItemStatus::Implementing,
+                                    "mcp",
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                self.status_message = Some(format!(
+                                    "Plan saved but could not verify status: {e}"
+                                ));
+                            }
                         }
                     }
                 }
@@ -2361,6 +2411,7 @@ impl App {
         if self.review_gate_wi.as_ref() == Some(&wi_id) {
             self.review_gate_rx = None;
             self.review_gate_wi = None;
+            self.review_gate_progress = None;
             if let Some(aid) = self.review_gate_activity.take() {
                 self.end_activity(aid);
             }
@@ -3090,6 +3141,7 @@ impl App {
         // Spawn the claude --print check in a background thread.
         let (tx, rx) = crossbeam_channel::bounded(1);
         let wi_id_clone = wi_id.clone();
+        let review_skill = self.config.defaults.review_skill.clone();
 
         std::thread::spawn(move || {
             let mut vars = std::collections::HashMap::new();
@@ -3098,7 +3150,7 @@ impl App {
             let system = crate::prompts::render("review_gate", &vars).unwrap_or_else(|| {
                 "Compare plan to diff. Respond APPROVED or REJECTED: reason".into()
             });
-            let prompt = format!("Plan:\n{plan}\n\nDiff:\n{diff}");
+            let prompt = format!("{review_skill}\n\nPlan:\n{plan}\n\nDiff:\n{diff}");
 
             let result = match std::process::Command::new("claude")
                 .args(["--print", "-p", &prompt, "--system-prompt", &system])
@@ -3164,6 +3216,7 @@ impl App {
                 // Thread exited without sending - treat as gate error.
                 self.review_gate_rx = None;
                 self.review_gate_wi = None;
+                self.review_gate_progress = None;
                 if let Some(aid) = self.review_gate_activity.take() {
                     self.end_activity(aid);
                 }
@@ -3176,6 +3229,7 @@ impl App {
         // Gate completed - clear the receiver and tracked work item.
         self.review_gate_rx = None;
         self.review_gate_wi = None;
+        self.review_gate_progress = None;
         if let Some(aid) = self.review_gate_activity.take() {
             self.end_activity(aid);
         }
@@ -3624,6 +3678,10 @@ impl WorktreeService for StubWorktreeService {
 pub struct StubBackend;
 
 impl WorkItemBackend for StubBackend {
+    fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+        Err(BackendError::NotFound(id.clone()))
+    }
+
     fn list(&self) -> Result<crate::work_item_backend::ListResult, BackendError> {
         Ok(crate::work_item_backend::ListResult {
             records: Vec::new(),
@@ -3826,6 +3884,10 @@ mod tests {
         }
 
         impl WorkItemBackend for TestBackend {
+            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                self.records.lock().unwrap().iter().find(|r| r.id == *id).cloned()
+                    .ok_or_else(|| BackendError::NotFound(id.clone()))
+            }
             fn list(&self) -> Result<ListResult, BackendError> {
                 Ok(ListResult {
                     records: self.records.lock().unwrap().clone(),
@@ -3957,6 +4019,9 @@ mod tests {
         struct CreateBackend;
 
         impl WorkItemBackend for CreateBackend {
+            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Err(BackendError::NotFound(id.clone()))
+            }
             fn list(&self) -> Result<ListResult, BackendError> {
                 Ok(ListResult {
                     records: Vec::new(),
@@ -4239,6 +4304,10 @@ mod tests {
         }
 
         impl WorkItemBackend for OrderableBackend {
+            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                self.records.lock().unwrap().iter().find(|r| r.id == *id).cloned()
+                    .ok_or_else(|| BackendError::NotFound(id.clone()))
+            }
             fn list(&self) -> Result<ListResult, BackendError> {
                 Ok(ListResult {
                     records: self.records.lock().unwrap().clone(),
@@ -4791,6 +4860,10 @@ mod tests {
         }
 
         impl WorkItemBackend for TestBackend {
+            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                self.records.lock().unwrap().iter().find(|r| r.id == *id).cloned()
+                    .ok_or_else(|| BackendError::NotFound(id.clone()))
+            }
             fn list(&self) -> Result<ListResult, BackendError> {
                 Ok(ListResult {
                     records: self.records.lock().unwrap().clone(),
@@ -5010,6 +5083,10 @@ mod tests {
         }
 
         impl WorkItemBackend for TestBackend {
+            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                self.records.lock().unwrap().iter().find(|r| r.id == *id).cloned()
+                    .ok_or_else(|| BackendError::NotFound(id.clone()))
+            }
             fn list(&self) -> Result<ListResult, BackendError> {
                 Ok(ListResult {
                     records: self.records.lock().unwrap().clone(),
@@ -5251,6 +5328,10 @@ mod tests {
         }
 
         impl WorkItemBackend for TestBackend {
+            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                self.records.lock().unwrap().iter().find(|r| r.id == *id).cloned()
+                    .ok_or_else(|| BackendError::NotFound(id.clone()))
+            }
             fn list(&self) -> Result<ListResult, BackendError> {
                 Ok(ListResult {
                     records: self.records.lock().unwrap().clone(),
@@ -5390,6 +5471,9 @@ mod tests {
         }
 
         impl WorkItemBackend for RecordingBackend {
+            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Err(BackendError::NotFound(id.clone()))
+            }
             fn list(&self) -> Result<ListResult, BackendError> {
                 Ok(ListResult {
                     records: Vec::new(),

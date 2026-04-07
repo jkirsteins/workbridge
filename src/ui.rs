@@ -824,11 +824,15 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 let spinner_chars = [b'|', b'/', b'-', b'\\'];
                 let frame = app.spinner_tick as usize % spinner_chars.len();
                 let spinner = spinner_chars[frame] as char;
+                let progress_text = app
+                    .review_gate_progress
+                    .as_deref()
+                    .unwrap_or("Checking implementation against plan.");
                 let text = Text::from(vec![
                     Line::from(""),
                     Line::from(format!("  {spinner} Running review gate...")),
                     Line::from(""),
-                    Line::from("  Checking implementation against plan."),
+                    Line::from(format!("  {progress_text}")),
                 ]);
                 let paragraph = Paragraph::new(text)
                     .block(block)
@@ -2043,6 +2047,10 @@ mod snapshot_tests {
     }
 
     impl WorkItemBackend for MockBackend {
+        fn read(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
+            self.records.iter().find(|r| r.id == *id).cloned()
+                .ok_or_else(|| BackendError::NotFound(id.clone()))
+        }
         fn list(&self) -> Result<crate::work_item_backend::ListResult, BackendError> {
             Ok(crate::work_item_backend::ListResult {
                 records: self.records.clone(),

@@ -129,6 +129,9 @@ pub trait WorkItemBackend: Send + Sync {
     /// entries to the user rather than silently ignoring them.
     fn list(&self) -> Result<ListResult, BackendError>;
 
+    /// Read a single work item record by ID.
+    fn read(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError>;
+
     /// Create a new work item and return the created record.
     /// Must return BackendError::Validation if request.repo_associations
     /// is empty (Invariant 1: at least one repo required).
@@ -279,6 +282,10 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 impl WorkItemBackend for LocalFileBackend {
+    fn read(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
+        self.read_record(id)
+    }
+
     fn list(&self) -> Result<ListResult, BackendError> {
         let entries = fs::read_dir(&self.data_dir).map_err(|e| {
             BackendError::Io(format!(

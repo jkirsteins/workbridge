@@ -105,6 +105,9 @@ pub struct Defaults {
     /// Regex for extracting issue identifiers from branch names.
     #[serde(default = "default_branch_issue_pattern")]
     pub branch_issue_pattern: String,
+    /// Skill (slash command) to invoke for the review gate.
+    #[serde(default = "default_review_skill")]
+    pub review_skill: String,
 }
 
 fn default_worktree_dir() -> String {
@@ -115,11 +118,16 @@ fn default_branch_issue_pattern() -> String {
     r"^(\d+)-".into()
 }
 
+fn default_review_skill() -> String {
+    "/claude-adversarial-review".into()
+}
+
 impl Default for Defaults {
     fn default() -> Self {
         Self {
             worktree_dir: default_worktree_dir(),
             branch_issue_pattern: default_branch_issue_pattern(),
+            review_skill: default_review_skill(),
         }
     }
 }
