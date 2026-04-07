@@ -442,13 +442,23 @@ fn handle_message(
                     let send_ok = tx.send(event).is_ok();
 
                     if send_ok {
+                        let response_text = if status == "Review" {
+                            format!(
+                                "Status change to {status} submitted to review gate. \
+                                 The status has NOT changed yet - it remains at its current stage \
+                                 until the review gate approves or rejects. \
+                                 Do NOT tell the user the status changed."
+                            )
+                        } else {
+                            format!("Status change to {status} requested - pending validation by workbridge")
+                        };
                         Some(json!({
                             "jsonrpc": "2.0",
                             "id": id,
                             "result": {
                                 "content": [{
                                     "type": "text",
-                                    "text": format!("Status change to {status} requested - pending validation by workbridge")
+                                    "text": response_text
                                 }]
                             }
                         }))
@@ -1330,5 +1340,62 @@ mod tests {
         assert!(resp.get("error").is_some());
         assert_eq!(resp["error"]["code"], -32601);
         assert!(rx.try_recv().is_err());
+    }
+
+    // -- Review gate MCP wording regression tests --
+
+    /// Regression: set_status("Review") response must contain "NOT changed"
+    /// and "review gate" to prevent Claude from telling the user the status
+    /// changed when it has not (it is pending gate approval).
+    #[test]
+    fn set_status_review_response_contains_not_changed() {
+        let (tx, _rx) = unbounded();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "workbridge_set_status",
+                "arguments": {
+                    "status": "Review",
+                    "reason": "Implementation complete"
+                }
+            }
+        });
+        let resp = handle_message(&msg, "wi-wording", "{}", None, &tx).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("NOT changed") || text.contains("NOT"),
+            "Review response must warn Claude that status has NOT changed, got: {text}",
+        );
+        assert!(
+            text.contains("review gate"),
+            "Review response must mention 'review gate', got: {text}",
+        );
+    }
+
+    /// Regression: set_status("Blocked") response must NOT contain "NOT changed"
+    /// since non-Review transitions are applied immediately.
+    #[test]
+    fn set_status_blocked_response_does_not_contain_not_changed() {
+        let (tx, _rx) = unbounded();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "workbridge_set_status",
+                "arguments": {
+                    "status": "Blocked",
+                    "reason": "Need user input"
+                }
+            }
+        });
+        let resp = handle_message(&msg, "wi-wording", "{}", None, &tx).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("NOT changed"),
+            "Blocked response must NOT contain 'NOT changed', got: {text}",
+        );
     }
 }

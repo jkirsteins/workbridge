@@ -78,7 +78,7 @@ Work items follow a six-stage workflow:
 - **Planning** - A Claude session produces an implementation plan. Advancing to Implementing requires the plan to be set via `workbridge_set_plan`; manual advance is blocked.
 - **Implementing** - Active development. A Claude session works on the code.
 - **Blocked** - The implementation is stuck and needs user input. Can move back to Implementing when unblocked.
-- **Review** - Implementation is complete and under review. Entering Review from Implementing triggers a review gate (async plan-vs-implementation check) and auto-creates a PR.
+- **Review** - Implementation is complete and under review. Entering Review from Implementing or Blocked triggers a review gate (async plan-vs-implementation check) and auto-creates a PR.
 - **Done** - Work is finished. This status is derived, not directly settable (see below).
 
 ### Status transitions
@@ -88,13 +88,14 @@ Most forward transitions are triggered by the user via TUI keybinds (advance/ret
 - Implementing -> Review (routed through the review gate)
 - Implementing -> Blocked
 - Blocked -> Implementing
+- Blocked -> Review (routed through the review gate)
 - Planning -> Implementing
 
 All other transitions must go through TUI keybinds.
 
 ### Review gate
 
-When a work item transitions from Implementing to Review (whether user- or MCP-initiated), a review gate runs asynchronously. It compares the implementation plan against the actual code changes and produces findings. If no plan exists, the gate is skipped.
+When a work item transitions from Implementing or Blocked to Review (whether user- or MCP-initiated), a review gate runs asynchronously. It compares the implementation plan against the actual code changes and produces findings. If no plan exists, the gate is skipped.
 
 ### Merge gate
 

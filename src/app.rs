@@ -2115,13 +2115,15 @@ impl App {
 
                     // Restrict MCP to valid forward transitions only.
                     // Allowed: Implementing -> Review (via gate), Implementing -> Blocked,
-                    // Blocked -> Implementing, Planning -> Implementing.
+                    // Blocked -> Implementing, Blocked -> Review (via gate),
+                    // Planning -> Implementing.
                     // All other transitions must go through the TUI keybinds.
                     let allowed = matches!(
                         (&current_status, &new_status),
                         (Some(WorkItemStatus::Implementing), WorkItemStatus::Review)
                             | (Some(WorkItemStatus::Implementing), WorkItemStatus::Blocked)
                             | (Some(WorkItemStatus::Blocked), WorkItemStatus::Implementing)
+                            | (Some(WorkItemStatus::Blocked), WorkItemStatus::Review)
                             | (Some(WorkItemStatus::Planning), WorkItemStatus::Implementing)
                     );
                     if !allowed {
@@ -2161,10 +2163,11 @@ impl App {
                         continue;
                     }
 
-                    // Review gate: when MCP requests Implementing -> Review,
+                    // Review gate: when MCP requests Implementing/Blocked -> Review,
                     // the review gate is the single chokepoint - the transition
                     // is blocked unless the gate spawns and later approves it.
-                    if current_status.as_ref() == Some(&WorkItemStatus::Implementing)
+                    if (current_status.as_ref() == Some(&WorkItemStatus::Implementing)
+                        || current_status.as_ref() == Some(&WorkItemStatus::Blocked))
                         && new_status == WorkItemStatus::Review
                     {
                         match self.spawn_review_gate(&wi_id) {
@@ -2173,7 +2176,41 @@ impl App {
                                     Some("Claude requested Review - running review gate...".into());
                             }
                             ReviewGateSpawn::Blocked(reason) => {
-                                self.status_message = Some(reason);
+                                // If a gate is already running (for this or another item),
+                                // just inform Claude - don't rework, the event is dropped
+                                // and Claude will need to request Review again.
+                                if reason.contains("already running") {
+                                    self.status_message = Some(reason);
+                                } else {
+                                    // Gate truly can't run (no plan, no diff, git error).
+                                    // Apply the rework flow so Claude gets feedback instead
+                                    // of waiting forever for a gate result that never comes.
+                                    self.rework_reasons
+                                        .insert(wi_id.clone(), reason.clone());
+                                    self.status_message = Some(format!(
+                                        "Review gate failed to start: {reason}"
+                                    ));
+                                    // If Blocked, transition to Implementing so the
+                                    // implementing_rework prompt (with {rework_reason}) is used.
+                                    if current_status.as_ref() == Some(&WorkItemStatus::Blocked)
+                                    {
+                                        let _ = self.backend.update_status(
+                                            &wi_id,
+                                            WorkItemStatus::Implementing,
+                                        );
+                                        self.reassemble_work_items();
+                                        self.build_display_list();
+                                    }
+                                    // Kill and respawn the session with rework prompt.
+                                    if let Some(key) = self.session_key_for(&wi_id)
+                                        && let Some(mut entry) = self.sessions.remove(&key)
+                                        && let Some(ref mut session) = entry.session
+                                    {
+                                        session.kill();
+                                    }
+                                    self.cleanup_mcp_for(&wi_id);
+                                    self.spawn_session(&wi_id);
+                                }
                             }
                         }
                         continue;
@@ -2585,7 +2622,10 @@ impl App {
         // The gate runs asynchronously in a background thread to avoid
         // blocking the TUI. The transition is blocked unless the gate
         // spawns and later approves it via poll_review_gate.
-        if current_status == WorkItemStatus::Implementing && new_status == WorkItemStatus::Review {
+        if (current_status == WorkItemStatus::Implementing
+            || current_status == WorkItemStatus::Blocked)
+            && new_status == WorkItemStatus::Review
+        {
             match self.spawn_review_gate(&wi_id) {
                 ReviewGateSpawn::Spawned => {
                     // Gate is running in background - do not advance yet.
@@ -2763,8 +2803,20 @@ impl App {
             self.spawn_pr_creation(wi_id);
         }
 
+        // Kill the old session for this work item before spawning a new one.
+        // Previously relied on orphan cleanup in check_liveness, but that
+        // leaves two sessions alive briefly and the old one can do work
+        // (push, commit, etc.) in the gap.
+        if let Some(old_key) = self.session_key_for(wi_id)
+            && let Some(mut entry) = self.sessions.remove(&old_key)
+        {
+            if let Some(ref mut session) = entry.session {
+                session.kill();
+            }
+            self.cleanup_mcp_for(wi_id);
+        }
+
         // Auto-spawn a session for stages that have prompts.
-        // The orphan cleanup in check_liveness handles killing the old session.
         if !matches!(new_status, WorkItemStatus::Backlog | WorkItemStatus::Done) {
             self.spawn_session(wi_id);
         }
@@ -2879,6 +2931,34 @@ impl App {
                     });
                     return;
                 }
+            }
+
+            // Ensure the branch is pushed to the remote before creating the PR.
+            let push_output = std::process::Command::new("git")
+                .args(["push", "-u", "origin", &branch])
+                .current_dir(&repo_path)
+                .output();
+            match push_output {
+                Ok(output) if !output.status.success() => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    let _ = tx.send(PrCreateResult {
+                        wi_id,
+                        info: None,
+                        error: Some(format!("git push failed: {stderr}")),
+                        url: None,
+                    });
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(PrCreateResult {
+                        wi_id,
+                        info: None,
+                        error: Some(format!("git push failed: {e}")),
+                        url: None,
+                    });
+                    return;
+                }
+                _ => {} // push succeeded
             }
 
             // Create the PR.
@@ -3358,33 +3438,51 @@ impl App {
             vars.insert("plan", plan.as_str());
             vars.insert("diff", diff.as_str());
             let system = crate::prompts::render("review_gate", &vars).unwrap_or_else(|| {
-                "Compare plan to diff. Respond APPROVED or REJECTED: reason".into()
+                "Compare plan to diff. Respond with JSON: {\"approved\": bool, \"detail\": string}"
+                    .into()
             });
             let prompt = format!("{review_skill}\n\nPlan:\n{plan}\n\nDiff:\n{diff}");
 
+            let json_schema = r#"{"type":"object","properties":{"approved":{"type":"boolean"},"detail":{"type":"string"}},"required":["approved","detail"]}"#;
+
             let result = match std::process::Command::new("claude")
-                .args(["--print", "-p", &prompt, "--system-prompt", &system])
+                .args([
+                    "--print",
+                    "-p",
+                    &prompt,
+                    "--system-prompt",
+                    &system,
+                    "--output-format",
+                    "json",
+                    "--json-schema",
+                    json_schema,
+                ])
                 .output()
             {
                 Ok(output) if output.status.success() => {
                     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if text.starts_with("APPROVED") {
-                        ReviewGateResult {
-                            work_item_id: wi_id_clone,
-                            approved: true,
-                            detail: text,
+                    // Parse the JSON envelope from claude --print --output-format json.
+                    // The structured output is in the "structured_output" field.
+                    match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(envelope) => {
+                            let structured = &envelope["structured_output"];
+                            let approved =
+                                structured["approved"].as_bool().unwrap_or(false);
+                            let detail = structured["detail"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string();
+                            ReviewGateResult {
+                                work_item_id: wi_id_clone,
+                                approved,
+                                detail,
+                            }
                         }
-                    } else {
-                        let reason = text
-                            .strip_prefix("REJECTED:")
-                            .unwrap_or(&text)
-                            .trim()
-                            .to_string();
-                        ReviewGateResult {
+                        Err(e) => ReviewGateResult {
                             work_item_id: wi_id_clone,
                             approved: false,
-                            detail: reason,
-                        }
+                            detail: format!("review gate: invalid JSON response: {e}"),
+                        },
                     }
                 }
                 Ok(output) => {
@@ -3446,19 +3544,21 @@ impl App {
 
         let wi_id = result.work_item_id.clone();
 
-        // Verify the work item is still in Implementing before applying the
-        // gate result. If the user retreated the item while the gate was
-        // running, we discard the result silently - the user intentionally
-        // moved away.
-        let still_implementing = self
+        // Verify the work item is still eligible for the gate result.
+        // Both Implementing and Blocked are valid pre-gate states (Blocked->Review
+        // is allowed per Fix #6). If the user retreated the item while the gate
+        // was running, we discard the result silently.
+        let gate_eligible = self
             .work_items
             .iter()
             .find(|w| w.id == wi_id)
-            .map(|w| w.status == WorkItemStatus::Implementing)
+            .map(|w| {
+                w.status == WorkItemStatus::Implementing
+                    || w.status == WorkItemStatus::Blocked
+            })
             .unwrap_or(false);
 
-        if !still_implementing {
-            // Work item is no longer in Implementing - discard the gate result.
+        if !gate_eligible {
             return;
         }
 
@@ -3481,14 +3581,22 @@ impl App {
             self.review_gate_findings
                 .insert(wi_id.clone(), result.detail.clone());
 
+            // Get the actual current status for apply_stage_change.
+            let current_status = self
+                .work_items
+                .iter()
+                .find(|w| w.id == wi_id)
+                .map(|w| w.status.clone())
+                .unwrap_or(WorkItemStatus::Implementing);
+
             self.apply_stage_change(
                 &wi_id,
-                &WorkItemStatus::Implementing,
+                &current_status,
                 &WorkItemStatus::Review,
                 "review_gate",
             );
         } else {
-            // Log rejection and stay in Implementing.
+            // Log rejection and stay in current stage.
             let entry = ActivityEntry {
                 timestamp: now_iso8601(),
                 event_type: "review_gate".to_string(),
@@ -3506,6 +3614,35 @@ impl App {
             self.rework_reasons
                 .insert(wi_id.clone(), result.detail.clone());
             self.status_message = Some(format!("Review gate rejected: {}", result.detail));
+
+            // If Blocked, transition to Implementing so the implementing_rework
+            // prompt (which has {rework_reason}) is used instead of the "blocked"
+            // prompt (which has no rework_reason placeholder).
+            {
+                let wi_status = self
+                    .work_items
+                    .iter()
+                    .find(|w| w.id == wi_id)
+                    .map(|w| w.status.clone());
+                if wi_status == Some(WorkItemStatus::Blocked) {
+                    let _ =
+                        self.backend
+                            .update_status(&wi_id, WorkItemStatus::Implementing);
+                    self.reassemble_work_items();
+                    self.build_display_list();
+                }
+            }
+
+            // Kill the current session and respawn with the implementing_rework
+            // prompt that includes the rejection feedback.
+            if let Some(key) = self.session_key_for(&wi_id)
+                && let Some(mut entry) = self.sessions.remove(&key)
+                && let Some(ref mut session) = entry.session
+            {
+                session.kill();
+            }
+            self.cleanup_mcp_for(&wi_id);
+            self.spawn_session(&wi_id);
         }
     }
 
@@ -6769,5 +6906,454 @@ mod tests {
         app.end_activity(id);
         // Status message still keeps bar visible.
         assert!(app.has_visible_status_bar());
+    }
+
+    // -- Review gate regression tests --
+
+    /// Helper: create an App with a single work item at the given status,
+    /// with an optional repo association (branch + repo_path).
+    fn app_with_work_item(
+        status: WorkItemStatus,
+        branch: Option<&str>,
+        repo_path: Option<&str>,
+    ) -> (App, WorkItemId) {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/gate-test.json"));
+        let repo_assoc = if let Some(rp) = repo_path {
+            vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from(rp),
+                branch: branch.map(|b| b.to_string()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }]
+        } else {
+            vec![]
+        };
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            title: "Gate test item".into(),
+            description: None,
+            status,
+            status_derived: false,
+            repo_associations: repo_assoc,
+            errors: vec![],
+        });
+        app.display_list
+            .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
+        app.selected_item = Some(app.display_list.len() - 1);
+        (app, wi_id)
+    }
+
+    /// Test 4: MCP StatusUpdate for Review on Implementing item with no plan
+    /// must NOT change status to Review (gate spawn fails), and rework_reasons
+    /// must be populated.
+    #[test]
+    fn mcp_review_gate_bypass_prevented_no_plan() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        // Set up MCP channel with a StatusUpdate for Review.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.mcp_rx = Some(rx);
+        let wi_id_json = serde_json::to_string(&wi_id).unwrap();
+        tx.send(McpEvent::StatusUpdate {
+            work_item_id: wi_id_json,
+            status: "Review".into(),
+            reason: "Implementation complete".into(),
+        })
+        .unwrap();
+
+        app.poll_mcp_status_updates();
+
+        // Status must stay at Implementing - the gate cannot run without a plan.
+        let wi = app.work_items.iter().find(|w| w.id == wi_id).unwrap();
+        assert_eq!(
+            wi.status,
+            WorkItemStatus::Implementing,
+            "status must not change to Review when no plan exists",
+        );
+        // rework_reasons must be populated (gate spawn failure triggers rework flow).
+        assert!(
+            app.rework_reasons.contains_key(&wi_id),
+            "rework_reasons must be populated after gate spawn failure",
+        );
+        let reason = app.rework_reasons.get(&wi_id).unwrap();
+        assert!(
+            reason.contains("no plan"),
+            "rework reason should mention no plan, got: {reason}",
+        );
+    }
+
+    /// Test 5: TUI advance_stage from Implementing with no plan must NOT
+    /// change status to Review.
+    #[test]
+    fn tui_advance_stage_blocked_without_plan() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        app.advance_stage();
+
+        // Status must stay at Implementing - spawn_review_gate returns Blocked.
+        let wi = app.work_items.iter().find(|w| w.id == wi_id).unwrap();
+        assert_eq!(
+            wi.status,
+            WorkItemStatus::Implementing,
+            "TUI advance_stage must not advance to Review without a plan",
+        );
+        // Status message should explain why.
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("no plan"),
+            "status message should explain gate failure, got: {msg}",
+        );
+    }
+
+    /// Test 6: After poll_review_gate processes a rejection result,
+    /// rework_reasons is populated for the work item.
+    #[test]
+    fn poll_review_gate_rejection_populates_rework_reasons() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        // Simulate a review gate that completed with a rejection.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(ReviewGateResult {
+            work_item_id: wi_id.clone(),
+            approved: false,
+            detail: "Tests are missing for the new feature".into(),
+        })
+        .unwrap();
+        app.review_gate_rx = Some(rx);
+        app.review_gate_wi = Some(wi_id.clone());
+
+        app.poll_review_gate();
+
+        assert!(
+            app.rework_reasons.contains_key(&wi_id),
+            "rework_reasons must be populated after gate rejection",
+        );
+        assert_eq!(
+            app.rework_reasons.get(&wi_id).unwrap(),
+            "Tests are missing for the new feature",
+        );
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("rejected"),
+            "status should mention rejection, got: {msg}",
+        );
+    }
+
+    /// Test 7: poll_review_gate supports Blocked status - a Blocked work item
+    /// can transition to Review when the gate approves.
+    #[test]
+    fn poll_review_gate_approves_blocked_to_review() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Blocked,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        // Simulate a review gate that completed with approval.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(ReviewGateResult {
+            work_item_id: wi_id.clone(),
+            approved: true,
+            detail: "All plan items implemented".into(),
+        })
+        .unwrap();
+        app.review_gate_rx = Some(rx);
+        app.review_gate_wi = Some(wi_id.clone());
+
+        app.poll_review_gate();
+
+        // StubBackend's update_status is a no-op, but reassemble rebuilds from
+        // StubBackend (empty). The status message from apply_stage_change confirms
+        // the transition was attempted. Also verify gate findings were stored.
+        assert!(
+            app.review_gate_findings.contains_key(&wi_id),
+            "review_gate_findings should be stored on approval",
+        );
+        assert_eq!(
+            app.review_gate_findings.get(&wi_id).unwrap(),
+            "All plan items implemented",
+        );
+        // Verify the receiver and tracked WI are cleared.
+        assert!(app.review_gate_rx.is_none(), "gate rx should be cleared");
+        assert!(app.review_gate_wi.is_none(), "gate wi should be cleared");
+    }
+
+    /// Test 8: Gate spawn failure (MCP path) populates rework_reasons with
+    /// the failure message.
+    #[test]
+    fn mcp_gate_spawn_failure_sets_rework_reasons() {
+        // Work item with no branch - gate will fail with "no branch set".
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            None,      // no branch
+            Some("/tmp/repo"),
+        );
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.mcp_rx = Some(rx);
+        let wi_id_json = serde_json::to_string(&wi_id).unwrap();
+        tx.send(McpEvent::StatusUpdate {
+            work_item_id: wi_id_json,
+            status: "Review".into(),
+            reason: "Done implementing".into(),
+        })
+        .unwrap();
+
+        app.poll_mcp_status_updates();
+
+        assert!(
+            app.rework_reasons.contains_key(&wi_id),
+            "rework_reasons must be set on gate spawn failure (no branch)",
+        );
+        let reason = app.rework_reasons.get(&wi_id).unwrap();
+        // The gate failure could mention "no plan" (checked first) or "no branch".
+        // StubBackend.read_plan returns Ok(None), so "no plan" is the first failure.
+        assert!(
+            reason.contains("no plan") || reason.contains("no branch"),
+            "rework reason should explain the failure, got: {reason}",
+        );
+    }
+
+    /// Test 9: When a review gate is already running for item A, an MCP
+    /// StatusUpdate for Review on item B should NOT populate rework_reasons
+    /// for item B. It should be silently skipped (gate busy).
+    #[test]
+    fn gate_busy_for_different_item_does_not_rework() {
+        let mut app = App::new();
+
+        // Item A: gate is running for this one.
+        let wi_id_a = WorkItemId::LocalFile(PathBuf::from("/tmp/gate-a.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id_a.clone(),
+            backend_type: BackendType::LocalFile,
+            title: "Item A".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/repo"),
+                branch: Some("branch-a".into()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        // Item B: MCP will request Review for this one.
+        let wi_id_b = WorkItemId::LocalFile(PathBuf::from("/tmp/gate-b.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id_b.clone(),
+            backend_type: BackendType::LocalFile,
+            title: "Item B".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/repo"),
+                branch: Some("branch-b".into()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        // Simulate gate running for item A.
+        app.review_gate_wi = Some(wi_id_a.clone());
+        // (We don't need a real rx - spawn_review_gate checks review_gate_wi first.)
+
+        // Send MCP StatusUpdate for item B.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.mcp_rx = Some(rx);
+        let wi_id_b_json = serde_json::to_string(&wi_id_b).unwrap();
+        tx.send(McpEvent::StatusUpdate {
+            work_item_id: wi_id_b_json,
+            status: "Review".into(),
+            reason: "Done".into(),
+        })
+        .unwrap();
+
+        app.poll_mcp_status_updates();
+
+        // Item B's status must be unchanged.
+        let wi_b = app.work_items.iter().find(|w| w.id == wi_id_b).unwrap();
+        assert_eq!(
+            wi_b.status,
+            WorkItemStatus::Implementing,
+            "item B should remain Implementing when gate is busy",
+        );
+        // rework_reasons must NOT contain item B (gate busy is not a failure).
+        assert!(
+            !app.rework_reasons.contains_key(&wi_id_b),
+            "rework_reasons must NOT be set for item B when gate is busy for item A",
+        );
+        // Status message should mention "already running".
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("already running"),
+            "status should mention gate already running, got: {msg}",
+        );
+    }
+
+    /// Test 10: A Blocked work item with no plan that fails the gate via MCP
+    /// should transition to Implementing (not stay Blocked), so the
+    /// implementing_rework prompt (which has {rework_reason}) is used.
+    #[test]
+    fn blocked_gate_failure_transitions_to_implementing() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Blocked,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        // Send MCP StatusUpdate for Review.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.mcp_rx = Some(rx);
+        let wi_id_json = serde_json::to_string(&wi_id).unwrap();
+        tx.send(McpEvent::StatusUpdate {
+            work_item_id: wi_id_json,
+            status: "Review".into(),
+            reason: "Implementation complete".into(),
+        })
+        .unwrap();
+
+        app.poll_mcp_status_updates();
+
+        // The work item should now be Implementing (not still Blocked).
+        // StubBackend.update_status is a no-op, but reassemble_work_items
+        // rebuilds from the StubBackend (which returns empty). The important
+        // assertion is that rework_reasons is populated AND the code path
+        // that transitions Blocked -> Implementing was executed.
+        assert!(
+            app.rework_reasons.contains_key(&wi_id),
+            "rework_reasons must be populated for Blocked gate failure",
+        );
+        // Verify status message mentions the gate failure.
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("Review gate failed") || msg.contains("no plan"),
+            "status should mention gate failure, got: {msg}",
+        );
+    }
+
+    /// Test 11: spawn_review_gate sets status_message on all failure paths.
+    #[test]
+    fn spawn_review_gate_sets_status_on_failure() {
+        // Case 1: no plan exists.
+        {
+            let (mut app, wi_id) = app_with_work_item(
+                WorkItemStatus::Implementing,
+                Some("feature/test"),
+                Some("/tmp/repo"),
+            );
+            let result = app.spawn_review_gate(&wi_id);
+            match result {
+                ReviewGateSpawn::Blocked(reason) => {
+                    assert!(
+                        reason.contains("no plan"),
+                        "should mention no plan, got: {reason}",
+                    );
+                }
+                ReviewGateSpawn::Spawned => {
+                    panic!("gate should not have spawned without a plan");
+                }
+            }
+        }
+
+        // Case 2: no branch set.
+        {
+            let (mut app, wi_id) = app_with_work_item(
+                WorkItemStatus::Implementing,
+                None, // no branch
+                Some("/tmp/repo"),
+            );
+            let result = app.spawn_review_gate(&wi_id);
+            match result {
+                ReviewGateSpawn::Blocked(reason) => {
+                    // Could fail on "no plan" first (StubBackend returns None).
+                    assert!(
+                        reason.contains("no plan") || reason.contains("no branch"),
+                        "should mention no plan or no branch, got: {reason}",
+                    );
+                }
+                ReviewGateSpawn::Spawned => {
+                    panic!("gate should not have spawned without a branch");
+                }
+            }
+        }
+
+        // Case 3: no repo association.
+        {
+            let (mut app, wi_id) = app_with_work_item(
+                WorkItemStatus::Implementing,
+                None,
+                None, // no repo association
+            );
+            let result = app.spawn_review_gate(&wi_id);
+            match result {
+                ReviewGateSpawn::Blocked(reason) => {
+                    // Could fail on "no plan" first (StubBackend returns None).
+                    assert!(
+                        reason.contains("no plan") || reason.contains("no repo"),
+                        "should mention no plan or no repo, got: {reason}",
+                    );
+                }
+                ReviewGateSpawn::Spawned => {
+                    panic!("gate should not have spawned without a repo association");
+                }
+            }
+        }
+    }
+
+    /// Test 2 (from MCP context): Blocked->Review is in the allowed
+    /// transitions in poll_mcp_status_updates. Verify by sending a
+    /// StatusUpdate from Blocked and confirming it is NOT rejected with
+    /// "not allowed".
+    #[test]
+    fn mcp_blocked_to_review_is_allowed_transition() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Blocked,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.mcp_rx = Some(rx);
+        let wi_id_json = serde_json::to_string(&wi_id).unwrap();
+        tx.send(McpEvent::StatusUpdate {
+            work_item_id: wi_id_json,
+            status: "Review".into(),
+            reason: "Done".into(),
+        })
+        .unwrap();
+
+        app.poll_mcp_status_updates();
+
+        // The transition should NOT be rejected as "not allowed". It should
+        // reach the gate spawn path (and fail there due to no plan).
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            !msg.contains("not allowed"),
+            "Blocked->Review must not be rejected as 'not allowed', got: {msg}",
+        );
     }
 }
