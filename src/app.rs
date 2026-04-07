@@ -62,15 +62,6 @@ pub enum DisplayEntry {
     WorkItemEntry(usize),
 }
 
-/// Result from the asynchronous review gate check.
-pub struct ReviewGateResult {
-    /// The work item that was being checked.
-    pub work_item_id: WorkItemId,
-    /// True if the gate approved the transition.
-    pub approved: bool,
-    /// Human-readable detail (approval note or rejection reason).
-    pub detail: String,
-}
 
 /// App holds the entire application state.
 pub struct App {
@@ -188,14 +179,19 @@ pub struct App {
     pub mcp_rx: Option<crossbeam_channel::Receiver<McpEvent>>,
     /// Sender for MCP events (cloned for each socket server).
     pub mcp_tx: crossbeam_channel::Sender<McpEvent>,
-    /// Receiver for asynchronous review gate results. The review gate spawns
-    /// a background thread that runs `claude --print` and sends the result
-    /// through this channel. Checked on each timer tick.
-    pub review_gate_rx: Option<crossbeam_channel::Receiver<ReviewGateResult>>,
     /// The work item ID that the current review gate was spawned for.
     /// Used to verify the gate result is still relevant (the user may have
     /// retreated the item while the gate was running).
     pub review_gate_wi: Option<WorkItemId>,
+    /// The MCP socket server for the review gate session. Kept alive until
+    /// the gate result arrives or the gate is cancelled.
+    pub review_gate_mcp: Option<McpSocketServer>,
+    /// The background Claude session running the review gate check. Not
+    /// displayed in the UI - a spinner is shown instead.
+    pub review_gate_session: Option<Session>,
+    /// Frame counter for the review gate spinner animation. Cycles through
+    /// |, /, -, \ characters on each timer tick while the gate is active.
+    pub review_gate_spinner_frame: u8,
 }
 
 impl App {
@@ -294,8 +290,10 @@ impl App {
             mcp_servers: HashMap::new(),
             mcp_rx: Some(mcp_rx),
             mcp_tx,
-            review_gate_rx: None,
             review_gate_wi: None,
+            review_gate_mcp: None,
+            review_gate_session: None,
+            review_gate_spinner_frame: 0,
         };
         app.reassemble_work_items();
         app.build_display_list();
@@ -499,6 +497,19 @@ impl App {
                 session.kill();
             }
         }
+
+        // Check if the review gate session died without delivering a result.
+        // If Claude exits or crashes before calling the MCP tool, clear the
+        // gate state and surface an error so the spinner doesn't spin forever.
+        if let Some(ref mut session) = self.review_gate_session
+            && !session.is_alive()
+        {
+            self.review_gate_session = None;
+            self.review_gate_mcp = None;
+            self.review_gate_wi = None;
+            self.status_message =
+                Some("Review gate session exited without delivering a verdict".into());
+        }
     }
 
     /// Stop MCP server for a work item.
@@ -541,11 +552,14 @@ impl App {
                 session.send_sigterm();
             }
         }
+        if let Some(ref mut session) = self.review_gate_session {
+            session.send_sigterm();
+        }
     }
 
     /// Check if all sessions are dead (or there are no sessions).
     pub fn all_dead(&self) -> bool {
-        self.sessions.values().all(|entry| !entry.alive)
+        self.sessions.values().all(|entry| !entry.alive) && self.review_gate_session.is_none()
     }
 
     /// SIGKILL all remaining alive sessions. Used for force-quit during
@@ -557,6 +571,12 @@ impl App {
             }
             entry.alive = false;
         }
+        if let Some(ref mut session) = self.review_gate_session {
+            session.force_kill();
+        }
+        self.review_gate_session = None;
+        self.review_gate_mcp = None;
+        self.review_gate_wi = None;
     }
 
     /// Find the session key for a work item ID (any stage).
@@ -716,8 +736,9 @@ impl App {
     ///
     /// Groups (each hidden if empty):
     /// 1. UNLINKED - PRs not yet imported as work items
-    /// 2. ACTIVE (repo) - non-Backlog work items, grouped by repo
+    /// 2. ACTIVE (repo) - non-Backlog, non-Done work items, grouped by repo
     /// 3. BACKLOGGED (repo) - Backlog work items, grouped by repo
+    /// 4. DONE (repo) - Done work items, grouped by repo
     pub fn build_display_list(&mut self) {
         let mut list = Vec::new();
 
@@ -732,11 +753,14 @@ impl App {
             }
         }
 
-        // Partition work items into active vs backlogged, then sub-group by repo.
+        // Partition work items into active, backlogged, and done, then sub-group by repo.
         let mut active: Vec<usize> = Vec::new();
         let mut backlogged: Vec<usize> = Vec::new();
+        let mut done: Vec<usize> = Vec::new();
         for i in 0..self.work_items.len() {
-            if self.work_items[i].status == WorkItemStatus::Backlog {
+            if self.work_items[i].status == WorkItemStatus::Done {
+                done.push(i);
+            } else if self.work_items[i].status == WorkItemStatus::Backlog {
                 backlogged.push(i);
             } else {
                 active.push(i);
@@ -745,6 +769,7 @@ impl App {
 
         Self::push_repo_groups(&self.work_items, &mut list, "ACTIVE", &active);
         Self::push_repo_groups(&self.work_items, &mut list, "BACKLOGGED", &backlogged);
+        Self::push_repo_groups(&self.work_items, &mut list, "DONE", &done);
 
         self.display_list = list;
 
@@ -967,6 +992,7 @@ impl App {
         };
         let work_item_id = wi.id.clone();
         let work_item_status = wi.status.clone();
+        let is_planning = work_item_status == WorkItemStatus::Planning;
         let session_key = (work_item_id.clone(), work_item_status);
 
         // Stages without sessions.
@@ -1074,6 +1100,35 @@ impl App {
                 cmd.push(config_path.to_string_lossy().to_string());
             }
         }
+
+        // Write a Claude Code Stop hook into the worktree so Claude cannot finish
+        // a planning session without calling workbridge_set_plan.  For non-planning
+        // stages, remove any leftover hook from a prior planning session.
+        let claude_dir = cwd.join(".claude");
+        if is_planning {
+            let _ = std::fs::create_dir_all(&claude_dir);
+            let hook_settings = r#"{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'T=$(cat | jq -r .transcript_path); grep -q workbridge_set_plan \"$T\" 2>/dev/null || { echo \"BLOCKED: You MUST call workbridge_set_plan with the finalized plan before finishing.\" >&2; exit 2; }'"
+          }
+        ]
+      }
+    ]
+  }
+}"#;
+            if let Err(e) = std::fs::write(claude_dir.join("settings.local.json"), hook_settings) {
+                self.status_message = Some(format!("Hook settings write error: {e}"));
+            }
+        } else {
+            // Clean up planning-stage hook so it does not block non-planning sessions.
+            let _ = std::fs::remove_file(claude_dir.join("settings.local.json"));
+        }
+
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
 
         match Session::spawn(self.pane_cols, self.pane_rows, Some(&cwd), &cmd_refs) {
@@ -1298,11 +1353,17 @@ impl App {
                     // single chokepoint for entering Review.
                     if current_status.as_ref() == Some(&WorkItemStatus::Implementing)
                         && new_status == WorkItemStatus::Review
-                        && self.spawn_review_gate(&wi_id)
                     {
-                        self.status_message =
-                            Some("Claude requested Review - running review gate...".into());
-                        continue;
+                        if self.review_gate_wi.as_ref() == Some(&wi_id) {
+                            // Gate already running for this item - wait for it.
+                            continue;
+                        }
+                        if self.spawn_review_gate(&wi_id) {
+                            self.status_message = Some(
+                                "Claude requested Review - running review gate...".into(),
+                            );
+                            continue;
+                        }
                     }
                     // No plan or gate skipped - fall through to direct update.
                     // Use apply_stage_change for consistent logging, auto-PR
@@ -1393,6 +1454,79 @@ impl App {
                             let next = WorkItemStatus::Implementing;
                             self.apply_stage_change(&wi_id, &current, &next, "mcp");
                         }
+                    }
+                }
+                McpEvent::ReviewGateResult {
+                    work_item_id: wi_id_str,
+                    approved,
+                    detail,
+                } => {
+                    let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            continue;
+                        }
+                    };
+
+                    // Only accept results when a gate is actually running for this work item.
+                    if self.review_gate_wi.as_ref() != Some(&wi_id) {
+                        continue;
+                    }
+
+                    // Clean up the review gate session and MCP server.
+                    self.review_gate_session = None;
+                    self.review_gate_mcp = None;
+                    self.review_gate_wi = None;
+
+                    // Verify the work item is still in Implementing before
+                    // applying the gate result. If the user retreated the item
+                    // while the gate was running, discard the result silently.
+                    let still_implementing = self
+                        .work_items
+                        .iter()
+                        .find(|w| w.id == wi_id)
+                        .map(|w| w.status == WorkItemStatus::Implementing)
+                        .unwrap_or(false);
+
+                    if !still_implementing {
+                        continue;
+                    }
+
+                    if approved {
+                        let entry = ActivityEntry {
+                            timestamp: now_iso8601(),
+                            event_type: "review_gate".to_string(),
+                            payload: serde_json::json!({
+                                "result": "approved",
+                                "response": detail
+                            }),
+                        };
+                        if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
+                            self.status_message = Some(format!("Activity log error: {e}"));
+                        }
+
+                        self.apply_stage_change(
+                            &wi_id,
+                            &WorkItemStatus::Implementing,
+                            &WorkItemStatus::Review,
+                            "review_gate",
+                        );
+                    } else {
+                        let entry = ActivityEntry {
+                            timestamp: now_iso8601(),
+                            event_type: "review_gate".to_string(),
+                            payload: serde_json::json!({
+                                "result": "rejected",
+                                "reason": detail
+                            }),
+                        };
+                        if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
+                            self.status_message = Some(format!("Activity log error: {e}"));
+                        }
+                        self.rework_reasons.insert(wi_id.clone(), detail.clone());
+                        self.status_message =
+                            Some(format!("Review gate rejected: {}", detail));
                     }
                 }
             }
@@ -1681,10 +1815,15 @@ impl App {
         // and the result is processed on the next timer tick.
         if current_status == WorkItemStatus::Implementing
             && new_status == WorkItemStatus::Review
-            && self.spawn_review_gate(&wi_id)
         {
-            // Gate is running in background - do not advance yet.
-            return;
+            if self.review_gate_wi.as_ref() == Some(&wi_id) {
+                self.status_message = Some("Review gate already running...".into());
+                return;
+            }
+            if self.spawn_review_gate(&wi_id) {
+                // Gate is running in background - do not advance yet.
+                return;
+            }
         }
 
         // Merge prompt: when transitioning from Review to Done,
@@ -1722,7 +1861,8 @@ impl App {
         // If the retreating item has a pending review gate, cancel it.
         // The gate result would be stale since the user intentionally moved away.
         if self.review_gate_wi.as_ref() == Some(&wi_id) {
-            self.review_gate_rx = None;
+            self.review_gate_session = None;
+            self.review_gate_mcp = None;
             self.review_gate_wi = None;
         }
 
@@ -2107,6 +2247,12 @@ impl App {
     /// Returns true if the gate was spawned (caller should wait for result),
     /// false if no gate is needed (no plan, empty plan, missing data).
     fn spawn_review_gate(&mut self, wi_id: &WorkItemId) -> bool {
+        // Guard: if a review gate is already running, don't spawn another one.
+        // A second call would overwrite the fields and leak the first session.
+        if self.review_gate_wi.is_some() {
+            return false;
+        }
+
         // Read the plan from the backend.
         let plan = match self.backend.read_plan(wi_id) {
             Ok(Some(plan)) if !plan.trim().is_empty() => plan,
@@ -2131,6 +2277,10 @@ impl App {
             None => return false,
         };
         let repo_path = assoc.repo_path.clone();
+        let cwd = assoc
+            .worktree_path
+            .clone()
+            .unwrap_or_else(|| repo_path.clone());
 
         // Get the default branch for diffing.
         let default_branch = self
@@ -2164,152 +2314,97 @@ impl App {
             return false;
         }
 
-        // Spawn the claude --print check in a background thread.
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let wi_id_clone = wi_id.clone();
-
-        std::thread::spawn(move || {
-            let mut vars = std::collections::HashMap::new();
-            vars.insert("plan", plan.as_str());
-            vars.insert("diff", diff.as_str());
-            let system = crate::prompts::render("review_gate", &vars).unwrap_or_else(|| {
-                "Compare plan to diff. Respond APPROVED or REJECTED: reason".into()
-            });
-            let prompt = format!("Plan:\n{plan}\n\nDiff:\n{diff}");
-
-            let result = match std::process::Command::new("claude")
-                .args(["--print", "-p", &prompt, "--system-prompt", &system])
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if text.starts_with("APPROVED") {
-                        ReviewGateResult {
-                            work_item_id: wi_id_clone,
-                            approved: true,
-                            detail: text,
-                        }
-                    } else {
-                        let reason = text
-                            .strip_prefix("REJECTED:")
-                            .unwrap_or(&text)
-                            .trim()
-                            .to_string();
-                        ReviewGateResult {
-                            work_item_id: wi_id_clone,
-                            approved: false,
-                            detail: reason,
-                        }
-                    }
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    ReviewGateResult {
-                        work_item_id: wi_id_clone,
-                        approved: false,
-                        detail: format!("claude failed: {stderr}"),
-                    }
-                }
-                Err(e) => ReviewGateResult {
-                    work_item_id: wi_id_clone,
-                    approved: false,
-                    detail: format!("could not run claude: {e}"),
-                },
-            };
-            let _ = tx.send(result);
+        // Build the review gate system prompt via the template.
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("plan", plan.as_str());
+        vars.insert("diff", diff.as_str());
+        let system = crate::prompts::render("review_gate", &vars).unwrap_or_else(|| {
+            "Compare plan to diff. Call workbridge_review_gate_result with your verdict.".into()
         });
 
-        self.review_gate_rx = Some(rx);
-        self.review_gate_wi = Some(wi_id.clone());
-        self.status_message = Some("Running review gate...".into());
-        true
-    }
-
-    /// Poll the async review gate for a result. Called on each timer tick.
-    /// If the gate has completed, processes the result: advances to Review
-    /// if approved, stays in Implementing if rejected.
-    pub fn poll_review_gate(&mut self) {
-        let rx = match self.review_gate_rx.as_ref() {
-            Some(rx) => rx,
-            None => return,
-        };
-
-        let result = match rx.try_recv() {
-            Ok(r) => r,
-            Err(crossbeam_channel::TryRecvError::Empty) => return, // Still running.
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                // Thread exited without sending - treat as gate error.
-                self.review_gate_rx = None;
-                self.review_gate_wi = None;
+        // Start MCP socket server for the review gate session.
+        let socket_path = crate::mcp::socket_path_for_session();
+        let wi_id_str = match serde_json::to_string(wi_id) {
+            Ok(s) => s,
+            Err(e) => {
                 self.status_message =
-                    Some("Review gate: background thread exited unexpectedly".into());
-                return;
+                    Some(format!("Review gate: could not serialize work item ID: {e}"));
+                return false;
+            }
+        };
+        let context_json = serde_json::json!({
+            "work_item_id": wi_id_str,
+            "stage": "ReviewGate",
+            "title": wi.title,
+        })
+        .to_string();
+
+        let server = match McpSocketServer::start(
+            socket_path.clone(),
+            wi_id_str,
+            context_json,
+            None,
+            self.mcp_tx.clone(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status_message =
+                    Some(format!("Review gate: MCP server failed to start: {e}"));
+                return false;
             }
         };
 
-        // Gate completed - clear the receiver and tracked work item.
-        self.review_gate_rx = None;
-        self.review_gate_wi = None;
+        // Build claude command with system prompt and MCP config.
+        let exe = std::env::current_exe().unwrap_or_default();
+        let mcp_config = crate::mcp::build_mcp_config(&exe, &socket_path);
 
-        let wi_id = result.work_item_id.clone();
+        let mut cmd: Vec<String> = vec!["claude".to_string()];
+        cmd.push("--system-prompt".to_string());
+        cmd.push(system);
 
-        // Verify the work item is still in Implementing before applying the
-        // gate result. If the user retreated the item while the gate was
-        // running, we discard the result silently - the user intentionally
-        // moved away.
-        let still_implementing = self
-            .work_items
-            .iter()
-            .find(|w| w.id == wi_id)
-            .map(|w| w.status == WorkItemStatus::Implementing)
-            .unwrap_or(false);
-
-        if !still_implementing {
-            // Work item is no longer in Implementing - discard the gate result.
-            return;
+        // Write MCP config to a temp file for --mcp-config.
+        let config_path = std::env::temp_dir().join(format!(
+            "workbridge-review-gate-mcp-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(e) = std::fs::write(&config_path, &mcp_config) {
+            self.status_message = Some(format!("Review gate: MCP config write error: {e}"));
+            return false;
         }
+        cmd.push("--mcp-config".to_string());
+        cmd.push(config_path.to_string_lossy().to_string());
 
-        if result.approved {
-            // Log approval and advance to Review.
-            let entry = ActivityEntry {
-                timestamp: now_iso8601(),
-                event_type: "review_gate".to_string(),
-                payload: serde_json::json!({
-                    "result": "approved",
-                    "response": result.detail
-                }),
-            };
-            if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
-                self.status_message = Some(format!("Activity log error: {e}"));
-            }
+        // Do NOT write .mcp.json to the worktree cwd for the review gate.
+        // The gate session gets its MCP config via --mcp-config (temp file).
+        // Writing .mcp.json here would overwrite the implementing session's
+        // config and leave a stale pointer when the gate's socket is removed.
 
-            self.apply_stage_change(
-                &wi_id,
-                &WorkItemStatus::Implementing,
-                &WorkItemStatus::Review,
-                "review_gate",
-            );
-        } else {
-            // Log rejection and stay in Implementing.
-            let entry = ActivityEntry {
-                timestamp: now_iso8601(),
-                event_type: "review_gate".to_string(),
-                payload: serde_json::json!({
-                    "result": "rejected",
-                    "reason": result.detail
-                }),
-            };
-            if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
-                self.status_message = Some(format!("Activity log error: {e}"));
+        // Pass the prompt (plan + diff) as initial input via -p flag.
+        let prompt = format!("Plan:\n{plan}\n\nDiff:\n{diff}");
+        cmd.push("-p".to_string());
+        cmd.push(prompt);
+        cmd.push("--allowedTools".to_string());
+        cmd.push("mcp__workbridge__workbridge_review_gate_result".to_string());
+
+        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+
+        match Session::spawn(self.pane_cols, self.pane_rows, Some(&cwd), &cmd_refs) {
+            Ok(session) => {
+                self.review_gate_mcp = Some(server);
+                self.review_gate_session = Some(session);
+                self.review_gate_wi = Some(wi_id.clone());
+                self.review_gate_spinner_frame = 0;
+                self.status_message = Some("Running review gate...".into());
+                true
             }
-            // Store the rejection reason so the next Claude session uses the
-            // implementing_rework prompt with specific feedback, rather than
-            // a generic implementing prompt.
-            self.rework_reasons
-                .insert(wi_id.clone(), result.detail.clone());
-            self.status_message = Some(format!("Review gate rejected: {}", result.detail));
+            Err(e) => {
+                self.status_message = Some(format!("Review gate: session spawn error: {e}"));
+                false
+            }
         }
     }
+
+
 
     /// Get the SessionEntry for the currently selected work item, if any.
     pub fn active_session_entry(&self) -> Option<&SessionEntry> {
@@ -4382,8 +4477,8 @@ mod tests {
             })
             .collect();
         assert_eq!(group_headers.len(), 2);
-        assert_eq!(group_headers[0], ("ACTIVE (alpha)", 1));
-        assert_eq!(group_headers[1], ("BACKLOGGED (alpha)", 1));
+        assert_eq!(group_headers[0], ("BACKLOGGED (alpha)", 1));
+        assert_eq!(group_headers[1], ("DONE (alpha)", 1));
     }
 
     #[test]

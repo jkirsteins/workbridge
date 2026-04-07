@@ -15,7 +15,7 @@ expression: "render(&app, 80, 24)"
 │                       ││  Issue       (none)                                 │
 │                       ││  Errors      (none)                                 │
 │                       ││                                                     │
-│                       ││  Press Enter to start a session.                    │
+│                       ││  Press Shift+Right to move to Planning.             │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

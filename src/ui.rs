@@ -265,9 +265,15 @@ fn format_work_item_entry<'a>(
         right_parts.push((format!(" [{repo_count} repos]"), theme.style_text_muted()));
     }
 
-    // Stage badge + title.
+    // Stage badge + title. Done items omit the badge since the DONE group
+    // header already communicates their status; use equivalent-width spacing
+    // to preserve alignment.
     let badge = wi.status.badge_text();
-    let prefix = format!("{badge} ");
+    let prefix = if wi.status == WorkItemStatus::Done {
+        " ".repeat(badge.len() + 1)
+    } else {
+        format!("{badge} ")
+    };
     // Minimum number of display columns reserved for the title so it never
     // vanishes when badges consume all available width.
     const MIN_TITLE_BUDGET: usize = 5;
@@ -330,12 +336,20 @@ fn format_work_item_entry<'a>(
         max_width.saturating_sub(prefix.width() + first_title.width() + right_text.width());
     let pad_str: String = " ".repeat(padding);
 
-    let mut line1_spans = vec![
-        Span::styled(badge.to_string(), badge_style),
-        Span::raw(" "),
-        Span::styled(first_title, title_style),
-        Span::raw(pad_str),
-    ];
+    let mut line1_spans = if wi.status == WorkItemStatus::Done {
+        vec![
+            Span::raw(prefix),
+            Span::styled(first_title, title_style),
+            Span::raw(pad_str),
+        ]
+    } else {
+        vec![
+            Span::styled(badge.to_string(), badge_style),
+            Span::raw(" "),
+            Span::styled(first_title, title_style),
+            Span::raw(pad_str),
+        ]
+    };
     for (text, style) in &right_parts[..visible_badge_count] {
         let s = if is_selected {
             right_badge_style
@@ -689,10 +703,12 @@ fn draw_work_item_detail(
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  Press Enter to start a session.",
-        none_style,
-    )));
+    let hint = match wi.status {
+        WorkItemStatus::Backlog => "  Press Shift+Right to move to Planning.",
+        WorkItemStatus::Done => "  Done.",
+        _ => "  Press Enter to start a session.",
+    };
+    lines.push(Line::from(Span::styled(hint, none_style)));
 
     let text = Text::from(lines);
     let paragraph = Paragraph::new(text).block(block);
@@ -734,6 +750,30 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
 
     match selected_entry {
         Some(DisplayEntry::WorkItemEntry(wi_idx)) => {
+            // Check if the review gate is running for this work item.
+            let review_gate_active = app
+                .work_items
+                .get(*wi_idx)
+                .map(|wi| app.review_gate_wi.as_ref() == Some(&wi.id))
+                .unwrap_or(false);
+
+            if review_gate_active {
+                let spinner_chars = [b'|', b'/', b'-', b'\\'];
+                let frame = app.review_gate_spinner_frame as usize % spinner_chars.len();
+                let spinner = spinner_chars[frame] as char;
+                let text = Text::from(vec![
+                    Line::from(""),
+                    Line::from(format!("  {spinner} Running review gate...")),
+                    Line::from(""),
+                    Line::from("  Checking implementation against plan."),
+                ]);
+                let paragraph = Paragraph::new(text)
+                    .block(block)
+                    .style(theme.style_text_muted());
+                paragraph.render(area, buf);
+                return;
+            }
+
             let session_key = app
                 .work_items
                 .get(*wi_idx)
@@ -790,8 +830,15 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                             }
                         }
                         lines.push(Line::from(""));
+                        let hint = match wi.map(|w| &w.status) {
+                            Some(WorkItemStatus::Backlog) => {
+                                "  Press Shift+Right to move to Planning."
+                            }
+                            Some(WorkItemStatus::Done) => "  Done.",
+                            _ => "  Press Enter to start a session.",
+                        };
                         lines.push(Line::from(Span::styled(
-                            "  Press Enter to start a session.",
+                            hint,
                             theme.style_text_muted(),
                         )));
                         let text = Text::from(lines);
