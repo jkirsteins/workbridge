@@ -151,7 +151,10 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     theme.style_group_header(),
                 )]))
             }
-            DisplayEntry::UnlinkedItem(idx) => format_unlinked_item(app, *idx, inner_width, theme),
+            DisplayEntry::UnlinkedItem(idx) => {
+                let selected = app.selected_item == Some(i);
+                format_unlinked_item(app, *idx, inner_width, theme, selected)
+            }
             DisplayEntry::WorkItemEntry(idx) => {
                 let selected = app.selected_item == Some(i);
                 format_work_item_entry(app, *idx, inner_width, theme, selected)
@@ -176,6 +179,7 @@ fn format_unlinked_item<'a>(
     idx: usize,
     max_width: usize,
     theme: &Theme,
+    is_selected: bool,
 ) -> ListItem<'a> {
     let Some(unlinked) = app.unlinked_prs.get(idx) else {
         return ListItem::new(Line::from("  ? <invalid>"));
@@ -204,11 +208,22 @@ fn format_unlinked_item<'a>(
         max_width.saturating_sub(prefix.width() + truncated_title.width() + right.width());
     let pad_str: String = " ".repeat(padding);
 
+    let (marker_style, title_style, badge_style) = if is_selected {
+        let hl = theme.style_tab_highlight();
+        (hl, hl, hl)
+    } else {
+        (
+            theme.style_unlinked_marker(),
+            theme.style_text(),
+            theme.style_badge_pr(),
+        )
+    };
+
     ListItem::new(Line::from(vec![
-        Span::styled(prefix.to_string(), theme.style_unlinked_marker()),
-        Span::styled(truncated_title, theme.style_text()),
+        Span::styled(prefix.to_string(), marker_style),
+        Span::styled(truncated_title, title_style),
         Span::raw(pad_str),
-        Span::styled(right, theme.style_badge_pr()),
+        Span::styled(right, badge_style),
     ]))
 }
 
@@ -2079,6 +2094,56 @@ mod snapshot_tests {
         // Select the unlinked item (index 1, since index 0 is UNLINKED header).
         app.selected_item = Some(1);
         insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn unlinked_pr_selected_badge_has_highlight_style() {
+        let items = vec![make_work_item(
+            "prog-1",
+            "Active feature",
+            WorkItemStatus::Implementing,
+            Some(make_pr_info(30, CheckStatus::Passing)),
+            1,
+        )];
+        let unlinked = vec![make_unlinked_pr("fix-typo", 45, false)];
+        let mut app = app_with_items(items, unlinked);
+        app.selected_item = Some(1); // select the unlinked item
+
+        let width: u16 = 80;
+        let height: u16 = 24;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default_theme();
+        terminal
+            .draw(|frame| draw_to_buffer(frame.area(), frame.buffer_mut(), &app, &theme))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // The selected row is row 2 (row 0 = border, row 1 = UNLINKED header, row 2 = item).
+        let selected_row: u16 = 2;
+        let hl = theme.style_tab_highlight();
+        let mut found_badge = false;
+        for x in 0..width {
+            let cell = buf.cell((x, selected_row)).unwrap();
+            if cell.symbol() == "P" {
+                let next: String = (x..x + 5)
+                    .filter_map(|cx| buf.cell((cx, selected_row)).map(|c| c.symbol().to_string()))
+                    .collect();
+                if next == "PR#45" {
+                    assert_eq!(
+                        cell.style().fg,
+                        hl.fg,
+                        "PR badge fg on selected unlinked item should match highlight style, \
+                         got {:?} (expected {:?}). Green-on-Cyan is invisible.",
+                        cell.style().fg,
+                        hl.fg,
+                    );
+                    found_badge = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_badge, "PR#45 badge not found on the selected row");
     }
 
     #[test]
