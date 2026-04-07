@@ -87,10 +87,19 @@ pub struct GitWorktreeService;
 
 impl GitWorktreeService {
     /// Run a git command with `-C repo_path` and return stdout on success.
+    ///
+    /// Clears inherited git env vars (GIT_DIR, GIT_WORK_TREE, etc.) so the
+    /// command operates on `repo_path` rather than a parent worktree. This
+    /// matters when the process runs inside a git hook (e.g. pre-push) where
+    /// git sets these variables.
     fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, WorktreeError> {
         let output = Command::new("git")
             .arg("-C")
             .arg(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
             .args(args)
             .output()
             .map_err(|e| WorktreeError::Io(format!("failed to run git: {e}")))?;
@@ -181,13 +190,13 @@ impl GitWorktreeService {
         let worktrees = Self::parse_porcelain(&output);
         // Canonicalize the target path to handle symlinks (e.g. /tmp ->
         // /private/tmp on macOS) so it matches the paths git reports.
-        let canonical_target = worktree_path
-            .canonicalize()
+        let canonical_target = crate::config::canonicalize_path(worktree_path)
             .unwrap_or_else(|_| worktree_path.to_path_buf());
         Ok(worktrees
             .into_iter()
             .find(|w| {
-                let canonical_w = w.path.canonicalize().unwrap_or_else(|_| w.path.clone());
+                let canonical_w =
+                    crate::config::canonicalize_path(&w.path).unwrap_or_else(|_| w.path.clone());
                 canonical_w == canonical_target
             })
             .and_then(|w| w.branch))
@@ -436,6 +445,19 @@ mod integration_tests {
     use std::path::Path;
     use std::process::Command;
 
+    /// Build a Command with git environment variables cleared so
+    /// child git processes operate on `dir` instead of inheriting
+    /// the parent worktree's GIT_DIR/GIT_WORK_TREE.
+    fn git_cmd(dir: &Path) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR");
+        cmd
+    }
+
     /// Create a temporary git repo with an initial commit.
     /// Uses env vars for author identity - NEVER calls `git config`.
     fn setup_git_repo(dir: &Path) {
@@ -444,10 +466,8 @@ mod integration_tests {
         fs::write(&file_path, "init").unwrap();
         run_in(dir, &["git", "add", "README"]);
         // Use -c flags for author identity instead of git config.
-        let output = Command::new("git")
+        let output = git_cmd(dir)
             .args([
-                "-C",
-                dir.to_str().unwrap(),
                 "-c",
                 "user.email=test@test.com",
                 "-c",
@@ -465,9 +485,17 @@ mod integration_tests {
     }
 
     fn run_in(dir: &Path, args: &[&str]) {
-        let output = Command::new(args[0])
-            .args(&args[1..])
-            .current_dir(dir)
+        let mut cmd = Command::new(args[0]);
+        cmd.args(&args[1..]).current_dir(dir);
+        // Clear git env vars so child processes use `dir` as their repo,
+        // not the parent worktree.
+        if args[0] == "git" {
+            cmd.env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_COMMON_DIR");
+        }
+        let output = cmd
             .output()
             .unwrap_or_else(|e| panic!("failed to run {:?}: {e}", args));
         if !output.status.success() {
@@ -478,10 +506,8 @@ mod integration_tests {
 
     /// Helper for git commits that need author identity without git config.
     fn commit_in(dir: &Path, message: &str) {
-        let output = Command::new("git")
+        let output = git_cmd(dir)
             .args([
-                "-C",
-                dir.to_str().unwrap(),
                 "-c",
                 "user.email=test@test.com",
                 "-c",
@@ -588,9 +614,7 @@ mod integration_tests {
         );
 
         // Verify the branch was deleted.
-        let branch_check = Command::new("git")
-            .arg("-C")
-            .arg(&repo_dir)
+        let branch_check = git_cmd(&repo_dir)
             .args(["rev-parse", "--verify", "refs/heads/test-branch"])
             .output()
             .unwrap();
@@ -839,9 +863,7 @@ mod integration_tests {
         run_in(&source_dir, &["git", "push", "origin", "pr-branch"]);
 
         // Get the commit SHA on pr-branch in source.
-        let expected_sha = Command::new("git")
-            .arg("-C")
-            .arg(&source_dir)
+        let expected_sha = git_cmd(&source_dir)
             .args(["rev-parse", "pr-branch"])
             .output()
             .unwrap();

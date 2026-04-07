@@ -2,6 +2,7 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
+  List    Board                                                Tab: switch view
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  ACTIVE (0) (1)       ││                                                     │
 │> [IM] Build feature   ││  Build feature                                      │
@@ -16,7 +17,6 @@ expression: "render(&app, 80, 24)"
 │                       ││  Errors      (none)                                 │
 │                       ││                                                     │
 │                       ││  Press Enter to start a session.                    │
-│                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

@@ -203,6 +203,29 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Canonicalize a path, resolving symlinks and `.`/`..` components.
+///
+/// On macOS, `/tmp` is a symlink to `/private/tmp`. The `/private` prefix
+/// is an implementation detail that leaks into displayed paths and breaks
+/// snapshot tests across platforms. This function strips the `/private`
+/// prefix when the shortened path still exists, keeping paths consistent
+/// between macOS and Linux.
+pub fn canonicalize_path(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(rest) = canonical.strip_prefix("/private") {
+            let shortened = Path::new("/").join(rest);
+            if shortened.exists() {
+                return Ok(shortened);
+            }
+        }
+    }
+
+    Ok(canonical)
+}
+
 /// Collapse the user's home directory back to `~` for display.
 fn collapse_home(path: &Path) -> String {
     if let Some(home) = home_dir()
@@ -218,7 +241,7 @@ fn collapse_home(path: &Path) -> String {
 /// `./repo`, `~/repo`, and `/abs/path/repo` all produce the same string.
 fn normalize_repo_path(path: &str) -> String {
     let expanded = expand_tilde(path);
-    let canonical = fs::canonicalize(&expanded).unwrap_or(expanded);
+    let canonical = canonicalize_path(&expanded).unwrap_or(expanded);
     collapse_home(&canonical)
 }
 
@@ -263,7 +286,7 @@ impl Config {
     pub fn add_repo(&mut self, raw: &str) -> Result<String, ConfigError> {
         let expanded = expand_tilde(raw);
         let canonical =
-            fs::canonicalize(&expanded).map_err(|_| ConfigError::PathNotFound(raw.to_string()))?;
+            canonicalize_path(&expanded).map_err(|_| ConfigError::PathNotFound(raw.to_string()))?;
 
         if !canonical.join(".git").exists() {
             return Err(ConfigError::NotAGitRepo(raw.to_string()));
@@ -282,7 +305,7 @@ impl Config {
     pub fn add_base_dir(&mut self, raw: &str) -> Result<(String, usize), ConfigError> {
         let expanded = expand_tilde(raw);
         let canonical =
-            fs::canonicalize(&expanded).map_err(|_| ConfigError::PathNotFound(raw.to_string()))?;
+            canonicalize_path(&expanded).map_err(|_| ConfigError::PathNotFound(raw.to_string()))?;
 
         if !canonical.is_dir() {
             return Err(ConfigError::PathNotFound(raw.to_string()));
@@ -300,7 +323,7 @@ impl Config {
     /// Remove a path from repos, base_dirs, and included_repos.
     pub fn remove_path(&mut self, raw: &str) -> bool {
         let target = expand_tilde(raw);
-        let target_canonical = fs::canonicalize(&target).ok();
+        let target_canonical = canonicalize_path(&target).ok();
 
         let before = self.repos.len() + self.base_dirs.len() + self.included_repos.len();
 
@@ -314,7 +337,7 @@ impl Config {
             // If either fails to canonicalize (e.g., unmounted drive),
             // we cannot conclude they match - this prevents removing
             // unrelated entries that also happen to be inaccessible.
-            if let (Some(tc), Ok(sc)) = (&target_canonical, fs::canonicalize(&stored_expanded)) {
+            if let (Some(tc), Ok(sc)) = (&target_canonical, canonicalize_path(&stored_expanded)) {
                 return sc == *tc;
             }
             false

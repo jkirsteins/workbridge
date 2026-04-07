@@ -12,12 +12,14 @@ use ratatui_widgets::{
     list::{List, ListItem, ListState},
     paragraph::Paragraph,
     scrollbar::{Scrollbar, ScrollbarOrientation, ScrollbarState},
+    tabs::Tabs,
 };
 use tui_term::widget::PseudoTerminal;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, DisplayEntry, FocusPanel, GroupHeaderKind, SettingsListFocus, WorkItemContext,
+    App, BOARD_COLUMNS, DisplayEntry, FocusPanel, GroupHeaderKind, SettingsListFocus, ViewMode,
+    WorkItemContext,
 };
 use crate::config;
 use crate::create_dialog::{CreateDialog, CreateDialogFocus};
@@ -39,11 +41,11 @@ const SPINNER_FRAMES: &[char] = &[
 /// callback. All rendering uses Widget::render(area, buf) and
 /// StatefulWidget::render(widget, area, buf, &mut state) directly.
 pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
-    // Vertical split: main area + optional 1-row context bar + optional 1-row status bar.
+    // Vertical split: 1-row view mode header + main area + optional context bar + optional status bar.
     let has_context = app.selected_work_item_context().is_some();
     let has_status = app.has_visible_status_bar();
 
-    let mut constraints = vec![Constraint::Min(0)];
+    let mut constraints = vec![Constraint::Length(1), Constraint::Min(0)];
     if has_context {
         constraints.push(Constraint::Length(1));
     }
@@ -55,8 +57,9 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
         .constraints(constraints)
         .split(area);
 
-    let main_area = vertical[0];
-    let mut next_slot = 1;
+    let header_area = vertical[0];
+    let main_area = vertical[1];
+    let mut next_slot = 2;
 
     let context_area = if has_context {
         let a = vertical[next_slot];
@@ -72,15 +75,24 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
         None
     };
 
-    // Horizontal split: left panel, right panel.
-    let pl = layout::compute(main_area.width, main_area.height, 0);
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(pl.left_width), Constraint::Min(0)])
-        .split(main_area);
+    // View mode header (segmented tab bar).
+    draw_view_mode_header(buf, app, theme, header_area);
 
-    draw_work_item_list(buf, app, theme, chunks[0]);
-    draw_pane_output(buf, app, theme, chunks[1]);
+    // Branch on view mode.
+    if app.view_mode == ViewMode::Board && !app.board_drill_down {
+        // Full-width Kanban board (no right panel).
+        draw_board_view(buf, app, theme, main_area);
+    } else {
+        // Horizontal split: left panel, right panel.
+        let pl = layout::compute(main_area.width, main_area.height, 0);
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(pl.left_width), Constraint::Min(0)])
+            .split(main_area);
+
+        draw_work_item_list(buf, app, theme, chunks[0]);
+        draw_pane_output(buf, app, theme, chunks[1]);
+    }
 
     // Context bar (persistent work-item info).
     if let Some(area) = context_area
@@ -130,7 +142,186 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
     }
 }
 
-/// Draw the left panel containing the grouped work item list.
+/// Draw the view mode header: a segmented tab bar showing List/Board
+/// with contextual keybinding hints on the right.
+fn draw_view_mode_header(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+    let selected = match app.view_mode {
+        ViewMode::FlatList => 0,
+        ViewMode::Board => {
+            if app.board_drill_down {
+                0
+            } else {
+                1
+            }
+        }
+    };
+
+    let tabs = Tabs::new(vec![" List ", " Board "])
+        .select(selected)
+        .style(theme.style_view_mode_tab())
+        .highlight_style(theme.style_view_mode_tab_active())
+        .divider("");
+
+    // Keybinding hints (right-aligned).
+    let hints = if app.view_mode == ViewMode::Board && !app.board_drill_down {
+        "Tab: switch view | <-/->: columns | Shift+arrow: move item | Enter: drill down"
+    } else {
+        "Tab: switch view"
+    };
+
+    // Split header: tabs on left, hints on right.
+    let hints_width = hints.len() as u16 + 1; // +1 for trailing space
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(hints_width)])
+        .split(area);
+
+    tabs.render(cols[0], buf);
+    Paragraph::new(Span::styled(hints, theme.style_view_mode_hints())).render(cols[1], buf);
+}
+
+/// Render the board (Kanban) view: four vertical columns for Backlog,
+/// Planning, Implementing, and Review. Done items are hidden.
+fn draw_board_view(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+    let bl = layout::compute_board(area.width);
+
+    // Split into 4 columns: first 3 fixed width, last gets remainder.
+    let constraints = [
+        Constraint::Length(bl.column_width),
+        Constraint::Length(bl.column_width),
+        Constraint::Length(bl.column_width),
+        Constraint::Min(0),
+    ];
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area);
+
+    for (col_idx, status) in BOARD_COLUMNS.iter().enumerate() {
+        let col_area = columns[col_idx];
+        let is_selected_col = col_idx == app.board_cursor.column;
+
+        let items = app.items_for_column(status);
+        let count = items.len();
+
+        // Column border style.
+        let border_style = if is_selected_col {
+            theme.style_board_column_focused()
+        } else {
+            theme.style_board_column_unfocused()
+        };
+
+        let col_title = format!(
+            " {} ({}) ",
+            match status {
+                WorkItemStatus::Backlog => "Backlog",
+                WorkItemStatus::Planning => "Planning",
+                WorkItemStatus::Implementing => "Implementing",
+                WorkItemStatus::Review => "Review",
+                _ => "",
+            },
+            count
+        );
+
+        let block = Block::default()
+            .title(col_title)
+            .title_style(theme.style_board_column_header())
+            .borders(Borders::ALL)
+            .border_style(border_style);
+
+        if items.is_empty() {
+            let empty_text = Text::from(vec![Line::from(""), Line::from("  No items")]);
+            let paragraph = Paragraph::new(empty_text)
+                .block(block)
+                .style(theme.style_text_muted());
+            paragraph.render(col_area, buf);
+            continue;
+        }
+
+        // Inner width for text wrapping (column width minus 2 for borders,
+        // minus 2 for highlight symbol space).
+        let inner_width = col_area.width.saturating_sub(2).saturating_sub(2) as usize;
+
+        let list_items: Vec<ListItem> = items
+            .iter()
+            .enumerate()
+            .map(|(row_idx, &wi_idx)| format_board_item(app, wi_idx, inner_width, theme, row_idx))
+            .collect();
+
+        let list = List::new(list_items)
+            .block(block)
+            .highlight_style(theme.style_board_item_highlight())
+            .highlight_symbol("> ");
+
+        let mut state = ListState::default();
+        if is_selected_col {
+            state.select(app.board_cursor.row);
+        }
+
+        StatefulWidget::render(list, col_area, buf, &mut state);
+    }
+}
+
+/// Format a work item for display inside a board column.
+/// Uses wrapping (never truncation) to avoid clipping.
+fn format_board_item<'a>(
+    app: &App,
+    wi_idx: usize,
+    max_width: usize,
+    theme: &Theme,
+    _row_idx: usize,
+) -> ListItem<'a> {
+    let Some(wi) = app.work_items.get(wi_idx) else {
+        return ListItem::new(Line::from("<invalid>"));
+    };
+
+    let mut lines: Vec<Line<'a>> = Vec::new();
+
+    // Title line(s) -- wrap, never truncate.
+    let title_prefix = if wi.status == WorkItemStatus::Blocked {
+        "[BK] "
+    } else {
+        ""
+    };
+    let title_text = format!("{title_prefix}{}", wi.title);
+    let wrapped = wrap_text(&title_text, max_width);
+    for (i, wl) in wrapped.into_iter().enumerate() {
+        let style = if wi.status == WorkItemStatus::Blocked {
+            theme.style_stage_badge(&WorkItemStatus::Blocked)
+        } else if i == 0 {
+            theme.style_text()
+        } else {
+            theme.style_text_muted()
+        };
+        lines.push(Line::from(Span::styled(wl, style)));
+    }
+
+    // Status indicators on a second line (PR badge, session status).
+    let mut indicators: Vec<Span<'a>> = Vec::new();
+    let first_pr = wi.repo_associations.iter().find_map(|a| a.pr.as_ref());
+    if let Some(pr) = first_pr {
+        let pr_text = format!("PR#{}", pr.number);
+        indicators.push(Span::styled(pr_text, theme.style_badge_pr()));
+        match &pr.checks {
+            CheckStatus::Passing => {
+                indicators.push(Span::styled(" ok", theme.style_badge_ci_pass()));
+            }
+            CheckStatus::Failing => {
+                indicators.push(Span::styled(" fail", theme.style_badge_ci_fail()));
+            }
+            CheckStatus::Pending => {
+                indicators.push(Span::styled(" ...", theme.style_badge_ci_pending()));
+            }
+            CheckStatus::None | CheckStatus::Unknown => {}
+        }
+    }
+    if !indicators.is_empty() {
+        lines.push(Line::from(indicators));
+    }
+
+    ListItem::new(Text::from(lines))
+}
+
 fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // When the settings overlay is open, dim background panels so the
     // overlay is the clear focal point.
@@ -142,20 +333,50 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         theme.style_border_unfocused()
     };
 
+    // When drilling down from board view, show the stage name in the title.
+    let title = if let Some(ref stage) = app.board_drill_stage {
+        let stage_name = match stage {
+            WorkItemStatus::Backlog => "Backlog",
+            WorkItemStatus::Planning => "Planning",
+            WorkItemStatus::Implementing => "Implementing",
+            WorkItemStatus::Blocked => "Blocked",
+            WorkItemStatus::Review => "Review",
+            WorkItemStatus::Done => "Done",
+        };
+        let count = app
+            .display_list
+            .iter()
+            .filter(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
+            .count();
+        format!(" {stage_name} ({count}) ")
+    } else {
+        format!(" Work Items ({}) ", app.work_items.len())
+    };
+
     let block = Block::default()
-        .title(format!(" Work Items ({}) ", app.work_items.len()))
+        .title(title)
         .title_style(theme.style_title())
         .borders(Borders::ALL)
         .border_style(border_style);
 
     if app.display_list.is_empty() {
-        let text = Text::from(vec![
-            Line::from(""),
-            Line::from("  No work items."),
-            Line::from(""),
-            Line::from("  Press Ctrl+N"),
-            Line::from("  to create one."),
-        ]);
+        let text = if app.board_drill_stage.is_some() {
+            Text::from(vec![
+                Line::from(""),
+                Line::from("  No items."),
+                Line::from(""),
+                Line::from("  Press Ctrl+]"),
+                Line::from("  to return."),
+            ])
+        } else {
+            Text::from(vec![
+                Line::from(""),
+                Line::from("  No work items."),
+                Line::from(""),
+                Line::from("  Press Ctrl+N"),
+                Line::from("  to create one."),
+            ])
+        };
         let paragraph = Paragraph::new(text)
             .block(block)
             .style(theme.style_text_muted());
@@ -2006,7 +2227,7 @@ mod format_entry_tests {
 #[cfg(test)]
 mod snapshot_tests {
     use super::draw_to_buffer;
-    use crate::app::{App, FocusPanel, StubBackend, is_selectable};
+    use crate::app::{App, FocusPanel, StubBackend, ViewMode, is_selectable};
     use crate::theme::Theme;
     use crate::work_item::{
         BackendType, CheckStatus, PrInfo, PrState, RepoAssociation, ReviewDecision, UnlinkedPr,
@@ -2249,8 +2470,8 @@ mod snapshot_tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
 
-        // The selected row is row 2 (row 0 = border, row 1 = UNLINKED header, row 2 = item).
-        let selected_row: u16 = 2;
+        // The selected row is row 3 (row 0 = header, row 1 = border, row 2 = UNLINKED header, row 3 = item).
+        let selected_row: u16 = 3;
         let hl = theme.style_tab_highlight();
         let mut found_badge = false;
         for x in 0..width {
@@ -2381,8 +2602,10 @@ mod snapshot_tests {
     fn settings_overlay_with_config() {
         use crate::config::Config;
 
-        // Use real temp dirs so Config::all_repos() can discover them.
-        let base = std::env::temp_dir().join("workbridge-test-settings-overlay");
+        // Use /tmp (not std::env::temp_dir()) so rendered paths are
+        // deterministic across machines. macOS temp_dir() returns
+        // /var/folders/... which differs per user.
+        let base = std::path::PathBuf::from("/tmp/workbridge-test-settings-overlay");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("discovered-a/.git")).unwrap();
         std::fs::create_dir_all(base.join("discovered-b/.git")).unwrap();
@@ -2392,7 +2615,9 @@ mod snapshot_tests {
 
         let config = Config {
             base_dirs: vec![base_str],
-            repos: vec!["~/Forks/special-repo".into()],
+            // Use an absolute path instead of ~ to avoid tilde expansion
+            // which produces different paths on different machines.
+            repos: vec!["/root/Forks/special-repo".into()],
             included_repos: vec![discovered_a],
             ..Config::for_test()
         };
@@ -2617,5 +2842,153 @@ mod snapshot_tests {
         ];
         let app = app_with_items(items, vec![]);
         insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    // -- Board view snapshot tests --
+
+    #[test]
+    fn board_view_empty() {
+        let mut app = App::new();
+        app.view_mode = ViewMode::Board;
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn board_view_items_distributed() {
+        let items = vec![
+            make_work_item("bl1", "Add caching layer", WorkItemStatus::Backlog, None, 1),
+            make_work_item(
+                "pl1",
+                "Refactor auth middleware",
+                WorkItemStatus::Planning,
+                None,
+                1,
+            ),
+            make_work_item(
+                "im1",
+                "Fix race condition",
+                WorkItemStatus::Implementing,
+                None,
+                1,
+            ),
+            make_work_item(
+                "rv1",
+                "Update CI pipeline",
+                WorkItemStatus::Review,
+                Some(make_pr_info(42, CheckStatus::Passing)),
+                1,
+            ),
+        ];
+        let mut app = app_with_items(items, vec![]);
+        app.view_mode = ViewMode::Board;
+        app.sync_board_cursor();
+        insta::assert_snapshot!(render(&app, 120, 40));
+    }
+
+    #[test]
+    fn board_view_selected_item() {
+        let items = vec![
+            make_work_item("bl1", "First item", WorkItemStatus::Backlog, None, 1),
+            make_work_item("im1", "Active work", WorkItemStatus::Implementing, None, 1),
+            make_work_item(
+                "im2",
+                "Second active",
+                WorkItemStatus::Implementing,
+                None,
+                1,
+            ),
+        ];
+        let mut app = app_with_items(items, vec![]);
+        app.view_mode = ViewMode::Board;
+        // Select second item in Implementing column (column 2, row 1).
+        app.board_cursor.column = 2;
+        app.board_cursor.row = Some(1);
+        app.sync_selection_from_board();
+        insta::assert_snapshot!(render(&app, 120, 40));
+    }
+
+    #[test]
+    fn board_view_blocked_item() {
+        let items = vec![
+            make_work_item("im1", "Normal work", WorkItemStatus::Implementing, None, 1),
+            make_work_item("bk1", "Blocked task", WorkItemStatus::Blocked, None, 1),
+        ];
+        let mut app = app_with_items(items, vec![]);
+        app.view_mode = ViewMode::Board;
+        app.board_cursor.column = 2; // Implementing column
+        app.board_cursor.row = Some(0);
+        app.sync_selection_from_board();
+        insta::assert_snapshot!(render(&app, 120, 40));
+    }
+
+    #[test]
+    fn board_view_long_title_wraps() {
+        let items = vec![make_work_item(
+            "long1",
+            "Add response caching layer with Redis integration for the API users endpoint",
+            WorkItemStatus::Backlog,
+            None,
+            1,
+        )];
+        let mut app = app_with_items(items, vec![]);
+        app.view_mode = ViewMode::Board;
+        app.sync_board_cursor();
+        // At 80 cols: column is 20 wide, inner 16. Title must wrap, not clip.
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn board_view_with_status_bar() {
+        let items = vec![make_work_item(
+            "bl1",
+            "Test item",
+            WorkItemStatus::Backlog,
+            None,
+            1,
+        )];
+        let mut app = app_with_items(items, vec![]);
+        app.view_mode = ViewMode::Board;
+        app.sync_board_cursor();
+        app.status_message = Some("Item moved to Planning".to_string());
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn board_view_item_in_every_column_120x40() {
+        let items = vec![
+            make_work_item(
+                "bl1",
+                "Add response caching layer",
+                WorkItemStatus::Backlog,
+                None,
+                1,
+            ),
+            make_work_item(
+                "pl1",
+                "Refactor auth middleware",
+                WorkItemStatus::Planning,
+                None,
+                1,
+            ),
+            make_work_item(
+                "im1",
+                "Fix race condition in fetcher",
+                WorkItemStatus::Implementing,
+                None,
+                1,
+            ),
+            make_work_item(
+                "rv1",
+                "Update CI pipeline config",
+                WorkItemStatus::Review,
+                Some(make_pr_info(42, CheckStatus::Passing)),
+                1,
+            ),
+        ];
+        let mut app = app_with_items(items, vec![]);
+        app.view_mode = ViewMode::Board;
+        app.sync_board_cursor();
+        // At 120x40, each column is 30 wide (28 inner). No title should clip.
+        insta::assert_snapshot!(render(&app, 120, 40));
     }
 }

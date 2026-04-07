@@ -1,0 +1,28 @@
+---
+source: src/ui.rs
+expression: "render(&app, 80, 24)"
+---
+ Tab: switch view | <-/->: columns | Shift+arrow: move item | Enter: drill down
+┌ Backlog (1) ─────┐┌ Planning (0) ────┐┌ Implementing (0) ┐┌ Review (0) ──────┐
+│> Add response    ││                  ││                  ││                  │
+│      caching     ││  No items        ││  No items        ││  No items        │
+│      layer with  ││                  ││                  ││                  │
+│      Redis       ││                  ││                  ││                  │
+│      integration ││                  ││                  ││                  │
+│      for the API ││                  ││                  ││                  │
+│      users       ││                  ││                  ││                  │
+│      endpoint    ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+│                  ││                  ││                  ││                  │
+└──────────────────┘└──────────────────┘└──────────────────┘└──────────────────┘
+Add response caching layer with Redis integration for the API users endpoint ...

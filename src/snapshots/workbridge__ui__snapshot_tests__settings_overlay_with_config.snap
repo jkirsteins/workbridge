@@ -2,18 +2,18 @@
 source: src/ui.rs
 expression: output
 ---
+  List    Board                                                Tab: switch view
 ┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
-│                       ││                                                     │
-│  No work i┌ Settings (press ? or Esc to close) ──────────────────┐           │
+│           ┌ Settings (press ? or Esc to close) ──────────────────┐           │
+│  No work i│                                                      │           │
+│           │ Config source:                                       │           │
+│  Press Ctr│   in-memory (test)                                   │           │
+│  to create│ Base directories:                                    │           │
+│           │   + /tmp/workbridge-test-settings-overlay            │           │
 │           │                                                      │           │
-│  Press Ctr│ Config source:                                       │           │
-│  to create│   in-memory (test)                                   │           │
-│           │ Base directories:                                    │           │
-│           │   + /var/folders/rv/dqk6jtx96153x987fl6416s40000gn/T │           │
-│           │                                                      │           │
-│           │ ┌ Managed repos (1) ─────┐┌ Available (2) ─────────┐ │           │
-│           │ │>  - /Users/janis.kirste││ + /var/folders/rv/dqk6j│ │           │
-│           │ │                        ││ + /var/folders/rv/dqk6j│ │           │
+│           │ ┌ Managed repos (2) ─────┐┌ Available (1) ─────────┐ │           │
+│           │ │>  - /root/Forks/special││ + /tmp/workbridge-test-│ │           │
+│           │ │   + /tmp/workbridge-tes││                        │ │           │
 │           │ └────────────────────────┘└────────────────────────┘ │           │
 │           │                                                      │           │
 │           │ Defaults:                                            │           │

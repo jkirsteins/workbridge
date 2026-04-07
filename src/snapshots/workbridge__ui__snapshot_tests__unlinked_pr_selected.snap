@@ -2,6 +2,7 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
+  List    Board                                                Tab: switch view
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  UNLINKED (1)         ││                                                     │
 │> ? fix-typo      PR#45││  Press Enter to import                              │
@@ -9,7 +10,6 @@ expression: "render(&app, 80, 24)"
 │  [IM] Active  PR#30 ok││                                                     │
 │  feature              ││                                                     │
 │  branch-prog-1 [no wt]││                                                     │
-│                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
