@@ -299,6 +299,30 @@ impl Theme {
             .add_modifier(Modifier::DIM)
     }
 
+    // -- View mode header styles --
+
+    /// Style for the inactive tab label in the view mode header.
+    pub fn style_view_mode_tab(&self) -> Style {
+        Style::default()
+            .fg(self.text_muted)
+            .add_modifier(Modifier::DIM)
+    }
+
+    /// Style for the active (selected) tab label in the view mode header.
+    pub fn style_view_mode_tab_active(&self) -> Style {
+        Style::default()
+            .fg(self.tab_highlight_fg)
+            .bg(self.tab_highlight_bg)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Style for keybinding hints in the view mode header.
+    pub fn style_view_mode_hints(&self) -> Style {
+        Style::default()
+            .fg(self.text_muted)
+            .add_modifier(Modifier::DIM)
+    }
+
     // -- Board view styles --
     // Reuse existing colors for visual consistency.
 

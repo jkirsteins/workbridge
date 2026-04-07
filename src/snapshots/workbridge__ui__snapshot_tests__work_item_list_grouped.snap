@@ -2,6 +2,7 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
+  List    Board                                                Tab: switch view
 ┌ Work Items (4) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  ACTIVE (0) (2)       ││                                                     │
 │> [IM] Refac PR#88 fail││  Refactor backend API                               │
@@ -17,7 +18,6 @@ expression: "render(&app, 80, 24)"
 │  [BL] Add user        ││                                                     │
 │  settings page        ││  Press Enter to start a session.                    │
 │  branch-todo-2 [no wt]││                                                     │
-│                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

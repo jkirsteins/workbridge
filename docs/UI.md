@@ -49,7 +49,11 @@ The `ViewMode` enum controls the root overview layout:
   See Board View section below.
 
 Toggle between modes with Tab. The selected work item is preserved
-across toggles.
+across toggles. A 1-row view mode header at the top of the screen
+shows a segmented tab bar (using the ratatui `Tabs` widget) with
+`List` and `Board` labels. The active mode is highlighted. Contextual
+keybinding hints appear right-aligned in the header (e.g., board mode
+shows arrow key and Shift+arrow controls).
 
 ## Focus Model
 
@@ -126,6 +130,7 @@ ratatui-core.
 ### Layout: Flat List Mode
 
 ```
+  List   Board                          Tab: switch view
 +-- Work Items --+-- Claude Code -----------------+
 |                |                                 |
 | UNLINKED (N)   |  [PTY output or placeholder]    |
@@ -142,6 +147,9 @@ ratatui-core.
 +--------------------------------------------------+
 ```
 
+The `List` label is highlighted (active). The header uses the ratatui
+`Tabs` widget with `style_view_mode_tab_active()` for the selected tab.
+
 Work items are shown as a flat list with stage badges:
 - [BL] Backlog, [PL] Planning, [IM] Implementing
 - [BK] Blocked, [RV] Review, [DN] Done
@@ -155,6 +163,7 @@ Status bar: 1 row, conditional on status_message.is_some()
 ### Layout: Board View
 
 ```
+  List   Board          Tab: switch view | <-/->: columns | ...
 +- Backlog ----+- Planning ---+- Implementing +- Review -----+
 |              |              |               |              |
 | idea-1       | plan-2       | [BK] fix-5    | fix-4        |
@@ -166,6 +175,9 @@ Status bar: 1 row, conditional on status_message.is_some()
 | Status bar message                                         |
 +------------------------------------------------------------+
 ```
+
+The `Board` label is highlighted (active). Board-mode hints show
+arrow key navigation and Shift+arrow stage transitions.
 
 Four columns displayed: Backlog, Planning, Implementing, Review.
 Done items are hidden from the board. Blocked items appear in the
@@ -202,6 +214,11 @@ To style a rat-widget component, pass Theme styles directly:
 ```rust
 TextInput::new().style(theme.style_text())
 ```
+
+View mode header styles:
+- `style_view_mode_tab()` - inactive tab label (dimmed)
+- `style_view_mode_tab_active()` - active tab label (bold, inverted highlight)
+- `style_view_mode_hints()` - keybinding hints text (dimmed)
 
 Board-specific styles:
 - `style_board_column_focused()` - border for the active column
@@ -254,5 +271,6 @@ Currently used:
 - SimpleTextInput (custom, in create_dialog.rs) - lightweight text input
 - List (ratatui-widgets) - work item list, repo selection, board columns
   (rendered via StatefulWidget::render in board view)
+- Tabs (ratatui-widgets) - view mode header (List/Board segmented tab bar)
 - Block, Paragraph, Clear (ratatui-widgets) - layout and overlays
 - PseudoTerminal (tui-term) - PTY output rendering

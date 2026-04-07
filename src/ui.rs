@@ -12,6 +12,7 @@ use ratatui_widgets::{
     list::{List, ListItem, ListState},
     paragraph::Paragraph,
     scrollbar::{Scrollbar, ScrollbarOrientation, ScrollbarState},
+    tabs::Tabs,
 };
 use tui_term::widget::PseudoTerminal;
 use unicode_width::UnicodeWidthStr;
@@ -40,11 +41,11 @@ const SPINNER_FRAMES: &[char] = &[
 /// callback. All rendering uses Widget::render(area, buf) and
 /// StatefulWidget::render(widget, area, buf, &mut state) directly.
 pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
-    // Vertical split: main area + optional 1-row context bar + optional 1-row status bar.
+    // Vertical split: 1-row view mode header + main area + optional context bar + optional status bar.
     let has_context = app.selected_work_item_context().is_some();
     let has_status = app.has_visible_status_bar();
 
-    let mut constraints = vec![Constraint::Min(0)];
+    let mut constraints = vec![Constraint::Length(1), Constraint::Min(0)];
     if has_context {
         constraints.push(Constraint::Length(1));
     }
@@ -56,8 +57,9 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
         .constraints(constraints)
         .split(area);
 
-    let main_area = vertical[0];
-    let mut next_slot = 1;
+    let header_area = vertical[0];
+    let main_area = vertical[1];
+    let mut next_slot = 2;
 
     let context_area = if has_context {
         let a = vertical[next_slot];
@@ -72,6 +74,9 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
     } else {
         None
     };
+
+    // View mode header (segmented tab bar).
+    draw_view_mode_header(buf, app, theme, header_area);
 
     // Branch on view mode.
     if app.view_mode == ViewMode::Board && !app.board_drill_down {
@@ -137,7 +142,44 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
     }
 }
 
-/// Draw the left panel containing the grouped work item list.
+/// Draw the view mode header: a segmented tab bar showing List/Board
+/// with contextual keybinding hints on the right.
+fn draw_view_mode_header(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+    let selected = match app.view_mode {
+        ViewMode::FlatList => 0,
+        ViewMode::Board => {
+            if app.board_drill_down {
+                0
+            } else {
+                1
+            }
+        }
+    };
+
+    let tabs = Tabs::new(vec![" List ", " Board "])
+        .select(selected)
+        .style(theme.style_view_mode_tab())
+        .highlight_style(theme.style_view_mode_tab_active())
+        .divider("");
+
+    // Keybinding hints (right-aligned).
+    let hints = if app.view_mode == ViewMode::Board && !app.board_drill_down {
+        "Tab: switch view | <-/->: columns | Shift+arrow: move item | Enter: drill down"
+    } else {
+        "Tab: switch view"
+    };
+
+    // Split header: tabs on left, hints on right.
+    let hints_width = hints.len() as u16 + 1; // +1 for trailing space
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(hints_width)])
+        .split(area);
+
+    tabs.render(cols[0], buf);
+    Paragraph::new(Span::styled(hints, theme.style_view_mode_hints())).render(cols[1], buf);
+}
+
 /// Render the board (Kanban) view: four vertical columns for Backlog,
 /// Planning, Implementing, and Review. Done items are hidden.
 fn draw_board_view(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
@@ -2428,8 +2470,8 @@ mod snapshot_tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
 
-        // The selected row is row 2 (row 0 = border, row 1 = UNLINKED header, row 2 = item).
-        let selected_row: u16 = 2;
+        // The selected row is row 3 (row 0 = header, row 1 = border, row 2 = UNLINKED header, row 3 = item).
+        let selected_row: u16 = 3;
         let hl = theme.style_tab_highlight();
         let mut found_badge = false;
         for x in 0..width {

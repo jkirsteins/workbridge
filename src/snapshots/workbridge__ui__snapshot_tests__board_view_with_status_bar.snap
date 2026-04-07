@@ -1,12 +1,11 @@
 ---
 source: src/ui.rs
-assertion_line: 2383
 expression: "render(&app, 80, 24)"
 ---
+ Tab: switch view | <-/->: columns | Shift+arrow: move item | Enter: drill down
 ┌ Backlog (1) ─────┐┌ Planning (0) ────┐┌ Implementing (0) ┐┌ Review (0) ──────┐
 │> Test item       ││                  ││                  ││                  │
 │                  ││  No items        ││  No items        ││  No items        │
-│                  ││                  ││                  ││                  │
 │                  ││                  ││                  ││                  │
 │                  ││                  ││                  ││                  │
 │                  ││                  ││                  ││                  │

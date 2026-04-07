@@ -2,6 +2,7 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
+  List    Board                                                Tab: switch view
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  BACKLOGGED (0) (1)   ││                                                     │
 │> [BL] Fix     PR#14 ok││  Fix authentication bug                             │
@@ -16,7 +17,6 @@ expression: "render(&app, 80, 24)"
 │                       ││  Errors      (none)                                 │
 │                       ││                                                     │
 │                       ││  Press Shift+Right to move to Planning.             │
-│                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

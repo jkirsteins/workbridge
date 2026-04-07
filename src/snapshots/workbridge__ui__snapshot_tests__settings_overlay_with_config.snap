@@ -1,15 +1,14 @@
 ---
 source: src/ui.rs
-assertion_line: 2099
 expression: output
 ---
+  List    Board                                                Tab: switch view
 ┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
-│                       ││                                                     │
-│  No work i┌ Settings (press ? or Esc to close) ──────────────────┐           │
-│           │                                                      │           │
-│  Press Ctr│ Config source:                                       │           │
-│  to create│   in-memory (test)                                   │           │
-│           │ Base directories:                                    │           │
+│           ┌ Settings (press ? or Esc to close) ──────────────────┐           │
+│  No work i│                                                      │           │
+│           │ Config source:                                       │           │
+│  Press Ctr│   in-memory (test)                                   │           │
+│  to create│ Base directories:                                    │           │
 │           │   + /tmp/workbridge-test-settings-overlay            │           │
 │           │                                                      │           │
 │           │ ┌ Managed repos (2) ─────┐┌ Available (1) ─────────┐ │           │
