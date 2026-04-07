@@ -87,10 +87,19 @@ pub struct GitWorktreeService;
 
 impl GitWorktreeService {
     /// Run a git command with `-C repo_path` and return stdout on success.
+    ///
+    /// Clears inherited git env vars (GIT_DIR, GIT_WORK_TREE, etc.) so the
+    /// command operates on `repo_path` rather than a parent worktree. This
+    /// matters when the process runs inside a git hook (e.g. pre-push) where
+    /// git sets these variables.
     fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, WorktreeError> {
         let output = Command::new("git")
             .arg("-C")
             .arg(repo_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
             .args(args)
             .output()
             .map_err(|e| WorktreeError::Io(format!("failed to run git: {e}")))?;
@@ -605,9 +614,7 @@ mod integration_tests {
         );
 
         // Verify the branch was deleted.
-        let branch_check = Command::new("git")
-            .arg("-C")
-            .arg(&repo_dir)
+        let branch_check = git_cmd(&repo_dir)
             .args(["rev-parse", "--verify", "refs/heads/test-branch"])
             .output()
             .unwrap();
@@ -856,9 +863,7 @@ mod integration_tests {
         run_in(&source_dir, &["git", "push", "origin", "pr-branch"]);
 
         // Get the commit SHA on pr-branch in source.
-        let expected_sha = Command::new("git")
-            .arg("-C")
-            .arg(&source_dir)
+        let expected_sha = git_cmd(&source_dir)
             .args(["rev-parse", "pr-branch"])
             .output()
             .unwrap();
