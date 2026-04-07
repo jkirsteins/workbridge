@@ -26,7 +26,7 @@ The backend record anchors the work item's identity. It is a local JSON file
 
 - Work item ID (file path)
 - Title
-- Status (Todo or InProgress)
+- Status (Backlog, Planning, Implementing, Blocked, or Review)
 - Repo associations (repo path + optional branch name)
 
 The UI can render a work item list immediately from backend records alone,
@@ -72,13 +72,39 @@ If no PR exists for the branch, there is no PR piece.
 
 ## Work Item Status
 
-Work items have two statuses:
+Work items follow a six-stage workflow:
 
-- **Todo** - Work has been planned but not started.
-- **InProgress** - Work is actively being done.
+- **Backlog** - Work has been identified but not started. (Stored as "Backlog" in the backend; legacy "Todo" values are accepted via serde alias.)
+- **Planning** - A Claude session produces an implementation plan. Advancing to Implementing requires the plan to be set via `workbridge_set_plan`; manual advance is blocked.
+- **Implementing** - Active development. A Claude session works on the code.
+- **Blocked** - The implementation is stuck and needs user input. Can move back to Implementing when unblocked.
+- **Review** - Implementation is complete and under review. Entering Review from Implementing triggers a review gate (async plan-vs-implementation check) and auto-creates a PR.
+- **Done** - Work is finished. This status is derived, not directly settable (see below).
 
-These are stored in the backend record and do not change automatically based
-on PR state or session activity. Status transitions are user-initiated.
+### Status transitions
+
+Most forward transitions are triggered by the user via TUI keybinds (advance/retreat). Claude sessions can request a limited set of transitions via the `workbridge_set_status` MCP tool:
+
+- Implementing -> Review (routed through the review gate)
+- Implementing -> Blocked
+- Blocked -> Implementing
+- Planning -> Implementing
+
+All other transitions must go through TUI keybinds.
+
+### Review gate
+
+When a work item transitions from Implementing to Review (whether user- or MCP-initiated), a review gate runs asynchronously. It compares the implementation plan against the actual code changes and produces findings. If no plan exists, the gate is skipped.
+
+### Merge gate
+
+Advancing from Review to Done is gated by PR merge. Instead of directly changing status, the user is prompted to choose a merge strategy (squash or merge). The TUI spawns an async `gh pr merge` command. Done is reached only after GitHub confirms the PR was merged.
+
+If any prerequisite is missing - no repo association, no branch, no GitHub remote, or no open PR - the merge is blocked with an error message and the item stays in Review. Done cannot be set directly via MCP either; it always requires the merge gate.
+
+### Derived Done status
+
+During assembly, if any repo association has a merged PR (`PrState::Merged`), the work item's status is set to Done regardless of what the backend record says. This is marked as a derived status (`status_derived = true`). When the status is derived, manual stage transitions (advance/retreat) and MCP transitions are blocked.
 
 ## Sessions
 

@@ -2547,6 +2547,10 @@ impl App {
     }
 
     /// Shared logic for applying a stage change: log it, persist it, reassemble.
+    ///
+    /// Transitions to Done are only allowed when `source == "pr_merge"`,
+    /// enforcing the merge-gate invariant at the chokepoint rather than
+    /// relying on caller discipline alone.
     pub fn apply_stage_change(
         &mut self,
         wi_id: &WorkItemId,
@@ -2554,6 +2558,14 @@ impl App {
         new_status: &WorkItemStatus,
         source: &str,
     ) {
+        // Merge-gate guard: Done requires a verified PR merge.  All other
+        // callers must go through the merge prompt / poll_pr_merge path,
+        // which is the only code that passes source == "pr_merge".
+        if *new_status == WorkItemStatus::Done && source != "pr_merge" {
+            self.status_message = Some("Cannot move to Done without a merged PR".to_string());
+            return;
+        }
+
         let entry = ActivityEntry {
             timestamp: now_iso8601(),
             event_type: "stage_change".to_string(),
@@ -2826,12 +2838,13 @@ impl App {
         }
     }
 
-    /// Execute a PR merge for the given work item, then advance to Done.
-    ///
-    /// `strategy` is either "squash" or "merge". If no PR exists for the
-    /// branch, the merge step is skipped and we go directly to Done.
-    /// After a successful merge, the worktree directory is cleaned up.
     /// Spawn an async PR merge for the given work item.
+    ///
+    /// `strategy` is either "squash" or "merge". If any prerequisite is
+    /// missing (no repo association, no branch, no GitHub remote), the
+    /// request is blocked with an error message and the item stays in
+    /// Review. The background thread also checks for an open PR and
+    /// blocks if none exists (see `poll_pr_merge` / `NoPr` outcome).
     ///
     /// Gathers the needed data synchronously, then spawns a background
     /// thread to run `gh pr merge`. Results are polled by `poll_pr_merge()`
@@ -2852,26 +2865,14 @@ impl App {
         let assoc = match wi.repo_associations.first() {
             Some(a) => a,
             None => {
-                // No repo association - just advance to Done.
-                self.apply_stage_change(
-                    wi_id,
-                    &WorkItemStatus::Review,
-                    &WorkItemStatus::Done,
-                    "user",
-                );
+                self.status_message = Some("Cannot merge: no repo association".into());
                 return;
             }
         };
         let branch = match assoc.branch.as_ref() {
             Some(b) => b.clone(),
             None => {
-                // No branch - just advance to Done.
-                self.apply_stage_change(
-                    wi_id,
-                    &WorkItemStatus::Review,
-                    &WorkItemStatus::Done,
-                    "user",
-                );
+                self.status_message = Some("Cannot merge: no branch associated".into());
                 return;
             }
         };
@@ -2881,13 +2882,7 @@ impl App {
         let (owner, repo_name) = match self.worktree_service.github_remote(&repo_path) {
             Ok(Some((o, r))) => (o, r),
             _ => {
-                // No GitHub remote - skip merge, advance to Done.
-                self.apply_stage_change(
-                    wi_id,
-                    &WorkItemStatus::Review,
-                    &WorkItemStatus::Done,
-                    "user",
-                );
+                self.status_message = Some("Cannot merge: no GitHub remote found".into());
                 return;
             }
         };
@@ -3020,16 +3015,8 @@ impl App {
 
         match result.outcome {
             PrMergeOutcome::NoPr => {
-                if actual_status.as_ref() != Some(&WorkItemStatus::Review) {
-                    return;
-                }
-                // No PR - advance to Done directly.
-                self.apply_stage_change(
-                    &result.wi_id,
-                    &WorkItemStatus::Review,
-                    &WorkItemStatus::Done,
-                    "user",
-                );
+                self.status_message =
+                    Some("Cannot merge: no PR found. Push branch and open a PR first.".into());
             }
             PrMergeOutcome::Merged { ref strategy } => {
                 // Log merge to activity log (always - the merge happened on GitHub).
@@ -3064,7 +3051,7 @@ impl App {
                     &result.wi_id,
                     &WorkItemStatus::Review,
                     &WorkItemStatus::Done,
-                    "user",
+                    "pr_merge",
                 );
                 self.status_message = Some(format!("PR merged ({strategy}) and moved to [DN]"));
             }
@@ -5924,6 +5911,173 @@ mod tests {
         assert!(
             msg.contains("quash"),
             "status should mention squash option, got: {msg}",
+        );
+    }
+
+    // -- Regression: execute_merge must not advance to Done without a real merge --
+
+    #[test]
+    fn execute_merge_no_repo_assoc_blocks_done() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-no-assoc.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            title: "No assoc".into(),
+            description: None,
+            status: WorkItemStatus::Review,
+            status_derived: false,
+            repo_associations: vec![],
+            errors: vec![],
+        });
+        app.execute_merge(&wi_id, "squash");
+        let status = app
+            .work_items
+            .iter()
+            .find(|w| w.id == wi_id)
+            .unwrap()
+            .status
+            .clone();
+        assert_eq!(status, WorkItemStatus::Review, "must stay in Review");
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(msg.contains("no repo association"), "got: {msg}");
+    }
+
+    #[test]
+    fn execute_merge_no_branch_blocks_done() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-no-branch.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            title: "No branch".into(),
+            description: None,
+            status: WorkItemStatus::Review,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/repo"),
+                branch: None,
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+        app.execute_merge(&wi_id, "squash");
+        let status = app
+            .work_items
+            .iter()
+            .find(|w| w.id == wi_id)
+            .unwrap()
+            .status
+            .clone();
+        assert_eq!(status, WorkItemStatus::Review, "must stay in Review");
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(msg.contains("no branch"), "got: {msg}");
+    }
+
+    #[test]
+    fn execute_merge_no_github_remote_blocks_done() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-no-remote.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            title: "No remote".into(),
+            description: None,
+            status: WorkItemStatus::Review,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/repo"),
+                branch: Some("feature/test".into()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+        // StubWorktreeService.github_remote() returns Ok(None)
+        app.execute_merge(&wi_id, "squash");
+        let status = app
+            .work_items
+            .iter()
+            .find(|w| w.id == wi_id)
+            .unwrap()
+            .status
+            .clone();
+        assert_eq!(status, WorkItemStatus::Review, "must stay in Review");
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(msg.contains("no GitHub remote"), "got: {msg}");
+    }
+
+    #[test]
+    fn poll_pr_merge_no_pr_blocks_done() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-no-pr.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            title: "No PR".into(),
+            description: None,
+            status: WorkItemStatus::Review,
+            status_derived: false,
+            repo_associations: vec![],
+            errors: vec![],
+        });
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(PrMergeResult {
+            wi_id: wi_id.clone(),
+            branch: "feature/test".into(),
+            outcome: PrMergeOutcome::NoPr,
+        })
+        .unwrap();
+        app.pr_merge_rx = Some(rx);
+        app.poll_pr_merge();
+        let status = app
+            .work_items
+            .iter()
+            .find(|w| w.id == wi_id)
+            .unwrap()
+            .status
+            .clone();
+        assert_eq!(status, WorkItemStatus::Review, "must stay in Review");
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(msg.contains("no PR found"), "got: {msg}");
+    }
+
+    #[test]
+    fn poll_pr_merge_merged_advances_to_done() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-ok.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            title: "Merged OK".into(),
+            description: None,
+            status: WorkItemStatus::Review,
+            status_derived: false,
+            repo_associations: vec![],
+            errors: vec![],
+        });
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(PrMergeResult {
+            wi_id: wi_id.clone(),
+            branch: "feature/test".into(),
+            outcome: PrMergeOutcome::Merged {
+                strategy: "squash".into(),
+            },
+        })
+        .unwrap();
+        app.pr_merge_rx = Some(rx);
+        app.poll_pr_merge();
+        // After apply_stage_change, reassemble rebuilds from StubBackend (empty),
+        // so we verify via the status message that the merge path was taken.
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("PR merged") && msg.contains("[DN]"),
+            "should confirm merge and Done, got: {msg}",
         );
     }
 
