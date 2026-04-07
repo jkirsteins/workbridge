@@ -337,7 +337,11 @@ fn format_work_item_entry<'a>(
         Span::raw(pad_str),
     ];
     for (text, style) in &right_parts[..visible_badge_count] {
-        let s = if is_selected { right_badge_style } else { *style };
+        let s = if is_selected {
+            right_badge_style
+        } else {
+            *style
+        };
         line1_spans.push(Span::styled(text.clone(), s));
     }
     let line1 = Line::from(line1_spans);
@@ -371,10 +375,7 @@ fn format_work_item_entry<'a>(
 
         let meta_content = format!("{branch_name}{wt_indicator}");
         for wrapped_line in wrap_text(&meta_content, max_width) {
-            lines.push(Line::from(vec![Span::styled(
-                wrapped_line,
-                meta_style,
-            )]));
+            lines.push(Line::from(vec![Span::styled(wrapped_line, meta_style)]));
         }
     }
     // No repo associations = no line 2 (invariant 1 violation, but render gracefully)
@@ -733,8 +734,11 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
 
     match selected_entry {
         Some(DisplayEntry::WorkItemEntry(wi_idx)) => {
-            let work_item_id = app.work_items.get(*wi_idx).map(|wi| &wi.id);
-            let session_entry = work_item_id.and_then(|id| app.sessions.get(id));
+            let session_key = app
+                .work_items
+                .get(*wi_idx)
+                .and_then(|wi| app.session_key_for(&wi.id));
+            let session_entry = session_key.as_ref().and_then(|key| app.sessions.get(key));
 
             match session_entry {
                 Some(entry) if !entry.alive => {
@@ -1504,7 +1508,11 @@ mod wrap_variant_tests {
             25,
         );
         // First line fits within 10 columns
-        assert!(result[0].width() <= 10, "first line too wide: {:?}", result[0]);
+        assert!(
+            result[0].width() <= 10,
+            "first line too wide: {:?}",
+            result[0]
+        );
         // Continuation lines use the wider budget
         for line in result.iter().skip(1) {
             assert!(line.width() <= 25, "continuation too wide: {:?}", line);
@@ -1603,7 +1611,10 @@ mod format_entry_tests {
             "should not show [no wt] tag: {text}"
         );
         // Repo name is now in the group header, not per-item.
-        assert!(!text.contains("myrepo"), "repo should be in group header, not item: {text}");
+        assert!(
+            !text.contains("myrepo"),
+            "repo should be in group header, not item: {text}"
+        );
     }
 
     /// Work items with a branch should show branch on line 2.
@@ -1701,7 +1712,7 @@ mod format_entry_tests {
 #[cfg(test)]
 mod snapshot_tests {
     use super::draw_to_buffer;
-    use crate::app::{is_selectable, App, FocusPanel, StubBackend};
+    use crate::app::{App, FocusPanel, StubBackend, is_selectable};
     use crate::theme::Theme;
     use crate::work_item::{
         BackendType, CheckStatus, PrInfo, PrState, RepoAssociation, ReviewDecision, UnlinkedPr,

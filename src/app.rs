@@ -132,8 +132,8 @@ pub struct App {
     pub work_items: Vec<WorkItem>,
     /// PRs not linked to any work item.
     pub unlinked_prs: Vec<UnlinkedPr>,
-    /// Sessions keyed by work item ID.
-    pub sessions: HashMap<WorkItemId, SessionEntry>,
+    /// Sessions keyed by (work item ID, stage).
+    pub sessions: HashMap<(WorkItemId, WorkItemStatus), SessionEntry>,
     /// Fetched data per repo path (populated by background fetcher).
     pub repo_data: HashMap<PathBuf, RepoFetchResult>,
     /// Receiver for background fetch messages.
@@ -464,7 +464,7 @@ impl App {
     /// Also cleans up .mcp.json files and MCP servers for dead sessions.
     pub fn check_liveness(&mut self) {
         let mut dead_ids: Vec<WorkItemId> = Vec::new();
-        for (id, entry) in self.sessions.iter_mut() {
+        for ((wi_id, _stage), entry) in self.sessions.iter_mut() {
             let was_alive = entry.alive;
             if let Some(ref mut session) = entry.session {
                 entry.alive = session.is_alive();
@@ -472,12 +472,32 @@ impl App {
                 entry.alive = false;
             }
             if was_alive && !entry.alive {
-                dead_ids.push(id.clone());
+                dead_ids.push(wi_id.clone());
             }
         }
         // Clean up MCP resources for newly dead sessions.
         for id in dead_ids {
             self.cleanup_mcp_for(&id);
+        }
+
+        // Kill sessions whose stage doesn't match the work item's current stage.
+        let orphans: Vec<_> = self
+            .sessions
+            .keys()
+            .filter(|(wi_id, stage)| {
+                self.work_items
+                    .iter()
+                    .find(|w| w.id == *wi_id)
+                    .is_none_or(|wi| wi.status != *stage)
+            })
+            .cloned()
+            .collect();
+        for key in orphans {
+            if let Some(mut entry) = self.sessions.remove(&key)
+                && let Some(mut session) = entry.session.take()
+            {
+                session.kill();
+            }
         }
     }
 
@@ -539,6 +559,11 @@ impl App {
         }
     }
 
+    /// Find the session key for a work item ID (any stage).
+    pub fn session_key_for(&self, wi_id: &WorkItemId) -> Option<(WorkItemId, WorkItemStatus)> {
+        self.sessions.keys().find(|(id, _)| id == wi_id).cloned()
+    }
+
     /// Send raw bytes to the active session's PTY.
     ///
     /// The active session is the one associated with the currently selected
@@ -547,7 +572,10 @@ impl App {
         let Some(work_item_id) = self.selected_work_item_id() else {
             return;
         };
-        let Some(entry) = self.sessions.get(&work_item_id) else {
+        let Some(key) = self.session_key_for(&work_item_id) else {
+            return;
+        };
+        let Some(entry) = self.sessions.get(&key) else {
             return;
         };
         if let Some(ref session) = entry.session
@@ -914,17 +942,36 @@ impl App {
 
         // If session already exists and is alive, just focus right panel.
         // If the session is dead, remove it and fall through to spawn a new one.
-        if self.sessions.contains_key(&work_item_id) {
+        if let Some(existing_key) = self.session_key_for(&work_item_id) {
             let is_alive = self
                 .sessions
-                .get(&work_item_id)
+                .get(&existing_key)
                 .is_some_and(|entry| entry.alive);
             if is_alive {
                 self.focus = FocusPanel::Right;
                 self.status_message = Some("Right panel focused - press Ctrl+] to return".into());
                 return;
             }
-            self.sessions.remove(&work_item_id);
+            self.sessions.remove(&existing_key);
+        }
+
+        self.spawn_session(&work_item_id);
+    }
+
+    /// Spawn a fresh Claude session for a work item in its current stage.
+    /// Creates a worktree if needed, starts an MCP server, and launches
+    /// the Claude process with the stage-specific system prompt.
+    pub fn spawn_session(&mut self, work_item_id: &WorkItemId) {
+        let Some(wi) = self.work_items.iter().find(|w| w.id == *work_item_id) else {
+            return;
+        };
+        let work_item_id = wi.id.clone();
+        let work_item_status = wi.status.clone();
+        let session_key = (work_item_id.clone(), work_item_status);
+
+        // Stages without sessions.
+        if matches!(wi.status, WorkItemStatus::Backlog | WorkItemStatus::Done) {
+            return;
         }
 
         // Find the first worktree path among the work item's repo associations.
@@ -1037,7 +1084,7 @@ impl App {
                     alive: true,
                     session: Some(session),
                 };
-                self.sessions.insert(work_item_id.clone(), entry);
+                self.sessions.insert(session_key.clone(), entry);
                 match mcp_result {
                     Ok((server, _)) => {
                         self.mcp_servers.insert(work_item_id, server);
@@ -1336,6 +1383,16 @@ impl App {
                         } else {
                             self.status_message = Some("Plan saved by Claude".to_string());
                         }
+
+                        // Auto-advance from Planning to Implementing when plan is set.
+                        // The orphan cleanup in check_liveness will kill the Planning session.
+                        if let Some(wi) = self.work_items.iter().find(|w| w.id == wi_id)
+                            && wi.status == WorkItemStatus::Planning
+                        {
+                            let current = WorkItemStatus::Planning;
+                            let next = WorkItemStatus::Implementing;
+                            self.apply_stage_change(&wi_id, &current, &next, "mcp");
+                        }
                     }
                 }
             }
@@ -1457,13 +1514,13 @@ impl App {
 
     /// Create a new work item with explicit parameters from the creation
     /// dialog. Unlike `create_work_item()` which uses CWD and a hardcoded
-    /// title, this accepts user-provided title, selected repos, and an
-    /// optional branch name.
+    /// title, this accepts user-provided title, selected repos, and a
+    /// branch name (required).
     pub fn create_work_item_with(
         &mut self,
         title: String,
         repos: Vec<PathBuf>,
-        branch: Option<String>,
+        branch: String,
     ) -> Result<(), String> {
         if repos.is_empty() {
             let msg = "No repos selected".to_string();
@@ -1489,13 +1546,11 @@ impl App {
             return Err(msg);
         }
 
-        let has_branch = branch.is_some();
-
         let repo_associations: Vec<RepoAssociationRecord> = valid_repos
             .into_iter()
             .map(|repo_path| RepoAssociationRecord {
                 repo_path,
-                branch: branch.clone(),
+                branch: Some(branch.clone()),
             })
             .collect();
 
@@ -1509,9 +1564,7 @@ impl App {
             Ok(_record) => {
                 self.reassemble_work_items();
                 self.build_display_list();
-                if has_branch {
-                    self.fetcher_repos_changed = true;
-                }
+                self.fetcher_repos_changed = true;
                 self.status_message = Some(format!("Created: {title}"));
                 Ok(())
             }
@@ -1542,7 +1595,8 @@ impl App {
         // Backend delete succeeded - now kill any active session and
         // clean up MCP resources (.mcp.json, socket server).
         self.cleanup_mcp_for(&work_item_id);
-        if let Some(mut entry) = self.sessions.remove(&work_item_id)
+        if let Some(key) = self.session_key_for(&work_item_id)
+            && let Some(mut entry) = self.sessions.remove(&key)
             && let Some(ref mut session) = entry.session
         {
             session.kill();
@@ -1609,6 +1663,16 @@ impl App {
             self.status_message = Some("Already at final stage".into());
             return;
         };
+
+        // Planning -> Implementing is automatic (triggered by workbridge_set_plan).
+        // Block manual advance to prevent skipping the plan handoff.
+        if current_status == WorkItemStatus::Planning
+            && new_status == WorkItemStatus::Implementing
+        {
+            self.status_message =
+                Some("Plan must be set via Claude session (workbridge_set_plan)".into());
+            return;
+        }
 
         // Review gate: when transitioning from Implementing to Review,
         // check the plan against the implementation if a plan exists.
@@ -1714,6 +1778,12 @@ impl App {
             msg = format!("{msg} - {info}");
         }
         self.status_message = Some(msg);
+
+        // Auto-spawn a session for stages that have prompts.
+        // The orphan cleanup in check_liveness handles killing the old session.
+        if !matches!(new_status, WorkItemStatus::Backlog | WorkItemStatus::Done) {
+            self.spawn_session(wi_id);
+        }
     }
 
     /// Best-effort PR creation when entering Review.
@@ -2244,7 +2314,8 @@ impl App {
     /// Get the SessionEntry for the currently selected work item, if any.
     pub fn active_session_entry(&self) -> Option<&SessionEntry> {
         let work_item_id = self.selected_work_item_id()?;
-        self.sessions.get(&work_item_id)
+        let key = self.session_key_for(&work_item_id)?;
+        self.sessions.get(&key)
     }
 
     /// Returns true if any session is alive.
@@ -2793,22 +2864,12 @@ mod tests {
         let result = app.create_work_item_with(
             "With branch".into(),
             vec![PathBuf::from("/repo")],
-            Some("feature/test".into()),
+            "feature/test".into(),
         );
         assert!(result.is_ok());
         assert!(
             app.fetcher_repos_changed,
             "fetcher_repos_changed should be true after creating with a branch",
-        );
-
-        // Reset and create without a branch - flag should NOT be set.
-        app.fetcher_repos_changed = false;
-        let result =
-            app.create_work_item_with("No branch".into(), vec![PathBuf::from("/repo")], None);
-        assert!(result.is_ok());
-        assert!(
-            !app.fetcher_repos_changed,
-            "fetcher_repos_changed should remain false when creating without a branch",
         );
     }
 
@@ -4250,7 +4311,7 @@ mod tests {
                 PathBuf::from("/repos/with-git"),
                 PathBuf::from("/repos/no-git"),
             ],
-            None,
+            "feature/test".into(),
         );
         assert!(result.is_ok(), "create should succeed for valid repos");
 
@@ -4349,7 +4410,11 @@ mod tests {
     fn display_list_all_active_only_shows_active_group() {
         let mut app = App::new();
         app.work_items = vec![
-            make_work_item("/repos/myrepo", "Implementing item", WorkItemStatus::Implementing),
+            make_work_item(
+                "/repos/myrepo",
+                "Implementing item",
+                WorkItemStatus::Implementing,
+            ),
             make_work_item("/repos/myrepo", "Review item", WorkItemStatus::Review),
         ];
         app.build_display_list();
@@ -4448,7 +4513,7 @@ mod tests {
         let result = app.create_work_item_with(
             "Test item".into(),
             vec![PathBuf::from("/repos/no-git")],
-            None,
+            "feature/test".into(),
         );
         assert!(
             result.is_err(),
@@ -4556,8 +4621,8 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id,
             backend_type: BackendType::LocalFile,
-            title: "Planning item".into(),
-            status: WorkItemStatus::Planning,
+            title: "Backlog item".into(),
+            status: WorkItemStatus::Backlog,
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
@@ -4570,8 +4635,62 @@ mod tests {
 
         assert!(
             !app.confirm_merge,
-            "merge prompt should not appear for Planning -> Implementing",
+            "merge prompt should not appear for Backlog -> Planning",
         );
+    }
+
+    /// Manual advance from Planning to Implementing is blocked.
+    #[test]
+    fn advance_stage_planning_to_implementing_blocked() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/plan.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id,
+            backend_type: BackendType::LocalFile,
+            title: "Planning item".into(),
+            status: WorkItemStatus::Planning,
+            status_derived: false,
+            repo_associations: vec![],
+            errors: vec![],
+        });
+        app.display_list
+            .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
+        app.selected_item = Some(app.display_list.len() - 1);
+
+        app.advance_stage();
+
+        // Status should still be Planning - manual advance blocked.
+        assert_eq!(app.work_items[0].status, WorkItemStatus::Planning);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("workbridge_set_plan"),
+        );
+    }
+
+    /// Session lookup requires matching stage in composite key.
+    #[test]
+    fn session_lookup_requires_correct_stage() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/session-key.json"));
+
+        // Insert a mock session entry under (wi_id, Planning).
+        let parser = Arc::new(std::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+        app.sessions.insert(
+            (wi_id.clone(), WorkItemStatus::Planning),
+            SessionEntry {
+                parser,
+                alive: true,
+                session: None,
+            },
+        );
+
+        // Lookup with Planning stage finds it.
+        assert!(app.sessions.get(&(wi_id.clone(), WorkItemStatus::Planning)).is_some());
+
+        // Lookup with Implementing stage does NOT find it.
+        assert!(app.sessions.get(&(wi_id.clone(), WorkItemStatus::Implementing)).is_none());
     }
 
     // -- Issue 7: gh availability check --
