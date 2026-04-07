@@ -993,7 +993,7 @@ impl App {
         let work_item_id = wi.id.clone();
         let work_item_status = wi.status.clone();
         let is_planning = work_item_status == WorkItemStatus::Planning;
-        let session_key = (work_item_id.clone(), work_item_status);
+        let session_key = (work_item_id.clone(), work_item_status.clone());
 
         // Stages without sessions.
         if matches!(wi.status, WorkItemStatus::Backlog | WorkItemStatus::Done) {
@@ -1069,15 +1069,8 @@ impl App {
 
         // Build the claude command with system prompt and MCP config.
         let system_prompt = self.stage_system_prompt(&work_item_id, &cwd);
-        let mut cmd: Vec<String> = vec!["claude".to_string()];
-        if is_planning {
-            cmd.push("--permission-mode".to_string());
-            cmd.push("plan".to_string());
-        }
-        if let Some(ref prompt) = system_prompt {
-            cmd.push("--system-prompt".to_string());
-            cmd.push(prompt.clone());
-        }
+        let mut cmd = Self::build_claude_cmd(&work_item_status, system_prompt.as_deref());
+
         // Write MCP config as .mcp.json in the worktree AND pass via --mcp-config.
         // Both are needed: .mcp.json for Claude Code's project discovery, --mcp-config
         // as a backup. The socket must be listening before Claude starts (it is - the
@@ -1162,12 +1155,6 @@ impl App {
             let _ = std::fs::remove_file(claude_dir.join("settings.local.json"));
         }
 
-        // For planning sessions, send an initial message so Claude starts
-        // Phase 1 refinement immediately instead of waiting for user input.
-        if is_planning {
-            cmd.push("Begin.".to_string());
-        }
-
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
 
         match Session::spawn(self.pane_cols, self.pane_rows, Some(&cwd), &cmd_refs) {
@@ -1196,6 +1183,40 @@ impl App {
                 self.status_message = Some(format!("Error spawning session: {e}"));
             }
         }
+    }
+
+    /// Build the `claude` CLI argument list.
+    ///
+    /// The positional prompt (for planning sessions) MUST come before
+    /// `--mcp-config` so Claude Code does not mistake it for a config
+    /// file path. The returned Vec does not include `--mcp-config` -
+    /// callers append it after this returns.
+    fn build_claude_cmd(
+        status: &WorkItemStatus,
+        system_prompt: Option<&str>,
+    ) -> Vec<String> {
+        let is_planning = *status == WorkItemStatus::Planning;
+        let auto_start = matches!(
+            status,
+            WorkItemStatus::Planning | WorkItemStatus::Implementing
+        );
+
+        let mut cmd: Vec<String> = vec!["claude".to_string()];
+        if is_planning {
+            cmd.push("--permission-mode".to_string());
+            cmd.push("plan".to_string());
+        }
+        if let Some(prompt) = system_prompt {
+            cmd.push("--system-prompt".to_string());
+            cmd.push(prompt.to_string());
+        }
+        // Add the initial prompt BEFORE --mcp-config so Claude Code treats
+        // it as the positional prompt argument, not as an additional config
+        // file path.
+        if auto_start {
+            cmd.push("Explain who you are and start working.".to_string());
+        }
+        cmd
     }
 
     /// Build a stage-specific system prompt for the Claude session.
@@ -4953,6 +4974,60 @@ mod tests {
                 detected, expected,
                 "stderr={stderr:?}: expected conflict={expected}, got {detected}",
             );
+        }
+    }
+
+    /// Regression: the positional prompt must come BEFORE --mcp-config
+    /// in the argument list. If it comes after, Claude Code treats it as
+    /// a config file path and exits with "MCP config file not found".
+    #[test]
+    fn build_claude_cmd_prompt_before_mcp_config() {
+        // Planning session: has --permission-mode plan and positional prompt.
+        let cmd = App::build_claude_cmd(
+            &WorkItemStatus::Planning,
+            Some("system prompt here"),
+        );
+        assert_eq!(cmd[0], "claude");
+        assert_eq!(cmd[1], "--permission-mode");
+        assert_eq!(cmd[2], "plan");
+        assert_eq!(cmd[3], "--system-prompt");
+        assert_eq!(cmd[4], "system prompt here");
+        // Positional prompt is the LAST element - callers append
+        // --mcp-config after this, so it stays after the prompt.
+        assert_eq!(
+            cmd.last().unwrap(),
+            "Explain who you are and start working.",
+        );
+        // Verify --mcp-config is not in the vec (callers add it).
+        assert!(
+            !cmd.iter().any(|a| a == "--mcp-config"),
+            "build_claude_cmd must not include --mcp-config",
+        );
+    }
+
+    /// Implementing sessions also get an auto-start prompt.
+    #[test]
+    fn build_claude_cmd_implementing_has_prompt() {
+        let cmd = App::build_claude_cmd(
+            &WorkItemStatus::Implementing,
+            Some("impl prompt"),
+        );
+        assert_eq!(cmd[0], "claude");
+        // No --permission-mode for implementing.
+        assert_eq!(cmd[1], "--system-prompt");
+        assert!(
+            cmd.last().unwrap().contains("start working"),
+            "implementing should have auto-start prompt",
+        );
+    }
+
+    /// Blocked and Review sessions do NOT get an auto-start prompt.
+    #[test]
+    fn build_claude_cmd_blocked_review_no_prompt() {
+        for status in [WorkItemStatus::Blocked, WorkItemStatus::Review] {
+            let cmd = App::build_claude_cmd(&status, Some("prompt"));
+            // Last arg should be the system prompt value, not a positional prompt.
+            assert_eq!(cmd.last().unwrap(), "prompt");
         }
     }
 }
