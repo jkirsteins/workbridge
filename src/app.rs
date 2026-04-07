@@ -138,7 +138,6 @@ pub struct WorktreeCreateResult {
     pub error: Option<String>,
 }
 
-
 /// App holds the entire application state.
 pub struct App {
     pub should_quit: bool,
@@ -165,8 +164,11 @@ pub struct App {
     /// True when the no-plan prompt is visible (offered when Claude blocks
     /// because no implementation plan exists).
     pub no_plan_prompt_visible: bool,
-    /// The work item ID that the no-plan prompt applies to.
-    pub no_plan_prompt_wi: Option<WorkItemId>,
+    /// Queue of work item IDs awaiting no-plan prompt resolution.
+    /// When multiple items block with "No implementation plan" concurrently,
+    /// all are queued. The front item is shown to the user; resolving it
+    /// pops it and shows the next (if any).
+    pub no_plan_prompt_queue: VecDeque<WorkItemId>,
     /// True when the app has sent SIGTERM to all sessions and is waiting
     /// for them to exit. During shutdown, only Q (force quit) is accepted.
     pub shutting_down: bool,
@@ -390,7 +392,7 @@ impl App {
             rework_prompt_wi: None,
             rework_reasons: HashMap::new(),
             no_plan_prompt_visible: false,
-            no_plan_prompt_wi: None,
+            no_plan_prompt_queue: VecDeque::new(),
             shutting_down: false,
             shutdown_started: None,
             pane_cols: 80,
@@ -943,10 +945,11 @@ impl App {
     /// Build the display list from current work_items and unlinked_prs.
     ///
     /// Groups (each hidden if empty):
-    /// 1. UNLINKED - PRs not yet imported as work items
-    /// 2. ACTIVE (repo) - non-Backlog, non-Done work items, grouped by repo
-    /// 3. BACKLOGGED (repo) - Backlog work items, grouped by repo
-    /// 4. DONE (repo) - Done work items, grouped by repo
+    /// 1. BLOCKED (repo) - Blocked work items (red header, shown first)
+    /// 2. UNLINKED - PRs not yet imported as work items
+    /// 3. ACTIVE (repo) - non-Backlog, non-Done, non-Blocked work items
+    /// 4. BACKLOGGED (repo) - Backlog work items, grouped by repo
+    /// 5. DONE (repo) - Done work items, grouped by repo
     pub fn build_display_list(&mut self) {
         let mut list = Vec::new();
 
@@ -1696,8 +1699,7 @@ impl App {
         let default_branch = match self.worktree_service.default_branch(repo_path) {
             Ok(b) => b,
             Err(e) => {
-                self.status_message =
-                    Some(format!("Could not detect default branch: {e}"));
+                self.status_message = Some(format!("Could not detect default branch: {e}"));
                 return false;
             }
         };
@@ -1713,15 +1715,12 @@ impl App {
             }
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
-                self.status_message = Some(format!(
-                    "Branch commit check failed: {}",
-                    stderr.trim()
-                ));
+                self.status_message =
+                    Some(format!("Branch commit check failed: {}", stderr.trim()));
                 false
             }
             Err(e) => {
-                self.status_message =
-                    Some(format!("Branch commit check failed: {e}"));
+                self.status_message = Some(format!("Branch commit check failed: {e}"));
                 false
             }
         }
@@ -1879,12 +1878,12 @@ impl App {
                         let current = current_status.clone().unwrap();
                         self.apply_stage_change(&wi_id, &current, &new_status, "mcp");
 
-                        // Only show the prompt if one is not already visible.
-                        // A second work item blocking with no-plan should not
-                        // clobber the first prompt's work item ID.
+                        // Enqueue for the no-plan prompt (skip duplicates).
+                        if !self.no_plan_prompt_queue.contains(&wi_id) {
+                            self.no_plan_prompt_queue.push_back(wi_id);
+                        }
                         if !self.no_plan_prompt_visible {
                             self.no_plan_prompt_visible = true;
-                            self.no_plan_prompt_wi = Some(wi_id);
                             self.status_message = Some(
                                 "No plan available. [p] Plan from branch  [Esc] Stay blocked"
                                     .to_string(),

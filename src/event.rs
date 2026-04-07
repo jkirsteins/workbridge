@@ -720,17 +720,33 @@ fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
 fn handle_no_plan_prompt(app: &mut App, key: KeyEvent) {
     match (key.modifiers, key.code) {
         (_, KeyCode::Esc) => {
-            app.no_plan_prompt_visible = false;
-            app.no_plan_prompt_wi = None;
-            app.status_message = None;
+            // Dismiss the current item (stay blocked), advance to next queued.
+            app.no_plan_prompt_queue.pop_front();
+            if app.no_plan_prompt_queue.is_empty() {
+                app.no_plan_prompt_visible = false;
+                app.status_message = None;
+            } else {
+                app.status_message =
+                    Some("No plan available. [p] Plan from branch  [Esc] Stay blocked".to_string());
+            }
         }
         (KeyModifiers::NONE, KeyCode::Char('p')) => {
-            app.no_plan_prompt_visible = false;
-            let wi_id = match app.no_plan_prompt_wi.take() {
+            let wi_id = match app.no_plan_prompt_queue.pop_front() {
                 Some(id) => id,
-                None => return,
+                None => {
+                    app.no_plan_prompt_visible = false;
+                    return;
+                }
             };
             app.plan_from_branch(&wi_id);
+            // Re-set prompt text AFTER plan_from_branch (which overwrites
+            // status_message), or clear prompt if queue is empty.
+            if app.no_plan_prompt_queue.is_empty() {
+                app.no_plan_prompt_visible = false;
+            } else {
+                app.status_message =
+                    Some("No plan available. [p] Plan from branch  [Esc] Stay blocked".to_string());
+            }
         }
         _ => {}
     }
@@ -1077,9 +1093,10 @@ mod tests {
     fn no_plan_prompt_esc_dismisses() {
         let mut app = App::new();
         app.no_plan_prompt_visible = true;
-        app.no_plan_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
-            "/tmp/test.json",
-        )));
+        app.no_plan_prompt_queue
+            .push_back(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
+                "/tmp/test.json",
+            )));
         app.status_message =
             Some("No plan available. [p] Plan from branch  [Esc] Stay blocked".into());
 
@@ -1091,12 +1108,46 @@ mod tests {
             "no_plan_prompt_visible should be cleared",
         );
         assert!(
-            app.no_plan_prompt_wi.is_none(),
-            "no_plan_prompt_wi should be cleared",
+            app.no_plan_prompt_queue.is_empty(),
+            "no_plan_prompt_queue should be empty",
         );
         assert!(
             app.status_message.is_none(),
             "status_message should be cleared",
+        );
+    }
+
+    /// No-plan prompt: Esc with queued items shows next item.
+    #[test]
+    fn no_plan_prompt_esc_advances_queue() {
+        let mut app = App::new();
+        app.no_plan_prompt_visible = true;
+        app.no_plan_prompt_queue
+            .push_back(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
+                "/tmp/first.json",
+            )));
+        app.no_plan_prompt_queue
+            .push_back(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
+                "/tmp/second.json",
+            )));
+        app.status_message =
+            Some("No plan available. [p] Plan from branch  [Esc] Stay blocked".into());
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, esc);
+
+        assert!(
+            app.no_plan_prompt_visible,
+            "prompt should remain visible with queued items",
+        );
+        assert_eq!(
+            app.no_plan_prompt_queue.len(),
+            1,
+            "first item should be popped, second remains",
+        );
+        assert!(
+            app.status_message.as_deref().unwrap_or("").contains("[p]"),
+            "status should show prompt for next item",
         );
     }
 
@@ -1105,9 +1156,10 @@ mod tests {
     fn no_plan_prompt_blocks_other_keys() {
         let mut app = App::new();
         app.no_plan_prompt_visible = true;
-        app.no_plan_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
-            "/tmp/test.json",
-        )));
+        app.no_plan_prompt_queue
+            .push_back(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
+                "/tmp/test.json",
+            )));
         app.status_message = Some("No plan available.".into());
 
         // Press 'q' - should not quit.

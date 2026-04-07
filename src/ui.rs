@@ -219,8 +219,7 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
             .thumb_style(theme.style_scrollbar_thumb())
             .track_style(theme.style_scrollbar_track());
 
-        let mut scrollbar_state =
-            ScrollbarState::new(total_rows).position(row_offset);
+        let mut scrollbar_state = ScrollbarState::new(total_rows).position(row_offset);
 
         let scrollbar_area = area.inner(Margin::new(0, 1));
         StatefulWidget::render(scrollbar, scrollbar_area, buf, &mut scrollbar_state);
