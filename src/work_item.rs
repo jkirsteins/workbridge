@@ -63,7 +63,7 @@ pub enum BackendType {
 /// Blocked is a sub-state of Implementing (Claude needs user input).
 /// Done can also be derived by the assembly layer when any repo
 /// association has a merged PR.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum WorkItemStatus {
     #[serde(alias = "Todo")]
     Backlog,

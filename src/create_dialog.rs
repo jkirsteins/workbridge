@@ -228,7 +228,7 @@ impl CreateDialog {
 
     /// Validate the dialog fields. Returns Ok with (title, repos, branch)
     /// or Err with an error message.
-    pub fn validate(&self) -> Result<(String, Vec<PathBuf>, Option<String>), String> {
+    pub fn validate(&self) -> Result<(String, Vec<PathBuf>, String), String> {
         let title = self.title_input.text().trim().to_string();
         if title.is_empty() {
             return Err("Title cannot be empty".to_string());
@@ -245,10 +245,10 @@ impl CreateDialog {
             return Err("Select at least one repo".to_string());
         }
 
-        let branch = {
-            let b = self.branch_input.text().trim().to_string();
-            if b.is_empty() { None } else { Some(b) }
-        };
+        let branch = self.branch_input.text().trim().to_string();
+        if branch.is_empty() {
+            return Err("Branch name is required".to_string());
+        }
 
         Ok((title, selected_repos, branch))
     }
@@ -444,19 +444,20 @@ mod tests {
         let (title, selected_repos, branch) = result.unwrap();
         assert_eq!(title, "My feature");
         assert_eq!(selected_repos, vec![PathBuf::from("/repo/a")]);
-        assert_eq!(branch, Some("feature/my-branch".to_string()));
+        assert_eq!(branch, "feature/my-branch");
     }
 
     #[test]
-    fn dialog_optional_branch_omitted() {
+    fn dialog_empty_branch_rejected() {
         let repos = vec![PathBuf::from("/repo/a")];
         let mut dialog = CreateDialog::new();
         dialog.open(&repos, Some(&PathBuf::from("/repo/a")));
         dialog.title_input.set_text("Item without branch");
         // branch_input left empty
 
-        let (_, _, branch) = dialog.validate().unwrap();
-        assert!(branch.is_none());
+        let result = dialog.validate();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Branch name is required");
     }
 
     #[test]
