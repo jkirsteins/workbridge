@@ -331,6 +331,7 @@ pub fn reassemble(
             id: record.id.clone(),
             backend_type: backend_type_from_id(&record.id),
             title,
+            description: record.description.clone(),
             status,
             status_derived,
             repo_associations: assembled_associations,
@@ -429,6 +430,7 @@ mod tests {
         WorkItemRecord {
             id: WorkItemId::LocalFile(PathBuf::from(format!("/data/{id_suffix}.json"))),
             title: title.to_string(),
+            description: None,
             status,
             repo_associations: associations,
             plan: None,
@@ -1228,6 +1230,7 @@ mod tests {
             WorkItemRecord {
                 id: WorkItemId::LocalFile(PathBuf::from("/data/wi.json")),
                 title: "Local".to_string(),
+                description: None,
                 status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: repo_path("alpha"),
@@ -1242,6 +1245,7 @@ mod tests {
                     number: 1,
                 },
                 title: "GH Issue".to_string(),
+                description: None,
                 status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: repo_path("alpha"),
@@ -1254,6 +1258,7 @@ mod tests {
                     node_id: "node123".to_string(),
                 },
                 title: "GH Project".to_string(),
+                description: None,
                 status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: repo_path("alpha"),

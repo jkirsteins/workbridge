@@ -3,12 +3,15 @@ source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
 ┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
-│                       ││                                                     │
-│  No work items.       ││  Welcome to workbridge                              │
 │               ┌ Create Work Item ────────────────────────────┐               │
-│  Press Ctrl+N │                                              │               │
-│  to create one│ Title:                                       │               │
-│               │  My feature                                  │               │
+│  No work items│                                              │               │
+│               │ Title:                                       │               │
+│  Press Ctrl+N │  My feature                                  │               │
+│  to create one│                                              │               │
+│               │ Description (optional):                      │               │
+│               │  (empty)                                     │               │
+│               │                                              │               │
+│               │                                              │               │
 │               │                                              │               │
 │               │ Repos:                                       │               │
 │               │    [ ] /repo/alpha                           │               │
@@ -22,7 +25,4 @@ expression: "render(&app, 80, 24)"
 │               │ Enter: Create | Esc: Cancel | Tab: Next fiel │               │
 │               │                                              │               │
 │               └──────────────────────────────────────────────┘               │
-│                       ││                                                     │
-│                       ││                                                     │
-│                       ││                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘

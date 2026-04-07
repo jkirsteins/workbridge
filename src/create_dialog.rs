@@ -4,6 +4,7 @@ use std::path::PathBuf;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CreateDialogFocus {
     Title,
+    Description,
     Repos,
     Branch,
 }
@@ -116,6 +117,209 @@ impl SimpleTextInput {
     }
 }
 
+/// A simple multi-line text area with cursor movement and scrolling.
+///
+/// Stores text as a vector of lines. Supports insert, delete, newlines,
+/// and basic cursor movement (arrows, home, end, up, down).
+#[derive(Clone, Debug)]
+pub struct SimpleTextArea {
+    /// Lines of text. Always has at least one entry (possibly empty).
+    lines: Vec<String>,
+    /// Current cursor row (0-based line index).
+    cursor_row: usize,
+    /// Byte offset of the cursor within the current line.
+    cursor_col: usize,
+    /// First visible line index (for vertical scrolling).
+    pub scroll_offset: usize,
+}
+
+impl Default for SimpleTextArea {
+    fn default() -> Self {
+        Self {
+            lines: vec![String::new()],
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll_offset: 0,
+        }
+    }
+}
+
+impl SimpleTextArea {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set text content and move cursor to end.
+    #[allow(dead_code)]
+    pub fn set_text(&mut self, s: &str) {
+        self.lines = s.split('\n').map(|l| l.to_string()).collect();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = self.lines.len() - 1;
+        self.cursor_col = self.lines[self.cursor_row].len();
+        self.scroll_offset = 0;
+    }
+
+    /// Get the full text content with newlines joining lines.
+    pub fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    /// Get the cursor position as (row, char_col) for rendering.
+    pub fn cursor_pos(&self) -> (usize, usize) {
+        let char_col = self.lines[self.cursor_row][..self.cursor_col]
+            .chars()
+            .count();
+        (self.cursor_row, char_col)
+    }
+
+    /// Get visible lines for rendering, given the visible height.
+    pub fn visible_lines(&self, height: usize) -> &[String] {
+        let start = self.scroll_offset;
+        let end = (start + height).min(self.lines.len());
+        &self.lines[start..end]
+    }
+
+    /// Ensure the cursor row is visible given the viewport height.
+    pub fn ensure_visible(&mut self, height: usize) {
+        if height == 0 {
+            return;
+        }
+        if self.cursor_row < self.scroll_offset {
+            self.scroll_offset = self.cursor_row;
+        } else if self.cursor_row >= self.scroll_offset + height {
+            self.scroll_offset = self.cursor_row - height + 1;
+        }
+    }
+
+    /// Insert a character at the cursor position.
+    pub fn insert_char(&mut self, c: char) {
+        self.lines[self.cursor_row].insert(self.cursor_col, c);
+        self.cursor_col += c.len_utf8();
+    }
+
+    /// Insert a newline, splitting the current line at the cursor.
+    pub fn insert_newline(&mut self) {
+        let rest = self.lines[self.cursor_row][self.cursor_col..].to_string();
+        self.lines[self.cursor_row].truncate(self.cursor_col);
+        self.cursor_row += 1;
+        self.lines.insert(self.cursor_row, rest);
+        self.cursor_col = 0;
+    }
+
+    /// Delete the character before the cursor (backspace).
+    /// At the start of a line, joins with the previous line.
+    pub fn backspace(&mut self) {
+        if self.cursor_col > 0 {
+            let prev = self.lines[self.cursor_row][..self.cursor_col]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.lines[self.cursor_row].remove(prev);
+            self.cursor_col = prev;
+        } else if self.cursor_row > 0 {
+            let current_line = self.lines.remove(self.cursor_row);
+            self.cursor_row -= 1;
+            self.cursor_col = self.lines[self.cursor_row].len();
+            self.lines[self.cursor_row].push_str(&current_line);
+        }
+    }
+
+    /// Delete the character at the cursor position.
+    /// At the end of a line, joins with the next line.
+    pub fn delete(&mut self) {
+        let line_len = self.lines[self.cursor_row].len();
+        if self.cursor_col < line_len {
+            self.lines[self.cursor_row].remove(self.cursor_col);
+        } else if self.cursor_row + 1 < self.lines.len() {
+            let next_line = self.lines.remove(self.cursor_row + 1);
+            self.lines[self.cursor_row].push_str(&next_line);
+        }
+    }
+
+    /// Move cursor one character to the left. Wraps to end of previous line.
+    pub fn move_left(&mut self) {
+        if self.cursor_col > 0 {
+            let prev = self.lines[self.cursor_row][..self.cursor_col]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.cursor_col = prev;
+        } else if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+            self.cursor_col = self.lines[self.cursor_row].len();
+        }
+    }
+
+    /// Move cursor one character to the right. Wraps to start of next line.
+    pub fn move_right(&mut self) {
+        let line_len = self.lines[self.cursor_row].len();
+        if self.cursor_col < line_len {
+            let next = self.lines[self.cursor_row][self.cursor_col..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| self.cursor_col + i)
+                .unwrap_or(line_len);
+            self.cursor_col = next;
+        } else if self.cursor_row + 1 < self.lines.len() {
+            self.cursor_row += 1;
+            self.cursor_col = 0;
+        }
+    }
+
+    /// Move cursor up one line, preserving column position as best as possible.
+    pub fn move_up(&mut self) {
+        if self.cursor_row > 0 {
+            let char_col = self.lines[self.cursor_row][..self.cursor_col]
+                .chars()
+                .count();
+            self.cursor_row -= 1;
+            self.cursor_col = char_to_byte_offset(&self.lines[self.cursor_row], char_col);
+        }
+    }
+
+    /// Move cursor down one line, preserving column position as best as possible.
+    pub fn move_down(&mut self) {
+        if self.cursor_row + 1 < self.lines.len() {
+            let char_col = self.lines[self.cursor_row][..self.cursor_col]
+                .chars()
+                .count();
+            self.cursor_row += 1;
+            self.cursor_col = char_to_byte_offset(&self.lines[self.cursor_row], char_col);
+        }
+    }
+
+    /// Move cursor to the start of the current line.
+    pub fn home(&mut self) {
+        self.cursor_col = 0;
+    }
+
+    /// Move cursor to the end of the current line.
+    pub fn end(&mut self) {
+        self.cursor_col = self.lines[self.cursor_row].len();
+    }
+
+    /// Clear all text and reset cursor.
+    pub fn clear(&mut self) {
+        self.lines = vec![String::new()];
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.scroll_offset = 0;
+    }
+}
+
+/// Convert a character offset to a byte offset within a string, clamping
+/// to the string length if the char offset exceeds available characters.
+fn char_to_byte_offset(s: &str, char_offset: usize) -> usize {
+    s.char_indices()
+        .nth(char_offset)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
+}
+
 /// State for the work item creation modal dialog.
 #[derive(Clone, Debug)]
 pub struct CreateDialog {
@@ -123,6 +327,8 @@ pub struct CreateDialog {
     pub visible: bool,
     /// Text input for the work item title.
     pub title_input: SimpleTextInput,
+    /// Multi-line text area for the optional description.
+    pub description_input: SimpleTextArea,
     /// Text input for the optional branch name.
     pub branch_input: SimpleTextInput,
     /// List of repos with selection state: (repo_path, selected).
@@ -143,6 +349,7 @@ impl Default for CreateDialog {
         Self {
             visible: false,
             title_input: SimpleTextInput::new(),
+            description_input: SimpleTextArea::new(),
             branch_input: SimpleTextInput::new(),
             repo_list: Vec::new(),
             repo_cursor: 0,
@@ -163,6 +370,7 @@ impl CreateDialog {
     pub fn open(&mut self, active_repos: &[PathBuf], cwd_repo: Option<&PathBuf>) {
         self.visible = true;
         self.title_input.clear();
+        self.description_input.clear();
         self.branch_input.clear();
         self.error_message = None;
         self.branch_user_edited = false;
@@ -189,21 +397,23 @@ impl CreateDialog {
         self.visible = false;
     }
 
-    /// Cycle focus to the next field (Title -> Repos -> Branch -> Title).
+    /// Cycle focus to the next field (Title -> Description -> Repos -> Branch -> Title).
     pub fn focus_next(&mut self) {
         self.focus_field = match self.focus_field {
-            CreateDialogFocus::Title => CreateDialogFocus::Repos,
+            CreateDialogFocus::Title => CreateDialogFocus::Description,
+            CreateDialogFocus::Description => CreateDialogFocus::Repos,
             CreateDialogFocus::Repos => CreateDialogFocus::Branch,
             CreateDialogFocus::Branch => CreateDialogFocus::Title,
         };
     }
 
-    /// Cycle focus to the previous field (Title -> Branch -> Repos -> Title).
+    /// Cycle focus to the previous field (Title -> Branch -> Repos -> Description -> Title).
     pub fn focus_prev(&mut self) {
         self.focus_field = match self.focus_field {
             CreateDialogFocus::Title => CreateDialogFocus::Branch,
             CreateDialogFocus::Branch => CreateDialogFocus::Repos,
-            CreateDialogFocus::Repos => CreateDialogFocus::Title,
+            CreateDialogFocus::Repos => CreateDialogFocus::Description,
+            CreateDialogFocus::Description => CreateDialogFocus::Title,
         };
     }
 
@@ -226,13 +436,21 @@ impl CreateDialog {
         }
     }
 
-    /// Validate the dialog fields. Returns Ok with (title, repos, branch)
-    /// or Err with an error message.
-    pub fn validate(&self) -> Result<(String, Vec<PathBuf>, String), String> {
+    /// Validate the dialog fields. Returns Ok with (title, description, repos, branch)
+    /// or Err with an error message. Description is None when empty.
+    pub fn validate(&self) -> Result<(String, Option<String>, Vec<PathBuf>, String), String> {
         let title = self.title_input.text().trim().to_string();
         if title.is_empty() {
             return Err("Title cannot be empty".to_string());
         }
+
+        let desc_text = self.description_input.text();
+        let desc_trimmed = desc_text.trim();
+        let description = if desc_trimmed.is_empty() {
+            None
+        } else {
+            Some(desc_trimmed.to_string())
+        };
 
         let selected_repos: Vec<PathBuf> = self
             .repo_list
@@ -250,20 +468,21 @@ impl CreateDialog {
             return Err("Branch name is required".to_string());
         }
 
-        Ok((title, selected_repos, branch))
+        Ok((title, description, selected_repos, branch))
     }
 
-    /// Get the currently focused text input mutably.
+    /// Get the currently focused single-line text input mutably.
+    /// Returns None for Description (uses SimpleTextArea) and Repos.
     pub fn focused_input_mut(&mut self) -> Option<&mut SimpleTextInput> {
         match self.focus_field {
             CreateDialogFocus::Title => Some(&mut self.title_input),
             CreateDialogFocus::Branch => Some(&mut self.branch_input),
-            CreateDialogFocus::Repos => None,
+            CreateDialogFocus::Description | CreateDialogFocus::Repos => None,
         }
     }
 
     /// Auto-fill the branch field from the title, unless the user has manually
-    /// edited the branch. Format: {username}/{slugified-title}.
+    /// edited the branch. Format: {username}/{slugified-title}-{suffix}.
     pub fn auto_fill_branch(&mut self) {
         if self.branch_user_edited {
             return;
@@ -272,10 +491,15 @@ impl CreateDialog {
         if slug.is_empty() {
             return;
         }
+        let slug = truncate_slug(&slug, MAX_SLUG_LEN);
+        let suffix = random_suffix();
         let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
-        self.branch_input.set_text(&format!("{username}/{slug}"));
+        self.branch_input.set_text(&format!("{username}/{slug}-{suffix}"));
     }
 }
+
+/// Maximum length of the slugified portion of a branch name.
+const MAX_SLUG_LEN: usize = 50;
 
 /// Convert a title into a git-branch-safe slug.
 ///
@@ -305,6 +529,28 @@ fn slugify(title: &str) -> String {
     }
 
     result
+}
+
+/// Truncate a slug to at most `max_len` bytes, cutting at the last hyphen
+/// boundary to avoid mid-word breaks. Falls back to a hard cut when the
+/// slug contains no hyphens within the limit.
+fn truncate_slug(slug: &str, max_len: usize) -> String {
+    if slug.len() <= max_len {
+        return slug.to_string();
+    }
+    // Find last hyphen at or before max_len.
+    if let Some(pos) = slug[..max_len].rfind('-') {
+        slug[..pos].to_string()
+    } else {
+        slug[..max_len].to_string()
+    }
+}
+
+/// Generate a 4-character hex suffix for branch name uniqueness.
+fn random_suffix() -> String {
+    let bytes = uuid::Uuid::new_v4();
+    let b = bytes.as_bytes();
+    format!("{:02x}{:02x}", b[0], b[1])
 }
 
 #[cfg(test)]
@@ -372,6 +618,128 @@ mod tests {
         input.move_right();
         assert_eq!(input.cursor_char_pos(), 0);
     }
+
+    // -- SimpleTextArea tests --
+
+    #[test]
+    fn textarea_basic_insert_and_newline() {
+        let mut ta = SimpleTextArea::new();
+        ta.insert_char('a');
+        ta.insert_char('b');
+        ta.insert_newline();
+        ta.insert_char('c');
+        assert_eq!(ta.text(), "ab\nc");
+        assert_eq!(ta.cursor_pos(), (1, 1));
+    }
+
+    #[test]
+    fn textarea_backspace_joins_lines() {
+        let mut ta = SimpleTextArea::new();
+        ta.set_text("hello\nworld");
+        // cursor at end of "world"
+        ta.home(); // start of "world"
+        ta.backspace(); // should join with previous line
+        assert_eq!(ta.text(), "helloworld");
+        assert_eq!(ta.cursor_pos(), (0, 5));
+    }
+
+    #[test]
+    fn textarea_delete_joins_lines() {
+        let mut ta = SimpleTextArea::new();
+        ta.set_text("hello\nworld");
+        // Move to end of first line
+        ta.cursor_row = 0;
+        ta.cursor_col = 5;
+        ta.delete(); // should join with next line
+        assert_eq!(ta.text(), "helloworld");
+    }
+
+    #[test]
+    fn textarea_move_up_down() {
+        let mut ta = SimpleTextArea::new();
+        ta.set_text("abc\nde\nfghij");
+        ta.cursor_row = 0;
+        ta.cursor_col = 3; // end of "abc"
+
+        ta.move_down();
+        assert_eq!(ta.cursor_row, 1);
+        // char col 3 clamps to len of "de" = 2
+        assert_eq!(ta.cursor_col, 2);
+
+        ta.move_down();
+        assert_eq!(ta.cursor_row, 2);
+        // restores to char col 2 (byte 2 in "fghij")
+        assert_eq!(ta.cursor_col, 2);
+
+        ta.move_up();
+        assert_eq!(ta.cursor_row, 1);
+    }
+
+    #[test]
+    fn textarea_move_left_wraps_to_prev_line() {
+        let mut ta = SimpleTextArea::new();
+        ta.set_text("ab\ncd");
+        ta.cursor_row = 1;
+        ta.cursor_col = 0;
+        ta.move_left(); // wrap to end of "ab"
+        assert_eq!(ta.cursor_row, 0);
+        assert_eq!(ta.cursor_col, 2);
+    }
+
+    #[test]
+    fn textarea_move_right_wraps_to_next_line() {
+        let mut ta = SimpleTextArea::new();
+        ta.set_text("ab\ncd");
+        ta.cursor_row = 0;
+        ta.cursor_col = 2; // end of "ab"
+        ta.move_right(); // wrap to start of "cd"
+        assert_eq!(ta.cursor_row, 1);
+        assert_eq!(ta.cursor_col, 0);
+    }
+
+    #[test]
+    fn textarea_clear() {
+        let mut ta = SimpleTextArea::new();
+        ta.set_text("some\ntext");
+        ta.clear();
+        assert_eq!(ta.text(), "");
+        assert_eq!(ta.cursor_pos(), (0, 0));
+    }
+
+    #[test]
+    fn textarea_visible_lines_with_scroll() {
+        let mut ta = SimpleTextArea::new();
+        ta.set_text("line0\nline1\nline2\nline3\nline4");
+        ta.scroll_offset = 2;
+        let visible = ta.visible_lines(2);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0], "line2");
+        assert_eq!(visible[1], "line3");
+    }
+
+    #[test]
+    fn textarea_ensure_visible() {
+        let mut ta = SimpleTextArea::new();
+        ta.set_text("a\nb\nc\nd\ne");
+        ta.cursor_row = 4;
+        ta.ensure_visible(3);
+        assert_eq!(ta.scroll_offset, 2); // lines 2,3,4 visible
+    }
+
+    #[test]
+    fn textarea_boundary_no_panic() {
+        let mut ta = SimpleTextArea::new();
+        // Operations on empty
+        ta.backspace();
+        ta.delete();
+        ta.move_left();
+        ta.move_right();
+        ta.move_up();
+        ta.move_down();
+        assert_eq!(ta.text(), "");
+    }
+
+    // -- Dialog tests --
 
     #[test]
     fn dialog_opens_with_cwd_repo_preselected() {
@@ -441,8 +809,9 @@ mod tests {
 
         let result = dialog.validate();
         assert!(result.is_ok());
-        let (title, selected_repos, branch) = result.unwrap();
+        let (title, description, selected_repos, branch) = result.unwrap();
         assert_eq!(title, "My feature");
+        assert!(description.is_none());
         assert_eq!(selected_repos, vec![PathBuf::from("/repo/a")]);
         assert_eq!(branch, "feature/my-branch");
     }
@@ -466,6 +835,9 @@ mod tests {
         assert_eq!(dialog.focus_field, CreateDialogFocus::Title);
 
         dialog.focus_next();
+        assert_eq!(dialog.focus_field, CreateDialogFocus::Description);
+
+        dialog.focus_next();
         assert_eq!(dialog.focus_field, CreateDialogFocus::Repos);
 
         dialog.focus_next();
@@ -480,6 +852,9 @@ mod tests {
 
         dialog.focus_prev();
         assert_eq!(dialog.focus_field, CreateDialogFocus::Repos);
+
+        dialog.focus_prev();
+        assert_eq!(dialog.focus_field, CreateDialogFocus::Description);
     }
 
     #[test]
@@ -563,6 +938,52 @@ mod tests {
         assert_eq!(slugify("  hello world  "), "hello-world");
     }
 
+    // -- truncate_slug tests --
+
+    #[test]
+    fn truncate_slug_no_truncation_needed() {
+        assert_eq!(truncate_slug("fix-login-bug", 50), "fix-login-bug");
+    }
+
+    #[test]
+    fn truncate_slug_at_word_boundary() {
+        let slug = "implement-comprehensive-authentication-system-with-oauth2-and-saml-support";
+        let result = truncate_slug(slug, 50);
+        assert!(result.len() <= 50, "got len {}: {result}", result.len());
+        // Should cut at a hyphen boundary
+        assert!(
+            !result.ends_with('-'),
+            "should not end with hyphen: {result}"
+        );
+        assert_eq!(result, "implement-comprehensive-authentication-system");
+    }
+
+    #[test]
+    fn truncate_slug_single_long_word() {
+        let slug = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz0123456789";
+        let result = truncate_slug(slug, 50);
+        assert_eq!(result.len(), 50);
+        assert_eq!(result, &slug[..50]);
+    }
+
+    #[test]
+    fn truncate_slug_exact_boundary() {
+        let slug = "a".repeat(50);
+        assert_eq!(truncate_slug(&slug, 50), slug);
+    }
+
+    // -- random_suffix tests --
+
+    #[test]
+    fn random_suffix_is_4_hex_chars() {
+        let s = random_suffix();
+        assert_eq!(s.len(), 4);
+        assert!(
+            s.chars().all(|c| c.is_ascii_hexdigit()),
+            "not hex: {s}"
+        );
+    }
+
     // -- auto_fill_branch tests --
 
     #[test]
@@ -573,9 +994,35 @@ mod tests {
         dialog.auto_fill_branch();
 
         let branch = dialog.branch_input.text().to_string();
-        // Should be {username}/fix-login-bug
-        assert!(branch.ends_with("/fix-login-bug"), "got: {branch}");
-        assert!(branch.contains('/'), "got: {branch}");
+        // Should be {username}/fix-login-bug-{4hex}
+        assert!(branch.contains("/fix-login-bug-"), "got: {branch}");
+        // Verify 4-char hex suffix at end
+        let suffix = &branch[branch.len() - 4..];
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "suffix not hex: {suffix}"
+        );
+    }
+
+    #[test]
+    fn auto_fill_branch_long_title_truncated() {
+        let mut dialog = CreateDialog::new();
+        dialog.open(&[PathBuf::from("/repo/a")], None);
+        dialog.title_input.set_text(
+            "Implement comprehensive authentication system with OAuth2 and SAML support for enterprise",
+        );
+        dialog.auto_fill_branch();
+
+        let branch = dialog.branch_input.text().to_string();
+        // Extract slug portion: after the first '/' and before the last '-xxxx'
+        let after_slash = branch.split('/').nth(1).unwrap();
+        let slug_end = after_slash.len() - 5; // strip "-xxxx"
+        let slug = &after_slash[..slug_end];
+        assert!(
+            slug.len() <= MAX_SLUG_LEN,
+            "slug too long ({} > {MAX_SLUG_LEN}): {slug}",
+            slug.len()
+        );
     }
 
     #[test]

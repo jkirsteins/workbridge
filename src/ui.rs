@@ -1151,14 +1151,19 @@ fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect)
 ///   |  [error message if any]                             |
 ///   |  Enter: Create  |  Esc: Cancel  |  Tab: Next field  |
 ///   +-----------------------------------------------------+
+/// Height of the description text area (visible lines).
+pub const DESC_TEXTAREA_HEIGHT: u16 = 3;
+
 fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, area: Rect) {
     // Compute dialog height based on content.
     // Rows: border(1) + blank(1) + "Title:" label(1) + input(1) + blank(1)
+    //   + "Description:" label(1) + textarea(3) + blank(1)
     //   + "Repos:" label(1) + repo_lines(max 6) + blank(1)
     //   + "Branch:" label(1) + input(1) + blank(1)
     //   + error_line(1) + hint(1) + border(1)
     let repo_lines = dialog.repo_list.len().clamp(1, 6) as u16;
-    let dialog_height = 2 + 2 + 1 + 1 + repo_lines + 1 + 2 + 1 + 2 + 2;
+    let dialog_height =
+        2 + 2 + 1 + 1 + DESC_TEXTAREA_HEIGHT + 1 + 1 + repo_lines + 1 + 2 + 1 + 2 + 2;
     let dialog_width = (area.width * 60 / 100).max(40).min(area.width);
 
     let popup = centered_rect_fixed(dialog_width, dialog_height, area);
@@ -1184,18 +1189,21 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, ar
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),          // Title label
-            Constraint::Length(1),          // Title input
-            Constraint::Length(1),          // blank
-            Constraint::Length(1),          // Repos label
-            Constraint::Length(repo_lines), // Repos list
-            Constraint::Length(1),          // blank
-            Constraint::Length(1),          // Branch label
-            Constraint::Length(1),          // Branch input
-            Constraint::Length(1),          // blank
-            Constraint::Length(1),          // error / blank
-            Constraint::Length(1),          // hint line
-            Constraint::Min(0),             // absorb remaining
+            Constraint::Length(1),                    // [0] Title label
+            Constraint::Length(1),                    // [1] Title input
+            Constraint::Length(1),                    // [2] blank
+            Constraint::Length(1),                    // [3] Description label
+            Constraint::Length(DESC_TEXTAREA_HEIGHT), // [4] Description textarea
+            Constraint::Length(1),                    // [5] blank
+            Constraint::Length(1),                    // [6] Repos label
+            Constraint::Length(repo_lines),           // [7] Repos list
+            Constraint::Length(1),                    // [8] blank
+            Constraint::Length(1),                    // [9] Branch label
+            Constraint::Length(1),                    // [10] Branch input
+            Constraint::Length(1),                    // [11] blank
+            Constraint::Length(1),                    // [12] error / blank
+            Constraint::Length(1),                    // [13] hint line
+            Constraint::Min(0),                       // [14] absorb remaining
         ])
         .split(inner);
 
@@ -1216,18 +1224,36 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, ar
         dialog.focus_field == CreateDialogFocus::Title,
     );
 
+    // Description label
+    let desc_label_style = if dialog.focus_field == CreateDialogFocus::Description {
+        theme.style_heading()
+    } else {
+        theme.style_text()
+    };
+    Paragraph::new(Line::styled("Description (optional):", desc_label_style))
+        .render(sections[3], buf);
+
+    // Description textarea
+    draw_text_area_field(
+        buf,
+        &dialog.description_input,
+        theme,
+        sections[4],
+        dialog.focus_field == CreateDialogFocus::Description,
+    );
+
     // Repos label
     let repos_label_style = if dialog.focus_field == CreateDialogFocus::Repos {
         theme.style_heading()
     } else {
         theme.style_text()
     };
-    Paragraph::new(Line::styled("Repos:", repos_label_style)).render(sections[3], buf);
+    Paragraph::new(Line::styled("Repos:", repos_label_style)).render(sections[6], buf);
 
     // Repos list
     if dialog.repo_list.is_empty() {
         let msg = Line::styled("  (no repos configured)", theme.style_text_muted());
-        Paragraph::new(msg).render(sections[4], buf);
+        Paragraph::new(msg).render(sections[7], buf);
     } else {
         let items: Vec<ListItem<'_>> = dialog
             .repo_list
@@ -1248,7 +1274,7 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, ar
             state.select(Some(dialog.repo_cursor));
         }
 
-        StatefulWidget::render(list, sections[4], buf, &mut state);
+        StatefulWidget::render(list, sections[7], buf, &mut state);
     }
 
     // Branch label
@@ -1257,20 +1283,21 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, ar
     } else {
         theme.style_text()
     };
-    Paragraph::new(Line::styled("Branch (optional):", branch_label_style)).render(sections[6], buf);
+    Paragraph::new(Line::styled("Branch (optional):", branch_label_style))
+        .render(sections[9], buf);
 
     // Branch input
     draw_text_input_field(
         buf,
         &dialog.branch_input,
         theme,
-        sections[7],
+        sections[10],
         dialog.focus_field == CreateDialogFocus::Branch,
     );
 
     // Error message (if any)
     if let Some(ref err) = dialog.error_message {
-        Paragraph::new(Line::styled(err.as_str(), theme.style_error())).render(sections[9], buf);
+        Paragraph::new(Line::styled(err.as_str(), theme.style_error())).render(sections[12], buf);
     }
 
     // Hint line
@@ -1278,7 +1305,7 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, ar
         "Enter: Create | Esc: Cancel | Tab: Next field | Space: Toggle repo",
         theme.style_text_muted(),
     );
-    Paragraph::new(hint).render(sections[10], buf);
+    Paragraph::new(hint).render(sections[13], buf);
 }
 
 /// Draw a simple text input field with a visual cursor indicator.
@@ -1353,6 +1380,86 @@ fn draw_text_input_field(
             Span::styled(display, theme.style_text_muted()),
         ]);
         Paragraph::new(line).render(area, buf);
+    }
+}
+
+/// Draw a multi-line text area field for the description input.
+///
+/// Shows visible lines from the textarea with cursor when focused.
+/// When unfocused, shows the first few lines dimmed.
+fn draw_text_area_field(
+    buf: &mut Buffer,
+    textarea: &crate::create_dialog::SimpleTextArea,
+    theme: &Theme,
+    area: Rect,
+    focused: bool,
+) {
+    let height = area.height as usize;
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let visible = textarea.visible_lines(height);
+    let (cursor_row, cursor_char_col) = textarea.cursor_pos();
+    let scroll = textarea.scroll_offset;
+
+    for (i, row_area) in (0..height).map(|i| {
+        (
+            i,
+            Rect {
+                x: area.x,
+                y: area.y + i as u16,
+                width: area.width,
+                height: 1,
+            },
+        )
+    }) {
+        let line_idx = scroll + i;
+        let line_text = visible.get(i).map(|s| s.as_str()).unwrap_or("");
+
+        if focused && line_idx == cursor_row {
+            // Render this line with a cursor block.
+            let before: String = line_text.chars().take(cursor_char_col).collect();
+            let cursor_char: String = line_text
+                .chars()
+                .nth(cursor_char_col)
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| " ".to_string());
+            let after: String = line_text.chars().skip(cursor_char_col + 1).collect();
+
+            // Truncate to fit width (simple: no horizontal scroll for now).
+            let b: String = before.chars().take(inner_width).collect();
+            let remaining = inner_width.saturating_sub(b.chars().count() + 1);
+            let a: String = after.chars().take(remaining).collect();
+
+            let line = Line::from(vec![
+                Span::raw(" "),
+                Span::styled(b, theme.style_text()),
+                Span::styled(
+                    cursor_char,
+                    ratatui_core::style::Style::default()
+                        .fg(theme.tab_highlight_fg)
+                        .bg(theme.tab_highlight_bg),
+                ),
+                Span::styled(a, theme.style_text()),
+            ]);
+            Paragraph::new(line).render(row_area, buf);
+        } else if focused {
+            let display: String = line_text.chars().take(inner_width).collect();
+            let line = Line::from(vec![
+                Span::raw(" "),
+                Span::styled(display, theme.style_text()),
+            ]);
+            Paragraph::new(line).render(row_area, buf);
+        } else {
+            let display: String = if i == 0 && line_text.is_empty() && visible.len() <= 1 {
+                "(empty)".to_string()
+            } else {
+                line_text.chars().take(inner_width).collect()
+            };
+            let line = Line::from(vec![
+                Span::raw(" "),
+                Span::styled(display, theme.style_text_muted()),
+            ]);
+            Paragraph::new(line).render(row_area, buf);
+        }
     }
 }
 
@@ -1630,6 +1737,7 @@ mod format_entry_tests {
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             title: "Fix auth bug".to_string(),
+            description: None,
             status: WorkItemStatus::Backlog,
             repo_associations: vec![RepoAssociation {
                 repo_path: PathBuf::from("/Projects/myrepo"),
@@ -1669,6 +1777,7 @@ mod format_entry_tests {
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             title: "Fix auth bug".to_string(),
+            description: None,
             status: WorkItemStatus::Implementing,
             repo_associations: vec![RepoAssociation {
                 repo_path: PathBuf::from("/Projects/myrepo"),
@@ -1698,6 +1807,7 @@ mod format_entry_tests {
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             title: "Planned work".to_string(),
+            description: None,
             status: WorkItemStatus::Backlog,
             repo_associations: vec![RepoAssociation {
                 repo_path: PathBuf::from("/Projects/myrepo"),
@@ -1726,6 +1836,7 @@ mod format_entry_tests {
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             title: "A very long title that should be truncated properly".to_string(),
+            description: None,
             status: WorkItemStatus::Implementing,
             repo_associations: vec![RepoAssociation {
                 repo_path: PathBuf::from("/Projects/walleyboard"),
@@ -1879,6 +1990,7 @@ mod snapshot_tests {
             id: WorkItemId::LocalFile(PathBuf::from(format!("/data/{id_suffix}.json"))),
             backend_type: BackendType::LocalFile,
             title: title.to_string(),
+            description: None,
             status,
             status_derived: false,
             repo_associations: associations,
@@ -2168,6 +2280,7 @@ mod snapshot_tests {
             id: WorkItemId::LocalFile(PathBuf::from("/data/err.json")),
             backend_type: BackendType::LocalFile,
             title: "Broken work item".to_string(),
+            description: None,
             status: WorkItemStatus::Implementing,
             status_derived: false,
             repo_associations: vec![RepoAssociation {

@@ -1292,8 +1292,14 @@ impl App {
             WorkItemStatus::Review => "review",
         };
 
+        let description_var = match &wi.description {
+            Some(d) if !d.is_empty() => format!("\nUser-provided description: {d}"),
+            _ => String::new(),
+        };
+
         let mut vars: HashMap<&str, &str> = HashMap::new();
         vars.insert("title", &title);
+        vars.insert("description", &description_var);
         vars.insert("situation", &situation);
         vars.insert("plan", &plan_text);
         vars.insert("rework_reason", &rework_reason);
@@ -1326,6 +1332,7 @@ impl App {
                     "work_item_id": wi_id_str,
                     "stage": format!("{:?}", wi.status),
                     "title": wi.title,
+                    "description": wi.description,
                     "repo": worktree_path.display().to_string(),
                 })
                 .to_string()
@@ -1720,6 +1727,7 @@ impl App {
 
         let request = CreateWorkItem {
             title: "New work item".to_string(),
+            description: None,
             status: WorkItemStatus::Backlog,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: repo_root,
@@ -1747,6 +1755,7 @@ impl App {
     pub fn create_work_item_with(
         &mut self,
         title: String,
+        description: Option<String>,
         repos: Vec<PathBuf>,
         branch: String,
     ) -> Result<(), String> {
@@ -1784,6 +1793,7 @@ impl App {
 
         let request = CreateWorkItem {
             title: title.clone(),
+            description,
             status: WorkItemStatus::Backlog,
             repo_associations,
         };
@@ -2888,6 +2898,7 @@ mod tests {
                 let record = crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/fake.json")),
                     title: unlinked.pr.title.clone(),
+                    description: None,
                     status: WorkItemStatus::Implementing,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
@@ -2996,6 +3007,7 @@ mod tests {
                 Ok(crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/new.json")),
                     title: req.title.clone(),
+                    description: None,
                     status: req.status.clone(),
                     repo_associations: req.repo_associations,
                     plan: None,
@@ -3052,6 +3064,7 @@ mod tests {
         assert!(!app.fetcher_repos_changed);
         let result = app.create_work_item_with(
             "With branch".into(),
+            None,
             vec![PathBuf::from("/repo")],
             "feature/test".into(),
         );
@@ -3321,6 +3334,7 @@ mod tests {
         let record_a = crate::work_item_backend::WorkItemRecord {
             id: id_a.clone(),
             title: "Item A".into(),
+            description: None,
             status: WorkItemStatus::Backlog,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: PathBuf::from("/repo"),
@@ -3331,6 +3345,7 @@ mod tests {
         let record_b = crate::work_item_backend::WorkItemRecord {
             id: id_b.clone(),
             title: "Item B".into(),
+            description: None,
             status: WorkItemStatus::Backlog,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: PathBuf::from("/repo"),
@@ -3365,6 +3380,7 @@ mod tests {
                 id: id_b.clone(),
                 backend_type: crate::work_item::BackendType::LocalFile,
                 title: "Item B".into(),
+                description: None,
                 status: WorkItemStatus::Backlog,
                 status_derived: false,
                 repo_associations: vec![crate::work_item::RepoAssociation {
@@ -3381,6 +3397,7 @@ mod tests {
                 id: id_a.clone(),
                 backend_type: crate::work_item::BackendType::LocalFile,
                 title: "Item A".into(),
+                description: None,
                 status: WorkItemStatus::Backlog,
                 status_derived: false,
                 repo_associations: vec![crate::work_item::RepoAssociation {
@@ -3428,6 +3445,7 @@ mod tests {
             let record = crate::work_item_backend::WorkItemRecord {
                 id: WorkItemId::LocalFile(dir.join(name)),
                 title: format!("Item {name}"),
+                description: None,
                 status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
@@ -3839,6 +3857,7 @@ mod tests {
                 let record = crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported.json")),
                     title: unlinked.pr.title.clone(),
+                    description: None,
                     status: WorkItemStatus::Implementing,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
@@ -4057,6 +4076,7 @@ mod tests {
                 let record = crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported.json")),
                     title: unlinked.pr.title.clone(),
+                    description: None,
                     status: WorkItemStatus::Implementing,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
@@ -4297,6 +4317,7 @@ mod tests {
                 let record = crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported.json")),
                     title: unlinked.pr.title.clone(),
+                    description: None,
                     status: WorkItemStatus::Implementing,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
@@ -4424,6 +4445,7 @@ mod tests {
                 let record = crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/new.json")),
                     title: req.title.clone(),
+                    description: None,
                     status: req.status.clone(),
                     repo_associations: req.repo_associations,
                     plan: None,
@@ -4496,6 +4518,7 @@ mod tests {
         // Attempt to create with both repos selected.
         let result = app.create_work_item_with(
             "Test item".into(),
+            None,
             vec![
                 PathBuf::from("/repos/with-git"),
                 PathBuf::from("/repos/no-git"),
@@ -4532,6 +4555,7 @@ mod tests {
             id: WorkItemId::LocalFile(PathBuf::from(format!("/data/{title}.json"))),
             backend_type: BackendType::LocalFile,
             title: title.to_string(),
+            description: None,
             status,
             status_derived: false,
             repo_associations: vec![RepoAssociation {
@@ -4701,6 +4725,7 @@ mod tests {
 
         let result = app.create_work_item_with(
             "Test item".into(),
+            None,
             vec![PathBuf::from("/repos/no-git")],
             "feature/test".into(),
         );
@@ -4728,6 +4753,7 @@ mod tests {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             title: "Merge test".into(),
+            description: None,
             status: WorkItemStatus::Review,
             status_derived: false,
             repo_associations: vec![],
@@ -4764,6 +4790,7 @@ mod tests {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             title: "Rework test".into(),
+            description: None,
             status: WorkItemStatus::Review,
             status_derived: false,
             repo_associations: vec![],
@@ -4811,6 +4838,7 @@ mod tests {
             id: wi_id,
             backend_type: BackendType::LocalFile,
             title: "Backlog item".into(),
+            description: None,
             status: WorkItemStatus::Backlog,
             status_derived: false,
             repo_associations: vec![],
@@ -4837,6 +4865,7 @@ mod tests {
             id: wi_id,
             backend_type: BackendType::LocalFile,
             title: "Planning item".into(),
+            description: None,
             status: WorkItemStatus::Planning,
             status_derived: false,
             repo_associations: vec![],

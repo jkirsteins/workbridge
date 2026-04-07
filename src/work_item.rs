@@ -118,6 +118,7 @@ pub struct WorkItem {
     pub id: WorkItemId,
     pub backend_type: BackendType,
     pub title: String,
+    pub description: Option<String>,
     pub status: WorkItemStatus,
     /// True when the assembly layer derived the status (e.g. merged PR -> Done)
     /// rather than using the backend record's status directly. Stage transitions

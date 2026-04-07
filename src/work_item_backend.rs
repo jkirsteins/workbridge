@@ -55,6 +55,10 @@ impl fmt::Display for BackendError {
 pub struct WorkItemRecord {
     pub id: WorkItemId,
     pub title: String,
+    /// Optional description providing context for planning/refinement.
+    /// Defaults to None for migration compatibility with existing records.
+    #[serde(default)]
+    pub description: Option<String>,
     pub status: WorkItemStatus,
     pub repo_associations: Vec<RepoAssociationRecord>,
     /// Implementation plan text. None means no plan has been set yet.
@@ -106,6 +110,7 @@ pub struct ListResult {
 #[derive(Clone, Debug)]
 pub struct CreateWorkItem {
     pub title: String,
+    pub description: Option<String>,
     pub status: WorkItemStatus,
     pub repo_associations: Vec<RepoAssociationRecord>,
 }
@@ -354,6 +359,7 @@ impl WorkItemBackend for LocalFileBackend {
         let record = WorkItemRecord {
             id: WorkItemId::LocalFile(path.clone()),
             title: request.title,
+            description: request.description,
             status: request.status,
             repo_associations: request.repo_associations,
             plan: None,
@@ -396,6 +402,7 @@ impl WorkItemBackend for LocalFileBackend {
     fn import(&self, unlinked: &UnlinkedPr) -> Result<WorkItemRecord, BackendError> {
         let request = CreateWorkItem {
             title: unlinked.pr.title.clone(),
+            description: None,
             status: WorkItemStatus::Implementing,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: unlinked.repo_path.clone(),
@@ -503,6 +510,7 @@ mod tests {
         let record = backend
             .create(CreateWorkItem {
                 title: "Fix auth bug".into(),
+                description: None,
                 status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/path/to/repo"),
@@ -540,6 +548,7 @@ mod tests {
 
         let result = backend.create(CreateWorkItem {
             title: "No repos".into(),
+            description: None,
             status: WorkItemStatus::Backlog,
             repo_associations: vec![],
         });
@@ -567,6 +576,7 @@ mod tests {
         let record = backend
             .create(CreateWorkItem {
                 title: "To delete".into(),
+                description: None,
                 status: WorkItemStatus::Implementing,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
@@ -674,6 +684,7 @@ mod tests {
         backend
             .create(CreateWorkItem {
                 title: "Valid item".into(),
+                description: None,
                 status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
@@ -722,6 +733,7 @@ mod tests {
         let record = backend
             .create(CreateWorkItem {
                 title: "Planning item".into(),
+                description: None,
                 status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
@@ -799,6 +811,7 @@ mod tests {
         let record = backend
             .create(CreateWorkItem {
                 title: "Activity test".into(),
+                description: None,
                 status: WorkItemStatus::Implementing,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
@@ -841,6 +854,7 @@ mod tests {
         let record = backend
             .create(CreateWorkItem {
                 title: "No activity".into(),
+                description: None,
                 status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
@@ -863,6 +877,7 @@ mod tests {
         let record = backend
             .create(CreateWorkItem {
                 title: "Plan test".into(),
+                description: None,
                 status: WorkItemStatus::Planning,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
@@ -908,6 +923,7 @@ mod tests {
         let record = backend
             .create(CreateWorkItem {
                 title: "Path test".into(),
+                description: None,
                 status: WorkItemStatus::Backlog,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),

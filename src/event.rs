@@ -592,29 +592,41 @@ fn handle_create_dialog(app: &mut App, key: KeyEvent) {
             app.create_dialog.focus_prev();
         }
 
-        // Enter - validate and create
-        (_, KeyCode::Enter) => match app.create_dialog.validate() {
-            Ok((title, repos, branch)) => {
-                let had_status = app.status_message.is_some();
-                let had_context = app.selected_work_item_context().is_some();
-                match app.create_work_item_with(title, repos, branch) {
-                    Ok(()) => {
-                        app.create_dialog.close();
-                        if app.status_message.is_some() != had_status
-                            || app.selected_work_item_context().is_some() != had_context
-                        {
-                            sync_layout(app);
+        // Enter - in Description field inserts newline, otherwise validates and creates
+        (_, KeyCode::Enter) => {
+            if matches!(
+                app.create_dialog.focus_field,
+                CreateDialogFocus::Description
+            ) {
+                app.create_dialog.description_input.insert_newline();
+                app.create_dialog
+                    .description_input
+                    .ensure_visible(crate::ui::DESC_TEXTAREA_HEIGHT as usize);
+                return;
+            }
+            match app.create_dialog.validate() {
+                Ok((title, description, repos, branch)) => {
+                    let had_status = app.status_message.is_some();
+                    let had_context = app.selected_work_item_context().is_some();
+                    match app.create_work_item_with(title, description, repos, branch) {
+                        Ok(()) => {
+                            app.create_dialog.close();
+                            if app.status_message.is_some() != had_status
+                                || app.selected_work_item_context().is_some() != had_context
+                            {
+                                sync_layout(app);
+                            }
+                        }
+                        Err(msg) => {
+                            app.create_dialog.error_message = Some(msg);
                         }
                     }
-                    Err(msg) => {
-                        app.create_dialog.error_message = Some(msg);
-                    }
+                }
+                Err(msg) => {
+                    app.create_dialog.error_message = Some(msg);
                 }
             }
-            Err(msg) => {
-                app.create_dialog.error_message = Some(msg);
-            }
-        },
+        }
 
         // Keys handled differently depending on focused field
         _ => {
@@ -622,6 +634,9 @@ fn handle_create_dialog(app: &mut App, key: KeyEvent) {
                 CreateDialogFocus::Title | CreateDialogFocus::Branch => {
                     // Forward to the focused text input
                     handle_text_input_key(app, key);
+                }
+                CreateDialogFocus::Description => {
+                    handle_textarea_key(app, key);
                 }
                 CreateDialogFocus::Repos => match (key.modifiers, key.code) {
                     (_, KeyCode::Up) => app.create_dialog.repo_up(),
@@ -677,6 +692,43 @@ fn handle_text_input_key(app: &mut App, key: KeyEvent) {
     if is_branch && is_content_key {
         app.create_dialog.branch_user_edited = true;
     }
+}
+
+/// Forward a key event to the description textarea in the create dialog.
+fn handle_textarea_key(app: &mut App, key: KeyEvent) {
+    let ta = &mut app.create_dialog.description_input;
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Char(c)) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            ta.insert_char(c);
+        }
+        (_, KeyCode::Backspace) => {
+            ta.backspace();
+        }
+        (_, KeyCode::Delete) => {
+            ta.delete();
+        }
+        (_, KeyCode::Left) => {
+            ta.move_left();
+        }
+        (_, KeyCode::Right) => {
+            ta.move_right();
+        }
+        (_, KeyCode::Up) => {
+            ta.move_up();
+        }
+        (_, KeyCode::Down) => {
+            ta.move_down();
+        }
+        (_, KeyCode::Home) => {
+            ta.home();
+        }
+        (_, KeyCode::End) => {
+            ta.end();
+        }
+        _ => {}
+    }
+    // Keep cursor visible within the 3-line viewport.
+    ta.ensure_visible(crate::ui::DESC_TEXTAREA_HEIGHT as usize);
 }
 
 /// Recalculate layout from the current terminal size and resize PTY panes.
