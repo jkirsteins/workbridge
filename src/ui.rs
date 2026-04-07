@@ -1,6 +1,6 @@
 use ratatui_core::{
     buffer::Buffer,
-    layout::{Constraint, Direction, Layout, Position, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Position, Rect},
     style::Modifier,
     text::{Line, Span, Text},
     widgets::{StatefulWidget, Widget},
@@ -11,6 +11,7 @@ use ratatui_widgets::{
     clear::Clear,
     list::{List, ListItem, ListState},
     paragraph::Paragraph,
+    scrollbar::{Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use tui_term::widget::PseudoTerminal;
 use unicode_width::UnicodeWidthStr;
@@ -190,6 +191,10 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         })
         .collect();
 
+    // Pre-compute per-item row heights for scrollbar calculations.
+    let item_heights: Vec<usize> = items.iter().map(ListItem::height).collect();
+    let total_rows: usize = item_heights.iter().sum();
+
     let list = List::new(items)
         .block(block)
         .highlight_style(theme.style_tab_highlight_bg())
@@ -199,6 +204,27 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     state.select(app.selected_item);
 
     StatefulWidget::render(list, area, buf, &mut state);
+
+    // Scrollbar - only when content overflows the viewport.
+    let inner_height = area.height.saturating_sub(2) as usize;
+    if total_rows > inner_height || state.offset() > 0 {
+        // Convert the item-based offset to a row-based offset so the
+        // scrollbar thumb position matches the actual viewport scroll.
+        let row_offset: usize = item_heights.iter().take(state.offset()).sum();
+
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None)
+            .thumb_style(theme.style_scrollbar_thumb())
+            .track_style(theme.style_scrollbar_track());
+
+        let mut scrollbar_state =
+            ScrollbarState::new(total_rows).position(row_offset);
+
+        let scrollbar_area = area.inner(Margin::new(0, 1));
+        StatefulWidget::render(scrollbar, scrollbar_area, buf, &mut scrollbar_state);
+    }
 }
 
 /// Format an unlinked PR entry for the left panel list.
@@ -797,7 +823,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
 
             if review_gate_active {
                 let spinner_chars = [b'|', b'/', b'-', b'\\'];
-                let frame = app.review_gate_spinner_frame as usize % spinner_chars.len();
+                let frame = app.spinner_tick as usize % spinner_chars.len();
                 let spinner = spinner_chars[frame] as char;
                 let text = Text::from(vec![
                     Line::from(""),
@@ -2546,6 +2572,40 @@ mod snapshot_tests {
         let repos = vec![PathBuf::from("/repo/only")];
         app.create_dialog.open(&repos, None);
         app.create_dialog.error_message = Some("Title cannot be empty".to_string());
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn work_item_list_scrollbar_visible_on_overflow() {
+        let items: Vec<WorkItem> = (0..15)
+            .map(|i| {
+                let status = match i % 3 {
+                    0 => WorkItemStatus::Implementing,
+                    1 => WorkItemStatus::Backlog,
+                    _ => WorkItemStatus::Review,
+                };
+                make_work_item(
+                    &format!("item-{i}"),
+                    &format!("Work item number {i}"),
+                    status,
+                    None,
+                    1,
+                )
+            })
+            .collect();
+        let mut app = app_with_items(items, vec![]);
+        // Select an item near the end to force scrolling.
+        app.selected_item = Some(app.display_list.len().saturating_sub(2));
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn work_item_list_no_scrollbar_when_fits() {
+        let items = vec![
+            make_work_item("a", "First item", WorkItemStatus::Backlog, None, 1),
+            make_work_item("b", "Second item", WorkItemStatus::Implementing, None, 1),
+        ];
+        let app = app_with_items(items, vec![]);
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 }

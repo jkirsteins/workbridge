@@ -20,6 +20,12 @@ pub struct Theme {
     /// Subtle borders (e.g., inner list in settings).
     pub border_subtle: Color,
 
+    // -- Scrollbar --
+    /// Scrollbar thumb (the draggable indicator).
+    pub scrollbar_thumb: Color,
+    /// Scrollbar track (the gutter).
+    pub scrollbar_track: Color,
+
     // -- Tab list --
     /// Highlight bar: foreground.
     pub tab_highlight_fg: Color,
@@ -111,6 +117,9 @@ impl Theme {
             border_overlay: Color::Cyan,
             border_subtle: Color::Reset,
 
+            scrollbar_thumb: Color::Gray,
+            scrollbar_track: Color::Reset,
+
             tab_highlight_fg: Color::Black,
             tab_highlight_bg: Color::Cyan,
 
@@ -177,6 +186,14 @@ impl Theme {
 
     pub fn style_border_subtle(&self) -> Style {
         Style::default().fg(self.border_subtle)
+    }
+
+    pub fn style_scrollbar_thumb(&self) -> Style {
+        Style::default().fg(self.scrollbar_thumb)
+    }
+
+    pub fn style_scrollbar_track(&self) -> Style {
+        Style::default().fg(self.scrollbar_track)
     }
 
     pub fn style_tab_highlight(&self) -> Style {

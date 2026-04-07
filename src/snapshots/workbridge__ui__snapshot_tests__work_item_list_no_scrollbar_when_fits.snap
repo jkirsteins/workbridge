@@ -1,0 +1,28 @@
+---
+source: src/ui.rs
+expression: "render(&app, 80, 24)"
+---
+┌ Work Items (2) ───────┐┌ Claude Code ────────────────────────────────────────┐
+│  ACTIVE (0) (1)       ││                                                     │
+│> [IM] Second item     ││  Second item                                        │
+│  branch-b [no wt]     ││                                                     │
+│  BACKLOGGED (0) (1)   ││  Status      Implementing                           │
+│  [BL] First item      ││  Backend     Local file                             │
+│  branch-a [no wt]     ││  Repo        /repo/b/0                              │
+│                       ││  Branch      branch-b                               │
+│                       ││  Worktree    (none)                                 │
+│                       ││  PR          (none)                                 │
+│                       ││  Issue       (none)                                 │
+│                       ││  Errors      (none)                                 │
+│                       ││                                                     │
+│                       ││  Press Enter to start a session.                    │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+└───────────────────────┘└─────────────────────────────────────────────────────┘
+Second item | [Implementing] | /repo/b/0
