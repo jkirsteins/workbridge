@@ -161,6 +161,10 @@ pub struct App {
     /// Rework reasons keyed by work item ID. Used by stage_system_prompt
     /// to select the "implementing_rework" prompt template.
     pub rework_reasons: HashMap<WorkItemId, String>,
+    /// Review-gate findings keyed by work item ID. Populated when the gate
+    /// approves, consumed one-shot by `stage_system_prompt` to select the
+    /// "review_with_findings" prompt template and inject the assessment.
+    pub review_gate_findings: HashMap<WorkItemId, String>,
     /// True when the no-plan prompt is visible (offered when Claude blocks
     /// because no implementation plan exists).
     pub no_plan_prompt_visible: bool,
@@ -393,6 +397,7 @@ impl App {
             rework_prompt_input: crate::create_dialog::SimpleTextInput::new(),
             rework_prompt_wi: None,
             rework_reasons: HashMap::new(),
+            review_gate_findings: HashMap::new(),
             no_plan_prompt_visible: false,
             no_plan_prompt_queue: VecDeque::new(),
             shutting_down: false,
@@ -1386,8 +1391,13 @@ impl App {
             .unwrap_or(WorkItemStatus::Implementing);
         let is_planning = work_item_status == WorkItemStatus::Planning;
         let session_key = (work_item_id.clone(), work_item_status.clone());
+        let has_gate_findings = self.review_gate_findings.contains_key(work_item_id);
         let system_prompt = self.stage_system_prompt(work_item_id, cwd);
-        let mut cmd = Self::build_claude_cmd(&work_item_status, system_prompt.as_deref());
+        let mut cmd = Self::build_claude_cmd(
+            &work_item_status,
+            system_prompt.as_deref(),
+            has_gate_findings,
+        );
 
         // Write MCP config as .mcp.json in the worktree AND pass via --mcp-config.
         // Both are needed: .mcp.json for Claude Code's project discovery, --mcp-config
@@ -1514,12 +1524,17 @@ impl App {
     /// `--mcp-config` so Claude Code does not mistake it for a config
     /// file path. The returned Vec does not include `--mcp-config` -
     /// callers append it after this returns.
-    fn build_claude_cmd(status: &WorkItemStatus, system_prompt: Option<&str>) -> Vec<String> {
+    fn build_claude_cmd(
+        status: &WorkItemStatus,
+        system_prompt: Option<&str>,
+        force_auto_start: bool,
+    ) -> Vec<String> {
         let is_planning = *status == WorkItemStatus::Planning;
-        let auto_start = matches!(
-            status,
-            WorkItemStatus::Planning | WorkItemStatus::Implementing
-        );
+        let auto_start = force_auto_start
+            || matches!(
+                status,
+                WorkItemStatus::Planning | WorkItemStatus::Implementing
+            );
 
         let mut cmd: Vec<String> = vec!["claude".to_string()];
         if is_planning {
@@ -1534,7 +1549,14 @@ impl App {
         // it as the positional prompt argument, not as an additional config
         // file path.
         if auto_start {
-            cmd.push("Explain who you are and start working.".to_string());
+            if *status == WorkItemStatus::Review {
+                cmd.push(
+                    "Present the review gate assessment from your system prompt to the user."
+                        .to_string(),
+                );
+            } else {
+                cmd.push("Explain who you are and start working.".to_string());
+            }
         }
         cmd
     }
@@ -1625,6 +1647,10 @@ impl App {
 
         // Look up and consume rework reason if any (one-shot use).
         let rework_reason = self.rework_reasons.remove(work_item_id).unwrap_or_default();
+        let review_gate_findings = self
+            .review_gate_findings
+            .remove(work_item_id)
+            .unwrap_or_default();
 
         // Check if the branch has commits ahead of the default branch.
         // Used to select the retroactive planning prompt when appropriate.
@@ -1682,10 +1708,17 @@ impl App {
                 )
             }
             WorkItemStatus::Review => {
-                format!(
-                    "Worktree: {worktree_display}. Branch: {branch_name}. \
-                     Implementation is complete and ready for review."
-                )
+                if !review_gate_findings.is_empty() {
+                    format!(
+                        "Worktree: {worktree_display}. Branch: {branch_name}. \
+                         Implementation passed the review gate and is ready for review."
+                    )
+                } else {
+                    format!(
+                        "Worktree: {worktree_display}. Branch: {branch_name}. \
+                         Implementation is complete and ready for review."
+                    )
+                }
             }
         };
 
@@ -1710,7 +1743,13 @@ impl App {
                 }
             }
             WorkItemStatus::Blocked => "blocked",
-            WorkItemStatus::Review => "review",
+            WorkItemStatus::Review => {
+                if !review_gate_findings.is_empty() {
+                    "review_with_findings"
+                } else {
+                    "review"
+                }
+            }
         };
 
         let description_var = match &description {
@@ -1724,6 +1763,7 @@ impl App {
         vars.insert("situation", &situation);
         vars.insert("plan", &plan_text);
         vars.insert("rework_reason", &rework_reason);
+        vars.insert("review_gate_findings", &review_gate_findings);
 
         crate::prompts::render(prompt_key, &vars)
     }
@@ -3253,6 +3293,11 @@ impl App {
             if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
                 self.status_message = Some(format!("Activity log error: {e}"));
             }
+
+            // Store the gate's assessment so the Review session can present
+            // it to the user (consumed one-shot by stage_system_prompt).
+            self.review_gate_findings
+                .insert(wi_id.clone(), result.detail.clone());
 
             self.apply_stage_change(
                 &wi_id,
@@ -6052,7 +6097,8 @@ mod tests {
     #[test]
     fn build_claude_cmd_prompt_before_mcp_config() {
         // Planning session: has --permission-mode plan and positional prompt.
-        let cmd = App::build_claude_cmd(&WorkItemStatus::Planning, Some("system prompt here"));
+        let cmd =
+            App::build_claude_cmd(&WorkItemStatus::Planning, Some("system prompt here"), false);
         assert_eq!(cmd[0], "claude");
         assert_eq!(cmd[1], "--permission-mode");
         assert_eq!(cmd[2], "plan");
@@ -6074,7 +6120,7 @@ mod tests {
     /// Implementing sessions also get an auto-start prompt.
     #[test]
     fn build_claude_cmd_implementing_has_prompt() {
-        let cmd = App::build_claude_cmd(&WorkItemStatus::Implementing, Some("impl prompt"));
+        let cmd = App::build_claude_cmd(&WorkItemStatus::Implementing, Some("impl prompt"), false);
         assert_eq!(cmd[0], "claude");
         // No --permission-mode for implementing.
         assert_eq!(cmd[1], "--system-prompt");
@@ -6263,10 +6309,34 @@ mod tests {
     #[test]
     fn build_claude_cmd_blocked_review_no_prompt() {
         for status in [WorkItemStatus::Blocked, WorkItemStatus::Review] {
-            let cmd = App::build_claude_cmd(&status, Some("prompt"));
+            let cmd = App::build_claude_cmd(&status, Some("prompt"), false);
             // Last arg should be the system prompt value, not a positional prompt.
             assert_eq!(cmd.last().unwrap(), "prompt");
         }
+    }
+
+    /// Review sessions auto-start when force_auto_start is true (gate findings present).
+    #[test]
+    fn build_claude_cmd_review_force_auto_start() {
+        let cmd = App::build_claude_cmd(&WorkItemStatus::Review, Some("review prompt"), true);
+        assert!(
+            cmd.last().unwrap().contains("review gate assessment"),
+            "review with force_auto_start should have gate-specific prompt",
+        );
+    }
+
+    /// Review-gate findings are stored per work item and influence prompt key.
+    #[test]
+    fn review_gate_findings_stored_per_work_item() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/gate-findings.json"));
+        app.review_gate_findings
+            .insert(wi_id.clone(), "All plan items implemented correctly".into());
+
+        assert_eq!(
+            app.review_gate_findings.get(&wi_id).map(|s| s.as_str()),
+            Some("All plan items implemented correctly"),
+        );
     }
 
     // -- Activity indicator tests --

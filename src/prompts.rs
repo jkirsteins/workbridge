@@ -123,6 +123,7 @@ mod tests {
         assert!(prompts.contains_key("implementing_rework"));
         assert!(prompts.contains_key("blocked"));
         assert!(prompts.contains_key("review"));
+        assert!(prompts.contains_key("review_with_findings"));
         assert!(prompts.contains_key("review_gate"));
         assert!(prompts.contains_key("global_assistant"));
     }
@@ -187,6 +188,15 @@ mod tests {
             (
                 "review",
                 vec![("title", "Test"), ("situation", "Sit"), ("description", "")],
+            ),
+            (
+                "review_with_findings",
+                vec![
+                    ("title", "Test"),
+                    ("situation", "Sit"),
+                    ("review_gate_findings", "All plan items implemented"),
+                    ("description", ""),
+                ],
             ),
             (
                 "implementing_rework",
