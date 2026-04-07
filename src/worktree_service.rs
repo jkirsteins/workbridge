@@ -82,6 +82,24 @@ pub trait WorktreeService: Send + Sync {
     fn create_branch(&self, repo_path: &Path, branch: &str) -> Result<(), WorktreeError>;
 }
 
+/// Build a `Command::new("git")` with inherited git env vars cleared.
+///
+/// Git sets GIT_DIR, GIT_WORK_TREE, etc. when running inside hooks or
+/// worktrees. Clearing them ensures each command targets only the
+/// directory it's told to via `-C` or `current_dir()`.
+pub fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// GitWorktreeService shells out to the git CLI for worktree operations.
 pub struct GitWorktreeService;
 
@@ -93,13 +111,9 @@ impl GitWorktreeService {
     /// matters when the process runs inside a git hook (e.g. pre-push) where
     /// git sets these variables.
     fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, WorktreeError> {
-        let output = Command::new("git")
+        let output = git_command()
             .arg("-C")
             .arg(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_COMMON_DIR")
             .args(args)
             .output()
             .map_err(|e| WorktreeError::Io(format!("failed to run git: {e}")))?;

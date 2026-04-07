@@ -44,6 +44,19 @@ git -c user.email=test@test.com -c user.name=Test commit -m "message"
 
 This sets values for a single command without writing to any config file.
 
+## Use `git_command()` for all git subprocesses
+
+All code that spawns `git` as a child process must use
+`worktree_service::git_command()` instead of `Command::new("git")`. This
+helper clears inherited git env vars (`GIT_DIR`, `GIT_WORK_TREE`, etc.) that
+git sets when running inside hooks or worktrees. Without clearing, child
+processes operate on the parent repo instead of their target directory -
+which is how `core.bare=true` corruption happened.
+
+The pre-commit hook enforces this: any staged `.rs` file with
+`Command::new("git")` that lacks `env_remove("GIT_DIR")` or `git_command()`
+will be rejected.
+
 ## Integration tests
 
 Tests that shell out to real `git` commands (creating repos, worktrees,

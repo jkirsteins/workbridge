@@ -17,5 +17,9 @@ if [ -n "$untracked" ]; then
 fi
 
 echo "=== pre-push: running tests ==="
+# Clear git env vars so child git processes in integration tests operate on
+# their temp directories, not on this repo. Defense-in-depth for the
+# env_remove() calls in Rust code.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
 cargo test --all-features
 echo "All tests passed."

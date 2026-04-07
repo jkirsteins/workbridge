@@ -1613,7 +1613,7 @@ impl App {
             // Check if our target files are already tracked by git.  If so,
             // writing them would silently modify tracked files, so skip the
             // hook and let prompt-level enforcement be the only safeguard.
-            let files_tracked = std::process::Command::new("git")
+            let files_tracked = crate::worktree_service::git_command()
                 .args([
                     "-C",
                     &cwd.to_string_lossy(),
@@ -1966,7 +1966,7 @@ impl App {
             }
         };
 
-        let output = std::process::Command::new("git")
+        let output = crate::worktree_service::git_command()
             .args(["log", &format!("{default_branch}..HEAD"), "--oneline"])
             .current_dir(cwd)
             .output();
@@ -2185,19 +2185,15 @@ impl App {
                                     // Gate truly can't run (no plan, no diff, git error).
                                     // Apply the rework flow so Claude gets feedback instead
                                     // of waiting forever for a gate result that never comes.
-                                    self.rework_reasons
-                                        .insert(wi_id.clone(), reason.clone());
-                                    self.status_message = Some(format!(
-                                        "Review gate failed to start: {reason}"
-                                    ));
+                                    self.rework_reasons.insert(wi_id.clone(), reason.clone());
+                                    self.status_message =
+                                        Some(format!("Review gate failed to start: {reason}"));
                                     // If Blocked, transition to Implementing so the
                                     // implementing_rework prompt (with {rework_reason}) is used.
-                                    if current_status.as_ref() == Some(&WorkItemStatus::Blocked)
-                                    {
-                                        let _ = self.backend.update_status(
-                                            &wi_id,
-                                            WorkItemStatus::Implementing,
-                                        );
+                                    if current_status.as_ref() == Some(&WorkItemStatus::Blocked) {
+                                        let _ = self
+                                            .backend
+                                            .update_status(&wi_id, WorkItemStatus::Implementing);
                                         self.reassemble_work_items();
                                         self.build_display_list();
                                     }
@@ -2934,7 +2930,7 @@ impl App {
             }
 
             // Ensure the branch is pushed to the remote before creating the PR.
-            let push_output = std::process::Command::new("git")
+            let push_output = crate::worktree_service::git_command()
                 .args(["push", "-u", "origin", &branch])
                 .current_dir(&repo_path)
                 .output();
@@ -3406,7 +3402,7 @@ impl App {
             .unwrap_or_else(|_| "main".to_string());
 
         // Get the git diff (this is fast, local I/O only).
-        let diff = match std::process::Command::new("git")
+        let diff = match crate::worktree_service::git_command()
             .arg("-C")
             .arg(&repo_path)
             .args(["diff", &format!("{default_branch}...{branch}")])
@@ -3466,12 +3462,8 @@ impl App {
                     match serde_json::from_str::<serde_json::Value>(&text) {
                         Ok(envelope) => {
                             let structured = &envelope["structured_output"];
-                            let approved =
-                                structured["approved"].as_bool().unwrap_or(false);
-                            let detail = structured["detail"]
-                                .as_str()
-                                .unwrap_or("")
-                                .to_string();
+                            let approved = structured["approved"].as_bool().unwrap_or(false);
+                            let detail = structured["detail"].as_str().unwrap_or("").to_string();
                             ReviewGateResult {
                                 work_item_id: wi_id_clone,
                                 approved,
@@ -3553,8 +3545,7 @@ impl App {
             .iter()
             .find(|w| w.id == wi_id)
             .map(|w| {
-                w.status == WorkItemStatus::Implementing
-                    || w.status == WorkItemStatus::Blocked
+                w.status == WorkItemStatus::Implementing || w.status == WorkItemStatus::Blocked
             })
             .unwrap_or(false);
 
@@ -3625,9 +3616,9 @@ impl App {
                     .find(|w| w.id == wi_id)
                     .map(|w| w.status.clone());
                 if wi_status == Some(WorkItemStatus::Blocked) {
-                    let _ =
-                        self.backend
-                            .update_status(&wi_id, WorkItemStatus::Implementing);
+                    let _ = self
+                        .backend
+                        .update_status(&wi_id, WorkItemStatus::Implementing);
                     self.reassemble_work_items();
                     self.build_display_list();
                 }
@@ -7101,7 +7092,7 @@ mod tests {
         // Work item with no branch - gate will fail with "no branch set".
         let (mut app, wi_id) = app_with_work_item(
             WorkItemStatus::Implementing,
-            None,      // no branch
+            None, // no branch
             Some("/tmp/repo"),
         );
 

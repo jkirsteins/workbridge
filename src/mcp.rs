@@ -450,7 +450,9 @@ fn handle_message(
                                  Do NOT tell the user the status changed."
                             )
                         } else {
-                            format!("Status change to {status} requested - pending validation by workbridge")
+                            format!(
+                                "Status change to {status} requested - pending validation by workbridge"
+                            )
                         };
                         Some(json!({
                             "jsonrpc": "2.0",
