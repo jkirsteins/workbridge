@@ -108,6 +108,15 @@ pub struct Activity {
     pub message: String,
 }
 
+/// Outcome of attempting to spawn the review gate.
+pub enum ReviewGateSpawn {
+    /// The gate was spawned and is running - caller should wait for result.
+    Spawned,
+    /// The gate cannot run - caller must NOT advance to Review.
+    /// Contains a human-readable reason to display.
+    Blocked(String),
+}
+
 /// Result from the asynchronous review gate check.
 pub struct ReviewGateResult {
     /// The work item that was being checked.
@@ -738,9 +747,14 @@ impl App {
                 None => false,
             };
             if has_commits {
-                if self.spawn_review_gate(&wi_id) {
-                    self.status_message =
-                        Some("Implementing session ended - running review gate...".into());
+                match self.spawn_review_gate(&wi_id) {
+                    ReviewGateSpawn::Spawned => {
+                        self.status_message =
+                            Some("Implementing session ended - running review gate...".into());
+                    }
+                    ReviewGateSpawn::Blocked(reason) => {
+                        self.status_message = Some(reason);
+                    }
                 }
             } else {
                 self.status_message =
@@ -2148,25 +2162,23 @@ impl App {
                     }
 
                     // Review gate: when MCP requests Implementing -> Review,
-                    // trigger the review gate instead of applying directly.
-                    // This ensures the plan-vs-implementation check is the
-                    // single chokepoint for entering Review.
+                    // the review gate is the single chokepoint - the transition
+                    // is blocked unless the gate spawns and later approves it.
                     if current_status.as_ref() == Some(&WorkItemStatus::Implementing)
                         && new_status == WorkItemStatus::Review
                     {
-                        if self.review_gate_wi.as_ref() == Some(&wi_id) {
-                            // Gate already running for this item - wait for it.
-                            continue;
+                        match self.spawn_review_gate(&wi_id) {
+                            ReviewGateSpawn::Spawned => {
+                                self.status_message =
+                                    Some("Claude requested Review - running review gate...".into());
+                            }
+                            ReviewGateSpawn::Blocked(reason) => {
+                                self.status_message = Some(reason);
+                            }
                         }
-                        if self.spawn_review_gate(&wi_id) {
-                            self.status_message =
-                                Some("Claude requested Review - running review gate...".into());
-                            continue;
-                        }
+                        continue;
                     }
-                    // No plan or gate skipped - fall through to direct update.
-                    // Use apply_stage_change for consistent logging, auto-PR
-                    // creation, and reassembly.
+                    // Non-Review transitions fall through to direct update.
                     let current = current_status.unwrap();
                     self.apply_stage_change(&wi_id, &current, &new_status, "mcp");
 
@@ -2569,20 +2581,20 @@ impl App {
             return;
         }
 
-        // Review gate: when transitioning from Implementing to Review,
-        // check the plan against the implementation if a plan exists.
+        // Review gate: the single chokepoint for entering Review.
         // The gate runs asynchronously in a background thread to avoid
-        // blocking the TUI. If the gate is triggered, we return early
-        // and the result is processed on the next timer tick.
+        // blocking the TUI. The transition is blocked unless the gate
+        // spawns and later approves it via poll_review_gate.
         if current_status == WorkItemStatus::Implementing && new_status == WorkItemStatus::Review {
-            if self.review_gate_wi.as_ref() == Some(&wi_id) {
-                self.status_message = Some("Review gate already running...".into());
-                return;
+            match self.spawn_review_gate(&wi_id) {
+                ReviewGateSpawn::Spawned => {
+                    // Gate is running in background - do not advance yet.
+                }
+                ReviewGateSpawn::Blocked(reason) => {
+                    self.status_message = Some(reason);
+                }
             }
-            if self.spawn_review_gate(&wi_id) {
-                // Gate is running in background - do not advance yet.
-                return;
-            }
+            return;
         }
 
         // Merge prompt: when transitioning from Review to Done,
@@ -3266,37 +3278,44 @@ impl App {
     }
 
     /// Attempt to spawn the async review gate for the given work item.
-    /// Returns true if the gate was spawned (caller should wait for result),
-    /// false if no gate is needed (no plan, empty plan, missing data).
-    fn spawn_review_gate(&mut self, wi_id: &WorkItemId) -> bool {
+    /// Returns `Spawned` if the gate is running (caller should wait),
+    /// or `Blocked(reason)` if the transition must not proceed.
+    fn spawn_review_gate(&mut self, wi_id: &WorkItemId) -> ReviewGateSpawn {
         // Guard: if a review gate is already running, don't spawn another one.
         // A second call would overwrite the fields and leak the first session.
         if self.review_gate_wi.is_some() {
-            return false;
+            return ReviewGateSpawn::Blocked("Review gate already running".into());
         }
 
         // Read the plan from the backend.
         let plan = match self.backend.read_plan(wi_id) {
             Ok(Some(plan)) if !plan.trim().is_empty() => plan,
-            Ok(_) => return false, // No plan or empty plan - skip gate.
+            Ok(_) => {
+                return ReviewGateSpawn::Blocked("Cannot enter Review: no plan exists".into());
+            }
             Err(e) => {
-                self.status_message = Some(format!("Could not read plan: {e}"));
-                return false;
+                return ReviewGateSpawn::Blocked(format!("Could not read plan: {e}"));
             }
         };
 
         // Find the branch for this work item to get the diff.
         let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
             Some(wi) => wi,
-            None => return false,
+            None => {
+                return ReviewGateSpawn::Blocked("Work item not found".into());
+            }
         };
         let assoc = match wi.repo_associations.first() {
             Some(a) => a,
-            None => return false,
+            None => {
+                return ReviewGateSpawn::Blocked("Cannot enter Review: no repo association".into());
+            }
         };
         let branch = match assoc.branch.as_ref() {
             Some(b) => b.clone(),
-            None => return false,
+            None => {
+                return ReviewGateSpawn::Blocked("Cannot enter Review: no branch set".into());
+            }
         };
         let repo_path = assoc.repo_path.clone();
 
@@ -3318,18 +3337,15 @@ impl App {
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                self.status_message = Some(format!("Review gate: git diff failed: {stderr}"));
-                return false;
+                return ReviewGateSpawn::Blocked(format!("Review gate: git diff failed: {stderr}"));
             }
             Err(e) => {
-                self.status_message = Some(format!("Review gate: could not run git: {e}"));
-                return false;
+                return ReviewGateSpawn::Blocked(format!("Review gate: could not run git: {e}"));
             }
         };
 
         if diff.trim().is_empty() {
-            self.status_message = Some("Review gate: no changes found in diff".into());
-            return false;
+            return ReviewGateSpawn::Blocked("Cannot enter Review: no changes on branch".into());
         }
 
         // Spawn the claude --print check in a background thread.
@@ -3391,7 +3407,7 @@ impl App {
         self.review_gate_rx = Some(rx);
         self.review_gate_wi = Some(wi_id.clone());
         self.review_gate_activity = Some(self.start_activity("Running review gate..."));
-        true
+        ReviewGateSpawn::Spawned
     }
 
     /// Poll the async review gate for a result. Called on each timer tick.
