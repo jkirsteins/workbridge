@@ -436,6 +436,19 @@ mod integration_tests {
     use std::path::Path;
     use std::process::Command;
 
+    /// Build a Command with git environment variables cleared so
+    /// child git processes operate on `dir` instead of inheriting
+    /// the parent worktree's GIT_DIR/GIT_WORK_TREE.
+    fn git_cmd(dir: &Path) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR");
+        cmd
+    }
+
     /// Create a temporary git repo with an initial commit.
     /// Uses env vars for author identity - NEVER calls `git config`.
     fn setup_git_repo(dir: &Path) {
@@ -444,10 +457,8 @@ mod integration_tests {
         fs::write(&file_path, "init").unwrap();
         run_in(dir, &["git", "add", "README"]);
         // Use -c flags for author identity instead of git config.
-        let output = Command::new("git")
+        let output = git_cmd(dir)
             .args([
-                "-C",
-                dir.to_str().unwrap(),
                 "-c",
                 "user.email=test@test.com",
                 "-c",
@@ -465,9 +476,17 @@ mod integration_tests {
     }
 
     fn run_in(dir: &Path, args: &[&str]) {
-        let output = Command::new(args[0])
-            .args(&args[1..])
-            .current_dir(dir)
+        let mut cmd = Command::new(args[0]);
+        cmd.args(&args[1..]).current_dir(dir);
+        // Clear git env vars so child processes use `dir` as their repo,
+        // not the parent worktree.
+        if args[0] == "git" {
+            cmd.env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_COMMON_DIR");
+        }
+        let output = cmd
             .output()
             .unwrap_or_else(|e| panic!("failed to run {:?}: {e}", args));
         if !output.status.success() {
@@ -478,10 +497,8 @@ mod integration_tests {
 
     /// Helper for git commits that need author identity without git config.
     fn commit_in(dir: &Path, message: &str) {
-        let output = Command::new("git")
+        let output = git_cmd(dir)
             .args([
-                "-C",
-                dir.to_str().unwrap(),
                 "-c",
                 "user.email=test@test.com",
                 "-c",
