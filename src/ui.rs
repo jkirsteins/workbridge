@@ -266,11 +266,10 @@ fn format_work_item_entry<'a>(
     }
 
     // Stage badge + title. Done items omit the badge since the DONE group
-    // header already communicates their status; use equivalent-width spacing
-    // to preserve alignment.
+    // header already communicates their status.
     let badge = wi.status.badge_text();
     let prefix = if wi.status == WorkItemStatus::Done {
-        " ".repeat(badge.len() + 1)
+        String::new()
     } else {
         format!("{badge} ")
     };
@@ -338,7 +337,6 @@ fn format_work_item_entry<'a>(
 
     let mut line1_spans = if wi.status == WorkItemStatus::Done {
         vec![
-            Span::raw(prefix),
             Span::styled(first_title, title_style),
             Span::raw(pad_str),
         ]
