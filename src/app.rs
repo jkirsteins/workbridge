@@ -716,8 +716,9 @@ impl App {
     ///
     /// Groups (each hidden if empty):
     /// 1. UNLINKED - PRs not yet imported as work items
-    /// 2. ACTIVE (repo) - non-Backlog work items, grouped by repo
+    /// 2. ACTIVE (repo) - non-Backlog, non-Done work items, grouped by repo
     /// 3. BACKLOGGED (repo) - Backlog work items, grouped by repo
+    /// 4. DONE (repo) - Done work items, grouped by repo
     pub fn build_display_list(&mut self) {
         let mut list = Vec::new();
 
@@ -732,11 +733,14 @@ impl App {
             }
         }
 
-        // Partition work items into active vs backlogged, then sub-group by repo.
+        // Partition work items into active, backlogged, and done, then sub-group by repo.
         let mut active: Vec<usize> = Vec::new();
         let mut backlogged: Vec<usize> = Vec::new();
+        let mut done: Vec<usize> = Vec::new();
         for i in 0..self.work_items.len() {
-            if self.work_items[i].status == WorkItemStatus::Backlog {
+            if self.work_items[i].status == WorkItemStatus::Done {
+                done.push(i);
+            } else if self.work_items[i].status == WorkItemStatus::Backlog {
                 backlogged.push(i);
             } else {
                 active.push(i);
@@ -745,6 +749,7 @@ impl App {
 
         Self::push_repo_groups(&self.work_items, &mut list, "ACTIVE", &active);
         Self::push_repo_groups(&self.work_items, &mut list, "BACKLOGGED", &backlogged);
+        Self::push_repo_groups(&self.work_items, &mut list, "DONE", &done);
 
         self.display_list = list;
 
@@ -4382,8 +4387,8 @@ mod tests {
             })
             .collect();
         assert_eq!(group_headers.len(), 2);
-        assert_eq!(group_headers[0], ("ACTIVE (alpha)", 1));
-        assert_eq!(group_headers[1], ("BACKLOGGED (alpha)", 1));
+        assert_eq!(group_headers[0], ("BACKLOGGED (alpha)", 1));
+        assert_eq!(group_headers[1], ("DONE (alpha)", 1));
     }
 
     #[test]
