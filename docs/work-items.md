@@ -27,7 +27,7 @@ The backend record anchors the work item's identity. It is a local JSON file
 - Work item ID (file path)
 - Title
 - Status (Backlog, Planning, Implementing, Blocked, or Review)
-- Repo associations (repo path + optional branch name)
+- Repo associations (repo path + optional branch name + optional PR identity snapshot)
 
 The UI can render a work item list immediately from backend records alone,
 before any git or GitHub data is fetched.
@@ -68,7 +68,13 @@ work item's branch. The PR gives WorkBridge:
 - CI check status
 - URL
 
-If no PR exists for the branch, there is no PR piece.
+If no live PR exists for the branch but the backend record is Done and has
+a persisted PR identity snapshot (saved at merge time), assembly synthesizes
+a PrInfo with PrState::Merged from the snapshot. This ensures Done items
+continue displaying their PR link after the branch/PR is cleaned up.
+
+If no live PR exists and no persisted PR identity applies, there is no PR
+piece.
 
 ## Work Item Status
 
@@ -106,6 +112,8 @@ If any prerequisite is missing - no repo association, no branch, no GitHub remot
 ### Derived Done status
 
 During assembly, if any repo association has a merged PR (`PrState::Merged`), the work item's status is set to Done regardless of what the backend record says. This is marked as a derived status (`status_derived = true`). When the status is derived, manual stage transitions (advance/retreat) and MCP transitions are blocked.
+
+This includes synthetic PrInfo produced by the PR identity fallback: when a backend record is Done and has a persisted PR identity snapshot but no live PR, assembly injects a PrInfo with PrState::Merged. The derived-Done logic then fires on this synthetic PR, setting `status_derived = true`. Because the fallback only activates when the backend record is already Done, non-Done items are never forced into derived-Done by a stale snapshot.
 
 ## Sessions
 

@@ -15,7 +15,8 @@ use crate::work_item::{
     WorkItemStatus,
 };
 use crate::work_item_backend::{
-    ActivityEntry, BackendError, CreateWorkItem, RepoAssociationRecord, WorkItemBackend,
+    ActivityEntry, BackendError, CreateWorkItem, PrIdentityRecord, RepoAssociationRecord,
+    WorkItemBackend,
 };
 use crate::worktree_service::WorktreeService;
 
@@ -144,7 +145,11 @@ pub enum PrMergeOutcome {
     /// No PR found for this branch - advance to Done directly.
     NoPr,
     /// PR merged successfully.
-    Merged { strategy: String },
+    Merged {
+        strategy: String,
+        /// PR identity fetched from GitHub at merge time.
+        pr_identity: Option<PrIdentityRecord>,
+    },
     /// Merge failed due to conflicts - send back to Implementing.
     Conflict { stderr: String },
     /// Merge failed for another reason.
@@ -157,6 +162,8 @@ pub struct PrMergeResult {
     pub wi_id: WorkItemId,
     /// The branch that was being merged.
     pub branch: String,
+    /// The repo path for persisting PR identity.
+    pub repo_path: PathBuf,
     /// The outcome of the merge attempt.
     pub outcome: PrMergeOutcome,
 }
@@ -2412,6 +2419,7 @@ impl App {
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: repo_root,
                 branch: None,
+                pr_identity: None,
             }],
         };
 
@@ -2468,6 +2476,7 @@ impl App {
             .map(|repo_path| RepoAssociationRecord {
                 repo_path,
                 branch: Some(branch.clone()),
+                pr_identity: None,
             })
             .collect();
 
@@ -3142,19 +3151,20 @@ impl App {
         let strategy_owned = strategy.to_string();
         let wi_id_clone = wi_id.clone();
         let merge_flag_owned = merge_flag.to_string();
+        let repo_path_clone = repo_path.clone();
 
         let (tx, rx) = crossbeam_channel::bounded(1);
 
         std::thread::spawn(move || {
-            // Check if a PR exists for this branch.
-            let pr_exists = match std::process::Command::new("gh")
+            // Check if a PR exists for this branch and fetch its identity.
+            let pr_identity = match std::process::Command::new("gh")
                 .args([
                     "pr",
                     "list",
                     "--head",
                     &branch,
                     "--json",
-                    "number",
+                    "number,title,url",
                     "--repo",
                     &owner_repo,
                 ])
@@ -3162,58 +3172,59 @@ impl App {
             {
                 Ok(output) if output.status.success() => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    serde_json::from_str::<serde_json::Value>(stdout.trim())
+                    serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim())
                         .ok()
-                        .and_then(|v| v.as_array().map(|a| !a.is_empty()))
-                        .unwrap_or(false)
+                        .and_then(|arr| arr.into_iter().next())
+                        .and_then(|obj| {
+                            let number = obj.get("number")?.as_u64()?;
+                            let title = obj.get("title")?.as_str()?.to_string();
+                            let url = obj.get("url")?.as_str()?.to_string();
+                            Some(PrIdentityRecord { number, title, url })
+                        })
                 }
-                _ => false,
+                _ => None,
             };
 
-            if !pr_exists {
-                let _ = tx.send(PrMergeResult {
-                    wi_id: wi_id_clone,
-                    branch,
-                    outcome: PrMergeOutcome::NoPr,
-                });
-                return;
-            }
-
-            // Run gh pr merge.
-            let merge_result = std::process::Command::new("gh")
-                .args([
-                    "pr",
-                    "merge",
-                    &branch,
-                    &merge_flag_owned,
-                    "--delete-branch",
-                    "--repo",
-                    &owner_repo,
-                ])
-                .output();
-
-            let outcome = match merge_result {
-                Ok(output) if output.status.success() => PrMergeOutcome::Merged {
-                    strategy: strategy_owned,
-                },
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    if stderr.to_lowercase().contains("conflict") {
-                        PrMergeOutcome::Conflict { stderr }
-                    } else {
-                        PrMergeOutcome::Failed {
-                            error: format!("Merge failed: {}", stderr.trim()),
+            let outcome = if pr_identity.is_none() {
+                PrMergeOutcome::NoPr
+            } else {
+                // Run gh pr merge.
+                match std::process::Command::new("gh")
+                    .args([
+                        "pr",
+                        "merge",
+                        &branch,
+                        &merge_flag_owned,
+                        "--delete-branch",
+                        "--repo",
+                        &owner_repo,
+                    ])
+                    .output()
+                {
+                    Ok(output) if output.status.success() => PrMergeOutcome::Merged {
+                        strategy: strategy_owned,
+                        pr_identity,
+                    },
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                        if stderr.to_lowercase().contains("conflict") {
+                            PrMergeOutcome::Conflict { stderr }
+                        } else {
+                            PrMergeOutcome::Failed {
+                                error: format!("Merge failed: {}", stderr.trim()),
+                            }
                         }
                     }
+                    Err(e) => PrMergeOutcome::Failed {
+                        error: format!("Merge failed: {e}"),
+                    },
                 }
-                Err(e) => PrMergeOutcome::Failed {
-                    error: format!("Merge failed: {e}"),
-                },
             };
 
             let _ = tx.send(PrMergeResult {
                 wi_id: wi_id_clone,
                 branch,
+                repo_path: repo_path_clone,
                 outcome,
             });
         });
@@ -3265,7 +3276,19 @@ impl App {
                 self.status_message =
                     Some("Cannot merge: no PR found. Push branch and open a PR first.".into());
             }
-            PrMergeOutcome::Merged { ref strategy } => {
+            PrMergeOutcome::Merged {
+                ref strategy,
+                ref pr_identity,
+            } => {
+                // Persist PR identity to backend so it survives reassembly.
+                if let Some(identity) = pr_identity
+                    && let Err(e) =
+                        self.backend
+                            .save_pr_identity(&result.wi_id, &result.repo_path, identity)
+                {
+                    self.status_message = Some(format!("PR identity save error: {e}"));
+                }
+
                 // Log merge to activity log (always - the merge happened on GitHub).
                 let log_entry = ActivityEntry {
                     timestamp: now_iso8601(),
@@ -4282,6 +4305,7 @@ mod tests {
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
+                        pr_identity: None,
                     }],
                     plan: None,
                 };
@@ -4736,6 +4760,7 @@ mod tests {
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: PathBuf::from("/repo"),
                 branch: None,
+                pr_identity: None,
             }],
             plan: None,
         };
@@ -4747,6 +4772,7 @@ mod tests {
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: PathBuf::from("/repo"),
                 branch: None,
+                pr_identity: None,
             }],
             plan: None,
         };
@@ -4847,6 +4873,7 @@ mod tests {
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,
+                    pr_identity: None,
                 }],
                 plan: None,
             };
@@ -5271,6 +5298,7 @@ mod tests {
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
+                        pr_identity: None,
                     }],
                     plan: None,
                 };
@@ -5502,6 +5530,7 @@ mod tests {
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
+                        pr_identity: None,
                     }],
                     plan: None,
                 };
@@ -5755,6 +5784,7 @@ mod tests {
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
+                        pr_identity: None,
                     }],
                     plan: None,
                 };
@@ -6333,6 +6363,7 @@ mod tests {
         tx.send(PrMergeResult {
             wi_id: wi_id.clone(),
             branch: "feature/test".into(),
+            repo_path: PathBuf::from("/tmp/repo"),
             outcome: PrMergeOutcome::NoPr,
         })
         .unwrap();
@@ -6368,8 +6399,10 @@ mod tests {
         tx.send(PrMergeResult {
             wi_id: wi_id.clone(),
             branch: "feature/test".into(),
+            repo_path: PathBuf::from("/tmp/repo"),
             outcome: PrMergeOutcome::Merged {
                 strategy: "squash".into(),
+                pr_identity: None,
             },
         })
         .unwrap();
