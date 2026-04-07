@@ -1070,6 +1070,10 @@ impl App {
         // Build the claude command with system prompt and MCP config.
         let system_prompt = self.stage_system_prompt(&work_item_id);
         let mut cmd: Vec<String> = vec!["claude".to_string()];
+        if is_planning {
+            cmd.push("--permission-mode".to_string());
+            cmd.push("plan".to_string());
+        }
         if let Some(ref prompt) = system_prompt {
             cmd.push("--system-prompt".to_string());
             cmd.push(prompt.clone());
@@ -1101,32 +1105,67 @@ impl App {
             }
         }
 
-        // Write a Claude Code Stop hook into the worktree so Claude cannot finish
-        // a planning session without calling workbridge_set_plan.  For non-planning
+        // Write a Claude Code PreToolUse hook into the worktree so Claude cannot
+        // exit plan mode without calling workbridge_set_plan.  For non-planning
         // stages, remove any leftover hook from a prior planning session.
         let claude_dir = cwd.join(".claude");
         if is_planning {
-            let _ = std::fs::create_dir_all(&claude_dir);
-            let hook_settings = r#"{
+            // Check if our target files are already tracked by git.  If so,
+            // writing them would silently modify tracked files, so skip the
+            // hook and let prompt-level enforcement be the only safeguard.
+            let files_tracked = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    &cwd.to_string_lossy(),
+                    "ls-files",
+                    ".claude/settings.local.json",
+                    ".claude/.gitignore",
+                ])
+                .output()
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(false);
+
+            if files_tracked {
+                self.status_message = Some(
+                    "Planning hook skipped: .claude/ has tracked files in this repo".into(),
+                );
+            } else {
+                let _ = std::fs::create_dir_all(&claude_dir);
+                // Ignore everything in .claude/ so the settings file does not
+                // appear as an untracked file (some repos reject dangling
+                // files in pre-commit hooks).  A .gitignore containing `*`
+                // also matches itself, so git reports zero untracked entries.
+                let _ = std::fs::write(claude_dir.join(".gitignore"), "*\n");
+                let hook_settings = r#"{
   "hooks": {
-    "Stop": [
+    "PreToolUse": [
       {
+        "matcher": "ExitPlanMode",
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'T=$(cat | jq -r .transcript_path); grep -q workbridge_set_plan \"$T\" 2>/dev/null || { echo \"BLOCKED: You MUST call workbridge_set_plan with the finalized plan before finishing.\" >&2; exit 2; }'"
+            "command": "bash -c 'T=$(cat | jq -r .transcript_path); grep -q workbridge_set_plan \"$T\" 2>/dev/null || { echo \"BLOCKED: You MUST call workbridge_set_plan with the finalized plan before exiting plan mode.\" >&2; exit 2; }'"
           }
         ]
       }
     ]
   }
 }"#;
-            if let Err(e) = std::fs::write(claude_dir.join("settings.local.json"), hook_settings) {
-                self.status_message = Some(format!("Hook settings write error: {e}"));
+                if let Err(e) =
+                    std::fs::write(claude_dir.join("settings.local.json"), hook_settings)
+                {
+                    self.status_message = Some(format!("Hook settings write error: {e}"));
+                }
             }
         } else {
             // Clean up planning-stage hook so it does not block non-planning sessions.
             let _ = std::fs::remove_file(claude_dir.join("settings.local.json"));
+        }
+
+        // For planning sessions, send an initial message so Claude starts
+        // Phase 1 refinement immediately instead of waiting for user input.
+        if is_planning {
+            cmd.push("Begin.".to_string());
         }
 
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
