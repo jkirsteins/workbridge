@@ -261,10 +261,26 @@ mod tests {
             _repo_path: &Path,
             _worktree_path: &Path,
             _delete_branch: bool,
+            _force: bool,
         ) -> Result<(), WorktreeError> {
             Err(WorktreeError::GitError(
                 "remove_worktree not implemented in mock".to_string(),
             ))
+        }
+
+        fn delete_branch(
+            &self,
+            _repo_path: &Path,
+            _branch: &str,
+            _force: bool,
+        ) -> Result<(), WorktreeError> {
+            Err(WorktreeError::GitError(
+                "delete_branch not implemented in mock".to_string(),
+            ))
+        }
+
+        fn is_worktree_dirty(&self, _worktree_path: &Path) -> Result<bool, WorktreeError> {
+            Ok(false)
         }
 
         fn default_branch(&self, _repo_path: &Path) -> Result<String, WorktreeError> {

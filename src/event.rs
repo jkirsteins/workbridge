@@ -1,6 +1,8 @@
 use crate::salsa::ct::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
-use crate::app::{App, BOARD_COLUMNS, DisplayEntry, FocusPanel, SettingsListFocus, ViewMode};
+use crate::app::{
+    App, BOARD_COLUMNS, DeleteConfirmState, DisplayEntry, FocusPanel, SettingsListFocus, ViewMode,
+};
 use crate::create_dialog::CreateDialogFocus;
 use crate::layout;
 
@@ -120,7 +122,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Char('q' | 'Q')
             ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
         );
-    let is_delete_confirm = app.confirm_delete
+    let is_delete_confirm = app.confirm_delete != DeleteConfirmState::None
         && (key.code == KeyCode::Delete
             || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d')));
 
@@ -129,8 +131,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         app.confirm_quit = false;
         app.status_message = None;
     }
-    if app.confirm_delete && !is_delete_confirm {
-        app.confirm_delete = false;
+    if app.confirm_delete != DeleteConfirmState::None && !is_delete_confirm {
+        app.confirm_delete = DeleteConfirmState::None;
         app.status_message = None;
     }
     // If cancelling a confirmation hid the status bar, resync layout so
@@ -259,18 +261,28 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
                 .and_then(|cwd| app.managed_repo_root(&cwd));
             app.create_dialog.open(&active_repos, cwd_repo.as_ref());
         }
-        // Ctrl+D or Delete - delete work item with confirmation
+        // Ctrl+D or Delete - delete work item with 3-step confirmation
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Delete) => {
             if app.selected_work_item_id().is_none() {
                 return;
             }
-            if app.confirm_delete {
-                app.confirm_delete = false;
-                app.delete_selected_work_item();
-            } else {
-                app.confirm_delete = true;
-                app.status_message = Some("Press again to delete this work item".into());
-                sync_layout(app);
+            match app.confirm_delete {
+                DeleteConfirmState::None => {
+                    app.confirm_delete = DeleteConfirmState::AwaitingConfirm;
+                    app.status_message =
+                        Some("Press again to delete this work item".into());
+                    sync_layout(app);
+                }
+                DeleteConfirmState::AwaitingConfirm => {
+                    app.confirm_delete = DeleteConfirmState::None;
+                    app.attempt_delete_selected_work_item();
+                    sync_layout(app);
+                }
+                DeleteConfirmState::AwaitingForce => {
+                    app.confirm_delete = DeleteConfirmState::None;
+                    app.delete_selected_work_item(true);
+                    sync_layout(app);
+                }
             }
         }
         // ? - toggle settings overlay
@@ -311,25 +323,43 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 .and_then(|cwd| app.managed_repo_root(&cwd));
             app.create_dialog.open(&active_repos, cwd_repo.as_ref());
         }
-        // Ctrl+D or Delete - delete work item with confirmation
+        // Ctrl+D or Delete - delete work item with 3-step confirmation
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Delete) => {
             if app.selected_work_item_id().is_none() {
                 return;
             }
-            if app.confirm_delete {
-                app.confirm_delete = false;
-                let had_status = app.has_visible_status_bar();
-                let had_context = app.selected_work_item_context().is_some();
-                app.delete_selected_work_item();
-                if app.has_visible_status_bar() != had_status
-                    || app.selected_work_item_context().is_some() != had_context
-                {
+            match app.confirm_delete {
+                DeleteConfirmState::None => {
+                    app.confirm_delete = DeleteConfirmState::AwaitingConfirm;
+                    app.status_message = Some("Press again to delete this work item".into());
                     sync_layout(app);
                 }
-            } else {
-                app.confirm_delete = true;
-                app.status_message = Some("Press again to delete this work item".into());
-                sync_layout(app);
+                DeleteConfirmState::AwaitingConfirm => {
+                    let had_status = app.has_visible_status_bar();
+                    let had_context = app.selected_work_item_context().is_some();
+                    app.attempt_delete_selected_work_item();
+                    app.confirm_delete = match app.confirm_delete {
+                        // attempt_delete may have escalated to AwaitingForce
+                        DeleteConfirmState::AwaitingForce => DeleteConfirmState::AwaitingForce,
+                        _ => DeleteConfirmState::None,
+                    };
+                    if app.has_visible_status_bar() != had_status
+                        || app.selected_work_item_context().is_some() != had_context
+                    {
+                        sync_layout(app);
+                    }
+                }
+                DeleteConfirmState::AwaitingForce => {
+                    app.confirm_delete = DeleteConfirmState::None;
+                    let had_status = app.has_visible_status_bar();
+                    let had_context = app.selected_work_item_context().is_some();
+                    app.delete_selected_work_item(true);
+                    if app.has_visible_status_bar() != had_status
+                        || app.selected_work_item_context().is_some() != had_context
+                    {
+                        sync_layout(app);
+                    }
+                }
             }
         }
         // Up arrow - previous item (skipping non-selectable entries)
