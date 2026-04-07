@@ -31,6 +31,37 @@ pub fn compute(cols: u16, rows: u16, bottom_bar_rows: u16) -> PanelLayout {
     }
 }
 
+/// Drawer dimensions for the global assistant overlay.
+pub struct DrawerLayout {
+    /// Width of the drawer rectangle (terminal width minus inset margins).
+    pub drawer_width: u16,
+    /// Height of the drawer rectangle (60% of terminal height, minimum 5).
+    pub drawer_height: u16,
+    /// Columns available for the PTY inside the drawer (after borders).
+    pub pane_cols: u16,
+    /// Rows available for the PTY inside the drawer (after borders).
+    pub pane_rows: u16,
+}
+
+/// Compute global drawer geometry from terminal dimensions.
+///
+/// The drawer occupies 60% of the terminal height (minimum 5 rows),
+/// inset 2 columns on each side. PTY dimensions subtract border cells.
+/// Uses u32 intermediate arithmetic to avoid u16 overflow on large terminals.
+pub fn compute_drawer(cols: u16, rows: u16) -> DrawerLayout {
+    let drawer_width = cols.saturating_sub(4);
+    // Cast to u32 to prevent overflow when rows > 1092 (rows * 60 > u16::MAX).
+    let drawer_height = ((rows as u32 * 60 / 100).max(5) as u16).min(rows);
+    let pane_cols = drawer_width.saturating_sub(2).max(1);
+    let pane_rows = drawer_height.saturating_sub(2).max(1);
+    DrawerLayout {
+        drawer_width,
+        drawer_height,
+        pane_cols,
+        pane_rows,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +129,40 @@ mod tests {
         let pl = compute(80, 2, 1);
         // rows = 2 - 2 (borders) - 1 (bar) = 0 saturated -> 1
         assert_eq!(pl.pane_rows, 1);
+    }
+
+    #[test]
+    fn drawer_standard_terminal() {
+        let dl = compute_drawer(80, 24);
+        // width = 80 - 4 = 76
+        assert_eq!(dl.drawer_width, 76);
+        // height = 24 * 60 / 100 = 14
+        assert_eq!(dl.drawer_height, 14);
+        // pane_cols = 76 - 2 = 74
+        assert_eq!(dl.pane_cols, 74);
+        // pane_rows = 14 - 2 = 12
+        assert_eq!(dl.pane_rows, 12);
+    }
+
+    #[test]
+    fn drawer_tiny_terminal() {
+        let dl = compute_drawer(10, 4);
+        // width = 10 - 4 = 6
+        assert_eq!(dl.drawer_width, 6);
+        // height = 4 * 60 / 100 = 2, but min 5 -> 5, capped at rows -> 4
+        assert_eq!(dl.drawer_height, 4);
+        // pane_cols = 6 - 2 = 4
+        assert_eq!(dl.pane_cols, 4);
+        // pane_rows = 4 - 2 = 2
+        assert_eq!(dl.pane_rows, 2);
+    }
+
+    #[test]
+    fn drawer_no_u16_overflow_large_rows() {
+        // rows=2000: 2000*60=120000 would overflow u16 (max 65535).
+        // With u32 intermediate: 120000/100=1200, capped to u16 fine.
+        let dl = compute_drawer(200, 2000);
+        assert_eq!(dl.drawer_height, 1200);
+        assert_eq!(dl.pane_rows, 1198);
     }
 }

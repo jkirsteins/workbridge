@@ -71,7 +71,10 @@ mod tests {
     fn render_planning_prompt() {
         let mut vars = HashMap::new();
         vars.insert("title", "Fix auth bug");
-        vars.insert("situation", "Worktree: /tmp/wt. Branch: fix-auth. No plan exists yet.");
+        vars.insert(
+            "situation",
+            "Worktree: /tmp/wt. Branch: fix-auth. No plan exists yet.",
+        );
         vars.insert("description", "");
         let result = render("planning", &vars).unwrap();
         assert!(result.contains("Fix auth bug"));
@@ -141,7 +144,10 @@ mod tests {
     fn render_implementing_rework() {
         let mut vars = HashMap::new();
         vars.insert("title", "Fix auth bug");
-        vars.insert("situation", "Worktree: /tmp/wt. Branch: fix-auth. Rework requested.");
+        vars.insert(
+            "situation",
+            "Worktree: /tmp/wt. Branch: fix-auth. Rework requested.",
+        );
         vars.insert("plan", "Step 1: implement\nStep 2: test");
         vars.insert("rework_reason", "Tests are failing on CI");
         vars.insert("description", "");
@@ -159,11 +165,7 @@ mod tests {
         let cases = vec![
             (
                 "planning",
-                vec![
-                    ("title", "Test"),
-                    ("situation", "Sit"),
-                    ("description", ""),
-                ],
+                vec![("title", "Test"), ("situation", "Sit"), ("description", "")],
             ),
             (
                 "implementing_with_plan",
@@ -176,27 +178,15 @@ mod tests {
             ),
             (
                 "implementing_no_plan",
-                vec![
-                    ("title", "Test"),
-                    ("situation", "Sit"),
-                    ("description", ""),
-                ],
+                vec![("title", "Test"), ("situation", "Sit"), ("description", "")],
             ),
             (
                 "blocked",
-                vec![
-                    ("title", "Test"),
-                    ("situation", "Sit"),
-                    ("description", ""),
-                ],
+                vec![("title", "Test"), ("situation", "Sit"), ("description", "")],
             ),
             (
                 "review",
-                vec![
-                    ("title", "Test"),
-                    ("situation", "Sit"),
-                    ("description", ""),
-                ],
+                vec![("title", "Test"), ("situation", "Sit"), ("description", "")],
             ),
             (
                 "implementing_rework",
@@ -208,10 +198,7 @@ mod tests {
                     ("description", ""),
                 ],
             ),
-            (
-                "global_assistant",
-                vec![("repo_list", "- /tmp/repo")],
-            ),
+            ("global_assistant", vec![("repo_list", "- /tmp/repo")]),
         ];
         for (key, var_list) in cases {
             let vars: HashMap<&str, &str> = var_list.into_iter().collect();
@@ -240,7 +227,10 @@ mod tests {
     #[test]
     fn render_global_assistant() {
         let mut vars = HashMap::new();
-        vars.insert("repo_list", "- /Users/foo/project-a\n- /Users/foo/project-b");
+        vars.insert(
+            "repo_list",
+            "- /Users/foo/project-a\n- /Users/foo/project-b",
+        );
         let result = render("global_assistant", &vars).unwrap();
         assert!(result.contains("cross-project assistant"));
         assert!(result.contains("/Users/foo/project-a"));
@@ -255,7 +245,10 @@ mod tests {
         vars.insert("title", "Test");
         vars.insert("situation", "Sit");
         vars.insert("plan", "Step 1: real plan");
-        vars.insert("description", "\nUser-provided description: {plan} is my text");
+        vars.insert(
+            "description",
+            "\nUser-provided description: {plan} is my text",
+        );
         let result = render("implementing_with_plan", &vars).unwrap();
         // The description should appear literally with {plan} intact, not expanded
         assert!(

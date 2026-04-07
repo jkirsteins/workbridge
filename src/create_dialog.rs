@@ -494,7 +494,8 @@ impl CreateDialog {
         let slug = truncate_slug(&slug, MAX_SLUG_LEN);
         let suffix = random_suffix();
         let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
-        self.branch_input.set_text(&format!("{username}/{slug}-{suffix}"));
+        self.branch_input
+            .set_text(&format!("{username}/{slug}-{suffix}"));
     }
 }
 
@@ -978,10 +979,7 @@ mod tests {
     fn random_suffix_is_4_hex_chars() {
         let s = random_suffix();
         assert_eq!(s.len(), 4);
-        assert!(
-            s.chars().all(|c| c.is_ascii_hexdigit()),
-            "not hex: {s}"
-        );
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()), "not hex: {s}");
     }
 
     // -- auto_fill_branch tests --

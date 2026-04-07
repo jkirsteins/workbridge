@@ -357,10 +357,7 @@ fn format_work_item_entry<'a>(
     let pad_str: String = " ".repeat(padding);
 
     let mut line1_spans = if wi.status == WorkItemStatus::Done {
-        vec![
-            Span::styled(first_title, title_style),
-            Span::raw(pad_str),
-        ]
+        vec![Span::styled(first_title, title_style), Span::raw(pad_str)]
     } else {
         vec![
             Span::styled(badge.to_string(), badge_style),
@@ -856,10 +853,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                             Some(WorkItemStatus::Done) => "  Done.",
                             _ => "  Press Enter to start a session.",
                         };
-                        lines.push(Line::from(Span::styled(
-                            hint,
-                            theme.style_text_muted(),
-                        )));
+                        lines.push(Line::from(Span::styled(hint, theme.style_text_muted())));
                         let text = Text::from(lines);
                         let paragraph = Paragraph::new(text).block(block);
                         paragraph.render(area, buf);
@@ -910,18 +904,23 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
 /// dimmed to give visual depth.
 fn draw_global_drawer(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // 1. Dim every cell in the buffer to push the background behind the drawer.
+    //    DIM modifier alone is insufficient because borders and colored
+    //    elements don't respond well to it. Override foreground to dark gray
+    //    for consistent visual separation regardless of existing styling.
+    let dim_fg = ratatui_core::style::Color::DarkGray;
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
             if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
-                let style = cell.style().add_modifier(Modifier::DIM);
+                let style = cell.style().add_modifier(Modifier::DIM).fg(dim_fg);
                 cell.set_style(style);
             }
         }
     }
 
-    // 2. Compute drawer rect: 60% height, inset 2 cols, anchored to bottom.
-    let drawer_width = area.width.saturating_sub(4);
-    let drawer_height = (area.height * 60 / 100).max(5);
+    // 2. Compute drawer rect via shared helper (overflow-safe).
+    let dl = crate::layout::compute_drawer(area.width, area.height);
+    let drawer_width = dl.drawer_width;
+    let drawer_height = dl.drawer_height;
     let drawer_x = area.x + 2;
     let drawer_y = area.y + area.height.saturating_sub(drawer_height);
     let drawer_rect = Rect::new(drawer_x, drawer_y, drawer_width, drawer_height);
@@ -1372,8 +1371,7 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, ar
     } else {
         theme.style_text()
     };
-    Paragraph::new(Line::styled("Branch (optional):", branch_label_style))
-        .render(sections[9], buf);
+    Paragraph::new(Line::styled("Branch (optional):", branch_label_style)).render(sections[9], buf);
 
     // Branch input
     draw_text_input_field(

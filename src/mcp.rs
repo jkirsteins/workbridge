@@ -11,12 +11,11 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Sender;
 use serde_json::{Value, json};
-
 
 /// An MCP event sent from the socket handler to the main TUI thread.
 #[derive(Clone, Debug)]
@@ -92,10 +91,7 @@ impl McpSocketServer {
     ///
     /// Unlike `start()`, the context is shared via `Arc<Mutex<String>>` so the
     /// main thread can refresh it periodically as repos/work items change.
-    pub fn start_global(
-        socket_path: PathBuf,
-        context: Arc<Mutex<String>>,
-    ) -> io::Result<Self> {
+    pub fn start_global(socket_path: PathBuf, context: Arc<Mutex<String>>) -> io::Result<Self> {
         let _ = std::fs::remove_file(&socket_path);
 
         let listener = UnixListener::bind(&socket_path)?;
@@ -167,22 +163,18 @@ fn accept_loop(
 }
 
 /// Accept loop for the global assistant MCP server.
-/// Reads dynamic context from the shared mutex on each connection.
-fn global_accept_loop(
-    listener: UnixListener,
-    context: &Arc<Mutex<String>>,
-    stop: &AtomicBool,
-) {
+/// Passes the shared context mutex to each connection handler so that
+/// tool calls always read the latest context (not a stale snapshot).
+fn global_accept_loop(listener: UnixListener, context: &Arc<Mutex<String>>, stop: &AtomicBool) {
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
         match listener.accept() {
             Ok((stream, _)) => {
-                // Snapshot current context for this connection.
-                let ctx_snapshot = context.lock().map(|g| g.clone()).unwrap_or_default();
+                let ctx = Arc::clone(context);
                 std::thread::spawn(move || {
-                    handle_global_connection(stream, &ctx_snapshot);
+                    handle_global_connection(stream, &ctx);
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -196,7 +188,10 @@ fn global_accept_loop(
 }
 
 /// Handle a single global assistant MCP connection.
-fn handle_global_connection(stream: UnixStream, context_json: &str) {
+///
+/// Accepts the shared context mutex so that each tools/call re-reads the
+/// latest context rather than using a stale snapshot from connection time.
+fn handle_global_connection(stream: UnixStream, context: &Arc<Mutex<String>>) {
     if stream.set_nonblocking(false).is_err() {
         return;
     }
@@ -208,7 +203,15 @@ fn handle_global_connection(stream: UnixStream, context_json: &str) {
     let mut writer = stream;
 
     while let Ok(msg) = read_message(&mut reader) {
-        let response = handle_global_message(&msg, context_json);
+        // Re-read context on every message so tool calls see fresh data.
+        let ctx_snapshot = match context.lock() {
+            Ok(guard) => guard.clone(),
+            Err(e) => {
+                eprintln!("workbridge: global MCP context lock poisoned: {e}");
+                "{}".to_string()
+            }
+        };
+        let response = handle_global_message(&msg, &ctx_snapshot);
         if let Some(resp) = response
             && write_message(&mut writer, &resp).is_err()
         {
@@ -776,8 +779,13 @@ fn handle_global_message(msg: &Value, context_json: &str) -> Option<Value> {
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
             // Parse the dynamic context once per tool call.
-            let ctx: Value =
-                serde_json::from_str(context_json).unwrap_or(json!({}));
+            let ctx: Value = match serde_json::from_str(context_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("workbridge: global MCP context deserialization error: {e}");
+                    json!({})
+                }
+            };
 
             match tool_name {
                 "workbridge_list_repos" => {

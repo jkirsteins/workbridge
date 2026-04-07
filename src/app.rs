@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::assembly;
@@ -61,7 +61,6 @@ pub enum DisplayEntry {
     /// A work item (index into App::work_items).
     WorkItemEntry(usize),
 }
-
 
 /// App holds the entire application state.
 pub struct App {
@@ -206,6 +205,13 @@ pub struct App {
     pub global_pane_cols: u16,
     /// PTY rows for the global assistant drawer.
     pub global_pane_rows: u16,
+    /// Path to the temp MCP config file for the global assistant.
+    /// Tracked so it can be cleaned up on shutdown or respawn.
+    pub global_mcp_config_path: Option<PathBuf>,
+    /// True when repo/work-item data has changed since the last
+    /// `refresh_global_mcp_context` call. Set by `drain_fetch_results`
+    /// returning true; cleared after the refresh runs.
+    pub global_mcp_context_dirty: bool,
 }
 
 impl App {
@@ -315,6 +321,8 @@ impl App {
             pre_drawer_focus: FocusPanel::Left,
             global_pane_cols: 80,
             global_pane_rows: 24,
+            global_mcp_config_path: None,
+            global_mcp_context_dirty: false,
         };
         app.reassemble_work_items();
         app.build_display_list();
@@ -550,10 +558,14 @@ impl App {
         self.mcp_servers.remove(wi_id);
     }
 
-    /// Stop all MCP servers. Called on app exit.
+    /// Stop all MCP servers and remove temp config files. Called on app exit.
     pub fn cleanup_all_mcp(&mut self) {
         self.mcp_servers.clear();
         self.global_mcp_server = None;
+        if let Some(ref path) = self.global_mcp_config_path {
+            let _ = std::fs::remove_file(path);
+        }
+        self.global_mcp_config_path = None;
     }
 
     /// Resize PTY sessions and vt100 parsers to match the current pane
@@ -609,10 +621,7 @@ impl App {
     pub fn all_dead(&self) -> bool {
         self.sessions.values().all(|entry| !entry.alive)
             && self.review_gate_session.is_none()
-            && self
-                .global_session
-                .as_ref()
-                .is_none_or(|s| !s.alive)
+            && self.global_session.as_ref().is_none_or(|s| !s.alive)
     }
 
     /// SIGKILL all remaining alive sessions. Used for force-quit during
@@ -1136,25 +1145,31 @@ impl App {
         // as a backup. The socket must be listening before Claude starts (it is - the
         // socket server was started above).
         if let Ok((ref server, _)) = mcp_result {
-            let exe = std::env::current_exe().unwrap_or_default();
-            let mcp_config = crate::mcp::build_mcp_config(&exe, &server.socket_path);
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    let mcp_config = crate::mcp::build_mcp_config(&exe, &server.socket_path);
 
-            // Write .mcp.json to the worktree root.
-            let mcp_json_path = cwd.join(".mcp.json");
-            if let Err(e) = std::fs::write(&mcp_json_path, &mcp_config) {
-                self.status_message = Some(format!("MCP config write error: {e}"));
-            }
+                    // Write .mcp.json to the worktree root.
+                    let mcp_json_path = cwd.join(".mcp.json");
+                    if let Err(e) = std::fs::write(&mcp_json_path, &mcp_config) {
+                        self.status_message = Some(format!("MCP config write error: {e}"));
+                    }
 
-            // Also pass via --mcp-config as a temp file.
-            let config_path = std::env::temp_dir().join(format!(
-                "workbridge-mcp-config-{}.json",
-                uuid::Uuid::new_v4()
-            ));
-            if let Err(e) = std::fs::write(&config_path, &mcp_config) {
-                self.status_message = Some(format!("MCP config write error: {e}"));
-            } else {
-                cmd.push("--mcp-config".to_string());
-                cmd.push(config_path.to_string_lossy().to_string());
+                    // Also pass via --mcp-config as a temp file.
+                    let config_path = std::env::temp_dir().join(format!(
+                        "workbridge-mcp-config-{}.json",
+                        uuid::Uuid::new_v4()
+                    ));
+                    if let Err(e) = std::fs::write(&config_path, &mcp_config) {
+                        self.status_message = Some(format!("MCP config write error: {e}"));
+                    } else {
+                        cmd.push("--mcp-config".to_string());
+                        cmd.push(config_path.to_string_lossy().to_string());
+                    }
+                }
+                Err(e) => {
+                    self.status_message = Some(format!("Cannot resolve executable path: {e}"));
+                }
             }
         }
 
@@ -1179,9 +1194,8 @@ impl App {
                 .unwrap_or(false);
 
             if files_tracked {
-                self.status_message = Some(
-                    "Planning hook skipped: .claude/ has tracked files in this repo".into(),
-                );
+                self.status_message =
+                    Some("Planning hook skipped: .claude/ has tracked files in this repo".into());
             } else {
                 let _ = std::fs::create_dir_all(&claude_dir);
                 // Ignore everything in .claude/ so the settings file does not
@@ -1251,10 +1265,7 @@ impl App {
     /// `--mcp-config` so Claude Code does not mistake it for a config
     /// file path. The returned Vec does not include `--mcp-config` -
     /// callers append it after this returns.
-    fn build_claude_cmd(
-        status: &WorkItemStatus,
-        system_prompt: Option<&str>,
-    ) -> Vec<String> {
+    fn build_claude_cmd(status: &WorkItemStatus, system_prompt: Option<&str>) -> Vec<String> {
         let is_planning = *status == WorkItemStatus::Planning;
         let auto_start = matches!(
             status,
@@ -1541,9 +1552,8 @@ impl App {
                             continue;
                         }
                         if self.spawn_review_gate(&wi_id) {
-                            self.status_message = Some(
-                                "Claude requested Review - running review gate...".into(),
-                            );
+                            self.status_message =
+                                Some("Claude requested Review - running review gate...".into());
                             continue;
                         }
                     }
@@ -1707,8 +1717,7 @@ impl App {
                             self.status_message = Some(format!("Activity log error: {e}"));
                         }
                         self.rework_reasons.insert(wi_id.clone(), detail.clone());
-                        self.status_message =
-                            Some(format!("Review gate rejected: {}", detail));
+                        self.status_message = Some(format!("Review gate rejected: {}", detail));
                     }
                 }
             }
@@ -1985,8 +1994,7 @@ impl App {
 
         // Planning -> Implementing is automatic (triggered by workbridge_set_plan).
         // Block manual advance to prevent skipping the plan handoff.
-        if current_status == WorkItemStatus::Planning
-            && new_status == WorkItemStatus::Implementing
+        if current_status == WorkItemStatus::Planning && new_status == WorkItemStatus::Implementing
         {
             self.status_message =
                 Some("Plan must be set via Claude session (workbridge_set_plan)".into());
@@ -1998,9 +2006,7 @@ impl App {
         // The gate runs asynchronously in a background thread to avoid
         // blocking the TUI. If the gate is triggered, we return early
         // and the result is processed on the next timer tick.
-        if current_status == WorkItemStatus::Implementing
-            && new_status == WorkItemStatus::Review
-        {
+        if current_status == WorkItemStatus::Implementing && new_status == WorkItemStatus::Review {
             if self.review_gate_wi.as_ref() == Some(&wi_id) {
                 self.status_message = Some("Review gate already running...".into());
                 return;
@@ -2512,8 +2518,9 @@ impl App {
         let wi_id_str = match serde_json::to_string(wi_id) {
             Ok(s) => s,
             Err(e) => {
-                self.status_message =
-                    Some(format!("Review gate: could not serialize work item ID: {e}"));
+                self.status_message = Some(format!(
+                    "Review gate: could not serialize work item ID: {e}"
+                ));
                 return false;
             }
         };
@@ -2533,14 +2540,20 @@ impl App {
         ) {
             Ok(s) => s,
             Err(e) => {
-                self.status_message =
-                    Some(format!("Review gate: MCP server failed to start: {e}"));
+                self.status_message = Some(format!("Review gate: MCP server failed to start: {e}"));
                 return false;
             }
         };
 
         // Build claude command with system prompt and MCP config.
-        let exe = std::env::current_exe().unwrap_or_default();
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.status_message =
+                    Some(format!("Review gate: cannot resolve executable path: {e}"));
+                return false;
+            }
+        };
         let mcp_config = crate::mcp::build_mcp_config(&exe, &socket_path);
 
         let mut cmd: Vec<String> = vec!["claude".to_string()];
@@ -2589,8 +2602,6 @@ impl App {
         }
     }
 
-
-
     /// Get the SessionEntry for the currently selected work item, if any.
     pub fn active_session_entry(&self) -> Option<&SessionEntry> {
         let work_item_id = self.selected_work_item_id()?;
@@ -2601,10 +2612,7 @@ impl App {
     /// Returns true if any session is alive (including the global session).
     pub fn has_any_session(&self) -> bool {
         self.sessions.values().any(|e| e.alive)
-            || self
-                .global_session
-                .as_ref()
-                .is_some_and(|s| s.alive)
+            || self.global_session.as_ref().is_some_and(|s| s.alive)
     }
 
     // -- Global assistant --------------------------------------------------
@@ -2622,10 +2630,7 @@ impl App {
             self.global_drawer_open = true;
 
             // Spawn on first use (or respawn if dead).
-            let needs_spawn = self
-                .global_session
-                .as_ref()
-                .is_none_or(|s| !s.alive);
+            let needs_spawn = self.global_session.as_ref().is_none_or(|s| !s.alive);
             if needs_spawn {
                 self.spawn_global_session();
             }
@@ -2643,8 +2648,9 @@ impl App {
         ) {
             Ok(server) => server,
             Err(e) => {
-                self.status_message =
-                    Some(format!("Global assistant MCP error: {e}"));
+                self.status_message = Some(format!("Global assistant MCP error: {e}"));
+                self.global_drawer_open = false;
+                self.focus = self.pre_drawer_focus;
                 return;
             }
         };
@@ -2666,23 +2672,43 @@ impl App {
         let mut cmd: Vec<String> = vec!["claude".to_string()];
         cmd.push("--permission-mode".to_string());
         cmd.push("plan".to_string());
+        // Auto-allow workbridge MCP tools so Claude Code does not prompt.
+        cmd.push("--allowedTools".to_string());
+        cmd.push(
+            "mcp__workbridge__workbridge_list_repos,\
+             mcp__workbridge__workbridge_list_work_items,\
+             mcp__workbridge__workbridge_repo_info"
+                .to_string(),
+        );
         if let Some(ref prompt) = system_prompt {
             cmd.push("--system-prompt".to_string());
             cmd.push(prompt.clone());
         }
 
         // Write MCP config to a temp file and pass via --mcp-config.
-        let exe = std::env::current_exe().unwrap_or_default();
+        // Use a deterministic PID-based path so respawns overwrite the
+        // previous file instead of leaking a new one each time.
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.status_message = Some(format!(
+                    "Global assistant: cannot resolve executable path: {e}"
+                ));
+                self.global_drawer_open = false;
+                self.focus = self.pre_drawer_focus;
+                return;
+            }
+        };
         let mcp_config = crate::mcp::build_mcp_config(&exe, &mcp_server.socket_path);
-        let config_path = std::env::temp_dir().join(format!(
-            "workbridge-global-mcp-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let config_path =
+            std::env::temp_dir().join(format!("workbridge-global-mcp-{}.json", std::process::id()));
         if let Err(e) = std::fs::write(&config_path, &mcp_config) {
-            self.status_message =
-                Some(format!("Global assistant MCP config error: {e}"));
+            self.status_message = Some(format!("Global assistant MCP config error: {e}"));
+            self.global_drawer_open = false;
+            self.focus = self.pre_drawer_focus;
             return;
         }
+        self.global_mcp_config_path = Some(config_path.clone());
         cmd.push("--mcp-config".to_string());
         cmd.push(config_path.to_string_lossy().to_string());
 
@@ -2708,8 +2734,9 @@ impl App {
                 self.global_mcp_server = Some(mcp_server);
             }
             Err(e) => {
-                self.status_message =
-                    Some(format!("Global assistant spawn error: {e}"));
+                self.status_message = Some(format!("Global assistant spawn error: {e}"));
+                self.global_drawer_open = false;
+                self.focus = self.pre_drawer_focus;
             }
         }
     }
@@ -2721,8 +2748,7 @@ impl App {
             && let Some(ref session) = entry.session
             && let Err(e) = session.write_bytes(data)
         {
-            self.status_message =
-                Some(format!("Global assistant write error: {e}"));
+            self.status_message = Some(format!("Global assistant write error: {e}"));
         }
     }
 
@@ -2811,8 +2837,13 @@ impl App {
             "work_items": work_items,
         });
 
-        if let Ok(mut guard) = self.global_mcp_context.lock() {
-            *guard = ctx.to_string();
+        match self.global_mcp_context.lock() {
+            Ok(mut guard) => {
+                *guard = ctx.to_string();
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Global MCP context lock poisoned: {e}"));
+            }
         }
     }
 
@@ -5199,10 +5230,18 @@ mod tests {
         );
 
         // Lookup with Planning stage finds it.
-        assert!(app.sessions.get(&(wi_id.clone(), WorkItemStatus::Planning)).is_some());
+        assert!(
+            app.sessions
+                .get(&(wi_id.clone(), WorkItemStatus::Planning))
+                .is_some()
+        );
 
         // Lookup with Implementing stage does NOT find it.
-        assert!(app.sessions.get(&(wi_id.clone(), WorkItemStatus::Implementing)).is_none());
+        assert!(
+            app.sessions
+                .get(&(wi_id.clone(), WorkItemStatus::Implementing))
+                .is_none()
+        );
     }
 
     // -- Issue 7: gh availability check --
@@ -5256,10 +5295,7 @@ mod tests {
     #[test]
     fn build_claude_cmd_prompt_before_mcp_config() {
         // Planning session: has --permission-mode plan and positional prompt.
-        let cmd = App::build_claude_cmd(
-            &WorkItemStatus::Planning,
-            Some("system prompt here"),
-        );
+        let cmd = App::build_claude_cmd(&WorkItemStatus::Planning, Some("system prompt here"));
         assert_eq!(cmd[0], "claude");
         assert_eq!(cmd[1], "--permission-mode");
         assert_eq!(cmd[2], "plan");
@@ -5281,10 +5317,7 @@ mod tests {
     /// Implementing sessions also get an auto-start prompt.
     #[test]
     fn build_claude_cmd_implementing_has_prompt() {
-        let cmd = App::build_claude_cmd(
-            &WorkItemStatus::Implementing,
-            Some("impl prompt"),
-        );
+        let cmd = App::build_claude_cmd(&WorkItemStatus::Implementing, Some("impl prompt"));
         assert_eq!(cmd[0], "claude");
         // No --permission-mode for implementing.
         assert_eq!(cmd[1], "--system-prompt");

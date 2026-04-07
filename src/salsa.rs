@@ -157,6 +157,11 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
         let pl = layout::compute(size.width, size.height, bottom_rows);
         state.pane_cols = pl.pane_cols;
         state.pane_rows = pl.pane_rows;
+
+        // Compute global drawer PTY dimensions via shared helper.
+        let dl = layout::compute_drawer(size.width, size.height);
+        state.global_pane_cols = dl.pane_cols;
+        state.global_pane_rows = dl.pane_rows;
     }
 
     // Initial reassembly + display list build (already done in App::new,
@@ -247,21 +252,24 @@ pub fn app_event(
             // Liveness check on all sessions.
             state.check_liveness();
 
-            // Refresh dynamic context for the global assistant MCP server.
-            if state.global_mcp_server.is_some() {
-                state.refresh_global_mcp_context();
-            }
-
             // Drain fetch results and reassemble if new data arrived.
             if state.drain_fetch_results() {
                 state.reassemble_work_items();
                 state.build_display_list();
+                state.global_mcp_context_dirty = true;
+            }
+
+            // Refresh dynamic context for the global MCP server only when
+            // underlying data has changed, avoiding redundant JSON
+            // serialization on every tick.
+            if state.global_mcp_context_dirty && state.global_mcp_server.is_some() {
+                state.refresh_global_mcp_context();
+                state.global_mcp_context_dirty = false;
             }
 
             // Advance the review gate spinner animation.
             if state.review_gate_wi.is_some() {
-                state.review_gate_spinner_frame =
-                    state.review_gate_spinner_frame.wrapping_add(1);
+                state.review_gate_spinner_frame = state.review_gate_spinner_frame.wrapping_add(1);
             }
 
             // Surface queued fetch errors.

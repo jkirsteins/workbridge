@@ -390,15 +390,20 @@ fn handle_key_right(app: &mut App, key: KeyEvent) {
 }
 
 /// Key handling when the global assistant drawer is open.
-/// Ctrl+G, Ctrl+], or Esc closes the drawer. All other keys are forwarded
-/// to the global session PTY using the same encoding as handle_key_right.
+/// Ctrl+G toggles the drawer (closing it, or respawning if the session
+/// died). Ctrl+] also closes the drawer. Esc is forwarded to the PTY as
+/// \x1b. All other keys are forwarded to the global session PTY using
+/// the same encoding as handle_key_right.
 fn handle_global_drawer_key(app: &mut App, key: KeyEvent) {
-    // Check if the global session is alive. If dead, close the drawer.
-    if app
-        .global_session
-        .as_ref()
-        .is_none_or(|s| !s.alive)
-    {
+    // Ctrl+G toggles the drawer (handles dead-session respawn internally).
+    if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.toggle_global_drawer();
+        return;
+    }
+
+    // For any other key, check if the global session is alive. If dead,
+    // close the drawer rather than forwarding to a defunct PTY.
+    if app.global_session.as_ref().is_none_or(|s| !s.alive) {
         app.global_drawer_open = false;
         app.focus = app.pre_drawer_focus;
         app.status_message = Some("Global assistant session ended".into());
@@ -407,11 +412,7 @@ fn handle_global_drawer_key(app: &mut App, key: KeyEvent) {
     }
 
     match key.code {
-        // Ctrl+G or Ctrl+] closes the drawer.
-        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.global_drawer_open = false;
-            app.focus = app.pre_drawer_focus;
-        }
+        // Ctrl+] closes the drawer.
         KeyCode::Char(']') | KeyCode::Char('5')
             if key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
@@ -586,11 +587,10 @@ pub fn handle_resize(app: &mut App, cols: u16, rows: u16) {
     app.pane_cols = pl.pane_cols;
     app.pane_rows = pl.pane_rows;
 
-    // Compute global drawer PTY dimensions (60% height, inset 2 cols, minus borders).
-    let drawer_width = cols.saturating_sub(4);
-    let drawer_height = (rows * 60 / 100).max(5);
-    app.global_pane_cols = drawer_width.saturating_sub(2).max(1);
-    app.global_pane_rows = drawer_height.saturating_sub(2).max(1);
+    // Compute global drawer PTY dimensions via shared helper.
+    let dl = layout::compute_drawer(cols, rows);
+    app.global_pane_cols = dl.pane_cols;
+    app.global_pane_rows = dl.pane_rows;
 
     app.resize_pty_panes();
 }
