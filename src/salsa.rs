@@ -222,6 +222,9 @@ pub fn app_event(
                 ct::event::Event::Resize(cols, rows) => {
                     event::handle_resize(state, *cols, *rows);
                 }
+                ct::event::Event::Mouse(mouse_event) => {
+                    event::handle_mouse(state, *mouse_event);
+                }
                 _ => {}
             }
             // Check if the app wants to quit after handling the key event.

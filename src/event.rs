@@ -1,4 +1,4 @@
-use crate::salsa::ct::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::salsa::ct::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::app::{App, BOARD_COLUMNS, DisplayEntry, FocusPanel, SettingsListFocus, ViewMode};
 use crate::create_dialog::CreateDialogFocus;
@@ -1067,6 +1067,198 @@ fn handle_textarea_key(app: &mut App, key: KeyEvent) {
     ta.ensure_visible(crate::ui::DESC_TEXTAREA_HEIGHT as usize);
 }
 
+// -- Mouse scroll handling ---------------------------------------------------
+
+/// Which PTY area (if any) the mouse cursor is over.
+enum MouseTarget {
+    /// Mouse is over the global assistant drawer's inner area.
+    GlobalDrawer { local_col: u16, local_row: u16 },
+    /// Mouse is over the right panel's inner area.
+    RightPanel { local_col: u16, local_row: u16 },
+    /// Mouse is not over any PTY area.
+    None,
+}
+
+/// Determine which PTY area contains the given terminal-absolute coordinates.
+///
+/// Checks the global drawer first (since it overlays everything), then the
+/// right panel. Returns `MouseTarget::None` if outside both areas.
+fn mouse_target(app: &App, column: u16, row: u16) -> MouseTarget {
+    let Ok((cols, rows)) = ratatui_crossterm::crossterm::terminal::size() else {
+        return MouseTarget::None;
+    };
+
+    // Check global drawer first (it overlays everything when open).
+    if app.global_drawer_open {
+        let dl = layout::compute_drawer(cols, rows);
+        // Drawer origin matches the render code in ui.rs:
+        // drawer_x = 2, drawer_y = rows - drawer_height
+        let drawer_x = 2u16;
+        let drawer_y = rows.saturating_sub(dl.drawer_height);
+
+        // Inner area is 1 cell inside the border on all sides.
+        let inner_x = drawer_x + 1;
+        let inner_y = drawer_y + 1;
+        let inner_right = drawer_x + dl.drawer_width; // exclusive
+        let inner_bottom = drawer_y + dl.drawer_height; // exclusive (border row)
+
+        if column >= inner_x
+            && column < inner_right
+            && row >= inner_y
+            && row < inner_bottom.saturating_sub(1)
+        {
+            return MouseTarget::GlobalDrawer {
+                local_col: column - inner_x,
+                local_row: row - inner_y,
+            };
+        }
+    }
+
+    // Compute right panel geometry.
+    let bottom_rows = u16::from(app.has_visible_status_bar())
+        + u16::from(app.selected_work_item_context().is_some());
+    let pl = layout::compute(cols, rows, bottom_rows);
+
+    // Right panel inner area starts after the left panel + 1 border column,
+    // and after the top border row.
+    let inner_x = pl.left_width + 1;
+    let inner_y = 1u16;
+
+    if column >= inner_x
+        && column < inner_x + pl.pane_cols
+        && row >= inner_y
+        && row < inner_y + pl.pane_rows
+    {
+        return MouseTarget::RightPanel {
+            local_col: column - inner_x,
+            local_row: row - inner_y,
+        };
+    }
+
+    MouseTarget::None
+}
+
+/// Encode a scroll event as bytes to send to a PTY session.
+///
+/// When the child has not enabled mouse reporting (mode is `None`), the scroll
+/// is converted to arrow key sequences (Up/Down). When the child has enabled
+/// mouse reporting, the event is encoded according to the child's chosen
+/// encoding (SGR or Default/Utf8).
+///
+/// Returns `None` if the event cannot be encoded (e.g., Default encoding with
+/// coordinates exceeding 222).
+fn encode_mouse_scroll(
+    scroll_up: bool,
+    local_col: u16,
+    local_row: u16,
+    mode: vt100::MouseProtocolMode,
+    encoding: vt100::MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    if mode == vt100::MouseProtocolMode::None {
+        // Child has not enabled mouse reporting - convert to arrow keys.
+        // Send 3 lines per scroll tick for usable scroll speed.
+        let arrow = if scroll_up { b"\x1b[A" } else { b"\x1b[B" };
+        let mut data = Vec::with_capacity(arrow.len() * 3);
+        for _ in 0..3 {
+            data.extend_from_slice(arrow);
+        }
+        return Some(data);
+    }
+
+    // Button codes: 64 = scroll up, 65 = scroll down.
+    let button: u8 = if scroll_up { 64 } else { 65 };
+
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => {
+            // SGR encoding: ESC [ < button ; col+1 ; row+1 M
+            let seq = format!("\x1b[<{};{};{}M", button, local_col + 1, local_row + 1);
+            Some(seq.into_bytes())
+        }
+        vt100::MouseProtocolEncoding::Default | vt100::MouseProtocolEncoding::Utf8 => {
+            // X10/Default encoding: ESC [ M <button+32> <col+1+32> <row+1+32>
+            // Coordinates > 222 cannot be encoded (would exceed printable byte range).
+            let cx = local_col + 1 + 32;
+            let cy = local_row + 1 + 32;
+            if cx > 255 || cy > 255 {
+                return None;
+            }
+            Some(vec![0x1b, b'[', b'M', button + 32, cx as u8, cy as u8])
+        }
+    }
+}
+
+/// Handle a mouse event. Only scroll events (ScrollUp/ScrollDown) are
+/// processed; all other mouse events are ignored.
+///
+/// Scroll events are hit-tested against the global drawer and right panel
+/// areas. If the mouse is over a PTY area, the scroll is encoded and
+/// forwarded to the corresponding PTY session.
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    // Only handle scroll events.
+    let scroll_up = match mouse.kind {
+        MouseEventKind::ScrollUp => true,
+        MouseEventKind::ScrollDown => false,
+        _ => return,
+    };
+
+    // Ignore during shutdown or when overlays are visible.
+    if app.shutting_down
+        || app.create_dialog.visible
+        || app.show_settings
+        || app.rework_prompt_visible
+        || app.no_plan_prompt_visible
+        || app.confirm_merge
+    {
+        return;
+    }
+
+    match mouse_target(app, mouse.column, mouse.row) {
+        MouseTarget::GlobalDrawer {
+            local_col,
+            local_row,
+        } => {
+            // Extract mouse protocol info from the global session parser,
+            // then drop the lock before calling send_bytes_to_global.
+            let proto = app.global_session.as_ref().map(|s| {
+                let parser = s.parser.lock().unwrap();
+                let screen = parser.screen();
+                (
+                    screen.mouse_protocol_mode(),
+                    screen.mouse_protocol_encoding(),
+                )
+            });
+            if let Some((mode, encoding)) = proto
+                && let Some(data) =
+                    encode_mouse_scroll(scroll_up, local_col, local_row, mode, encoding)
+            {
+                app.send_bytes_to_global(&data);
+            }
+        }
+        MouseTarget::RightPanel {
+            local_col,
+            local_row,
+        } => {
+            // Extract mouse protocol info from the active session parser,
+            // then drop the lock before calling send_bytes_to_active.
+            let proto = app.active_session_entry().map(|s| {
+                let parser = s.parser.lock().unwrap();
+                let screen = parser.screen();
+                (
+                    screen.mouse_protocol_mode(),
+                    screen.mouse_protocol_encoding(),
+                )
+            });
+            if let Some((mode, encoding)) = proto
+                && let Some(data) =
+                    encode_mouse_scroll(scroll_up, local_col, local_row, mode, encoding)
+            {
+                app.send_bytes_to_active(&data);
+            }
+        }
+        MouseTarget::None => {}
+    }
+}
+
 /// Recalculate layout from the current terminal size and resize PTY panes.
 /// Called when the status bar visibility changes to keep the PTY pane
 /// dimensions in sync with the actual display area.
@@ -1343,5 +1535,95 @@ mod tests {
             !app.confirm_merge,
             "merge should be cancelled by unknown key"
         );
+    }
+
+    // -- Mouse scroll encoding tests --
+
+    /// SGR encoding produces correct escape sequences for scroll up.
+    #[test]
+    fn encode_mouse_scroll_sgr_up() {
+        let data = encode_mouse_scroll(
+            true,
+            5,
+            10,
+            vt100::MouseProtocolMode::PressRelease,
+            vt100::MouseProtocolEncoding::Sgr,
+        );
+        // button=64 (scroll up), col=5+1=6, row=10+1=11
+        assert_eq!(data, Some(b"\x1b[<64;6;11M".to_vec()));
+    }
+
+    /// SGR encoding produces correct escape sequences for scroll down.
+    #[test]
+    fn encode_mouse_scroll_sgr_down() {
+        let data = encode_mouse_scroll(
+            false,
+            0,
+            0,
+            vt100::MouseProtocolMode::AnyMotion,
+            vt100::MouseProtocolEncoding::Sgr,
+        );
+        // button=65 (scroll down), col=0+1=1, row=0+1=1
+        assert_eq!(data, Some(b"\x1b[<65;1;1M".to_vec()));
+    }
+
+    /// Default (X10) encoding produces correct escape sequences.
+    #[test]
+    fn encode_mouse_scroll_default() {
+        let data = encode_mouse_scroll(
+            true,
+            2,
+            3,
+            vt100::MouseProtocolMode::Press,
+            vt100::MouseProtocolEncoding::Default,
+        );
+        // button=64, col=2, row=3
+        // bytes: ESC [ M (64+32) (2+1+32) (3+1+32) = ESC [ M 96 35 36
+        assert_eq!(data, Some(vec![0x1b, b'[', b'M', 96, 35, 36]));
+    }
+
+    /// Default encoding returns None when coordinates exceed the encodable
+    /// range (col or row + 1 + 32 > 255).
+    #[test]
+    fn encode_mouse_scroll_default_overflow() {
+        // col = 250: 250 + 1 + 32 = 283 > 255 -> None
+        let data = encode_mouse_scroll(
+            true,
+            250,
+            0,
+            vt100::MouseProtocolMode::Press,
+            vt100::MouseProtocolEncoding::Default,
+        );
+        assert_eq!(data, None);
+    }
+
+    /// When mouse protocol mode is None, scroll converts to arrow key
+    /// sequences (3 per tick).
+    #[test]
+    fn encode_mouse_scroll_no_mode_up() {
+        let data = encode_mouse_scroll(
+            true,
+            0,
+            0,
+            vt100::MouseProtocolMode::None,
+            vt100::MouseProtocolEncoding::Default,
+        );
+        // 3x Up arrow
+        assert_eq!(data, Some(b"\x1b[A\x1b[A\x1b[A".to_vec()));
+    }
+
+    /// When mouse protocol mode is None, scroll down converts to Down arrow
+    /// sequences (3 per tick).
+    #[test]
+    fn encode_mouse_scroll_no_mode_down() {
+        let data = encode_mouse_scroll(
+            false,
+            0,
+            0,
+            vt100::MouseProtocolMode::None,
+            vt100::MouseProtocolEncoding::Default,
+        );
+        // 3x Down arrow
+        assert_eq!(data, Some(b"\x1b[B\x1b[B\x1b[B".to_vec()));
     }
 }

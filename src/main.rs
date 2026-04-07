@@ -285,12 +285,11 @@ fn main() -> Result<(), AppError> {
         github_client,
     };
 
-    // Disable mouse capture and keyboard enhancements. Workbridge doesn't
-    // use mouse input, and PTY programs may expect mouse events. Keyboard
-    // enhancements change how Ctrl+] is reported and would break the
-    // existing key handling.
+    // Enable mouse capture so scroll events can be forwarded to embedded
+    // PTY sessions. Keyboard enhancements remain disabled because they
+    // change how Ctrl+] is reported and would break existing key handling.
     let term_init = rat_salsa::TermInit {
-        mouse_capture: false,
+        mouse_capture: true,
         keyboard_enhancements: ratatui_crossterm::crossterm::event::KeyboardEnhancementFlags::empty(
         ),
         ..Default::default()
