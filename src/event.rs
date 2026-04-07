@@ -1070,6 +1070,60 @@ mod tests {
         assert_eq!(app.rework_prompt_input.text(), "q");
     }
 
+    // -- Feature: no-plan prompt --
+
+    /// No-plan prompt: Esc dismisses and clears state.
+    #[test]
+    fn no_plan_prompt_esc_dismisses() {
+        let mut app = App::new();
+        app.no_plan_prompt_visible = true;
+        app.no_plan_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
+            "/tmp/test.json",
+        )));
+        app.status_message =
+            Some("No plan available. [p] Plan from branch  [Esc] Stay blocked".into());
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, esc);
+
+        assert!(
+            !app.no_plan_prompt_visible,
+            "no_plan_prompt_visible should be cleared",
+        );
+        assert!(
+            app.no_plan_prompt_wi.is_none(),
+            "no_plan_prompt_wi should be cleared",
+        );
+        assert!(
+            app.status_message.is_none(),
+            "status_message should be cleared",
+        );
+    }
+
+    /// No-plan prompt blocks other keys (quit, settings, etc.).
+    #[test]
+    fn no_plan_prompt_blocks_other_keys() {
+        let mut app = App::new();
+        app.no_plan_prompt_visible = true;
+        app.no_plan_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
+            "/tmp/test.json",
+        )));
+        app.status_message = Some("No plan available.".into());
+
+        // Press 'q' - should not quit.
+        let key_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        handle_key(&mut app, key_q);
+
+        assert!(
+            !app.should_quit,
+            "should not quit while no-plan prompt is open",
+        );
+        assert!(
+            app.no_plan_prompt_visible,
+            "prompt should still be visible after unrecognized key",
+        );
+    }
+
     /// Merge prompt blocks other keys during shutdown check.
     #[test]
     fn merge_prompt_blocks_during_active() {

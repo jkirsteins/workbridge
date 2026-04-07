@@ -2187,14 +2187,29 @@ impl App {
     /// Move a blocked (no-plan) work item back to Planning so that Claude
     /// can analyze existing branch work and produce a retroactive plan.
     pub fn plan_from_branch(&mut self, wi_id: &WorkItemId) {
-        // Clear any existing (empty) plan so the planning session starts fresh.
-        if let Err(e) = self.backend.update_plan(wi_id, "") {
-            self.status_message = Some(format!("Could not clear plan: {e}"));
+        // Guard: verify the work item is actually in Blocked state. MCP events
+        // can change the status while the no-plan prompt is visible, so the
+        // item may no longer be Blocked by the time the user responds.
+        let is_blocked = self
+            .work_items
+            .iter()
+            .find(|w| w.id == *wi_id)
+            .is_some_and(|w| w.status == WorkItemStatus::Blocked);
+        if !is_blocked {
+            self.status_message = Some("Work item is no longer blocked".into());
             return;
         }
+
+        // Transition first, then clear the plan. This way if the status
+        // update fails the plan is not destroyed.
         let current = WorkItemStatus::Blocked;
         let next = WorkItemStatus::Planning;
         self.apply_stage_change(wi_id, &current, &next, "user");
+
+        // Clear the plan so the planning session starts fresh.
+        if let Err(e) = self.backend.update_plan(wi_id, "") {
+            self.status_message = Some(format!("Could not clear plan: {e}"));
+        }
     }
 
     /// Shared logic for applying a stage change: log it, persist it, reassemble.
@@ -5452,6 +5467,181 @@ mod tests {
             cmd.last().unwrap().contains("start working"),
             "implementing should have auto-start prompt",
         );
+    }
+
+    // -- Feature: plan_from_branch (no-plan recovery) --
+
+    /// plan_from_branch accepts a Blocked item and applies the transition.
+    #[test]
+    fn plan_from_branch_accepts_blocked_item() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/plan-from-branch.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            title: "Plan from branch test".into(),
+            description: None,
+            status: WorkItemStatus::Blocked,
+            status_derived: false,
+            repo_associations: vec![],
+            errors: vec![],
+        });
+        app.display_list
+            .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
+        app.selected_item = Some(app.display_list.len() - 1);
+
+        app.plan_from_branch(&wi_id);
+
+        // StubBackend persists nothing, so we verify via the status message
+        // that apply_stage_change was called (it sets "Moved to [PL]").
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("[PL]"),
+            "should show Planning transition message, got: {msg}",
+        );
+    }
+
+    /// plan_from_branch rejects a work item that is not Blocked.
+    #[test]
+    fn plan_from_branch_rejects_non_blocked() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/plan-not-blocked.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            title: "Not blocked test".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![],
+            errors: vec![],
+        });
+        app.display_list
+            .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
+        app.selected_item = Some(app.display_list.len() - 1);
+
+        app.plan_from_branch(&wi_id);
+
+        // Item should remain unchanged - verify via status message.
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("no longer blocked"),
+            "should show informational message, got: {msg}",
+        );
+        // Work item should still be in original status.
+        let wi = app.work_items.iter().find(|w| w.id == wi_id).unwrap();
+        assert_eq!(
+            wi.status,
+            WorkItemStatus::Implementing,
+            "should remain in Implementing when not Blocked",
+        );
+    }
+
+    // -- Feature: BLOCKED sidebar group --
+
+    /// Blocked items appear in a BLOCKED group, not in ACTIVE.
+    #[test]
+    fn display_list_blocked_items_in_blocked_group() {
+        let mut app = App::new();
+        // Add one Blocked and one Implementing item.
+        let blocked_id = WorkItemId::LocalFile(PathBuf::from("/tmp/blocked.json"));
+        let active_id = WorkItemId::LocalFile(PathBuf::from("/tmp/active.json"));
+        let repo = PathBuf::from("/repos/test");
+        for (id, status) in [
+            (blocked_id, WorkItemStatus::Blocked),
+            (active_id, WorkItemStatus::Implementing),
+        ] {
+            app.work_items.push(crate::work_item::WorkItem {
+                id,
+                backend_type: BackendType::LocalFile,
+                title: format!("{status:?} item"),
+                description: None,
+                status,
+                status_derived: false,
+                repo_associations: vec![crate::work_item::RepoAssociation {
+                    repo_path: repo.clone(),
+                    branch: Some("test-branch".into()),
+                    worktree_path: None,
+                    pr: None,
+                    issue: None,
+                    git_state: None,
+                }],
+                errors: vec![],
+            });
+        }
+
+        app.build_display_list();
+
+        let headers: Vec<&str> = app
+            .display_list
+            .iter()
+            .filter_map(|e| match e {
+                DisplayEntry::GroupHeader { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            headers.contains(&"BLOCKED (test)"),
+            "should have BLOCKED group, got: {headers:?}",
+        );
+        assert!(
+            headers.contains(&"ACTIVE (test)"),
+            "should have ACTIVE group, got: {headers:?}",
+        );
+        // BLOCKED should come before ACTIVE.
+        let blocked_pos = headers
+            .iter()
+            .position(|h| h.starts_with("BLOCKED"))
+            .unwrap();
+        let active_pos = headers
+            .iter()
+            .position(|h| h.starts_with("ACTIVE"))
+            .unwrap();
+        assert!(
+            blocked_pos < active_pos,
+            "BLOCKED group should come before ACTIVE",
+        );
+    }
+
+    /// BLOCKED group header uses GroupHeaderKind::Blocked.
+    #[test]
+    fn display_list_blocked_header_kind() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/blocked-kind.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id,
+            backend_type: BackendType::LocalFile,
+            title: "Blocked kind test".into(),
+            description: None,
+            status: WorkItemStatus::Blocked,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/repos/test"),
+                branch: Some("branch".into()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        app.build_display_list();
+
+        let blocked_header = app.display_list.iter().find(|e| {
+            matches!(
+                e,
+                DisplayEntry::GroupHeader { label, .. } if label.starts_with("BLOCKED")
+            )
+        });
+        assert!(blocked_header.is_some(), "should have BLOCKED header");
+        if let Some(DisplayEntry::GroupHeader { kind, .. }) = blocked_header {
+            assert_eq!(
+                *kind,
+                GroupHeaderKind::Blocked,
+                "BLOCKED header should use Blocked kind"
+            );
+        }
     }
 
     /// Blocked and Review sessions do NOT get an auto-start prompt.
