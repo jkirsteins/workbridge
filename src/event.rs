@@ -240,6 +240,10 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 sync_layout(app);
             }
         }
+        // Ctrl+] - detach from daemon session
+        (KeyModifiers::CONTROL, KeyCode::Char(']')) => {
+            app.detach_requested = true;
+        }
         // ? - toggle settings overlay
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
             app.show_settings = !app.show_settings;

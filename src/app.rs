@@ -196,6 +196,9 @@ pub struct App {
     /// Used to verify the gate result is still relevant (the user may have
     /// retreated the item while the gate was running).
     pub review_gate_wi: Option<WorkItemId>,
+    /// Set by the detach keybinding (Ctrl+]) to signal the daemon layer
+    /// that the user wants to detach from the daemon session.
+    pub detach_requested: bool,
 }
 
 impl App {
@@ -296,6 +299,7 @@ impl App {
             mcp_tx,
             review_gate_rx: None,
             review_gate_wi: None,
+            detach_requested: false,
         };
         app.reassemble_work_items();
         app.build_display_list();

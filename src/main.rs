@@ -2,6 +2,7 @@ mod app;
 mod assembly;
 mod config;
 mod create_dialog;
+mod daemon;
 mod event;
 mod fetcher;
 mod github_client;
@@ -206,6 +207,9 @@ fn main() -> Result<(), AppError> {
         return Ok(());
     }
 
+    // Check for --no-daemon flag.
+    let no_daemon = args.iter().any(|a| a == "--no-daemon");
+
     // Load config and discover repos for the TUI.
     let (cfg, config_error) = match config::Config::load() {
         Ok(c) => (c, None),
@@ -215,6 +219,36 @@ fn main() -> Result<(), AppError> {
             (config::Config::default(), Some(msg))
         }
     };
+
+    // Daemon mode: fork a background server or connect to an existing one.
+    // This must happen before any TUI setup since the server redirects
+    // fd 0/1/2 to a PTY, and the client runs its own terminal proxy.
+    let daemon_disabled = no_daemon || !cfg.daemon.enabled;
+    let socket_dir = cfg.daemon.socket_dir.clone();
+    let attach_timeout = cfg.daemon.attach_timeout_secs;
+    match daemon::start_server(daemon_disabled, socket_dir.as_deref(), attach_timeout) {
+        Ok(Some(daemon::ServerRole::Client { stream })) => {
+            // This process is the client. Run the terminal proxy and exit.
+            daemon::run_client(stream);
+            // run_client calls process::exit, but satisfy the type checker.
+        }
+        Ok(Some(daemon::ServerRole::Server { master_fd })) => {
+            // This process is the daemon server. Continue to TUI setup below.
+            // fd 0/1/2 are already redirected to the server PTY slave.
+            // Leak master_fd to keep it alive for the lifetime of the process.
+            // The daemon's accept loop and PTY reader threads use the raw fd.
+            std::mem::forget(master_fd);
+        }
+        Ok(None) => {
+            // Daemon disabled. Run TUI directly.
+        }
+        Err(e) => {
+            eprintln!("workbridge: daemon error: {e}");
+            eprintln!("workbridge: falling back to direct mode (use --no-daemon to skip)");
+            // Fall through to normal TUI startup.
+        }
+    }
+
     let (backend, backend_error): (Box<dyn work_item_backend::WorkItemBackend>, Option<String>) =
         match work_item_backend::LocalFileBackend::new() {
             Ok(b) => (Box::new(b), None),

@@ -90,6 +90,9 @@ pub struct Config {
     /// Fallback settings for repos that don't specify overrides.
     #[serde(default)]
     pub defaults: Defaults,
+    /// Daemon mode settings (detach/reattach across SSH sessions).
+    #[serde(default)]
+    pub daemon: DaemonConfig,
     /// Human-readable description of where this config came from.
     /// Set by the loader - not serialized to the TOML file.
     #[serde(skip)]
@@ -105,6 +108,41 @@ pub struct Defaults {
     /// Regex for extracting issue identifiers from branch names.
     #[serde(default = "default_branch_issue_pattern")]
     pub branch_issue_pattern: String,
+}
+
+/// Daemon mode configuration.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    /// Whether daemon mode is enabled. When true, workbridge forks a
+    /// background server on startup and reconnects on subsequent launches.
+    #[serde(default = "default_daemon_enabled")]
+    pub enabled: bool,
+    /// Override directory for the Unix socket and lock file.
+    /// Defaults to $XDG_RUNTIME_DIR or /tmp.
+    #[serde(default)]
+    pub socket_dir: Option<PathBuf>,
+    /// Timeout in seconds for the client to wait for the server to become
+    /// ready after fork.
+    #[serde(default = "default_attach_timeout")]
+    pub attach_timeout_secs: u64,
+}
+
+fn default_daemon_enabled() -> bool {
+    true
+}
+
+fn default_attach_timeout() -> u64 {
+    5
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_daemon_enabled(),
+            socket_dir: None,
+            attach_timeout_secs: default_attach_timeout(),
+        }
+    }
 }
 
 fn default_worktree_dir() -> String {
