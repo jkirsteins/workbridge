@@ -541,7 +541,8 @@ impl App {
     /// The cache entries are already canonicalized (via `canonicalize_repo_entries`),
     /// so we only need to canonicalize the input path.
     pub fn managed_repo_root(&self, path: &std::path::Path) -> Option<PathBuf> {
-        let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canonical_path =
+            crate::config::canonicalize_path(path).unwrap_or_else(|_| path.to_path_buf());
         self.active_repo_cache.iter().find_map(|entry| {
             if canonical_path.starts_with(&entry.path) {
                 Some(entry.path.clone())
@@ -3773,7 +3774,7 @@ fn canonicalize_repo_entries(entries: Vec<RepoEntry>) -> Vec<RepoEntry> {
     entries
         .into_iter()
         .map(|mut entry| {
-            if let Ok(canonical) = std::fs::canonicalize(&entry.path) {
+            if let Ok(canonical) = crate::config::canonicalize_path(&entry.path) {
                 entry.path = canonical;
             }
             entry
@@ -4059,7 +4060,7 @@ mod tests {
         let root = app.managed_repo_root(&subdir);
         assert!(root.is_some(), "subdir should be inside a managed repo");
         let root = root.unwrap();
-        let canonical_dir = std::fs::canonicalize(&dir).unwrap();
+        let canonical_dir = crate::config::canonicalize_path(&dir).unwrap();
         assert_eq!(
             root,
             canonical_dir,
@@ -4363,7 +4364,7 @@ mod tests {
         // not the symlink path.
         assert_eq!(app.active_repo_cache.len(), 1);
         let cached_path = &app.active_repo_cache[0].path;
-        let canonical_real = std::fs::canonicalize(&real_path).unwrap();
+        let canonical_real = crate::config::canonicalize_path(&real_path).unwrap();
         assert_eq!(
             *cached_path,
             canonical_real,

@@ -2560,8 +2560,10 @@ mod snapshot_tests {
     fn settings_overlay_with_config() {
         use crate::config::Config;
 
-        // Use real temp dirs so Config::all_repos() can discover them.
-        let base = std::env::temp_dir().join("workbridge-test-settings-overlay");
+        // Use /tmp (not std::env::temp_dir()) so rendered paths are
+        // deterministic across machines. macOS temp_dir() returns
+        // /var/folders/... which differs per user.
+        let base = std::path::PathBuf::from("/tmp/workbridge-test-settings-overlay");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("discovered-a/.git")).unwrap();
         std::fs::create_dir_all(base.join("discovered-b/.git")).unwrap();
@@ -2571,7 +2573,9 @@ mod snapshot_tests {
 
         let config = Config {
             base_dirs: vec![base_str],
-            repos: vec!["~/Forks/special-repo".into()],
+            // Use an absolute path instead of ~ to avoid tilde expansion
+            // which produces different paths on different machines.
+            repos: vec!["/root/Forks/special-repo".into()],
             included_repos: vec![discovered_a],
             ..Config::for_test()
         };

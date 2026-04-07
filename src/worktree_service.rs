@@ -181,13 +181,13 @@ impl GitWorktreeService {
         let worktrees = Self::parse_porcelain(&output);
         // Canonicalize the target path to handle symlinks (e.g. /tmp ->
         // /private/tmp on macOS) so it matches the paths git reports.
-        let canonical_target = worktree_path
-            .canonicalize()
+        let canonical_target = crate::config::canonicalize_path(worktree_path)
             .unwrap_or_else(|_| worktree_path.to_path_buf());
         Ok(worktrees
             .into_iter()
             .find(|w| {
-                let canonical_w = w.path.canonicalize().unwrap_or_else(|_| w.path.clone());
+                let canonical_w =
+                    crate::config::canonicalize_path(&w.path).unwrap_or_else(|_| w.path.clone());
                 canonical_w == canonical_target
             })
             .and_then(|w| w.branch))

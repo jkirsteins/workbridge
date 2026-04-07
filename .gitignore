@@ -2,3 +2,4 @@
 REVIEW_LOG.md
 .worktrees/
 .mcp.json
+*.snap.new

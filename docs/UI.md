@@ -39,9 +39,21 @@ A 200ms repeating timer drives:
 5. Shutdown deadline enforcement (10s)
 6. Fetcher restart when managed repos change
 
+## View Modes
+
+The `ViewMode` enum controls the root overview layout:
+
+- `FlatList` (default): two-panel layout with work item list (left) and
+  PTY session (right). See Layout section below.
+- `Board`: kanban board with 4 columns organized by workflow stage.
+  See Board View section below.
+
+Toggle between modes with Tab. The selected work item is preserved
+across toggles.
+
 ## Focus Model
 
-### Top-Level: Left/Right Panel
+### Top-Level: Left/Right Panel (Flat List Mode)
 
 The `FocusPanel` enum tracks whether the left panel (work item list) or
 right panel (PTY session) has focus. This is NOT managed by rat-focus
@@ -51,6 +63,22 @@ incompatible with rat-focus's widget navigation model.
 - Enter on a work item: focus right panel
 - Ctrl+]: return to left panel
 - Dead session: auto-return to left panel
+
+### Board Mode Navigation
+
+In board view, `handle_key_board()` intercepts key events before the
+left/right panel handlers. The `BoardCursor` struct tracks column index
+and row index independently.
+
+- Left/Right arrows: move between columns
+- Up/Down arrows: move between items within a column
+- Shift+Right: advance item to next stage
+- Shift+Left: retreat item to previous stage
+- Enter: drill down into selected column (filtered flat list + PTY)
+- Ctrl+]: return from drill-down to board view
+
+After a stage transition (Shift+arrow), the cursor follows the item
+into its new column.
 
 ### Within Dialogs
 
@@ -95,7 +123,7 @@ All rendering is Buffer-based (not Frame-based). Widgets use the
 `StatefulWidget::render(widget, area, buf, &mut state)` patterns from
 ratatui-core.
 
-### Layout
+### Layout: Flat List Mode
 
 ```
 +-- Work Items --+-- Claude Code -----------------+
@@ -124,6 +152,35 @@ Left panel: 25% of width (min 30 columns)
 Right panel: remainder minus 2 for borders
 Status bar: 1 row, conditional on status_message.is_some()
 
+### Layout: Board View
+
+```
++- Backlog ----+- Planning ---+- Implementing +- Review -----+
+|              |              |               |              |
+| idea-1       | plan-2       | [BK] fix-5    | fix-4        |
+| idea-6       |              | feature-3     |              |
+|              |              |               |              |
++--------------+--------------+---------------+--------------+
+| Context bar: title | repo | labels                         |
++------------------------------------------------------------+
+| Status bar message                                         |
++------------------------------------------------------------+
+```
+
+Four columns displayed: Backlog, Planning, Implementing, Review.
+Done items are hidden from the board. Blocked items appear in the
+Implementing column with a [BK] prefix. PR badges and CI status
+are shown on board items. Long titles wrap (not truncate).
+
+The `BoardLayout` struct (in `src/layout.rs`) and `compute_board()`
+function calculate 4 equal-width columns from the terminal width.
+The focused column's border uses `style_board_column_focused()`;
+other columns use `style_board_column_unfocused()`.
+
+Drill-down (Enter on a board item) switches to a filtered two-panel
+layout showing only items from the selected column's stage, with the
+PTY panel on the right. Ctrl+] returns to the full board view.
+
 ### Overlays
 
 Overlays (settings, creation dialog) render on top using:
@@ -145,6 +202,12 @@ To style a rat-widget component, pass Theme styles directly:
 ```rust
 TextInput::new().style(theme.style_text())
 ```
+
+Board-specific styles:
+- `style_board_column_focused()` - border for the active column
+- `style_board_column_unfocused()` - border for inactive columns
+- `style_board_column_header()` - column header text
+- `style_board_item_highlight()` - selected item highlight bar
 
 ## Testing
 
@@ -189,6 +252,7 @@ From rat-widget (available for future dialogs):
 
 Currently used:
 - SimpleTextInput (custom, in create_dialog.rs) - lightweight text input
-- List (ratatui-widgets) - work item list, repo selection
+- List (ratatui-widgets) - work item list, repo selection, board columns
+  (rendered via StatefulWidget::render in board view)
 - Block, Paragraph, Clear (ratatui-widgets) - layout and overlays
 - PseudoTerminal (tui-term) - PTY output rendering
