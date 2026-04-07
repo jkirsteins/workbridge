@@ -239,6 +239,11 @@ pub fn app_event(
             Ok(Control::Changed)
         }
         AppEvent::Timer(_) => {
+            // Poll MCP status updates BEFORE liveness check so that a
+            // review gate verdict arriving in the same tick as session
+            // exit is processed before check_liveness clears review_gate_wi.
+            state.poll_mcp_status_updates();
+
             // Liveness check on all sessions.
             state.check_liveness();
 
@@ -248,11 +253,11 @@ pub fn app_event(
                 state.build_display_list();
             }
 
-            // Poll MCP status updates from Claude sessions.
-            state.poll_mcp_status_updates();
-
-            // Poll async review gate result.
-            state.poll_review_gate();
+            // Advance the review gate spinner animation.
+            if state.review_gate_wi.is_some() {
+                state.review_gate_spinner_frame =
+                    state.review_gate_spinner_frame.wrapping_add(1);
+            }
 
             // Surface queued fetch errors.
             state.drain_pending_fetch_errors();

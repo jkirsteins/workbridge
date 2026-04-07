@@ -15,7 +15,7 @@ expression: "render(&app, 80, 24)"
 │                       ││  Issue       #42 - Fix resize bug                   │
 │                       ││  Errors      (none)                                 │
 │                       ││                                                     │
-│                       ││  Press Enter to start a session.                    │
+│                       ││  Press Shift+Right to move to Planning.             │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
