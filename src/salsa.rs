@@ -247,6 +247,11 @@ pub fn app_event(
             // Liveness check on all sessions.
             state.check_liveness();
 
+            // Refresh dynamic context for the global assistant MCP server.
+            if state.global_mcp_server.is_some() {
+                state.refresh_global_mcp_context();
+            }
+
             // Drain fetch results and reassemble if new data arrived.
             if state.drain_fetch_results() {
                 state.reassemble_work_items();

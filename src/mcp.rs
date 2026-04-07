@@ -11,11 +11,12 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::Sender;
 use serde_json::{Value, json};
+
 
 /// An MCP event sent from the socket handler to the main TUI thread.
 #[derive(Clone, Debug)]
@@ -87,6 +88,31 @@ impl McpSocketServer {
         Ok(Self { socket_path, stop })
     }
 
+    /// Start a global assistant MCP server with dynamic context.
+    ///
+    /// Unlike `start()`, the context is shared via `Arc<Mutex<String>>` so the
+    /// main thread can refresh it periodically as repos/work items change.
+    pub fn start_global(
+        socket_path: PathBuf,
+        context: Arc<Mutex<String>>,
+    ) -> io::Result<Self> {
+        let _ = std::fs::remove_file(&socket_path);
+
+        let listener = UnixListener::bind(&socket_path)?;
+        listener.set_nonblocking(true)?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let path_clone = socket_path.clone();
+
+        std::thread::spawn(move || {
+            global_accept_loop(listener, &context, &stop_clone);
+            let _ = std::fs::remove_file(&path_clone);
+        });
+
+        Ok(Self { socket_path, stop })
+    }
+
     /// Stop the server. The accept thread will exit on its next iteration.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -136,6 +162,57 @@ fn accept_loop(
             Err(_) => {
                 break;
             }
+        }
+    }
+}
+
+/// Accept loop for the global assistant MCP server.
+/// Reads dynamic context from the shared mutex on each connection.
+fn global_accept_loop(
+    listener: UnixListener,
+    context: &Arc<Mutex<String>>,
+    stop: &AtomicBool,
+) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // Snapshot current context for this connection.
+                let ctx_snapshot = context.lock().map(|g| g.clone()).unwrap_or_default();
+                std::thread::spawn(move || {
+                    handle_global_connection(stream, &ctx_snapshot);
+                });
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                break;
+            }
+        }
+    }
+}
+
+/// Handle a single global assistant MCP connection.
+fn handle_global_connection(stream: UnixStream, context_json: &str) {
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
+    let reader_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut reader = BufReader::new(reader_stream);
+    let mut writer = stream;
+
+    while let Ok(msg) = read_message(&mut reader) {
+        let response = handle_global_message(&msg, context_json);
+        if let Some(resp) = response
+            && write_message(&mut writer, &resp).is_err()
+        {
+            break;
         }
     }
 }
@@ -600,6 +677,168 @@ fn handle_message(
                             }
                         }))
                     }
+                }
+                _ => Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": format!("unknown tool: {tool_name}")
+                    }
+                })),
+            }
+        }
+        _ => id.map(|id| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("unknown method: {method}")
+                }
+            })
+        }),
+    }
+}
+
+/// Handle an incoming JSON-RPC message for the global assistant.
+/// Only read-only tools are available.
+fn handle_global_message(msg: &Value, context_json: &str) -> Option<Value> {
+    let method = msg.get("method")?.as_str()?;
+    let id = msg.get("id");
+
+    match method {
+        "initialize" => {
+            let id = id?;
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": "workbridge-global",
+                        "version": "0.1.0"
+                    }
+                }
+            }))
+        }
+        "notifications/initialized" => None,
+        "tools/list" => {
+            let id = id?;
+            let tools = vec![
+                json!({
+                    "name": "workbridge_list_repos",
+                    "description": "List all managed repositories with their paths.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }),
+                json!({
+                    "name": "workbridge_list_work_items",
+                    "description": "List all work items with their current status, title, associated repo, branch, and PR info.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }),
+                json!({
+                    "name": "workbridge_repo_info",
+                    "description": "Get detailed info about a specific managed repo: worktrees, branches, open PRs.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "repo_path": {
+                                "type": "string",
+                                "description": "Absolute path to the repository"
+                            }
+                        },
+                        "required": ["repo_path"]
+                    }
+                }),
+            ];
+
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": tools
+                }
+            }))
+        }
+        "tools/call" => {
+            let id = id?;
+            let params = msg.get("params")?;
+            let tool_name = params.get("name")?.as_str()?;
+            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+
+            // Parse the dynamic context once per tool call.
+            let ctx: Value =
+                serde_json::from_str(context_json).unwrap_or(json!({}));
+
+            match tool_name {
+                "workbridge_list_repos" => {
+                    let repos = ctx.get("repos").cloned().unwrap_or(json!([]));
+                    let text = serde_json::to_string_pretty(&repos).unwrap_or_default();
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": text
+                            }]
+                        }
+                    }))
+                }
+                "workbridge_list_work_items" => {
+                    let items = ctx.get("work_items").cloned().unwrap_or(json!([]));
+                    let text = serde_json::to_string_pretty(&items).unwrap_or_default();
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": text
+                            }]
+                        }
+                    }))
+                }
+                "workbridge_repo_info" => {
+                    let repo_path = arguments
+                        .get("repo_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    // Find the matching repo in context.
+                    let repo_info = ctx
+                        .get("repos")
+                        .and_then(|repos| repos.as_array())
+                        .and_then(|arr| {
+                            arr.iter().find(|r| {
+                                r.get("path")
+                                    .and_then(|p| p.as_str())
+                                    .is_some_and(|p| p == repo_path)
+                            })
+                        })
+                        .cloned()
+                        .unwrap_or(json!({"error": "repo not found in managed repos"}));
+
+                    let text = serde_json::to_string_pretty(&repo_info).unwrap_or_default();
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": text
+                            }]
+                        }
+                    }))
                 }
                 _ => Some(json!({
                     "jsonrpc": "2.0",

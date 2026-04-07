@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -192,6 +192,20 @@ pub struct App {
     /// Frame counter for the review gate spinner animation. Cycles through
     /// |, /, -, \ characters on each timer tick while the gate is active.
     pub review_gate_spinner_frame: u8,
+    /// Whether the global assistant drawer is open.
+    pub global_drawer_open: bool,
+    /// The global assistant PTY session (lazy, persistent).
+    pub global_session: Option<SessionEntry>,
+    /// MCP socket server for the global assistant.
+    pub global_mcp_server: Option<McpSocketServer>,
+    /// Dynamic context for the global MCP server, updated on each tick.
+    pub global_mcp_context: Arc<Mutex<String>>,
+    /// Which panel had focus before the drawer opened (restored on close).
+    pub pre_drawer_focus: FocusPanel,
+    /// PTY columns for the global assistant drawer (differs from main pane).
+    pub global_pane_cols: u16,
+    /// PTY rows for the global assistant drawer.
+    pub global_pane_rows: u16,
 }
 
 impl App {
@@ -294,6 +308,13 @@ impl App {
             review_gate_mcp: None,
             review_gate_session: None,
             review_gate_spinner_frame: 0,
+            global_drawer_open: false,
+            global_session: None,
+            global_mcp_server: None,
+            global_mcp_context: Arc::new(Mutex::new("{}".to_string())),
+            pre_drawer_focus: FocusPanel::Left,
+            global_pane_cols: 80,
+            global_pane_rows: 24,
         };
         app.reassemble_work_items();
         app.build_display_list();
@@ -510,6 +531,18 @@ impl App {
             self.status_message =
                 Some("Review gate session exited without delivering a verdict".into());
         }
+
+        // Check global assistant session liveness.
+        if let Some(ref mut entry) = self.global_session {
+            if let Some(ref mut session) = entry.session {
+                entry.alive = session.is_alive();
+            } else {
+                entry.alive = false;
+            }
+            if !entry.alive {
+                self.global_mcp_server = None;
+            }
+        }
     }
 
     /// Stop MCP server for a work item.
@@ -520,6 +553,7 @@ impl App {
     /// Stop all MCP servers. Called on app exit.
     pub fn cleanup_all_mcp(&mut self) {
         self.mcp_servers.clear();
+        self.global_mcp_server = None;
     }
 
     /// Resize PTY sessions and vt100 parsers to match the current pane
@@ -535,6 +569,14 @@ impl App {
             {
                 first_error = Some(e);
             }
+        }
+        // Resize global assistant session to its own drawer dimensions.
+        if let Some(ref entry) = self.global_session
+            && let Some(ref session) = entry.session
+            && let Err(e) = session.resize(self.global_pane_cols, self.global_pane_rows)
+            && first_error.is_none()
+        {
+            first_error = Some(e);
         }
         if let Some(e) = first_error {
             self.status_message = Some(format!("PTY resize error: {e}"));
@@ -555,11 +597,22 @@ impl App {
         if let Some(ref mut session) = self.review_gate_session {
             session.send_sigterm();
         }
+        if let Some(ref mut entry) = self.global_session
+            && entry.alive
+            && let Some(ref mut session) = entry.session
+        {
+            session.send_sigterm();
+        }
     }
 
     /// Check if all sessions are dead (or there are no sessions).
     pub fn all_dead(&self) -> bool {
-        self.sessions.values().all(|entry| !entry.alive) && self.review_gate_session.is_none()
+        self.sessions.values().all(|entry| !entry.alive)
+            && self.review_gate_session.is_none()
+            && self
+                .global_session
+                .as_ref()
+                .is_none_or(|s| !s.alive)
     }
 
     /// SIGKILL all remaining alive sessions. Used for force-quit during
@@ -577,6 +630,13 @@ impl App {
         self.review_gate_session = None;
         self.review_gate_mcp = None;
         self.review_gate_wi = None;
+        if let Some(ref mut entry) = self.global_session {
+            if let Some(ref mut session) = entry.session {
+                session.force_kill();
+            }
+            entry.alive = false;
+        }
+        self.global_mcp_server = None;
     }
 
     /// Find the session key for a work item ID (any stage).
@@ -2538,9 +2598,222 @@ impl App {
         self.sessions.get(&key)
     }
 
-    /// Returns true if any session is alive.
+    /// Returns true if any session is alive (including the global session).
     pub fn has_any_session(&self) -> bool {
         self.sessions.values().any(|e| e.alive)
+            || self
+                .global_session
+                .as_ref()
+                .is_some_and(|s| s.alive)
+    }
+
+    // -- Global assistant --------------------------------------------------
+
+    /// Toggle the global assistant drawer open/closed.
+    /// On first open, spawns the global session lazily.
+    pub fn toggle_global_drawer(&mut self) {
+        if self.global_drawer_open {
+            // Close drawer, restore previous focus.
+            self.global_drawer_open = false;
+            self.focus = self.pre_drawer_focus;
+        } else {
+            // Open drawer.
+            self.pre_drawer_focus = self.focus;
+            self.global_drawer_open = true;
+
+            // Spawn on first use (or respawn if dead).
+            let needs_spawn = self
+                .global_session
+                .as_ref()
+                .is_none_or(|s| !s.alive);
+            if needs_spawn {
+                self.spawn_global_session();
+            }
+        }
+    }
+
+    /// Spawn the global assistant Claude Code session.
+    fn spawn_global_session(&mut self) {
+        // Build dynamic context and start MCP server.
+        self.refresh_global_mcp_context();
+        let socket_path = crate::mcp::socket_path_for_session();
+        let mcp_server = match McpSocketServer::start_global(
+            socket_path.clone(),
+            Arc::clone(&self.global_mcp_context),
+        ) {
+            Ok(server) => server,
+            Err(e) => {
+                self.status_message =
+                    Some(format!("Global assistant MCP error: {e}"));
+                return;
+            }
+        };
+
+        // Build repo list for the system prompt.
+        let repo_list: String = self
+            .active_repo_cache
+            .iter()
+            .map(|r| format!("- {}", r.path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let system_prompt = {
+            let mut vars = std::collections::HashMap::new();
+            vars.insert("repo_list", repo_list.as_str());
+            crate::prompts::render("global_assistant", &vars)
+        };
+
+        let mut cmd: Vec<String> = vec!["claude".to_string()];
+        cmd.push("--permission-mode".to_string());
+        cmd.push("plan".to_string());
+        if let Some(ref prompt) = system_prompt {
+            cmd.push("--system-prompt".to_string());
+            cmd.push(prompt.clone());
+        }
+
+        // Write MCP config to a temp file and pass via --mcp-config.
+        let exe = std::env::current_exe().unwrap_or_default();
+        let mcp_config = crate::mcp::build_mcp_config(&exe, &mcp_server.socket_path);
+        let config_path = std::env::temp_dir().join(format!(
+            "workbridge-global-mcp-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(e) = std::fs::write(&config_path, &mcp_config) {
+            self.status_message =
+                Some(format!("Global assistant MCP config error: {e}"));
+            return;
+        }
+        cmd.push("--mcp-config".to_string());
+        cmd.push(config_path.to_string_lossy().to_string());
+
+        // Use home directory as cwd (neutral, not biased toward any repo).
+        let home = directories::UserDirs::new()
+            .map(|u| u.home_dir().to_path_buf())
+            .unwrap_or_else(std::env::temp_dir);
+
+        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        match Session::spawn(
+            self.global_pane_cols,
+            self.global_pane_rows,
+            Some(&home),
+            &cmd_refs,
+        ) {
+            Ok(session) => {
+                let parser = Arc::clone(&session.parser);
+                self.global_session = Some(SessionEntry {
+                    parser,
+                    alive: true,
+                    session: Some(session),
+                });
+                self.global_mcp_server = Some(mcp_server);
+            }
+            Err(e) => {
+                self.status_message =
+                    Some(format!("Global assistant spawn error: {e}"));
+            }
+        }
+    }
+
+    /// Send raw bytes to the global assistant session's PTY.
+    pub fn send_bytes_to_global(&mut self, data: &[u8]) {
+        if let Some(ref entry) = self.global_session
+            && entry.alive
+            && let Some(ref session) = entry.session
+            && let Err(e) = session.write_bytes(data)
+        {
+            self.status_message =
+                Some(format!("Global assistant write error: {e}"));
+        }
+    }
+
+    /// Refresh the shared dynamic context for the global MCP server.
+    /// Called on each timer tick.
+    pub fn refresh_global_mcp_context(&mut self) {
+        let repos: Vec<serde_json::Value> = self
+            .active_repo_cache
+            .iter()
+            .map(|r| {
+                let repo_path = r.path.display().to_string();
+                let fetch_data = self.repo_data.get(&r.path);
+
+                let worktrees: Vec<serde_json::Value> = fetch_data
+                    .and_then(|fd| fd.worktrees.as_ref().ok())
+                    .map(|wts| {
+                        wts.iter()
+                            .map(|wt| {
+                                serde_json::json!({
+                                    "path": wt.path.display().to_string(),
+                                    "branch": wt.branch,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let prs: Vec<serde_json::Value> = fetch_data
+                    .and_then(|fd| fd.prs.as_ref().ok())
+                    .map(|pr_list| {
+                        pr_list
+                            .iter()
+                            .map(|pr| {
+                                serde_json::json!({
+                                    "number": pr.number,
+                                    "title": pr.title,
+                                    "state": &pr.state,
+                                    "branch": &pr.head_branch,
+                                    "url": &pr.url,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                serde_json::json!({
+                    "path": repo_path,
+                    "worktrees": worktrees,
+                    "prs": prs,
+                })
+            })
+            .collect();
+
+        let work_items: Vec<serde_json::Value> = self
+            .work_items
+            .iter()
+            .map(|wi| {
+                let repo_path = wi
+                    .repo_associations
+                    .first()
+                    .map(|a| a.repo_path.display().to_string())
+                    .unwrap_or_default();
+                let branch = wi
+                    .repo_associations
+                    .first()
+                    .and_then(|a| a.branch.as_deref())
+                    .unwrap_or("");
+                let pr_url = wi
+                    .repo_associations
+                    .first()
+                    .and_then(|a| a.pr.as_ref())
+                    .map(|pr| pr.url.as_str())
+                    .unwrap_or("");
+                serde_json::json!({
+                    "title": wi.title,
+                    "status": format!("{:?}", wi.status),
+                    "repo_path": repo_path,
+                    "branch": branch,
+                    "pr_url": pr_url,
+                })
+            })
+            .collect();
+
+        let ctx = serde_json::json!({
+            "repos": repos,
+            "work_items": work_items,
+        });
+
+        if let Ok(mut guard) = self.global_mcp_context.lock() {
+            *guard = ctx.to_string();
+        }
     }
 
     /// Collect extra branch names from backend records, grouped by repo

@@ -1,6 +1,7 @@
 use ratatui_core::{
     buffer::Buffer,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
+    style::Modifier,
     text::{Line, Span, Text},
     widgets::{StatefulWidget, Widget},
 };
@@ -94,6 +95,11 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
     // Settings overlay (rendered on top of everything).
     if app.show_settings {
         draw_settings_overlay(buf, app, theme, area);
+    }
+
+    // Global assistant drawer (rendered on top, below create dialog).
+    if app.global_drawer_open {
+        draw_global_drawer(buf, app, theme, area);
     }
 
     // Create dialog overlay (rendered on top of everything).
@@ -884,6 +890,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 Line::from("  Up/Down   - Navigate items"),
                 Line::from("  Enter     - Open session / Import"),
                 Line::from("  Ctrl+]    - Return to item list"),
+                Line::from("  Ctrl+G    - Global assistant"),
                 Line::from("  Ctrl+D    - Delete work item"),
                 Line::from("  ?         - Settings"),
                 Line::from("  Q/Ctrl+Q  - Quit"),
@@ -892,6 +899,73 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 .block(block)
                 .style(theme.style_text_muted());
             paragraph.render(area, buf);
+        }
+    }
+}
+
+/// Draw the global assistant bottom drawer with dimmed background.
+///
+/// The drawer is anchored to the bottom of the screen, inset 2 columns on
+/// each side to create a floating-sheet effect. Everything behind it is
+/// dimmed to give visual depth.
+fn draw_global_drawer(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+    // 1. Dim every cell in the buffer to push the background behind the drawer.
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                let style = cell.style().add_modifier(Modifier::DIM);
+                cell.set_style(style);
+            }
+        }
+    }
+
+    // 2. Compute drawer rect: 60% height, inset 2 cols, anchored to bottom.
+    let drawer_width = area.width.saturating_sub(4);
+    let drawer_height = (area.height * 60 / 100).max(5);
+    let drawer_x = area.x + 2;
+    let drawer_y = area.y + area.height.saturating_sub(drawer_height);
+    let drawer_rect = Rect::new(drawer_x, drawer_y, drawer_width, drawer_height);
+
+    // 3. Clear the drawer area and draw the border.
+    Clear.render(drawer_rect, buf);
+
+    let block = Block::default()
+        .title(" Global Assistant (Ctrl+G to close) ")
+        .title_style(theme.style_title())
+        .borders(Borders::ALL)
+        .border_style(theme.style_border_overlay());
+    let inner = block.inner(drawer_rect);
+    block.render(drawer_rect, buf);
+
+    // 4. Render the global session PTY or a placeholder.
+    match &app.global_session {
+        Some(entry) if entry.alive => {
+            if let Ok(parser) = entry.parser.lock() {
+                let pseudo_term = PseudoTerminal::new(parser.screen());
+                pseudo_term.render(inner, buf);
+            } else {
+                let text = Text::from(vec![Line::from(""), Line::from("  [render error]")]);
+                let paragraph = Paragraph::new(text).style(theme.style_error());
+                paragraph.render(inner, buf);
+            }
+        }
+        Some(_) => {
+            // Session is dead.
+            let text = Text::from(vec![
+                Line::from(""),
+                Line::from("  Global assistant session ended."),
+                Line::from("  Press Ctrl+G to restart."),
+            ]);
+            let paragraph = Paragraph::new(text).style(theme.style_text_muted());
+            paragraph.render(inner, buf);
+        }
+        None => {
+            let text = Text::from(vec![
+                Line::from(""),
+                Line::from("  Starting global assistant..."),
+            ]);
+            let paragraph = Paragraph::new(text).style(theme.style_text_muted());
+            paragraph.render(inner, buf);
         }
     }
 }

@@ -121,6 +121,7 @@ mod tests {
         assert!(prompts.contains_key("blocked"));
         assert!(prompts.contains_key("review"));
         assert!(prompts.contains_key("review_gate"));
+        assert!(prompts.contains_key("global_assistant"));
     }
 
     #[test]
@@ -207,6 +208,10 @@ mod tests {
                     ("description", ""),
                 ],
             ),
+            (
+                "global_assistant",
+                vec![("repo_list", "- /tmp/repo")],
+            ),
         ];
         for (key, var_list) in cases {
             let vars: HashMap<&str, &str> = var_list.into_iter().collect();
@@ -230,6 +235,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn render_global_assistant() {
+        let mut vars = HashMap::new();
+        vars.insert("repo_list", "- /Users/foo/project-a\n- /Users/foo/project-b");
+        let result = render("global_assistant", &vars).unwrap();
+        assert!(result.contains("cross-project assistant"));
+        assert!(result.contains("/Users/foo/project-a"));
+        assert!(result.contains("workbridge_list_repos"));
+        assert!(result.contains("read-only mode"));
     }
 
     #[test]

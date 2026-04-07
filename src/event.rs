@@ -28,6 +28,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // When the global assistant drawer is open, route all keys to it.
+    if app.global_drawer_open {
+        handle_global_drawer_key(app, key);
+        return;
+    }
+
     // When the create dialog is open, route all keys to it.
     if app.create_dialog.visible {
         handle_create_dialog(app, key);
@@ -240,6 +246,10 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 sync_layout(app);
             }
         }
+        // Ctrl+G - toggle global assistant drawer
+        (KeyModifiers::CONTROL, KeyCode::Char('g')) => {
+            app.toggle_global_drawer();
+        }
         // ? - toggle settings overlay
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
             app.show_settings = !app.show_settings;
@@ -379,6 +389,134 @@ fn handle_key_right(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Key handling when the global assistant drawer is open.
+/// Ctrl+G, Ctrl+], or Esc closes the drawer. All other keys are forwarded
+/// to the global session PTY using the same encoding as handle_key_right.
+fn handle_global_drawer_key(app: &mut App, key: KeyEvent) {
+    // Check if the global session is alive. If dead, close the drawer.
+    if app
+        .global_session
+        .as_ref()
+        .is_none_or(|s| !s.alive)
+    {
+        app.global_drawer_open = false;
+        app.focus = app.pre_drawer_focus;
+        app.status_message = Some("Global assistant session ended".into());
+        sync_layout(app);
+        return;
+    }
+
+    match key.code {
+        // Ctrl+G or Ctrl+] closes the drawer.
+        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.global_drawer_open = false;
+            app.focus = app.pre_drawer_focus;
+        }
+        KeyCode::Char(']') | KeyCode::Char('5')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.global_drawer_open = false;
+            app.focus = app.pre_drawer_focus;
+        }
+        // Forward all other keys to the global session PTY.
+        KeyCode::Esc => {
+            app.send_bytes_to_global(b"\x1b");
+        }
+        KeyCode::Enter => {
+            app.send_bytes_to_global(b"\r");
+        }
+        KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                let byte = (c.to_ascii_lowercase() as u8)
+                    .wrapping_sub(b'a')
+                    .wrapping_add(1);
+                if byte <= 26 {
+                    app.send_bytes_to_global(&[byte]);
+                }
+            } else if key.modifiers.contains(KeyModifiers::ALT) {
+                let mut buf = [0u8; 5];
+                let s = c.encode_utf8(&mut buf);
+                let mut data = vec![0x1bu8];
+                data.extend_from_slice(s.as_bytes());
+                app.send_bytes_to_global(&data);
+            } else {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                app.send_bytes_to_global(s.as_bytes());
+            }
+        }
+        KeyCode::Backspace => {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                app.send_bytes_to_global(&[0x1b, 0x7f]);
+            } else {
+                app.send_bytes_to_global(&[0x7f]);
+            }
+        }
+        KeyCode::Tab => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                app.send_bytes_to_global(b"\x1b[Z");
+            } else {
+                app.send_bytes_to_global(&[0x09]);
+            }
+        }
+        KeyCode::BackTab => {
+            app.send_bytes_to_global(b"\x1b[Z");
+        }
+        KeyCode::Up => {
+            send_global_arrow(app, b'A', key.modifiers);
+        }
+        KeyCode::Down => {
+            send_global_arrow(app, b'B', key.modifiers);
+        }
+        KeyCode::Right => {
+            send_global_arrow(app, b'C', key.modifiers);
+        }
+        KeyCode::Left => {
+            send_global_arrow(app, b'D', key.modifiers);
+        }
+        KeyCode::Home => {
+            send_global_special(app, b'H', key.modifiers);
+        }
+        KeyCode::End => {
+            send_global_special(app, b'F', key.modifiers);
+        }
+        KeyCode::PageUp => {
+            app.send_bytes_to_global(b"\x1b[5~");
+        }
+        KeyCode::PageDown => {
+            app.send_bytes_to_global(b"\x1b[6~");
+        }
+        KeyCode::Delete => {
+            app.send_bytes_to_global(b"\x1b[3~");
+        }
+        KeyCode::F(n) => {
+            let seq = f_key_sequence(n);
+            app.send_bytes_to_global(seq.as_bytes());
+        }
+        _ => {}
+    }
+}
+
+fn send_global_arrow(app: &mut App, arrow: u8, modifiers: KeyModifiers) {
+    let modifier_code = modifier_param(modifiers);
+    if modifier_code > 1 {
+        let seq = format!("\x1b[1;{modifier_code}{}", arrow as char);
+        app.send_bytes_to_global(seq.as_bytes());
+    } else {
+        app.send_bytes_to_global(&[0x1b, b'[', arrow]);
+    }
+}
+
+fn send_global_special(app: &mut App, key_char: u8, modifiers: KeyModifiers) {
+    let modifier_code = modifier_param(modifiers);
+    if modifier_code > 1 {
+        let seq = format!("\x1b[1;{modifier_code}{}", key_char as char);
+        app.send_bytes_to_global(seq.as_bytes());
+    } else {
+        app.send_bytes_to_global(&[0x1b, b'[', key_char]);
+    }
+}
+
 /// Send an arrow key with optional modifiers as an ANSI escape sequence.
 /// Arrow keys: A=Up, B=Down, C=Right, D=Left.
 fn send_arrow_key(app: &mut App, arrow: u8, modifiers: KeyModifiers) {
@@ -447,6 +585,13 @@ pub fn handle_resize(app: &mut App, cols: u16, rows: u16) {
     let pl = layout::compute(cols, rows, bottom_rows);
     app.pane_cols = pl.pane_cols;
     app.pane_rows = pl.pane_rows;
+
+    // Compute global drawer PTY dimensions (60% height, inset 2 cols, minus borders).
+    let drawer_width = cols.saturating_sub(4);
+    let drawer_height = (rows * 60 / 100).max(5);
+    app.global_pane_cols = drawer_width.saturating_sub(2).max(1);
+    app.global_pane_rows = drawer_height.saturating_sub(2).max(1);
+
     app.resize_pty_panes();
 }
 
