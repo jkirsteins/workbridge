@@ -227,6 +227,12 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    pub fn style_group_header_blocked(&self) -> Style {
+        Style::default()
+            .fg(self.badge_blocked)
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn style_badge_pr(&self) -> Style {
         Style::default().fg(self.badge_pr)
     }

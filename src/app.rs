@@ -51,11 +51,22 @@ pub struct WorkItemContext {
     pub last_activity: Option<String>,
 }
 
+/// Visual style variant for group headers.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GroupHeaderKind {
+    Normal,
+    Blocked,
+}
+
 /// An entry in the flat display list rendered in the left panel.
 #[derive(Clone, Debug)]
 pub enum DisplayEntry {
-    /// Section header with label and item count.
-    GroupHeader { label: String, count: usize },
+    /// Section header with label, item count, and visual kind.
+    GroupHeader {
+        label: String,
+        count: usize,
+        kind: GroupHeaderKind,
+    },
     /// An unlinked PR (index into App::unlinked_prs).
     UnlinkedItem(usize),
     /// A work item (index into App::work_items).
@@ -85,6 +96,11 @@ pub struct App {
     /// Rework reasons keyed by work item ID. Used by stage_system_prompt
     /// to select the "implementing_rework" prompt template.
     pub rework_reasons: HashMap<WorkItemId, String>,
+    /// True when the no-plan prompt is visible (offered when Claude blocks
+    /// because no implementation plan exists).
+    pub no_plan_prompt_visible: bool,
+    /// The work item ID that the no-plan prompt applies to.
+    pub no_plan_prompt_wi: Option<WorkItemId>,
     /// True when the app has sent SIGTERM to all sessions and is waiting
     /// for them to exit. During shutdown, only Q (force quit) is accepted.
     pub shutting_down: bool,
@@ -276,6 +292,8 @@ impl App {
             rework_prompt_input: crate::create_dialog::SimpleTextInput::new(),
             rework_prompt_wi: None,
             rework_reasons: HashMap::new(),
+            no_plan_prompt_visible: false,
+            no_plan_prompt_wi: None,
             shutting_down: false,
             shutdown_started: None,
             pane_cols: 80,
@@ -811,18 +829,8 @@ impl App {
     pub fn build_display_list(&mut self) {
         let mut list = Vec::new();
 
-        // UNLINKED group (hidden if empty).
-        if !self.unlinked_prs.is_empty() {
-            list.push(DisplayEntry::GroupHeader {
-                label: "UNLINKED".to_string(),
-                count: self.unlinked_prs.len(),
-            });
-            for i in 0..self.unlinked_prs.len() {
-                list.push(DisplayEntry::UnlinkedItem(i));
-            }
-        }
-
-        // Partition work items into active, backlogged, and done, then sub-group by repo.
+        // Partition work items into blocked, active, backlogged, and done.
+        let mut blocked: Vec<usize> = Vec::new();
         let mut active: Vec<usize> = Vec::new();
         let mut backlogged: Vec<usize> = Vec::new();
         let mut done: Vec<usize> = Vec::new();
@@ -831,14 +839,55 @@ impl App {
                 done.push(i);
             } else if self.work_items[i].status == WorkItemStatus::Backlog {
                 backlogged.push(i);
+            } else if self.work_items[i].status == WorkItemStatus::Blocked {
+                blocked.push(i);
             } else {
                 active.push(i);
             }
         }
 
-        Self::push_repo_groups(&self.work_items, &mut list, "ACTIVE", &active);
-        Self::push_repo_groups(&self.work_items, &mut list, "BACKLOGGED", &backlogged);
-        Self::push_repo_groups(&self.work_items, &mut list, "DONE", &done);
+        // BLOCKED group first (red, attention-grabbing).
+        Self::push_repo_groups(
+            &self.work_items,
+            &mut list,
+            "BLOCKED",
+            &blocked,
+            GroupHeaderKind::Blocked,
+        );
+
+        // UNLINKED group (hidden if empty).
+        if !self.unlinked_prs.is_empty() {
+            list.push(DisplayEntry::GroupHeader {
+                label: "UNLINKED".to_string(),
+                count: self.unlinked_prs.len(),
+                kind: GroupHeaderKind::Normal,
+            });
+            for i in 0..self.unlinked_prs.len() {
+                list.push(DisplayEntry::UnlinkedItem(i));
+            }
+        }
+
+        Self::push_repo_groups(
+            &self.work_items,
+            &mut list,
+            "ACTIVE",
+            &active,
+            GroupHeaderKind::Normal,
+        );
+        Self::push_repo_groups(
+            &self.work_items,
+            &mut list,
+            "BACKLOGGED",
+            &backlogged,
+            GroupHeaderKind::Normal,
+        );
+        Self::push_repo_groups(
+            &self.work_items,
+            &mut list,
+            "DONE",
+            &done,
+            GroupHeaderKind::Normal,
+        );
 
         self.display_list = list;
 
@@ -889,6 +938,7 @@ impl App {
         list: &mut Vec<DisplayEntry>,
         label: &str,
         indices: &[usize],
+        kind: GroupHeaderKind,
     ) {
         if indices.is_empty() {
             return;
@@ -916,6 +966,7 @@ impl App {
             list.push(DisplayEntry::GroupHeader {
                 label: format!("{label} ({repo})"),
                 count: items.len(),
+                kind: kind.clone(),
             });
             for &i in items {
                 list.push(DisplayEntry::WorkItemEntry(i));
@@ -1323,16 +1374,31 @@ impl App {
         // Look up and consume rework reason if any (one-shot use).
         let rework_reason = self.rework_reasons.remove(work_item_id).unwrap_or_default();
 
+        // Check if the branch has commits ahead of the default branch.
+        // Used to select the retroactive planning prompt when appropriate.
+        let repo_path = wi.repo_associations.first().map(|a| &a.repo_path);
+        let has_branch_commits = repo_path
+            .map(|rp| self.branch_has_commits(cwd, rp))
+            .unwrap_or(false);
+
         // Build a situation summary that tells Claude where it is and what
         // state the work item is in.  Uses the worktree path (not the main
         // repo path) so Claude runs commands in the right directory.
         let situation = match wi.status {
             WorkItemStatus::Backlog | WorkItemStatus::Done => return None,
             WorkItemStatus::Planning => {
-                format!(
-                    "Worktree: {worktree_display}. Branch: {branch_name}. \
-                     No plan exists yet - your job is to create one."
-                )
+                if has_branch_commits {
+                    format!(
+                        "Worktree: {worktree_display}. Branch: {branch_name}. \
+                         Existing implementation work found on this branch - \
+                         analyze it and create a plan."
+                    )
+                } else {
+                    format!(
+                        "Worktree: {worktree_display}. Branch: {branch_name}. \
+                         No plan exists yet - your job is to create one."
+                    )
+                }
             }
             WorkItemStatus::Implementing => {
                 if !rework_reason.is_empty() {
@@ -1370,7 +1436,13 @@ impl App {
         // unreachable here.
         let prompt_key = match wi.status {
             WorkItemStatus::Backlog | WorkItemStatus::Done => unreachable!(),
-            WorkItemStatus::Planning => "planning",
+            WorkItemStatus::Planning => {
+                if has_branch_commits {
+                    "planning_retroactive"
+                } else {
+                    "planning"
+                }
+            }
             WorkItemStatus::Implementing => {
                 if !rework_reason.is_empty() {
                     "implementing_rework"
@@ -1397,6 +1469,27 @@ impl App {
         vars.insert("rework_reason", &rework_reason);
 
         crate::prompts::render(prompt_key, &vars)
+    }
+
+    /// Check if the branch in `cwd` has commits ahead of the default branch.
+    /// Returns false on any error (missing branch, no git, etc.).
+    fn branch_has_commits(&self, cwd: &std::path::Path, repo_path: &std::path::Path) -> bool {
+        let default_branch = self
+            .worktree_service
+            .default_branch(repo_path)
+            .unwrap_or_else(|_| "main".to_string());
+
+        let output = std::process::Command::new("git")
+            .args(["log", &format!("{default_branch}..HEAD"), "--oneline"])
+            .current_dir(cwd)
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                !stdout.trim().is_empty()
+            }
+            _ => false,
+        }
     }
 
     /// Start an MCP socket server for a work item session.
@@ -1537,6 +1630,27 @@ impl App {
                                 .unwrap_or("unknown"),
                             new_status.badge_text()
                         ));
+                        continue;
+                    }
+
+                    // No-plan prompt: when Claude blocks because there is no
+                    // implementation plan, offer the user a choice to retreat
+                    // to Planning instead of staying blocked.
+                    if current_status.as_ref() == Some(&WorkItemStatus::Implementing)
+                        && new_status == WorkItemStatus::Blocked
+                        && reason.contains("No implementation plan")
+                    {
+                        // Apply the block first so the item is in Blocked state.
+                        let current = current_status.clone().unwrap();
+                        self.apply_stage_change(&wi_id, &current, &new_status, "mcp");
+
+                        // Then show the prompt offering to retreat to Planning.
+                        self.no_plan_prompt_visible = true;
+                        self.no_plan_prompt_wi = Some(wi_id);
+                        self.status_message = Some(
+                            "No plan available. [p] Plan from branch  [Esc] Stay blocked"
+                                .to_string(),
+                        );
                         continue;
                     }
 
@@ -2068,6 +2182,19 @@ impl App {
         }
 
         self.apply_stage_change(&wi_id, &current_status, &new_status, "user");
+    }
+
+    /// Move a blocked (no-plan) work item back to Planning so that Claude
+    /// can analyze existing branch work and produce a retroactive plan.
+    pub fn plan_from_branch(&mut self, wi_id: &WorkItemId) {
+        // Clear any existing (empty) plan so the planning session starts fresh.
+        if let Err(e) = self.backend.update_plan(wi_id, "") {
+            self.status_message = Some(format!("Could not clear plan: {e}"));
+            return;
+        }
+        let current = WorkItemStatus::Blocked;
+        let next = WorkItemStatus::Planning;
+        self.apply_stage_change(wi_id, &current, &next, "user");
     }
 
     /// Shared logic for applying a stage change: log it, persist it, reassemble.
@@ -4915,7 +5042,7 @@ mod tests {
             .display_list
             .iter()
             .filter_map(|e| match e {
-                DisplayEntry::GroupHeader { label, count } => Some((label.as_str(), *count)),
+                DisplayEntry::GroupHeader { label, count, .. } => Some((label.as_str(), *count)),
                 _ => None,
             })
             .collect();
@@ -5002,7 +5129,7 @@ mod tests {
             .display_list
             .iter()
             .filter_map(|e| match e {
-                DisplayEntry::GroupHeader { label, count } => Some((label.as_str(), *count)),
+                DisplayEntry::GroupHeader { label, count, .. } => Some((label.as_str(), *count)),
                 _ => None,
             })
             .collect();
@@ -5026,7 +5153,7 @@ mod tests {
             .display_list
             .iter()
             .filter_map(|e| match e {
-                DisplayEntry::GroupHeader { label, count } => Some((label.as_str(), *count)),
+                DisplayEntry::GroupHeader { label, count, .. } => Some((label.as_str(), *count)),
                 _ => None,
             })
             .collect();

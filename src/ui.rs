@@ -15,7 +15,9 @@ use ratatui_widgets::{
 use tui_term::widget::PseudoTerminal;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, DisplayEntry, FocusPanel, SettingsListFocus, WorkItemContext};
+use crate::app::{
+    App, DisplayEntry, FocusPanel, GroupHeaderKind, SettingsListFocus, WorkItemContext,
+};
 use crate::config;
 use crate::create_dialog::{CreateDialog, CreateDialogFocus};
 use crate::layout;
@@ -150,12 +152,13 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, entry)| match entry {
-            DisplayEntry::GroupHeader { label, count } => {
+            DisplayEntry::GroupHeader { label, count, kind } => {
                 let text = format!("{label} ({count})");
-                ListItem::new(Line::from(vec![Span::styled(
-                    text,
-                    theme.style_group_header(),
-                )]))
+                let style = match kind {
+                    GroupHeaderKind::Blocked => theme.style_group_header_blocked(),
+                    GroupHeaderKind::Normal => theme.style_group_header(),
+                };
+                ListItem::new(Line::from(vec![Span::styled(text, style)]))
             }
             DisplayEntry::UnlinkedItem(idx) => {
                 let selected = app.selected_item == Some(i);

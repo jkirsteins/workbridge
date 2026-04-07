@@ -46,6 +46,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // When the no-plan prompt is visible, route keys to it.
+    if app.no_plan_prompt_visible {
+        handle_no_plan_prompt(app, key);
+        return;
+    }
+
     // When the merge strategy prompt is visible, handle it.
     if app.confirm_merge {
         handle_merge_prompt(app, key);
@@ -704,6 +710,29 @@ fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
     }
     if app.status_message.is_some() != had_status {
         sync_layout(app);
+    }
+}
+
+/// Handle key events when the no-plan prompt is visible.
+///
+/// [p] retreats the blocked item to Planning for retroactive plan creation.
+/// [Esc] dismisses the prompt and keeps the item blocked.
+fn handle_no_plan_prompt(app: &mut App, key: KeyEvent) {
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Esc) => {
+            app.no_plan_prompt_visible = false;
+            app.no_plan_prompt_wi = None;
+            app.status_message = None;
+        }
+        (KeyModifiers::NONE, KeyCode::Char('p')) => {
+            app.no_plan_prompt_visible = false;
+            let wi_id = match app.no_plan_prompt_wi.take() {
+                Some(id) => id,
+                None => return,
+            };
+            app.plan_from_branch(&wi_id);
+        }
+        _ => {}
     }
 }
 
