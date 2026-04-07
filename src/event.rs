@@ -124,7 +124,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         && (key.code == KeyCode::Delete
             || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d')));
 
-    let had_status = app.status_message.is_some();
+    let had_status = app.has_visible_status_bar();
     if app.confirm_quit && !is_quit_confirm {
         app.confirm_quit = false;
         app.status_message = None;
@@ -135,7 +135,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
     // If cancelling a confirmation hid the status bar, resync layout so
     // pane dimensions match the new visible area.
-    if had_status && app.status_message.is_none() {
+    if had_status && !app.has_visible_status_bar() {
         sync_layout(app);
     }
 
@@ -182,10 +182,10 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
             }
             if app.confirm_delete {
                 app.confirm_delete = false;
-                let had_status = app.status_message.is_some();
+                let had_status = app.has_visible_status_bar();
                 let had_context = app.selected_work_item_context().is_some();
                 app.delete_selected_work_item();
-                if app.status_message.is_some() != had_status
+                if app.has_visible_status_bar() != had_status
                     || app.selected_work_item_context().is_some() != had_context
                 {
                     sync_layout(app);
@@ -220,7 +220,7 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
             let Some(entry) = app.display_list.get(idx).cloned() else {
                 return;
             };
-            let had_status = app.status_message.is_some();
+            let had_status = app.has_visible_status_bar();
             match entry {
                 DisplayEntry::WorkItemEntry(_) => {
                     app.open_session_for_selected();
@@ -229,7 +229,7 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 }
                 DisplayEntry::UnlinkedItem(_) => {
                     app.import_selected_unlinked();
-                    if app.status_message.is_some() != had_status {
+                    if app.has_visible_status_bar() != had_status {
                         sync_layout(app);
                     }
                 }
@@ -238,17 +238,17 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
         }
         // Shift+Right - advance to next workflow stage
         (KeyModifiers::SHIFT, KeyCode::Right) => {
-            let had_status = app.status_message.is_some();
+            let had_status = app.has_visible_status_bar();
             app.advance_stage();
-            if app.status_message.is_some() != had_status {
+            if app.has_visible_status_bar() != had_status {
                 sync_layout(app);
             }
         }
         // Shift+Left - retreat to previous workflow stage
         (KeyModifiers::SHIFT, KeyCode::Left) => {
-            let had_status = app.status_message.is_some();
+            let had_status = app.has_visible_status_bar();
             app.retreat_stage();
-            if app.status_message.is_some() != had_status {
+            if app.has_visible_status_bar() != had_status {
                 sync_layout(app);
             }
         }
@@ -270,7 +270,7 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
 /// key, matching telnet/SSH conventions). Escape is forwarded to the PTY
 /// so Claude Code can use it.
 fn handle_key_right(app: &mut App, key: KeyEvent) {
-    let had_status = app.status_message.is_some();
+    let had_status = app.has_visible_status_bar();
 
     // Check if the active session is dead before forwarding keys. If dead,
     // auto-return focus to the left panel instead of spamming errors.
@@ -390,7 +390,7 @@ fn handle_key_right(app: &mut App, key: KeyEvent) {
 
     // If a send error caused a status message to appear (or disappear),
     // the status bar visibility changed and pane dimensions need updating.
-    if app.status_message.is_some() != had_status {
+    if app.has_visible_status_bar() != had_status {
         sync_layout(app);
     }
 }
@@ -587,7 +587,7 @@ fn f_key_sequence(n: u8) -> String {
 /// Handle a terminal resize event by updating pane dimensions and resizing PTY.
 /// Called from the rat-salsa event callback in salsa.rs.
 pub fn handle_resize(app: &mut App, cols: u16, rows: u16) {
-    let bottom_rows = u16::from(app.status_message.is_some())
+    let bottom_rows = u16::from(app.has_visible_status_bar())
         + u16::from(app.selected_work_item_context().is_some());
     let pl = layout::compute(cols, rows, bottom_rows);
     app.pane_cols = pl.pane_cols;
@@ -605,7 +605,7 @@ pub fn handle_resize(app: &mut App, cols: u16, rows: u16) {
 ///
 /// 's' or Enter = squash merge, 'm' = normal merge, Esc = cancel.
 fn handle_merge_prompt(app: &mut App, key: KeyEvent) {
-    let had_status = app.status_message.is_some();
+    let had_status = app.has_visible_status_bar();
     match (key.modifiers, key.code) {
         (_, KeyCode::Char('s')) | (_, KeyCode::Enter) => {
             app.confirm_merge = false;
@@ -631,7 +631,7 @@ fn handle_merge_prompt(app: &mut App, key: KeyEvent) {
             app.status_message = None;
         }
     }
-    if app.status_message.is_some() != had_status {
+    if app.has_visible_status_bar() != had_status {
         sync_layout(app);
     }
 }
@@ -641,7 +641,7 @@ fn handle_merge_prompt(app: &mut App, key: KeyEvent) {
 /// All keys are routed to the text input. Enter submits the reason,
 /// Esc cancels and stays in Review.
 fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
-    let had_status = app.status_message.is_some();
+    let had_status = app.has_visible_status_bar();
     match (key.modifiers, key.code) {
         (_, KeyCode::Esc) => {
             app.rework_prompt_visible = false;
@@ -708,7 +708,7 @@ fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
-    if app.status_message.is_some() != had_status {
+    if app.has_visible_status_bar() != had_status {
         sync_layout(app);
     }
 }
@@ -780,12 +780,12 @@ fn handle_create_dialog(app: &mut App, key: KeyEvent) {
             }
             match app.create_dialog.validate() {
                 Ok((title, description, repos, branch)) => {
-                    let had_status = app.status_message.is_some();
+                    let had_status = app.has_visible_status_bar();
                     let had_context = app.selected_work_item_context().is_some();
                     match app.create_work_item_with(title, description, repos, branch) {
                         Ok(()) => {
                             app.create_dialog.close();
-                            if app.status_message.is_some() != had_status
+                            if app.has_visible_status_bar() != had_status
                                 || app.selected_work_item_context().is_some() != had_context
                             {
                                 sync_layout(app);
@@ -908,7 +908,7 @@ fn handle_textarea_key(app: &mut App, key: KeyEvent) {
 /// Recalculate layout from the current terminal size and resize PTY panes.
 /// Called when the status bar visibility changes to keep the PTY pane
 /// dimensions in sync with the actual display area.
-fn sync_layout(app: &mut App) {
+pub(crate) fn sync_layout(app: &mut App) {
     if let Ok((cols, rows)) = ratatui_crossterm::crossterm::terminal::size() {
         handle_resize(app, cols, rows);
     }

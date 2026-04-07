@@ -24,6 +24,13 @@ use crate::layout;
 use crate::theme::Theme;
 use crate::work_item::{BackendType, CheckStatus, PrState, WorkItemError, WorkItemStatus};
 
+/// Braille-dot spinner frames for the activity indicator.
+/// 10 frames at 200ms per tick = 2-second full rotation.
+const SPINNER_FRAMES: &[char] = &[
+    '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}', '\u{2826}', '\u{2827}',
+    '\u{2807}', '\u{280F}',
+];
+
 /// Render the entire UI: left panel (work item list) and right panel
 /// (session output), plus optional context bar and status bar at the bottom.
 ///
@@ -33,7 +40,7 @@ use crate::work_item::{BackendType, CheckStatus, PrState, WorkItemError, WorkIte
 pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
     // Vertical split: main area + optional 1-row context bar + optional 1-row status bar.
     let has_context = app.selected_work_item_context().is_some();
-    let has_status = app.status_message.is_some();
+    let has_status = app.has_visible_status_bar();
 
     let mut constraints = vec![Constraint::Min(0)];
     if has_context {
@@ -81,17 +88,29 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
         draw_context_bar(buf, &ctx, theme, area);
     }
 
-    // Status bar (transient messages).
-    if let Some(area) = status_area
-        && let Some(msg) = &app.status_message
-    {
-        let style = if app.shutting_down {
-            theme.style_status_shutdown()
-        } else {
-            theme.style_status()
-        };
-        let status = Paragraph::new(msg.as_str()).style(style);
-        status.render(area, buf);
+    // Status bar: activity indicator overrides transient messages.
+    if let Some(area) = status_area {
+        if let Some(activity_msg) = app.current_activity() {
+            let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+            let count_suffix = if app.activities.len() > 1 {
+                format!(" (+{})", app.activities.len() - 1)
+            } else {
+                String::new()
+            };
+            let line = Line::from(vec![
+                Span::styled(format!(" {} ", spinner), theme.style_activity_spinner()),
+                Span::styled(activity_msg, theme.style_activity()),
+                Span::styled(count_suffix, theme.style_text_muted()),
+            ]);
+            Paragraph::new(line).render(area, buf);
+        } else if let Some(msg) = &app.status_message {
+            let style = if app.shutting_down {
+                theme.style_status_shutdown()
+            } else {
+                theme.style_status()
+            };
+            Paragraph::new(msg.as_str()).style(style).render(area, buf);
+        }
     }
 
     // Settings overlay (rendered on top of everything).
@@ -2285,6 +2304,40 @@ mod snapshot_tests {
         let mut app = app_with_items(vec![wi], vec![]);
         app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
         app.status_message = Some("Right panel focused - press Ctrl+] to return".into());
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn activity_indicator_overrides_status_message() {
+        let items = vec![make_work_item(
+            "act-1",
+            "Build feature",
+            WorkItemStatus::Implementing,
+            None,
+            1,
+        )];
+        let mut app = app_with_items(items, vec![]);
+        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
+        app.status_message = Some("This should be hidden".into());
+        app.start_activity("Creating pull request...");
+        app.spinner_tick = 3; // Pick a specific frame for deterministic snapshot.
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn activity_indicator_with_count() {
+        let items = vec![make_work_item(
+            "act-2",
+            "Multi-task",
+            WorkItemStatus::Implementing,
+            None,
+            1,
+        )];
+        let mut app = app_with_items(items, vec![]);
+        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
+        app.start_activity("Running review gate...");
+        app.start_activity("Creating pull request...");
+        app.spinner_tick = 0;
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 
