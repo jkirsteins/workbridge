@@ -34,12 +34,6 @@ pub enum McpEvent {
     },
     /// Claude called workbridge_set_plan.
     SetPlan { work_item_id: String, plan: String },
-    /// Claude called workbridge_review_gate_result from the review gate session.
-    ReviewGateResult {
-        work_item_id: String,
-        approved: bool,
-        detail: String,
-    },
 }
 
 /// Handle to the MCP socket server. Holds the socket path for cleanup
@@ -346,15 +340,7 @@ fn handle_message(
         "notifications/initialized" => None,
         "tools/list" => {
             let id = id?;
-            // Only advertise the review gate tool when the session is a
-            // review gate (context_json contains "stage": "ReviewGate").
-            // This prevents implementing sessions from self-approving.
-            let is_review_gate = serde_json::from_str::<Value>(context_json)
-                .ok()
-                .and_then(|ctx| ctx.get("stage")?.as_str().map(|s| s == "ReviewGate"))
-                .unwrap_or(false);
-
-            let mut tools = vec![
+            let tools = vec![
                 json!({
                     "name": "workbridge_set_status",
                     "description": "Request a workflow stage change for the current work item. Call this when you finish implementing to signal readiness for review, or to signal that you are blocked and need user input. Done is not settable via MCP (it requires the merge gate). Note: status changes are validated asynchronously by the TUI - the request may be rejected if the transition is not allowed from the current state.",
@@ -422,27 +408,6 @@ fn handle_message(
                     }
                 }),
             ];
-
-            if is_review_gate {
-                tools.push(json!({
-                    "name": "workbridge_review_gate_result",
-                    "description": "Submit the review gate verdict. Call this after comparing the plan to the diff. You MUST respond with exactly APPROVED or REJECTED with a reason.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "approved": {
-                                "type": "boolean",
-                                "description": "true if the implementation matches the plan, false otherwise"
-                            },
-                            "detail": {
-                                "type": "string",
-                                "description": "For approved: brief confirmation. For rejected: specific reason why the implementation does not match the plan."
-                            }
-                        },
-                        "required": ["approved", "detail"]
-                    }
-                }));
-            }
 
             Some(json!({
                 "jsonrpc": "2.0",
@@ -605,65 +570,6 @@ fn handle_message(
                                 "content": [{
                                     "type": "text",
                                     "text": "Plan saved"
-                                }]
-                            }
-                        }))
-                    } else {
-                        Some(json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "content": [{
-                                    "type": "text",
-                                    "text": "Error: TUI channel disconnected"
-                                }],
-                                "isError": true
-                            }
-                        }))
-                    }
-                }
-                "workbridge_review_gate_result" => {
-                    // Only review gate sessions may call this tool.
-                    let is_review_gate = serde_json::from_str::<Value>(context_json)
-                        .ok()
-                        .and_then(|ctx| ctx.get("stage")?.as_str().map(|s| s == "ReviewGate"))
-                        .unwrap_or(false);
-                    if !is_review_gate {
-                        return Some(json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": {
-                                "code": -32601,
-                                "message": "workbridge_review_gate_result is only available in review gate sessions"
-                            }
-                        }));
-                    }
-
-                    let approved = arguments
-                        .get("approved")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let detail = arguments
-                        .get("detail")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    let event = McpEvent::ReviewGateResult {
-                        work_item_id: work_item_id.to_string(),
-                        approved,
-                        detail,
-                    };
-                    let send_ok = tx.send(event).is_ok();
-
-                    if send_ok {
-                        Some(json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "content": [{
-                                    "type": "text",
-                                    "text": if approved { "Review gate: approved" } else { "Review gate: rejected" }
                                 }]
                             }
                         }))
@@ -1030,24 +936,8 @@ mod tests {
         assert!(names.contains(&"workbridge_set_plan"));
         assert!(
             !names.contains(&"workbridge_review_gate_result"),
-            "review gate tool should not be listed for non-gate sessions"
+            "review gate tool was removed"
         );
-    }
-
-    #[test]
-    fn handle_tools_list_gate_session() {
-        let tx = make_tx();
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list"
-        });
-        let context = r#"{"stage":"ReviewGate"}"#;
-        let resp = handle_message(&msg, "test-id", context, None, &tx).unwrap();
-        let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
-        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"workbridge_review_gate_result"));
     }
 
     #[test]
@@ -1421,9 +1311,8 @@ mod tests {
     }
 
     #[test]
-    fn handle_review_gate_result_approved() {
+    fn review_gate_result_tool_is_unknown() {
         let (tx, rx) = unbounded();
-        let gate_context = r#"{"stage":"ReviewGate"}"#;
         let msg = json!({
             "jsonrpc": "2.0",
             "id": 10,
@@ -1436,91 +1325,10 @@ mod tests {
                 }
             }
         });
-        let resp = handle_message(&msg, "wi-gate", gate_context, None, &tx).unwrap();
-        assert_eq!(
-            resp["result"]["content"][0]["text"].as_str().unwrap(),
-            "Review gate: approved"
-        );
-
-        let event = rx.try_recv().unwrap();
-        match event {
-            McpEvent::ReviewGateResult {
-                work_item_id,
-                approved,
-                detail,
-            } => {
-                assert_eq!(work_item_id, "wi-gate");
-                assert!(approved);
-                assert_eq!(detail, "Implementation matches the plan");
-            }
-            _ => panic!("expected ReviewGateResult event"),
-        }
-    }
-
-    #[test]
-    fn handle_review_gate_result_rejected() {
-        let (tx, rx) = unbounded();
-        let gate_context = r#"{"stage":"ReviewGate"}"#;
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "id": 11,
-            "method": "tools/call",
-            "params": {
-                "name": "workbridge_review_gate_result",
-                "arguments": {
-                    "approved": false,
-                    "detail": "Missing error handling in module X"
-                }
-            }
-        });
-        let resp = handle_message(&msg, "wi-gate", gate_context, None, &tx).unwrap();
-        assert_eq!(
-            resp["result"]["content"][0]["text"].as_str().unwrap(),
-            "Review gate: rejected"
-        );
-
-        let event = rx.try_recv().unwrap();
-        match event {
-            McpEvent::ReviewGateResult {
-                work_item_id,
-                approved,
-                detail,
-            } => {
-                assert_eq!(work_item_id, "wi-gate");
-                assert!(!approved);
-                assert_eq!(detail, "Missing error handling in module X");
-            }
-            _ => panic!("expected ReviewGateResult event"),
-        }
-    }
-
-    #[test]
-    fn handle_review_gate_result_rejected_from_non_gate_session() {
-        let (tx, rx) = unbounded();
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "id": 12,
-            "method": "tools/call",
-            "params": {
-                "name": "workbridge_review_gate_result",
-                "arguments": {
-                    "approved": true,
-                    "detail": "Self-approve attempt"
-                }
-            }
-        });
-        // Non-gate session (empty context) should get an error.
-        let resp = handle_message(&msg, "wi-impl", "{}", None, &tx).unwrap();
-        assert!(
-            resp.get("error").is_some(),
-            "non-gate session should get error for review gate tool"
-        );
+        // The review gate tool was removed (gate uses claude --print now).
+        let resp = handle_message(&msg, "wi-gate", r#"{"stage":"ReviewGate"}"#, None, &tx).unwrap();
+        assert!(resp.get("error").is_some());
         assert_eq!(resp["error"]["code"], -32601);
-
-        // No event should have been sent.
-        assert!(
-            rx.try_recv().is_err(),
-            "no channel event should be sent for rejected call"
-        );
+        assert!(rx.try_recv().is_err());
     }
 }

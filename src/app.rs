@@ -1274,9 +1274,6 @@ impl App {
             return;
         };
         let work_item_id = wi.id.clone();
-        let work_item_status = wi.status.clone();
-        let is_planning = work_item_status == WorkItemStatus::Planning;
-        let session_key = (work_item_id.clone(), work_item_status.clone());
 
         // Stages without sessions.
         if matches!(wi.status, WorkItemStatus::Backlog | WorkItemStatus::Done) {
@@ -2043,17 +2040,12 @@ impl App {
                             }
                             Ok(_) => {}
                             Err(e) => {
-                                self.status_message = Some(format!(
-                                    "Plan saved but could not verify status: {e}"
-                                ));
+                                self.status_message =
+                                    Some(format!("Plan saved but could not verify status: {e}"));
                             }
                         }
                     }
                 }
-                // ReviewGateResult events from MCP are no longer used.
-                // The review gate now runs as a background thread and
-                // results are polled via poll_review_gate().
-                McpEvent::ReviewGateResult { .. } => {}
             }
         }
     }
@@ -3101,10 +3093,6 @@ impl App {
             None => return false,
         };
         let repo_path = assoc.repo_path.clone();
-        let cwd = assoc
-            .worktree_path
-            .clone()
-            .unwrap_or_else(|| repo_path.clone());
 
         // Get the default branch for diffing.
         let default_branch = self
@@ -3678,7 +3666,10 @@ impl WorktreeService for StubWorktreeService {
 pub struct StubBackend;
 
 impl WorkItemBackend for StubBackend {
-    fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+    fn read(
+        &self,
+        id: &WorkItemId,
+    ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
         Err(BackendError::NotFound(id.clone()))
     }
 
@@ -3884,8 +3875,16 @@ mod tests {
         }
 
         impl WorkItemBackend for TestBackend {
-            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-                self.records.lock().unwrap().iter().find(|r| r.id == *id).cloned()
+            fn read(
+                &self,
+                id: &WorkItemId,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                self.records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == *id)
+                    .cloned()
                     .ok_or_else(|| BackendError::NotFound(id.clone()))
             }
             fn list(&self) -> Result<ListResult, BackendError> {
@@ -4019,7 +4018,10 @@ mod tests {
         struct CreateBackend;
 
         impl WorkItemBackend for CreateBackend {
-            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            fn read(
+                &self,
+                id: &WorkItemId,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 Err(BackendError::NotFound(id.clone()))
             }
             fn list(&self) -> Result<ListResult, BackendError> {
@@ -4304,8 +4306,16 @@ mod tests {
         }
 
         impl WorkItemBackend for OrderableBackend {
-            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-                self.records.lock().unwrap().iter().find(|r| r.id == *id).cloned()
+            fn read(
+                &self,
+                id: &WorkItemId,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                self.records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == *id)
+                    .cloned()
                     .ok_or_else(|| BackendError::NotFound(id.clone()))
             }
             fn list(&self) -> Result<ListResult, BackendError> {
@@ -4860,8 +4870,16 @@ mod tests {
         }
 
         impl WorkItemBackend for TestBackend {
-            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-                self.records.lock().unwrap().iter().find(|r| r.id == *id).cloned()
+            fn read(
+                &self,
+                id: &WorkItemId,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                self.records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == *id)
+                    .cloned()
                     .ok_or_else(|| BackendError::NotFound(id.clone()))
             }
             fn list(&self) -> Result<ListResult, BackendError> {
@@ -5083,8 +5101,16 @@ mod tests {
         }
 
         impl WorkItemBackend for TestBackend {
-            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-                self.records.lock().unwrap().iter().find(|r| r.id == *id).cloned()
+            fn read(
+                &self,
+                id: &WorkItemId,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                self.records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == *id)
+                    .cloned()
                     .ok_or_else(|| BackendError::NotFound(id.clone()))
             }
             fn list(&self) -> Result<ListResult, BackendError> {
@@ -5328,8 +5354,16 @@ mod tests {
         }
 
         impl WorkItemBackend for TestBackend {
-            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-                self.records.lock().unwrap().iter().find(|r| r.id == *id).cloned()
+            fn read(
+                &self,
+                id: &WorkItemId,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                self.records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == *id)
+                    .cloned()
                     .ok_or_else(|| BackendError::NotFound(id.clone()))
             }
             fn list(&self) -> Result<ListResult, BackendError> {
@@ -5471,7 +5505,10 @@ mod tests {
         }
 
         impl WorkItemBackend for RecordingBackend {
-            fn read(&self, id: &WorkItemId) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            fn read(
+                &self,
+                id: &WorkItemId,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 Err(BackendError::NotFound(id.clone()))
             }
             fn list(&self) -> Result<ListResult, BackendError> {
@@ -5954,15 +5991,13 @@ mod tests {
         // Lookup with Planning stage finds it.
         assert!(
             app.sessions
-                .get(&(wi_id.clone(), WorkItemStatus::Planning))
-                .is_some()
+                .contains_key(&(wi_id.clone(), WorkItemStatus::Planning))
         );
 
         // Lookup with Implementing stage does NOT find it.
         assert!(
-            app.sessions
-                .get(&(wi_id.clone(), WorkItemStatus::Implementing))
-                .is_none()
+            !app.sessions
+                .contains_key(&(wi_id.clone(), WorkItemStatus::Implementing))
         );
     }
 

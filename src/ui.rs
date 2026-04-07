@@ -822,7 +822,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
 
             if review_gate_active {
                 let spinner_chars = [b'|', b'/', b'-', b'\\'];
-                let frame = app.spinner_tick as usize % spinner_chars.len();
+                let frame = app.spinner_tick % spinner_chars.len();
                 let spinner = spinner_chars[frame] as char;
                 let progress_text = app
                     .review_gate_progress
@@ -2048,7 +2048,10 @@ mod snapshot_tests {
 
     impl WorkItemBackend for MockBackend {
         fn read(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
-            self.records.iter().find(|r| r.id == *id).cloned()
+            self.records
+                .iter()
+                .find(|r| r.id == *id)
+                .cloned()
                 .ok_or_else(|| BackendError::NotFound(id.clone()))
         }
         fn list(&self) -> Result<crate::work_item_backend::ListResult, BackendError> {
@@ -2203,7 +2206,7 @@ mod snapshot_tests {
         )];
         let mut app = app_with_items(items, vec![]);
         // Select the first selectable work item entry.
-        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
+        app.selected_item = app.display_list.iter().position(is_selectable);
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 
@@ -2286,7 +2289,7 @@ mod snapshot_tests {
             1,
         )];
         let mut app = app_with_items(items, vec![]);
-        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
+        app.selected_item = app.display_list.iter().position(is_selectable);
         app.focus = FocusPanel::Right;
         insta::assert_snapshot!(render(&app, 80, 24));
     }
@@ -2305,7 +2308,7 @@ mod snapshot_tests {
         });
         let mut app = app_with_items(vec![wi], vec![]);
         // Select the first selectable work item entry.
-        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
+        app.selected_item = app.display_list.iter().position(is_selectable);
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 
@@ -2319,7 +2322,7 @@ mod snapshot_tests {
             1,
         )];
         let mut app = app_with_items(items, vec![]);
-        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
+        app.selected_item = app.display_list.iter().position(is_selectable);
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 
@@ -2335,7 +2338,7 @@ mod snapshot_tests {
             labels: vec!["bug".into()],
         });
         let mut app = app_with_items(vec![wi], vec![]);
-        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
+        app.selected_item = app.display_list.iter().position(is_selectable);
         app.status_message = Some("Right panel focused - press Ctrl+] to return".into());
         insta::assert_snapshot!(render(&app, 80, 24));
     }
@@ -2350,7 +2353,7 @@ mod snapshot_tests {
             1,
         )];
         let mut app = app_with_items(items, vec![]);
-        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
+        app.selected_item = app.display_list.iter().position(is_selectable);
         app.status_message = Some("This should be hidden".into());
         app.start_activity("Creating pull request...");
         app.spinner_tick = 3; // Pick a specific frame for deterministic snapshot.
@@ -2367,7 +2370,7 @@ mod snapshot_tests {
             1,
         )];
         let mut app = app_with_items(items, vec![]);
-        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
+        app.selected_item = app.display_list.iter().position(is_selectable);
         app.start_activity("Running review gate...");
         app.start_activity("Creating pull request...");
         app.spinner_tick = 0;
@@ -2531,7 +2534,7 @@ mod snapshot_tests {
         }];
         let mut app = app_with_items(items, vec![]);
         // Select the first selectable work item entry (skipping group headers).
-        app.selected_item = app.display_list.iter().position(|e| is_selectable(e));
+        app.selected_item = app.display_list.iter().position(is_selectable);
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 
