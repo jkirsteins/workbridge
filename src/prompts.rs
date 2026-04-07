@@ -44,6 +44,9 @@ mod tests {
         assert!(result.contains("Fix auth bug"));
         assert!(result.contains("/path/to/repo"));
         assert!(result.contains("workbridge_set_plan"));
+        assert!(result.contains("Acceptance Criteria"));
+        assert!(result.contains("PHASE 1: REFINEMENT"));
+        assert!(result.contains("PHASE 2: PLANNING"));
     }
 
     #[test]
