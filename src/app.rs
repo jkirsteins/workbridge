@@ -1345,6 +1345,8 @@ impl App {
             .find(|w| w.id == *work_item_id)
             .map(|w| w.status.clone())
             .unwrap_or(WorkItemStatus::Implementing);
+        let is_planning = work_item_status == WorkItemStatus::Planning;
+        let session_key = (work_item_id.clone(), work_item_status.clone());
         let system_prompt = self.stage_system_prompt(work_item_id, cwd);
         let mut cmd = Self::build_claude_cmd(&work_item_status, system_prompt.as_deref());
 
