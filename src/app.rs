@@ -1551,7 +1551,7 @@ impl App {
         if auto_start {
             if *status == WorkItemStatus::Review {
                 cmd.push(
-                    "Present the review gate assessment from your system prompt to the user."
+                    "Present the review gate assessment and the pull request URL from your system prompt to the user."
                         .to_string(),
                 );
             } else {
@@ -1633,6 +1633,12 @@ impl App {
             .first()
             .and_then(|a| a.branch.clone())
             .unwrap_or_else(|| "unknown".to_string());
+        let pr_url = wi
+            .repo_associations
+            .first()
+            .and_then(|a| a.pr.as_ref())
+            .map(|pr| pr.url.clone())
+            .filter(|u| !u.is_empty());
         let worktree_display = cwd.display().to_string();
 
         // Read the plan text (if any) from the backend.
@@ -1708,15 +1714,22 @@ impl App {
                 )
             }
             WorkItemStatus::Review => {
+                let pr_line = match &pr_url {
+                    Some(url) => format!(" Pull request: {url}."),
+                    None => format!(
+                        " Note: no pull request URL is available yet (it may still be creating). \
+                         You can find it by running: gh pr list --head {branch_name}"
+                    ),
+                };
                 if !review_gate_findings.is_empty() {
                     format!(
                         "Worktree: {worktree_display}. Branch: {branch_name}. \
-                         Implementation passed the review gate and is ready for review."
+                         Implementation passed the review gate and is ready for review.{pr_line}"
                     )
                 } else {
                     format!(
                         "Worktree: {worktree_display}. Branch: {branch_name}. \
-                         Implementation is complete and ready for review."
+                         Implementation is complete and ready for review.{pr_line}"
                     )
                 }
             }
@@ -1823,12 +1836,19 @@ impl App {
         let context_json = {
             let wi = self.work_items.iter().find(|w| w.id == *work_item_id);
             if let Some(wi) = wi {
+                let pr_url = wi
+                    .repo_associations
+                    .first()
+                    .and_then(|a| a.pr.as_ref())
+                    .map(|pr| pr.url.as_str())
+                    .unwrap_or("");
                 serde_json::json!({
                     "work_item_id": wi_id_str,
                     "stage": format!("{:?}", wi.status),
                     "title": wi.title,
                     "description": wi.description,
                     "repo": worktree_path.display().to_string(),
+                    "pr_url": pr_url,
                 })
                 .to_string()
             } else {
