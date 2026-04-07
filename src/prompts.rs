@@ -7,7 +7,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
-/// Raw prompt template with placeholder variables like {title}, {repo}, {plan}.
+/// Raw prompt template with placeholder variables like {title}, {situation}, {plan}.
 #[derive(Deserialize)]
 struct PromptEntry {
     template: String,
@@ -39,10 +39,10 @@ mod tests {
     fn render_planning_prompt() {
         let mut vars = HashMap::new();
         vars.insert("title", "Fix auth bug");
-        vars.insert("repo", "/path/to/repo");
+        vars.insert("situation", "Worktree: /tmp/wt. Branch: fix-auth. No plan exists yet.");
         let result = render("planning", &vars).unwrap();
         assert!(result.contains("Fix auth bug"));
-        assert!(result.contains("/path/to/repo"));
+        assert!(result.contains("Worktree: /tmp/wt"));
         assert!(result.contains("workbridge_set_plan"));
         assert!(result.contains("Acceptance Criteria"));
         assert!(result.contains("PHASE 1: REFINEMENT"));
@@ -53,7 +53,7 @@ mod tests {
     fn render_implementing_with_plan() {
         let mut vars = HashMap::new();
         vars.insert("title", "Add feature");
-        vars.insert("repo", "/repo");
+        vars.insert("situation", "Worktree: /tmp/wt. Branch: add-feature.");
         vars.insert("plan", "Step 1: do thing\nStep 2: test");
         let result = render("implementing_with_plan", &vars).unwrap();
         assert!(result.contains("Step 1: do thing"));
@@ -64,7 +64,7 @@ mod tests {
     fn render_implementing_no_plan() {
         let mut vars = HashMap::new();
         vars.insert("title", "Add feature");
-        vars.insert("repo", "/repo");
+        vars.insert("situation", "Worktree: /tmp/wt. Branch: add-feature.");
         let result = render("implementing_no_plan", &vars).unwrap();
         assert!(result.contains("CRITICAL: No implementation plan"));
         assert!(result.contains("Blocked"));
@@ -105,7 +105,7 @@ mod tests {
     fn render_implementing_rework() {
         let mut vars = HashMap::new();
         vars.insert("title", "Fix auth bug");
-        vars.insert("repo", "/path/to/repo");
+        vars.insert("situation", "Worktree: /tmp/wt. Branch: fix-auth. Rework requested.");
         vars.insert("plan", "Step 1: implement\nStep 2: test");
         vars.insert("rework_reason", "Tests are failing on CI");
         let result = render("implementing_rework", &vars).unwrap();

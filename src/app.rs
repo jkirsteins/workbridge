@@ -1068,7 +1068,7 @@ impl App {
         let mcp_result = self.start_mcp_for_session(&cwd, &work_item_id);
 
         // Build the claude command with system prompt and MCP config.
-        let system_prompt = self.stage_system_prompt(&work_item_id);
+        let system_prompt = self.stage_system_prompt(&work_item_id, &cwd);
         let mut cmd: Vec<String> = vec!["claude".to_string()];
         if is_planning {
             cmd.push("--permission-mode".to_string());
@@ -1199,16 +1199,24 @@ impl App {
     }
 
     /// Build a stage-specific system prompt for the Claude session.
-    fn stage_system_prompt(&mut self, work_item_id: &WorkItemId) -> Option<String> {
+    ///
+    /// `cwd` is the worktree path where Claude will run - used to build the
+    /// situation summary so Claude knows where it is working.
+    fn stage_system_prompt(
+        &mut self,
+        work_item_id: &WorkItemId,
+        cwd: &std::path::Path,
+    ) -> Option<String> {
         use std::collections::HashMap;
 
         let wi = self.work_items.iter().find(|w| w.id == *work_item_id)?;
         let title = wi.title.clone();
-        let repo_info = wi
+        let branch_name = wi
             .repo_associations
             .first()
-            .map(|a| a.repo_path.display().to_string())
-            .unwrap_or_default();
+            .and_then(|a| a.branch.as_deref())
+            .unwrap_or("unknown");
+        let worktree_display = cwd.display().to_string();
 
         // Read the plan text (if any) from the backend.
         let plan_text = match self.backend.read_plan(work_item_id) {
@@ -1223,14 +1231,53 @@ impl App {
         // Look up and consume rework reason if any (one-shot use).
         let rework_reason = self.rework_reasons.remove(work_item_id).unwrap_or_default();
 
-        let mut vars: HashMap<&str, &str> = HashMap::new();
-        vars.insert("title", &title);
-        vars.insert("repo", &repo_info);
-        vars.insert("plan", &plan_text);
-        vars.insert("rework_reason", &rework_reason);
-
-        let prompt_key = match wi.status {
+        // Build a situation summary that tells Claude where it is and what
+        // state the work item is in.  Uses the worktree path (not the main
+        // repo path) so Claude runs commands in the right directory.
+        let situation = match wi.status {
             WorkItemStatus::Backlog | WorkItemStatus::Done => return None,
+            WorkItemStatus::Planning => {
+                format!(
+                    "Worktree: {worktree_display}. Branch: {branch_name}. \
+                     No plan exists yet - your job is to create one."
+                )
+            }
+            WorkItemStatus::Implementing => {
+                if !rework_reason.is_empty() {
+                    format!(
+                        "Worktree: {worktree_display}. Branch: {branch_name}. \
+                         Rework requested (see reason below)."
+                    )
+                } else if plan_text.is_empty() {
+                    format!(
+                        "Worktree: {worktree_display}. Branch: {branch_name}. \
+                         No plan is available - you must block."
+                    )
+                } else {
+                    format!(
+                        "Worktree: {worktree_display}. Branch: {branch_name}. \
+                         An approved plan is available (see below)."
+                    )
+                }
+            }
+            WorkItemStatus::Blocked => {
+                format!(
+                    "Worktree: {worktree_display}. Branch: {branch_name}. \
+                     Waiting for user input."
+                )
+            }
+            WorkItemStatus::Review => {
+                format!(
+                    "Worktree: {worktree_display}. Branch: {branch_name}. \
+                     Implementation is complete and ready for review."
+                )
+            }
+        };
+
+        // Backlog | Done already returned None above, so they are
+        // unreachable here.
+        let prompt_key = match wi.status {
+            WorkItemStatus::Backlog | WorkItemStatus::Done => unreachable!(),
             WorkItemStatus::Planning => "planning",
             WorkItemStatus::Implementing => {
                 if !rework_reason.is_empty() {
@@ -1245,6 +1292,12 @@ impl App {
             WorkItemStatus::Review => "review",
         };
 
+        let mut vars: HashMap<&str, &str> = HashMap::new();
+        vars.insert("title", &title);
+        vars.insert("situation", &situation);
+        vars.insert("plan", &plan_text);
+        vars.insert("rework_reason", &rework_reason);
+
         crate::prompts::render(prompt_key, &vars)
     }
 
@@ -1254,7 +1307,7 @@ impl App {
     /// on failure.
     fn start_mcp_for_session(
         &self,
-        _worktree_path: &std::path::Path,
+        worktree_path: &std::path::Path,
         work_item_id: &WorkItemId,
     ) -> Result<(McpSocketServer, PathBuf), String> {
         let socket_path = crate::mcp::socket_path_for_session();
@@ -1264,6 +1317,8 @@ impl App {
             .map_err(|e| format!("MCP unavailable: could not serialize work item ID: {e}"))?;
 
         // Build context JSON for get_context tool.
+        // Uses the worktree path (not the main repo) so Claude operates in
+        // the correct working directory.
         let context_json = {
             let wi = self.work_items.iter().find(|w| w.id == *work_item_id);
             if let Some(wi) = wi {
@@ -1271,7 +1326,7 @@ impl App {
                     "work_item_id": wi_id_str,
                     "stage": format!("{:?}", wi.status),
                     "title": wi.title,
-                    "repo": wi.repo_associations.first().map(|a| a.repo_path.display().to_string()).unwrap_or_default(),
+                    "repo": worktree_path.display().to_string(),
                 })
                 .to_string()
             } else {

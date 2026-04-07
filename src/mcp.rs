@@ -296,7 +296,7 @@ fn handle_message(
                 }),
                 json!({
                     "name": "workbridge_get_context",
-                    "description": "Get the current context for this work item: stage, title, repo path.",
+                    "description": "Get the current context for this work item: stage, title, worktree path.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
