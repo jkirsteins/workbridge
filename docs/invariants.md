@@ -155,6 +155,13 @@ Implementing, Blocked, Review, Done. Stage transitions are user-initiated
 (MVP). The Blocked stage is a sub-state of Implementing where Claude needs
 user input. Done can also be derived from merged PRs (existing behavior).
 
+**Blocked -> Planning retreat:** When Claude blocks due to a missing
+implementation plan, the user may retreat from Blocked to Planning. This
+is an explicit user opt-in (prompted, never automatic). The retreat clears
+the existing plan and spawns a retroactive planning session that analyzes
+the branch's existing commits to produce a plan. The plan clear only
+proceeds if the status transition succeeds.
+
 ### 13. Fresh Claude session per stage
 
 Each stage transition that involves Claude spawns a fresh session. The plan

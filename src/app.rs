@@ -1357,8 +1357,8 @@ impl App {
         let branch_name = wi
             .repo_associations
             .first()
-            .and_then(|a| a.branch.as_deref())
-            .unwrap_or("unknown");
+            .and_then(|a| a.branch.clone())
+            .unwrap_or_else(|| "unknown".to_string());
         let worktree_display = cwd.display().to_string();
 
         // Read the plan text (if any) from the backend.
@@ -1376,15 +1376,20 @@ impl App {
 
         // Check if the branch has commits ahead of the default branch.
         // Used to select the retroactive planning prompt when appropriate.
-        let repo_path = wi.repo_associations.first().map(|a| &a.repo_path);
-        let has_branch_commits = repo_path
+        // Clone the repo path to release the borrow on self.work_items
+        // before calling &mut self method.
+        let repo_path_owned = wi.repo_associations.first().map(|a| a.repo_path.clone());
+        let status = wi.status.clone();
+        let description = wi.description.clone();
+        let has_branch_commits = repo_path_owned
+            .as_ref()
             .map(|rp| self.branch_has_commits(cwd, rp))
             .unwrap_or(false);
 
         // Build a situation summary that tells Claude where it is and what
         // state the work item is in.  Uses the worktree path (not the main
         // repo path) so Claude runs commands in the right directory.
-        let situation = match wi.status {
+        let situation = match status {
             WorkItemStatus::Backlog | WorkItemStatus::Done => return None,
             WorkItemStatus::Planning => {
                 if has_branch_commits {
@@ -1433,8 +1438,8 @@ impl App {
         };
 
         // Backlog | Done already returned None above, so they are
-        // unreachable here.
-        let prompt_key = match wi.status {
+        // unreachable here - the match uses a cloned status value.
+        let prompt_key = match status {
             WorkItemStatus::Backlog | WorkItemStatus::Done => unreachable!(),
             WorkItemStatus::Planning => {
                 if has_branch_commits {
@@ -1456,7 +1461,7 @@ impl App {
             WorkItemStatus::Review => "review",
         };
 
-        let description_var = match &wi.description {
+        let description_var = match &description {
             Some(d) if !d.is_empty() => format!("\nUser-provided description: {d}"),
             _ => String::new(),
         };
@@ -1472,12 +1477,17 @@ impl App {
     }
 
     /// Check if the branch in `cwd` has commits ahead of the default branch.
-    /// Returns false on any error (missing branch, no git, etc.).
-    fn branch_has_commits(&self, cwd: &std::path::Path, repo_path: &std::path::Path) -> bool {
-        let default_branch = self
-            .worktree_service
-            .default_branch(repo_path)
-            .unwrap_or_else(|_| "main".to_string());
+    /// Returns false and surfaces a status message on error so the user knows
+    /// retroactive analysis was skipped.
+    fn branch_has_commits(&mut self, cwd: &std::path::Path, repo_path: &std::path::Path) -> bool {
+        let default_branch = match self.worktree_service.default_branch(repo_path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status_message =
+                    Some(format!("Could not detect default branch: {e}"));
+                return false;
+            }
+        };
 
         let output = std::process::Command::new("git")
             .args(["log", &format!("{default_branch}..HEAD"), "--oneline"])
@@ -1488,7 +1498,19 @@ impl App {
                 let stdout = String::from_utf8_lossy(&o.stdout);
                 !stdout.trim().is_empty()
             }
-            _ => false,
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                self.status_message = Some(format!(
+                    "Branch commit check failed: {}",
+                    stderr.trim()
+                ));
+                false
+            }
+            Err(e) => {
+                self.status_message =
+                    Some(format!("Branch commit check failed: {e}"));
+                false
+            }
         }
     }
 
@@ -1644,13 +1666,17 @@ impl App {
                         let current = current_status.clone().unwrap();
                         self.apply_stage_change(&wi_id, &current, &new_status, "mcp");
 
-                        // Then show the prompt offering to retreat to Planning.
-                        self.no_plan_prompt_visible = true;
-                        self.no_plan_prompt_wi = Some(wi_id);
-                        self.status_message = Some(
-                            "No plan available. [p] Plan from branch  [Esc] Stay blocked"
-                                .to_string(),
-                        );
+                        // Only show the prompt if one is not already visible.
+                        // A second work item blocking with no-plan should not
+                        // clobber the first prompt's work item ID.
+                        if !self.no_plan_prompt_visible {
+                            self.no_plan_prompt_visible = true;
+                            self.no_plan_prompt_wi = Some(wi_id);
+                            self.status_message = Some(
+                                "No plan available. [p] Plan from branch  [Esc] Stay blocked"
+                                    .to_string(),
+                            );
+                        }
                         continue;
                     }
 
@@ -2200,11 +2226,21 @@ impl App {
             return;
         }
 
-        // Transition first, then clear the plan. This way if the status
-        // update fails the plan is not destroyed.
+        // Transition first, then clear the plan. Only clear the plan if
+        // the transition actually succeeded (the work item is now Planning).
         let current = WorkItemStatus::Blocked;
         let next = WorkItemStatus::Planning;
         self.apply_stage_change(wi_id, &current, &next, "user");
+
+        let is_planning = self
+            .work_items
+            .iter()
+            .find(|w| w.id == *wi_id)
+            .is_some_and(|w| w.status == WorkItemStatus::Planning);
+        if !is_planning {
+            // apply_stage_change already set a status_message with the error.
+            return;
+        }
 
         // Clear the plan so the planning session starts fresh.
         if let Err(e) = self.backend.update_plan(wi_id, "") {
