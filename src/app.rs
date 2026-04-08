@@ -1695,7 +1695,6 @@ impl App {
             .find(|w| w.id == *work_item_id)
             .map(|w| w.status.clone())
             .unwrap_or(WorkItemStatus::Implementing);
-        let is_planning = work_item_status == WorkItemStatus::Planning;
         let session_key = (work_item_id.clone(), work_item_status.clone());
         let has_gate_findings = self.review_gate_findings.contains_key(work_item_id);
         let system_prompt = self.stage_system_prompt(work_item_id, cwd);
@@ -1736,62 +1735,6 @@ impl App {
                     self.status_message = Some(format!("Cannot resolve executable path: {e}"));
                 }
             }
-        }
-
-        // Write a Claude Code PreToolUse hook into the worktree so Claude cannot
-        // exit plan mode without calling workbridge_set_plan.  For non-planning
-        // stages, remove any leftover hook from a prior planning session.
-        let claude_dir = cwd.join(".claude");
-        if is_planning {
-            // Check if our target files are already tracked by git.  If so,
-            // writing them would silently modify tracked files, so skip the
-            // hook and let prompt-level enforcement be the only safeguard.
-            let files_tracked = crate::worktree_service::git_command()
-                .args([
-                    "-C",
-                    &cwd.to_string_lossy(),
-                    "ls-files",
-                    ".claude/settings.local.json",
-                    ".claude/.gitignore",
-                ])
-                .output()
-                .map(|o| !o.stdout.is_empty())
-                .unwrap_or(false);
-
-            if files_tracked {
-                self.status_message =
-                    Some("Planning hook skipped: .claude/ has tracked files in this repo".into());
-            } else {
-                let _ = std::fs::create_dir_all(&claude_dir);
-                // Ignore everything in .claude/ so the settings file does not
-                // appear as an untracked file (some repos reject dangling
-                // files in pre-commit hooks).  A .gitignore containing `*`
-                // also matches itself, so git reports zero untracked entries.
-                let _ = std::fs::write(claude_dir.join(".gitignore"), "*\n");
-                let hook_settings = r#"{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "ExitPlanMode",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash -c 'T=$(cat | jq -r .transcript_path); grep -q workbridge_set_plan \"$T\" 2>/dev/null || { echo \"BLOCKED: You MUST call workbridge_set_plan with the finalized plan before exiting plan mode.\" >&2; exit 2; }'"
-          }
-        ]
-      }
-    ]
-  }
-}"#;
-                if let Err(e) =
-                    std::fs::write(claude_dir.join("settings.local.json"), hook_settings)
-                {
-                    self.status_message = Some(format!("Hook settings write error: {e}"));
-                }
-            }
-        } else {
-            // Clean up planning-stage hook so it does not block non-planning sessions.
-            let _ = std::fs::remove_file(claude_dir.join("settings.local.json"));
         }
 
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
@@ -1846,6 +1789,11 @@ impl App {
         if is_planning {
             cmd.push("--permission-mode".to_string());
             cmd.push("plan".to_string());
+            cmd.push("--settings".to_string());
+            cmd.push(
+                r#"{"hooks":{"PostToolUse":[{"matcher":"TodoWrite","hooks":[{"type":"command","command":"bash -c 'cat | grep -q workbridge_set_plan || echo \"REMINDER: Your plan MUST include a step to call workbridge_set_plan MCP tool to persist the plan. Add this as the FIRST step.\" >&2; true'"}]}]}}"#
+                    .to_string(),
+            );
         }
         if let Some(prompt) = system_prompt {
             cmd.push("--system-prompt".to_string());
@@ -7482,14 +7430,19 @@ mod tests {
     /// a config file path and exits with "MCP config file not found".
     #[test]
     fn build_claude_cmd_prompt_before_mcp_config() {
-        // Planning session: has --permission-mode plan and positional prompt.
+        // Planning session: has --permission-mode plan, --settings hook, and positional prompt.
         let cmd =
             App::build_claude_cmd(&WorkItemStatus::Planning, Some("system prompt here"), false);
         assert_eq!(cmd[0], "claude");
         assert_eq!(cmd[1], "--permission-mode");
         assert_eq!(cmd[2], "plan");
-        assert_eq!(cmd[3], "--system-prompt");
-        assert_eq!(cmd[4], "system prompt here");
+        assert_eq!(cmd[3], "--settings");
+        assert!(
+            cmd[4].contains("PostToolUse") && cmd[4].contains("workbridge_set_plan"),
+            "planning sessions must include TodoWrite reminder hook via --settings",
+        );
+        assert_eq!(cmd[5], "--system-prompt");
+        assert_eq!(cmd[6], "system prompt here");
         // Positional prompt is the LAST element - callers append
         // --mcp-config after this, so it stays after the prompt.
         assert_eq!(
