@@ -26,7 +26,7 @@ use crate::create_dialog::{CreateDialog, CreateDialogFocus};
 use crate::layout;
 use crate::theme::Theme;
 use crate::work_item::{
-    BackendType, CheckStatus, PrState, WorkItemError, WorkItemKind, WorkItemStatus,
+    BackendType, CheckStatus, PrState, ReviewDecision, WorkItemError, WorkItemKind, WorkItemStatus,
 };
 
 /// Braille-dot spinner frames for the activity indicator.
@@ -1096,6 +1096,89 @@ fn draw_work_item_detail(
     paragraph.render(area, buf);
 }
 
+/// Draw a structured detail view for an unlinked PR.
+///
+/// Shows PR title, number/URL, repo, branch, state, draft status,
+/// review decision, and CI checks, followed by a prompt to import.
+fn draw_unlinked_pr_detail(
+    buf: &mut Buffer,
+    unlinked: &crate::work_item::UnlinkedPr,
+    theme: &Theme,
+    block: Block<'_>,
+    area: Rect,
+) {
+    let pr = &unlinked.pr;
+    let label_style = theme.style_heading();
+    let none_style = theme.style_text_muted();
+
+    let val_style = |s: &str| -> ratatui_core::style::Style {
+        if s == "(none)" {
+            none_style
+        } else {
+            theme.style_text()
+        }
+    };
+
+    let pr_str = format!("#{} {}", pr.number, pr.url);
+    let repo_str = unlinked.repo_path.display().to_string();
+
+    let state_str = match pr.state {
+        PrState::Open => "Open",
+        PrState::Closed => "Closed",
+        PrState::Merged => "Merged",
+    };
+
+    let draft_str = if pr.is_draft { "Yes" } else { "No" };
+
+    let review_str = match pr.review_decision {
+        ReviewDecision::Approved => "Approved",
+        ReviewDecision::ChangesRequested => "Changes requested",
+        ReviewDecision::Pending => "Pending",
+        ReviewDecision::None => "(none)",
+    };
+
+    let checks_str = match pr.checks {
+        CheckStatus::Passing => "Passing",
+        CheckStatus::Failing => "Failing",
+        CheckStatus::Pending => "Pending",
+        CheckStatus::Unknown => "Unknown",
+        CheckStatus::None => "(none)",
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(format!("  {}", pr.title), theme.style_text())),
+        Line::from(""),
+    ];
+
+    let fields: Vec<(&str, &str)> = vec![
+        ("PR", &pr_str),
+        ("Repo", &repo_str),
+        ("Branch", &unlinked.branch),
+        ("State", state_str),
+        ("Draft", draft_str),
+        ("Review", review_str),
+        ("Checks", checks_str),
+    ];
+
+    for (label, value) in &fields {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {label:<12}"), label_style),
+            Span::styled(value.to_string(), val_style(value)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press Enter to import this PR as a work item.",
+        none_style,
+    )));
+
+    let text = Text::from(lines);
+    let paragraph = Paragraph::new(text).block(block);
+    paragraph.render(area, buf);
+}
+
 /// Draw the right panel showing captured PTY output.
 /// Uses vt100::Parser + tui-term PseudoTerminal for full ANSI color rendering.
 ///
@@ -1232,16 +1315,20 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 }
             }
         }
-        Some(DisplayEntry::UnlinkedItem(_)) => {
-            let text = Text::from(vec![
-                Line::from(""),
-                Line::from("  Press Enter to import"),
-                Line::from("  this PR as a work item."),
-            ]);
-            let paragraph = Paragraph::new(text)
-                .block(block)
-                .style(theme.style_text_muted());
-            paragraph.render(area, buf);
+        Some(DisplayEntry::UnlinkedItem(ul_idx)) => {
+            if let Some(unlinked) = app.unlinked_prs.get(*ul_idx) {
+                draw_unlinked_pr_detail(buf, unlinked, theme, block, area);
+            } else {
+                let text = Text::from(vec![
+                    Line::from(""),
+                    Line::from("  Press Enter to import"),
+                    Line::from("  this PR as a work item."),
+                ]);
+                let paragraph = Paragraph::new(text)
+                    .block(block)
+                    .style(theme.style_text_muted());
+                paragraph.render(area, buf);
+            }
         }
         _ => {
             // Nothing selected or non-selectable entry.

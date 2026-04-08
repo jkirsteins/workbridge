@@ -5,17 +5,17 @@ expression: "render(&app, 80, 24)"
   List    Board                                                Tab: switch view
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  UNLINKED (1)         ││                                                     │
-│> ? fix-typo      PR#45││  Press Enter to import                              │
-│  ACTIVE (0) (1)       ││  this PR as a work item.                            │
-│  [IM] Active  PR#30 ok││                                                     │
-│  feature              ││                                                     │
-│  branch-prog-1 [no wt]││                                                     │
+│> ? fix-typo      PR#45││  Unlinked PR #45                                    │
+│  ACTIVE (0) (1)       ││                                                     │
+│  [IM] Active  PR#30 ok││  PR          #45 https://github.com/o/r/pull/45     │
+│  feature              ││  Repo        /repo/unlinked                         │
+│  branch-prog-1 [no wt]││  Branch      fix-typo                               │
+│                       ││  State       Open                                   │
+│                       ││  Draft       No                                     │
+│                       ││  Review      (none)                                 │
+│                       ││  Checks      (none)                                 │
 │                       ││                                                     │
-│                       ││                                                     │
-│                       ││                                                     │
-│                       ││                                                     │
-│                       ││                                                     │
-│                       ││                                                     │
+│                       ││  Press Enter to import this PR as a work item.      │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

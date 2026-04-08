@@ -206,12 +206,8 @@ pub struct PrInfo {
     pub title: String,
     pub state: PrState,
     pub is_draft: bool,
-    /// Shown in detail views when added; read in tests.
-    #[allow(dead_code)]
     pub review_decision: ReviewDecision,
     pub checks: CheckStatus,
-    /// Shown in detail views when added; read in tests.
-    #[allow(dead_code)]
     pub url: String,
 }
 
