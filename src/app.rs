@@ -2253,6 +2253,18 @@ impl App {
                         continue;
                     }
 
+                    // Block all MCP transitions for review request items.
+                    // Claude sessions should not drive workflow for someone else's PR.
+                    if wi_ref
+                        .map(|w| w.kind == WorkItemKind::ReviewRequest)
+                        .unwrap_or(false)
+                    {
+                        self.status_message = Some(
+                            "MCP: status transitions not supported for review request items".into(),
+                        );
+                        continue;
+                    }
+
                     let current_status = wi_ref.map(|w| w.status.clone());
 
                     // Restrict MCP to valid forward transitions only.
@@ -3029,6 +3041,13 @@ impl App {
             self.status_message = Some("Status is derived from merged PR".into());
             return;
         }
+        // Review request items only support Review -> Done (via merge gate).
+        // Block advance from any other stage.
+        if wi.kind == WorkItemKind::ReviewRequest && wi.status != WorkItemStatus::Review {
+            self.status_message =
+                Some("Review request items only support Review and Done stages".into());
+            return;
+        }
         let current_status = wi.status.clone();
         let Some(new_status) = current_status.next_stage() else {
             self.status_message = Some("Already at final stage".into());
@@ -3087,6 +3106,12 @@ impl App {
         };
         if wi.status_derived {
             self.status_message = Some("Status is derived from merged PR".into());
+            return;
+        }
+        // Review request items cannot retreat - there is no valid previous
+        // stage for a review request in Review.
+        if wi.kind == WorkItemKind::ReviewRequest {
+            self.status_message = Some("Review request items cannot be retreated".into());
             return;
         }
         let current_status = wi.status.clone();

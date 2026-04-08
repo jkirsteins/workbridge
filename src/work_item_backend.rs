@@ -474,7 +474,7 @@ impl WorkItemBackend for LocalFileBackend {
         let request = CreateWorkItem {
             title: rr.pr.title.clone(),
             description: None,
-            status: WorkItemStatus::Backlog,
+            status: WorkItemStatus::Review,
             kind: WorkItemKind::ReviewRequest,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: rr.repo_path.clone(),

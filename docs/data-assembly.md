@@ -90,6 +90,20 @@ many total open PRs exist in the repo (the per-call limit of 500 is more
 than sufficient for a single user). Unlinked PR discovery also only
 shows the user's own PRs.
 
+In addition to the user's own PRs, the fetcher also queries for
+review-requested PRs using the `review-requested:@me` GitHub search
+filter. These are PRs authored by others where the current user has
+been requested as a reviewer.
+
+The `reassemble()` function produces a 3-tuple:
+`(work_items, unlinked_prs, review_requested_prs)`. The
+`collect_review_requested_prs()` helper filters out any
+review-requested PRs that are already claimed by an existing work item,
+so only genuinely untracked review requests appear in the sidebar.
+Review-requested PRs are distinct from unlinked PRs - unlinked PRs are
+the user's own PRs without a work item, while review-requested PRs are
+other people's PRs where the user is a reviewer.
+
 This requires GitHub API access with authentication. Responses take
 200-500ms typically. Rate-limited to 5000 requests/hour with a token.
 
