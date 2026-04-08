@@ -358,6 +358,12 @@ pub struct App {
     /// activities are present.
     pub spinner_tick: usize,
 
+    // -- Background fetch indicator --
+    /// Activity ID for the in-flight background GitHub fetch. Started when
+    /// a FetchStarted message arrives, ended when RepoData or FetcherError
+    /// arrives. Shows a spinner in the status bar during GitHub API calls.
+    pub fetch_activity: Option<ActivityId>,
+
     // -- Async PR creation --
     /// Receiver for asynchronous PR creation results.
     pub pr_create_rx: Option<crossbeam_channel::Receiver<PrCreateResult>>,
@@ -524,6 +530,7 @@ impl App {
             activity_counter: 0,
             activities: Vec::new(),
             spinner_tick: 0,
+            fetch_activity: None,
             pr_create_rx: None,
             pr_create_activity: None,
             pr_create_wi: None,
@@ -964,8 +971,26 @@ impl App {
         let mut received_any = false;
         loop {
             match rx.try_recv() {
+                Ok(FetchMessage::FetchStarted { .. }) => {
+                    // Show a spinner while GitHub data is being fetched.
+                    // Only start one activity even if multiple repos send
+                    // FetchStarted before any RepoData arrives.
+                    if self.fetch_activity.is_none() {
+                        self.activity_counter += 1;
+                        let id = ActivityId(self.activity_counter);
+                        self.activities.push(Activity {
+                            id,
+                            message: "Refreshing GitHub data".into(),
+                        });
+                        self.fetch_activity = Some(id);
+                    }
+                    continue;
+                }
                 Ok(FetchMessage::RepoData(result)) => {
                     received_any = true;
+                    if let Some(id) = self.fetch_activity.take() {
+                        self.activities.retain(|a| a.id != id);
+                    }
                     // Surface worktree errors in the status bar. One-time
                     // per repo to avoid flooding on every fetch cycle.
                     if let Err(ref e) = result.worktrees
@@ -1009,6 +1034,9 @@ impl App {
                 }
                 Ok(FetchMessage::FetcherError { error, .. }) => {
                     received_any = true;
+                    if let Some(id) = self.fetch_activity.take() {
+                        self.activities.retain(|a| a.id != id);
+                    }
                     let msg = format!("Fetch error: {error}");
                     if self.status_message.is_none() {
                         self.status_message = Some(msg);
@@ -4860,6 +4888,93 @@ mod tests {
             source.contains(r#""500""#) && source.contains(r#""--limit""#),
             "PR list limit should be 500 to avoid silent truncation in busy repos",
         );
+    }
+
+    /// PR list calls must include --author @me to filter to the
+    /// authenticated user's PRs. Without this, repos with 5000+ open PRs
+    /// return foreign PRs and may not include the user's own.
+    #[test]
+    fn pr_list_uses_author_me() {
+        let source = include_str!("github_client.rs");
+        assert!(
+            source.contains(r#""--author""#) && source.contains(r#""@me""#),
+            "PR list calls should include --author @me to filter to user's PRs",
+        );
+    }
+
+    /// FetchStarted message triggers a status bar activity, cleared on
+    /// RepoData arrival.
+    #[test]
+    fn fetch_started_shows_activity() {
+        let mut app = App::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.fetch_rx = Some(rx);
+
+        tx.send(FetchMessage::FetchStarted {
+            repo_path: PathBuf::from("/repo"),
+        })
+        .unwrap();
+
+        app.drain_fetch_results();
+        assert!(app.fetch_activity.is_some());
+        assert!(app.current_activity().is_some());
+
+        // Sending RepoData should clear the activity.
+        tx.send(FetchMessage::RepoData(RepoFetchResult {
+            repo_path: PathBuf::from("/repo"),
+            github_remote: None,
+            worktrees: Ok(vec![]),
+            prs: Ok(vec![]),
+            issues: vec![],
+        }))
+        .unwrap();
+
+        app.drain_fetch_results();
+        assert!(app.fetch_activity.is_none());
+    }
+
+    /// FetcherError also clears the fetch activity.
+    #[test]
+    fn fetch_started_cleared_on_error() {
+        let mut app = App::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.fetch_rx = Some(rx);
+
+        tx.send(FetchMessage::FetchStarted {
+            repo_path: PathBuf::from("/repo"),
+        })
+        .unwrap();
+        app.drain_fetch_results();
+        assert!(app.fetch_activity.is_some());
+
+        tx.send(FetchMessage::FetcherError {
+            repo_path: PathBuf::from("/repo"),
+            error: "test error".into(),
+        })
+        .unwrap();
+
+        app.drain_fetch_results();
+        assert!(app.fetch_activity.is_none());
+    }
+
+    /// Multiple FetchStarted messages should not create duplicate activities.
+    #[test]
+    fn fetch_started_deduplicates() {
+        let mut app = App::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.fetch_rx = Some(rx);
+
+        tx.send(FetchMessage::FetchStarted {
+            repo_path: PathBuf::from("/repo-a"),
+        })
+        .unwrap();
+        tx.send(FetchMessage::FetchStarted {
+            repo_path: PathBuf::from("/repo-b"),
+        })
+        .unwrap();
+
+        app.drain_fetch_results();
+        assert_eq!(app.activities.len(), 1);
     }
 
     // -- Round 4 regression tests --

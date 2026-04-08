@@ -50,9 +50,9 @@ keep Done items showing their PR link.
 
 Done items that were merged before `pr_identity` persistence was added
 have their identity backfilled at startup: a background thread queries
-`gh pr list --state merged` once per repo and matches branches. This is
-a one-time migration - once all Done items have `pr_identity` on disk,
-the backfill code can be removed.
+`gh pr list --state merged --author @me` once per repo and matches
+branches. This is a one-time migration - once all Done items have
+`pr_identity` on disk, the backfill code can be removed.
 
 ### Tier 0: Local git (instant, always available)
 
@@ -84,8 +84,18 @@ is down or the remote is unreachable.
 - Issue details, labels, assignees
 - Issue state (open/closed)
 
+PR list calls use `--author @me` to filter to the authenticated user's
+PRs. This ensures the user's PRs are always returned regardless of how
+many total open PRs exist in the repo (the per-call limit of 500 is more
+than sufficient for a single user). Unlinked PR discovery also only
+shows the user's own PRs.
+
 This requires GitHub API access with authentication. Responses take
 200-500ms typically. Rate-limited to 5000 requests/hour with a token.
+
+The status bar shows a spinner ("Refreshing GitHub data") while Tier 2
+fetches are in progress. This provides visibility into the background
+refresh cycle, especially during the initial startup fetch.
 
 ### Tier 3: Derived (pure computation)
 
@@ -174,13 +184,15 @@ the worktree is removed.
 With 5000 GitHub API requests per hour and a 120-second refresh cycle,
 the budget per cycle is ~166 requests. Each work item costs approximately:
 
-- 1 request: search PRs by head branch
+- 1 request: search PRs by head branch (filtered to `--author @me`)
 - 1 request: get issue details (if linked)
 - 1 request: get PR check runs (if PR exists)
 
 So ~2-3 requests per work item per cycle. At 166 requests per cycle, the
 system supports ~55-80 active work items before approaching rate limits.
-This is well beyond typical usage.
+This is well beyond typical usage. The `--author @me` filter keeps the
+PR list response small regardless of total repo PR count, so even repos
+with thousands of open PRs stay within budget.
 
 For users with many repos and many open branches, WorkBridge should
 prioritize refreshing work items that are currently visible or recently

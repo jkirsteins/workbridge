@@ -105,6 +105,11 @@ fn fetcher_loop(
             break;
         }
 
+        // Step 0: notify the UI that a fetch cycle is starting
+        let _ = tx.send(FetchMessage::FetchStarted {
+            repo_path: repo_path.clone(),
+        });
+
         // Step 1: list worktrees
         let worktrees = worktree_service.list_worktrees(&repo_path);
 
@@ -303,6 +308,56 @@ mod tests {
         }
     }
 
+    /// Helper: receive the next non-FetchStarted message from the channel,
+    /// asserting that any preceding messages are FetchStarted.
+    fn recv_data(rx: &mpsc::Receiver<FetchMessage>) -> FetchMessage {
+        loop {
+            let msg = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("should receive a FetchMessage within 5 seconds");
+            match msg {
+                FetchMessage::FetchStarted { .. } => continue,
+                other => return other,
+            }
+        }
+    }
+
+    #[test]
+    fn fetcher_sends_fetch_started_before_data() {
+        let ws = Arc::new(MockWorktreeService {
+            worktrees: vec![],
+            github_remote: Some(("owner".to_string(), "repo".to_string())),
+        });
+        let gc = Arc::new(MockGithubClient::new());
+
+        let (rx, handle) = start(
+            vec![PathBuf::from("/tmp/test-repo")],
+            ws,
+            gc,
+            r"^(\d+)-".to_string(),
+        );
+
+        // First message must be FetchStarted.
+        let first = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("should receive first message");
+        assert!(
+            matches!(first, FetchMessage::FetchStarted { .. }),
+            "first message should be FetchStarted, got RepoData/FetcherError",
+        );
+
+        // Second message should be RepoData.
+        let second = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("should receive second message");
+        assert!(
+            matches!(second, FetchMessage::RepoData(_)),
+            "second message should be RepoData",
+        );
+
+        handle.stop();
+    }
+
     #[test]
     fn fetcher_sends_results() {
         let ws = Arc::new(MockWorktreeService {
@@ -342,10 +397,7 @@ mod tests {
             r"^(\d+)-".to_string(),
         );
 
-        // Wait for a message (with timeout to avoid hanging)
-        let msg = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("should receive a FetchMessage within 5 seconds");
+        let msg = recv_data(&rx);
 
         match msg {
             FetchMessage::RepoData(result) => {
@@ -370,6 +422,9 @@ mod tests {
             }
             FetchMessage::FetcherError { error, .. } => {
                 panic!("unexpected FetcherError: {error}");
+            }
+            FetchMessage::FetchStarted { .. } => {
+                panic!("unexpected FetchStarted after recv_data");
             }
         }
 
@@ -412,9 +467,7 @@ mod tests {
             r"^(\d+)-".to_string(),
         );
 
-        let msg = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("should receive a FetchMessage within 5 seconds");
+        let msg = recv_data(&rx);
 
         match msg {
             FetchMessage::RepoData(result) => {
@@ -431,6 +484,9 @@ mod tests {
             }
             FetchMessage::FetcherError { error, .. } => {
                 panic!("unexpected FetcherError: {error}");
+            }
+            FetchMessage::FetchStarted { .. } => {
+                panic!("unexpected FetchStarted after recv_data");
             }
         }
 
@@ -469,9 +525,7 @@ mod tests {
             extra,
         );
 
-        let msg = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("should receive a FetchMessage within 5 seconds");
+        let msg = recv_data(&rx);
 
         match msg {
             FetchMessage::RepoData(result) => {
@@ -492,6 +546,9 @@ mod tests {
             }
             FetchMessage::FetcherError { error, .. } => {
                 panic!("unexpected FetcherError: {error}");
+            }
+            FetchMessage::FetchStarted { .. } => {
+                panic!("unexpected FetchStarted after recv_data");
             }
         }
 
