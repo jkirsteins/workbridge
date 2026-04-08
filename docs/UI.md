@@ -69,6 +69,31 @@ Pattern for background I/O:
 See `spawn_import_worktree()` and `poll_worktree_creation()` in
 `src/app.rs` as reference implementations.
 
+#### Streaming progress variant
+
+When a background task needs to send intermediate progress updates
+before a final result, use `crossbeam_channel::unbounded()` instead of
+`bounded(1)`. Define an enum with Progress and Result variants. The
+background thread sends zero or more Progress messages followed by one
+Result. The poll method uses a drain loop:
+
+```
+loop {
+    match rx.try_recv() {
+        Ok(Progress(text)) => update progress field, continue
+        Ok(Result(r))      => process final result, break
+        Err(Empty)         => break (no more messages this tick)
+        Err(Disconnected)  => thread died without Result, handle error
+    }
+}
+```
+
+The sender detects cancellation when `tx.send()` returns `Err`
+(receiver dropped). Long-running poll loops should include a timeout
+to prevent indefinite thread leaks.
+
+See `spawn_review_gate()` and `poll_review_gate()` in `src/app.rs`.
+
 Examples of operations that MUST be async:
 - `git fetch`, `git worktree add`, `git clone`
 - GitHub API calls (`gh pr list`, `gh api`)

@@ -156,7 +156,28 @@ All other transitions must go through TUI keybinds.
 
 ### Review gate
 
-When a work item transitions from Implementing or Blocked to Review (whether user- or MCP-initiated), a review gate runs asynchronously. It compares the implementation plan against the actual code changes and produces findings. If no plan exists, the gate is skipped.
+When a work item transitions from Implementing or Blocked to Review (whether
+user- or MCP-initiated), a review gate runs asynchronously in three phases:
+
+1. **PR existence check** - if the repo has a GitHub remote, the gate verifies
+   a pull request exists for the branch. If no PR is found, the gate rejects
+   with a message asking the implementer to create one. Repos with no GitHub
+   remote skip this phase entirely.
+
+2. **CI check wait** - if the PR has CI checks configured (status check rollup
+   is not empty), the gate polls `gh pr checks` every 15 seconds until all
+   checks complete. Progress is shown in the right panel (e.g. "2 / 5 CI
+   checks green"). If any check fails, the gate rejects immediately with the
+   names of the failed checks. If no checks are configured, this phase is
+   skipped.
+
+3. **Adversarial code review** - compares the implementation plan against the
+   actual code changes (git diff) and produces findings. If no plan exists,
+   the gate is blocked before it can start.
+
+If the gate approves, the work item advances to Review. If it rejects (at any
+phase), the rejection reason is fed back to the implementing Claude session as
+rework feedback.
 
 ### Merge gate
 
