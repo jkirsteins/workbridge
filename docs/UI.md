@@ -243,11 +243,38 @@ View mode header styles:
 - `style_view_mode_tab_active()` - active tab label (bold, inverted highlight)
 - `style_view_mode_hints()` - keybinding hints text (dimmed)
 
+Session activity indicator styles:
+- `style_badge_session_idle()` - filled circle for idle session (Gray)
+- `style_badge_session_working()` - animated braille spinner for active work (Cyan, Bold)
+
 Board-specific styles:
 - `style_board_column_focused()` - border for the active column
 - `style_board_column_unfocused()` - border for inactive columns
 - `style_board_column_header()` - column header text
 - `style_board_item_highlight()` - selected item highlight bar
+
+## Session Activity Indicators
+
+Work items display a visual indicator when a Claude session exists,
+distinguishing three states:
+
+1. **No session**: no indicator (default).
+2. **Session exists, idle**: a filled circle in Gray. This means a Claude
+   session is alive but has not signaled active work.
+3. **Actively working**: an animated braille spinner in Cyan+Bold. Claude
+   has called `workbridge_set_activity(working=true)` via MCP.
+
+In the flat list view, the indicator appears as the first right-side
+badge (before the PR badge). In the board view, it appears on the
+second line alongside PR and CI indicators.
+
+The activity state is signaled by Claude via the `workbridge_set_activity`
+MCP tool and is cleared automatically when the session process exits
+(detected during liveness checks).
+
+The spinner reuses the same braille-dot frames and 200ms tick rate as the
+status bar activity indicator. The `spinner_tick` counter advances when
+either status-bar activities or `claude_working` entries exist.
 
 ## Testing
 

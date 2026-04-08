@@ -298,8 +298,29 @@ fn format_board_item<'a>(
 
     // Status indicators on a second line (PR badge, session status).
     let mut indicators: Vec<Span<'a>> = Vec::new();
+
+    // Session activity indicator.
+    let has_session = app.session_key_for(&wi.id).is_some();
+    let is_working = app.claude_working.contains(&wi.id);
+    if is_working {
+        let frame = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+        indicators.push(Span::styled(
+            frame.to_string(),
+            theme.style_badge_session_working(),
+        ));
+    } else if has_session {
+        indicators.push(Span::styled(
+            "\u{25CF}".to_string(),
+            theme.style_badge_session_idle(),
+        ));
+    }
+
     let first_pr = wi.repo_associations.iter().find_map(|a| a.pr.as_ref());
     if let Some(pr) = first_pr {
+        // Add space separator if session indicator is already present.
+        if !indicators.is_empty() {
+            indicators.push(Span::raw(" "));
+        }
         let pr_text = format!("PR#{}", pr.number);
         indicators.push(Span::styled(pr_text, theme.style_badge_pr()));
         match &pr.checks {
@@ -522,10 +543,23 @@ fn format_work_item_entry<'a>(
     // Build the right-side badge string.
     let mut right_parts: Vec<(String, ratatui_core::style::Style)> = Vec::new();
 
+    // Session activity indicator: spinner when working, filled circle when session exists.
+    let has_session = app.session_key_for(&wi.id).is_some();
+    let is_working = app.claude_working.contains(&wi.id);
+    if is_working {
+        let frame = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+        right_parts.push((frame.to_string(), theme.style_badge_session_working()));
+    } else if has_session {
+        // Unicode filled circle as idle session indicator.
+        right_parts.push(("\u{25CF}".to_string(), theme.style_badge_session_idle()));
+    }
+
     // PR badge: show first PR if any.
     let first_pr = wi.repo_associations.iter().find_map(|a| a.pr.as_ref());
     if let Some(pr) = first_pr {
-        let pr_text = format!("PR#{}", pr.number);
+        // Add space separator if session indicator is already present.
+        let prefix = if right_parts.is_empty() { "" } else { " " };
+        let pr_text = format!("{prefix}PR#{}", pr.number);
         let pr_style = if pr.state == PrState::Merged {
             theme.style_text_muted()
         } else {

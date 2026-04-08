@@ -88,6 +88,12 @@ pub struct Theme {
     /// Done item text color (muted, completed work is less prominent).
     pub done_item: Color,
 
+    // -- Session activity badges --
+    /// Session exists but idle (filled circle).
+    pub badge_session_idle: Color,
+    /// Session actively working (animated spinner).
+    pub badge_session_working: Color,
+
     // -- Stage badges --
     /// Backlog stage badge color.
     pub badge_backlog: Color,
@@ -150,6 +156,9 @@ impl Theme {
             badge_ci_pending: Color::Yellow,
             unlinked_marker: Color::Yellow,
             done_item: Color::Reset,
+
+            badge_session_idle: Color::Gray,
+            badge_session_working: Color::Cyan,
 
             badge_backlog: Color::Reset,
             badge_planning: Color::Cyan,
@@ -287,6 +296,16 @@ impl Theme {
 
     pub fn style_badge_ci_pending(&self) -> Style {
         Style::default().fg(self.badge_ci_pending)
+    }
+
+    pub fn style_badge_session_idle(&self) -> Style {
+        Style::default().fg(self.badge_session_idle)
+    }
+
+    pub fn style_badge_session_working(&self) -> Style {
+        Style::default()
+            .fg(self.badge_session_working)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn style_unlinked_marker(&self) -> Style {
