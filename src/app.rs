@@ -4897,6 +4897,7 @@ mod tests {
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: rr.repo_path.clone(),
                         branch: Some(rr.branch.clone()),
+                        pr_identity: None,
                     }],
                     plan: None,
                     description: None,
@@ -5129,6 +5130,8 @@ mod tests {
             github_remote: None,
             worktrees: Ok(vec![]),
             prs: Ok(vec![]),
+            review_requested_prs: Ok(vec![]),
+            authenticated_user: None,
             issues: vec![],
         }))
         .unwrap();
@@ -5191,6 +5194,8 @@ mod tests {
             github_remote: None,
             worktrees: Ok(vec![]),
             prs: Ok(vec![]),
+            review_requested_prs: Ok(vec![]),
+            authenticated_user: None,
             issues: vec![],
         }))
         .unwrap();
@@ -5206,6 +5211,8 @@ mod tests {
             github_remote: None,
             worktrees: Ok(vec![]),
             prs: Ok(vec![]),
+            review_requested_prs: Ok(vec![]),
+            authenticated_user: None,
             issues: vec![],
         }))
         .unwrap();
@@ -6073,6 +6080,7 @@ mod tests {
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: rr.repo_path.clone(),
                         branch: Some(rr.branch.clone()),
+                        pr_identity: None,
                     }],
                     plan: None,
                     description: None,
@@ -6342,6 +6350,7 @@ mod tests {
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: rr.repo_path.clone(),
                         branch: Some(rr.branch.clone()),
+                        pr_identity: None,
                     }],
                     plan: None,
                     description: None,
@@ -6633,6 +6642,7 @@ mod tests {
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: rr.repo_path.clone(),
                         branch: Some(rr.branch.clone()),
+                        pr_identity: None,
                     }],
                     plan: None,
                     description: None,
@@ -7828,6 +7838,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Gate test item".into(),
             description: None,
             status,
@@ -8036,6 +8047,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id_a.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Item A".into(),
             description: None,
             status: WorkItemStatus::Implementing,
@@ -8056,6 +8068,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id_b.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Item B".into(),
             description: None,
             status: WorkItemStatus::Implementing,
@@ -8275,6 +8288,7 @@ mod tests {
                 title: "Done item".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: crate::work_item::WorkItemKind::Own,
                 repo_associations: vec![make_assoc("/tmp/repo", "feature/done")],
             })
             .unwrap();
@@ -8288,6 +8302,7 @@ mod tests {
                 title: "Impl item".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: crate::work_item::WorkItemKind::Own,
                 repo_associations: vec![make_assoc("/tmp/repo", "feature/impl")],
             })
             .unwrap();
@@ -8298,6 +8313,7 @@ mod tests {
                 title: "Done with PR".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: crate::work_item::WorkItemKind::Own,
                 repo_associations: vec![make_assoc("/tmp/repo", "feature/done-pr")],
             })
             .unwrap();
@@ -8397,6 +8413,7 @@ mod tests {
                     title: unlinked.pr.title.clone(),
                     description: None,
                     status: WorkItemStatus::Implementing,
+                    kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
@@ -8406,6 +8423,12 @@ mod tests {
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
+            }
+            fn import_review_request(
+                &self,
+                _rr: &crate::work_item::ReviewRequestedPr,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not supported in test".into()))
             }
             fn append_activity(
                 &self,
@@ -8536,6 +8559,7 @@ mod tests {
                     title: title.into(),
                     description: None,
                     status: WorkItemStatus::Implementing,
+                    kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: PathBuf::from(repo_path),
                         branch: Some(branch.into()),
@@ -8581,6 +8605,12 @@ mod tests {
             _unlinked: &crate::work_item::UnlinkedPr,
         ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
             Err(BackendError::Validation("not used".into()))
+        }
+        fn import_review_request(
+            &self,
+            _rr: &crate::work_item::ReviewRequestedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation("not supported in test".into()))
         }
         fn append_activity(
             &self,

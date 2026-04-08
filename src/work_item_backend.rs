@@ -479,6 +479,7 @@ impl WorkItemBackend for LocalFileBackend {
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: rr.repo_path.clone(),
                 branch: Some(rr.branch.clone()),
+                pr_identity: None,
             }],
         };
         self.create(request)
@@ -1065,6 +1066,7 @@ mod tests {
                 title: "PR identity test".into(),
                 description: None,
                 status: WorkItemStatus::Implementing,
+                kind: WorkItemKind::Own,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: repo.clone(),
                     branch: Some("feature-x".into()),

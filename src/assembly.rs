@@ -1687,7 +1687,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -1735,7 +1735,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![live_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let assoc = &items[0].repo_associations[0];
@@ -1776,7 +1776,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
