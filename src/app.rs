@@ -11,8 +11,8 @@ use crate::github_client::GithubError;
 use crate::mcp::{McpEvent, McpSocketServer};
 use crate::session::Session;
 use crate::work_item::{
-    FetchMessage, FetcherHandle, RepoFetchResult, ReviewRequestedPr, SessionEntry, UnlinkedPr,
-    WorkItem, WorkItemId, WorkItemKind, WorkItemStatus,
+    CheckStatus, FetchMessage, FetcherHandle, RepoFetchResult, ReviewRequestedPr, SessionEntry,
+    UnlinkedPr, WorkItem, WorkItemId, WorkItemKind, WorkItemStatus,
 };
 use crate::work_item_backend::{
     ActivityEntry, BackendError, CreateWorkItem, PrIdentityRecord, RepoAssociationRecord,
@@ -142,6 +142,22 @@ pub struct ReviewGateResult {
     pub approved: bool,
     /// Human-readable detail (approval note or rejection reason).
     pub detail: String,
+}
+
+/// Messages sent from the review gate background thread to the main thread.
+/// The gate sends Progress updates (e.g. CI check status) before the final Result.
+pub enum ReviewGateMessage {
+    /// Intermediate progress update shown in the right panel.
+    Progress(String),
+    /// Final result - the gate completed or failed.
+    Result(ReviewGateResult),
+}
+
+/// A single CI check as returned by `gh pr checks --json name,bucket`.
+struct CiCheck {
+    name: String,
+    /// One of: pass, fail, pending, skipping, cancel
+    bucket: String,
 }
 
 /// Result from the asynchronous PR creation thread.
@@ -386,8 +402,8 @@ pub struct App {
     /// Used to verify the gate result is still relevant (the user may have
     /// retreated the item while the gate was running).
     pub review_gate_wi: Option<WorkItemId>,
-    /// Receiver for asynchronous review gate results.
-    pub review_gate_rx: Option<crossbeam_channel::Receiver<ReviewGateResult>>,
+    /// Receiver for asynchronous review gate messages (progress + final result).
+    pub review_gate_rx: Option<crossbeam_channel::Receiver<ReviewGateMessage>>,
     /// Activity ID for the running review gate indicator.
     pub review_gate_activity: Option<ActivityId>,
     /// Progress summary from the review gate, shown in the right panel.
@@ -4583,6 +4599,67 @@ impl App {
         }
     }
 
+    /// Find a PR number for a branch by querying `gh pr list --head <branch>`.
+    /// Returns None if no PR exists. Runs on background thread (blocking I/O).
+    fn find_pr_for_branch(owner: &str, repo: &str, branch: &str) -> Option<u64> {
+        let owner_repo = format!("{owner}/{repo}");
+        let output = std::process::Command::new("gh")
+            .args([
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--json",
+                "number",
+                "--repo",
+                &owner_repo,
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let arr: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+        arr.as_array()?.first()?.get("number")?.as_u64()
+    }
+
+    /// Fetch per-check CI status for a PR via `gh pr checks`.
+    /// Returns empty vec on error (treated as "no checks configured").
+    /// Runs on background thread (blocking I/O).
+    fn fetch_pr_checks(owner: &str, repo: &str, pr_number: u64) -> Vec<CiCheck> {
+        let owner_repo = format!("{owner}/{repo}");
+        let pr_str = pr_number.to_string();
+        let output = match std::process::Command::new("gh")
+            .args([
+                "pr",
+                "checks",
+                &pr_str,
+                "--repo",
+                &owner_repo,
+                "--json",
+                "name,bucket",
+            ])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let arr: Vec<serde_json::Value> = match serde_json::from_str(stdout.trim()) {
+            Ok(a) => a,
+            Err(_) => return Vec::new(),
+        };
+        arr.iter()
+            .filter_map(|v| {
+                Some(CiCheck {
+                    name: v.get("name")?.as_str()?.to_string(),
+                    bucket: v.get("bucket")?.as_str()?.to_string(),
+                })
+            })
+            .collect()
+    }
+
     /// Attempt to spawn the async review gate for the given work item.
     /// Returns `Spawned` if the gate is running (caller should wait),
     /// or `Blocked(reason)` if the transition must not proceed.
@@ -4625,6 +4702,20 @@ impl App {
         };
         let repo_path = assoc.repo_path.clone();
 
+        // Gather PR and GitHub remote info for the background thread.
+        let current_pr_number = assoc.pr.as_ref().map(|p| p.number);
+        let current_check_status = assoc.pr.as_ref().map(|p| p.checks.clone());
+        let (gh_owner, gh_repo) = match self.worktree_service.github_remote(&repo_path) {
+            Ok(Some((o, r))) => (Some(o), Some(r)),
+            Ok(None) => (None, None),
+            Err(e) => {
+                return ReviewGateSpawn::Blocked(format!("Could not read GitHub remote: {e}"));
+            }
+        };
+        let has_github_remote = gh_owner.is_some();
+        let gh_owner = gh_owner.unwrap_or_default();
+        let gh_repo = gh_repo.unwrap_or_default();
+
         // Get the default branch for diffing.
         let default_branch = self
             .worktree_service
@@ -4654,12 +4745,130 @@ impl App {
             return ReviewGateSpawn::Blocked("Cannot enter Review: no changes on branch".into());
         }
 
-        // Spawn the claude --print check in a background thread.
-        let (tx, rx) = crossbeam_channel::bounded(1);
+        // Spawn the review gate in a background thread with three phases:
+        // 1. PR existence check (if GitHub remote exists)
+        // 2. CI check wait (if checks are configured)
+        // 3. Adversarial code review (claude --print)
+        let (tx, rx) = crossbeam_channel::unbounded();
         let wi_id_clone = wi_id.clone();
         let review_skill = self.config.defaults.review_skill.clone();
 
         std::thread::spawn(move || {
+            // === Phase 1: PR Existence Check ===
+            let pr_number = if has_github_remote {
+                if tx
+                    .send(ReviewGateMessage::Progress(
+                        "Checking for pull request...".into(),
+                    ))
+                    .is_err()
+                {
+                    return; // Receiver dropped - gate cancelled.
+                }
+
+                let pr_num = match current_pr_number {
+                    Some(n) => Some(n),
+                    None => Self::find_pr_for_branch(&gh_owner, &gh_repo, &branch),
+                };
+
+                if pr_num.is_none() {
+                    let _ = tx.send(ReviewGateMessage::Result(ReviewGateResult {
+                        work_item_id: wi_id_clone,
+                        approved: false,
+                        detail: format!(
+                            "No pull request found for branch '{}'. \
+                             Create a PR before requesting review.",
+                            branch
+                        ),
+                    }));
+                    return;
+                }
+                pr_num
+            } else {
+                None
+            };
+
+            // === Phase 2: CI Check Wait ===
+            if let Some(pr_num) = pr_number {
+                // Determine whether CI checks are configured.
+                let has_checks = match current_check_status.as_ref() {
+                    Some(CheckStatus::None) => false,
+                    Some(_) => true,
+                    None => {
+                        // No cached info - query fresh to discover.
+                        !Self::fetch_pr_checks(&gh_owner, &gh_repo, pr_num).is_empty()
+                    }
+                };
+
+                if has_checks {
+                    if tx
+                        .send(ReviewGateMessage::Progress(
+                            "Waiting for CI checks...".into(),
+                        ))
+                        .is_err()
+                    {
+                        return;
+                    }
+
+                    loop {
+                        let checks = Self::fetch_pr_checks(&gh_owner, &gh_repo, pr_num);
+
+                        if checks.is_empty() {
+                            // Checks disappeared (race) - treat as no checks.
+                            break;
+                        }
+
+                        let passed = checks
+                            .iter()
+                            .filter(|c| c.bucket == "pass" || c.bucket == "skipping")
+                            .count();
+                        let failed: Vec<_> = checks
+                            .iter()
+                            .filter(|c| c.bucket == "fail" || c.bucket == "cancel")
+                            .collect();
+                        let total = checks.len();
+
+                        if !failed.is_empty() {
+                            let failed_names: Vec<_> =
+                                failed.iter().map(|c| c.name.clone()).collect();
+                            let _ = tx.send(ReviewGateMessage::Result(ReviewGateResult {
+                                work_item_id: wi_id_clone,
+                                approved: false,
+                                detail: format!(
+                                    "CI checks failed: {}. \
+                                     Fix failures before requesting review.",
+                                    failed_names.join(", ")
+                                ),
+                            }));
+                            return;
+                        }
+
+                        if passed == total {
+                            // All checks green - proceed to code review.
+                            let _ = tx.send(ReviewGateMessage::Progress(format!(
+                                "{passed} / {total} CI checks green. Running code review..."
+                            )));
+                            break;
+                        }
+
+                        // Still pending - update progress and poll again.
+                        if tx
+                            .send(ReviewGateMessage::Progress(format!(
+                                "{passed} / {total} CI checks green"
+                            )))
+                            .is_err()
+                        {
+                            return; // Receiver dropped - gate cancelled.
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(15));
+                    }
+                }
+            }
+
+            // === Phase 3: Adversarial Code Review ===
+            let _ = tx.send(ReviewGateMessage::Progress(
+                "Checking implementation against plan.".into(),
+            ));
+
             let mut vars = std::collections::HashMap::new();
             vars.insert("plan", plan.as_str());
             vars.insert("diff", diff.as_str());
@@ -4721,7 +4930,7 @@ impl App {
                     detail: format!("could not run claude: {e}"),
                 },
             };
-            let _ = tx.send(result);
+            let _ = tx.send(ReviewGateMessage::Result(result));
         });
 
         self.review_gate_rx = Some(rx);
@@ -4739,21 +4948,38 @@ impl App {
             None => return,
         };
 
-        let result = match rx.try_recv() {
-            Ok(r) => r,
-            Err(crossbeam_channel::TryRecvError::Empty) => return, // Still running.
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                // Thread exited without sending - treat as gate error.
-                self.review_gate_rx = None;
-                self.review_gate_wi = None;
-                self.review_gate_progress = None;
-                if let Some(aid) = self.review_gate_activity.take() {
-                    self.end_activity(aid);
+        // Drain all pending messages. There may be multiple Progress updates
+        // queued before a final Result.
+        let mut result: Option<ReviewGateResult> = None;
+        loop {
+            match rx.try_recv() {
+                Ok(ReviewGateMessage::Progress(text)) => {
+                    self.review_gate_progress = Some(text);
+                    // Continue draining - a Result may follow.
                 }
-                self.status_message =
-                    Some("Review gate: background thread exited unexpectedly".into());
-                return;
+                Ok(ReviewGateMessage::Result(r)) => {
+                    result = Some(r);
+                    break;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break, // No more messages.
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // Thread exited without sending a Result - treat as gate error.
+                    self.review_gate_rx = None;
+                    self.review_gate_wi = None;
+                    self.review_gate_progress = None;
+                    if let Some(aid) = self.review_gate_activity.take() {
+                        self.end_activity(aid);
+                    }
+                    self.status_message =
+                        Some("Review gate: background thread exited unexpectedly".into());
+                    return;
+                }
             }
+        }
+
+        let result = match result {
+            Some(r) => r,
+            None => return, // Only progress updates this tick, no final result yet.
         };
 
         // Gate completed - clear the receiver and tracked work item.
@@ -8615,12 +8841,12 @@ mod tests {
         );
 
         // Simulate a review gate that completed with a rejection.
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        tx.send(ReviewGateResult {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ReviewGateMessage::Result(ReviewGateResult {
             work_item_id: wi_id.clone(),
             approved: false,
             detail: "Tests are missing for the new feature".into(),
-        })
+        }))
         .unwrap();
         app.review_gate_rx = Some(rx);
         app.review_gate_wi = Some(wi_id.clone());
@@ -8653,12 +8879,12 @@ mod tests {
         );
 
         // Simulate a review gate that completed with approval.
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        tx.send(ReviewGateResult {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ReviewGateMessage::Result(ReviewGateResult {
             work_item_id: wi_id.clone(),
             approved: true,
             detail: "All plan items implemented".into(),
-        })
+        }))
         .unwrap();
         app.review_gate_rx = Some(rx);
         app.review_gate_wi = Some(wi_id.clone());
@@ -8679,6 +8905,103 @@ mod tests {
         // Verify the receiver and tracked WI are cleared.
         assert!(app.review_gate_rx.is_none(), "gate rx should be cleared");
         assert!(app.review_gate_wi.is_none(), "gate wi should be cleared");
+    }
+
+    /// Test: Progress messages update review_gate_progress without completing
+    /// the gate.
+    #[test]
+    fn poll_review_gate_progress_updates_field() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ReviewGateMessage::Progress("2 / 3 CI checks green".into()))
+            .unwrap();
+        app.review_gate_rx = Some(rx);
+        app.review_gate_wi = Some(wi_id.clone());
+
+        app.poll_review_gate();
+
+        // Progress should be updated but gate should still be running.
+        assert_eq!(
+            app.review_gate_progress.as_deref(),
+            Some("2 / 3 CI checks green"),
+        );
+        assert!(
+            app.review_gate_rx.is_some(),
+            "gate rx should still be present (gate not done)",
+        );
+        assert!(
+            app.review_gate_wi.is_some(),
+            "gate wi should still be present (gate not done)",
+        );
+    }
+
+    /// Test: Progress followed by Result in the same tick - both are processed.
+    #[test]
+    fn poll_review_gate_progress_then_result() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ReviewGateMessage::Progress(
+            "1 / 1 CI checks green. Running code review...".into(),
+        ))
+        .unwrap();
+        tx.send(ReviewGateMessage::Result(ReviewGateResult {
+            work_item_id: wi_id.clone(),
+            approved: false,
+            detail: "Missing error handling".into(),
+        }))
+        .unwrap();
+        app.review_gate_rx = Some(rx);
+        app.review_gate_wi = Some(wi_id.clone());
+
+        app.poll_review_gate();
+
+        // Result should have been processed - gate is done.
+        assert!(app.review_gate_rx.is_none(), "gate rx should be cleared");
+        assert!(app.review_gate_wi.is_none(), "gate wi should be cleared");
+        assert!(
+            app.rework_reasons.contains_key(&wi_id),
+            "rework_reasons must be populated after rejection",
+        );
+    }
+
+    /// Test: Disconnected channel (thread exited) after progress is handled.
+    #[test]
+    fn poll_review_gate_disconnect_after_progress() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ReviewGateMessage::Progress(
+            "Checking for pull request...".into(),
+        ))
+        .unwrap();
+        drop(tx); // Simulate thread exit without sending Result.
+        app.review_gate_rx = Some(rx);
+        app.review_gate_wi = Some(wi_id.clone());
+
+        app.poll_review_gate();
+
+        // Gate should be cleaned up with an error message.
+        assert!(app.review_gate_rx.is_none(), "gate rx should be cleared");
+        assert!(app.review_gate_wi.is_none(), "gate wi should be cleared");
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("unexpectedly"),
+            "status should mention unexpected exit, got: {msg}",
+        );
     }
 
     /// Test 8: Gate spawn failure (MCP path) populates rework_reasons with
