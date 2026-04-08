@@ -14,6 +14,7 @@ Read and follow CONTRIBUTING.md before making changes.
 - Underscore-prefixing struct fields or variables to hide dead code warnings instead of removing the dead code: always P0
 - Adding redundant filtering: if data is already filtered at the source (e.g., gh CLI flags like --author @me), do not add a second filter for the same constraint in downstream code: always P0
 - Adding new external API calls (gh api, network requests) without verifying the information is not already available from existing calls or CLI flags: always P0
+- Performing blocking I/O (git commands, network requests, slow file operations) on the main UI thread instead of spawning a background thread: always P0 - see docs/UI.md "Blocking I/O Prohibition"
 
 ### Review guidelines
 
@@ -23,4 +24,5 @@ Read and follow CONTRIBUTING.md before making changes.
 - docs/invariants.md is immutable - any diff that modifies it must be flagged as a violation regardless of context
 - If a change touches a system that has a corresponding doc in docs/ (e.g., aggregation, inbox, worktree management, error states, etc.), the review must verify that the doc is updated to reflect the new behavior. Missing doc updates are P0
 - Never relax linter requirements, add #[allow(...)], suppress warnings, or skip git hooks to make code pass CI. Fix the underlying issue instead
+- All blocking I/O (git commands, network requests, subprocess calls) must run on a background thread with results polled via crossbeam channels - never on the main UI thread. See docs/UI.md "Blocking I/O Prohibition" for the pattern
 - Also reference CONTRIBUTING.md and docs/invariants.md as authoritative project files

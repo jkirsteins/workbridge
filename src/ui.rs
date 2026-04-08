@@ -407,9 +407,9 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         return;
     }
 
-    // Available width inside the block borders, minus highlight symbol space.
-    // The List widget reserves space for the highlight symbol ("> ") on all rows.
-    let inner_width = area.width.saturating_sub(2).saturating_sub(2) as usize;
+    // Available width inside the block borders. Each item prepends its own
+    // 2-char left margin (selection caret or activity indicator).
+    let inner_width = area.width.saturating_sub(2) as usize;
 
     let items: Vec<ListItem> = app
         .display_list
@@ -422,14 +422,15 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     GroupHeaderKind::Blocked => theme.style_group_header_blocked(),
                     GroupHeaderKind::Normal => theme.style_group_header(),
                 };
-                ListItem::new(Line::from(vec![Span::styled(text, style)]))
+                ListItem::new(Line::from(vec![Span::raw("  "), Span::styled(text, style)]))
             }
             DisplayEntry::UnlinkedItem(idx) => {
                 let selected = app.selected_item == Some(i);
                 format_unlinked_item(app, *idx, inner_width, theme, selected)
             }
             DisplayEntry::ReviewRequestItem(idx) => {
-                format_review_request_item(app, *idx, inner_width, theme)
+                let selected = app.selected_item == Some(i);
+                format_review_request_item(app, *idx, inner_width, theme, selected)
             }
             DisplayEntry::WorkItemEntry(idx) => {
                 let selected = app.selected_item == Some(i);
@@ -444,8 +445,7 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
 
     let list = List::new(items)
         .block(block)
-        .highlight_style(theme.style_tab_highlight_bg())
-        .highlight_symbol("> ");
+        .highlight_style(theme.style_tab_highlight_bg());
 
     let mut state = ListState::default();
     state.select(app.selected_item);
@@ -479,9 +479,13 @@ fn format_review_request_item<'a>(
     idx: usize,
     max_width: usize,
     theme: &Theme,
+    is_selected: bool,
 ) -> ListItem<'a> {
+    let margin = if is_selected { "> " } else { "  " };
+    let content_width = max_width.saturating_sub(2);
+
     let Some(rr) = app.review_requested_prs.get(idx) else {
-        return ListItem::new(Line::from("  R <invalid>"));
+        return ListItem::new(Line::from(format!("{margin}R <invalid>")));
     };
 
     let pr_badge = format!("PR#{}", rr.pr.number);
@@ -493,19 +497,26 @@ fn format_review_request_item<'a>(
 
     let title = &rr.pr.title;
 
-    // Layout: "R title    PR#N [draft]"
+    // Layout: "{margin}R title    PR#N [draft]"
     let prefix = "R ";
-    let available = max_width
+    let available = content_width
         .saturating_sub(prefix.width())
         .saturating_sub(right.width())
         .saturating_sub(1);
     let truncated_title = truncate_str(title, available);
 
     let padding =
-        max_width.saturating_sub(prefix.width() + truncated_title.width() + right.width());
+        content_width.saturating_sub(prefix.width() + truncated_title.width() + right.width());
     let pad_str: String = " ".repeat(padding);
 
+    let margin_style = if is_selected {
+        theme.style_tab_highlight()
+    } else {
+        ratatui_core::style::Style::default()
+    };
+
     ListItem::new(Line::from(vec![
+        Span::styled(margin, margin_style),
         Span::styled(prefix.to_string(), theme.style_review_request_marker()),
         Span::styled(truncated_title, theme.style_text()),
         Span::raw(pad_str),
@@ -521,8 +532,11 @@ fn format_unlinked_item<'a>(
     theme: &Theme,
     is_selected: bool,
 ) -> ListItem<'a> {
+    let margin = if is_selected { "> " } else { "  " };
+    let content_width = max_width.saturating_sub(2);
+
     let Some(unlinked) = app.unlinked_prs.get(idx) else {
-        return ListItem::new(Line::from("  ? <invalid>"));
+        return ListItem::new(Line::from(format!("{margin}? <invalid>")));
     };
 
     let pr_badge = format!("PR#{}", unlinked.pr.number);
@@ -535,24 +549,25 @@ fn format_unlinked_item<'a>(
     // Title: branch name for unlinked items.
     let title = &unlinked.branch;
 
-    // Layout: "? title    PR#N [draft]"
+    // Layout: "{margin}? title    PR#N [draft]"
     // Reserve space: 2 for "? " prefix, right.len() for badge, 1 for gap.
     let prefix = "? ";
-    let available = max_width
+    let available = content_width
         .saturating_sub(prefix.width())
         .saturating_sub(right.width())
         .saturating_sub(1);
     let truncated_title = truncate_str(title, available);
 
     let padding =
-        max_width.saturating_sub(prefix.width() + truncated_title.width() + right.width());
+        content_width.saturating_sub(prefix.width() + truncated_title.width() + right.width());
     let pad_str: String = " ".repeat(padding);
 
-    let (marker_style, title_style, badge_style) = if is_selected {
+    let (margin_style, marker_style, title_style, badge_style) = if is_selected {
         let hl = theme.style_tab_highlight();
-        (hl, hl, hl)
+        (hl, hl, hl, hl)
     } else {
         (
+            ratatui_core::style::Style::default(),
             theme.style_unlinked_marker(),
             theme.style_text(),
             theme.style_badge_pr(),
@@ -560,6 +575,7 @@ fn format_unlinked_item<'a>(
     };
 
     ListItem::new(Line::from(vec![
+        Span::styled(margin, margin_style),
         Span::styled(prefix.to_string(), marker_style),
         Span::styled(truncated_title, title_style),
         Span::raw(pad_str),
@@ -583,28 +599,31 @@ fn format_work_item_entry<'a>(
         return ListItem::new(Line::from("<invalid>"));
     };
 
+    let content_width = max_width.saturating_sub(2);
+
+    // -- Left margin: activity indicator or selection caret --
+    let has_session = app.session_key_for(&wi.id).is_some();
+    let is_working = app.claude_working.contains(&wi.id);
+    let (margin_text, margin_style): (String, ratatui_core::style::Style) = if is_working {
+        let frame = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+        (format!("{frame} "), theme.style_badge_session_working())
+    } else if has_session {
+        ("\u{25CF} ".to_string(), theme.style_badge_session_idle())
+    } else if is_selected {
+        ("> ".to_string(), theme.style_tab_highlight())
+    } else {
+        ("  ".to_string(), ratatui_core::style::Style::default())
+    };
+
     // -- Line 1: title + badges --
 
     // Build the right-side badge string.
     let mut right_parts: Vec<(String, ratatui_core::style::Style)> = Vec::new();
 
-    // Session activity indicator: spinner when working, filled circle when session exists.
-    let has_session = app.session_key_for(&wi.id).is_some();
-    let is_working = app.claude_working.contains(&wi.id);
-    if is_working {
-        let frame = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
-        right_parts.push((frame.to_string(), theme.style_badge_session_working()));
-    } else if has_session {
-        // Unicode filled circle as idle session indicator.
-        right_parts.push(("\u{25CF}".to_string(), theme.style_badge_session_idle()));
-    }
-
     // PR badge: show first PR if any.
     let first_pr = wi.repo_associations.iter().find_map(|a| a.pr.as_ref());
     if let Some(pr) = first_pr {
-        // Add space separator if session indicator is already present.
-        let prefix = if right_parts.is_empty() { "" } else { " " };
-        let pr_text = format!("{prefix}PR#{}", pr.number);
+        let pr_text = format!("PR#{}", pr.number);
         let pr_style = if pr.state == PrState::Merged {
             theme.style_text_muted()
         } else {
@@ -656,7 +675,7 @@ fn format_work_item_entry<'a>(
     // vanishes when badges consume all available width.
     const MIN_TITLE_BUDGET: usize = 5;
 
-    let space_for_content = max_width.saturating_sub(prefix.width());
+    let space_for_content = content_width.saturating_sub(prefix.width());
 
     // Drop badges from the right until the title gets at least MIN_TITLE_BUDGET
     // columns (or we run out of badges to drop).
@@ -707,27 +726,32 @@ fn format_work_item_entry<'a>(
 
     // Wrap the title: first line shares space with badge + right badges,
     // continuation lines get the full panel width with no indent.
-    let title_lines = wrap_two_widths(&wi.title, available.max(1), max_width);
+    let title_lines = wrap_two_widths(&wi.title, available.max(1), content_width);
     let first_title = title_lines.first().cloned().unwrap_or_default();
 
     let padding =
-        max_width.saturating_sub(prefix.width() + first_title.width() + right_text.width());
+        content_width.saturating_sub(prefix.width() + first_title.width() + right_text.width());
     let pad_str: String = " ".repeat(padding);
 
     let mut line1_spans = if wi.status == WorkItemStatus::Done {
-        vec![Span::styled(first_title, title_style), Span::raw(pad_str)]
+        vec![
+            Span::styled(margin_text, margin_style),
+            Span::styled(first_title, title_style),
+            Span::raw(pad_str),
+        ]
     } else {
         vec![
+            Span::styled(margin_text, margin_style),
             Span::styled(badge.to_string(), badge_style),
             Span::raw(" "),
             Span::styled(first_title, title_style),
             Span::raw(pad_str),
         ]
     };
-    // Insert [RR] badge at the beginning of line1 for review-request items.
+    // Insert [RR] badge after the margin span for review-request items.
     if wi.kind == WorkItemKind::ReviewRequest {
         line1_spans.insert(
-            0,
+            1,
             Span::styled("[RR]".to_string(), theme.style_badge_review_request_kind()),
         );
     }
@@ -755,12 +779,12 @@ fn format_work_item_entry<'a>(
 
     let mut lines = vec![line1];
 
-    // Title continuation lines (no indent).
+    // Title continuation lines (indented to align with content after margin).
     for title_cont in title_lines.iter().skip(1) {
-        lines.push(Line::from(vec![Span::styled(
-            title_cont.clone(),
-            title_style,
-        )]));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(title_cont.clone(), title_style),
+        ]));
     }
 
     if has_branch {
@@ -769,8 +793,11 @@ fn format_work_item_entry<'a>(
         let wt_indicator = if has_worktree { "" } else { " [no wt]" };
 
         let meta_content = format!("{branch_name}{wt_indicator}");
-        for wrapped_line in wrap_text(&meta_content, max_width) {
-            lines.push(Line::from(vec![Span::styled(wrapped_line, meta_style)]));
+        for wrapped_line in wrap_text(&meta_content, content_width) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(wrapped_line, meta_style),
+            ]));
         }
     }
     // No repo associations = no line 2 (invariant 1 violation, but render gracefully)
@@ -1096,18 +1123,26 @@ fn draw_work_item_detail(
     paragraph.render(area, buf);
 }
 
-/// Draw a structured detail view for an unlinked PR.
+/// Detail fields for rendering an importable PR in the right panel.
+struct ImportablePrDetail<'a> {
+    pr: &'a crate::work_item::PrInfo,
+    repo_path: &'a std::path::Path,
+    branch: &'a str,
+    hint: &'a str,
+}
+
+/// Draw a structured detail view for an importable PR (unlinked or review request).
 ///
 /// Shows PR title, number/URL, repo, branch, state, draft status,
-/// review decision, and CI checks, followed by a prompt to import.
-fn draw_unlinked_pr_detail(
+/// review decision, and CI checks, followed by a contextual hint.
+fn draw_importable_pr_detail(
     buf: &mut Buffer,
-    unlinked: &crate::work_item::UnlinkedPr,
+    detail: &ImportablePrDetail<'_>,
     theme: &Theme,
     block: Block<'_>,
     area: Rect,
 ) {
-    let pr = &unlinked.pr;
+    let pr = detail.pr;
     let label_style = theme.style_heading();
     let none_style = theme.style_text_muted();
 
@@ -1120,7 +1155,7 @@ fn draw_unlinked_pr_detail(
     };
 
     let pr_str = format!("#{} {}", pr.number, pr.url);
-    let repo_str = unlinked.repo_path.display().to_string();
+    let repo_str = detail.repo_path.display().to_string();
 
     let state_str = match pr.state {
         PrState::Open => "Open",
@@ -1154,7 +1189,7 @@ fn draw_unlinked_pr_detail(
     let fields: Vec<(&str, &str)> = vec![
         ("PR", &pr_str),
         ("Repo", &repo_str),
-        ("Branch", &unlinked.branch),
+        ("Branch", detail.branch),
         ("State", state_str),
         ("Draft", draft_str),
         ("Review", review_str),
@@ -1170,7 +1205,7 @@ fn draw_unlinked_pr_detail(
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  Press Enter to import this PR as a work item.",
+        format!("  {}", detail.hint),
         none_style,
     )));
 
@@ -1317,12 +1352,49 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         }
         Some(DisplayEntry::UnlinkedItem(ul_idx)) => {
             if let Some(unlinked) = app.unlinked_prs.get(*ul_idx) {
-                draw_unlinked_pr_detail(buf, unlinked, theme, block, area);
+                draw_importable_pr_detail(
+                    buf,
+                    &ImportablePrDetail {
+                        pr: &unlinked.pr,
+                        repo_path: &unlinked.repo_path,
+                        branch: &unlinked.branch,
+                        hint: "Press Enter to import this PR as a work item.",
+                    },
+                    theme,
+                    block,
+                    area,
+                );
             } else {
                 let text = Text::from(vec![
                     Line::from(""),
                     Line::from("  Press Enter to import"),
                     Line::from("  this PR as a work item."),
+                ]);
+                let paragraph = Paragraph::new(text)
+                    .block(block)
+                    .style(theme.style_text_muted());
+                paragraph.render(area, buf);
+            }
+        }
+        Some(DisplayEntry::ReviewRequestItem(rr_idx)) => {
+            if let Some(rr) = app.review_requested_prs.get(*rr_idx) {
+                draw_importable_pr_detail(
+                    buf,
+                    &ImportablePrDetail {
+                        pr: &rr.pr,
+                        repo_path: &rr.repo_path,
+                        branch: &rr.branch,
+                        hint: "Press Enter to import this review request as a work item.",
+                    },
+                    theme,
+                    block,
+                    area,
+                );
+            } else {
+                let text = Text::from(vec![
+                    Line::from(""),
+                    Line::from("  Press Enter to import this"),
+                    Line::from("  review request as a work item."),
                 ]);
                 let paragraph = Paragraph::new(text)
                     .block(block)
@@ -2638,6 +2710,29 @@ mod snapshot_tests {
         let unlinked = vec![make_unlinked_pr("fix-typo", 45, false)];
         let mut app = app_with_items(items, unlinked);
         // Select the unlinked item (index 1, since index 0 is UNLINKED header).
+        app.selected_item = Some(1);
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn review_request_pr_selected() {
+        let mut app = App::new();
+        app.review_requested_prs
+            .push(crate::work_item::ReviewRequestedPr {
+                repo_path: PathBuf::from("/repo/upstream"),
+                pr: PrInfo {
+                    number: 77,
+                    title: "Refactor auth middleware".into(),
+                    state: PrState::Open,
+                    is_draft: false,
+                    review_decision: ReviewDecision::Pending,
+                    checks: CheckStatus::Passing,
+                    url: "https://github.com/o/r/pull/77".into(),
+                },
+                branch: "refactor-auth".into(),
+            });
+        app.build_display_list();
+        // Select the review request item (index 1: header at 0, item at 1).
         app.selected_item = Some(1);
         insta::assert_snapshot!(render(&app, 80, 24));
     }

@@ -201,6 +201,9 @@ pub struct WorktreeCreateResult {
     pub path: Option<PathBuf>,
     /// Human-readable error message on failure.
     pub error: Option<String>,
+    /// When true, automatically open a Claude session after worktree creation.
+    /// Set to false for import operations that only need the worktree.
+    pub open_session: bool,
 }
 
 /// App holds the entire application state.
@@ -1639,6 +1642,7 @@ impl App {
                                         "Could not fetch or create branch '{}': {create_err}",
                                         branch,
                                     )),
+                                    open_session: true,
                                 });
                                 return;
                             }
@@ -1649,6 +1653,7 @@ impl App {
                                         repo_path,
                                         path: Some(wt_info.path),
                                         error: None,
+                                        open_session: true,
                                     });
                                 }
                                 Err(e) => {
@@ -1660,6 +1665,7 @@ impl App {
                                             "Failed to create worktree for '{}': {e}",
                                             branch,
                                         )),
+                                        open_session: true,
                                     });
                                 }
                             }
@@ -1862,11 +1868,15 @@ impl App {
                     }
                     return;
                 }
-                // Worktree created successfully - continue with session setup.
-                // Reassemble so the new worktree path is visible in the data model.
+                // Worktree created successfully - reassemble so the new
+                // worktree path is visible in the data model.
                 self.reassemble_work_items();
                 self.build_display_list();
-                self.complete_session_open(&result.wi_id, &path);
+                if result.open_session {
+                    self.complete_session_open(&result.wi_id, &path);
+                } else {
+                    self.status_message = Some("Imported (worktree created)".into());
+                }
             }
             (None, Some(error)) => {
                 self.status_message = Some(error);
@@ -2435,10 +2445,9 @@ impl App {
 
     /// Import the currently selected unlinked PR as a work item.
     ///
-    /// Calls backend.import() then attempts to create a worktree for the
-    /// imported branch (since the branch name is known from the PR). This
-    /// makes the imported work item immediately sessionable. Finally,
-    /// reassembles work items and rebuilds the display list.
+    /// Calls backend.import() then spawns a background thread to fetch the
+    /// branch and create a worktree. The UI remains responsive while the
+    /// git operations run. Results are picked up by poll_worktree_creation().
     pub fn import_selected_unlinked(&mut self) {
         let Some(idx) = self.selected_item else {
             return;
@@ -2451,44 +2460,17 @@ impl App {
             return;
         };
 
-        // Capture values needed for worktree creation before borrowing self.
         let repo_path = unlinked.repo_path.clone();
         let branch = unlinked.branch.clone();
 
         match self.backend.import(unlinked) {
             Ok(record) => {
                 let title = record.title.clone();
-
-                // Fetch the branch from origin first so the local ref
-                // points at the correct commit. If the fetch fails (fork PR,
-                // branch does not exist on origin, network error), skip
-                // worktree creation to avoid creating from wrong revision.
-                let wt_msg = match self.worktree_service.fetch_branch(&repo_path, &branch) {
-                    Ok(()) => {
-                        let wt_target = Self::worktree_target_path(
-                            &repo_path,
-                            &branch,
-                            &self.config.defaults.worktree_dir,
-                        );
-                        match self
-                            .worktree_service
-                            .create_worktree(&repo_path, &branch, &wt_target)
-                        {
-                            Ok(_) => format!("Imported: {title} (worktree created)"),
-                            Err(e) => format!("Imported: {title} (worktree not created: {e})"),
-                        }
-                    }
-                    Err(_) => {
-                        format!(
-                            "Imported: {title} - could not fetch branch '{branch}' from origin. Manual checkout required."
-                        )
-                    }
-                };
-
+                let wi_id = record.id.clone();
                 self.reassemble_work_items();
                 self.build_display_list();
                 self.fetcher_repos_changed = true;
-                self.status_message = Some(wt_msg);
+                self.spawn_import_worktree(wi_id, repo_path, branch, title);
             }
             Err(e) => {
                 self.status_message = Some(format!("Import error: {e}"));
@@ -2498,8 +2480,9 @@ impl App {
 
     /// Import the currently selected review-requested PR as a work item.
     ///
-    /// Mirrors import_selected_unlinked but uses import_review_request on
-    /// the backend, which sets kind=ReviewRequest and status=Review.
+    /// Calls backend.import_review_request() then spawns a background thread
+    /// to fetch the branch and create a worktree. The UI remains responsive
+    /// while the git operations run.
     pub fn import_selected_review_request(&mut self) {
         let Some(idx) = self.selected_item else {
             return;
@@ -2518,40 +2501,87 @@ impl App {
         match self.backend.import_review_request(rr) {
             Ok(record) => {
                 let title = record.title.clone();
-
-                let wt_msg = match self.worktree_service.fetch_branch(&repo_path, &branch) {
-                    Ok(()) => {
-                        let wt_target = Self::worktree_target_path(
-                            &repo_path,
-                            &branch,
-                            &self.config.defaults.worktree_dir,
-                        );
-                        match self
-                            .worktree_service
-                            .create_worktree(&repo_path, &branch, &wt_target)
-                        {
-                            Ok(_) => format!("Imported review: {title} (worktree created)"),
-                            Err(e) => {
-                                format!("Imported review: {title} (worktree not created: {e})")
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        format!(
-                            "Imported review: {title} - could not fetch branch '{branch}' from origin. Manual checkout required."
-                        )
-                    }
-                };
-
+                let wi_id = record.id.clone();
                 self.reassemble_work_items();
                 self.build_display_list();
                 self.fetcher_repos_changed = true;
-                self.status_message = Some(wt_msg);
+                self.spawn_import_worktree(wi_id, repo_path, branch, title);
             }
             Err(e) => {
                 self.status_message = Some(format!("Import error: {e}"));
             }
         }
+    }
+
+    /// Spawn a background thread to fetch the branch and create a worktree
+    /// for a freshly imported work item. If another worktree creation is
+    /// already in flight, falls back to a status message instead of blocking.
+    fn spawn_import_worktree(
+        &mut self,
+        wi_id: WorkItemId,
+        repo_path: PathBuf,
+        branch: String,
+        title: String,
+    ) {
+        if self.worktree_create_wi.is_some() {
+            self.status_message = Some(format!(
+                "Imported: {title} (worktree queued - another in progress)"
+            ));
+            return;
+        }
+
+        let wt_dir = self.config.defaults.worktree_dir.clone();
+        let ws = Arc::clone(&self.worktree_service);
+        let wi_id_clone = wi_id.clone();
+        let title_clone = title.clone();
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        std::thread::spawn(move || {
+            let title = title_clone;
+            if ws.fetch_branch(&repo_path, &branch).is_err() {
+                let _ = tx.send(WorktreeCreateResult {
+                    wi_id: wi_id_clone,
+                    repo_path,
+                    path: None,
+                    error: Some(format!(
+                        "Imported: {title} - could not fetch branch '{branch}' from origin. \
+                         Manual checkout required."
+                    )),
+                    open_session: false,
+                });
+                return;
+            }
+            let wt_target = Self::worktree_target_path(&repo_path, &branch, &wt_dir);
+            match ws.create_worktree(&repo_path, &branch, &wt_target) {
+                Ok(wt_info) => {
+                    let _ = tx.send(WorktreeCreateResult {
+                        wi_id: wi_id_clone,
+                        repo_path,
+                        path: Some(wt_info.path),
+                        error: None,
+                        open_session: false,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(WorktreeCreateResult {
+                        wi_id: wi_id_clone,
+                        repo_path,
+                        path: None,
+                        error: Some(format!("Imported: {title} (worktree not created: {e})")),
+                        open_session: false,
+                    });
+                }
+            }
+        });
+
+        self.worktree_create_rx = Some(rx);
+        self.worktree_create_wi = Some(wi_id);
+        if let Some(aid) = self.worktree_create_activity.take() {
+            self.end_activity(aid);
+        }
+        self.worktree_create_activity = Some(self.start_activity(format!("Importing: {title}...")));
+        self.status_message = Some(format!("Imported: {title} (creating worktree...)"));
     }
 
     /// Create a new work item with the current working directory as the
@@ -6097,8 +6127,12 @@ mod tests {
             .expect("should have an unlinked item in display list");
         app.selected_item = Some(unlinked_idx);
 
-        // Import it.
+        // Import it (spawns background worktree creation).
         app.import_selected_unlinked();
+
+        // Wait for the background thread to complete and poll the result.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        app.poll_worktree_creation();
 
         // Verify a worktree was created.
         let created = mock_ws.created.lock().unwrap();
@@ -6367,8 +6401,12 @@ mod tests {
             .expect("should have an unlinked item in display list");
         app.selected_item = Some(unlinked_idx);
 
-        // Import it.
+        // Import it (spawns background worktree creation).
         app.import_selected_unlinked();
+
+        // Wait for the background thread to complete and poll the result.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        app.poll_worktree_creation();
 
         // Verify NO worktree was created (fetch failed, so we skip).
         let created = mock_ws.created.lock().unwrap();
@@ -6663,8 +6701,12 @@ mod tests {
             .expect("should have an unlinked item in display list");
         app.selected_item = Some(unlinked_idx);
 
-        // Import it.
+        // Import it (spawns background worktree creation).
         app.import_selected_unlinked();
+
+        // Wait for the background thread to complete and poll the result.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        app.poll_worktree_creation();
 
         // Verify the worktree target directory uses config.defaults.worktree_dir
         // and sanitizes the branch name.

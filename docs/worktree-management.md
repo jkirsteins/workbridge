@@ -31,10 +31,24 @@ A `StubWorktreeService` exists for tests.
 
 ### Auto-create on import
 
-When an unlinked PR is imported, WorkBridge automatically:
-1. Fetches the branch from origin (`fetch_branch`)
-2. Creates a worktree for the branch (`create_worktree`)
-3. Creates a backend record linking the work item to the repo and branch
+When an unlinked PR is imported, WorkBridge:
+
+1. Creates a backend record linking the work item to the repo and branch
+   (synchronous - returns immediately).
+2. Spawns a background thread (`spawn_import_worktree`) that performs the
+   git operations asynchronously, following the Blocking I/O Prohibition
+   pattern described in `docs/UI.md`:
+   a. Fetches the branch from origin (`fetch_branch`).
+   b. Creates a worktree for the branch (`create_worktree`).
+   c. Sends the result (success or error) through a bounded channel.
+3. The main event loop picks up results via `poll_worktree_creation()` on
+   each timer tick. On success it reassembles the work item list so the
+   new worktree path is visible. On failure (fetch or create error) it
+   displays a status message and the work item remains without a worktree.
+
+Only one worktree creation can be in flight at a time. If a second import
+is triggered while one is already running, the backend record is still
+created but the worktree creation is queued with a status message.
 
 ### Auto-create on session spawn
 

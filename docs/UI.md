@@ -50,6 +50,31 @@ and encoding (queried from the vt100 parser). The resulting bytes are
 written to the PTY master fd. When the child has not enabled mouse
 reporting, scrolls are converted to arrow-key sequences (Up/Down).
 
+### Blocking I/O Prohibition
+
+The event loop runs on a single thread. Any blocking I/O (network
+requests, git commands, file system operations that may be slow) will
+freeze the UI until the operation completes. All I/O that could take
+more than a few milliseconds must run on a background thread.
+
+Pattern for background I/O:
+
+1. Create a `crossbeam_channel::bounded(1)` channel pair (tx, rx).
+2. Spawn a `std::thread::spawn` closure that performs the I/O and sends
+   the result through `tx`.
+3. Store the `rx` receiver on the App struct.
+4. Poll `rx.try_recv()` in a timer-driven poll method (called every
+   200ms tick) to pick up results without blocking.
+
+See `spawn_import_worktree()` and `poll_worktree_creation()` in
+`src/app.rs` as reference implementations.
+
+Examples of operations that MUST be async:
+- `git fetch`, `git worktree add`, `git clone`
+- GitHub API calls (`gh pr list`, `gh api`)
+- Any `std::process::Command::output()` call
+- Large file reads/writes
+
 ### Timer-Driven Periodic Work
 
 A 200ms repeating timer drives:
@@ -264,9 +289,9 @@ distinguishing three states:
 3. **Actively working**: an animated braille spinner in Cyan+Bold. Claude
    has called `workbridge_set_activity(working=true)` via MCP.
 
-In the flat list view, the indicator appears as the first right-side
-badge (before the PR badge). In the board view, it appears on the
-second line alongside PR and CI indicators.
+In the flat list view, the indicator appears in the left margin
+(replacing the selection caret ">"). In the board view, it appears on
+the second line alongside PR and CI indicators.
 
 The activity state is signaled by Claude via the `workbridge_set_activity`
 MCP tool and is cleared automatically when the session process exits
