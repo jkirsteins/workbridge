@@ -87,6 +87,7 @@ incompatible with rat-focus's widget navigation model.
 
 - Enter on a work item: focus right panel
 - Ctrl+]: return to left panel
+- Ctrl+D / Delete: delete selected work item (3-step confirmation)
 - Dead session: auto-return to left panel
 
 ### Board Mode Navigation
@@ -99,6 +100,7 @@ and row index independently.
 - Up/Down arrows: move between items within a column
 - Shift+Right: advance item to next stage
 - Shift+Left: retreat item to previous stage
+- Ctrl+D / Delete: delete selected work item (3-step confirmation)
 - Enter: drill down into selected column (filtered flat list + PTY)
 - Ctrl+]: return from drill-down to board view
 

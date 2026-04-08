@@ -2553,6 +2553,7 @@ impl App {
         };
 
         // Check each repo association's worktree for dirty status.
+        // On error, default to dirty (safer: forces user to confirm force-delete).
         let has_dirty = self
             .work_items
             .iter()
@@ -2562,7 +2563,17 @@ impl App {
                     assoc
                         .worktree_path
                         .as_ref()
-                        .and_then(|wt_path| self.worktree_service.is_worktree_dirty(wt_path).ok())
+                        .map(
+                            |wt_path| match self.worktree_service.is_worktree_dirty(wt_path) {
+                                Ok(dirty) => dirty,
+                                Err(e) => {
+                                    self.status_message = Some(format!(
+                                        "Could not check worktree status: {e} - treating as dirty"
+                                    ));
+                                    true
+                                }
+                            },
+                        )
                         .unwrap_or(false)
                 })
             })
@@ -2589,6 +2600,9 @@ impl App {
             self.status_message = Some("No work item selected".into());
             return;
         };
+
+        // Warnings are collected across phases and reported in Phase 8.
+        let mut warnings: Vec<String> = Vec::new();
 
         // -- Phase 1: Snapshot resource info before backend delete --
         // Collect (repo_path, branch, worktree_path, open_pr_number, owner/repo)
@@ -2617,10 +2631,14 @@ impl App {
                                 None
                             }
                         });
-                        let github_remote = self
-                            .worktree_service
-                            .github_remote(&assoc.repo_path)
-                            .unwrap_or(None);
+                        let github_remote =
+                            match self.worktree_service.github_remote(&assoc.repo_path) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warnings.push(format!("github remote: {e}"));
+                                    None
+                                }
+                            };
                         RepoCleanupInfo {
                             repo_path: assoc.repo_path.clone(),
                             branch: assoc.branch.clone(),
@@ -2636,7 +2654,7 @@ impl App {
         // -- Phase 2: Backend cleanup --
         if let Err(e) = self.backend.pre_delete_cleanup(&work_item_id) {
             // Non-fatal: warn but continue with delete.
-            eprintln!("workbridge: pre-delete cleanup warning: {e}");
+            warnings.push(format!("pre-delete cleanup: {e}"));
         }
 
         if let Err(e) = self.backend.delete(&work_item_id) {
@@ -2654,7 +2672,6 @@ impl App {
         }
 
         // -- Phase 4: Resource cleanup (all best-effort with warnings) --
-        let mut warnings: Vec<String> = Vec::new();
 
         for info in &cleanup_infos {
             // 4a: Remove worktree (don't delete branch here - handled separately)
@@ -2700,19 +2717,36 @@ impl App {
         // Cancel in-flight worktree creation and clean up any orphaned worktree.
         if self.worktree_create_wi.as_ref() == Some(&work_item_id) {
             // Try to drain the result in case the thread already completed.
-            if let Some(ref rx) = self.worktree_create_rx
-                && let Ok(result) = rx.try_recv()
-                && let Some(ref path) = result.path
-            {
-                // Orphaned worktree - clean it up using the result's repo_path.
-                if let Err(e) =
-                    self.worktree_service
-                        .remove_worktree(&result.repo_path, path, true, true)
-                {
-                    warnings.push(format!("orphan worktree cleanup: {e}"));
+            let thread_done = if let Some(ref rx) = self.worktree_create_rx {
+                match rx.try_recv() {
+                    Ok(result) => {
+                        // Thread completed - clean up the orphaned worktree now.
+                        if let Some(ref path) = result.path
+                            && let Err(e) = self.worktree_service.remove_worktree(
+                                &result.repo_path,
+                                path,
+                                true,
+                                true,
+                            )
+                        {
+                            warnings.push(format!("orphan worktree cleanup: {e}"));
+                        }
+                        true
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => true,
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        // Thread still running. Leave the receiver intact so
+                        // poll_worktree_creation can drain it on the next timer
+                        // tick and run the orphan-cleanup path (line 1774).
+                        false
+                    }
                 }
+            } else {
+                true
+            };
+            if thread_done {
+                self.worktree_create_rx = None;
             }
-            self.worktree_create_rx = None;
             self.worktree_create_wi = None;
             if let Some(aid) = self.worktree_create_activity.take() {
                 self.end_activity(aid);
@@ -2730,6 +2764,14 @@ impl App {
 
         // Remove the deleted item from the PR creation pending queue.
         self.pr_create_pending.retain(|id| *id != work_item_id);
+
+        // Cancel in-flight PR merge if it was for the deleted item.
+        if self.merge_wi_id.as_ref() == Some(&work_item_id) && self.pr_merge_rx.is_some() {
+            self.pr_merge_rx = None;
+            if let Some(aid) = self.pr_merge_activity.take() {
+                self.end_activity(aid);
+            }
+        }
 
         // -- Phase 6: Clean up in-memory state --
         self.rework_reasons.remove(&work_item_id);
@@ -2749,6 +2791,7 @@ impl App {
         if self.review_gate_wi.as_ref() == Some(&work_item_id) {
             self.review_gate_wi = None;
             self.review_gate_rx = None;
+            self.review_gate_progress = None;
             if let Some(aid) = self.review_gate_activity.take() {
                 self.end_activity(aid);
             }
