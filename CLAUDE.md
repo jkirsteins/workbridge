@@ -12,6 +12,8 @@ Read and follow CONTRIBUTING.md before making changes.
 - Code changes to a system described in docs/ without corresponding docs updates: always P0
 - Relaxing linter rules, suppressing warnings, or skipping git hooks (--no-verify): always P0
 - Underscore-prefixing struct fields or variables to hide dead code warnings instead of removing the dead code: always P0
+- Adding redundant filtering: if data is already filtered at the source (e.g., gh CLI flags like --author @me), do not add a second filter for the same constraint in downstream code: always P0
+- Adding new external API calls (gh api, network requests) without verifying the information is not already available from existing calls or CLI flags: always P0
 
 ### Review guidelines
 

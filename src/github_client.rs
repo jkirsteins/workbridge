@@ -76,9 +76,6 @@ pub trait GithubClient: Send + Sync {
         repo: &str,
     ) -> Result<Vec<GithubPr>, GithubError>;
 
-    /// Get the login of the currently authenticated GitHub user.
-    fn get_authenticated_user(&self) -> Result<String, GithubError>;
-
     /// Get a single issue by number.
     fn get_issue(&self, owner: &str, repo: &str, number: u64) -> Result<GithubIssue, GithubError>;
 
@@ -96,7 +93,6 @@ pub struct MockGithubClient {
     pub prs: Vec<GithubPr>,
     pub review_requested_prs: Vec<GithubPr>,
     pub issues: Vec<GithubIssue>,
-    pub authenticated_user: String,
     /// If set, all calls return this error instead of fixture data.
     pub error: Option<GithubError>,
 }
@@ -108,7 +104,6 @@ impl MockGithubClient {
             prs: Vec::new(),
             review_requested_prs: Vec::new(),
             issues: Vec::new(),
-            authenticated_user: "testuser".to_string(),
             error: None,
         }
     }
@@ -132,13 +127,6 @@ impl GithubClient for MockGithubClient {
             return Err(err.clone());
         }
         Ok(self.review_requested_prs.clone())
-    }
-
-    fn get_authenticated_user(&self) -> Result<String, GithubError> {
-        if let Some(ref err) = self.error {
-            return Err(err.clone());
-        }
-        Ok(self.authenticated_user.clone())
     }
 
     fn get_issue(
@@ -254,17 +242,6 @@ impl GithubClient for GhCliClient {
             .map_err(|e| GithubError::ParseError(format!("failed to parse PR list JSON: {e}")))?;
 
         items.iter().map(parse_pr_from_value).collect()
-    }
-
-    fn get_authenticated_user(&self) -> Result<String, GithubError> {
-        let stdout = self.run_gh(&["api", "user", "--json", "login"])?;
-        let value: Value = serde_json::from_str(&stdout)
-            .map_err(|e| GithubError::ParseError(format!("failed to parse user JSON: {e}")))?;
-        value
-            .get("login")
-            .and_then(|l| l.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| GithubError::ParseError("user response missing 'login' field".into()))
     }
 
     fn get_issue(&self, owner: &str, repo: &str, number: u64) -> Result<GithubIssue, GithubError> {
@@ -598,7 +575,7 @@ mod tests {
             }],
             issues: Vec::new(),
             review_requested_prs: Vec::new(),
-            authenticated_user: "testuser".to_string(),
+
             error: None,
         };
 
@@ -613,7 +590,7 @@ mod tests {
             prs: Vec::new(),
             issues: Vec::new(),
             review_requested_prs: Vec::new(),
-            authenticated_user: "testuser".to_string(),
+
             error: Some(GithubError::AuthRequired),
         };
 
@@ -632,7 +609,7 @@ mod tests {
                 labels: vec!["enhancement".into()],
             }],
             review_requested_prs: Vec::new(),
-            authenticated_user: "testuser".to_string(),
+
             error: None,
         };
 

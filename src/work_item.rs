@@ -301,8 +301,6 @@ pub struct RepoFetchResult {
     pub prs: Result<Vec<GithubPr>, GithubError>,
     /// PRs where the authenticated user has been requested as a reviewer.
     pub review_requested_prs: Result<Vec<GithubPr>, GithubError>,
-    /// The login of the authenticated GitHub user, if available.
-    pub authenticated_user: Option<String>,
     pub issues: Vec<(u64, Result<GithubIssue, GithubError>)>,
 }
 

@@ -5079,7 +5079,7 @@ mod tests {
             worktrees: Ok(vec![]),
             prs: Ok(vec![]),
             review_requested_prs: Ok(vec![]),
-            authenticated_user: None,
+
             issues: vec![],
         }))
         .unwrap();
@@ -5143,7 +5143,7 @@ mod tests {
             worktrees: Ok(vec![]),
             prs: Ok(vec![]),
             review_requested_prs: Ok(vec![]),
-            authenticated_user: None,
+
             issues: vec![],
         }))
         .unwrap();
@@ -5160,7 +5160,7 @@ mod tests {
             worktrees: Ok(vec![]),
             prs: Ok(vec![]),
             review_requested_prs: Ok(vec![]),
-            authenticated_user: None,
+
             issues: vec![],
         }))
         .unwrap();
@@ -5223,7 +5223,7 @@ mod tests {
                 worktrees: Ok(vec![]),
                 prs: Ok(vec![]),
                 review_requested_prs: Ok(vec![]),
-                authenticated_user: None,
+
                 issues: vec![],
             },
         );
@@ -5253,7 +5253,7 @@ mod tests {
                 worktrees: Ok(vec![]),
                 prs: Ok(vec![]),
                 review_requested_prs: Ok(vec![]),
-                authenticated_user: None,
+
                 issues: vec![],
             },
         );
@@ -5265,7 +5265,7 @@ mod tests {
                 worktrees: Ok(vec![]),
                 prs: Ok(vec![]),
                 review_requested_prs: Ok(vec![]),
-                authenticated_user: None,
+
                 issues: vec![],
             },
         );
@@ -5308,7 +5308,7 @@ mod tests {
             worktrees: Err(WorktreeError::GitError("not a git repository".into())),
             prs: Ok(vec![]),
             review_requested_prs: Ok(vec![]),
-            authenticated_user: None,
+
             issues: vec![],
         }))
         .unwrap();
@@ -5338,7 +5338,7 @@ mod tests {
             worktrees: Err(WorktreeError::GitError("still broken".into())),
             prs: Ok(vec![]),
             review_requested_prs: Ok(vec![]),
-            authenticated_user: None,
+
             issues: vec![],
         }))
         .unwrap();
@@ -5659,7 +5659,7 @@ mod tests {
                 "rate limited".into(),
             )),
             review_requested_prs: Ok(vec![]),
-            authenticated_user: None,
+
             issues: vec![],
         }))
         .unwrap();

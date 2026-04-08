@@ -365,13 +365,10 @@ pub fn reassemble(
         });
     }
 
-    // Determine authenticated user from any repo fetch result.
-    let authenticated_user: Option<&str> = repo_data
-        .values()
-        .find_map(|f| f.authenticated_user.as_deref());
-
-    // --- Collect unlinked PRs (only the user's own) ---
-    let unlinked_prs = collect_unlinked_prs(repo_data, &claimed_branches, authenticated_user);
+    // --- Collect unlinked PRs ---
+    // All fetched PRs are already filtered to the authenticated user via
+    // `--author @me` in the gh CLI calls, so no additional author check needed.
+    let unlinked_prs = collect_unlinked_prs(repo_data, &claimed_branches);
 
     // --- Collect review-requested PRs ---
     let review_requested_prs = collect_review_requested_prs(repo_data, &claimed_branches);
@@ -403,30 +400,18 @@ fn backend_type_from_id(id: &crate::work_item::WorkItemId) -> crate::work_item::
     }
 }
 
-/// Collect the user's own PRs from all repos whose (repo_path, branch) is
-/// not already claimed by a work item. Only PRs authored by the
-/// authenticated user are included so that other people's PRs do not
-/// appear in the UNLINKED group.
+/// Collect PRs from all repos whose (repo_path, branch) is not already
+/// claimed by a work item. All fetched PRs are pre-filtered to the
+/// authenticated user via `--author @me` in the gh CLI calls.
 fn collect_unlinked_prs(
     repo_data: &HashMap<PathBuf, RepoFetchResult>,
     claimed_branches: &HashSet<(PathBuf, String)>,
-    authenticated_user: Option<&str>,
 ) -> Vec<UnlinkedPr> {
     let mut unlinked = Vec::new();
     for (repo_path, fetch) in repo_data {
         if let Ok(prs) = &fetch.prs {
             for pr in prs {
                 if pr.head_branch.is_empty() {
-                    continue;
-                }
-                // Only include PRs authored by the authenticated user.
-                // If we don't know the user, skip all unlinked PRs to
-                // avoid showing other people's work.
-                if let Some(user) = authenticated_user {
-                    if pr.author.as_deref() != Some(user) {
-                        continue;
-                    }
-                } else {
                     continue;
                 }
                 if !claimed_branches.contains(&(repo_path.clone(), pr.head_branch.clone())) {
@@ -577,7 +562,6 @@ mod tests {
             worktrees: Ok(worktrees),
             prs: Ok(prs),
             review_requested_prs: Ok(vec![]),
-            authenticated_user: Some("testuser".to_string()),
             issues,
         };
         (path, fetch)

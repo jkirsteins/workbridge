@@ -100,10 +100,6 @@ fn fetcher_loop(
         }
     };
 
-    // Cache the authenticated user login once per fetcher session.
-    // This avoids an extra API call every cycle for data that doesn't change.
-    let mut cached_user: Option<String> = None;
-
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -145,12 +141,6 @@ fn fetcher_loop(
             Some((owner, repo)) => github_client.list_review_requested_prs(owner, repo),
             None => Ok(Vec::new()),
         };
-
-        // Step 3c: resolve authenticated user (cached after first successful fetch)
-        if cached_user.is_none() && github_remote.is_some() {
-            cached_user = github_client.get_authenticated_user().ok();
-        }
-        let authenticated_user = cached_user.clone();
 
         // Step 4: extract issue numbers from worktree branch names AND
         // extra branches (backend records without worktrees) and fetch each
@@ -197,7 +187,6 @@ fn fetcher_loop(
             worktrees,
             prs,
             review_requested_prs,
-            authenticated_user,
             issues,
         };
 
@@ -405,7 +394,7 @@ mod tests {
                 labels: vec!["bug".into()],
             }],
             review_requested_prs: vec![],
-            authenticated_user: "testuser".to_string(),
+
             error: None,
         });
 
@@ -524,7 +513,7 @@ mod tests {
         let gc = Arc::new(MockGithubClient {
             prs: vec![],
             review_requested_prs: vec![],
-            authenticated_user: "testuser".to_string(),
+
             issues: vec![GithubIssue {
                 number: 55,
                 title: "Backend-only issue".into(),
