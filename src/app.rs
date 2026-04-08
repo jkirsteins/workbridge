@@ -358,6 +358,15 @@ pub struct App {
     /// activities are present.
     pub spinner_tick: usize,
 
+    // -- Background fetch indicator --
+    /// Activity ID for the in-flight background GitHub fetch. Started when
+    /// a FetchStarted message arrives, ended when all in-flight fetches
+    /// complete. Shows a spinner in the status bar during GitHub API calls.
+    pub fetch_activity: Option<ActivityId>,
+    /// Number of repos currently fetching. The activity spinner is shown
+    /// while this is > 0 and cleared when it returns to 0.
+    pub pending_fetch_count: usize,
+
     // -- Async PR creation --
     /// Receiver for asynchronous PR creation results.
     pub pr_create_rx: Option<crossbeam_channel::Receiver<PrCreateResult>>,
@@ -524,6 +533,8 @@ impl App {
             activity_counter: 0,
             activities: Vec::new(),
             spinner_tick: 0,
+            fetch_activity: None,
+            pending_fetch_count: 0,
             pr_create_rx: None,
             pr_create_activity: None,
             pr_create_wi: None,
@@ -964,8 +975,33 @@ impl App {
         let mut received_any = false;
         loop {
             match rx.try_recv() {
+                Ok(FetchMessage::FetchStarted) => {
+                    // Show a spinner while GitHub data is being fetched.
+                    // Track how many repos are in-flight so the spinner
+                    // persists until all repos have reported back.
+                    self.pending_fetch_count += 1;
+                    if self.fetch_activity.is_none() {
+                        // Can't call self.start_activity() here because
+                        // `rx` borrows self.fetch_rx immutably.
+                        self.activity_counter += 1;
+                        let id = ActivityId(self.activity_counter);
+                        self.activities.push(Activity {
+                            id,
+                            message: "Refreshing GitHub data".into(),
+                        });
+                        self.fetch_activity = Some(id);
+                    }
+                    continue;
+                }
                 Ok(FetchMessage::RepoData(result)) => {
                     received_any = true;
+                    self.pending_fetch_count = self.pending_fetch_count.saturating_sub(1);
+                    // Can't call self.end_activity() here - rx borrow.
+                    if self.pending_fetch_count == 0
+                        && let Some(id) = self.fetch_activity.take()
+                    {
+                        self.activities.retain(|a| a.id != id);
+                    }
                     // Surface worktree errors in the status bar. One-time
                     // per repo to avoid flooding on every fetch cycle.
                     if let Err(ref e) = result.worktrees
@@ -1007,9 +1043,16 @@ impl App {
                     }
                     self.repo_data.insert(result.repo_path.clone(), result);
                 }
-                Ok(FetchMessage::FetcherError { error, .. }) => {
+                Ok(FetchMessage::FetcherError { repo_path, error }) => {
                     received_any = true;
-                    let msg = format!("Fetch error: {error}");
+                    self.pending_fetch_count = self.pending_fetch_count.saturating_sub(1);
+                    // Can't call self.end_activity() here - rx borrow.
+                    if self.pending_fetch_count == 0
+                        && let Some(id) = self.fetch_activity.take()
+                    {
+                        self.activities.retain(|a| a.id != id);
+                    }
+                    let msg = format!("Fetch error ({}): {error}", repo_path.display());
                     if self.status_message.is_none() {
                         self.status_message = Some(msg);
                     } else {
@@ -4862,6 +4905,122 @@ mod tests {
         );
     }
 
+    /// PR list calls must include --author @me to filter to the
+    /// authenticated user's PRs. Without this, repos with 5000+ open PRs
+    /// return foreign PRs and may not include the user's own.
+    #[test]
+    fn pr_list_uses_author_me() {
+        let source = include_str!("github_client.rs");
+        assert!(
+            source.contains(r#""--author""#) && source.contains(r#""@me""#),
+            "PR list calls should include --author @me to filter to user's PRs",
+        );
+    }
+
+    /// FetchStarted message triggers a status bar activity, cleared on
+    /// RepoData arrival.
+    #[test]
+    fn fetch_started_shows_activity() {
+        let mut app = App::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.fetch_rx = Some(rx);
+
+        tx.send(FetchMessage::FetchStarted).unwrap();
+
+        app.drain_fetch_results();
+        assert!(app.fetch_activity.is_some());
+        assert!(app.current_activity().is_some());
+
+        // Sending RepoData should clear the activity.
+        tx.send(FetchMessage::RepoData(RepoFetchResult {
+            repo_path: PathBuf::from("/repo"),
+            github_remote: None,
+            worktrees: Ok(vec![]),
+            prs: Ok(vec![]),
+            issues: vec![],
+        }))
+        .unwrap();
+
+        app.drain_fetch_results();
+        assert!(app.fetch_activity.is_none());
+    }
+
+    /// FetcherError also clears the fetch activity.
+    #[test]
+    fn fetch_started_cleared_on_error() {
+        let mut app = App::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.fetch_rx = Some(rx);
+
+        tx.send(FetchMessage::FetchStarted).unwrap();
+        app.drain_fetch_results();
+        assert!(app.fetch_activity.is_some());
+
+        tx.send(FetchMessage::FetcherError {
+            repo_path: PathBuf::from("/repo"),
+            error: "test error".into(),
+        })
+        .unwrap();
+
+        app.drain_fetch_results();
+        assert!(app.fetch_activity.is_none());
+    }
+
+    /// Multiple FetchStarted messages should not create duplicate activities.
+    #[test]
+    fn fetch_started_deduplicates() {
+        let mut app = App::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.fetch_rx = Some(rx);
+
+        tx.send(FetchMessage::FetchStarted).unwrap();
+        tx.send(FetchMessage::FetchStarted).unwrap();
+
+        app.drain_fetch_results();
+        assert_eq!(app.activities.len(), 1);
+    }
+
+    /// Spinner persists until all in-flight repos finish, not just the first.
+    #[test]
+    fn fetch_activity_persists_until_all_repos_finish() {
+        let mut app = App::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.fetch_rx = Some(rx);
+
+        // Two repos start fetching.
+        tx.send(FetchMessage::FetchStarted).unwrap();
+        tx.send(FetchMessage::FetchStarted).unwrap();
+        app.drain_fetch_results();
+        assert!(app.fetch_activity.is_some());
+
+        // First repo finishes - spinner should persist.
+        tx.send(FetchMessage::RepoData(RepoFetchResult {
+            repo_path: PathBuf::from("/repo-a"),
+            github_remote: None,
+            worktrees: Ok(vec![]),
+            prs: Ok(vec![]),
+            issues: vec![],
+        }))
+        .unwrap();
+        app.drain_fetch_results();
+        assert!(
+            app.fetch_activity.is_some(),
+            "spinner should persist while second repo is still fetching",
+        );
+
+        // Second repo finishes - now spinner should clear.
+        tx.send(FetchMessage::RepoData(RepoFetchResult {
+            repo_path: PathBuf::from("/repo-b"),
+            github_remote: None,
+            worktrees: Ok(vec![]),
+            prs: Ok(vec![]),
+            issues: vec![],
+        }))
+        .unwrap();
+        app.drain_fetch_results();
+        assert!(app.fetch_activity.is_none());
+    }
+
     // -- Round 4 regression tests --
 
     /// F-1: Canonicalized repo paths in active_repo_cache match fetcher
@@ -5303,7 +5462,7 @@ mod tests {
         // The queued error should now be shown.
         assert_eq!(
             app.status_message.as_deref(),
-            Some("Fetch error: connection timed out"),
+            Some("Fetch error (/repo): connection timed out"),
             "queued error should surface when status clears",
         );
         assert!(

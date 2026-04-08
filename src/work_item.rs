@@ -287,11 +287,11 @@ pub struct RepoFetchResult {
 pub enum FetchMessage {
     RepoData(RepoFetchResult),
     FetcherError {
-        /// Available for per-repo error reporting in future UI enhancements.
-        #[allow(dead_code)]
         repo_path: PathBuf,
         error: String,
     },
+    /// Sent at the start of each fetch cycle so the UI can show a spinner.
+    FetchStarted,
 }
 
 /// Handle to background fetcher threads. Holds a shared stop flag for
