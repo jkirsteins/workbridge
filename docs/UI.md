@@ -29,6 +29,27 @@ Event handlers return `Control<AppEvent>`:
 - `Control::Changed` - trigger a re-render
 - `Control::Quit` - exit the application
 
+### Mouse Events
+
+Mouse capture is enabled so the terminal forwards mouse events to the
+application. Currently only ScrollUp and ScrollDown are handled; all
+other mouse events are ignored.
+
+When a scroll event arrives, `mouse_target()` performs hit-testing
+against terminal-absolute coordinates to determine which PTY area (if
+any) the cursor is over:
+
+1. **Global drawer** - checked first because it overlays everything.
+   When the drawer is open, coordinates outside its inner area return
+   `MouseTarget::None` so the dimmed background does not receive events.
+2. **Right panel** - the per-work-item PTY session area.
+
+If a target is found and the underlying session is alive, the scroll
+event is encoded according to the child process's mouse protocol mode
+and encoding (queried from the vt100 parser). The resulting bytes are
+written to the PTY master fd. When the child has not enabled mouse
+reporting, scrolls are converted to arrow-key sequences (Up/Down).
+
 ### Timer-Driven Periodic Work
 
 A 200ms repeating timer drives:
