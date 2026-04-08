@@ -106,12 +106,29 @@ created for the reviewer to inspect the code.
 
 Stage restrictions for ReviewRequest items:
 
-- **advance_stage**: Only Review -> Done is allowed (via the merge gate).
-  Advancing from any other stage is blocked.
+- **advance_stage**: All manual stage advancement is blocked. Review
+  requests are completed via the approve/request-changes MCP tools, not
+  manual stage advancement.
 - **retreat_stage**: Always blocked. There is no valid previous stage for
   a review request in Review.
-- **MCP transitions**: All MCP status transitions are blocked. Claude
+- **MCP status transitions**: `workbridge_set_status` is blocked. Claude
   sessions should not drive workflow for someone else's PR.
+- **MCP review tools**: `workbridge_approve_review` and
+  `workbridge_request_changes` are available only for ReviewRequest items.
+  These submit a GitHub PR review via `gh pr review` and auto-move the
+  item to Done on success. The MCP tools/call handler enforces the
+  ReviewRequest kind check server-side.
+
+### Re-open on re-request
+
+When a reviewer's review request is re-requested on a PR that already has
+a completed (Done) ReviewRequest work item, the item is automatically
+re-opened back to Review during reassembly. This handles the case where
+a PR author pushes changes and re-requests review after an initial review.
+
+To avoid false re-opens from stale GitHub data, recently-submitted review
+items are suppressed from re-open detection until fresh data arrives from
+the next GitHub fetch cycle.
 
 ## Work Item Status
 

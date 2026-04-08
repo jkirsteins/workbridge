@@ -36,6 +36,12 @@ pub enum McpEvent {
     SetPlan { work_item_id: String, plan: String },
     /// Claude called workbridge_set_activity.
     SetActivity { work_item_id: String, working: bool },
+    /// Claude called workbridge_approve_review or workbridge_request_changes.
+    SubmitReview {
+        work_item_id: String,
+        action: String,
+        comment: String,
+    },
 }
 
 /// Handle to the MCP socket server. Holds the socket path for cleanup
@@ -52,6 +58,7 @@ impl McpSocketServer {
     pub fn start(
         socket_path: PathBuf,
         work_item_id: String,
+        work_item_kind: String,
         context_json: String,
         activity_log_path: Option<PathBuf>,
         tx: Sender<McpEvent>,
@@ -71,6 +78,7 @@ impl McpSocketServer {
             accept_loop(
                 listener,
                 &work_item_id,
+                &work_item_kind,
                 &context_json,
                 activity_log_path.as_deref(),
                 &tx,
@@ -124,6 +132,7 @@ impl Drop for McpSocketServer {
 fn accept_loop(
     listener: UnixListener,
     work_item_id: &str,
+    work_item_kind: &str,
     context_json: &str,
     activity_log_path: Option<&Path>,
     tx: &Sender<McpEvent>,
@@ -131,6 +140,7 @@ fn accept_loop(
 ) {
     // Clone owned data for spawned threads.
     let wi_id = work_item_id.to_string();
+    let wi_kind = work_item_kind.to_string();
     let ctx_json = context_json.to_string();
     let act_path = activity_log_path.map(|p| p.to_path_buf());
 
@@ -141,11 +151,19 @@ fn accept_loop(
         match listener.accept() {
             Ok((stream, _)) => {
                 let wi_id = wi_id.clone();
+                let wi_kind = wi_kind.clone();
                 let ctx_json = ctx_json.clone();
                 let act_path = act_path.clone();
                 let tx = tx.clone();
                 std::thread::spawn(move || {
-                    handle_connection(stream, &wi_id, &ctx_json, act_path.as_deref(), &tx);
+                    handle_connection(
+                        stream,
+                        &wi_id,
+                        &wi_kind,
+                        &ctx_json,
+                        act_path.as_deref(),
+                        &tx,
+                    );
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -220,6 +238,7 @@ fn handle_global_connection(stream: UnixStream, context: &Arc<Mutex<String>>) {
 fn handle_connection(
     stream: UnixStream,
     work_item_id: &str,
+    work_item_kind: &str,
     context_json: &str,
     activity_log_path: Option<&Path>,
     tx: &Sender<McpEvent>,
@@ -236,7 +255,14 @@ fn handle_connection(
     let mut writer = stream;
 
     while let Ok(msg) = read_message(&mut reader) {
-        let response = handle_message(&msg, work_item_id, context_json, activity_log_path, tx);
+        let response = handle_message(
+            &msg,
+            work_item_id,
+            work_item_kind,
+            context_json,
+            activity_log_path,
+            tx,
+        );
         if let Some(resp) = response
             && write_message(&mut writer, &resp).is_err()
         {
@@ -314,6 +340,7 @@ fn write_message(writer: &mut impl Write, msg: &Value) -> io::Result<()> {
 fn handle_message(
     msg: &Value,
     work_item_id: &str,
+    work_item_kind: &str,
     context_json: &str,
     activity_log_path: Option<&Path>,
     tx: &Sender<McpEvent>,
@@ -342,26 +369,10 @@ fn handle_message(
         "notifications/initialized" => None,
         "tools/list" => {
             let id = id?;
-            let tools = vec![
-                json!({
-                    "name": "workbridge_set_status",
-                    "description": "Request a workflow stage change for the current work item. Call this when you finish implementing to signal readiness for review, or to signal that you are blocked and need user input. Done is not settable via MCP (it requires the merge gate). Note: status changes are validated asynchronously by the TUI - the request may be rejected if the transition is not allowed from the current state.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "status": {
-                                "type": "string",
-                                "description": "The new workflow stage. One of: Backlog, Planning, Implementing, Blocked, Review",
-                                "enum": ["Backlog", "Planning", "Implementing", "Blocked", "Review"]
-                            },
-                            "reason": {
-                                "type": "string",
-                                "description": "Optional reason for the status change (shown to the user)"
-                            }
-                        },
-                        "required": ["status"]
-                    }
-                }),
+            let is_review_request = work_item_kind == "ReviewRequest";
+
+            // Common tools available for all work item kinds.
+            let mut tools = vec![
                 json!({
                     "name": "workbridge_get_context",
                     "description": "Get the current context for this work item: stage, title, worktree path.",
@@ -396,20 +407,6 @@ fn handle_message(
                     }
                 }),
                 json!({
-                    "name": "workbridge_set_plan",
-                    "description": "Set the implementation plan for this work item. Call this when you have finalized the plan during the Planning stage.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "plan_text": {
-                                "type": "string",
-                                "description": "The full implementation plan text"
-                            }
-                        },
-                        "required": ["plan_text"]
-                    }
-                }),
-                json!({
                     "name": "workbridge_set_activity",
                     "description": "Signal whether you are actively working or idle. Call with working=true when starting a significant operation (running tests, building, making changes) and working=false when waiting for user input or finished. This controls a visual indicator in the TUI.",
                     "inputSchema": {
@@ -424,6 +421,73 @@ fn handle_message(
                     }
                 }),
             ];
+
+            if is_review_request {
+                // Review request items get approve/request-changes tools
+                // instead of set_status/set_plan.
+                tools.push(json!({
+                    "name": "workbridge_approve_review",
+                    "description": "Approve the PR review. Submits your approval via GitHub and completes this review request work item.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "comment": {
+                                "type": "string",
+                                "description": "Optional comment to include with the approval"
+                            }
+                        }
+                    }
+                }));
+                tools.push(json!({
+                    "name": "workbridge_request_changes",
+                    "description": "Request changes on the PR. Submits your review via GitHub and completes this review request work item.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "comment": {
+                                "type": "string",
+                                "description": "Comment explaining what changes are needed"
+                            }
+                        },
+                        "required": ["comment"]
+                    }
+                }));
+            } else {
+                // Regular work items get set_status and set_plan tools.
+                tools.push(json!({
+                    "name": "workbridge_set_status",
+                    "description": "Request a workflow stage change for the current work item. Call this when you finish implementing to signal readiness for review, or to signal that you are blocked and need user input. Done is not settable via MCP (it requires the merge gate). Note: status changes are validated asynchronously by the TUI - the request may be rejected if the transition is not allowed from the current state.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "status": {
+                                "type": "string",
+                                "description": "The new workflow stage. One of: Backlog, Planning, Implementing, Blocked, Review",
+                                "enum": ["Backlog", "Planning", "Implementing", "Blocked", "Review"]
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Optional reason for the status change (shown to the user)"
+                            }
+                        },
+                        "required": ["status"]
+                    }
+                }));
+                tools.push(json!({
+                    "name": "workbridge_set_plan",
+                    "description": "Set the implementation plan for this work item. Call this when you have finalized the plan during the Planning stage.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "plan_text": {
+                                "type": "string",
+                                "description": "The full implementation plan text"
+                            }
+                        },
+                        "required": ["plan_text"]
+                    }
+                }));
+            }
 
             Some(json!({
                 "jsonrpc": "2.0",
@@ -636,6 +700,69 @@ fn handle_message(
                                 "content": [{
                                     "type": "text",
                                     "text": format!("Activity state set to {state_text}")
+                                }]
+                            }
+                        }))
+                    } else {
+                        Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": "Error: TUI channel disconnected"
+                                }],
+                                "isError": true
+                            }
+                        }))
+                    }
+                }
+                "workbridge_approve_review" | "workbridge_request_changes" => {
+                    if work_item_kind != "ReviewRequest" {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": "Error: review tools are only available for ReviewRequest work items"
+                                }],
+                                "isError": true
+                            }
+                        }));
+                    }
+                    let action = if tool_name == "workbridge_approve_review" {
+                        "approve"
+                    } else {
+                        "request_changes"
+                    };
+                    let comment = arguments
+                        .get("comment")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let event = McpEvent::SubmitReview {
+                        work_item_id: work_item_id.to_string(),
+                        action: action.to_string(),
+                        comment,
+                    };
+                    let send_ok = tx.send(event).is_ok();
+
+                    if send_ok {
+                        let verb = if action == "approve" {
+                            "Approval"
+                        } else {
+                            "Changes-requested review"
+                        };
+                        Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": format!("{verb} submitted - pending GitHub API call. \
+                                             The work item will move to Done once the review is posted.")
                                 }]
                             }
                         }))
@@ -979,7 +1106,7 @@ mod tests {
                 "clientInfo": {"name": "claude", "version": "1.0"}
             }
         });
-        let resp = handle_message(&msg, "test-id", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "test-id", "", "{}", None, &tx).unwrap();
         assert_eq!(resp["result"]["serverInfo"]["name"], "workbridge");
     }
 
@@ -991,7 +1118,7 @@ mod tests {
             "id": 2,
             "method": "tools/list"
         });
-        let resp = handle_message(&msg, "test-id", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "test-id", "", "{}", None, &tx).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 6);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -1022,7 +1149,7 @@ mod tests {
                 }
             }
         });
-        let resp = handle_message(&msg, "wi-123", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "wi-123", "", "{}", None, &tx).unwrap();
         assert!(
             resp["result"]["content"][0]["text"]
                 .as_str()
@@ -1061,7 +1188,7 @@ mod tests {
                 }
             }
         });
-        let resp = handle_message(&msg, "wi-456", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "wi-456", "", "{}", None, &tx).unwrap();
         assert_eq!(
             resp["result"]["content"][0]["text"].as_str().unwrap(),
             "Event logged"
@@ -1096,7 +1223,7 @@ mod tests {
                 }
             }
         });
-        let resp = handle_message(&msg, "wi-789", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "wi-789", "", "{}", None, &tx).unwrap();
         assert_eq!(
             resp["result"]["content"][0]["text"].as_str().unwrap(),
             "Plan saved"
@@ -1126,7 +1253,7 @@ mod tests {
                 }
             }
         });
-        let resp = handle_message(&msg, "wi-789", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "wi-789", "", "{}", None, &tx).unwrap();
         assert!(resp.get("error").is_some(), "expected error response");
         assert_eq!(resp["error"]["code"], -32602);
 
@@ -1141,7 +1268,7 @@ mod tests {
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         });
-        assert!(handle_message(&msg, "test-id", "{}", None, &tx).is_none());
+        assert!(handle_message(&msg, "test-id", "", "{}", None, &tx).is_none());
     }
 
     #[test]
@@ -1156,7 +1283,7 @@ mod tests {
                 "arguments": {}
             }
         });
-        let resp = handle_message(&msg, "test-id", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "test-id", "", "{}", None, &tx).unwrap();
         assert!(resp.get("error").is_some());
     }
 
@@ -1168,9 +1295,15 @@ mod tests {
         ));
         let (tx, _rx) = unbounded();
 
-        let server =
-            McpSocketServer::start(socket_path.clone(), "test-wi".into(), "{}".into(), None, tx)
-                .expect("failed to start server");
+        let server = McpSocketServer::start(
+            socket_path.clone(),
+            "test-wi".into(),
+            "".into(),
+            "{}".into(),
+            None,
+            tx,
+        )
+        .expect("failed to start server");
 
         // Verify socket file exists.
         assert!(socket_path.exists(), "socket file should exist");
@@ -1295,6 +1428,7 @@ mod tests {
         let server = McpSocketServer::start(
             socket_path.clone(),
             "integration-wi".into(),
+            "".into(),
             "{}".into(),
             None,
             tx,
@@ -1393,7 +1527,8 @@ mod tests {
             }
         });
         // The review gate tool was removed (gate uses claude --print now).
-        let resp = handle_message(&msg, "wi-gate", r#"{"stage":"ReviewGate"}"#, None, &tx).unwrap();
+        let resp =
+            handle_message(&msg, "wi-gate", "", r#"{"stage":"ReviewGate"}"#, None, &tx).unwrap();
         assert!(resp.get("error").is_some());
         assert_eq!(resp["error"]["code"], -32601);
         assert!(rx.try_recv().is_err());
@@ -1419,7 +1554,7 @@ mod tests {
                 }
             }
         });
-        let resp = handle_message(&msg, "wi-wording", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "wi-wording", "", "{}", None, &tx).unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains("NOT changed") || text.contains("NOT"),
@@ -1448,7 +1583,7 @@ mod tests {
                 }
             }
         });
-        let resp = handle_message(&msg, "wi-wording", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "wi-wording", "", "{}", None, &tx).unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
             !text.contains("NOT changed"),

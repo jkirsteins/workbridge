@@ -95,14 +95,21 @@ review-requested PRs using the `review-requested:@me` GitHub search
 filter. These are PRs authored by others where the current user has
 been requested as a reviewer.
 
-The `reassemble()` function produces a 3-tuple:
-`(work_items, unlinked_prs, review_requested_prs)`. The
+The `reassemble()` function produces a 4-tuple:
+`(work_items, unlinked_prs, review_requested_prs, reopen_ids)`. The
 `collect_review_requested_prs()` helper filters out any
 review-requested PRs that are already claimed by an existing work item,
 so only genuinely untracked review requests appear in the sidebar.
 Review-requested PRs are distinct from unlinked PRs - unlinked PRs are
 the user's own PRs without a work item, while review-requested PRs are
 other people's PRs where the user is a reviewer.
+
+The `reopen_ids` vector contains WorkItemIds for Done ReviewRequest items
+whose branch still appears in the review-requested set from GitHub. The
+caller (App::reassemble_work_items) uses this to re-open those items back
+to Review, handling the case where a PR author re-requests review after
+an initial review was completed. A suppression set prevents false re-opens
+from stale GitHub data immediately after review submission.
 
 This requires GitHub API access with authentication. Responses take
 200-500ms typically. Rate-limited to 5000 requests/hour with a token.

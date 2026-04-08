@@ -350,6 +350,9 @@ pub fn app_event(
             // Poll async PR merge result.
             state.poll_pr_merge();
 
+            // Poll async review submission result.
+            state.poll_review_submission();
+
             // Poll mergequeue items for externally merged PRs.
             state.poll_mergequeue();
 
