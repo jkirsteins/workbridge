@@ -161,8 +161,7 @@ mod tests {
 
     #[test]
     fn render_no_unsubstituted_markers() {
-        // Verify that when all known variables are provided, no {key} markers remain
-        // in rendered output (except review_gate which uses different vars).
+        // Verify that when all known variables are provided, no {key} markers remain.
         let cases = vec![
             (
                 "planning",
@@ -206,6 +205,14 @@ mod tests {
                     ("plan", "Plan"),
                     ("rework_reason", "Reason"),
                     ("description", ""),
+                ],
+            ),
+            (
+                "review_gate",
+                vec![
+                    ("repo_path", "/tmp/repo"),
+                    ("default_branch", "main"),
+                    ("branch", "feature/test"),
                 ],
             ),
             ("global_assistant", vec![("repo_list", "- /tmp/repo")]),

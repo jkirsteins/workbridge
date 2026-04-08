@@ -55,6 +55,13 @@ impl McpSocketServer {
     /// Start a new MCP socket server at the given path.
     /// Returns the server handle and immediately begins accepting connections
     /// on a background thread.
+    ///
+    /// When `read_only` is true, only read-only tools (`workbridge_get_context`,
+    /// `workbridge_get_plan`, `workbridge_query_log`) are exposed. Mutating
+    /// tools (`workbridge_set_status`, `workbridge_set_plan`,
+    /// `workbridge_set_activity`, `workbridge_log_event`) are hidden from
+    /// `tools/list` and rejected at `tools/call`. Use this for sessions that
+    /// must not modify work item state (e.g., the adversarial review gate).
     pub fn start(
         socket_path: PathBuf,
         work_item_id: String,
@@ -62,6 +69,7 @@ impl McpSocketServer {
         context_json: String,
         activity_log_path: Option<PathBuf>,
         tx: Sender<McpEvent>,
+        read_only: bool,
     ) -> io::Result<Self> {
         // Remove stale socket if it exists.
         let _ = std::fs::remove_file(&socket_path);
@@ -75,15 +83,14 @@ impl McpSocketServer {
         let path_clone = socket_path.clone();
 
         std::thread::spawn(move || {
-            accept_loop(
-                listener,
-                &work_item_id,
-                &work_item_kind,
-                &context_json,
-                activity_log_path.as_deref(),
-                &tx,
-                &stop_clone,
-            );
+            let cfg = SessionMcpConfig {
+                work_item_id,
+                work_item_kind,
+                context_json,
+                activity_log_path,
+                read_only,
+            };
+            accept_loop(listener, &cfg, &tx, &stop_clone);
             // Clean up the socket file when the accept loop exits.
             let _ = std::fs::remove_file(&path_clone);
         });
@@ -126,34 +133,35 @@ impl Drop for McpSocketServer {
     }
 }
 
+/// Bundles per-session MCP configuration to keep function signatures short.
+struct SessionMcpConfig {
+    work_item_id: String,
+    work_item_kind: String,
+    context_json: String,
+    activity_log_path: Option<PathBuf>,
+    read_only: bool,
+}
+
 /// Accept loop: waits for connections and spawns a thread per connection.
 /// Each connection is handled independently so that a stale health-check
 /// connection cannot block subsequent real connections.
 fn accept_loop(
     listener: UnixListener,
-    work_item_id: &str,
-    work_item_kind: &str,
-    context_json: &str,
-    activity_log_path: Option<&Path>,
+    cfg: &SessionMcpConfig,
     tx: &Sender<McpEvent>,
     stop: &AtomicBool,
 ) {
-    // Clone owned data for spawned threads.
-    let wi_id = work_item_id.to_string();
-    let wi_kind = work_item_kind.to_string();
-    let ctx_json = context_json.to_string();
-    let act_path = activity_log_path.map(|p| p.to_path_buf());
-
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
         match listener.accept() {
             Ok((stream, _)) => {
-                let wi_id = wi_id.clone();
-                let wi_kind = wi_kind.clone();
-                let ctx_json = ctx_json.clone();
-                let act_path = act_path.clone();
+                let wi_id = cfg.work_item_id.clone();
+                let wi_kind = cfg.work_item_kind.clone();
+                let ctx_json = cfg.context_json.clone();
+                let act_path = cfg.activity_log_path.clone();
+                let read_only = cfg.read_only;
                 let tx = tx.clone();
                 std::thread::spawn(move || {
                     handle_connection(
@@ -163,6 +171,7 @@ fn accept_loop(
                         &ctx_json,
                         act_path.as_deref(),
                         &tx,
+                        read_only,
                     );
                 });
             }
@@ -242,6 +251,7 @@ fn handle_connection(
     context_json: &str,
     activity_log_path: Option<&Path>,
     tx: &Sender<McpEvent>,
+    read_only: bool,
 ) {
     // Set the stream to blocking mode for this connection.
     if stream.set_nonblocking(false).is_err() {
@@ -262,6 +272,7 @@ fn handle_connection(
             context_json,
             activity_log_path,
             tx,
+            read_only,
         );
         if let Some(resp) = response
             && write_message(&mut writer, &resp).is_err()
@@ -344,6 +355,7 @@ fn handle_message(
     context_json: &str,
     activity_log_path: Option<&Path>,
     tx: &Sender<McpEvent>,
+    read_only: bool,
 ) -> Option<Value> {
     let method = msg.get("method")?.as_str()?;
     let id = msg.get("id");
@@ -371,7 +383,8 @@ fn handle_message(
             let id = id?;
             let is_review_request = work_item_kind == "ReviewRequest";
 
-            // Common tools available for all work item kinds.
+            // Read-only tools available for all sessions (including
+            // read-only review gate sessions).
             let mut tools = vec![
                 json!({
                     "name": "workbridge_get_context",
@@ -382,23 +395,6 @@ fn handle_message(
                     }
                 }),
                 json!({
-                    "name": "workbridge_log_event",
-                    "description": "Log an event to the work item's activity log.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "event_type": {
-                                "type": "string",
-                                "description": "Type of event (e.g., 'note', 'milestone', 'error')"
-                            },
-                            "payload": {
-                                "description": "Arbitrary JSON payload for the event"
-                            }
-                        },
-                        "required": ["event_type"]
-                    }
-                }),
-                json!({
                     "name": "workbridge_query_log",
                     "description": "Read the activity log for this work item.",
                     "inputSchema": {
@@ -406,21 +402,61 @@ fn handle_message(
                         "properties": {}
                     }
                 }),
-                json!({
-                    "name": "workbridge_set_activity",
-                    "description": "Signal whether you are actively working or idle. Call with working=true when starting a significant operation (running tests, building, making changes) and working=false when waiting for user input or finished. This controls a visual indicator in the TUI.",
+            ];
+
+            // Read-only sessions (e.g., review gate) get the plan tool
+            // in addition to the common read-only tools above, then
+            // return early - no mutating tools.
+            if read_only {
+                tools.push(json!({
+                    "name": "workbridge_get_plan",
+                    "description": "Get the implementation plan for this work item.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "working": {
-                                "type": "boolean",
-                                "description": "True if actively working, false if idle or waiting for input"
-                            }
-                        },
-                        "required": ["working"]
+                        "properties": {}
                     }
-                }),
-            ];
+                }));
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "tools": tools
+                    }
+                }));
+            }
+
+            // Mutating tools for interactive sessions.
+            tools.push(json!({
+                "name": "workbridge_log_event",
+                "description": "Log an event to the work item's activity log.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "event_type": {
+                            "type": "string",
+                            "description": "Type of event (e.g., 'note', 'milestone', 'error')"
+                        },
+                        "payload": {
+                            "description": "Arbitrary JSON payload for the event"
+                        }
+                    },
+                    "required": ["event_type"]
+                }
+            }));
+            tools.push(json!({
+                "name": "workbridge_set_activity",
+                "description": "Signal whether you are actively working or idle. Call with working=true when starting a significant operation (running tests, building, making changes) and working=false when waiting for user input or finished. This controls a visual indicator in the TUI.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "working": {
+                            "type": "boolean",
+                            "description": "True if actively working, false if idle or waiting for input"
+                        }
+                    },
+                    "required": ["working"]
+                }
+            }));
 
             if is_review_request {
                 // Review request items get approve/request-changes tools
@@ -502,6 +538,26 @@ fn handle_message(
             let params = msg.get("params")?;
             let tool_name = params.get("name")?.as_str()?;
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+
+            // Reject mutating tool calls in read-only mode. Even if a
+            // caller somehow discovers the tool name, the call is blocked.
+            if read_only {
+                match tool_name {
+                    "workbridge_get_context" | "workbridge_get_plan" | "workbridge_query_log" => {
+                        // Allowed - fall through to normal handling.
+                    }
+                    _ => {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32601,
+                                "message": format!("tool '{tool_name}' is not available in read-only mode")
+                            }
+                        }));
+                    }
+                }
+            }
 
             match tool_name {
                 "workbridge_set_status" => {
@@ -716,6 +772,23 @@ fn handle_message(
                             }
                         }))
                     }
+                }
+                "workbridge_get_plan" => {
+                    let ctx: Value = serde_json::from_str(context_json).unwrap_or(json!({}));
+                    let plan = ctx
+                        .get("plan")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("No plan available.");
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": plan
+                            }]
+                        }
+                    }))
                 }
                 "workbridge_approve_review" | "workbridge_request_changes" => {
                     if work_item_kind != "ReviewRequest" {
@@ -1140,7 +1213,7 @@ mod tests {
                 "clientInfo": {"name": "claude", "version": "1.0"}
             }
         });
-        let resp = handle_message(&msg, "test-id", "", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "test-id", "", "{}", None, &tx, false).unwrap();
         assert_eq!(resp["result"]["serverInfo"]["name"], "workbridge");
     }
 
@@ -1152,7 +1225,7 @@ mod tests {
             "id": 2,
             "method": "tools/list"
         });
-        let resp = handle_message(&msg, "test-id", "", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "test-id", "", "{}", None, &tx, false).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 6);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -1162,10 +1235,75 @@ mod tests {
         assert!(names.contains(&"workbridge_query_log"));
         assert!(names.contains(&"workbridge_set_plan"));
         assert!(names.contains(&"workbridge_set_activity"));
+        assert!(!names.contains(&"workbridge_get_plan"));
         assert!(
             !names.contains(&"workbridge_review_gate_result"),
             "review gate tool was removed"
         );
+    }
+
+    #[test]
+    fn read_only_mode_exposes_only_read_tools() {
+        let tx = make_tx();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        });
+        let resp = handle_message(&msg, "test-id", "", "{}", None, &tx, true).unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3);
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"workbridge_get_context"));
+        assert!(names.contains(&"workbridge_query_log"));
+        assert!(names.contains(&"workbridge_get_plan"));
+        assert!(!names.contains(&"workbridge_set_status"));
+        assert!(!names.contains(&"workbridge_set_plan"));
+        assert!(!names.contains(&"workbridge_set_activity"));
+        assert!(!names.contains(&"workbridge_log_event"));
+    }
+
+    #[test]
+    fn read_only_mode_rejects_mutating_tool_calls() {
+        let (tx, rx) = unbounded();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "workbridge_set_status",
+                "arguments": {"status": "Review"}
+            }
+        });
+        let resp = handle_message(&msg, "wi-ro", "", "{}", None, &tx, true).unwrap();
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not available in read-only mode")
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no channel event should be sent in read-only mode"
+        );
+    }
+
+    #[test]
+    fn read_only_mode_allows_get_plan() {
+        let tx = make_tx();
+        let context = json!({"plan": "test plan"}).to_string();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "workbridge_get_plan",
+                "arguments": {}
+            }
+        });
+        let resp = handle_message(&msg, "wi-ro", "", &context, None, &tx, true).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "test plan");
     }
 
     #[test]
@@ -1183,7 +1321,7 @@ mod tests {
                 }
             }
         });
-        let resp = handle_message(&msg, "wi-123", "", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "wi-123", "", "{}", None, &tx, false).unwrap();
         assert!(
             resp["result"]["content"][0]["text"]
                 .as_str()
@@ -1222,7 +1360,7 @@ mod tests {
                 }
             }
         });
-        let resp = handle_message(&msg, "wi-456", "", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "wi-456", "", "{}", None, &tx, false).unwrap();
         assert_eq!(
             resp["result"]["content"][0]["text"].as_str().unwrap(),
             "Event logged"
@@ -1257,7 +1395,7 @@ mod tests {
                 }
             }
         });
-        let resp = handle_message(&msg, "wi-789", "", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "wi-789", "", "{}", None, &tx, false).unwrap();
         assert_eq!(
             resp["result"]["content"][0]["text"].as_str().unwrap(),
             "Plan saved"
@@ -1287,12 +1425,47 @@ mod tests {
                 }
             }
         });
-        let resp = handle_message(&msg, "wi-789", "", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "wi-789", "", "{}", None, &tx, false).unwrap();
         assert!(resp.get("error").is_some(), "expected error response");
         assert_eq!(resp["error"]["code"], -32602);
 
         // No event should have been sent.
         assert!(rx.try_recv().is_err(), "expected no channel event");
+    }
+
+    #[test]
+    fn handle_get_plan_returns_plan_from_context() {
+        let tx = make_tx();
+        let context = json!({"plan": "Step 1: implement\nStep 2: test"}).to_string();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "workbridge_get_plan",
+                "arguments": {}
+            }
+        });
+        let resp = handle_message(&msg, "wi-plan", "", &context, None, &tx, false).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "Step 1: implement\nStep 2: test");
+    }
+
+    #[test]
+    fn handle_get_plan_returns_fallback_when_no_plan() {
+        let tx = make_tx();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "workbridge_get_plan",
+                "arguments": {}
+            }
+        });
+        let resp = handle_message(&msg, "wi-plan", "", "{}", None, &tx, false).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "No plan available.");
     }
 
     #[test]
@@ -1302,7 +1475,7 @@ mod tests {
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         });
-        assert!(handle_message(&msg, "test-id", "", "{}", None, &tx).is_none());
+        assert!(handle_message(&msg, "test-id", "", "{}", None, &tx, false).is_none());
     }
 
     #[test]
@@ -1317,7 +1490,7 @@ mod tests {
                 "arguments": {}
             }
         });
-        let resp = handle_message(&msg, "test-id", "", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "test-id", "", "{}", None, &tx, false).unwrap();
         assert!(resp.get("error").is_some());
     }
 
@@ -1336,6 +1509,7 @@ mod tests {
             "{}".into(),
             None,
             tx,
+            false,
         )
         .expect("failed to start server");
 
@@ -1531,6 +1705,7 @@ mod tests {
             "{}".into(),
             None,
             tx,
+            false,
         )
         .expect("failed to start server");
 
@@ -1626,8 +1801,16 @@ mod tests {
             }
         });
         // The review gate tool was removed (gate uses claude --print now).
-        let resp =
-            handle_message(&msg, "wi-gate", "", r#"{"stage":"ReviewGate"}"#, None, &tx).unwrap();
+        let resp = handle_message(
+            &msg,
+            "wi-gate",
+            "",
+            r#"{"stage":"ReviewGate"}"#,
+            None,
+            &tx,
+            false,
+        )
+        .unwrap();
         assert!(resp.get("error").is_some());
         assert_eq!(resp["error"]["code"], -32601);
         assert!(rx.try_recv().is_err());
@@ -1653,7 +1836,7 @@ mod tests {
                 }
             }
         });
-        let resp = handle_message(&msg, "wi-wording", "", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "wi-wording", "", "{}", None, &tx, false).unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains("NOT changed") || text.contains("NOT"),
@@ -1682,7 +1865,7 @@ mod tests {
                 }
             }
         });
-        let resp = handle_message(&msg, "wi-wording", "", "{}", None, &tx).unwrap();
+        let resp = handle_message(&msg, "wi-wording", "", "{}", None, &tx, false).unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
             !text.contains("NOT changed"),
