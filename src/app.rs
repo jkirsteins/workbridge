@@ -2693,6 +2693,10 @@ impl App {
             }
 
             // 4c: Close open PR via `gh pr close`
+            // Runs synchronously (unlike pr create/merge which are async). This is
+            // deliberate: delete is a user-confirmed destructive operation where all
+            // cleanup should complete before the user continues interacting. Making
+            // this async would risk orphaned PRs if the user quits during the gap.
             if let Some(pr_number) = info.open_pr_number
                 && let Some((ref owner, ref repo)) = info.github_remote
             {
@@ -8059,160 +8063,219 @@ mod tests {
         );
     }
 
+    // -- Shared delete test fixtures --
+
+    /// A backend that returns a fixed list of records from `list()`. All
+    /// mutating operations (delete, update_status, etc.) are no-ops that
+    /// return Ok. Eliminates the need for per-test OneItemBackend /
+    /// RecordingTestBackend / etc. boilerplate.
+    struct FixedListBackend {
+        records: Vec<crate::work_item_backend::WorkItemRecord>,
+    }
+
+    impl FixedListBackend {
+        fn one_item(id_path: &str, title: &str, repo_path: &str, branch: &str) -> Self {
+            Self {
+                records: vec![crate::work_item_backend::WorkItemRecord {
+                    id: WorkItemId::LocalFile(PathBuf::from(id_path)),
+                    title: title.into(),
+                    description: None,
+                    status: WorkItemStatus::Implementing,
+                    repo_associations: vec![RepoAssociationRecord {
+                        repo_path: PathBuf::from(repo_path),
+                        branch: Some(branch.into()),
+                        pr_identity: None,
+                    }],
+                    plan: None,
+                }],
+            }
+        }
+    }
+
+    impl WorkItemBackend for FixedListBackend {
+        fn read(
+            &self,
+            id: &WorkItemId,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::NotFound(id.clone()))
+        }
+        fn list(&self) -> Result<crate::work_item_backend::ListResult, BackendError> {
+            Ok(crate::work_item_backend::ListResult {
+                records: self.records.clone(),
+                corrupt: Vec::new(),
+            })
+        }
+        fn create(
+            &self,
+            _req: CreateWorkItem,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation("not used".into()))
+        }
+        fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn update_status(
+            &self,
+            _id: &WorkItemId,
+            _status: WorkItemStatus,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn import(
+            &self,
+            _unlinked: &crate::work_item::UnlinkedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation("not used".into()))
+        }
+        fn append_activity(
+            &self,
+            _id: &WorkItemId,
+            _entry: &ActivityEntry,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
+            Ok(Vec::new())
+        }
+        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
+            Ok(None)
+        }
+        fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn backend_type(&self) -> crate::work_item::BackendType {
+            crate::work_item::BackendType::LocalFile
+        }
+    }
+
+    /// Worktree service that delegates to StubWorktreeService defaults but
+    /// overrides `is_worktree_dirty` to always return the configured value,
+    /// and optionally records `remove_worktree` / `delete_branch` calls.
+    struct ConfigurableWorktreeService {
+        always_dirty: bool,
+        remove_worktree_calls: std::sync::Mutex<Vec<(PathBuf, PathBuf, bool, bool)>>,
+        delete_branch_calls: std::sync::Mutex<Vec<(PathBuf, String, bool)>>,
+    }
+
+    impl ConfigurableWorktreeService {
+        fn dirty() -> Self {
+            Self {
+                always_dirty: true,
+                remove_worktree_calls: std::sync::Mutex::new(Vec::new()),
+                delete_branch_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recording() -> Self {
+            Self {
+                always_dirty: false,
+                remove_worktree_calls: std::sync::Mutex::new(Vec::new()),
+                delete_branch_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl WorktreeService for ConfigurableWorktreeService {
+        fn list_worktrees(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<
+            Vec<crate::worktree_service::WorktreeInfo>,
+            crate::worktree_service::WorktreeError,
+        > {
+            Ok(Vec::new())
+        }
+        fn create_worktree(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+            _target_dir: &std::path::Path,
+        ) -> Result<crate::worktree_service::WorktreeInfo, crate::worktree_service::WorktreeError>
+        {
+            Err(crate::worktree_service::WorktreeError::GitError(
+                "not used".into(),
+            ))
+        }
+        fn remove_worktree(
+            &self,
+            repo_path: &std::path::Path,
+            worktree_path: &std::path::Path,
+            delete_branch: bool,
+            force: bool,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            self.remove_worktree_calls.lock().unwrap().push((
+                repo_path.to_path_buf(),
+                worktree_path.to_path_buf(),
+                delete_branch,
+                force,
+            ));
+            Ok(())
+        }
+        fn delete_branch(
+            &self,
+            repo_path: &std::path::Path,
+            branch: &str,
+            force: bool,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            self.delete_branch_calls.lock().unwrap().push((
+                repo_path.to_path_buf(),
+                branch.to_string(),
+                force,
+            ));
+            Ok(())
+        }
+        fn is_worktree_dirty(
+            &self,
+            _worktree_path: &std::path::Path,
+        ) -> Result<bool, crate::worktree_service::WorktreeError> {
+            Ok(self.always_dirty)
+        }
+        fn default_branch(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<String, crate::worktree_service::WorktreeError> {
+            Ok("main".to_string())
+        }
+        fn github_remote(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<Option<(String, String)>, crate::worktree_service::WorktreeError> {
+            Ok(None)
+        }
+        fn fetch_branch(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            Ok(())
+        }
+        fn create_branch(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            Ok(())
+        }
+    }
+
     /// When a worktree has uncommitted changes, attempt_delete escalates
     /// the confirmation state to AwaitingForce instead of deleting.
     #[test]
     fn dirty_worktree_triggers_force_prompt() {
-        use crate::work_item_backend::ListResult;
-        use crate::worktree_service::{WorktreeError, WorktreeInfo};
-
-        /// Mock worktree service that reports worktrees as dirty.
-        struct DirtyWorktreeService;
-
-        impl WorktreeService for DirtyWorktreeService {
-            fn list_worktrees(
-                &self,
-                _repo_path: &std::path::Path,
-            ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
-                Ok(Vec::new())
-            }
-            fn create_worktree(
-                &self,
-                _repo_path: &std::path::Path,
-                _branch: &str,
-                _target_dir: &std::path::Path,
-            ) -> Result<WorktreeInfo, WorktreeError> {
-                Err(WorktreeError::GitError("not used".into()))
-            }
-            fn remove_worktree(
-                &self,
-                _repo_path: &std::path::Path,
-                _worktree_path: &std::path::Path,
-                _delete_branch: bool,
-                _force: bool,
-            ) -> Result<(), WorktreeError> {
-                Ok(())
-            }
-            fn delete_branch(
-                &self,
-                _repo_path: &std::path::Path,
-                _branch: &str,
-                _force: bool,
-            ) -> Result<(), WorktreeError> {
-                Ok(())
-            }
-            fn is_worktree_dirty(
-                &self,
-                _worktree_path: &std::path::Path,
-            ) -> Result<bool, WorktreeError> {
-                Ok(true) // Always report dirty.
-            }
-            fn default_branch(
-                &self,
-                _repo_path: &std::path::Path,
-            ) -> Result<String, WorktreeError> {
-                Ok("main".to_string())
-            }
-            fn github_remote(
-                &self,
-                _repo_path: &std::path::Path,
-            ) -> Result<Option<(String, String)>, WorktreeError> {
-                Ok(None)
-            }
-            fn fetch_branch(
-                &self,
-                _repo_path: &std::path::Path,
-                _branch: &str,
-            ) -> Result<(), WorktreeError> {
-                Ok(())
-            }
-            fn create_branch(
-                &self,
-                _repo_path: &std::path::Path,
-                _branch: &str,
-            ) -> Result<(), WorktreeError> {
-                Ok(())
-            }
-        }
-
-        // Backend that holds one work item with a worktree path set.
-        struct OneItemBackend;
-
-        impl WorkItemBackend for OneItemBackend {
-            fn read(
-                &self,
-                id: &WorkItemId,
-            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-                Err(BackendError::NotFound(id.clone()))
-            }
-            fn list(&self) -> Result<ListResult, BackendError> {
-                Ok(ListResult {
-                    records: vec![crate::work_item_backend::WorkItemRecord {
-                        id: WorkItemId::LocalFile(PathBuf::from("/tmp/dirty-test.json")),
-                        title: "Dirty worktree item".into(),
-                        description: None,
-                        status: WorkItemStatus::Implementing,
-                        repo_associations: vec![RepoAssociationRecord {
-                            repo_path: PathBuf::from("/repo"),
-                            branch: Some("dirty-branch".into()),
-                            pr_identity: None,
-                        }],
-                        plan: None,
-                    }],
-                    corrupt: Vec::new(),
-                })
-            }
-            fn create(
-                &self,
-                _req: CreateWorkItem,
-            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-                Err(BackendError::Validation("not used".into()))
-            }
-            fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
-                Ok(())
-            }
-            fn update_status(
-                &self,
-                _id: &WorkItemId,
-                _status: WorkItemStatus,
-            ) -> Result<(), BackendError> {
-                Ok(())
-            }
-            fn import(
-                &self,
-                _unlinked: &crate::work_item::UnlinkedPr,
-            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-                Err(BackendError::Validation("not used".into()))
-            }
-            fn append_activity(
-                &self,
-                _id: &WorkItemId,
-                _entry: &ActivityEntry,
-            ) -> Result<(), BackendError> {
-                Ok(())
-            }
-            fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-                Ok(Vec::new())
-            }
-            fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
-                Ok(())
-            }
-            fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
-                Ok(None)
-            }
-            fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
-                None
-            }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
-            }
-        }
-
         use crate::config::InMemoryConfigProvider;
+
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
-            Box::new(OneItemBackend),
-            Arc::new(DirtyWorktreeService),
+            Box::new(FixedListBackend::one_item(
+                "/tmp/dirty-test.json",
+                "Dirty worktree item",
+                "/repo",
+                "dirty-branch",
+            )),
+            Arc::new(ConfigurableWorktreeService::dirty()),
             Box::new(InMemoryConfigProvider::new()),
         );
 
@@ -8260,180 +8323,17 @@ mod tests {
     /// delete_branch on the worktree service with the correct arguments.
     #[test]
     fn delete_calls_remove_worktree_and_delete_branch() {
-        use crate::work_item_backend::ListResult;
-        use crate::worktree_service::{WorktreeError, WorktreeInfo};
-
-        /// Recording mock that captures remove_worktree and delete_branch calls.
-        struct RecordingWorktreeService {
-            remove_worktree_calls: std::sync::Mutex<Vec<(PathBuf, PathBuf, bool, bool)>>,
-            delete_branch_calls: std::sync::Mutex<Vec<(PathBuf, String, bool)>>,
-        }
-
-        impl RecordingWorktreeService {
-            fn new() -> Self {
-                Self {
-                    remove_worktree_calls: std::sync::Mutex::new(Vec::new()),
-                    delete_branch_calls: std::sync::Mutex::new(Vec::new()),
-                }
-            }
-        }
-
-        impl WorktreeService for RecordingWorktreeService {
-            fn list_worktrees(
-                &self,
-                _repo_path: &std::path::Path,
-            ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
-                Ok(Vec::new())
-            }
-            fn create_worktree(
-                &self,
-                _repo_path: &std::path::Path,
-                _branch: &str,
-                _target_dir: &std::path::Path,
-            ) -> Result<WorktreeInfo, WorktreeError> {
-                Err(WorktreeError::GitError("not used".into()))
-            }
-            fn remove_worktree(
-                &self,
-                repo_path: &std::path::Path,
-                worktree_path: &std::path::Path,
-                delete_branch: bool,
-                force: bool,
-            ) -> Result<(), WorktreeError> {
-                self.remove_worktree_calls.lock().unwrap().push((
-                    repo_path.to_path_buf(),
-                    worktree_path.to_path_buf(),
-                    delete_branch,
-                    force,
-                ));
-                Ok(())
-            }
-            fn delete_branch(
-                &self,
-                repo_path: &std::path::Path,
-                branch: &str,
-                force: bool,
-            ) -> Result<(), WorktreeError> {
-                self.delete_branch_calls.lock().unwrap().push((
-                    repo_path.to_path_buf(),
-                    branch.to_string(),
-                    force,
-                ));
-                Ok(())
-            }
-            fn is_worktree_dirty(
-                &self,
-                _worktree_path: &std::path::Path,
-            ) -> Result<bool, WorktreeError> {
-                Ok(false)
-            }
-            fn default_branch(
-                &self,
-                _repo_path: &std::path::Path,
-            ) -> Result<String, WorktreeError> {
-                Ok("main".to_string())
-            }
-            fn github_remote(
-                &self,
-                _repo_path: &std::path::Path,
-            ) -> Result<Option<(String, String)>, WorktreeError> {
-                Ok(None)
-            }
-            fn fetch_branch(
-                &self,
-                _repo_path: &std::path::Path,
-                _branch: &str,
-            ) -> Result<(), WorktreeError> {
-                Ok(())
-            }
-            fn create_branch(
-                &self,
-                _repo_path: &std::path::Path,
-                _branch: &str,
-            ) -> Result<(), WorktreeError> {
-                Ok(())
-            }
-        }
-
-        // Backend with one work item that has a branch and worktree path.
-        struct RecordingTestBackend;
-
-        impl WorkItemBackend for RecordingTestBackend {
-            fn read(
-                &self,
-                id: &WorkItemId,
-            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-                Err(BackendError::NotFound(id.clone()))
-            }
-            fn list(&self) -> Result<ListResult, BackendError> {
-                Ok(ListResult {
-                    records: vec![crate::work_item_backend::WorkItemRecord {
-                        id: WorkItemId::LocalFile(PathBuf::from("/tmp/recording-test.json")),
-                        title: "Recording test item".into(),
-                        description: None,
-                        status: WorkItemStatus::Implementing,
-                        repo_associations: vec![RepoAssociationRecord {
-                            repo_path: PathBuf::from("/my/repo"),
-                            branch: Some("feature-branch".into()),
-                            pr_identity: None,
-                        }],
-                        plan: None,
-                    }],
-                    corrupt: Vec::new(),
-                })
-            }
-            fn create(
-                &self,
-                _req: CreateWorkItem,
-            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-                Err(BackendError::Validation("not used".into()))
-            }
-            fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
-                Ok(())
-            }
-            fn update_status(
-                &self,
-                _id: &WorkItemId,
-                _status: WorkItemStatus,
-            ) -> Result<(), BackendError> {
-                Ok(())
-            }
-            fn import(
-                &self,
-                _unlinked: &crate::work_item::UnlinkedPr,
-            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-                Err(BackendError::Validation("not used".into()))
-            }
-            fn append_activity(
-                &self,
-                _id: &WorkItemId,
-                _entry: &ActivityEntry,
-            ) -> Result<(), BackendError> {
-                Ok(())
-            }
-            fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-                Ok(Vec::new())
-            }
-            fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
-                Ok(())
-            }
-            fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
-                Ok(None)
-            }
-            fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
-                None
-            }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
-            }
-        }
-
-        let recording_ws = Arc::new(RecordingWorktreeService::new());
+        let recording_ws = Arc::new(ConfigurableWorktreeService::recording());
 
         use crate::config::InMemoryConfigProvider;
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
-            Box::new(RecordingTestBackend),
+            Box::new(FixedListBackend::one_item(
+                "/tmp/recording-test.json",
+                "Recording test item",
+                "/my/repo",
+                "feature-branch",
+            )),
             recording_ws.clone(),
             Box::new(InMemoryConfigProvider::new()),
         );

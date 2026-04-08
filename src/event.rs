@@ -273,8 +273,12 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
                     sync_layout(app);
                 }
                 DeleteConfirmState::AwaitingConfirm => {
-                    app.confirm_delete = DeleteConfirmState::None;
                     app.attempt_delete_selected_work_item();
+                    // Preserve AwaitingForce if attempt_delete escalated; reset otherwise.
+                    app.confirm_delete = match app.confirm_delete {
+                        DeleteConfirmState::AwaitingForce => DeleteConfirmState::AwaitingForce,
+                        _ => DeleteConfirmState::None,
+                    };
                     sync_layout(app);
                 }
                 DeleteConfirmState::AwaitingForce => {
