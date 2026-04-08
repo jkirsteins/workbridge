@@ -106,9 +106,7 @@ fn fetcher_loop(
         }
 
         // Step 0: notify the UI that a fetch cycle is starting
-        let _ = tx.send(FetchMessage::FetchStarted {
-            repo_path: repo_path.clone(),
-        });
+        let _ = tx.send(FetchMessage::FetchStarted);
 
         // Step 1: list worktrees
         let worktrees = worktree_service.list_worktrees(&repo_path);
@@ -316,7 +314,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("should receive a FetchMessage within 5 seconds");
             match msg {
-                FetchMessage::FetchStarted { .. } => continue,
+                FetchMessage::FetchStarted => continue,
                 other => return other,
             }
         }
@@ -342,7 +340,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("should receive first message");
         assert!(
-            matches!(first, FetchMessage::FetchStarted { .. }),
+            matches!(first, FetchMessage::FetchStarted),
             "first message should be FetchStarted, got RepoData/FetcherError",
         );
 
@@ -423,7 +421,7 @@ mod tests {
             FetchMessage::FetcherError { error, .. } => {
                 panic!("unexpected FetcherError: {error}");
             }
-            FetchMessage::FetchStarted { .. } => {
+            FetchMessage::FetchStarted => {
                 panic!("unexpected FetchStarted after recv_data");
             }
         }
@@ -485,7 +483,7 @@ mod tests {
             FetchMessage::FetcherError { error, .. } => {
                 panic!("unexpected FetcherError: {error}");
             }
-            FetchMessage::FetchStarted { .. } => {
+            FetchMessage::FetchStarted => {
                 panic!("unexpected FetchStarted after recv_data");
             }
         }
@@ -547,7 +545,7 @@ mod tests {
             FetchMessage::FetcherError { error, .. } => {
                 panic!("unexpected FetcherError: {error}");
             }
-            FetchMessage::FetchStarted { .. } => {
+            FetchMessage::FetchStarted => {
                 panic!("unexpected FetchStarted after recv_data");
             }
         }

@@ -293,10 +293,7 @@ pub enum FetchMessage {
         error: String,
     },
     /// Sent at the start of each fetch cycle so the UI can show a spinner.
-    FetchStarted {
-        #[allow(dead_code)]
-        repo_path: PathBuf,
-    },
+    FetchStarted,
 }
 
 /// Handle to background fetcher threads. Holds a shared stop flag for

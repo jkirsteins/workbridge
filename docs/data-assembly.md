@@ -94,8 +94,11 @@ This requires GitHub API access with authentication. Responses take
 200-500ms typically. Rate-limited to 5000 requests/hour with a token.
 
 The status bar shows a spinner ("Refreshing GitHub data") while Tier 2
-fetches are in progress. This provides visibility into the background
-refresh cycle, especially during the initial startup fetch.
+fetches are in progress. The spinner tracks the number of in-flight repo
+fetches and only clears when all repos have reported back, so multi-repo
+setups show continuous activity for the entire fetch cycle. This provides
+visibility into the background refresh cycle, especially during the
+initial startup fetch.
 
 ### Tier 3: Derived (pure computation)
 

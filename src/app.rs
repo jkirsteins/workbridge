@@ -360,9 +360,12 @@ pub struct App {
 
     // -- Background fetch indicator --
     /// Activity ID for the in-flight background GitHub fetch. Started when
-    /// a FetchStarted message arrives, ended when RepoData or FetcherError
-    /// arrives. Shows a spinner in the status bar during GitHub API calls.
+    /// a FetchStarted message arrives, ended when all in-flight fetches
+    /// complete. Shows a spinner in the status bar during GitHub API calls.
     pub fetch_activity: Option<ActivityId>,
+    /// Number of repos currently fetching. The activity spinner is shown
+    /// while this is > 0 and cleared when it returns to 0.
+    pub pending_fetch_count: usize,
 
     // -- Async PR creation --
     /// Receiver for asynchronous PR creation results.
@@ -531,6 +534,7 @@ impl App {
             activities: Vec::new(),
             spinner_tick: 0,
             fetch_activity: None,
+            pending_fetch_count: 0,
             pr_create_rx: None,
             pr_create_activity: None,
             pr_create_wi: None,
@@ -971,10 +975,11 @@ impl App {
         let mut received_any = false;
         loop {
             match rx.try_recv() {
-                Ok(FetchMessage::FetchStarted { .. }) => {
+                Ok(FetchMessage::FetchStarted) => {
                     // Show a spinner while GitHub data is being fetched.
-                    // Only start one activity even if multiple repos send
-                    // FetchStarted before any RepoData arrives.
+                    // Track how many repos are in-flight so the spinner
+                    // persists until all repos have reported back.
+                    self.pending_fetch_count += 1;
                     if self.fetch_activity.is_none() {
                         self.activity_counter += 1;
                         let id = ActivityId(self.activity_counter);
@@ -988,7 +993,10 @@ impl App {
                 }
                 Ok(FetchMessage::RepoData(result)) => {
                     received_any = true;
-                    if let Some(id) = self.fetch_activity.take() {
+                    self.pending_fetch_count = self.pending_fetch_count.saturating_sub(1);
+                    if self.pending_fetch_count == 0
+                        && let Some(id) = self.fetch_activity.take()
+                    {
                         self.activities.retain(|a| a.id != id);
                     }
                     // Surface worktree errors in the status bar. One-time
@@ -1034,7 +1042,10 @@ impl App {
                 }
                 Ok(FetchMessage::FetcherError { error, .. }) => {
                     received_any = true;
-                    if let Some(id) = self.fetch_activity.take() {
+                    self.pending_fetch_count = self.pending_fetch_count.saturating_sub(1);
+                    if self.pending_fetch_count == 0
+                        && let Some(id) = self.fetch_activity.take()
+                    {
                         self.activities.retain(|a| a.id != id);
                     }
                     let msg = format!("Fetch error: {error}");
@@ -4910,10 +4921,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         app.fetch_rx = Some(rx);
 
-        tx.send(FetchMessage::FetchStarted {
-            repo_path: PathBuf::from("/repo"),
-        })
-        .unwrap();
+        tx.send(FetchMessage::FetchStarted).unwrap();
 
         app.drain_fetch_results();
         assert!(app.fetch_activity.is_some());
@@ -4940,10 +4948,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         app.fetch_rx = Some(rx);
 
-        tx.send(FetchMessage::FetchStarted {
-            repo_path: PathBuf::from("/repo"),
-        })
-        .unwrap();
+        tx.send(FetchMessage::FetchStarted).unwrap();
         app.drain_fetch_results();
         assert!(app.fetch_activity.is_some());
 
@@ -4964,17 +4969,52 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         app.fetch_rx = Some(rx);
 
-        tx.send(FetchMessage::FetchStarted {
-            repo_path: PathBuf::from("/repo-a"),
-        })
-        .unwrap();
-        tx.send(FetchMessage::FetchStarted {
-            repo_path: PathBuf::from("/repo-b"),
-        })
-        .unwrap();
+        tx.send(FetchMessage::FetchStarted).unwrap();
+        tx.send(FetchMessage::FetchStarted).unwrap();
 
         app.drain_fetch_results();
         assert_eq!(app.activities.len(), 1);
+    }
+
+    /// Spinner persists until all in-flight repos finish, not just the first.
+    #[test]
+    fn fetch_activity_persists_until_all_repos_finish() {
+        let mut app = App::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.fetch_rx = Some(rx);
+
+        // Two repos start fetching.
+        tx.send(FetchMessage::FetchStarted).unwrap();
+        tx.send(FetchMessage::FetchStarted).unwrap();
+        app.drain_fetch_results();
+        assert!(app.fetch_activity.is_some());
+
+        // First repo finishes - spinner should persist.
+        tx.send(FetchMessage::RepoData(RepoFetchResult {
+            repo_path: PathBuf::from("/repo-a"),
+            github_remote: None,
+            worktrees: Ok(vec![]),
+            prs: Ok(vec![]),
+            issues: vec![],
+        }))
+        .unwrap();
+        app.drain_fetch_results();
+        assert!(
+            app.fetch_activity.is_some(),
+            "spinner should persist while second repo is still fetching",
+        );
+
+        // Second repo finishes - now spinner should clear.
+        tx.send(FetchMessage::RepoData(RepoFetchResult {
+            repo_path: PathBuf::from("/repo-b"),
+            github_remote: None,
+            worktrees: Ok(vec![]),
+            prs: Ok(vec![]),
+            issues: vec![],
+        }))
+        .unwrap();
+        app.drain_fetch_results();
+        assert!(app.fetch_activity.is_none());
     }
 
     // -- Round 4 regression tests --
