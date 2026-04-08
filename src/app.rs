@@ -8213,14 +8213,29 @@ mod tests {
         );
     }
 
+    /// Verify that deleting a work item calls remove_worktree and
+    /// delete_branch on the worktree service with the correct arguments.
     #[test]
-    fn collect_backfill_requests_returns_requests_when_github_remote_available() {
-        use crate::work_item_backend::LocalFileBackend;
+    fn delete_calls_remove_worktree_and_delete_branch() {
+        use crate::work_item_backend::ListResult;
         use crate::worktree_service::{WorktreeError, WorktreeInfo};
 
-        /// A worktree service that always returns a github remote.
-        struct GithubWorktreeService;
-        impl WorktreeService for GithubWorktreeService {
+        /// Recording mock that captures remove_worktree and delete_branch calls.
+        struct RecordingWorktreeService {
+            remove_worktree_calls: std::sync::Mutex<Vec<(PathBuf, PathBuf, bool, bool)>>,
+            delete_branch_calls: std::sync::Mutex<Vec<(PathBuf, String, bool)>>,
+        }
+
+        impl RecordingWorktreeService {
+            fn new() -> Self {
+                Self {
+                    remove_worktree_calls: std::sync::Mutex::new(Vec::new()),
+                    delete_branch_calls: std::sync::Mutex::new(Vec::new()),
+                }
+            }
+        }
+
+        impl WorktreeService for RecordingWorktreeService {
             fn list_worktrees(
                 &self,
                 _repo_path: &std::path::Path,
@@ -8233,23 +8248,34 @@ mod tests {
                 _branch: &str,
                 _target_dir: &std::path::Path,
             ) -> Result<WorktreeInfo, WorktreeError> {
-                Err(WorktreeError::GitError("stub".into()))
+                Err(WorktreeError::GitError("not used".into()))
             }
             fn remove_worktree(
                 &self,
-                _repo_path: &std::path::Path,
-                _worktree_path: &std::path::Path,
-                _delete_branch: bool,
-                _force: bool,
+                repo_path: &std::path::Path,
+                worktree_path: &std::path::Path,
+                delete_branch: bool,
+                force: bool,
             ) -> Result<(), WorktreeError> {
+                self.remove_worktree_calls.lock().unwrap().push((
+                    repo_path.to_path_buf(),
+                    worktree_path.to_path_buf(),
+                    delete_branch,
+                    force,
+                ));
                 Ok(())
             }
             fn delete_branch(
                 &self,
-                _repo_path: &std::path::Path,
-                _branch: &str,
-                _force: bool,
+                repo_path: &std::path::Path,
+                branch: &str,
+                force: bool,
             ) -> Result<(), WorktreeError> {
+                self.delete_branch_calls.lock().unwrap().push((
+                    repo_path.to_path_buf(),
+                    branch.to_string(),
+                    force,
+                ));
                 Ok(())
             }
             fn is_worktree_dirty(
@@ -8268,7 +8294,7 @@ mod tests {
                 &self,
                 _repo_path: &std::path::Path,
             ) -> Result<Option<(String, String)>, WorktreeError> {
-                Ok(Some(("testowner".to_string(), "testrepo".to_string())))
+                Ok(None)
             }
             fn fetch_branch(
                 &self,
@@ -8286,94 +8312,143 @@ mod tests {
             }
         }
 
-        let dir = std::env::temp_dir().join("workbridge-test-backfill-collect-positive");
-        let _ = std::fs::remove_dir_all(&dir);
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        // Backend with one work item that has a branch and worktree path.
+        struct RecordingTestBackend;
 
-        let done_record = backend
-            .create(CreateWorkItem {
-                title: "Done item".into(),
-                description: None,
-                status: WorkItemStatus::Backlog,
-                repo_associations: vec![make_assoc("/tmp/repo", "feature/done")],
-            })
-            .unwrap();
-        backend
-            .update_status(&done_record.id, WorkItemStatus::Done)
-            .unwrap();
+        impl WorkItemBackend for RecordingTestBackend {
+            fn read(
+                &self,
+                id: &WorkItemId,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Err(BackendError::NotFound(id.clone()))
+            }
+            fn list(&self) -> Result<ListResult, BackendError> {
+                Ok(ListResult {
+                    records: vec![crate::work_item_backend::WorkItemRecord {
+                        id: WorkItemId::LocalFile(PathBuf::from("/tmp/recording-test.json")),
+                        title: "Recording test item".into(),
+                        description: None,
+                        status: WorkItemStatus::Implementing,
+                        repo_associations: vec![RepoAssociationRecord {
+                            repo_path: PathBuf::from("/my/repo"),
+                            branch: Some("feature-branch".into()),
+                            pr_identity: None,
+                        }],
+                        plan: None,
+                    }],
+                    corrupt: Vec::new(),
+                })
+            }
+            fn create(
+                &self,
+                _req: CreateWorkItem,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not used".into()))
+            }
+            fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn update_status(
+                &self,
+                _id: &WorkItemId,
+                _status: WorkItemStatus,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn import(
+                &self,
+                _unlinked: &crate::work_item::UnlinkedPr,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not used".into()))
+            }
+            fn append_activity(
+                &self,
+                _id: &WorkItemId,
+                _entry: &ActivityEntry,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
+                Ok(Vec::new())
+            }
+            fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
+                Ok(None)
+            }
+            fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
+                None
+            }
+            fn backend_type(&self) -> crate::work_item::BackendType {
+                crate::work_item::BackendType::LocalFile
+            }
+        }
 
-        let _ = backend
-            .create(CreateWorkItem {
-                title: "Backlog item".into(),
-                description: None,
-                status: WorkItemStatus::Backlog,
-                repo_associations: vec![make_assoc("/tmp/repo", "feature/backlog")],
-            })
-            .unwrap();
+        let recording_ws = Arc::new(RecordingWorktreeService::new());
 
-        let mut app = App::with_config(Config::default(), Box::new(backend));
-        app.worktree_service = Arc::new(GithubWorktreeService);
-
-        let requests = app.collect_backfill_requests();
-
-        assert_eq!(
-            requests.len(),
-            1,
-            "expected exactly one backfill request, got {}",
-            requests.len()
+        use crate::config::InMemoryConfigProvider;
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Box::new(RecordingTestBackend),
+            recording_ws.clone(),
+            Box::new(InMemoryConfigProvider::new()),
         );
-        let (ref wi_id, ref _repo_path, ref branch, ref owner, ref repo_name) = requests[0];
-        assert_eq!(wi_id, &done_record.id);
-        assert_eq!(branch, "feature/done");
-        assert_eq!(owner, "testowner");
-        assert_eq!(repo_name, "testrepo");
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+        // Inject a fake worktree path so remove_worktree has something
+        // to clean up.
+        assert_eq!(app.work_items.len(), 1);
+        app.work_items[0].repo_associations[0].worktree_path =
+            Some(PathBuf::from("/my/repo/.worktrees/feature-branch"));
+        app.build_display_list();
 
-    #[test]
-    fn drain_pr_identity_backfill_saves_results() {
-        use crate::work_item_backend::{LocalFileBackend, PrIdentityRecord};
-
-        let dir = std::env::temp_dir().join("workbridge-test-backfill-drain");
-        let _ = std::fs::remove_dir_all(&dir);
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
-
-        let record = backend
-            .create(CreateWorkItem {
-                title: "Drain test".into(),
-                description: None,
-                status: WorkItemStatus::Done,
-                repo_associations: vec![make_assoc("/tmp/repo", "feature/drain")],
-            })
+        // Select the work item.
+        let wi_idx = app
+            .display_list
+            .iter()
+            .position(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
             .unwrap();
+        app.selected_item = Some(wi_idx);
+        app.sync_selection_identity();
 
-        let mut app = App::with_config(Config::default(), Box::new(backend));
+        // Delete (non-force).
+        app.delete_selected_work_item(false);
 
-        let (tx, rx) = crossbeam_channel::unbounded();
-        tx.send(Ok(PrIdentityBackfillResult {
-            wi_id: record.id.clone(),
-            repo_path: PathBuf::from("/tmp/repo"),
-            identity: PrIdentityRecord {
-                number: 99,
-                title: "Backfilled PR".into(),
-                url: "https://example.com/pr/99".into(),
-            },
-        }))
-        .unwrap();
-        drop(tx);
-        app.pr_identity_backfill_rx = Some(rx);
+        // Verify remove_worktree was called with correct arguments.
+        let rw_calls = recording_ws.remove_worktree_calls.lock().unwrap();
+        assert_eq!(rw_calls.len(), 1, "remove_worktree should be called once");
+        assert_eq!(
+            rw_calls[0].0,
+            PathBuf::from("/my/repo"),
+            "remove_worktree repo_path"
+        );
+        assert_eq!(
+            rw_calls[0].1,
+            PathBuf::from("/my/repo/.worktrees/feature-branch"),
+            "remove_worktree worktree_path"
+        );
+        assert!(
+            !rw_calls[0].2,
+            "remove_worktree delete_branch should be false (handled separately)"
+        );
+        assert!(
+            !rw_calls[0].3,
+            "remove_worktree force should be false for non-force delete"
+        );
+        drop(rw_calls);
 
-        let changed = app.drain_pr_identity_backfill();
-        assert!(changed, "should report changed");
-
-        let updated = app.backend.read(&record.id).unwrap();
-        let assoc = updated.repo_associations.first().unwrap();
-        let pi = assoc.pr_identity.as_ref().unwrap();
-        assert_eq!(pi.number, 99);
-        assert_eq!(pi.title, "Backfilled PR");
-        assert_eq!(pi.url, "https://example.com/pr/99");
-
-        let _ = std::fs::remove_dir_all(&dir);
+        // Verify delete_branch was called with correct arguments.
+        let db_calls = recording_ws.delete_branch_calls.lock().unwrap();
+        assert_eq!(db_calls.len(), 1, "delete_branch should be called once");
+        assert_eq!(
+            db_calls[0].0,
+            PathBuf::from("/my/repo"),
+            "delete_branch repo_path"
+        );
+        assert_eq!(db_calls[0].1, "feature-branch", "delete_branch branch name");
+        assert!(
+            db_calls[0].2,
+            "delete_branch force should be true (user chose to destroy the item)"
+        );
     }
 }

@@ -269,8 +269,7 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
             match app.confirm_delete {
                 DeleteConfirmState::None => {
                     app.confirm_delete = DeleteConfirmState::AwaitingConfirm;
-                    app.status_message =
-                        Some("Press again to delete this work item".into());
+                    app.status_message = Some("Press again to delete this work item".into());
                     sync_layout(app);
                 }
                 DeleteConfirmState::AwaitingConfirm => {
