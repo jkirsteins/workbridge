@@ -1112,6 +1112,11 @@ fn mouse_target(app: &App, column: u16, row: u16) -> MouseTarget {
                 local_row: row - inner_y,
             };
         }
+
+        // The drawer is open but the mouse is outside its inner area.
+        // Do not fall through to the right panel hit-test since the
+        // background is dimmed and should not receive scroll events.
+        return MouseTarget::None;
     }
 
     // Compute right panel geometry.
@@ -1193,12 +1198,15 @@ fn encode_mouse_scroll(
 /// Scroll events are hit-tested against the global drawer and right panel
 /// areas. If the mouse is over a PTY area, the scroll is encoded and
 /// forwarded to the corresponding PTY session.
-pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+/// Returns `true` if the event modified app state (i.e. forwarded scroll data
+/// to a PTY), `false` otherwise. The caller uses this to decide whether a
+/// re-render is needed.
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
     // Only handle scroll events.
     let scroll_up = match mouse.kind {
         MouseEventKind::ScrollUp => true,
         MouseEventKind::ScrollDown => false,
-        _ => return,
+        _ => return false,
     };
 
     // Ignore during shutdown or when overlays are visible.
@@ -1209,7 +1217,7 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         || app.no_plan_prompt_visible
         || app.confirm_merge
     {
-        return;
+        return false;
     }
 
     match mouse_target(app, mouse.column, mouse.row) {
@@ -1219,20 +1227,27 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         } => {
             // Extract mouse protocol info from the global session parser,
             // then drop the lock before calling send_bytes_to_global.
-            let proto = app.global_session.as_ref().map(|s| {
-                let parser = s.parser.lock().unwrap();
-                let screen = parser.screen();
-                (
-                    screen.mouse_protocol_mode(),
-                    screen.mouse_protocol_encoding(),
-                )
-            });
+            // Skip if the session is not alive to avoid writing to a dead PTY.
+            let proto = app
+                .global_session
+                .as_ref()
+                .filter(|s| s.alive)
+                .and_then(|s| {
+                    let parser = s.parser.lock().ok()?;
+                    let screen = parser.screen();
+                    Some((
+                        screen.mouse_protocol_mode(),
+                        screen.mouse_protocol_encoding(),
+                    ))
+                });
             if let Some((mode, encoding)) = proto
                 && let Some(data) =
                     encode_mouse_scroll(scroll_up, local_col, local_row, mode, encoding)
             {
                 app.send_bytes_to_global(&data);
+                return true;
             }
+            false
         }
         MouseTarget::RightPanel {
             local_col,
@@ -1240,22 +1255,28 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         } => {
             // Extract mouse protocol info from the active session parser,
             // then drop the lock before calling send_bytes_to_active.
-            let proto = app.active_session_entry().map(|s| {
-                let parser = s.parser.lock().unwrap();
-                let screen = parser.screen();
-                (
-                    screen.mouse_protocol_mode(),
-                    screen.mouse_protocol_encoding(),
-                )
-            });
+            // Skip if the session is not alive to avoid writing to a dead PTY.
+            let proto = app
+                .active_session_entry()
+                .filter(|s| s.alive)
+                .and_then(|s| {
+                    let parser = s.parser.lock().ok()?;
+                    let screen = parser.screen();
+                    Some((
+                        screen.mouse_protocol_mode(),
+                        screen.mouse_protocol_encoding(),
+                    ))
+                });
             if let Some((mode, encoding)) = proto
                 && let Some(data) =
                     encode_mouse_scroll(scroll_up, local_col, local_row, mode, encoding)
             {
                 app.send_bytes_to_active(&data);
+                return true;
             }
+            false
         }
-        MouseTarget::None => {}
+        MouseTarget::None => false,
     }
 }
 

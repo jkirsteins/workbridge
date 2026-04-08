@@ -223,9 +223,16 @@ pub fn app_event(
                     event::handle_resize(state, *cols, *rows);
                 }
                 ct::event::Event::Mouse(mouse_event) => {
-                    event::handle_mouse(state, *mouse_event);
+                    if !event::handle_mouse(state, *mouse_event) {
+                        // Mouse event did not modify state (e.g. motion,
+                        // click, or scroll that wasn't forwarded). Skip
+                        // re-render.
+                        return Ok(Control::Continue);
+                    }
                 }
-                _ => {}
+                _ => {
+                    return Ok(Control::Continue);
+                }
             }
             // Check if the app wants to quit after handling the key event.
             if state.should_quit && !state.shutting_down {
