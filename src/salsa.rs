@@ -301,7 +301,9 @@ pub fn app_event(
         }
         AppEvent::Timer(_) => {
             // Advance spinner for activity indicator animation.
-            if !state.activities.is_empty() {
+            // Tick when status-bar activities exist OR when any work item
+            // has Claude actively working (the list/board spinner needs it).
+            if !state.activities.is_empty() || !state.claude_working.is_empty() {
                 state.spinner_tick = state.spinner_tick.wrapping_add(1);
             }
 

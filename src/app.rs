@@ -331,6 +331,9 @@ pub struct App {
     /// MCP socket servers keyed by work item ID. Each server is created when
     /// a Claude session is spawned and handles MCP communication via a Unix socket.
     pub mcp_servers: HashMap<WorkItemId, McpSocketServer>,
+    /// Work item IDs where Claude has signaled it is actively working
+    /// (via workbridge_set_activity). Cleared when the session dies.
+    pub claude_working: std::collections::HashSet<WorkItemId>,
     /// Paths to .mcp.json files written to worktrees, keyed by work item ID.
     /// Tracked so they can be cleaned up when sessions die or work items are deleted.
     /// Receiver for MCP events from all socket servers.
@@ -524,6 +527,7 @@ impl App {
             fetcher_disconnected: false,
             fetcher_handle: None,
             mcp_servers: HashMap::new(),
+            claude_working: std::collections::HashSet::new(),
             mcp_rx: Some(mcp_rx),
             mcp_tx,
             review_gate_wi: None,
@@ -770,7 +774,7 @@ impl App {
         }
         // Clean up MCP resources for newly dead sessions.
         for id in &dead_ids {
-            self.cleanup_mcp_for(id);
+            self.cleanup_session_state_for(id);
         }
 
         // Auto-trigger review gate when an implementing session dies.
@@ -842,14 +846,17 @@ impl App {
         }
     }
 
-    /// Stop MCP server for a work item.
-    fn cleanup_mcp_for(&mut self, wi_id: &WorkItemId) {
+    /// Stop MCP server and clear activity state for a work item.
+    fn cleanup_session_state_for(&mut self, wi_id: &WorkItemId) {
         self.mcp_servers.remove(wi_id);
+        self.claude_working.remove(wi_id);
     }
 
-    /// Stop all MCP servers and remove temp config files. Called on app exit.
+    /// Stop all MCP servers, clear activity state, and remove temp config files.
+    /// Called on app exit.
     pub fn cleanup_all_mcp(&mut self) {
         self.mcp_servers.clear();
+        self.claude_working.clear();
         self.global_mcp_server = None;
         if let Some(ref path) = self.global_mcp_config_path {
             let _ = std::fs::remove_file(path);
@@ -2295,7 +2302,7 @@ impl App {
                                     {
                                         session.kill();
                                     }
-                                    self.cleanup_mcp_for(&wi_id);
+                                    self.cleanup_session_state_for(&wi_id);
                                     self.spawn_session(&wi_id);
                                 }
                             }
@@ -2399,6 +2406,23 @@ impl App {
                                     Some(format!("Plan saved but could not verify status: {e}"));
                             }
                         }
+                    }
+                }
+                McpEvent::SetActivity {
+                    work_item_id: wi_id_str,
+                    working,
+                } => {
+                    let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            continue;
+                        }
+                    };
+                    if working {
+                        self.claude_working.insert(wi_id);
+                    } else {
+                        self.claude_working.remove(&wi_id);
                     }
                 }
             }
@@ -2706,7 +2730,7 @@ impl App {
         }
 
         // -- Phase 3: Kill session and clean up MCP --
-        self.cleanup_mcp_for(&work_item_id);
+        self.cleanup_session_state_for(&work_item_id);
         if let Some(key) = self.session_key_for(&work_item_id)
             && let Some(mut entry) = self.sessions.remove(&key)
             && let Some(ref mut session) = entry.session
@@ -3110,7 +3134,7 @@ impl App {
             if let Some(ref mut session) = entry.session {
                 session.kill();
             }
-            self.cleanup_mcp_for(wi_id);
+            self.cleanup_session_state_for(wi_id);
         }
 
         // Auto-spawn a session for stages that have prompts.
@@ -4043,7 +4067,7 @@ impl App {
             {
                 session.kill();
             }
-            self.cleanup_mcp_for(&wi_id);
+            self.cleanup_session_state_for(&wi_id);
             self.spawn_session(&wi_id);
         }
     }

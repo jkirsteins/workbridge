@@ -34,6 +34,8 @@ pub enum McpEvent {
     },
     /// Claude called workbridge_set_plan.
     SetPlan { work_item_id: String, plan: String },
+    /// Claude called workbridge_set_activity.
+    SetActivity { work_item_id: String, working: bool },
 }
 
 /// Handle to the MCP socket server. Holds the socket path for cleanup
@@ -407,6 +409,20 @@ fn handle_message(
                         "required": ["plan_text"]
                     }
                 }),
+                json!({
+                    "name": "workbridge_set_activity",
+                    "description": "Signal whether you are actively working or idle. Call with working=true when starting a significant operation (running tests, building, making changes) and working=false when waiting for user input or finished. This controls a visual indicator in the TUI.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "working": {
+                                "type": "boolean",
+                                "description": "True if actively working, false if idle or waiting for input"
+                            }
+                        },
+                        "required": ["working"]
+                    }
+                }),
             ];
 
             Some(json!({
@@ -582,6 +598,44 @@ fn handle_message(
                                 "content": [{
                                     "type": "text",
                                     "text": "Plan saved"
+                                }]
+                            }
+                        }))
+                    } else {
+                        Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": "Error: TUI channel disconnected"
+                                }],
+                                "isError": true
+                            }
+                        }))
+                    }
+                }
+                "workbridge_set_activity" => {
+                    let working = arguments
+                        .get("working")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    let event = McpEvent::SetActivity {
+                        work_item_id: work_item_id.to_string(),
+                        working,
+                    };
+                    let send_ok = tx.send(event).is_ok();
+
+                    if send_ok {
+                        let state_text = if working { "working" } else { "idle" };
+                        Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": format!("Activity state set to {state_text}")
                                 }]
                             }
                         }))
@@ -939,13 +993,14 @@ mod tests {
         });
         let resp = handle_message(&msg, "test-id", "{}", None, &tx).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"workbridge_set_status"));
         assert!(names.contains(&"workbridge_get_context"));
         assert!(names.contains(&"workbridge_log_event"));
         assert!(names.contains(&"workbridge_query_log"));
         assert!(names.contains(&"workbridge_set_plan"));
+        assert!(names.contains(&"workbridge_set_activity"));
         assert!(
             !names.contains(&"workbridge_review_gate_result"),
             "review gate tool was removed"
