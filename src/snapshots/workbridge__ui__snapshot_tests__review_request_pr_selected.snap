@@ -1,0 +1,28 @@
+---
+source: src/ui.rs
+expression: "render(&app, 80, 24)"
+---
+  List    Board                                                Tab: switch view
+┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
+│  REVIEW REQUESTS (1)  ││                                                     │
+│> R Refactor au.. PR#77││  Refactor auth middleware                           │
+│                       ││                                                     │
+│                       ││  PR          #77 https://github.com/o/r/pull/77     │
+│                       ││  Repo        /repo/upstream                         │
+│                       ││  Branch      refactor-auth                          │
+│                       ││  State       Open                                   │
+│                       ││  Draft       No                                     │
+│                       ││  Review      Pending                                │
+│                       ││  Checks      Passing                                │
+│                       ││                                                     │
+│                       ││  Press Enter to import this review request as a work│
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+└───────────────────────┘└─────────────────────────────────────────────────────┘
