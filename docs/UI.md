@@ -200,7 +200,7 @@ The `List` label is highlighted (active). The header uses the ratatui
 
 Work items are shown as a flat list with stage badges:
 - [BL] Backlog, [PL] Planning, [IM] Implementing
-- [BK] Blocked, [RV] Review, [DN] Done
+- [BK] Blocked, [RV] Review, [MQ] Mergequeue, [DN] Done
 
 Stage transitions: Shift+Right to advance, Shift+Left to retreat.
 
@@ -229,8 +229,9 @@ arrow key navigation and Shift+arrow stage transitions.
 
 Four columns displayed: Backlog, Planning, Implementing, Review.
 Done items are hidden from the board. Blocked items appear in the
-Implementing column with a [BK] prefix. PR badges and CI status
-are shown on board items. Long titles wrap (not truncate).
+Implementing column with a [BK] prefix. Mergequeue items appear in the
+Review column with a [MQ] prefix. PR badges and CI status are shown on
+board items. Long titles wrap (not truncate).
 
 The `BoardLayout` struct (in `src/layout.rs`) and `compute_board()`
 function calculate 4 equal-width columns from the terminal width.

@@ -109,6 +109,8 @@ pub struct Theme {
     pub badge_blocked: Color,
     /// Review stage badge color.
     pub badge_review: Color,
+    /// Mergequeue stage badge color.
+    pub badge_mergequeue: Color,
     /// Done stage badge color.
     pub badge_done: Color,
 }
@@ -171,6 +173,7 @@ impl Theme {
             badge_implementing: Color::Green,
             badge_blocked: Color::Red,
             badge_review: Color::Yellow,
+            badge_mergequeue: Color::Magenta,
             badge_done: Color::Reset,
         }
     }
@@ -389,6 +392,7 @@ impl Theme {
             WorkItemStatus::Implementing => self.badge_implementing,
             WorkItemStatus::Blocked => self.badge_blocked,
             WorkItemStatus::Review => self.badge_review,
+            WorkItemStatus::Mergequeue => self.badge_mergequeue,
             WorkItemStatus::Done => self.badge_done,
         };
         let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);

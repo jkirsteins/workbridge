@@ -82,6 +82,7 @@ pub enum WorkItemStatus {
     Implementing,
     Blocked,
     Review,
+    Mergequeue,
     Done,
 }
 
@@ -94,6 +95,7 @@ impl WorkItemStatus {
             Self::Implementing => Some(Self::Review),
             Self::Blocked => Some(Self::Review),
             Self::Review => Some(Self::Done),
+            Self::Mergequeue => Some(Self::Done),
             Self::Done => None,
         }
     }
@@ -106,6 +108,7 @@ impl WorkItemStatus {
             Self::Implementing => Some(Self::Planning),
             Self::Blocked => Some(Self::Implementing),
             Self::Review => Some(Self::Implementing),
+            Self::Mergequeue => Some(Self::Review),
             Self::Done => Some(Self::Review),
         }
     }
@@ -118,6 +121,7 @@ impl WorkItemStatus {
             Self::Implementing => "[IM]",
             Self::Blocked => "[BK]",
             Self::Review => "[RV]",
+            Self::Mergequeue => "[MQ]",
             Self::Done => "[DN]",
         }
     }

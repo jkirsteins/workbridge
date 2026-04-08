@@ -350,6 +350,9 @@ pub fn app_event(
             // Poll async PR merge result.
             state.poll_pr_merge();
 
+            // Poll mergequeue items for externally merged PRs.
+            state.poll_mergequeue();
+
             // Poll async worktree creation result.
             state.poll_worktree_creation();
 
