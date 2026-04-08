@@ -1843,7 +1843,22 @@ impl App {
         if let Ok((ref server, _)) = mcp_result {
             match std::env::current_exe() {
                 Ok(exe) => {
-                    let mcp_config = crate::mcp::build_mcp_config(&exe, &server.socket_path);
+                    let repo_mcp_servers: Vec<crate::config::McpServerEntry> = self
+                        .work_items
+                        .iter()
+                        .find(|w| w.id == *work_item_id)
+                        .and_then(|wi| wi.repo_associations.first())
+                        .map(|assoc| {
+                            let repo_display = crate::config::collapse_home(&assoc.repo_path);
+                            self.config
+                                .mcp_servers_for_repo(&repo_display)
+                                .into_iter()
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mcp_config =
+                        crate::mcp::build_mcp_config(&exe, &server.socket_path, &repo_mcp_servers);
 
                     // Write .mcp.json to the worktree root.
                     let mcp_json_path = cwd.join(".mcp.json");
@@ -4949,7 +4964,7 @@ impl App {
                 return;
             }
         };
-        let mcp_config = crate::mcp::build_mcp_config(&exe, &mcp_server.socket_path);
+        let mcp_config = crate::mcp::build_mcp_config(&exe, &mcp_server.socket_path, &[]);
         let config_path =
             std::env::temp_dir().join(format!("workbridge-global-mcp-{}.json", std::process::id()));
         if let Err(e) = std::fs::write(&config_path, &mcp_config) {

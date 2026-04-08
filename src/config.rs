@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -74,6 +75,42 @@ fn home_dir() -> Option<PathBuf> {
     directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
 }
 
+/// An MCP server entry configured for a specific repository.
+///
+/// Stored as `[[mcp_servers]]` array-of-tables in config.toml.
+/// The `(repo, name)` pair is the composite key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerEntry {
+    /// Repo path (collapsed home, e.g., "~/Projects/workbridge").
+    pub repo: String,
+    /// Unique server name within the repo (e.g., "datadog", "chrome-devtools").
+    pub name: String,
+    /// Server type: "stdio" (default, command-based) or "http".
+    #[serde(rename = "type", default = "default_mcp_type")]
+    #[serde(skip_serializing_if = "is_default_mcp_type")]
+    pub server_type: String,
+    /// Command to run (for stdio servers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Arguments for the command.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Environment variables for the command.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// URL (for http servers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+fn default_mcp_type() -> String {
+    "stdio".into()
+}
+
+fn is_default_mcp_type(s: &String) -> bool {
+    s == "stdio"
+}
+
 /// The TOML configuration for workbridge.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -90,6 +127,9 @@ pub struct Config {
     /// Fallback settings for repos that don't specify overrides.
     #[serde(default)]
     pub defaults: Defaults,
+    /// Per-repo MCP server configurations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServerEntry>,
     /// Human-readable description of where this config came from.
     /// Set by the loader - not serialized to the TOML file.
     #[serde(skip)]
@@ -157,6 +197,7 @@ pub enum ConfigError {
     NoConfigDir,
     PathNotFound(String),
     NotAGitRepo(String),
+    DuplicateMcpServer { repo: String, name: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -168,6 +209,9 @@ impl fmt::Display for ConfigError {
             ConfigError::NoConfigDir => write!(f, "could not determine config directory"),
             ConfigError::PathNotFound(p) => write!(f, "path not found: {p}"),
             ConfigError::NotAGitRepo(p) => write!(f, "not a git repository: {p}"),
+            ConfigError::DuplicateMcpServer { repo, name } => {
+                write!(f, "MCP server '{name}' already exists for repo '{repo}'")
+            }
         }
     }
 }
@@ -226,8 +270,8 @@ pub fn canonicalize_path(path: &Path) -> std::io::Result<PathBuf> {
     Ok(canonical)
 }
 
-/// Collapse the user's home directory back to `~` for display.
-fn collapse_home(path: &Path) -> String {
+/// Collapse the user's home directory back to `~` for display and storage.
+pub fn collapse_home(path: &Path) -> String {
     if let Some(home) = home_dir()
         && let Ok(rest) = path.strip_prefix(&home)
     {
@@ -239,7 +283,7 @@ fn collapse_home(path: &Path) -> String {
 /// Normalize a repo path to a consistent form: expand tilde, canonicalize
 /// if possible, then collapse back to ~/... for storage. This ensures that
 /// `./repo`, `~/repo`, and `/abs/path/repo` all produce the same string.
-fn normalize_repo_path(path: &str) -> String {
+pub fn normalize_repo_path(path: &str) -> String {
     let expanded = expand_tilde(path);
     let canonical = canonicalize_path(&expanded).unwrap_or(expanded);
     collapse_home(&canonical)
@@ -409,6 +453,63 @@ impl Config {
         }
 
         entries
+    }
+
+    /// Add an MCP server entry for a repo. Returns an error if an entry with
+    /// the same (repo, name) pair already exists.
+    pub fn add_mcp_server(&mut self, mut entry: McpServerEntry) -> Result<(), ConfigError> {
+        entry.repo = normalize_repo_path(&entry.repo);
+        let exists = self
+            .mcp_servers
+            .iter()
+            .any(|s| s.repo == entry.repo && s.name == entry.name);
+        if exists {
+            return Err(ConfigError::DuplicateMcpServer {
+                repo: entry.repo,
+                name: entry.name,
+            });
+        }
+        self.mcp_servers.push(entry);
+        Ok(())
+    }
+
+    /// Remove an MCP server entry by repo + name. Returns true if removed.
+    pub fn remove_mcp_server(&mut self, repo: &str, name: &str) -> bool {
+        let normalized = normalize_repo_path(repo);
+        let before = self.mcp_servers.len();
+        self.mcp_servers
+            .retain(|s| !(s.repo == normalized && s.name == name));
+        self.mcp_servers.len() < before
+    }
+
+    /// Return all MCP server entries configured for a given repo path.
+    pub fn mcp_servers_for_repo(&self, repo: &str) -> Vec<&McpServerEntry> {
+        let normalized = normalize_repo_path(repo);
+        self.mcp_servers
+            .iter()
+            .filter(|s| s.repo == normalized)
+            .collect()
+    }
+
+    /// Import MCP server entries for a repo using merge-with-overwrite semantics.
+    /// Existing entries with the same (repo, name) are replaced; new ones are added.
+    /// Returns the number of entries imported.
+    pub fn import_mcp_servers(&mut self, repo: &str, entries: Vec<McpServerEntry>) -> usize {
+        let normalized = normalize_repo_path(repo);
+        let count = entries.len();
+        for mut entry in entries {
+            entry.repo = normalized.clone();
+            if let Some(existing) = self
+                .mcp_servers
+                .iter_mut()
+                .find(|s| s.repo == entry.repo && s.name == entry.name)
+            {
+                *existing = entry;
+            } else {
+                self.mcp_servers.push(entry);
+            }
+        }
+        count
     }
 
     /// Return active repos: explicit repos (always active) plus discovered
@@ -600,6 +701,178 @@ mod tests {
         assert_eq!(count, 1);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_mcp_server_accepts_new_entry() {
+        let mut config = Config::default();
+        let entry = McpServerEntry {
+            repo: "/tmp/test-repo".into(),
+            name: "my-server".into(),
+            server_type: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec!["-y".into(), "some-mcp".into()],
+            env: BTreeMap::new(),
+            url: None,
+        };
+        assert!(config.add_mcp_server(entry).is_ok());
+        assert_eq!(config.mcp_servers.len(), 1);
+    }
+
+    #[test]
+    fn add_mcp_server_rejects_duplicate() {
+        let mut config = Config::default();
+        let entry = McpServerEntry {
+            repo: "/tmp/test-repo".into(),
+            name: "my-server".into(),
+            server_type: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec![],
+            env: BTreeMap::new(),
+            url: None,
+        };
+        config.add_mcp_server(entry.clone()).unwrap();
+        assert!(config.add_mcp_server(entry).is_err());
+    }
+
+    #[test]
+    fn remove_mcp_server_removes_matching_entry() {
+        let mut config = Config::default();
+        config
+            .add_mcp_server(McpServerEntry {
+                repo: "/tmp/repo-a".into(),
+                name: "server-a".into(),
+                server_type: "stdio".into(),
+                command: Some("cmd".into()),
+                args: vec![],
+                env: BTreeMap::new(),
+                url: None,
+            })
+            .unwrap();
+        let removed = config.remove_mcp_server("/tmp/repo-a", "server-a");
+        assert!(removed);
+        assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn remove_mcp_server_returns_false_when_not_found() {
+        let mut config = Config::default();
+        assert!(!config.remove_mcp_server("/tmp/repo-a", "no-such-server"));
+    }
+
+    #[test]
+    fn mcp_servers_for_repo_filters_by_repo() {
+        let mut config = Config::default();
+        config
+            .add_mcp_server(McpServerEntry {
+                repo: "/tmp/repo-a".into(),
+                name: "server-a".into(),
+                server_type: "stdio".into(),
+                command: Some("cmd-a".into()),
+                args: vec![],
+                env: BTreeMap::new(),
+                url: None,
+            })
+            .unwrap();
+        config
+            .add_mcp_server(McpServerEntry {
+                repo: "/tmp/repo-b".into(),
+                name: "server-b".into(),
+                server_type: "stdio".into(),
+                command: Some("cmd-b".into()),
+                args: vec![],
+                env: BTreeMap::new(),
+                url: None,
+            })
+            .unwrap();
+        let for_a = config.mcp_servers_for_repo("/tmp/repo-a");
+        assert_eq!(for_a.len(), 1);
+        assert_eq!(for_a[0].name, "server-a");
+    }
+
+    #[test]
+    fn import_mcp_servers_merges_with_overwrite() {
+        let mut config = Config::default();
+        config
+            .add_mcp_server(McpServerEntry {
+                repo: "/tmp/repo-a".into(),
+                name: "keep-me".into(),
+                server_type: "stdio".into(),
+                command: Some("old-cmd".into()),
+                args: vec![],
+                env: BTreeMap::new(),
+                url: None,
+            })
+            .unwrap();
+        config
+            .add_mcp_server(McpServerEntry {
+                repo: "/tmp/repo-a".into(),
+                name: "replace-me".into(),
+                server_type: "stdio".into(),
+                command: Some("old-cmd".into()),
+                args: vec![],
+                env: BTreeMap::new(),
+                url: None,
+            })
+            .unwrap();
+
+        let to_import = vec![
+            McpServerEntry {
+                repo: "/tmp/repo-a".into(),
+                name: "replace-me".into(),
+                server_type: "stdio".into(),
+                command: Some("new-cmd".into()),
+                args: vec![],
+                env: BTreeMap::new(),
+                url: None,
+            },
+            McpServerEntry {
+                repo: "/tmp/repo-a".into(),
+                name: "brand-new".into(),
+                server_type: "stdio".into(),
+                command: Some("fresh".into()),
+                args: vec![],
+                env: BTreeMap::new(),
+                url: None,
+            },
+        ];
+
+        let count = config.import_mcp_servers("/tmp/repo-a", to_import);
+        assert_eq!(count, 2);
+        assert_eq!(config.mcp_servers.len(), 3);
+
+        let replace_me = config
+            .mcp_servers
+            .iter()
+            .find(|s| s.name == "replace-me")
+            .unwrap();
+        assert_eq!(replace_me.command.as_deref(), Some("new-cmd"));
+
+        // Original entry is preserved.
+        assert!(config.mcp_servers.iter().any(|s| s.name == "keep-me"));
+        // New entry was added.
+        assert!(config.mcp_servers.iter().any(|s| s.name == "brand-new"));
+    }
+
+    #[test]
+    fn mcp_server_entry_roundtrips_toml() {
+        let mut config = Config::default();
+        config
+            .add_mcp_server(McpServerEntry {
+                repo: "~/Projects/my-repo".into(),
+                name: "chrome-devtools".into(),
+                server_type: "stdio".into(),
+                command: Some("npx".into()),
+                args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
+                env: BTreeMap::new(),
+                url: None,
+            })
+            .unwrap();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let reloaded: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(reloaded.mcp_servers.len(), 1);
+        assert_eq!(reloaded.mcp_servers[0].name, "chrome-devtools");
+        assert_eq!(reloaded.mcp_servers[0].command.as_deref(), Some("npx"));
     }
 
     #[test]
