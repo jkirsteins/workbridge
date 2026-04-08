@@ -287,8 +287,6 @@ pub struct RepoFetchResult {
 pub enum FetchMessage {
     RepoData(RepoFetchResult),
     FetcherError {
-        /// Available for per-repo error reporting in future UI enhancements.
-        #[allow(dead_code)]
         repo_path: PathBuf,
         error: String,
     },

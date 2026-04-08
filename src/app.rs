@@ -981,6 +981,8 @@ impl App {
                     // persists until all repos have reported back.
                     self.pending_fetch_count += 1;
                     if self.fetch_activity.is_none() {
+                        // Can't call self.start_activity() here because
+                        // `rx` borrows self.fetch_rx immutably.
                         self.activity_counter += 1;
                         let id = ActivityId(self.activity_counter);
                         self.activities.push(Activity {
@@ -994,6 +996,7 @@ impl App {
                 Ok(FetchMessage::RepoData(result)) => {
                     received_any = true;
                     self.pending_fetch_count = self.pending_fetch_count.saturating_sub(1);
+                    // Can't call self.end_activity() here - rx borrow.
                     if self.pending_fetch_count == 0
                         && let Some(id) = self.fetch_activity.take()
                     {
@@ -1040,15 +1043,16 @@ impl App {
                     }
                     self.repo_data.insert(result.repo_path.clone(), result);
                 }
-                Ok(FetchMessage::FetcherError { error, .. }) => {
+                Ok(FetchMessage::FetcherError { repo_path, error }) => {
                     received_any = true;
                     self.pending_fetch_count = self.pending_fetch_count.saturating_sub(1);
+                    // Can't call self.end_activity() here - rx borrow.
                     if self.pending_fetch_count == 0
                         && let Some(id) = self.fetch_activity.take()
                     {
                         self.activities.retain(|a| a.id != id);
                     }
-                    let msg = format!("Fetch error: {error}");
+                    let msg = format!("Fetch error ({}): {error}", repo_path.display());
                     if self.status_message.is_none() {
                         self.status_message = Some(msg);
                     } else {
@@ -5458,7 +5462,7 @@ mod tests {
         // The queued error should now be shown.
         assert_eq!(
             app.status_message.as_deref(),
-            Some("Fetch error: connection timed out"),
+            Some("Fetch error (/repo): connection timed out"),
             "queued error should surface when status clears",
         );
         assert!(
