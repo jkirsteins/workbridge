@@ -2551,7 +2551,7 @@ impl App {
     /// Import the currently selected review-requested PR as a work item.
     ///
     /// Mirrors import_selected_unlinked but uses import_review_request on
-    /// the backend, which sets kind=ReviewRequest and status=Backlog.
+    /// the backend, which sets kind=ReviewRequest and status=Review.
     pub fn import_selected_review_request(&mut self) {
         let Some(idx) = self.selected_item else {
             return;
@@ -4892,7 +4892,7 @@ mod tests {
                 let record = crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/fake-rr.json")),
                     title: rr.pr.title.clone(),
-                    status: WorkItemStatus::Backlog,
+                    status: WorkItemStatus::Review,
                     kind: crate::work_item::WorkItemKind::ReviewRequest,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: rr.repo_path.clone(),
@@ -6068,7 +6068,7 @@ mod tests {
                 let record = crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported-rr.json")),
                     title: rr.pr.title.clone(),
-                    status: WorkItemStatus::Backlog,
+                    status: WorkItemStatus::Review,
                     kind: crate::work_item::WorkItemKind::ReviewRequest,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: rr.repo_path.clone(),
@@ -6337,7 +6337,7 @@ mod tests {
                 let record = crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported-rr.json")),
                     title: rr.pr.title.clone(),
-                    status: WorkItemStatus::Backlog,
+                    status: WorkItemStatus::Review,
                     kind: crate::work_item::WorkItemKind::ReviewRequest,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: rr.repo_path.clone(),
@@ -6628,7 +6628,7 @@ mod tests {
                 let record = crate::work_item_backend::WorkItemRecord {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported-rr.json")),
                     title: rr.pr.title.clone(),
-                    status: WorkItemStatus::Backlog,
+                    status: WorkItemStatus::Review,
                     kind: crate::work_item::WorkItemKind::ReviewRequest,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: rr.repo_path.clone(),

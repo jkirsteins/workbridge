@@ -100,6 +100,10 @@ fn fetcher_loop(
         }
     };
 
+    // Cache the authenticated user login once per fetcher session.
+    // This avoids an extra API call every cycle for data that doesn't change.
+    let mut cached_user: Option<String> = None;
+
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -142,10 +146,11 @@ fn fetcher_loop(
             None => Ok(Vec::new()),
         };
 
-        // Step 3c: fetch authenticated user (for author filtering)
-        let authenticated_user = github_remote
-            .as_ref()
-            .and_then(|_| github_client.get_authenticated_user().ok());
+        // Step 3c: resolve authenticated user (cached after first successful fetch)
+        if cached_user.is_none() && github_remote.is_some() {
+            cached_user = github_client.get_authenticated_user().ok();
+        }
+        let authenticated_user = cached_user.clone();
 
         // Step 4: extract issue numbers from worktree branch names AND
         // extra branches (backend records without worktrees) and fetch each
