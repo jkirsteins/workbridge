@@ -1,0 +1,14 @@
+name: Dummy CI Check
+
+on:
+  push:
+    branches:
+      - test/ci-gate-verify
+  pull_request:
+
+jobs:
+  dummy-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulate CI check
+        run: sleep 30 && echo "CI check passed"
