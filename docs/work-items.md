@@ -171,9 +171,10 @@ user- or MCP-initiated), a review gate runs asynchronously in three phases:
    names of the failed checks. If no checks are configured, this phase is
    skipped.
 
-3. **Adversarial code review** - compares the implementation plan against the
-   actual code changes (git diff) and produces findings. If no plan exists,
-   the gate is blocked before it can start.
+3. **Adversarial code review** - spawns a `claude --print` session with MCP
+   access to fetch the plan (via `workbridge_get_plan`) and run `git diff`
+   itself, then compares the plan against the implementation. If no plan
+   exists, the gate is blocked before it can start.
 
 If the gate approves, the work item advances to Review. If it rejects (at any
 phase), the rejection reason is fed back to the implementing Claude session as

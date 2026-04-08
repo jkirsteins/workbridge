@@ -2309,6 +2309,7 @@ impl App {
             context_json,
             activity_log_path,
             self.mcp_tx.clone(),
+            false, // read_only: interactive sessions need full tool access
         )
         .map_err(|e| format!("MCP unavailable: failed to start socket server: {e}"))?;
 
@@ -4755,6 +4756,7 @@ impl App {
         let (tx, rx) = crossbeam_channel::unbounded();
         let wi_id_clone = wi_id.clone();
         let review_skill = self.config.defaults.review_skill.clone();
+        let gate_mcp_tx = self.mcp_tx.clone();
 
         std::thread::spawn(move || {
             // Resolve GitHub remote on this background thread (blocking I/O).
@@ -4900,14 +4902,74 @@ impl App {
                 "Checking implementation against plan.".into(),
             ));
 
+            let repo_path_str = repo_path.display().to_string();
             let mut vars = std::collections::HashMap::new();
-            vars.insert("plan", plan.as_str());
-            vars.insert("diff", diff.as_str());
+            vars.insert("default_branch", default_branch.as_str());
+            vars.insert("branch", branch.as_str());
+            vars.insert("repo_path", repo_path_str.as_str());
             let system = crate::prompts::render("review_gate", &vars).unwrap_or_else(|| {
                 "Compare plan to diff. Respond with JSON: {\"approved\": bool, \"detail\": string}"
                     .into()
             });
-            let prompt = format!("{review_skill}\n\nPlan:\n{plan}\n\nDiff:\n{diff}");
+            let prompt = review_skill;
+
+            // Start a temporary MCP server so `claude --print` can fetch the
+            // plan via MCP tools instead of receiving it as a CLI arg
+            // (which would hit the OS ARG_MAX limit on large diffs).
+            // The LLM gets the diff by running `git diff` itself.
+            let gate_context = serde_json::json!({
+                "work_item_id": serde_json::to_string(&wi_id_clone).unwrap_or_default(),
+                "plan": plan,
+            })
+            .to_string();
+
+            let gate_socket = crate::mcp::socket_path_for_session();
+            let gate_mcp_tx = gate_mcp_tx;
+            let gate_server = match crate::mcp::McpSocketServer::start(
+                gate_socket.clone(),
+                serde_json::to_string(&wi_id_clone).unwrap_or_default(),
+                String::new(),
+                gate_context,
+                None,
+                gate_mcp_tx,
+                true, // read_only: review gate must not mutate work item state
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(ReviewGateMessage::Result(ReviewGateResult {
+                        work_item_id: wi_id_clone,
+                        approved: false,
+                        detail: format!("review gate: could not start MCP server: {e}"),
+                    }));
+                    return;
+                }
+            };
+
+            // Build MCP config file for --mcp-config.
+            let exe_path = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    drop(gate_server);
+                    let _ = tx.send(ReviewGateMessage::Result(ReviewGateResult {
+                        work_item_id: wi_id_clone,
+                        approved: false,
+                        detail: format!("review gate: could not resolve exe path: {e}"),
+                    }));
+                    return;
+                }
+            };
+            let mcp_config = crate::mcp::build_mcp_config(&exe_path, &gate_socket, &[]);
+            let config_path = std::env::temp_dir()
+                .join(format!("workbridge-rg-mcp-{}.json", uuid::Uuid::new_v4()));
+            if let Err(e) = std::fs::write(&config_path, &mcp_config) {
+                drop(gate_server);
+                let _ = tx.send(ReviewGateMessage::Result(ReviewGateResult {
+                    work_item_id: wi_id_clone,
+                    approved: false,
+                    detail: format!("review gate: could not write MCP config: {e}"),
+                }));
+                return;
+            }
 
             let json_schema = r#"{"type":"object","properties":{"approved":{"type":"boolean"},"detail":{"type":"string"}},"required":["approved","detail"]}"#;
 
@@ -4922,6 +4984,8 @@ impl App {
                     "json",
                     "--json-schema",
                     json_schema,
+                    "--mcp-config",
+                    &config_path.to_string_lossy(),
                 ])
                 .output()
             {
@@ -4961,6 +5025,11 @@ impl App {
                     detail: format!("could not run claude: {e}"),
                 },
             };
+
+            // Clean up temporary MCP server and config file.
+            drop(gate_server);
+            let _ = std::fs::remove_file(&config_path);
+
             let _ = tx.send(ReviewGateMessage::Result(result));
         });
 
