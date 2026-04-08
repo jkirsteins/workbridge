@@ -81,6 +81,38 @@ removed once no Done items with `pr_identity=None` remain on disk.
 If no live PR exists and no persisted PR identity applies, there is no PR
 piece.
 
+## Work Item Kind
+
+Each work item has a `WorkItemKind` that determines its workflow:
+
+- **Own** (default) - The user's own work. Follows the full six-stage
+  workflow: Backlog -> Planning -> Implementing -> Blocked -> Review -> Done.
+  Created when importing an unlinked PR or creating a new work item from
+  scratch.
+
+- **ReviewRequest** - A PR where the user was requested as a reviewer.
+  Restricted to a two-stage workflow: Review -> Done. These items appear
+  in the "REVIEW REQUESTS" group in the sidebar with an "[RR]" badge.
+
+### Review request behavior
+
+Review-requested PRs are discovered via the `review-requested:@me` GitHub
+search filter and displayed in a dedicated "REVIEW REQUESTS" section in the
+sidebar. Before import, they show an "R" prefix.
+
+Pressing Enter on a review request imports it directly into the Review stage
+(not Backlog), since reviewing is the only meaningful action. A worktree is
+created for the reviewer to inspect the code.
+
+Stage restrictions for ReviewRequest items:
+
+- **advance_stage**: Only Review -> Done is allowed (via the merge gate).
+  Advancing from any other stage is blocked.
+- **retreat_stage**: Always blocked. There is no valid previous stage for
+  a review request in Review.
+- **MCP transitions**: All MCP status transitions are blocked. Claude
+  sessions should not drive workflow for someone else's PR.
+
 ## Work Item Status
 
 Work items follow a six-stage workflow:

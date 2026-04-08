@@ -127,6 +127,12 @@ impl GitWorktreeService {
         let output = git_command()
             .arg("-C")
             .arg(repo_path)
+            // Clear inherited git env vars so -C is authoritative.
+            // Without this, GIT_DIR from a parent worktree context
+            // can override the -C target.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .args(args)
             .output()
             .map_err(|e| WorktreeError::Io(format!("failed to run git: {e}")))?;
@@ -525,6 +531,9 @@ mod integration_tests {
                 "-m",
                 "initial commit",
             ])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         if !output.status.success() {
@@ -565,6 +574,9 @@ mod integration_tests {
                 "-m",
                 message,
             ])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         if !output.status.success() {
@@ -666,6 +678,9 @@ mod integration_tests {
         // Verify the branch was deleted.
         let branch_check = git_cmd(&repo_dir)
             .args(["rev-parse", "--verify", "refs/heads/test-branch"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         assert!(
@@ -915,6 +930,9 @@ mod integration_tests {
         // Get the commit SHA on pr-branch in source.
         let expected_sha = git_cmd(&source_dir)
             .args(["rev-parse", "pr-branch"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         let expected_sha = String::from_utf8(expected_sha.stdout)

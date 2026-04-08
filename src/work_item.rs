@@ -57,6 +57,16 @@ pub enum BackendType {
     GithubProject,
 }
 
+/// Distinguishes the user's own work items from review requests.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WorkItemKind {
+    /// The user's own work (default for existing items).
+    #[default]
+    Own,
+    /// A PR the user was requested to review.
+    ReviewRequest,
+}
+
 /// Workflow stage of a work item.
 ///
 /// Progresses: Backlog -> Planning -> Implementing -> Review -> Done.
@@ -117,6 +127,7 @@ impl WorkItemStatus {
 pub struct WorkItem {
     pub id: WorkItemId,
     pub backend_type: BackendType,
+    pub kind: WorkItemKind,
     pub title: String,
     pub description: Option<String>,
     pub status: WorkItemStatus,
@@ -263,6 +274,14 @@ pub struct UnlinkedPr {
     pub branch: String,
 }
 
+/// A GitHub PR where the authenticated user has been requested as a reviewer.
+/// Shown in the "Review Requests" group and can be imported as a work item.
+pub struct ReviewRequestedPr {
+    pub repo_path: PathBuf,
+    pub pr: PrInfo,
+    pub branch: String,
+}
+
 /// A session associated with a work item. Replaces the old Tab struct's
 /// fields minus `name` (the title comes from the work item).
 pub struct SessionEntry {
@@ -280,6 +299,10 @@ pub struct RepoFetchResult {
     pub github_remote: Option<(String, String)>,
     pub worktrees: Result<Vec<WorktreeInfo>, WorktreeError>,
     pub prs: Result<Vec<GithubPr>, GithubError>,
+    /// PRs where the authenticated user has been requested as a reviewer.
+    pub review_requested_prs: Result<Vec<GithubPr>, GithubError>,
+    /// The login of the authenticated GitHub user, if available.
+    pub authenticated_user: Option<String>,
     pub issues: Vec<(u64, Result<GithubIssue, GithubError>)>,
 }
 

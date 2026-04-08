@@ -402,6 +402,12 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                         sync_layout(app);
                     }
                 }
+                DisplayEntry::ReviewRequestItem(_) => {
+                    app.import_selected_review_request();
+                    if app.status_message.is_some() != had_status {
+                        sync_layout(app);
+                    }
+                }
                 _ => {}
             }
         }

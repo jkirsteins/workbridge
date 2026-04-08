@@ -11,8 +11,8 @@ use crate::github_client::GithubError;
 use crate::mcp::{McpEvent, McpSocketServer};
 use crate::session::Session;
 use crate::work_item::{
-    FetchMessage, FetcherHandle, RepoFetchResult, SessionEntry, UnlinkedPr, WorkItem, WorkItemId,
-    WorkItemStatus,
+    FetchMessage, FetcherHandle, RepoFetchResult, ReviewRequestedPr, SessionEntry, UnlinkedPr,
+    WorkItem, WorkItemId, WorkItemKind, WorkItemStatus,
 };
 use crate::work_item_backend::{
     ActivityEntry, BackendError, CreateWorkItem, PrIdentityRecord, RepoAssociationRecord,
@@ -106,6 +106,8 @@ pub enum DisplayEntry {
         count: usize,
         kind: GroupHeaderKind,
     },
+    /// A review-requested PR (index into App::review_requested_prs).
+    ReviewRequestItem(usize),
     /// An unlinked PR (index into App::unlinked_prs).
     UnlinkedItem(usize),
     /// A work item (index into App::work_items).
@@ -271,8 +273,10 @@ pub struct App {
     pub worktree_service: Arc<dyn WorktreeService + Send + Sync>,
     /// Assembled work items (from backend records + repo data).
     pub work_items: Vec<WorkItem>,
-    /// PRs not linked to any work item.
+    /// PRs not linked to any work item (only the user's own).
     pub unlinked_prs: Vec<UnlinkedPr>,
+    /// PRs where the user has been requested as a reviewer.
+    pub review_requested_prs: Vec<ReviewRequestedPr>,
     /// Sessions keyed by (work item ID, stage).
     pub sessions: HashMap<(WorkItemId, WorkItemStatus), SessionEntry>,
     /// Fetched data per repo path (populated by background fetcher).
@@ -317,6 +321,8 @@ pub struct App {
     /// Keyed by both repo_path and branch to disambiguate same-named branches
     /// across different repos.
     pub selected_unlinked_branch: Option<(PathBuf, String)>,
+    /// Tracks the selected review-requested PR for selection restoration.
+    pub selected_review_request_branch: Option<(PathBuf, String)>,
     /// Fetch errors that could not be shown because the status bar was
     /// occupied. Drained on the next tick when status_message is None.
     pub pending_fetch_errors: Vec<String>,
@@ -504,6 +510,7 @@ impl App {
             worktree_service,
             work_items: Vec::new(),
             unlinked_prs: Vec::new(),
+            review_requested_prs: Vec::new(),
             sessions: HashMap::new(),
             repo_data: HashMap::new(),
             fetch_rx: None,
@@ -523,6 +530,7 @@ impl App {
             fetcher_repos_changed: false,
             selected_work_item: None,
             selected_unlinked_branch: None,
+            selected_review_request_branch: None,
             pending_fetch_errors: Vec::new(),
             fetcher_disconnected: false,
             fetcher_handle: None,
@@ -1120,20 +1128,22 @@ impl App {
             ));
         }
         let issue_pattern = &self.config.defaults.branch_issue_pattern;
-        let (items, unlinked) =
+        let (items, unlinked, review_requested) =
             assembly::reassemble(&list_result.records, &self.repo_data, issue_pattern);
         self.work_items = items;
         self.unlinked_prs = unlinked;
+        self.review_requested_prs = review_requested;
     }
 
     /// Build the display list from current work_items and unlinked_prs.
     ///
     /// Groups (each hidden if empty):
-    /// 1. BLOCKED (repo) - Blocked work items (red header, shown first)
-    /// 2. UNLINKED - PRs not yet imported as work items
-    /// 3. ACTIVE (repo) - non-Backlog, non-Done, non-Blocked work items
-    /// 4. BACKLOGGED (repo) - Backlog work items, grouped by repo
-    /// 5. DONE (repo) - Done work items, grouped by repo
+    /// 1. REVIEW REQUESTS - PRs where the user is requested as reviewer
+    /// 2. BLOCKED (repo) - Blocked work items (red header, shown first)
+    /// 3. UNLINKED - PRs not yet imported as work items
+    /// 4. ACTIVE (repo) - non-Backlog, non-Done, non-Blocked work items
+    /// 5. BACKLOGGED (repo) - Backlog work items, grouped by repo
+    /// 6. DONE (repo) - Done work items, grouped by repo
     pub fn build_display_list(&mut self) {
         let mut list = Vec::new();
 
@@ -1152,6 +1162,18 @@ impl App {
                 }
             }
         } else {
+            // REVIEW REQUESTS group (hidden if empty).
+            if !self.review_requested_prs.is_empty() {
+                list.push(DisplayEntry::GroupHeader {
+                    label: "REVIEW REQUESTS".to_string(),
+                    count: self.review_requested_prs.len(),
+                    kind: GroupHeaderKind::Normal,
+                });
+                for i in 0..self.review_requested_prs.len() {
+                    list.push(DisplayEntry::ReviewRequestItem(i));
+                }
+            }
+
             // Partition work items into blocked, active, backlogged, and done.
             let mut blocked: Vec<usize> = Vec::new();
             let mut active: Vec<usize> = Vec::new();
@@ -1245,11 +1267,26 @@ impl App {
                 }
             }
         }
+        if !restored && let Some(ref target) = self.selected_review_request_branch {
+            let (target_repo, target_branch) = target;
+            for (i, entry) in self.display_list.iter().enumerate() {
+                if let DisplayEntry::ReviewRequestItem(rr_idx) = entry
+                    && let Some(rr) = self.review_requested_prs.get(*rr_idx)
+                    && rr.branch == *target_branch
+                    && rr.repo_path == *target_repo
+                {
+                    self.selected_item = Some(i);
+                    restored = true;
+                    break;
+                }
+            }
+        }
         if !restored {
             // Previously selected item is gone. Clear identity trackers
             // and fall back to first selectable item or None.
             self.selected_work_item = None;
             self.selected_unlinked_branch = None;
+            self.selected_review_request_branch = None;
             self.selected_item = self.display_list.iter().position(is_selectable);
         }
 
@@ -1307,6 +1344,7 @@ impl App {
     fn sync_selection_identity(&mut self) {
         self.selected_work_item = None;
         self.selected_unlinked_branch = None;
+        self.selected_review_request_branch = None;
         let Some(idx) = self.selected_item else {
             return;
         };
@@ -1319,6 +1357,12 @@ impl App {
             Some(DisplayEntry::UnlinkedItem(ul_idx)) => {
                 if let Some(ul) = self.unlinked_prs.get(*ul_idx) {
                     self.selected_unlinked_branch = Some((ul.repo_path.clone(), ul.branch.clone()));
+                }
+            }
+            Some(DisplayEntry::ReviewRequestItem(rr_idx)) => {
+                if let Some(rr) = self.review_requested_prs.get(*rr_idx) {
+                    self.selected_review_request_branch =
+                        Some((rr.repo_path.clone(), rr.branch.clone()));
                 }
             }
             _ => {}
@@ -2209,6 +2253,18 @@ impl App {
                         continue;
                     }
 
+                    // Block all MCP transitions for review request items.
+                    // Claude sessions should not drive workflow for someone else's PR.
+                    if wi_ref
+                        .map(|w| w.kind == WorkItemKind::ReviewRequest)
+                        .unwrap_or(false)
+                    {
+                        self.status_message = Some(
+                            "MCP: status transitions not supported for review request items".into(),
+                        );
+                        continue;
+                    }
+
                     let current_status = wi_ref.map(|w| w.status.clone());
 
                     // Restrict MCP to valid forward transitions only.
@@ -2492,6 +2548,64 @@ impl App {
         }
     }
 
+    /// Import the currently selected review-requested PR as a work item.
+    ///
+    /// Mirrors import_selected_unlinked but uses import_review_request on
+    /// the backend, which sets kind=ReviewRequest and status=Review.
+    pub fn import_selected_review_request(&mut self) {
+        let Some(idx) = self.selected_item else {
+            return;
+        };
+        let rr_idx = match self.display_list.get(idx) {
+            Some(DisplayEntry::ReviewRequestItem(i)) => *i,
+            _ => return,
+        };
+        let Some(rr) = self.review_requested_prs.get(rr_idx) else {
+            return;
+        };
+
+        let repo_path = rr.repo_path.clone();
+        let branch = rr.branch.clone();
+
+        match self.backend.import_review_request(rr) {
+            Ok(record) => {
+                let title = record.title.clone();
+
+                let wt_msg = match self.worktree_service.fetch_branch(&repo_path, &branch) {
+                    Ok(()) => {
+                        let wt_target = Self::worktree_target_path(
+                            &repo_path,
+                            &branch,
+                            &self.config.defaults.worktree_dir,
+                        );
+                        match self
+                            .worktree_service
+                            .create_worktree(&repo_path, &branch, &wt_target)
+                        {
+                            Ok(_) => format!("Imported review: {title} (worktree created)"),
+                            Err(e) => {
+                                format!("Imported review: {title} (worktree not created: {e})")
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        format!(
+                            "Imported review: {title} - could not fetch branch '{branch}' from origin. Manual checkout required."
+                        )
+                    }
+                };
+
+                self.reassemble_work_items();
+                self.build_display_list();
+                self.fetcher_repos_changed = true;
+                self.status_message = Some(wt_msg);
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Import error: {e}"));
+            }
+        }
+    }
+
     /// Create a new work item with the current working directory as the
     /// repo association. Validates that the CWD is inside a managed repo
     /// before persisting.
@@ -2524,6 +2638,7 @@ impl App {
             title: "New work item".to_string(),
             description: None,
             status: WorkItemStatus::Backlog,
+            kind: WorkItemKind::Own,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: repo_root,
                 branch: None,
@@ -2592,6 +2707,7 @@ impl App {
             title: title.clone(),
             description,
             status: WorkItemStatus::Backlog,
+            kind: WorkItemKind::Own,
             repo_associations,
         };
 
@@ -2871,6 +2987,7 @@ impl App {
         // -- Phase 7: Clear identity trackers and reassemble --
         self.selected_work_item = None;
         self.selected_unlinked_branch = None;
+        self.selected_review_request_branch = None;
 
         let old_idx = self.selected_item;
         self.reassemble_work_items();
@@ -2922,6 +3039,13 @@ impl App {
         };
         if wi.status_derived {
             self.status_message = Some("Status is derived from merged PR".into());
+            return;
+        }
+        // Review request items only support Review -> Done (via merge gate).
+        // Block advance from any other stage.
+        if wi.kind == WorkItemKind::ReviewRequest && wi.status != WorkItemStatus::Review {
+            self.status_message =
+                Some("Review request items only support Review and Done stages".into());
             return;
         }
         let current_status = wi.status.clone();
@@ -2982,6 +3106,12 @@ impl App {
         };
         if wi.status_derived {
             self.status_message = Some("Status is derived from merged PR".into());
+            return;
+        }
+        // Review request items cannot retreat - there is no valid previous
+        // stage for a review request in Review.
+        if wi.kind == WorkItemKind::ReviewRequest {
+            self.status_message = Some("Review request items cannot be retreated".into());
             return;
         }
         let current_status = wi.status.clone();
@@ -4383,7 +4513,9 @@ fn now_iso8601() -> String {
 pub fn is_selectable(entry: &DisplayEntry) -> bool {
     matches!(
         entry,
-        DisplayEntry::UnlinkedItem(_) | DisplayEntry::WorkItemEntry(_)
+        DisplayEntry::ReviewRequestItem(_)
+            | DisplayEntry::UnlinkedItem(_)
+            | DisplayEntry::WorkItemEntry(_)
     )
 }
 
@@ -4512,6 +4644,15 @@ impl WorkItemBackend for StubBackend {
     ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
         Err(BackendError::Validation(
             "stub backend does not support import".into(),
+        ))
+    }
+
+    fn import_review_request(
+        &self,
+        _rr: &crate::work_item::ReviewRequestedPr,
+    ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+        Err(BackendError::Validation(
+            "stub backend does not support import_review_request".into(),
         ))
     }
 
@@ -4733,12 +4874,33 @@ mod tests {
                     title: unlinked.pr.title.clone(),
                     description: None,
                     status: WorkItemStatus::Implementing,
+                    kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
                         pr_identity: None,
                     }],
                     plan: None,
+                };
+                self.records.lock().unwrap().push(record.clone());
+                Ok(record)
+            }
+            fn import_review_request(
+                &self,
+                rr: &crate::work_item::ReviewRequestedPr,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                let record = crate::work_item_backend::WorkItemRecord {
+                    id: WorkItemId::LocalFile(PathBuf::from("/tmp/fake-rr.json")),
+                    title: rr.pr.title.clone(),
+                    status: WorkItemStatus::Review,
+                    kind: crate::work_item::WorkItemKind::ReviewRequest,
+                    repo_associations: vec![RepoAssociationRecord {
+                        repo_path: rr.repo_path.clone(),
+                        branch: Some(rr.branch.clone()),
+                        pr_identity: None,
+                    }],
+                    plan: None,
+                    description: None,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -4849,6 +5011,7 @@ mod tests {
                     title: req.title.clone(),
                     description: None,
                     status: req.status.clone(),
+                    kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: req.repo_associations,
                     plan: None,
                 })
@@ -4868,6 +5031,12 @@ mod tests {
                 _unlinked: &crate::work_item::UnlinkedPr,
             ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 Err(BackendError::Validation("not used".into()))
+            }
+            fn import_review_request(
+                &self,
+                _rr: &crate::work_item::ReviewRequestedPr,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not supported in test".into()))
             }
             fn append_activity(
                 &self,
@@ -4961,6 +5130,8 @@ mod tests {
             github_remote: None,
             worktrees: Ok(vec![]),
             prs: Ok(vec![]),
+            review_requested_prs: Ok(vec![]),
+            authenticated_user: None,
             issues: vec![],
         }))
         .unwrap();
@@ -5023,6 +5194,8 @@ mod tests {
             github_remote: None,
             worktrees: Ok(vec![]),
             prs: Ok(vec![]),
+            review_requested_prs: Ok(vec![]),
+            authenticated_user: None,
             issues: vec![],
         }))
         .unwrap();
@@ -5038,6 +5211,8 @@ mod tests {
             github_remote: None,
             worktrees: Ok(vec![]),
             prs: Ok(vec![]),
+            review_requested_prs: Ok(vec![]),
+            authenticated_user: None,
             issues: vec![],
         }))
         .unwrap();
@@ -5099,6 +5274,8 @@ mod tests {
                 github_remote: None,
                 worktrees: Ok(vec![]),
                 prs: Ok(vec![]),
+                review_requested_prs: Ok(vec![]),
+                authenticated_user: None,
                 issues: vec![],
             },
         );
@@ -5127,6 +5304,8 @@ mod tests {
                 github_remote: None,
                 worktrees: Ok(vec![]),
                 prs: Ok(vec![]),
+                review_requested_prs: Ok(vec![]),
+                authenticated_user: None,
                 issues: vec![],
             },
         );
@@ -5137,6 +5316,8 @@ mod tests {
                 github_remote: None,
                 worktrees: Ok(vec![]),
                 prs: Ok(vec![]),
+                review_requested_prs: Ok(vec![]),
+                authenticated_user: None,
                 issues: vec![],
             },
         );
@@ -5178,6 +5359,8 @@ mod tests {
             github_remote: None,
             worktrees: Err(WorktreeError::GitError("not a git repository".into())),
             prs: Ok(vec![]),
+            review_requested_prs: Ok(vec![]),
+            authenticated_user: None,
             issues: vec![],
         }))
         .unwrap();
@@ -5206,6 +5389,8 @@ mod tests {
             github_remote: None,
             worktrees: Err(WorktreeError::GitError("still broken".into())),
             prs: Ok(vec![]),
+            review_requested_prs: Ok(vec![]),
+            authenticated_user: None,
             issues: vec![],
         }))
         .unwrap();
@@ -5272,6 +5457,12 @@ mod tests {
             ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 Err(BackendError::Validation("not used".into()))
             }
+            fn import_review_request(
+                &self,
+                _rr: &crate::work_item::ReviewRequestedPr,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not supported in test".into()))
+            }
             fn append_activity(
                 &self,
                 _id: &WorkItemId,
@@ -5304,6 +5495,7 @@ mod tests {
             title: "Item A".into(),
             description: None,
             status: WorkItemStatus::Backlog,
+            kind: crate::work_item::WorkItemKind::Own,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: PathBuf::from("/repo"),
                 branch: None,
@@ -5316,6 +5508,7 @@ mod tests {
             title: "Item B".into(),
             description: None,
             status: WorkItemStatus::Backlog,
+            kind: crate::work_item::WorkItemKind::Own,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: PathBuf::from("/repo"),
                 branch: None,
@@ -5349,6 +5542,7 @@ mod tests {
             crate::work_item::WorkItem {
                 id: id_b.clone(),
                 backend_type: crate::work_item::BackendType::LocalFile,
+                kind: crate::work_item::WorkItemKind::Own,
                 title: "Item B".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
@@ -5366,6 +5560,7 @@ mod tests {
             crate::work_item::WorkItem {
                 id: id_a.clone(),
                 backend_type: crate::work_item::BackendType::LocalFile,
+                kind: crate::work_item::WorkItemKind::Own,
                 title: "Item A".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
@@ -5417,6 +5612,7 @@ mod tests {
                 title: format!("Item {name}"),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: crate::work_item::WorkItemKind::Own,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,
@@ -5514,6 +5710,8 @@ mod tests {
             prs: Err(crate::github_client::GithubError::ApiError(
                 "rate limited".into(),
             )),
+            review_requested_prs: Ok(vec![]),
+            authenticated_user: None,
             issues: vec![],
         }))
         .unwrap();
@@ -5859,12 +6057,33 @@ mod tests {
                     title: unlinked.pr.title.clone(),
                     description: None,
                     status: WorkItemStatus::Implementing,
+                    kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
                         pr_identity: None,
                     }],
                     plan: None,
+                };
+                self.records.lock().unwrap().push(record.clone());
+                Ok(record)
+            }
+            fn import_review_request(
+                &self,
+                rr: &crate::work_item::ReviewRequestedPr,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                let record = crate::work_item_backend::WorkItemRecord {
+                    id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported-rr.json")),
+                    title: rr.pr.title.clone(),
+                    status: WorkItemStatus::Review,
+                    kind: crate::work_item::WorkItemKind::ReviewRequest,
+                    repo_associations: vec![RepoAssociationRecord {
+                        repo_path: rr.repo_path.clone(),
+                        branch: Some(rr.branch.clone()),
+                        pr_identity: None,
+                    }],
+                    plan: None,
+                    description: None,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -6108,12 +6327,33 @@ mod tests {
                     title: unlinked.pr.title.clone(),
                     description: None,
                     status: WorkItemStatus::Implementing,
+                    kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
                         pr_identity: None,
                     }],
                     plan: None,
+                };
+                self.records.lock().unwrap().push(record.clone());
+                Ok(record)
+            }
+            fn import_review_request(
+                &self,
+                rr: &crate::work_item::ReviewRequestedPr,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                let record = crate::work_item_backend::WorkItemRecord {
+                    id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported-rr.json")),
+                    title: rr.pr.title.clone(),
+                    status: WorkItemStatus::Review,
+                    kind: crate::work_item::WorkItemKind::ReviewRequest,
+                    repo_associations: vec![RepoAssociationRecord {
+                        repo_path: rr.repo_path.clone(),
+                        branch: Some(rr.branch.clone()),
+                        pr_identity: None,
+                    }],
+                    plan: None,
+                    description: None,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -6379,12 +6619,33 @@ mod tests {
                     title: unlinked.pr.title.clone(),
                     description: None,
                     status: WorkItemStatus::Implementing,
+                    kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
                         pr_identity: None,
                     }],
                     plan: None,
+                };
+                self.records.lock().unwrap().push(record.clone());
+                Ok(record)
+            }
+            fn import_review_request(
+                &self,
+                rr: &crate::work_item::ReviewRequestedPr,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                let record = crate::work_item_backend::WorkItemRecord {
+                    id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported-rr.json")),
+                    title: rr.pr.title.clone(),
+                    status: WorkItemStatus::Review,
+                    kind: crate::work_item::WorkItemKind::ReviewRequest,
+                    repo_associations: vec![RepoAssociationRecord {
+                        repo_path: rr.repo_path.clone(),
+                        branch: Some(rr.branch.clone()),
+                        pr_identity: None,
+                    }],
+                    plan: None,
+                    description: None,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -6514,6 +6775,7 @@ mod tests {
                     title: req.title.clone(),
                     description: None,
                     status: req.status.clone(),
+                    kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: req.repo_associations,
                     plan: None,
                 };
@@ -6534,6 +6796,12 @@ mod tests {
                 _unlinked: &crate::work_item::UnlinkedPr,
             ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 Err(BackendError::Validation("not used".into()))
+            }
+            fn import_review_request(
+                &self,
+                _rr: &crate::work_item::ReviewRequestedPr,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not supported in test".into()))
             }
             fn append_activity(
                 &self,
@@ -6621,6 +6889,7 @@ mod tests {
         WorkItem {
             id: WorkItemId::LocalFile(PathBuf::from(format!("/data/{title}.json"))),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: title.to_string(),
             description: None,
             status,
@@ -6819,6 +7088,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Merge test".into(),
             description: None,
             status: WorkItemStatus::Review,
@@ -6854,6 +7124,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "No assoc".into(),
             description: None,
             status: WorkItemStatus::Review,
@@ -6881,6 +7152,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "No branch".into(),
             description: None,
             status: WorkItemStatus::Review,
@@ -6915,6 +7187,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "No remote".into(),
             description: None,
             status: WorkItemStatus::Review,
@@ -6950,6 +7223,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "No PR".into(),
             description: None,
             status: WorkItemStatus::Review,
@@ -6986,6 +7260,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Merged OK".into(),
             description: None,
             status: WorkItemStatus::Review,
@@ -7026,6 +7301,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Rework test".into(),
             description: None,
             status: WorkItemStatus::Review,
@@ -7074,6 +7350,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id,
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Backlog item".into(),
             description: None,
             status: WorkItemStatus::Backlog,
@@ -7101,6 +7378,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id,
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Planning item".into(),
             description: None,
             status: WorkItemStatus::Planning,
@@ -7248,6 +7526,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Plan from branch test".into(),
             description: None,
             status: WorkItemStatus::Blocked,
@@ -7278,6 +7557,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Not blocked test".into(),
             description: None,
             status: WorkItemStatus::Implementing,
@@ -7323,6 +7603,7 @@ mod tests {
             app.work_items.push(crate::work_item::WorkItem {
                 id,
                 backend_type: BackendType::LocalFile,
+                kind: crate::work_item::WorkItemKind::Own,
                 title: format!("{status:?} item"),
                 description: None,
                 status,
@@ -7380,6 +7661,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id,
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Blocked kind test".into(),
             description: None,
             status: WorkItemStatus::Blocked,
@@ -7556,6 +7838,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Gate test item".into(),
             description: None,
             status,
@@ -7764,6 +8047,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id_a.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Item A".into(),
             description: None,
             status: WorkItemStatus::Implementing,
@@ -7784,6 +8068,7 @@ mod tests {
         app.work_items.push(crate::work_item::WorkItem {
             id: wi_id_b.clone(),
             backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
             title: "Item B".into(),
             description: None,
             status: WorkItemStatus::Implementing,
@@ -8003,6 +8288,7 @@ mod tests {
                 title: "Done item".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: crate::work_item::WorkItemKind::Own,
                 repo_associations: vec![make_assoc("/tmp/repo", "feature/done")],
             })
             .unwrap();
@@ -8016,6 +8302,7 @@ mod tests {
                 title: "Impl item".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: crate::work_item::WorkItemKind::Own,
                 repo_associations: vec![make_assoc("/tmp/repo", "feature/impl")],
             })
             .unwrap();
@@ -8026,6 +8313,7 @@ mod tests {
                 title: "Done with PR".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
+                kind: crate::work_item::WorkItemKind::Own,
                 repo_associations: vec![make_assoc("/tmp/repo", "feature/done-pr")],
             })
             .unwrap();
@@ -8125,6 +8413,7 @@ mod tests {
                     title: unlinked.pr.title.clone(),
                     description: None,
                     status: WorkItemStatus::Implementing,
+                    kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
@@ -8134,6 +8423,12 @@ mod tests {
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
+            }
+            fn import_review_request(
+                &self,
+                _rr: &crate::work_item::ReviewRequestedPr,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not supported in test".into()))
             }
             fn append_activity(
                 &self,
@@ -8264,6 +8559,7 @@ mod tests {
                     title: title.into(),
                     description: None,
                     status: WorkItemStatus::Implementing,
+                    kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: PathBuf::from(repo_path),
                         branch: Some(branch.into()),
@@ -8309,6 +8605,12 @@ mod tests {
             _unlinked: &crate::work_item::UnlinkedPr,
         ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
             Err(BackendError::Validation("not used".into()))
+        }
+        fn import_review_request(
+            &self,
+            _rr: &crate::work_item::ReviewRequestedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation("not supported in test".into()))
         }
         fn append_activity(
             &self,

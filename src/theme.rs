@@ -85,6 +85,10 @@ pub struct Theme {
     pub badge_ci_pending: Color,
     /// Unlinked item "?" marker color.
     pub unlinked_marker: Color,
+    /// Review request "R" marker color (pre-import).
+    pub review_request_marker: Color,
+    /// Review request kind badge "[RR]" color (post-import).
+    pub badge_review_request_kind: Color,
     /// Done item text color (muted, completed work is less prominent).
     pub done_item: Color,
 
@@ -155,6 +159,8 @@ impl Theme {
             badge_ci_fail: Color::Red,
             badge_ci_pending: Color::Yellow,
             unlinked_marker: Color::Yellow,
+            review_request_marker: Color::Magenta,
+            badge_review_request_kind: Color::Magenta,
             done_item: Color::Reset,
 
             badge_session_idle: Color::Gray,
@@ -310,6 +316,16 @@ impl Theme {
 
     pub fn style_unlinked_marker(&self) -> Style {
         Style::default().fg(self.unlinked_marker)
+    }
+
+    pub fn style_review_request_marker(&self) -> Style {
+        Style::default().fg(self.review_request_marker)
+    }
+
+    pub fn style_badge_review_request_kind(&self) -> Style {
+        Style::default()
+            .fg(self.badge_review_request_kind)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn style_done_item(&self) -> Style {
