@@ -184,6 +184,21 @@ pub struct PrMergeResult {
     pub outcome: PrMergeOutcome,
 }
 
+/// Outcome of an asynchronous PR review submission.
+pub enum ReviewSubmitOutcome {
+    /// Review posted successfully on GitHub.
+    Success,
+    /// Review submission failed.
+    Failed { error: String },
+}
+
+/// Result from the asynchronous review submission thread.
+pub struct ReviewSubmitResult {
+    pub wi_id: WorkItemId,
+    pub action: String,
+    pub outcome: ReviewSubmitOutcome,
+}
+
 /// Information needed to poll a Mergequeue item's PR state.
 pub struct MergequeueWatch {
     pub wi_id: WorkItemId,
@@ -414,6 +429,20 @@ pub struct App {
     /// Activity ID for the running PR merge indicator.
     pub pr_merge_activity: Option<ActivityId>,
 
+    // -- Async review submission --
+    /// Receiver for asynchronous review submission results.
+    pub review_submit_rx: Option<crossbeam_channel::Receiver<ReviewSubmitResult>>,
+    /// Work item ID of the in-flight review submission, used to cancel
+    /// the submission if the work item is deleted while in flight.
+    pub review_submit_wi: Option<WorkItemId>,
+    /// Activity ID for the running review submission indicator.
+    pub review_submit_activity: Option<ActivityId>,
+    /// Work item IDs whose reviews were just submitted. These are excluded
+    /// from the re-open logic in reassemble_work_items() because repo_data
+    /// may still contain stale review-requested entries until the next
+    /// GitHub fetch cycle. Cleared when fresh repo_data arrives.
+    pub review_reopen_suppress: std::collections::HashSet<WorkItemId>,
+
     // -- Mergequeue polling --
     /// Active mergequeue watches - items waiting for their PR to be merged.
     pub mergequeue_watches: Vec<MergequeueWatch>,
@@ -584,6 +613,10 @@ impl App {
             pr_create_pending: VecDeque::new(),
             pr_merge_rx: None,
             pr_merge_activity: None,
+            review_submit_rx: None,
+            review_submit_wi: None,
+            review_submit_activity: None,
+            review_reopen_suppress: std::collections::HashSet::new(),
             mergequeue_watches: Vec::new(),
             mergequeue_poll_rx: None,
             mergequeue_poll_activity: None,
@@ -1092,15 +1125,26 @@ impl App {
                         }
                     }
                     self.repo_data.insert(result.repo_path.clone(), result);
+                    // Clear re-open suppression only after ALL repos have
+                    // reported back.  In multi-repo setups, clearing on every
+                    // single RepoData arrival lets an early repo's stale data
+                    // re-open items that were just reviewed in a later repo.
+                    if self.pending_fetch_count == 0 {
+                        self.review_reopen_suppress.clear();
+                    }
                 }
                 Ok(FetchMessage::FetcherError { repo_path, error }) => {
                     received_any = true;
                     self.pending_fetch_count = self.pending_fetch_count.saturating_sub(1);
                     // Can't call self.end_activity() here - rx borrow.
-                    if self.pending_fetch_count == 0
-                        && let Some(id) = self.fetch_activity.take()
-                    {
-                        self.activities.retain(|a| a.id != id);
+                    if self.pending_fetch_count == 0 {
+                        if let Some(id) = self.fetch_activity.take() {
+                            self.activities.retain(|a| a.id != id);
+                        }
+                        // Clear re-open suppression when all repos have
+                        // reported back, even if they all failed.  This
+                        // mirrors the clear in the RepoData arm.
+                        self.review_reopen_suppress.clear();
                     }
                     let msg = format!("Fetch error ({}): {error}", repo_path.display());
                     if self.status_message.is_none() {
@@ -1163,11 +1207,49 @@ impl App {
             ));
         }
         let issue_pattern = &self.config.defaults.branch_issue_pattern;
-        let (items, unlinked, review_requested) =
+        let (items, unlinked, review_requested, mut reopen_ids) =
             assembly::reassemble(&list_result.records, &self.repo_data, issue_pattern);
         self.work_items = items;
         self.unlinked_prs = unlinked;
         self.review_requested_prs = review_requested;
+
+        // Exclude items whose reviews were recently submitted. Stale
+        // repo_data may still list them as review-requested until the
+        // next GitHub fetch cycle refreshes the data.
+        reopen_ids.retain(|id| !self.review_reopen_suppress.contains(id));
+
+        // Re-open Done ReviewRequest items that have been re-requested.
+        if !reopen_ids.is_empty() {
+            for wi_id in &reopen_ids {
+                if let Err(e) = self.backend.update_status(wi_id, WorkItemStatus::Review) {
+                    self.status_message = Some(format!("Re-open error: {e}"));
+                    continue;
+                }
+                let entry = ActivityEntry {
+                    timestamp: now_iso8601(),
+                    event_type: "stage_change".to_string(),
+                    payload: serde_json::json!({
+                        "from": "Done",
+                        "to": "Review",
+                        "source": "review_re_requested"
+                    }),
+                };
+                let _ = self.backend.append_activity(wi_id, &entry);
+            }
+            // Reassemble again to pick up the status changes.
+            let list_result = match self.backend.list() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let (items, unlinked, review_requested, _) =
+                assembly::reassemble(&list_result.records, &self.repo_data, issue_pattern);
+            self.work_items = items;
+            self.unlinked_prs = unlinked;
+            self.review_requested_prs = review_requested;
+
+            let count = reopen_ids.len();
+            self.status_message = Some(format!("{count} review request(s) re-opened"));
+        }
 
         // Reconstruct mergequeue watches for items that are in Mergequeue
         // but don't have a watch (e.g., after app restart).
@@ -2180,10 +2262,19 @@ impl App {
         // Compute the activity log path for the query_log MCP tool.
         let activity_log_path = self.backend.activity_path_for(work_item_id);
 
+        // Determine work item kind for conditional MCP tool exposure.
+        let wi_kind = self
+            .work_items
+            .iter()
+            .find(|w| w.id == *work_item_id)
+            .map(|w| format!("{:?}", w.kind))
+            .unwrap_or_default();
+
         // Start the socket server.
         let server = McpSocketServer::start(
             socket_path,
             wi_id_str,
+            wi_kind,
             context_json,
             activity_log_path,
             self.mcp_tx.clone(),
@@ -2486,6 +2577,31 @@ impl App {
                     } else {
                         self.claude_working.remove(&wi_id);
                     }
+                }
+                McpEvent::SubmitReview {
+                    work_item_id: wi_id_str,
+                    action,
+                    comment,
+                } => {
+                    let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            continue;
+                        }
+                    };
+                    let wi = self.work_items.iter().find(|w| w.id == wi_id);
+                    if !wi.is_some_and(|w| w.kind == WorkItemKind::ReviewRequest) {
+                        self.status_message =
+                            Some("MCP: review tools only work on review request items".into());
+                        continue;
+                    }
+                    if !wi.is_some_and(|w| w.status == WorkItemStatus::Review) {
+                        self.status_message =
+                            Some("MCP: review request is not in Review status".into());
+                        continue;
+                    }
+                    self.spawn_review_submission(&wi_id, &action, &comment);
                 }
             }
         }
@@ -2986,6 +3102,15 @@ impl App {
             }
         }
 
+        // Cancel in-flight review submission if it was for the deleted item.
+        if self.review_submit_wi.as_ref() == Some(&work_item_id) {
+            self.review_submit_rx = None;
+            self.review_submit_wi = None;
+            if let Some(aid) = self.review_submit_activity.take() {
+                self.end_activity(aid);
+            }
+        }
+
         // Cancel mergequeue watch for the deleted item. Any in-flight poll
         // result for a deleted item is discarded by poll_mergequeue (the item
         // won't be found in work_items after reassembly).
@@ -2994,6 +3119,7 @@ impl App {
         // -- Phase 6: Clean up in-memory state --
         self.rework_reasons.remove(&work_item_id);
         self.review_gate_findings.remove(&work_item_id);
+        self.review_reopen_suppress.remove(&work_item_id);
         self.no_plan_prompt_queue.retain(|id| *id != work_item_id);
         if self.no_plan_prompt_queue.is_empty() {
             self.no_plan_prompt_visible = false;
@@ -3072,11 +3198,10 @@ impl App {
             self.status_message = Some("Status is derived from merged PR".into());
             return;
         }
-        // Review request items only support Review -> Done (via merge gate).
-        // Block advance from any other stage.
-        if wi.kind == WorkItemKind::ReviewRequest && wi.status != WorkItemStatus::Review {
-            self.status_message =
-                Some("Review request items only support Review and Done stages".into());
+        // Review request items cannot be manually advanced.  The only way
+        // to complete them is via the approve/request-changes MCP tools.
+        if wi.kind == WorkItemKind::ReviewRequest {
+            self.status_message = Some("Use approve/request-changes in the Claude session".into());
             return;
         }
         let current_status = wi.status.clone();
@@ -3260,9 +3385,9 @@ impl App {
 
     /// Shared logic for applying a stage change: log it, persist it, reassemble.
     ///
-    /// Transitions to Done are only allowed when `source == "pr_merge"`,
-    /// enforcing the merge-gate invariant at the chokepoint rather than
-    /// relying on caller discipline alone.
+    /// Transitions to Done are only allowed when `source == "pr_merge"` or
+    /// `source == "review_submitted"`, enforcing the merge-gate invariant
+    /// at the chokepoint rather than relying on caller discipline alone.
     pub fn apply_stage_change(
         &mut self,
         wi_id: &WorkItemId,
@@ -3270,10 +3395,14 @@ impl App {
         new_status: &WorkItemStatus,
         source: &str,
     ) {
-        // Merge-gate guard: Done requires a verified PR merge.  All other
-        // callers must go through the merge prompt / poll_pr_merge path,
-        // which is the only code that passes source == "pr_merge".
-        if *new_status == WorkItemStatus::Done && source != "pr_merge" {
+        // Merge-gate guard: Done requires a verified PR merge or a
+        // submitted review.  All other callers must go through the merge
+        // prompt / poll_pr_merge path (source == "pr_merge") or the review
+        // submission path (source == "review_submitted").
+        if *new_status == WorkItemStatus::Done
+            && source != "pr_merge"
+            && source != "review_submitted"
+        {
             self.status_message = Some("Cannot move to Done without a merged PR".to_string());
             return;
         }
@@ -3300,7 +3429,13 @@ impl App {
         self.status_message = Some(format!("Moved to {}", new_status.badge_text()));
 
         // Feature 1: Auto-create PR when entering Review (async).
-        if *new_status == WorkItemStatus::Review {
+        // Skip for review requests - the PR already exists (it's someone else's).
+        let is_review_request = self
+            .work_items
+            .iter()
+            .find(|w| w.id == *wi_id)
+            .is_some_and(|w| w.kind == WorkItemKind::ReviewRequest);
+        if *new_status == WorkItemStatus::Review && !is_review_request {
             self.spawn_pr_creation(wi_id);
         }
 
@@ -3853,6 +3988,175 @@ impl App {
                 );
             }
             PrMergeOutcome::Failed { ref error } => {
+                self.status_message = Some(error.clone());
+            }
+        }
+    }
+
+    /// Spawn a background thread to submit a PR review (approve or
+    /// request-changes) via `gh pr review`. Results are polled by
+    /// `poll_review_submission()` on each timer tick.
+    pub fn spawn_review_submission(&mut self, wi_id: &WorkItemId, action: &str, comment: &str) {
+        if self.review_submit_rx.is_some() {
+            self.status_message = Some("Review submission already in progress".into());
+            return;
+        }
+
+        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
+            Some(w) => w,
+            None => return,
+        };
+        let assoc = match wi.repo_associations.first() {
+            Some(a) => a,
+            None => {
+                self.status_message = Some("Cannot submit review: no repo association".into());
+                return;
+            }
+        };
+        let branch = match assoc.branch.as_ref() {
+            Some(b) => b.clone(),
+            None => {
+                self.status_message = Some("Cannot submit review: no branch".into());
+                return;
+            }
+        };
+        let repo_path = assoc.repo_path.clone();
+        let (owner, repo_name) = match self.worktree_service.github_remote(&repo_path) {
+            Ok(Some((o, r))) => (o, r),
+            _ => {
+                self.status_message = Some("Cannot submit review: no GitHub remote found".into());
+                return;
+            }
+        };
+        let owner_repo = format!("{owner}/{repo_name}");
+        let action_owned = action.to_string();
+        let comment_owned = comment.to_string();
+        let wi_id_clone = wi_id.clone();
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        std::thread::spawn(move || {
+            let review_flag = if action_owned == "approve" {
+                "--approve"
+            } else {
+                "--request-changes"
+            };
+            let mut args = vec![
+                "pr".to_string(),
+                "review".to_string(),
+                branch,
+                review_flag.to_string(),
+                "--repo".to_string(),
+                owner_repo,
+            ];
+            if !comment_owned.is_empty() {
+                args.push("--body".to_string());
+                args.push(comment_owned);
+            }
+
+            let outcome = match std::process::Command::new("gh").args(&args).output() {
+                Ok(output) if output.status.success() => ReviewSubmitOutcome::Success,
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    ReviewSubmitOutcome::Failed {
+                        error: format!("Review submission failed: {}", stderr.trim()),
+                    }
+                }
+                Err(e) => ReviewSubmitOutcome::Failed {
+                    error: format!("Review submission failed: {e}"),
+                },
+            };
+
+            let _ = tx.send(ReviewSubmitResult {
+                wi_id: wi_id_clone,
+                action: action_owned,
+                outcome,
+            });
+        });
+
+        self.review_submit_rx = Some(rx);
+        self.review_submit_wi = Some(wi_id.clone());
+        if let Some(aid) = self.review_submit_activity.take() {
+            self.end_activity(aid);
+        }
+        let verb = if action == "approve" {
+            "Submitting approval"
+        } else {
+            "Requesting changes"
+        };
+        self.review_submit_activity = Some(self.start_activity(format!("{verb}...")));
+    }
+
+    /// Poll the asynchronous review submission result.
+    /// Called on the 200ms timer tick.
+    pub fn poll_review_submission(&mut self) {
+        let rx = match self.review_submit_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.review_submit_rx = None;
+                self.review_submit_wi = None;
+                if let Some(aid) = self.review_submit_activity.take() {
+                    self.end_activity(aid);
+                }
+                self.status_message =
+                    Some("Review submission: background thread exited unexpectedly".into());
+                return;
+            }
+        };
+
+        self.review_submit_rx = None;
+        self.review_submit_wi = None;
+        if let Some(aid) = self.review_submit_activity.take() {
+            self.end_activity(aid);
+        }
+
+        match result.outcome {
+            ReviewSubmitOutcome::Success => {
+                let verb = if result.action == "approve" {
+                    "approved"
+                } else {
+                    "changes requested"
+                };
+
+                let log_entry = ActivityEntry {
+                    timestamp: now_iso8601(),
+                    event_type: "review_submitted".to_string(),
+                    payload: serde_json::json!({ "action": result.action }),
+                };
+                if let Err(e) = self.backend.append_activity(&result.wi_id, &log_entry) {
+                    self.status_message = Some(format!("Activity log error: {e}"));
+                }
+
+                // Suppress re-open for this item until fresh repo_data
+                // arrives. Without this, stale review-requested data in
+                // repo_data would immediately bounce the item back to Review.
+                self.review_reopen_suppress.insert(result.wi_id.clone());
+
+                self.apply_stage_change(
+                    &result.wi_id,
+                    &WorkItemStatus::Review,
+                    &WorkItemStatus::Done,
+                    "review_submitted",
+                );
+                // Only show success if the item actually reached Done.
+                // apply_stage_change may have set an error message on failure
+                // (e.g. backend write error) - don't overwrite it.
+                let reached_done = self
+                    .work_items
+                    .iter()
+                    .find(|w| w.id == result.wi_id)
+                    .is_some_and(|w| w.status == WorkItemStatus::Done);
+                if reached_done {
+                    self.status_message = Some(format!("Review {verb} and moved to [DN]"));
+                }
+            }
+            ReviewSubmitOutcome::Failed { ref error } => {
                 self.status_message = Some(error.clone());
             }
         }

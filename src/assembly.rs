@@ -7,7 +7,7 @@ use crate::github_client::{GithubIssue, GithubPr};
 use crate::work_item::{
     CheckStatus, GitState, IssueInfo, IssueState, PrInfo, PrState, RepoAssociation,
     RepoFetchResult, ReviewDecision, ReviewRequestedPr, UnlinkedPr, WorkItem, WorkItemError,
-    WorkItemStatus,
+    WorkItemId, WorkItemKind, WorkItemStatus,
 };
 use crate::work_item_backend::WorkItemRecord;
 use crate::worktree_service::WorktreeInfo;
@@ -163,7 +163,12 @@ pub fn reassemble(
     backend_records: &[WorkItemRecord],
     repo_data: &HashMap<PathBuf, RepoFetchResult>,
     issue_pattern: &str,
-) -> (Vec<WorkItem>, Vec<UnlinkedPr>, Vec<ReviewRequestedPr>) {
+) -> (
+    Vec<WorkItem>,
+    Vec<UnlinkedPr>,
+    Vec<ReviewRequestedPr>,
+    Vec<WorkItemId>,
+) {
     let pattern = Regex::new(issue_pattern).ok();
 
     // Track all branches claimed by work items so we can find unlinked PRs.
@@ -365,6 +370,36 @@ pub fn reassemble(
         });
     }
 
+    // --- Detect Done ReviewRequest items that should be re-opened ---
+    // Build a set of (repo_path, branch) pairs where a review is currently
+    // requested so we can match against Done review request work items.
+    let mut review_requested_set: HashSet<(PathBuf, String)> = HashSet::new();
+    for (repo_path, fetch) in repo_data {
+        if let Ok(prs) = &fetch.review_requested_prs {
+            for pr in prs {
+                if !pr.head_branch.is_empty() {
+                    review_requested_set.insert((repo_path.clone(), pr.head_branch.clone()));
+                }
+            }
+        }
+    }
+    let mut reopen_ids: Vec<WorkItemId> = Vec::new();
+    for wi in &work_items {
+        if wi.kind == WorkItemKind::ReviewRequest
+            && wi.status == WorkItemStatus::Done
+            && !wi.status_derived
+        {
+            for assoc in &wi.repo_associations {
+                if let Some(ref branch) = assoc.branch
+                    && review_requested_set.contains(&(assoc.repo_path.clone(), branch.clone()))
+                {
+                    reopen_ids.push(wi.id.clone());
+                    break;
+                }
+            }
+        }
+    }
+
     // --- Collect unlinked PRs ---
     // All fetched PRs are already filtered to the authenticated user via
     // `--author @me` in the gh CLI calls, so no additional author check needed.
@@ -373,7 +408,7 @@ pub fn reassemble(
     // --- Collect review-requested PRs ---
     let review_requested_prs = collect_review_requested_prs(repo_data, &claimed_branches);
 
-    (work_items, unlinked_prs, review_requested_prs)
+    (work_items, unlinked_prs, review_requested_prs, reopen_ids)
 }
 
 /// Derive a fallback title from backend title or branch name.
@@ -597,7 +632,7 @@ mod tests {
             create_mock_repo_data(rp.clone(), vec![wt], vec![pr], vec![(42, Ok(issue))]);
         let repo_data: HashMap<PathBuf, RepoFetchResult> = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert_eq!(unlinked.len(), 0);
@@ -651,7 +686,7 @@ mod tests {
             let (rp_key, fetch) =
                 create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![(42, Ok(issue))]);
             let repo_data = HashMap::from([(rp_key, fetch)]);
-            let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
             assert_eq!(items[0].title, "PR title");
         }
 
@@ -671,7 +706,7 @@ mod tests {
             let (rp_key, fetch) =
                 create_mock_repo_data(rp.clone(), vec![], vec![], vec![(42, Ok(issue))]);
             let repo_data = HashMap::from([(rp_key, fetch)]);
-            let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
             assert_eq!(items[0].title, "Issue title");
         }
 
@@ -689,7 +724,7 @@ mod tests {
             );
             let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
             let repo_data = HashMap::from([(rp_key, fetch)]);
-            let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
             assert_eq!(items[0].title, "Backend title");
         }
 
@@ -708,7 +743,7 @@ mod tests {
             let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
             let repo_data = HashMap::from([(rp_key, fetch)]);
             // Use a pattern that won't match "my-feature"
-            let (items, _, _) = reassemble(&[record], &repo_data, r"^(\d+)-");
+            let (items, _, _, _) = reassemble(&[record], &repo_data, r"^(\d+)-");
             assert_eq!(items[0].title, "my-feature");
         }
 
@@ -725,7 +760,7 @@ mod tests {
                 }],
             );
             let repo_data = HashMap::new();
-            let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
             assert_eq!(items[0].title, "untitled");
         }
     }
@@ -753,7 +788,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr_a, pr_b], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert_eq!(unlinked.len(), 1);
@@ -793,7 +828,7 @@ mod tests {
         let (key_b, fetch_b) = create_mock_repo_data(rp_b.clone(), vec![], vec![pr_b], vec![]);
         let repo_data = HashMap::from([(key_a, fetch_a), (key_b, fetch_b)]);
 
-        let (items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert_eq!(unlinked.len(), 0);
@@ -847,7 +882,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let assoc = &items[0].repo_associations[0];
@@ -885,7 +920,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr1, pr2], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -934,7 +969,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt_detached], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -960,7 +995,7 @@ mod tests {
     #[test]
     fn empty_inputs() {
         let repo_data: HashMap<PathBuf, RepoFetchResult> = HashMap::new();
-        let (items, unlinked, _) = reassemble(&[], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) = reassemble(&[], &repo_data, DEFAULT_ISSUE_PATTERN);
         assert!(items.is_empty());
         assert!(unlinked.is_empty());
     }
@@ -987,7 +1022,7 @@ mod tests {
             create_mock_repo_data(rp.clone(), vec![], vec![], vec![(42, Ok(issue))]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _) = reassemble(&[record], &repo_data, r"^(\d+)-");
+        let (items, _, _, _) = reassemble(&[record], &repo_data, r"^(\d+)-");
 
         assert_eq!(items.len(), 1);
         let assoc = &items[0].repo_associations[0];
@@ -1026,7 +1061,7 @@ mod tests {
         );
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert!(
@@ -1065,7 +1100,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert!(
@@ -1096,7 +1131,7 @@ mod tests {
 
         // Empty repo_data - simulates startup before any fetch completes.
         let repo_data: HashMap<PathBuf, RepoFetchResult> = HashMap::new();
-        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert!(
@@ -1198,7 +1233,7 @@ mod tests {
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         // Invalid regex pattern should not panic - just skip issue extraction.
-        let (items, _, _) = reassemble(&[record], &repo_data, "[invalid(");
+        let (items, _, _, _) = reassemble(&[record], &repo_data, "[invalid(");
         assert_eq!(items.len(), 1);
         assert!(items[0].repo_associations[0].issue.is_none());
         // No IssueNotFound error either, since extraction was skipped.
@@ -1220,7 +1255,7 @@ mod tests {
         let (key_b, fetch_b) = create_mock_repo_data(rp_b.clone(), vec![], vec![pr_b], vec![]);
         let repo_data = HashMap::from([(key_a, fetch_a), (key_b, fetch_b)]);
 
-        let (items, unlinked, _) = reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) = reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert!(items.is_empty());
         assert_eq!(unlinked.len(), 2);
@@ -1252,7 +1287,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let assoc = &items[0].repo_associations[0];
@@ -1289,7 +1324,7 @@ mod tests {
         );
 
         let repo_data = HashMap::new();
-        let (items, _, _) = reassemble(
+        let (items, _, _, _) = reassemble(
             &[todo_record, in_progress_record],
             &repo_data,
             DEFAULT_ISSUE_PATTERN,
@@ -1351,7 +1386,7 @@ mod tests {
         ];
 
         let repo_data = HashMap::new();
-        let (items, _, _) = reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items[0].backend_type, BackendType::LocalFile);
         assert_eq!(items[1].backend_type, BackendType::GithubIssue);
@@ -1381,7 +1416,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1413,7 +1448,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1455,7 +1490,7 @@ mod tests {
         let (key_b, fetch_b) = create_mock_repo_data(rp_b, vec![], vec![pr_b], vec![]);
         let repo_data = HashMap::from([(key_a, fetch_a), (key_b, fetch_b)]);
 
-        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1509,7 +1544,7 @@ mod tests {
             create_mock_repo_data(rp.clone(), vec![], vec![same_repo_pr, fork_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -1565,7 +1600,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         assert!(
@@ -1619,7 +1654,7 @@ mod tests {
             create_mock_repo_data(rp.clone(), vec![], vec![same_repo_pr, fork_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         // The work item should have the same-repo PR matched.
         assert_eq!(items.len(), 1);
@@ -1671,7 +1706,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -1719,7 +1754,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![live_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let assoc = &items[0].repo_associations[0];
@@ -1760,7 +1795,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -1819,7 +1854,7 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![fork_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (_items, unlinked, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (_items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
 
         // The fork PR's branch is now claimed by the imported work item,
         // so it must NOT appear as unlinked.
