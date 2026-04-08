@@ -76,6 +76,20 @@ pub struct WorkItemContext {
     pub last_activity: Option<String>,
 }
 
+/// State for the 3-step delete confirmation flow.
+///
+/// None -> AwaitingConfirm (first press) -> AwaitingForce (dirty worktree) -> deleted
+/// None -> AwaitingConfirm (first press) -> deleted (clean worktree)
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeleteConfirmState {
+    /// No delete in progress.
+    None,
+    /// First press received - "Press again to delete".
+    AwaitingConfirm,
+    /// Dirty worktree detected - "Press again to force-delete".
+    AwaitingForce,
+}
+
 /// Visual style variant for group headers.
 #[derive(Clone, Debug, PartialEq)]
 pub enum GroupHeaderKind {
@@ -179,6 +193,8 @@ pub struct PrIdentityBackfillResult {
 pub struct WorktreeCreateResult {
     /// The work item the worktree was created for.
     pub wi_id: WorkItemId,
+    /// The repo path the worktree belongs to.
+    pub repo_path: PathBuf,
     /// The worktree path on success.
     pub path: Option<PathBuf>,
     /// Human-readable error message on failure.
@@ -193,8 +209,8 @@ pub struct App {
     pub status_message: Option<String>,
     /// True when waiting for a second press to confirm quit.
     pub confirm_quit: bool,
-    /// True when waiting for a second press to confirm work item deletion.
-    pub confirm_delete: bool,
+    /// State of the delete confirmation flow (None/AwaitingConfirm/AwaitingForce).
+    pub confirm_delete: DeleteConfirmState,
     /// True when the merge strategy prompt is visible (Review -> Done).
     pub confirm_merge: bool,
     /// The work item ID that the merge prompt applies to.
@@ -450,7 +466,7 @@ impl App {
             focus: FocusPanel::Left,
             status_message: None,
             confirm_quit: false,
-            confirm_delete: false,
+            confirm_delete: DeleteConfirmState::None,
             confirm_merge: false,
             merge_wi_id: None,
             rework_prompt_visible: false,
@@ -1523,6 +1539,7 @@ impl App {
                             {
                                 let _ = tx.send(WorktreeCreateResult {
                                     wi_id: wi_id_clone,
+                                    repo_path,
                                     path: None,
                                     error: Some(format!(
                                         "Could not fetch or create branch '{}': {create_err}",
@@ -1535,6 +1552,7 @@ impl App {
                                 Ok(wt_info) => {
                                     let _ = tx.send(WorktreeCreateResult {
                                         wi_id: wi_id_clone,
+                                        repo_path,
                                         path: Some(wt_info.path),
                                         error: None,
                                     });
@@ -1542,6 +1560,7 @@ impl App {
                                 Err(e) => {
                                     let _ = tx.send(WorktreeCreateResult {
                                         wi_id: wi_id_clone,
+                                        repo_path,
                                         path: None,
                                         error: Some(format!(
                                             "Failed to create worktree for '{}': {e}",
@@ -1787,9 +1806,18 @@ impl App {
                 // Verify the work item still exists before opening a session.
                 // It may have been deleted while the background thread was running.
                 if !self.work_items.iter().any(|w| w.id == result.wi_id) {
-                    self.status_message = Some(
-                        "Worktree created but work item was deleted - skipping session".into(),
-                    );
+                    // Clean up the orphaned worktree instead of leaving it behind.
+                    if let Err(e) =
+                        self.worktree_service
+                            .remove_worktree(&result.repo_path, &path, true, true)
+                    {
+                        self.status_message = Some(format!(
+                            "Worktree created but work item deleted; cleanup failed: {e}"
+                        ));
+                    } else {
+                        self.status_message =
+                            Some("Worktree created but work item was deleted - cleaned up".into());
+                    }
                     return;
                 }
                 // Worktree created successfully - continue with session setup.
@@ -2516,24 +2544,125 @@ impl App {
         }
     }
 
-    /// Delete the currently selected work item.
-    ///
-    /// Kills any active session for the work item, calls backend.delete(),
-    /// then reassembles and rebuilds the display list.
-    pub fn delete_selected_work_item(&mut self) {
+    /// Gateway between AwaitingConfirm and actual delete. Checks for dirty
+    /// worktrees and either proceeds to delete or escalates to AwaitingForce.
+    pub fn attempt_delete_selected_work_item(&mut self) {
         let Some(work_item_id) = self.selected_work_item_id() else {
             self.status_message = Some("No work item selected".into());
             return;
         };
 
-        // Delete from backend first. If this fails, keep the session alive.
+        // Check each repo association's worktree for dirty status.
+        // On error, default to dirty (safer: forces user to confirm force-delete).
+        let has_dirty = self
+            .work_items
+            .iter()
+            .find(|w| w.id == work_item_id)
+            .map(|wi| {
+                wi.repo_associations.iter().any(|assoc| {
+                    assoc
+                        .worktree_path
+                        .as_ref()
+                        .map(
+                            |wt_path| match self.worktree_service.is_worktree_dirty(wt_path) {
+                                Ok(dirty) => dirty,
+                                Err(e) => {
+                                    self.status_message = Some(format!(
+                                        "Could not check worktree status: {e} - treating as dirty"
+                                    ));
+                                    true
+                                }
+                            },
+                        )
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        if has_dirty {
+            self.confirm_delete = DeleteConfirmState::AwaitingForce;
+            self.status_message =
+                Some("Worktree has uncommitted changes! Press again to force-delete".into());
+        } else {
+            self.delete_selected_work_item(false);
+        }
+    }
+
+    /// Delete the currently selected work item with comprehensive resource cleanup.
+    ///
+    /// Kills any active session, removes worktrees and branches, closes open PRs,
+    /// deletes the backend record, and cleans up in-memory state.
+    ///
+    /// When `force` is true, dirty worktrees are removed with `--force` and
+    /// branches are deleted with `-D`.
+    pub fn delete_selected_work_item(&mut self, force: bool) {
+        let Some(work_item_id) = self.selected_work_item_id() else {
+            self.status_message = Some("No work item selected".into());
+            return;
+        };
+
+        // Warnings are collected across phases and reported in Phase 8.
+        let mut warnings: Vec<String> = Vec::new();
+
+        // -- Phase 1: Snapshot resource info before backend delete --
+        // Collect (repo_path, branch, worktree_path, open_pr_number, owner/repo)
+        // for each repo association so we can clean up after the backend record
+        // is gone.
+        struct RepoCleanupInfo {
+            repo_path: PathBuf,
+            branch: Option<String>,
+            worktree_path: Option<PathBuf>,
+            open_pr_number: Option<u64>,
+            github_remote: Option<(String, String)>,
+        }
+
+        let cleanup_infos: Vec<RepoCleanupInfo> = self
+            .work_items
+            .iter()
+            .find(|w| w.id == work_item_id)
+            .map(|wi| {
+                wi.repo_associations
+                    .iter()
+                    .map(|assoc| {
+                        let open_pr_number = assoc.pr.as_ref().and_then(|pr| {
+                            if pr.state == crate::work_item::PrState::Open {
+                                Some(pr.number)
+                            } else {
+                                None
+                            }
+                        });
+                        let github_remote =
+                            match self.worktree_service.github_remote(&assoc.repo_path) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warnings.push(format!("github remote: {e}"));
+                                    None
+                                }
+                            };
+                        RepoCleanupInfo {
+                            repo_path: assoc.repo_path.clone(),
+                            branch: assoc.branch.clone(),
+                            worktree_path: assoc.worktree_path.clone(),
+                            open_pr_number,
+                            github_remote,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // -- Phase 2: Backend cleanup --
+        if let Err(e) = self.backend.pre_delete_cleanup(&work_item_id) {
+            // Non-fatal: warn but continue with delete.
+            warnings.push(format!("pre-delete cleanup: {e}"));
+        }
+
         if let Err(e) = self.backend.delete(&work_item_id) {
             self.status_message = Some(format!("Delete error: {e}"));
             return;
         }
 
-        // Backend delete succeeded - now kill any active session and
-        // clean up MCP resources (.mcp.json, socket server).
+        // -- Phase 3: Kill session and clean up MCP --
         self.cleanup_mcp_for(&work_item_id);
         if let Some(key) = self.session_key_for(&work_item_id)
             && let Some(mut entry) = self.sessions.remove(&key)
@@ -2542,11 +2671,86 @@ impl App {
             session.kill();
         }
 
-        // Cancel in-flight worktree creation if it was for the deleted item.
-        // Dropping the receiver causes the background thread to silently exit
-        // when it tries to send its result.
+        // -- Phase 4: Resource cleanup (all best-effort with warnings) --
+
+        for info in &cleanup_infos {
+            // 4a: Remove worktree (don't delete branch here - handled separately)
+            if let Some(ref wt_path) = info.worktree_path
+                && let Err(e) =
+                    self.worktree_service
+                        .remove_worktree(&info.repo_path, wt_path, false, force)
+            {
+                warnings.push(format!("worktree: {e}"));
+            }
+
+            // 4b: Delete local branch (force=true since user chose to destroy the item)
+            if let Some(ref branch) = info.branch
+                && let Err(e) = self
+                    .worktree_service
+                    .delete_branch(&info.repo_path, branch, true)
+            {
+                warnings.push(format!("branch: {e}"));
+            }
+
+            // 4c: Close open PR via `gh pr close`
+            // Runs synchronously (unlike pr create/merge which are async). This is
+            // deliberate: delete is a user-confirmed destructive operation where all
+            // cleanup should complete before the user continues interacting. Making
+            // this async would risk orphaned PRs if the user quits during the gap.
+            if let Some(pr_number) = info.open_pr_number
+                && let Some((ref owner, ref repo)) = info.github_remote
+            {
+                let owner_repo = format!("{owner}/{repo}");
+                match std::process::Command::new("gh")
+                    .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
+                    .output()
+                {
+                    Ok(output) if !output.status.success() => {
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        warnings.push(format!("PR close: {stderr}"));
+                    }
+                    Err(e) => {
+                        warnings.push(format!("PR close: {e}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // -- Phase 5: Cancel in-flight operations --
+        // Cancel in-flight worktree creation and clean up any orphaned worktree.
         if self.worktree_create_wi.as_ref() == Some(&work_item_id) {
-            self.worktree_create_rx = None;
+            // Try to drain the result in case the thread already completed.
+            let thread_done = if let Some(ref rx) = self.worktree_create_rx {
+                match rx.try_recv() {
+                    Ok(result) => {
+                        // Thread completed - clean up the orphaned worktree now.
+                        if let Some(ref path) = result.path
+                            && let Err(e) = self.worktree_service.remove_worktree(
+                                &result.repo_path,
+                                path,
+                                true,
+                                true,
+                            )
+                        {
+                            warnings.push(format!("orphan worktree cleanup: {e}"));
+                        }
+                        true
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => true,
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        // Thread still running. Leave the receiver intact so
+                        // poll_worktree_creation can drain it on the next timer
+                        // tick and run the orphan-cleanup path (line 1774).
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            if thread_done {
+                self.worktree_create_rx = None;
+            }
             self.worktree_create_wi = None;
             if let Some(aid) = self.worktree_create_activity.take() {
                 self.end_activity(aid);
@@ -2565,13 +2769,42 @@ impl App {
         // Remove the deleted item from the PR creation pending queue.
         self.pr_create_pending.retain(|id| *id != work_item_id);
 
-        // Clear identity trackers since the deleted item is gone.
-        // build_display_list will fall back to the first selectable item.
+        // Cancel in-flight PR merge if it was for the deleted item.
+        if self.merge_wi_id.as_ref() == Some(&work_item_id) && self.pr_merge_rx.is_some() {
+            self.pr_merge_rx = None;
+            if let Some(aid) = self.pr_merge_activity.take() {
+                self.end_activity(aid);
+            }
+        }
+
+        // -- Phase 6: Clean up in-memory state --
+        self.rework_reasons.remove(&work_item_id);
+        self.review_gate_findings.remove(&work_item_id);
+        self.no_plan_prompt_queue.retain(|id| *id != work_item_id);
+        if self.no_plan_prompt_queue.is_empty() {
+            self.no_plan_prompt_visible = false;
+        }
+        if self.rework_prompt_wi.as_ref() == Some(&work_item_id) {
+            self.rework_prompt_wi = None;
+            self.rework_prompt_visible = false;
+        }
+        if self.merge_wi_id.as_ref() == Some(&work_item_id) {
+            self.merge_wi_id = None;
+            self.confirm_merge = false;
+        }
+        if self.review_gate_wi.as_ref() == Some(&work_item_id) {
+            self.review_gate_wi = None;
+            self.review_gate_rx = None;
+            self.review_gate_progress = None;
+            if let Some(aid) = self.review_gate_activity.take() {
+                self.end_activity(aid);
+            }
+        }
+
+        // -- Phase 7: Clear identity trackers and reassemble --
         self.selected_work_item = None;
         self.selected_unlinked_branch = None;
 
-        // Reassemble and rebuild. build_display_list will set selected_item
-        // to the first selectable item since identity trackers are cleared.
         let old_idx = self.selected_item;
         self.reassemble_work_items();
         self.build_display_list();
@@ -2580,7 +2813,6 @@ impl App {
         // Try to keep cursor near the old position instead of jumping to
         // the first item. If the old index is still valid, prefer it.
         if let Some(old) = old_idx {
-            // Find the nearest selectable item at or before the old position.
             let mut found = false;
             for i in (0..self.display_list.len().min(old + 1)).rev() {
                 if is_selectable(&self.display_list[i]) {
@@ -2590,7 +2822,6 @@ impl App {
                 }
             }
             if !found {
-                // Try forward.
                 self.selected_item = None;
                 for i in 0..self.display_list.len() {
                     if is_selectable(&self.display_list[i]) {
@@ -2602,8 +2833,13 @@ impl App {
         }
         self.sync_selection_identity();
 
+        // -- Phase 8: Status message --
         self.focus = FocusPanel::Left;
-        self.status_message = Some("Work item deleted".into());
+        if warnings.is_empty() {
+            self.status_message = Some("Work item deleted".into());
+        } else {
+            self.status_message = Some(format!("Deleted (with warnings: {})", warnings.join("; ")));
+        }
     }
 
     /// Advance the selected work item to the next workflow stage.
@@ -3457,19 +3693,30 @@ impl App {
         changed
     }
 
-    /// Remove the worktree directory for a work item after merge.
+    /// Remove the worktree directory and local branch for a work item after merge.
+    /// Uses delete_branch=true so the merged branch is cleaned up. Uses force=false
+    /// because post-merge worktrees should be clean and `-d` is safe for merged branches.
     fn cleanup_worktree_for_item(&mut self, wi_id: &WorkItemId) {
         let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
             Some(w) => w,
             None => return,
         };
         for assoc in &wi.repo_associations {
-            if let Some(ref wt_path) = assoc.worktree_path
-                && let Err(e) =
+            if let Some(ref wt_path) = assoc.worktree_path {
+                if let Err(e) =
                     self.worktree_service
-                        .remove_worktree(&assoc.repo_path, wt_path, false)
-            {
-                self.status_message = Some(format!("Worktree cleanup warning: {e}"));
+                        .remove_worktree(&assoc.repo_path, wt_path, true, false)
+                {
+                    self.status_message = Some(format!("Worktree cleanup warning: {e}"));
+                }
+            } else if let Some(ref branch) = assoc.branch {
+                // No worktree but a branch exists - still clean up the branch.
+                if let Err(e) = self
+                    .worktree_service
+                    .delete_branch(&assoc.repo_path, branch, false)
+                {
+                    self.status_message = Some(format!("Branch cleanup warning: {e}"));
+                }
             }
         }
     }
@@ -4075,8 +4322,10 @@ pub fn is_selectable(entry: &DisplayEntry) -> bool {
 
 /// A stub worktree service that returns empty results. Used as a default
 /// when no real worktree operations are needed (e.g. tests, initial setup).
+#[cfg(test)]
 pub struct StubWorktreeService;
 
+#[cfg(test)]
 impl WorktreeService for StubWorktreeService {
     fn list_worktrees(
         &self,
@@ -4102,8 +4351,25 @@ impl WorktreeService for StubWorktreeService {
         _repo_path: &std::path::Path,
         _worktree_path: &std::path::Path,
         _delete_branch: bool,
+        _force: bool,
     ) -> Result<(), crate::worktree_service::WorktreeError> {
         Ok(())
+    }
+
+    fn delete_branch(
+        &self,
+        _repo_path: &std::path::Path,
+        _branch: &str,
+        _force: bool,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+
+    fn is_worktree_dirty(
+        &self,
+        _worktree_path: &std::path::Path,
+    ) -> Result<bool, crate::worktree_service::WorktreeError> {
+        Ok(false)
     }
 
     fn default_branch(
@@ -4478,7 +4744,7 @@ mod tests {
             .position(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
             .expect("should have a work item in display list after import");
         app.selected_item = Some(work_item_idx);
-        app.delete_selected_work_item();
+        app.delete_selected_work_item(false);
         assert!(
             app.fetcher_repos_changed,
             "fetcher_repos_changed should be true after delete",
@@ -5308,8 +5574,25 @@ mod tests {
                 _repo_path: &std::path::Path,
                 _worktree_path: &std::path::Path,
                 _delete_branch: bool,
+                _force: bool,
             ) -> Result<(), WorktreeError> {
                 Ok(())
+            }
+
+            fn delete_branch(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+                _force: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+
+            fn is_worktree_dirty(
+                &self,
+                _worktree_path: &std::path::Path,
+            ) -> Result<bool, WorktreeError> {
+                Ok(false)
             }
 
             fn default_branch(
@@ -5539,8 +5822,25 @@ mod tests {
                 _repo_path: &std::path::Path,
                 _worktree_path: &std::path::Path,
                 _delete_branch: bool,
+                _force: bool,
             ) -> Result<(), WorktreeError> {
                 Ok(())
+            }
+
+            fn delete_branch(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+                _force: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+
+            fn is_worktree_dirty(
+                &self,
+                _worktree_path: &std::path::Path,
+            ) -> Result<bool, WorktreeError> {
+                Ok(false)
             }
 
             fn default_branch(
@@ -5795,8 +6095,25 @@ mod tests {
                 _repo_path: &std::path::Path,
                 _worktree_path: &std::path::Path,
                 _delete_branch: bool,
+                _force: bool,
             ) -> Result<(), WorktreeError> {
                 Ok(())
+            }
+
+            fn delete_branch(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+                _force: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+
+            fn is_worktree_dirty(
+                &self,
+                _worktree_path: &std::path::Path,
+            ) -> Result<bool, WorktreeError> {
+                Ok(false)
             }
 
             fn default_branch(
@@ -7561,155 +7878,520 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn collect_backfill_requests_returns_requests_when_github_remote_available() {
-        use crate::work_item_backend::LocalFileBackend;
-        use crate::worktree_service::{WorktreeError, WorktreeInfo};
+    // -- Delete resource cleanup tests --
 
-        /// A worktree service that always returns a github remote.
-        struct GithubWorktreeService;
-        impl WorktreeService for GithubWorktreeService {
-            fn list_worktrees(
+    /// Delete cleans up all in-memory state keyed by the deleted work item ID:
+    /// rework_reasons, review_gate_findings, no_plan_prompt_queue, and
+    /// associated visibility flags.
+    #[test]
+    fn delete_cleans_up_memory_state() {
+        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
+        use crate::work_item_backend::ListResult;
+
+        struct TestBackend {
+            records: std::sync::Mutex<Vec<crate::work_item_backend::WorkItemRecord>>,
+        }
+
+        impl WorkItemBackend for TestBackend {
+            fn read(
                 &self,
-                _repo_path: &std::path::Path,
-            ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+                id: &WorkItemId,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                self.records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == *id)
+                    .cloned()
+                    .ok_or_else(|| BackendError::NotFound(id.clone()))
+            }
+            fn list(&self) -> Result<ListResult, BackendError> {
+                Ok(ListResult {
+                    records: self.records.lock().unwrap().clone(),
+                    corrupt: Vec::new(),
+                })
+            }
+            fn create(
+                &self,
+                _req: CreateWorkItem,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not used".into()))
+            }
+            fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
+                let mut records = self.records.lock().unwrap();
+                if let Some(pos) = records.iter().position(|r| r.id == *id) {
+                    records.remove(pos);
+                    Ok(())
+                } else {
+                    Err(BackendError::NotFound(id.clone()))
+                }
+            }
+            fn update_status(
+                &self,
+                _id: &WorkItemId,
+                _status: WorkItemStatus,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn import(
+                &self,
+                unlinked: &crate::work_item::UnlinkedPr,
+            ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+                let record = crate::work_item_backend::WorkItemRecord {
+                    id: WorkItemId::LocalFile(PathBuf::from("/tmp/delete-mem-test.json")),
+                    title: unlinked.pr.title.clone(),
+                    description: None,
+                    status: WorkItemStatus::Implementing,
+                    repo_associations: vec![RepoAssociationRecord {
+                        repo_path: unlinked.repo_path.clone(),
+                        branch: Some(unlinked.branch.clone()),
+                        pr_identity: None,
+                    }],
+                    plan: None,
+                };
+                self.records.lock().unwrap().push(record.clone());
+                Ok(record)
+            }
+            fn append_activity(
+                &self,
+                _id: &WorkItemId,
+                _entry: &ActivityEntry,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
                 Ok(Vec::new())
             }
-            fn create_worktree(
-                &self,
-                _repo_path: &std::path::Path,
-                _branch: &str,
-                _target_dir: &std::path::Path,
-            ) -> Result<WorktreeInfo, WorktreeError> {
-                Err(WorktreeError::GitError("stub".into()))
-            }
-            fn remove_worktree(
-                &self,
-                _repo_path: &std::path::Path,
-                _worktree_path: &std::path::Path,
-                _delete_branch: bool,
-            ) -> Result<(), WorktreeError> {
+            fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
                 Ok(())
             }
-            fn default_branch(
-                &self,
-                _repo_path: &std::path::Path,
-            ) -> Result<String, WorktreeError> {
-                Ok("main".to_string())
+            fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
+                Ok(None)
             }
-            fn github_remote(
-                &self,
-                _repo_path: &std::path::Path,
-            ) -> Result<Option<(String, String)>, WorktreeError> {
-                Ok(Some(("testowner".to_string(), "testrepo".to_string())))
+            fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
+                None
             }
-            fn fetch_branch(
-                &self,
-                _repo_path: &std::path::Path,
-                _branch: &str,
-            ) -> Result<(), WorktreeError> {
-                Ok(())
-            }
-            fn create_branch(
-                &self,
-                _repo_path: &std::path::Path,
-                _branch: &str,
-            ) -> Result<(), WorktreeError> {
-                Ok(())
+            fn backend_type(&self) -> crate::work_item::BackendType {
+                crate::work_item::BackendType::LocalFile
             }
         }
 
-        let dir = std::env::temp_dir().join("workbridge-test-backfill-collect-positive");
-        let _ = std::fs::remove_dir_all(&dir);
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
-
-        // Done item with branch but no pr_identity - should produce a request.
-        let done_record = backend
-            .create(CreateWorkItem {
-                title: "Done item".into(),
-                description: None,
-                status: WorkItemStatus::Backlog,
-                repo_associations: vec![make_assoc("/tmp/repo", "feature/done")],
-            })
-            .unwrap();
-        backend
-            .update_status(&done_record.id, WorkItemStatus::Done)
-            .unwrap();
-
-        // Backlog item - should be skipped.
-        let _ = backend
-            .create(CreateWorkItem {
-                title: "Backlog item".into(),
-                description: None,
-                status: WorkItemStatus::Backlog,
-                repo_associations: vec![make_assoc("/tmp/repo", "feature/backlog")],
-            })
-            .unwrap();
-
+        let backend = TestBackend {
+            records: std::sync::Mutex::new(Vec::new()),
+        };
         let mut app = App::with_config(Config::default(), Box::new(backend));
-        app.worktree_service = Arc::new(GithubWorktreeService);
 
-        let requests = app.collect_backfill_requests();
+        // Import a work item so we have something to delete.
+        app.unlinked_prs.push(crate::work_item::UnlinkedPr {
+            repo_path: PathBuf::from("/repo"),
+            pr: PrInfo {
+                number: 1,
+                title: "Memory cleanup test".into(),
+                state: PrState::Open,
+                is_draft: false,
+                review_decision: ReviewDecision::None,
+                checks: CheckStatus::None,
+                url: "https://github.com/o/r/pull/1".into(),
+            },
+            branch: "1-test".into(),
+        });
+        app.build_display_list();
+        let unlinked_idx = app
+            .display_list
+            .iter()
+            .position(|e| matches!(e, DisplayEntry::UnlinkedItem(_)))
+            .unwrap();
+        app.selected_item = Some(unlinked_idx);
+        app.import_selected_unlinked();
 
-        assert_eq!(
-            requests.len(),
-            1,
-            "expected exactly one backfill request, got {}",
-            requests.len()
+        // Get the work item ID.
+        let wi_id = app.work_items[0].id.clone();
+
+        // Populate in-memory state for this work item.
+        app.rework_reasons
+            .insert(wi_id.clone(), "needs fixes".into());
+        app.review_gate_findings
+            .insert(wi_id.clone(), "some findings".into());
+        app.no_plan_prompt_queue.push_back(wi_id.clone());
+        app.no_plan_prompt_visible = true;
+        app.rework_prompt_wi = Some(wi_id.clone());
+        app.rework_prompt_visible = true;
+        app.merge_wi_id = Some(wi_id.clone());
+        app.confirm_merge = true;
+
+        // Select and delete.
+        let work_item_idx = app
+            .display_list
+            .iter()
+            .position(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
+            .unwrap();
+        app.selected_item = Some(work_item_idx);
+        app.delete_selected_work_item(false);
+
+        // Verify all in-memory state is cleaned up.
+        assert!(
+            app.rework_reasons.is_empty(),
+            "rework_reasons should be empty after delete"
         );
-        let (ref wi_id, ref _repo_path, ref branch, ref owner, ref repo_name) = requests[0];
-        assert_eq!(wi_id, &done_record.id);
-        assert_eq!(branch, "feature/done");
-        assert_eq!(owner, "testowner");
-        assert_eq!(repo_name, "testrepo");
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            app.review_gate_findings.is_empty(),
+            "review_gate_findings should be empty after delete"
+        );
+        assert!(
+            app.no_plan_prompt_queue.is_empty(),
+            "no_plan_prompt_queue should be empty after delete"
+        );
+        assert!(
+            !app.no_plan_prompt_visible,
+            "no_plan_prompt_visible should be false after delete"
+        );
+        assert!(
+            app.rework_prompt_wi.is_none(),
+            "rework_prompt_wi should be None after delete"
+        );
+        assert!(
+            !app.rework_prompt_visible,
+            "rework_prompt_visible should be false after delete"
+        );
+        assert!(
+            app.merge_wi_id.is_none(),
+            "merge_wi_id should be None after delete"
+        );
+        assert!(
+            !app.confirm_merge,
+            "confirm_merge should be false after delete"
+        );
     }
 
-    #[test]
-    fn drain_pr_identity_backfill_saves_results() {
-        use crate::work_item_backend::{LocalFileBackend, PrIdentityRecord};
+    // -- Shared delete test fixtures --
 
-        let dir = std::env::temp_dir().join("workbridge-test-backfill-drain");
-        let _ = std::fs::remove_dir_all(&dir);
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+    /// A backend that returns a fixed list of records from `list()`. All
+    /// mutating operations (delete, update_status, etc.) are no-ops that
+    /// return Ok. Eliminates the need for per-test OneItemBackend /
+    /// RecordingTestBackend / etc. boilerplate.
+    struct FixedListBackend {
+        records: Vec<crate::work_item_backend::WorkItemRecord>,
+    }
 
-        let record = backend
-            .create(CreateWorkItem {
-                title: "Drain test".into(),
-                description: None,
-                status: WorkItemStatus::Done,
-                repo_associations: vec![make_assoc("/tmp/repo", "feature/drain")],
+    impl FixedListBackend {
+        fn one_item(id_path: &str, title: &str, repo_path: &str, branch: &str) -> Self {
+            Self {
+                records: vec![crate::work_item_backend::WorkItemRecord {
+                    id: WorkItemId::LocalFile(PathBuf::from(id_path)),
+                    title: title.into(),
+                    description: None,
+                    status: WorkItemStatus::Implementing,
+                    repo_associations: vec![RepoAssociationRecord {
+                        repo_path: PathBuf::from(repo_path),
+                        branch: Some(branch.into()),
+                        pr_identity: None,
+                    }],
+                    plan: None,
+                }],
+            }
+        }
+    }
+
+    impl WorkItemBackend for FixedListBackend {
+        fn read(
+            &self,
+            id: &WorkItemId,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::NotFound(id.clone()))
+        }
+        fn list(&self) -> Result<crate::work_item_backend::ListResult, BackendError> {
+            Ok(crate::work_item_backend::ListResult {
+                records: self.records.clone(),
+                corrupt: Vec::new(),
             })
+        }
+        fn create(
+            &self,
+            _req: CreateWorkItem,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation("not used".into()))
+        }
+        fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn update_status(
+            &self,
+            _id: &WorkItemId,
+            _status: WorkItemStatus,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn import(
+            &self,
+            _unlinked: &crate::work_item::UnlinkedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation("not used".into()))
+        }
+        fn append_activity(
+            &self,
+            _id: &WorkItemId,
+            _entry: &ActivityEntry,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
+            Ok(Vec::new())
+        }
+        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
+            Ok(None)
+        }
+        fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn backend_type(&self) -> crate::work_item::BackendType {
+            crate::work_item::BackendType::LocalFile
+        }
+    }
+
+    /// Worktree service that delegates to StubWorktreeService defaults but
+    /// overrides `is_worktree_dirty` to always return the configured value,
+    /// and optionally records `remove_worktree` / `delete_branch` calls.
+    struct ConfigurableWorktreeService {
+        always_dirty: bool,
+        remove_worktree_calls: std::sync::Mutex<Vec<(PathBuf, PathBuf, bool, bool)>>,
+        delete_branch_calls: std::sync::Mutex<Vec<(PathBuf, String, bool)>>,
+    }
+
+    impl ConfigurableWorktreeService {
+        fn dirty() -> Self {
+            Self {
+                always_dirty: true,
+                remove_worktree_calls: std::sync::Mutex::new(Vec::new()),
+                delete_branch_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recording() -> Self {
+            Self {
+                always_dirty: false,
+                remove_worktree_calls: std::sync::Mutex::new(Vec::new()),
+                delete_branch_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl WorktreeService for ConfigurableWorktreeService {
+        fn list_worktrees(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<
+            Vec<crate::worktree_service::WorktreeInfo>,
+            crate::worktree_service::WorktreeError,
+        > {
+            Ok(Vec::new())
+        }
+        fn create_worktree(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+            _target_dir: &std::path::Path,
+        ) -> Result<crate::worktree_service::WorktreeInfo, crate::worktree_service::WorktreeError>
+        {
+            Err(crate::worktree_service::WorktreeError::GitError(
+                "not used".into(),
+            ))
+        }
+        fn remove_worktree(
+            &self,
+            repo_path: &std::path::Path,
+            worktree_path: &std::path::Path,
+            delete_branch: bool,
+            force: bool,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            self.remove_worktree_calls.lock().unwrap().push((
+                repo_path.to_path_buf(),
+                worktree_path.to_path_buf(),
+                delete_branch,
+                force,
+            ));
+            Ok(())
+        }
+        fn delete_branch(
+            &self,
+            repo_path: &std::path::Path,
+            branch: &str,
+            force: bool,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            self.delete_branch_calls.lock().unwrap().push((
+                repo_path.to_path_buf(),
+                branch.to_string(),
+                force,
+            ));
+            Ok(())
+        }
+        fn is_worktree_dirty(
+            &self,
+            _worktree_path: &std::path::Path,
+        ) -> Result<bool, crate::worktree_service::WorktreeError> {
+            Ok(self.always_dirty)
+        }
+        fn default_branch(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<String, crate::worktree_service::WorktreeError> {
+            Ok("main".to_string())
+        }
+        fn github_remote(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<Option<(String, String)>, crate::worktree_service::WorktreeError> {
+            Ok(None)
+        }
+        fn fetch_branch(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            Ok(())
+        }
+        fn create_branch(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            Ok(())
+        }
+    }
+
+    /// When a worktree has uncommitted changes, attempt_delete escalates
+    /// the confirmation state to AwaitingForce instead of deleting.
+    #[test]
+    fn dirty_worktree_triggers_force_prompt() {
+        use crate::config::InMemoryConfigProvider;
+
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Box::new(FixedListBackend::one_item(
+                "/tmp/dirty-test.json",
+                "Dirty worktree item",
+                "/repo",
+                "dirty-branch",
+            )),
+            Arc::new(ConfigurableWorktreeService::dirty()),
+            Box::new(InMemoryConfigProvider::new()),
+        );
+
+        // Inject a fake worktree path into the assembled work item so
+        // is_worktree_dirty has something to check.
+        assert_eq!(app.work_items.len(), 1);
+        app.work_items[0].repo_associations[0].worktree_path =
+            Some(PathBuf::from("/tmp/fake-worktree"));
+        app.build_display_list();
+
+        // Select the work item.
+        let wi_idx = app
+            .display_list
+            .iter()
+            .position(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
             .unwrap();
+        app.selected_item = Some(wi_idx);
+        app.sync_selection_identity();
 
-        let mut app = App::with_config(Config::default(), Box::new(backend));
+        // Attempt delete - should escalate to AwaitingForce.
+        app.attempt_delete_selected_work_item();
+        assert_eq!(
+            app.confirm_delete,
+            DeleteConfirmState::AwaitingForce,
+            "dirty worktree should trigger AwaitingForce state"
+        );
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("uncommitted changes"),
+            "status should mention uncommitted changes, got: {:?}",
+            app.status_message,
+        );
 
-        let (tx, rx) = crossbeam_channel::unbounded();
-        tx.send(Ok(PrIdentityBackfillResult {
-            wi_id: record.id.clone(),
-            repo_path: PathBuf::from("/tmp/repo"),
-            identity: PrIdentityRecord {
-                number: 99,
-                title: "Backfilled PR".into(),
-                url: "https://example.com/pr/99".into(),
-            },
-        }))
-        .unwrap();
-        drop(tx);
-        app.pr_identity_backfill_rx = Some(rx);
+        // Work item should NOT be deleted yet.
+        assert_eq!(
+            app.work_items.len(),
+            1,
+            "work item should still exist after AwaitingForce"
+        );
+    }
 
-        let changed = app.drain_pr_identity_backfill();
-        assert!(changed, "should report changed");
+    /// Verify that deleting a work item calls remove_worktree and
+    /// delete_branch on the worktree service with the correct arguments.
+    #[test]
+    fn delete_calls_remove_worktree_and_delete_branch() {
+        let recording_ws = Arc::new(ConfigurableWorktreeService::recording());
 
-        // Verify pr_identity was persisted to the backend.
-        let updated = app.backend.read(&record.id).unwrap();
-        let assoc = updated.repo_associations.first().unwrap();
-        let pi = assoc.pr_identity.as_ref().unwrap();
-        assert_eq!(pi.number, 99);
-        assert_eq!(pi.title, "Backfilled PR");
-        assert_eq!(pi.url, "https://example.com/pr/99");
+        use crate::config::InMemoryConfigProvider;
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Box::new(FixedListBackend::one_item(
+                "/tmp/recording-test.json",
+                "Recording test item",
+                "/my/repo",
+                "feature-branch",
+            )),
+            recording_ws.clone(),
+            Box::new(InMemoryConfigProvider::new()),
+        );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        // Inject a fake worktree path so remove_worktree has something
+        // to clean up.
+        assert_eq!(app.work_items.len(), 1);
+        app.work_items[0].repo_associations[0].worktree_path =
+            Some(PathBuf::from("/my/repo/.worktrees/feature-branch"));
+        app.build_display_list();
+
+        // Select the work item.
+        let wi_idx = app
+            .display_list
+            .iter()
+            .position(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
+            .unwrap();
+        app.selected_item = Some(wi_idx);
+        app.sync_selection_identity();
+
+        // Delete (non-force).
+        app.delete_selected_work_item(false);
+
+        // Verify remove_worktree was called with correct arguments.
+        let rw_calls = recording_ws.remove_worktree_calls.lock().unwrap();
+        assert_eq!(rw_calls.len(), 1, "remove_worktree should be called once");
+        assert_eq!(
+            rw_calls[0].0,
+            PathBuf::from("/my/repo"),
+            "remove_worktree repo_path"
+        );
+        assert_eq!(
+            rw_calls[0].1,
+            PathBuf::from("/my/repo/.worktrees/feature-branch"),
+            "remove_worktree worktree_path"
+        );
+        assert!(
+            !rw_calls[0].2,
+            "remove_worktree delete_branch should be false (handled separately)"
+        );
+        assert!(
+            !rw_calls[0].3,
+            "remove_worktree force should be false for non-force delete"
+        );
+        drop(rw_calls);
+
+        // Verify delete_branch was called with correct arguments.
+        let db_calls = recording_ws.delete_branch_calls.lock().unwrap();
+        assert_eq!(db_calls.len(), 1, "delete_branch should be called once");
+        assert_eq!(
+            db_calls[0].0,
+            PathBuf::from("/my/repo"),
+            "delete_branch repo_path"
+        );
+        assert_eq!(db_calls[0].1, "feature-branch", "delete_branch branch name");
+        assert!(
+            db_calls[0].2,
+            "delete_branch force should be true (user chose to destroy the item)"
+        );
     }
 }

@@ -14,8 +14,13 @@ worktree operations:
   `git worktree list --porcelain`)
 - `create_worktree(repo_path, branch, target_dir)` - Create a new worktree
   for a branch at a given directory
-- `remove_worktree(repo_path, worktree_path, delete_branch)` - Remove a
-  worktree and optionally delete the branch
+- `remove_worktree(repo_path, worktree_path, delete_branch, force)` - Remove a
+  worktree and optionally delete the branch. When `force` is true, uses
+  `--force` for dirty worktrees and `-D` for unmerged branches.
+- `delete_branch(repo_path, branch, force)` - Delete a local branch.
+  Uses `-d` (safe) or `-D` (force) based on the `force` parameter.
+- `is_worktree_dirty(worktree_path)` - Check if a worktree has uncommitted
+  changes (staged or unstaged) via `git status --porcelain`.
 - `default_branch(repo_path)` - Get the default branch name (checks
   symbolic-ref, falls back to local main/master)
 - `github_remote(repo_path)` - Get the GitHub remote owner/repo pair
@@ -64,16 +69,33 @@ to derive issue linkage:
 The issue number extraction pattern is configurable per-repo (default:
 `^(\d+)-`).
 
+### Worktree removal on delete
+
+Deleting a work item (Ctrl+D/Delete) performs comprehensive resource cleanup:
+
+1. Removes worktree directories via `remove_worktree`
+2. Deletes local git branches via `delete_branch` (force delete)
+3. Closes open PRs on GitHub via `gh pr close`
+4. Kills active sessions and MCP servers
+5. Cleans up in-memory state (rework reasons, review gate findings, etc.)
+
+A 3-step confirmation flow protects against accidental deletion:
+- First press: "Press again to delete this work item"
+- If dirty worktree detected: "Worktree has uncommitted changes! Press again to force-delete"
+- Final press: deletes with `--force` for dirty worktrees
+
+All cleanup failures are non-blocking - warnings are shown but the delete proceeds.
+
+### Post-merge cleanup
+
+After a PR is merged (Review -> Done transition), WorkBridge cleans up:
+- Removes the worktree directory (`remove_worktree` with `delete_branch=true`)
+- Deletes the local branch (`-d` safe delete, appropriate for merged branches)
+- If no worktree exists but a branch does, the branch is still cleaned up
+
 ## What Is Planned
 
 The following features are defined in the API but lack full UI flows:
-
-### Worktree removal UI
-
-The `remove_worktree` method exists and is tested, but the TUI does not
-yet expose a delete-worktree action (e.g., Ctrl+D). Deleting a work item
-currently removes the backend record but does not remove the worktree
-from disk.
 
 ### Divergence handling
 
@@ -81,11 +103,6 @@ When local and remote branches point to different commits, WorkBridge
 should create the worktree from the local branch and flag the work item
 with a "diverged" warning. This requires real git state derivation (dirty,
 ahead/behind), which is not yet implemented.
-
-### Post-merge cleanup
-
-After a PR is merged, WorkBridge should detect it and offer to clean up
-the worktree and optionally prune the branch. This is not yet implemented.
 
 ### Branch state detection on creation
 

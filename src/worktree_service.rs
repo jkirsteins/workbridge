@@ -55,15 +55,28 @@ pub trait WorktreeService: Send + Sync {
     ) -> Result<WorktreeInfo, WorktreeError>;
 
     /// Remove a worktree. Optionally delete the branch as well.
-    /// Used by integration tests; called from UI when "delete worktree"
-    /// flow is added.
-    #[allow(dead_code)]
+    /// When `force` is true, uses `--force` to remove dirty worktrees and
+    /// `-D` (instead of `-d`) for branch deletion.
     fn remove_worktree(
         &self,
         repo_path: &Path,
         worktree_path: &Path,
         delete_branch: bool,
+        force: bool,
     ) -> Result<(), WorktreeError>;
+
+    /// Delete a local branch. When `force` is true, uses `-D` (force delete)
+    /// instead of `-d` (safe delete that refuses unmerged branches).
+    fn delete_branch(
+        &self,
+        repo_path: &Path,
+        branch: &str,
+        force: bool,
+    ) -> Result<(), WorktreeError>;
+
+    /// Check if a worktree has uncommitted changes (staged or unstaged).
+    /// Returns true if `git status --porcelain` produces any output.
+    fn is_worktree_dirty(&self, worktree_path: &Path) -> Result<bool, WorktreeError>;
 
     /// Get the default branch name (main, master, or configured) for a repo.
     fn default_branch(&self, repo_path: &Path) -> Result<String, WorktreeError>;
@@ -277,6 +290,7 @@ impl WorktreeService for GitWorktreeService {
         repo_path: &Path,
         worktree_path: &Path,
         delete_branch: bool,
+        force: bool,
     ) -> Result<(), WorktreeError> {
         // Look up the branch name before removing the worktree, since we
         // need it for the optional branch deletion.
@@ -292,13 +306,34 @@ impl WorktreeService for GitWorktreeService {
                 worktree_path.display()
             ))
         })?;
-        Self::run_git(repo_path, &["worktree", "remove", wt_str])?;
+        if force {
+            Self::run_git(repo_path, &["worktree", "remove", "--force", wt_str])?;
+        } else {
+            Self::run_git(repo_path, &["worktree", "remove", wt_str])?;
+        }
 
         if let Some(branch_name) = branch {
-            Self::run_git(repo_path, &["branch", "-d", &branch_name])?;
+            let flag = if force { "-D" } else { "-d" };
+            Self::run_git(repo_path, &["branch", flag, &branch_name])?;
         }
 
         Ok(())
+    }
+
+    fn delete_branch(
+        &self,
+        repo_path: &Path,
+        branch: &str,
+        force: bool,
+    ) -> Result<(), WorktreeError> {
+        let flag = if force { "-D" } else { "-d" };
+        Self::run_git(repo_path, &["branch", flag, branch])?;
+        Ok(())
+    }
+
+    fn is_worktree_dirty(&self, worktree_path: &Path) -> Result<bool, WorktreeError> {
+        let output = Self::run_git(worktree_path, &["status", "--porcelain"])?;
+        Ok(!output.trim().is_empty())
     }
 
     fn default_branch(&self, repo_path: &Path) -> Result<String, WorktreeError> {
@@ -621,7 +656,8 @@ mod integration_tests {
         assert!(wt_dir.exists(), "worktree directory should exist on disk");
 
         // Remove the worktree (with branch deletion).
-        svc.remove_worktree(&repo_dir, &wt_dir, true).unwrap();
+        svc.remove_worktree(&repo_dir, &wt_dir, true, false)
+            .unwrap();
         assert!(
             !wt_dir.exists(),
             "worktree directory should be removed from disk"
@@ -1045,5 +1081,164 @@ mod integration_tests {
             &["rev-parse", "--verify", "refs/heads/existing-branch"],
         );
         assert!(check.is_ok(), "branch should still exist");
+    }
+
+    #[test]
+    fn is_worktree_dirty_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        setup_git_repo(&repo_dir);
+
+        let wt_dir = tmp.path().join("wt-clean");
+        run_in(
+            &repo_dir,
+            &[
+                "git",
+                "worktree",
+                "add",
+                wt_dir.to_str().unwrap(),
+                "-b",
+                "clean-branch",
+            ],
+        );
+
+        let svc = GitWorktreeService;
+        let dirty = svc.is_worktree_dirty(&wt_dir).unwrap();
+        assert!(!dirty, "freshly created worktree should not be dirty");
+    }
+
+    #[test]
+    fn is_worktree_dirty_modified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        setup_git_repo(&repo_dir);
+
+        let wt_dir = tmp.path().join("wt-dirty");
+        run_in(
+            &repo_dir,
+            &[
+                "git",
+                "worktree",
+                "add",
+                wt_dir.to_str().unwrap(),
+                "-b",
+                "dirty-branch",
+            ],
+        );
+
+        // Modify a tracked file inside the worktree.
+        fs::write(wt_dir.join("README"), "modified content").unwrap();
+
+        let svc = GitWorktreeService;
+        let dirty = svc.is_worktree_dirty(&wt_dir).unwrap();
+        assert!(dirty, "worktree with modified file should be dirty");
+    }
+
+    #[test]
+    fn delete_branch_non_force_fails_unmerged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        setup_git_repo(&repo_dir);
+        // Normalize to a known branch name.
+        run_in(&repo_dir, &["git", "branch", "-m", "main"]);
+
+        // Create a branch with an unmerged commit.
+        run_in(&repo_dir, &["git", "checkout", "-b", "unmerged-branch"]);
+        let new_file = repo_dir.join("unmerged.txt");
+        fs::write(&new_file, "unmerged content").unwrap();
+        run_in(&repo_dir, &["git", "add", "unmerged.txt"]);
+        commit_in(&repo_dir, "unmerged commit");
+        // Switch back to the original branch so we can delete the other one.
+        run_in(&repo_dir, &["git", "checkout", "main"]);
+
+        let svc = GitWorktreeService;
+        let result = svc.delete_branch(&repo_dir, "unmerged-branch", false);
+        assert!(
+            result.is_err(),
+            "non-force delete of unmerged branch should fail, got: {:?}",
+            result,
+        );
+    }
+
+    #[test]
+    fn delete_branch_force_succeeds_unmerged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        setup_git_repo(&repo_dir);
+        // Normalize to a known branch name.
+        run_in(&repo_dir, &["git", "branch", "-m", "main"]);
+
+        // Create a branch with an unmerged commit.
+        run_in(&repo_dir, &["git", "checkout", "-b", "unmerged-branch"]);
+        let new_file = repo_dir.join("unmerged.txt");
+        fs::write(&new_file, "unmerged content").unwrap();
+        run_in(&repo_dir, &["git", "add", "unmerged.txt"]);
+        commit_in(&repo_dir, "unmerged commit");
+        // Switch back to the original branch.
+        run_in(&repo_dir, &["git", "checkout", "main"]);
+
+        let svc = GitWorktreeService;
+        svc.delete_branch(&repo_dir, "unmerged-branch", true)
+            .unwrap();
+
+        // Verify the branch no longer exists.
+        let check = GitWorktreeService::run_git(
+            &repo_dir,
+            &["rev-parse", "--verify", "refs/heads/unmerged-branch"],
+        );
+        assert!(check.is_err(), "branch should have been force-deleted",);
+    }
+
+    #[test]
+    fn remove_worktree_force_removes_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        setup_git_repo(&repo_dir);
+
+        let svc = GitWorktreeService;
+        let wt_dir = tmp.path().join("wt-force");
+
+        svc.create_worktree(&repo_dir, "force-branch", &wt_dir)
+            .unwrap();
+
+        // Dirty the worktree.
+        fs::write(wt_dir.join("README"), "dirty").unwrap();
+
+        // Force remove should succeed even though the worktree is dirty.
+        svc.remove_worktree(&repo_dir, &wt_dir, true, true).unwrap();
+        assert!(
+            !wt_dir.exists(),
+            "worktree directory should be removed from disk",
+        );
+    }
+
+    #[test]
+    fn remove_worktree_non_force_fails_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        setup_git_repo(&repo_dir);
+
+        let svc = GitWorktreeService;
+        let wt_dir = tmp.path().join("wt-noforce");
+
+        svc.create_worktree(&repo_dir, "noforce-branch", &wt_dir)
+            .unwrap();
+
+        // Dirty the worktree.
+        fs::write(wt_dir.join("README"), "dirty").unwrap();
+
+        // Non-force remove should fail for a dirty worktree.
+        let result = svc.remove_worktree(&repo_dir, &wt_dir, false, false);
+        assert!(
+            result.is_err(),
+            "non-force remove of dirty worktree should fail, got: {:?}",
+            result,
+        );
     }
 }

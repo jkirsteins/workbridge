@@ -149,6 +149,17 @@ pub trait WorkItemBackend: Send + Sync {
     /// is empty (Invariant 1: at least one repo required).
     fn create(&self, request: CreateWorkItem) -> Result<WorkItemRecord, BackendError>;
 
+    /// Pre-delete cleanup hook. Called before `delete()` to allow
+    /// backend-specific cleanup (e.g., closing a backing GitHub issue,
+    /// archiving a project item). Errors are non-fatal - callers should
+    /// log warnings but continue with the delete.
+    ///
+    /// Default implementation is a no-op. Override in future backends
+    /// (GithubIssueBackend, GithubProjectBackend) as needed.
+    fn pre_delete_cleanup(&self, _id: &WorkItemId) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Delete a work item by id.
     fn delete(&self, id: &WorkItemId) -> Result<(), BackendError>;
 

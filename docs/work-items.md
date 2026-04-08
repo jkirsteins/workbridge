@@ -149,6 +149,48 @@ This means:
 - One branch can never have multiple worktrees on the same machine,
   because git prohibits two worktrees on the same branch.
 
+## Deleting Work Items
+
+Deleting a work item (Ctrl+D/Delete in the TUI) performs comprehensive cleanup
+of all associated resources. The cleanup is best-effort: failures produce
+warnings but do not prevent the delete.
+
+### Resources cleaned up
+
+- Backend record (the JSON file)
+- Activity log (the .jsonl file)
+- Worktree directory on disk
+- Local git branch (force-deleted with `-D`)
+- Open PR on GitHub (closed via `gh pr close`)
+- Active Claude session (killed)
+- MCP socket server and .mcp.json config file
+- In-memory state: rework reasons, review gate findings, no-plan prompt queue,
+  merge/rework prompt visibility flags
+
+### 3-step confirmation flow
+
+1. First press: "Press again to delete this work item"
+2. Second press checks worktree status:
+   - If all worktrees are clean (or no worktrees exist): deletes immediately
+   - If any worktree has uncommitted changes: "Worktree has uncommitted changes!
+     Press again to force-delete"
+3. Third press (only if dirty): force-deletes using `git worktree remove --force`
+
+Any key other than the delete key cancels the confirmation flow.
+
+### Backend-specific cleanup
+
+The `WorkItemBackend` trait provides a `pre_delete_cleanup()` hook called before
+the record is deleted. The default implementation is a no-op. Future backends
+(GithubIssueBackend, GithubProjectBackend) can override this to close backing
+issues or archive project items.
+
+### In-flight operation handling
+
+If worktree creation is in progress for the deleted item, the result is drained
+and any orphaned worktree is cleaned up. If PR creation is in progress, it is
+cancelled. Pending PR creation queue entries for the deleted item are removed.
+
 ## What a Work Item Is NOT
 
 - It is not a task tracker entry. There is no "assigned to," "due date,"
