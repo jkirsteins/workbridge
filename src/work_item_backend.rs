@@ -78,12 +78,24 @@ pub struct ActivityEntry {
     pub payload: serde_json::Value,
 }
 
+/// PR identity snapshot persisted at merge time. Allows the detail view
+/// to show PR info after the PR leaves the open-PR list.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PrIdentityRecord {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+}
+
 /// A repo association as stored by a backend. Minimal: just the repo path
 /// and optional branch name.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepoAssociationRecord {
     pub repo_path: PathBuf,
     pub branch: Option<String>,
+    /// Snapshot of PR identity persisted at merge time.
+    #[serde(default)]
+    pub pr_identity: Option<PrIdentityRecord>,
 }
 
 /// A corrupt backend record that could not be deserialized.
@@ -161,6 +173,17 @@ pub trait WorkItemBackend: Send + Sync {
     /// Get the activity log file path for a work item. Returns None if the
     /// backend does not support file-based activity logs.
     fn activity_path_for(&self, id: &WorkItemId) -> Option<PathBuf>;
+
+    /// Persist a PR identity snapshot on the repo association matching
+    /// `repo_path`. Default no-op for backends that don't support it.
+    fn save_pr_identity(
+        &self,
+        _id: &WorkItemId,
+        _repo_path: &Path,
+        _pr_identity: &PrIdentityRecord,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
 
     /// Which backend type this implementation represents.
     /// Not called in v1 (assembly derives it from WorkItemId); kept for
@@ -414,6 +437,7 @@ impl WorkItemBackend for LocalFileBackend {
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: unlinked.repo_path.clone(),
                 branch: Some(unlinked.branch.clone()),
+                pr_identity: None,
             }],
         };
         self.create(request)
@@ -493,6 +517,22 @@ impl WorkItemBackend for LocalFileBackend {
         self.activity_path(id).ok()
     }
 
+    fn save_pr_identity(
+        &self,
+        id: &WorkItemId,
+        repo_path: &Path,
+        pr_identity: &PrIdentityRecord,
+    ) -> Result<(), BackendError> {
+        let pr_identity = pr_identity.clone();
+        self.modify_record(id, |record| {
+            for assoc in &mut record.repo_associations {
+                if assoc.repo_path == repo_path {
+                    assoc.pr_identity = Some(pr_identity.clone());
+                }
+            }
+        })
+    }
+
     fn backend_type(&self) -> BackendType {
         BackendType::LocalFile
     }
@@ -522,6 +562,7 @@ mod tests {
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/path/to/repo"),
                     branch: Some("42-fix-auth".into()),
+                    pr_identity: None,
                 }],
             })
             .unwrap();
@@ -588,6 +629,7 @@ mod tests {
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,
+                    pr_identity: None,
                 }],
             })
             .unwrap();
@@ -696,6 +738,7 @@ mod tests {
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: Some("main".into()),
+                    pr_identity: None,
                 }],
             })
             .unwrap();
@@ -745,6 +788,7 @@ mod tests {
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: Some("42-feature".into()),
+                    pr_identity: None,
                 }],
             })
             .unwrap();
@@ -823,6 +867,7 @@ mod tests {
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: Some("main".into()),
+                    pr_identity: None,
                 }],
             })
             .unwrap();
@@ -866,6 +911,7 @@ mod tests {
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,
+                    pr_identity: None,
                 }],
             })
             .unwrap();
@@ -889,6 +935,7 @@ mod tests {
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: Some("feature/plan".into()),
+                    pr_identity: None,
                 }],
             })
             .unwrap();
@@ -935,6 +982,7 @@ mod tests {
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,
+                    pr_identity: None,
                 }],
             })
             .unwrap();
@@ -952,6 +1000,63 @@ mod tests {
             "path should end with .jsonl, got: {}",
             path.display(),
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_pr_identity_roundtrip() {
+        let dir = temp_dir("pr-identity");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let repo = PathBuf::from("/my/repo");
+        let record = backend
+            .create(CreateWorkItem {
+                title: "PR identity test".into(),
+                description: None,
+                status: WorkItemStatus::Implementing,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: repo.clone(),
+                    branch: Some("feature-x".into()),
+                    pr_identity: None,
+                }],
+            })
+            .unwrap();
+
+        // Initially no pr_identity.
+        let read_back = backend.read(&record.id).unwrap();
+        assert!(
+            read_back.repo_associations[0].pr_identity.is_none(),
+            "new record should have no pr_identity",
+        );
+
+        // Save a PR identity.
+        let identity = PrIdentityRecord {
+            number: 42,
+            title: "Ship the feature".into(),
+            url: "https://github.com/o/r/pull/42".into(),
+        };
+        backend
+            .save_pr_identity(&record.id, &repo, &identity)
+            .unwrap();
+
+        // Read back and verify it persisted.
+        let read_back = backend.read(&record.id).unwrap();
+        let saved = read_back.repo_associations[0]
+            .pr_identity
+            .as_ref()
+            .expect("pr_identity should be set after save");
+        assert_eq!(saved.number, 42);
+        assert_eq!(saved.title, "Ship the feature");
+        assert_eq!(saved.url, "https://github.com/o/r/pull/42");
+
+        // Verify it survives a list() roundtrip too.
+        let result = backend.list().unwrap();
+        let listed = result.records[0].repo_associations[0]
+            .pr_identity
+            .as_ref()
+            .expect("pr_identity should survive list roundtrip");
+        assert_eq!(listed.number, 42);
 
         let _ = fs::remove_dir_all(&dir);
     }

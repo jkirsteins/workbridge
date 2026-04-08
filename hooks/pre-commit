@@ -8,3 +8,20 @@ echo "Format OK."
 echo "=== pre-commit: running clippy ==="
 cargo clippy --all-targets --all-features -- -D warnings
 echo "Clippy OK."
+
+echo "=== pre-commit: checking for bare Command::new(\"git\") ==="
+bare_git_files=""
+for f in $(git diff --cached --name-only -- '*.rs'); do
+    if [ -f "$f" ] && grep -q 'Command::new("git")' "$f"; then
+        if ! grep -q 'env_remove("GIT_DIR")\|git_command()' "$f"; then
+            bare_git_files="$bare_git_files $f"
+        fi
+    fi
+done
+if [ -n "$bare_git_files" ]; then
+    echo "ERROR: These files use Command::new(\"git\") without env clearing:"
+    echo "$bare_git_files"
+    echo "Use worktree_service::git_command() or add .env_remove(\"GIT_DIR\") etc."
+    exit 1
+fi
+echo "Git env check OK."

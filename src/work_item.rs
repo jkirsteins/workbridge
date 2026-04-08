@@ -82,7 +82,7 @@ impl WorkItemStatus {
             Self::Backlog => Some(Self::Planning),
             Self::Planning => Some(Self::Implementing),
             Self::Implementing => Some(Self::Review),
-            Self::Blocked => Some(Self::Implementing),
+            Self::Blocked => Some(Self::Review),
             Self::Review => Some(Self::Done),
             Self::Done => None,
         }
@@ -328,7 +328,7 @@ mod tests {
         );
         assert_eq!(
             WorkItemStatus::Blocked.next_stage(),
-            Some(WorkItemStatus::Implementing)
+            Some(WorkItemStatus::Review)
         );
         assert_eq!(
             WorkItemStatus::Review.next_stage(),

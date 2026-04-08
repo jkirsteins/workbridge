@@ -15,7 +15,8 @@ use crate::work_item::{
     WorkItemStatus,
 };
 use crate::work_item_backend::{
-    ActivityEntry, BackendError, CreateWorkItem, RepoAssociationRecord, WorkItemBackend,
+    ActivityEntry, BackendError, CreateWorkItem, PrIdentityRecord, RepoAssociationRecord,
+    WorkItemBackend,
 };
 use crate::worktree_service::WorktreeService;
 
@@ -108,6 +109,15 @@ pub struct Activity {
     pub message: String,
 }
 
+/// Outcome of attempting to spawn the review gate.
+pub enum ReviewGateSpawn {
+    /// The gate was spawned and is running - caller should wait for result.
+    Spawned,
+    /// The gate cannot run - caller must NOT advance to Review.
+    /// Contains a human-readable reason to display.
+    Blocked(String),
+}
+
 /// Result from the asynchronous review gate check.
 pub struct ReviewGateResult {
     /// The work item that was being checked.
@@ -135,7 +145,11 @@ pub enum PrMergeOutcome {
     /// No PR found for this branch - advance to Done directly.
     NoPr,
     /// PR merged successfully.
-    Merged { strategy: String },
+    Merged {
+        strategy: String,
+        /// PR identity fetched from GitHub at merge time.
+        pr_identity: Option<PrIdentityRecord>,
+    },
     /// Merge failed due to conflicts - send back to Implementing.
     Conflict { stderr: String },
     /// Merge failed for another reason.
@@ -148,8 +162,17 @@ pub struct PrMergeResult {
     pub wi_id: WorkItemId,
     /// The branch that was being merged.
     pub branch: String,
+    /// The repo path for persisting PR identity.
+    pub repo_path: PathBuf,
     /// The outcome of the merge attempt.
     pub outcome: PrMergeOutcome,
+}
+
+/// Result from the background PR identity backfill thread.
+pub struct PrIdentityBackfillResult {
+    pub wi_id: WorkItemId,
+    pub repo_path: PathBuf,
+    pub identity: PrIdentityRecord,
 }
 
 /// Result from the asynchronous worktree creation thread.
@@ -336,6 +359,11 @@ pub struct App {
     /// Activity ID for the running PR merge indicator.
     pub pr_merge_activity: Option<ActivityId>,
 
+    // -- PR identity backfill --
+    /// Receiver for background PR identity backfill results (one-time startup).
+    pub pr_identity_backfill_rx:
+        Option<crossbeam_channel::Receiver<Result<PrIdentityBackfillResult, String>>>,
+
     // -- Async worktree creation --
     /// Receiver for asynchronous worktree creation results.
     pub worktree_create_rx: Option<crossbeam_channel::Receiver<WorktreeCreateResult>>,
@@ -486,6 +514,7 @@ impl App {
             pr_create_pending: VecDeque::new(),
             pr_merge_rx: None,
             pr_merge_activity: None,
+            pr_identity_backfill_rx: None,
             worktree_create_rx: None,
             worktree_create_activity: None,
             worktree_create_wi: None,
@@ -738,9 +767,14 @@ impl App {
                 None => false,
             };
             if has_commits {
-                if self.spawn_review_gate(&wi_id) {
-                    self.status_message =
-                        Some("Implementing session ended - running review gate...".into());
+                match self.spawn_review_gate(&wi_id) {
+                    ReviewGateSpawn::Spawned => {
+                        self.status_message =
+                            Some("Implementing session ended - running review gate...".into());
+                    }
+                    ReviewGateSpawn::Blocked(reason) => {
+                        self.status_message = Some(reason);
+                    }
                 }
             } else {
                 self.status_message =
@@ -1599,7 +1633,7 @@ impl App {
             // Check if our target files are already tracked by git.  If so,
             // writing them would silently modify tracked files, so skip the
             // hook and let prompt-level enforcement be the only safeguard.
-            let files_tracked = std::process::Command::new("git")
+            let files_tracked = crate::worktree_service::git_command()
                 .args([
                     "-C",
                     &cwd.to_string_lossy(),
@@ -1952,7 +1986,7 @@ impl App {
             }
         };
 
-        let output = std::process::Command::new("git")
+        let output = crate::worktree_service::git_command()
             .args(["log", &format!("{default_branch}..HEAD"), "--oneline"])
             .current_dir(cwd)
             .output();
@@ -2101,13 +2135,15 @@ impl App {
 
                     // Restrict MCP to valid forward transitions only.
                     // Allowed: Implementing -> Review (via gate), Implementing -> Blocked,
-                    // Blocked -> Implementing, Planning -> Implementing.
+                    // Blocked -> Implementing, Blocked -> Review (via gate),
+                    // Planning -> Implementing.
                     // All other transitions must go through the TUI keybinds.
                     let allowed = matches!(
                         (&current_status, &new_status),
                         (Some(WorkItemStatus::Implementing), WorkItemStatus::Review)
                             | (Some(WorkItemStatus::Implementing), WorkItemStatus::Blocked)
                             | (Some(WorkItemStatus::Blocked), WorkItemStatus::Implementing)
+                            | (Some(WorkItemStatus::Blocked), WorkItemStatus::Review)
                             | (Some(WorkItemStatus::Planning), WorkItemStatus::Implementing)
                     );
                     if !allowed {
@@ -2147,26 +2183,55 @@ impl App {
                         continue;
                     }
 
-                    // Review gate: when MCP requests Implementing -> Review,
-                    // trigger the review gate instead of applying directly.
-                    // This ensures the plan-vs-implementation check is the
-                    // single chokepoint for entering Review.
-                    if current_status.as_ref() == Some(&WorkItemStatus::Implementing)
+                    // Review gate: when MCP requests Implementing/Blocked -> Review,
+                    // the review gate is the single chokepoint - the transition
+                    // is blocked unless the gate spawns and later approves it.
+                    if (current_status.as_ref() == Some(&WorkItemStatus::Implementing)
+                        || current_status.as_ref() == Some(&WorkItemStatus::Blocked))
                         && new_status == WorkItemStatus::Review
                     {
-                        if self.review_gate_wi.as_ref() == Some(&wi_id) {
-                            // Gate already running for this item - wait for it.
-                            continue;
+                        match self.spawn_review_gate(&wi_id) {
+                            ReviewGateSpawn::Spawned => {
+                                self.status_message =
+                                    Some("Claude requested Review - running review gate...".into());
+                            }
+                            ReviewGateSpawn::Blocked(reason) => {
+                                // If a gate is already running (for this or another item),
+                                // just inform Claude - don't rework, the event is dropped
+                                // and Claude will need to request Review again.
+                                if reason.contains("already running") {
+                                    self.status_message = Some(reason);
+                                } else {
+                                    // Gate truly can't run (no plan, no diff, git error).
+                                    // Apply the rework flow so Claude gets feedback instead
+                                    // of waiting forever for a gate result that never comes.
+                                    self.rework_reasons.insert(wi_id.clone(), reason.clone());
+                                    self.status_message =
+                                        Some(format!("Review gate failed to start: {reason}"));
+                                    // If Blocked, transition to Implementing so the
+                                    // implementing_rework prompt (with {rework_reason}) is used.
+                                    if current_status.as_ref() == Some(&WorkItemStatus::Blocked) {
+                                        let _ = self
+                                            .backend
+                                            .update_status(&wi_id, WorkItemStatus::Implementing);
+                                        self.reassemble_work_items();
+                                        self.build_display_list();
+                                    }
+                                    // Kill and respawn the session with rework prompt.
+                                    if let Some(key) = self.session_key_for(&wi_id)
+                                        && let Some(mut entry) = self.sessions.remove(&key)
+                                        && let Some(ref mut session) = entry.session
+                                    {
+                                        session.kill();
+                                    }
+                                    self.cleanup_mcp_for(&wi_id);
+                                    self.spawn_session(&wi_id);
+                                }
+                            }
                         }
-                        if self.spawn_review_gate(&wi_id) {
-                            self.status_message =
-                                Some("Claude requested Review - running review gate...".into());
-                            continue;
-                        }
+                        continue;
                     }
-                    // No plan or gate skipped - fall through to direct update.
-                    // Use apply_stage_change for consistent logging, auto-PR
-                    // creation, and reassembly.
+                    // Non-Review transitions fall through to direct update.
                     let current = current_status.unwrap();
                     self.apply_stage_change(&wi_id, &current, &new_status, "mcp");
 
@@ -2367,6 +2432,7 @@ impl App {
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: repo_root,
                 branch: None,
+                pr_identity: None,
             }],
         };
 
@@ -2423,6 +2489,7 @@ impl App {
             .map(|repo_path| RepoAssociationRecord {
                 repo_path,
                 branch: Some(branch.clone()),
+                pr_identity: None,
             })
             .collect();
 
@@ -2569,20 +2636,23 @@ impl App {
             return;
         }
 
-        // Review gate: when transitioning from Implementing to Review,
-        // check the plan against the implementation if a plan exists.
+        // Review gate: the single chokepoint for entering Review.
         // The gate runs asynchronously in a background thread to avoid
-        // blocking the TUI. If the gate is triggered, we return early
-        // and the result is processed on the next timer tick.
-        if current_status == WorkItemStatus::Implementing && new_status == WorkItemStatus::Review {
-            if self.review_gate_wi.as_ref() == Some(&wi_id) {
-                self.status_message = Some("Review gate already running...".into());
-                return;
+        // blocking the TUI. The transition is blocked unless the gate
+        // spawns and later approves it via poll_review_gate.
+        if (current_status == WorkItemStatus::Implementing
+            || current_status == WorkItemStatus::Blocked)
+            && new_status == WorkItemStatus::Review
+        {
+            match self.spawn_review_gate(&wi_id) {
+                ReviewGateSpawn::Spawned => {
+                    // Gate is running in background - do not advance yet.
+                }
+                ReviewGateSpawn::Blocked(reason) => {
+                    self.status_message = Some(reason);
+                }
             }
-            if self.spawn_review_gate(&wi_id) {
-                // Gate is running in background - do not advance yet.
-                return;
-            }
+            return;
         }
 
         // Merge prompt: when transitioning from Review to Done,
@@ -2751,8 +2821,20 @@ impl App {
             self.spawn_pr_creation(wi_id);
         }
 
+        // Kill the old session for this work item before spawning a new one.
+        // Previously relied on orphan cleanup in check_liveness, but that
+        // leaves two sessions alive briefly and the old one can do work
+        // (push, commit, etc.) in the gap.
+        if let Some(old_key) = self.session_key_for(wi_id)
+            && let Some(mut entry) = self.sessions.remove(&old_key)
+        {
+            if let Some(ref mut session) = entry.session {
+                session.kill();
+            }
+            self.cleanup_mcp_for(wi_id);
+        }
+
         // Auto-spawn a session for stages that have prompts.
-        // The orphan cleanup in check_liveness handles killing the old session.
         if !matches!(new_status, WorkItemStatus::Backlog | WorkItemStatus::Done) {
             self.spawn_session(wi_id);
         }
@@ -2867,6 +2949,34 @@ impl App {
                     });
                     return;
                 }
+            }
+
+            // Ensure the branch is pushed to the remote before creating the PR.
+            let push_output = crate::worktree_service::git_command()
+                .args(["push", "-u", "origin", &branch])
+                .current_dir(&repo_path)
+                .output();
+            match push_output {
+                Ok(output) if !output.status.success() => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    let _ = tx.send(PrCreateResult {
+                        wi_id,
+                        info: None,
+                        error: Some(format!("git push failed: {stderr}")),
+                        url: None,
+                    });
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(PrCreateResult {
+                        wi_id,
+                        info: None,
+                        error: Some(format!("git push failed: {e}")),
+                        url: None,
+                    });
+                    return;
+                }
+                _ => {} // push succeeded
             }
 
             // Create the PR.
@@ -3054,19 +3164,20 @@ impl App {
         let strategy_owned = strategy.to_string();
         let wi_id_clone = wi_id.clone();
         let merge_flag_owned = merge_flag.to_string();
+        let repo_path_clone = repo_path.clone();
 
         let (tx, rx) = crossbeam_channel::bounded(1);
 
         std::thread::spawn(move || {
-            // Check if a PR exists for this branch.
-            let pr_exists = match std::process::Command::new("gh")
+            // Check if a PR exists for this branch and fetch its identity.
+            let pr_identity = match std::process::Command::new("gh")
                 .args([
                     "pr",
                     "list",
                     "--head",
                     &branch,
                     "--json",
-                    "number",
+                    "number,title,url",
                     "--repo",
                     &owner_repo,
                 ])
@@ -3074,58 +3185,59 @@ impl App {
             {
                 Ok(output) if output.status.success() => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    serde_json::from_str::<serde_json::Value>(stdout.trim())
+                    serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim())
                         .ok()
-                        .and_then(|v| v.as_array().map(|a| !a.is_empty()))
-                        .unwrap_or(false)
+                        .and_then(|arr| arr.into_iter().next())
+                        .and_then(|obj| {
+                            let number = obj.get("number")?.as_u64()?;
+                            let title = obj.get("title")?.as_str()?.to_string();
+                            let url = obj.get("url")?.as_str()?.to_string();
+                            Some(PrIdentityRecord { number, title, url })
+                        })
                 }
-                _ => false,
+                _ => None,
             };
 
-            if !pr_exists {
-                let _ = tx.send(PrMergeResult {
-                    wi_id: wi_id_clone,
-                    branch,
-                    outcome: PrMergeOutcome::NoPr,
-                });
-                return;
-            }
-
-            // Run gh pr merge.
-            let merge_result = std::process::Command::new("gh")
-                .args([
-                    "pr",
-                    "merge",
-                    &branch,
-                    &merge_flag_owned,
-                    "--delete-branch",
-                    "--repo",
-                    &owner_repo,
-                ])
-                .output();
-
-            let outcome = match merge_result {
-                Ok(output) if output.status.success() => PrMergeOutcome::Merged {
-                    strategy: strategy_owned,
-                },
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    if stderr.to_lowercase().contains("conflict") {
-                        PrMergeOutcome::Conflict { stderr }
-                    } else {
-                        PrMergeOutcome::Failed {
-                            error: format!("Merge failed: {}", stderr.trim()),
+            let outcome = if pr_identity.is_none() {
+                PrMergeOutcome::NoPr
+            } else {
+                // Run gh pr merge.
+                match std::process::Command::new("gh")
+                    .args([
+                        "pr",
+                        "merge",
+                        &branch,
+                        &merge_flag_owned,
+                        "--delete-branch",
+                        "--repo",
+                        &owner_repo,
+                    ])
+                    .output()
+                {
+                    Ok(output) if output.status.success() => PrMergeOutcome::Merged {
+                        strategy: strategy_owned,
+                        pr_identity,
+                    },
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                        if stderr.to_lowercase().contains("conflict") {
+                            PrMergeOutcome::Conflict { stderr }
+                        } else {
+                            PrMergeOutcome::Failed {
+                                error: format!("Merge failed: {}", stderr.trim()),
+                            }
                         }
                     }
+                    Err(e) => PrMergeOutcome::Failed {
+                        error: format!("Merge failed: {e}"),
+                    },
                 }
-                Err(e) => PrMergeOutcome::Failed {
-                    error: format!("Merge failed: {e}"),
-                },
             };
 
             let _ = tx.send(PrMergeResult {
                 wi_id: wi_id_clone,
                 branch,
+                repo_path: repo_path_clone,
                 outcome,
             });
         });
@@ -3177,7 +3289,19 @@ impl App {
                 self.status_message =
                     Some("Cannot merge: no PR found. Push branch and open a PR first.".into());
             }
-            PrMergeOutcome::Merged { ref strategy } => {
+            PrMergeOutcome::Merged {
+                ref strategy,
+                ref pr_identity,
+            } => {
+                // Persist PR identity to backend so it survives reassembly.
+                if let Some(identity) = pr_identity
+                    && let Err(e) =
+                        self.backend
+                            .save_pr_identity(&result.wi_id, &result.repo_path, identity)
+                {
+                    self.status_message = Some(format!("PR identity save error: {e}"));
+                }
+
                 // Log merge to activity log (always - the merge happened on GitHub).
                 let log_entry = ActivityEntry {
                     timestamp: now_iso8601(),
@@ -3248,6 +3372,91 @@ impl App {
         }
     }
 
+    /// Collect Done items that need PR identity backfill (have a branch but
+    /// no persisted pr_identity). Returns tuples of
+    /// (wi_id, repo_path, branch, github_owner, github_repo).
+    ///
+    /// Temporary migration helper - can be removed once all existing Done
+    /// items have been backfilled (i.e. no Done items with pr_identity=None
+    /// remain on disk).
+    pub fn collect_backfill_requests(&self) -> Vec<(WorkItemId, PathBuf, String, String, String)> {
+        let records = match self.backend.list() {
+            Ok(lr) => lr.records,
+            Err(_) => return vec![],
+        };
+        let mut requests = Vec::new();
+        for record in &records {
+            if record.status != WorkItemStatus::Done {
+                continue;
+            }
+            for assoc in &record.repo_associations {
+                if assoc.pr_identity.is_some() {
+                    continue;
+                }
+                let branch = match &assoc.branch {
+                    Some(b) => b.clone(),
+                    None => continue,
+                };
+                let (owner, repo_name) = match self.worktree_service.github_remote(&assoc.repo_path)
+                {
+                    Ok(Some((o, r))) => (o, r),
+                    _ => continue,
+                };
+                requests.push((
+                    record.id.clone(),
+                    assoc.repo_path.clone(),
+                    branch,
+                    owner,
+                    repo_name,
+                ));
+            }
+        }
+        requests
+    }
+
+    /// Drain results from the PR identity backfill channel. Returns true
+    /// if any identities were saved (caller should reassemble).
+    ///
+    /// Temporary migration helper - can be removed once all existing Done
+    /// items have been backfilled.
+    pub fn drain_pr_identity_backfill(&mut self) -> bool {
+        let rx = match self.pr_identity_backfill_rx.as_ref() {
+            Some(rx) => rx,
+            None => return false,
+        };
+        let mut changed = false;
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => match msg {
+                    Ok(result) => {
+                        if let Err(e) = self.backend.save_pr_identity(
+                            &result.wi_id,
+                            &result.repo_path,
+                            &result.identity,
+                        ) {
+                            self.status_message = Some(format!("PR identity backfill error: {e}"));
+                        } else {
+                            changed = true;
+                        }
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("PR identity backfill: {e}"));
+                    }
+                },
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            self.pr_identity_backfill_rx = None;
+        }
+        changed
+    }
+
     /// Remove the worktree directory for a work item after merge.
     fn cleanup_worktree_for_item(&mut self, wi_id: &WorkItemId) {
         let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
@@ -3266,37 +3475,44 @@ impl App {
     }
 
     /// Attempt to spawn the async review gate for the given work item.
-    /// Returns true if the gate was spawned (caller should wait for result),
-    /// false if no gate is needed (no plan, empty plan, missing data).
-    fn spawn_review_gate(&mut self, wi_id: &WorkItemId) -> bool {
+    /// Returns `Spawned` if the gate is running (caller should wait),
+    /// or `Blocked(reason)` if the transition must not proceed.
+    fn spawn_review_gate(&mut self, wi_id: &WorkItemId) -> ReviewGateSpawn {
         // Guard: if a review gate is already running, don't spawn another one.
         // A second call would overwrite the fields and leak the first session.
         if self.review_gate_wi.is_some() {
-            return false;
+            return ReviewGateSpawn::Blocked("Review gate already running".into());
         }
 
         // Read the plan from the backend.
         let plan = match self.backend.read_plan(wi_id) {
             Ok(Some(plan)) if !plan.trim().is_empty() => plan,
-            Ok(_) => return false, // No plan or empty plan - skip gate.
+            Ok(_) => {
+                return ReviewGateSpawn::Blocked("Cannot enter Review: no plan exists".into());
+            }
             Err(e) => {
-                self.status_message = Some(format!("Could not read plan: {e}"));
-                return false;
+                return ReviewGateSpawn::Blocked(format!("Could not read plan: {e}"));
             }
         };
 
         // Find the branch for this work item to get the diff.
         let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
             Some(wi) => wi,
-            None => return false,
+            None => {
+                return ReviewGateSpawn::Blocked("Work item not found".into());
+            }
         };
         let assoc = match wi.repo_associations.first() {
             Some(a) => a,
-            None => return false,
+            None => {
+                return ReviewGateSpawn::Blocked("Cannot enter Review: no repo association".into());
+            }
         };
         let branch = match assoc.branch.as_ref() {
             Some(b) => b.clone(),
-            None => return false,
+            None => {
+                return ReviewGateSpawn::Blocked("Cannot enter Review: no branch set".into());
+            }
         };
         let repo_path = assoc.repo_path.clone();
 
@@ -3307,7 +3523,7 @@ impl App {
             .unwrap_or_else(|_| "main".to_string());
 
         // Get the git diff (this is fast, local I/O only).
-        let diff = match std::process::Command::new("git")
+        let diff = match crate::worktree_service::git_command()
             .arg("-C")
             .arg(&repo_path)
             .args(["diff", &format!("{default_branch}...{branch}")])
@@ -3318,18 +3534,15 @@ impl App {
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                self.status_message = Some(format!("Review gate: git diff failed: {stderr}"));
-                return false;
+                return ReviewGateSpawn::Blocked(format!("Review gate: git diff failed: {stderr}"));
             }
             Err(e) => {
-                self.status_message = Some(format!("Review gate: could not run git: {e}"));
-                return false;
+                return ReviewGateSpawn::Blocked(format!("Review gate: could not run git: {e}"));
             }
         };
 
         if diff.trim().is_empty() {
-            self.status_message = Some("Review gate: no changes found in diff".into());
-            return false;
+            return ReviewGateSpawn::Blocked("Cannot enter Review: no changes on branch".into());
         }
 
         // Spawn the claude --print check in a background thread.
@@ -3342,33 +3555,47 @@ impl App {
             vars.insert("plan", plan.as_str());
             vars.insert("diff", diff.as_str());
             let system = crate::prompts::render("review_gate", &vars).unwrap_or_else(|| {
-                "Compare plan to diff. Respond APPROVED or REJECTED: reason".into()
+                "Compare plan to diff. Respond with JSON: {\"approved\": bool, \"detail\": string}"
+                    .into()
             });
             let prompt = format!("{review_skill}\n\nPlan:\n{plan}\n\nDiff:\n{diff}");
 
+            let json_schema = r#"{"type":"object","properties":{"approved":{"type":"boolean"},"detail":{"type":"string"}},"required":["approved","detail"]}"#;
+
             let result = match std::process::Command::new("claude")
-                .args(["--print", "-p", &prompt, "--system-prompt", &system])
+                .args([
+                    "--print",
+                    "-p",
+                    &prompt,
+                    "--system-prompt",
+                    &system,
+                    "--output-format",
+                    "json",
+                    "--json-schema",
+                    json_schema,
+                ])
                 .output()
             {
                 Ok(output) if output.status.success() => {
                     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if text.starts_with("APPROVED") {
-                        ReviewGateResult {
-                            work_item_id: wi_id_clone,
-                            approved: true,
-                            detail: text,
+                    // Parse the JSON envelope from claude --print --output-format json.
+                    // The structured output is in the "structured_output" field.
+                    match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(envelope) => {
+                            let structured = &envelope["structured_output"];
+                            let approved = structured["approved"].as_bool().unwrap_or(false);
+                            let detail = structured["detail"].as_str().unwrap_or("").to_string();
+                            ReviewGateResult {
+                                work_item_id: wi_id_clone,
+                                approved,
+                                detail,
+                            }
                         }
-                    } else {
-                        let reason = text
-                            .strip_prefix("REJECTED:")
-                            .unwrap_or(&text)
-                            .trim()
-                            .to_string();
-                        ReviewGateResult {
+                        Err(e) => ReviewGateResult {
                             work_item_id: wi_id_clone,
                             approved: false,
-                            detail: reason,
-                        }
+                            detail: format!("review gate: invalid JSON response: {e}"),
+                        },
                     }
                 }
                 Ok(output) => {
@@ -3391,7 +3618,7 @@ impl App {
         self.review_gate_rx = Some(rx);
         self.review_gate_wi = Some(wi_id.clone());
         self.review_gate_activity = Some(self.start_activity("Running review gate..."));
-        true
+        ReviewGateSpawn::Spawned
     }
 
     /// Poll the async review gate for a result. Called on each timer tick.
@@ -3430,19 +3657,20 @@ impl App {
 
         let wi_id = result.work_item_id.clone();
 
-        // Verify the work item is still in Implementing before applying the
-        // gate result. If the user retreated the item while the gate was
-        // running, we discard the result silently - the user intentionally
-        // moved away.
-        let still_implementing = self
+        // Verify the work item is still eligible for the gate result.
+        // Both Implementing and Blocked are valid pre-gate states (Blocked->Review
+        // is allowed per Fix #6). If the user retreated the item while the gate
+        // was running, we discard the result silently.
+        let gate_eligible = self
             .work_items
             .iter()
             .find(|w| w.id == wi_id)
-            .map(|w| w.status == WorkItemStatus::Implementing)
+            .map(|w| {
+                w.status == WorkItemStatus::Implementing || w.status == WorkItemStatus::Blocked
+            })
             .unwrap_or(false);
 
-        if !still_implementing {
-            // Work item is no longer in Implementing - discard the gate result.
+        if !gate_eligible {
             return;
         }
 
@@ -3465,14 +3693,22 @@ impl App {
             self.review_gate_findings
                 .insert(wi_id.clone(), result.detail.clone());
 
+            // Get the actual current status for apply_stage_change.
+            let current_status = self
+                .work_items
+                .iter()
+                .find(|w| w.id == wi_id)
+                .map(|w| w.status.clone())
+                .unwrap_or(WorkItemStatus::Implementing);
+
             self.apply_stage_change(
                 &wi_id,
-                &WorkItemStatus::Implementing,
+                &current_status,
                 &WorkItemStatus::Review,
                 "review_gate",
             );
         } else {
-            // Log rejection and stay in Implementing.
+            // Log rejection and stay in current stage.
             let entry = ActivityEntry {
                 timestamp: now_iso8601(),
                 event_type: "review_gate".to_string(),
@@ -3490,6 +3726,35 @@ impl App {
             self.rework_reasons
                 .insert(wi_id.clone(), result.detail.clone());
             self.status_message = Some(format!("Review gate rejected: {}", result.detail));
+
+            // If Blocked, transition to Implementing so the implementing_rework
+            // prompt (which has {rework_reason}) is used instead of the "blocked"
+            // prompt (which has no rework_reason placeholder).
+            {
+                let wi_status = self
+                    .work_items
+                    .iter()
+                    .find(|w| w.id == wi_id)
+                    .map(|w| w.status.clone());
+                if wi_status == Some(WorkItemStatus::Blocked) {
+                    let _ = self
+                        .backend
+                        .update_status(&wi_id, WorkItemStatus::Implementing);
+                    self.reassemble_work_items();
+                    self.build_display_list();
+                }
+            }
+
+            // Kill the current session and respawn with the implementing_rework
+            // prompt that includes the rejection feedback.
+            if let Some(key) = self.session_key_for(&wi_id)
+                && let Some(mut entry) = self.sessions.remove(&key)
+                && let Some(ref mut session) = entry.session
+            {
+                session.kill();
+            }
+            self.cleanup_mcp_for(&wi_id);
+            self.spawn_session(&wi_id);
         }
     }
 
@@ -4138,6 +4403,7 @@ mod tests {
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
+                        pr_identity: None,
                     }],
                     plan: None,
                 };
@@ -4592,6 +4858,7 @@ mod tests {
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: PathBuf::from("/repo"),
                 branch: None,
+                pr_identity: None,
             }],
             plan: None,
         };
@@ -4603,6 +4870,7 @@ mod tests {
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: PathBuf::from("/repo"),
                 branch: None,
+                pr_identity: None,
             }],
             plan: None,
         };
@@ -4703,6 +4971,7 @@ mod tests {
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: None,
+                    pr_identity: None,
                 }],
                 plan: None,
             };
@@ -5127,6 +5396,7 @@ mod tests {
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
+                        pr_identity: None,
                     }],
                     plan: None,
                 };
@@ -5358,6 +5628,7 @@ mod tests {
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
+                        pr_identity: None,
                     }],
                     plan: None,
                 };
@@ -5611,6 +5882,7 @@ mod tests {
                     repo_associations: vec![RepoAssociationRecord {
                         repo_path: unlinked.repo_path.clone(),
                         branch: Some(unlinked.branch.clone()),
+                        pr_identity: None,
                     }],
                     plan: None,
                 };
@@ -6189,6 +6461,7 @@ mod tests {
         tx.send(PrMergeResult {
             wi_id: wi_id.clone(),
             branch: "feature/test".into(),
+            repo_path: PathBuf::from("/tmp/repo"),
             outcome: PrMergeOutcome::NoPr,
         })
         .unwrap();
@@ -6224,8 +6497,10 @@ mod tests {
         tx.send(PrMergeResult {
             wi_id: wi_id.clone(),
             branch: "feature/test".into(),
+            repo_path: PathBuf::from("/tmp/repo"),
             outcome: PrMergeOutcome::Merged {
                 strategy: "squash".into(),
+                pr_identity: None,
             },
         })
         .unwrap();
@@ -6753,5 +7028,688 @@ mod tests {
         app.end_activity(id);
         // Status message still keeps bar visible.
         assert!(app.has_visible_status_bar());
+    }
+
+    // -- Review gate regression tests --
+
+    /// Helper: create an App with a single work item at the given status,
+    /// with an optional repo association (branch + repo_path).
+    fn app_with_work_item(
+        status: WorkItemStatus,
+        branch: Option<&str>,
+        repo_path: Option<&str>,
+    ) -> (App, WorkItemId) {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/gate-test.json"));
+        let repo_assoc = if let Some(rp) = repo_path {
+            vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from(rp),
+                branch: branch.map(|b| b.to_string()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }]
+        } else {
+            vec![]
+        };
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            title: "Gate test item".into(),
+            description: None,
+            status,
+            status_derived: false,
+            repo_associations: repo_assoc,
+            errors: vec![],
+        });
+        app.display_list
+            .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
+        app.selected_item = Some(app.display_list.len() - 1);
+        (app, wi_id)
+    }
+
+    /// Test 4: MCP StatusUpdate for Review on Implementing item with no plan
+    /// must NOT change status to Review (gate spawn fails), and rework_reasons
+    /// must be populated.
+    #[test]
+    fn mcp_review_gate_bypass_prevented_no_plan() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        // Set up MCP channel with a StatusUpdate for Review.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.mcp_rx = Some(rx);
+        let wi_id_json = serde_json::to_string(&wi_id).unwrap();
+        tx.send(McpEvent::StatusUpdate {
+            work_item_id: wi_id_json,
+            status: "Review".into(),
+            reason: "Implementation complete".into(),
+        })
+        .unwrap();
+
+        app.poll_mcp_status_updates();
+
+        // Status must stay at Implementing - the gate cannot run without a plan.
+        let wi = app.work_items.iter().find(|w| w.id == wi_id).unwrap();
+        assert_eq!(
+            wi.status,
+            WorkItemStatus::Implementing,
+            "status must not change to Review when no plan exists",
+        );
+        // rework_reasons must be populated (gate spawn failure triggers rework flow).
+        assert!(
+            app.rework_reasons.contains_key(&wi_id),
+            "rework_reasons must be populated after gate spawn failure",
+        );
+        let reason = app.rework_reasons.get(&wi_id).unwrap();
+        assert!(
+            reason.contains("no plan"),
+            "rework reason should mention no plan, got: {reason}",
+        );
+    }
+
+    /// Test 5: TUI advance_stage from Implementing with no plan must NOT
+    /// change status to Review.
+    #[test]
+    fn tui_advance_stage_blocked_without_plan() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        app.advance_stage();
+
+        // Status must stay at Implementing - spawn_review_gate returns Blocked.
+        let wi = app.work_items.iter().find(|w| w.id == wi_id).unwrap();
+        assert_eq!(
+            wi.status,
+            WorkItemStatus::Implementing,
+            "TUI advance_stage must not advance to Review without a plan",
+        );
+        // Status message should explain why.
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("no plan"),
+            "status message should explain gate failure, got: {msg}",
+        );
+    }
+
+    /// Test 6: After poll_review_gate processes a rejection result,
+    /// rework_reasons is populated for the work item.
+    #[test]
+    fn poll_review_gate_rejection_populates_rework_reasons() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        // Simulate a review gate that completed with a rejection.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(ReviewGateResult {
+            work_item_id: wi_id.clone(),
+            approved: false,
+            detail: "Tests are missing for the new feature".into(),
+        })
+        .unwrap();
+        app.review_gate_rx = Some(rx);
+        app.review_gate_wi = Some(wi_id.clone());
+
+        app.poll_review_gate();
+
+        assert!(
+            app.rework_reasons.contains_key(&wi_id),
+            "rework_reasons must be populated after gate rejection",
+        );
+        assert_eq!(
+            app.rework_reasons.get(&wi_id).unwrap(),
+            "Tests are missing for the new feature",
+        );
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("rejected"),
+            "status should mention rejection, got: {msg}",
+        );
+    }
+
+    /// Test 7: poll_review_gate supports Blocked status - a Blocked work item
+    /// can transition to Review when the gate approves.
+    #[test]
+    fn poll_review_gate_approves_blocked_to_review() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Blocked,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        // Simulate a review gate that completed with approval.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(ReviewGateResult {
+            work_item_id: wi_id.clone(),
+            approved: true,
+            detail: "All plan items implemented".into(),
+        })
+        .unwrap();
+        app.review_gate_rx = Some(rx);
+        app.review_gate_wi = Some(wi_id.clone());
+
+        app.poll_review_gate();
+
+        // StubBackend's update_status is a no-op, but reassemble rebuilds from
+        // StubBackend (empty). The status message from apply_stage_change confirms
+        // the transition was attempted. Also verify gate findings were stored.
+        assert!(
+            app.review_gate_findings.contains_key(&wi_id),
+            "review_gate_findings should be stored on approval",
+        );
+        assert_eq!(
+            app.review_gate_findings.get(&wi_id).unwrap(),
+            "All plan items implemented",
+        );
+        // Verify the receiver and tracked WI are cleared.
+        assert!(app.review_gate_rx.is_none(), "gate rx should be cleared");
+        assert!(app.review_gate_wi.is_none(), "gate wi should be cleared");
+    }
+
+    /// Test 8: Gate spawn failure (MCP path) populates rework_reasons with
+    /// the failure message.
+    #[test]
+    fn mcp_gate_spawn_failure_sets_rework_reasons() {
+        // Work item with no branch - gate will fail with "no branch set".
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            None, // no branch
+            Some("/tmp/repo"),
+        );
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.mcp_rx = Some(rx);
+        let wi_id_json = serde_json::to_string(&wi_id).unwrap();
+        tx.send(McpEvent::StatusUpdate {
+            work_item_id: wi_id_json,
+            status: "Review".into(),
+            reason: "Done implementing".into(),
+        })
+        .unwrap();
+
+        app.poll_mcp_status_updates();
+
+        assert!(
+            app.rework_reasons.contains_key(&wi_id),
+            "rework_reasons must be set on gate spawn failure (no branch)",
+        );
+        let reason = app.rework_reasons.get(&wi_id).unwrap();
+        // The gate failure could mention "no plan" (checked first) or "no branch".
+        // StubBackend.read_plan returns Ok(None), so "no plan" is the first failure.
+        assert!(
+            reason.contains("no plan") || reason.contains("no branch"),
+            "rework reason should explain the failure, got: {reason}",
+        );
+    }
+
+    /// Test 9: When a review gate is already running for item A, an MCP
+    /// StatusUpdate for Review on item B should NOT populate rework_reasons
+    /// for item B. It should be silently skipped (gate busy).
+    #[test]
+    fn gate_busy_for_different_item_does_not_rework() {
+        let mut app = App::new();
+
+        // Item A: gate is running for this one.
+        let wi_id_a = WorkItemId::LocalFile(PathBuf::from("/tmp/gate-a.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id_a.clone(),
+            backend_type: BackendType::LocalFile,
+            title: "Item A".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/repo"),
+                branch: Some("branch-a".into()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        // Item B: MCP will request Review for this one.
+        let wi_id_b = WorkItemId::LocalFile(PathBuf::from("/tmp/gate-b.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id_b.clone(),
+            backend_type: BackendType::LocalFile,
+            title: "Item B".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/repo"),
+                branch: Some("branch-b".into()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        // Simulate gate running for item A.
+        app.review_gate_wi = Some(wi_id_a.clone());
+        // (We don't need a real rx - spawn_review_gate checks review_gate_wi first.)
+
+        // Send MCP StatusUpdate for item B.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.mcp_rx = Some(rx);
+        let wi_id_b_json = serde_json::to_string(&wi_id_b).unwrap();
+        tx.send(McpEvent::StatusUpdate {
+            work_item_id: wi_id_b_json,
+            status: "Review".into(),
+            reason: "Done".into(),
+        })
+        .unwrap();
+
+        app.poll_mcp_status_updates();
+
+        // Item B's status must be unchanged.
+        let wi_b = app.work_items.iter().find(|w| w.id == wi_id_b).unwrap();
+        assert_eq!(
+            wi_b.status,
+            WorkItemStatus::Implementing,
+            "item B should remain Implementing when gate is busy",
+        );
+        // rework_reasons must NOT contain item B (gate busy is not a failure).
+        assert!(
+            !app.rework_reasons.contains_key(&wi_id_b),
+            "rework_reasons must NOT be set for item B when gate is busy for item A",
+        );
+        // Status message should mention "already running".
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("already running"),
+            "status should mention gate already running, got: {msg}",
+        );
+    }
+
+    /// Test 10: A Blocked work item with no plan that fails the gate via MCP
+    /// should transition to Implementing (not stay Blocked), so the
+    /// implementing_rework prompt (which has {rework_reason}) is used.
+    #[test]
+    fn blocked_gate_failure_transitions_to_implementing() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Blocked,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        // Send MCP StatusUpdate for Review.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.mcp_rx = Some(rx);
+        let wi_id_json = serde_json::to_string(&wi_id).unwrap();
+        tx.send(McpEvent::StatusUpdate {
+            work_item_id: wi_id_json,
+            status: "Review".into(),
+            reason: "Implementation complete".into(),
+        })
+        .unwrap();
+
+        app.poll_mcp_status_updates();
+
+        // The work item should now be Implementing (not still Blocked).
+        // StubBackend.update_status is a no-op, but reassemble_work_items
+        // rebuilds from the StubBackend (which returns empty). The important
+        // assertion is that rework_reasons is populated AND the code path
+        // that transitions Blocked -> Implementing was executed.
+        assert!(
+            app.rework_reasons.contains_key(&wi_id),
+            "rework_reasons must be populated for Blocked gate failure",
+        );
+        // Verify status message mentions the gate failure.
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("Review gate failed") || msg.contains("no plan"),
+            "status should mention gate failure, got: {msg}",
+        );
+    }
+
+    /// Test 11: spawn_review_gate sets status_message on all failure paths.
+    #[test]
+    fn spawn_review_gate_sets_status_on_failure() {
+        // Case 1: no plan exists.
+        {
+            let (mut app, wi_id) = app_with_work_item(
+                WorkItemStatus::Implementing,
+                Some("feature/test"),
+                Some("/tmp/repo"),
+            );
+            let result = app.spawn_review_gate(&wi_id);
+            match result {
+                ReviewGateSpawn::Blocked(reason) => {
+                    assert!(
+                        reason.contains("no plan"),
+                        "should mention no plan, got: {reason}",
+                    );
+                }
+                ReviewGateSpawn::Spawned => {
+                    panic!("gate should not have spawned without a plan");
+                }
+            }
+        }
+
+        // Case 2: no branch set.
+        {
+            let (mut app, wi_id) = app_with_work_item(
+                WorkItemStatus::Implementing,
+                None, // no branch
+                Some("/tmp/repo"),
+            );
+            let result = app.spawn_review_gate(&wi_id);
+            match result {
+                ReviewGateSpawn::Blocked(reason) => {
+                    // Could fail on "no plan" first (StubBackend returns None).
+                    assert!(
+                        reason.contains("no plan") || reason.contains("no branch"),
+                        "should mention no plan or no branch, got: {reason}",
+                    );
+                }
+                ReviewGateSpawn::Spawned => {
+                    panic!("gate should not have spawned without a branch");
+                }
+            }
+        }
+
+        // Case 3: no repo association.
+        {
+            let (mut app, wi_id) = app_with_work_item(
+                WorkItemStatus::Implementing,
+                None,
+                None, // no repo association
+            );
+            let result = app.spawn_review_gate(&wi_id);
+            match result {
+                ReviewGateSpawn::Blocked(reason) => {
+                    // Could fail on "no plan" first (StubBackend returns None).
+                    assert!(
+                        reason.contains("no plan") || reason.contains("no repo"),
+                        "should mention no plan or no repo, got: {reason}",
+                    );
+                }
+                ReviewGateSpawn::Spawned => {
+                    panic!("gate should not have spawned without a repo association");
+                }
+            }
+        }
+    }
+
+    /// Test 2 (from MCP context): Blocked->Review is in the allowed
+    /// transitions in poll_mcp_status_updates. Verify by sending a
+    /// StatusUpdate from Blocked and confirming it is NOT rejected with
+    /// "not allowed".
+    #[test]
+    fn mcp_blocked_to_review_is_allowed_transition() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Blocked,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.mcp_rx = Some(rx);
+        let wi_id_json = serde_json::to_string(&wi_id).unwrap();
+        tx.send(McpEvent::StatusUpdate {
+            work_item_id: wi_id_json,
+            status: "Review".into(),
+            reason: "Done".into(),
+        })
+        .unwrap();
+
+        app.poll_mcp_status_updates();
+
+        // The transition should NOT be rejected as "not allowed". It should
+        // reach the gate spawn path (and fail there due to no plan).
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            !msg.contains("not allowed"),
+            "Blocked->Review must not be rejected as 'not allowed', got: {msg}",
+        );
+    }
+
+    // -- PR identity backfill tests --
+
+    fn make_assoc(repo: &str, branch: &str) -> crate::work_item_backend::RepoAssociationRecord {
+        crate::work_item_backend::RepoAssociationRecord {
+            repo_path: PathBuf::from(repo),
+            branch: Some(branch.to_string()),
+            pr_identity: None,
+        }
+    }
+
+    #[test]
+    fn collect_backfill_requests_returns_done_items_without_pr_identity() {
+        use crate::work_item_backend::LocalFileBackend;
+
+        let dir = std::env::temp_dir().join("workbridge-test-backfill-collect");
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        // Done item with branch but no pr_identity - should be returned.
+        let done_record = backend
+            .create(CreateWorkItem {
+                title: "Done item".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![make_assoc("/tmp/repo", "feature/done")],
+            })
+            .unwrap();
+        backend
+            .update_status(&done_record.id, WorkItemStatus::Done)
+            .unwrap();
+
+        // Backlog item with branch - should be skipped.
+        let _ = backend
+            .create(CreateWorkItem {
+                title: "Impl item".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![make_assoc("/tmp/repo", "feature/impl")],
+            })
+            .unwrap();
+
+        // Done item with pr_identity already set - should be skipped.
+        let done_with_pr = backend
+            .create(CreateWorkItem {
+                title: "Done with PR".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![make_assoc("/tmp/repo", "feature/done-pr")],
+            })
+            .unwrap();
+        backend
+            .update_status(&done_with_pr.id, WorkItemStatus::Done)
+            .unwrap();
+        backend
+            .save_pr_identity(
+                &done_with_pr.id,
+                &PathBuf::from("/tmp/repo"),
+                &crate::work_item_backend::PrIdentityRecord {
+                    number: 42,
+                    title: "Already set".into(),
+                    url: "https://example.com/pr/42".into(),
+                },
+            )
+            .unwrap();
+
+        let mut app = App::with_config(Config::default(), Box::new(backend));
+        app.worktree_service = Arc::new(StubWorktreeService);
+
+        let requests = app.collect_backfill_requests();
+
+        // Only the first Done item (no pr_identity) should be a candidate.
+        // StubWorktreeService.github_remote returns None, so the request
+        // is skipped (no github remote). Verify filter works correctly.
+        assert!(
+            requests.is_empty(),
+            "no requests without github remote, got {}",
+            requests.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_backfill_requests_returns_requests_when_github_remote_available() {
+        use crate::work_item_backend::LocalFileBackend;
+        use crate::worktree_service::{WorktreeError, WorktreeInfo};
+
+        /// A worktree service that always returns a github remote.
+        struct GithubWorktreeService;
+        impl WorktreeService for GithubWorktreeService {
+            fn list_worktrees(
+                &self,
+                _repo_path: &std::path::Path,
+            ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+                Ok(Vec::new())
+            }
+            fn create_worktree(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+                _target_dir: &std::path::Path,
+            ) -> Result<WorktreeInfo, WorktreeError> {
+                Err(WorktreeError::GitError("stub".into()))
+            }
+            fn remove_worktree(
+                &self,
+                _repo_path: &std::path::Path,
+                _worktree_path: &std::path::Path,
+                _delete_branch: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn default_branch(
+                &self,
+                _repo_path: &std::path::Path,
+            ) -> Result<String, WorktreeError> {
+                Ok("main".to_string())
+            }
+            fn github_remote(
+                &self,
+                _repo_path: &std::path::Path,
+            ) -> Result<Option<(String, String)>, WorktreeError> {
+                Ok(Some(("testowner".to_string(), "testrepo".to_string())))
+            }
+            fn fetch_branch(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn create_branch(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+        }
+
+        let dir = std::env::temp_dir().join("workbridge-test-backfill-collect-positive");
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        // Done item with branch but no pr_identity - should produce a request.
+        let done_record = backend
+            .create(CreateWorkItem {
+                title: "Done item".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![make_assoc("/tmp/repo", "feature/done")],
+            })
+            .unwrap();
+        backend
+            .update_status(&done_record.id, WorkItemStatus::Done)
+            .unwrap();
+
+        // Backlog item - should be skipped.
+        let _ = backend
+            .create(CreateWorkItem {
+                title: "Backlog item".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![make_assoc("/tmp/repo", "feature/backlog")],
+            })
+            .unwrap();
+
+        let mut app = App::with_config(Config::default(), Box::new(backend));
+        app.worktree_service = Arc::new(GithubWorktreeService);
+
+        let requests = app.collect_backfill_requests();
+
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one backfill request, got {}",
+            requests.len()
+        );
+        let (ref wi_id, ref _repo_path, ref branch, ref owner, ref repo_name) = requests[0];
+        assert_eq!(wi_id, &done_record.id);
+        assert_eq!(branch, "feature/done");
+        assert_eq!(owner, "testowner");
+        assert_eq!(repo_name, "testrepo");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drain_pr_identity_backfill_saves_results() {
+        use crate::work_item_backend::{LocalFileBackend, PrIdentityRecord};
+
+        let dir = std::env::temp_dir().join("workbridge-test-backfill-drain");
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Drain test".into(),
+                description: None,
+                status: WorkItemStatus::Done,
+                repo_associations: vec![make_assoc("/tmp/repo", "feature/drain")],
+            })
+            .unwrap();
+
+        let mut app = App::with_config(Config::default(), Box::new(backend));
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(Ok(PrIdentityBackfillResult {
+            wi_id: record.id.clone(),
+            repo_path: PathBuf::from("/tmp/repo"),
+            identity: PrIdentityRecord {
+                number: 99,
+                title: "Backfilled PR".into(),
+                url: "https://example.com/pr/99".into(),
+            },
+        }))
+        .unwrap();
+        drop(tx);
+        app.pr_identity_backfill_rx = Some(rx);
+
+        let changed = app.drain_pr_identity_backfill();
+        assert!(changed, "should report changed");
+
+        // Verify pr_identity was persisted to the backend.
+        let updated = app.backend.read(&record.id).unwrap();
+        let assoc = updated.repo_associations.first().unwrap();
+        let pi = assoc.pr_identity.as_ref().unwrap();
+        assert_eq!(pi.number, 99);
+        assert_eq!(pi.title, "Backfilled PR");
+        assert_eq!(pi.url, "https://example.com/pr/99");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -255,6 +255,30 @@ pub fn reassemble(
                 }
             }
 
+            // Fallback: if no live PR matched, use persisted PR identity
+            // (saved at merge time) so Done items keep their PR link.
+            // Guard: only apply when the backend record is already Done.
+            // If the user moves the item back (e.g., merge reverted), the
+            // persisted identity is ignored and the item is not forced to Done.
+            if pr_info.is_none()
+                && record.status == WorkItemStatus::Done
+                && let Some(ref identity) = assoc_record.pr_identity
+            {
+                let info = PrInfo {
+                    number: identity.number,
+                    title: identity.title.clone(),
+                    state: PrState::Merged,
+                    is_draft: false,
+                    review_decision: ReviewDecision::None,
+                    checks: CheckStatus::None,
+                    url: identity.url.clone(),
+                };
+                if best_pr_title.is_none() {
+                    best_pr_title = Some(info.title.clone());
+                }
+                pr_info = Some(info);
+            }
+
             // --- Issue matching ---
             let mut issue_info: Option<IssueInfo> = None;
 
@@ -529,6 +553,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -586,6 +611,7 @@ mod tests {
                 vec![RepoAssociationRecord {
                     repo_path: rp.clone(),
                     branch: Some(branch.to_string()),
+                    pr_identity: None,
                 }],
             );
             let pr = create_mock_pr(10, "PR title", branch, "", "");
@@ -606,6 +632,7 @@ mod tests {
                 vec![RepoAssociationRecord {
                     repo_path: rp.clone(),
                     branch: Some(branch.to_string()),
+                    pr_identity: None,
                 }],
             );
             let issue = create_mock_issue(42, "Issue title");
@@ -625,6 +652,7 @@ mod tests {
                 vec![RepoAssociationRecord {
                     repo_path: rp.clone(),
                     branch: Some(branch.to_string()),
+                    pr_identity: None,
                 }],
             );
             let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
@@ -642,6 +670,7 @@ mod tests {
                 vec![RepoAssociationRecord {
                     repo_path: rp.clone(),
                     branch: Some("my-feature".to_string()),
+                    pr_identity: None,
                 }],
             );
             let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
@@ -660,6 +689,7 @@ mod tests {
                 vec![RepoAssociationRecord {
                     repo_path: rp.clone(),
                     branch: None,
+                    pr_identity: None,
                 }],
             );
             let repo_data = HashMap::new();
@@ -680,6 +710,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some("feature-a".to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -713,10 +744,12 @@ mod tests {
                 RepoAssociationRecord {
                     repo_path: rp_a.clone(),
                     branch: Some("feature-x".to_string()),
+                    pr_identity: None,
                 },
                 RepoAssociationRecord {
                     repo_path: rp_b.clone(),
                     branch: Some("feature-x".to_string()),
+                    pr_identity: None,
                 },
             ],
         );
@@ -771,6 +804,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: None,
+                pr_identity: None,
             }],
         );
 
@@ -808,6 +842,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -857,6 +892,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -909,6 +945,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -944,6 +981,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -987,6 +1025,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -1019,6 +1058,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp,
                 branch: Some(branch.to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -1119,6 +1159,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some("42-fix-bug".to_string()),
+                pr_identity: None,
             }],
         );
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
@@ -1169,6 +1210,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -1199,6 +1241,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: None,
+                pr_identity: None,
             }],
         );
 
@@ -1209,6 +1252,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: None,
+                pr_identity: None,
             }],
         );
 
@@ -1235,6 +1279,7 @@ mod tests {
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: repo_path("alpha"),
                     branch: None,
+                    pr_identity: None,
                 }],
                 plan: None,
             },
@@ -1250,6 +1295,7 @@ mod tests {
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: repo_path("alpha"),
                     branch: None,
+                    pr_identity: None,
                 }],
                 plan: None,
             },
@@ -1263,6 +1309,7 @@ mod tests {
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: repo_path("alpha"),
                     branch: None,
+                    pr_identity: None,
                 }],
                 plan: None,
             },
@@ -1289,6 +1336,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -1321,6 +1369,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -1352,10 +1401,12 @@ mod tests {
                 RepoAssociationRecord {
                     repo_path: rp_a.clone(),
                     branch: Some("feature-x".to_string()),
+                    pr_identity: None,
                 },
                 RepoAssociationRecord {
                     repo_path: rp_b.clone(),
                     branch: Some("feature-x".to_string()),
+                    pr_identity: None,
                 },
             ],
         );
@@ -1396,6 +1447,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -1468,6 +1520,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(branch.to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -1504,6 +1557,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some("fix-readme".to_string()),
+                pr_identity: None,
             }],
         );
 
@@ -1554,6 +1608,147 @@ mod tests {
 
     // -- Round 10 regression tests --
 
+    // -- PR identity fallback tests --
+
+    /// Persisted pr_identity produces a PrInfo when the backend record is
+    /// Done and no live PR is found.
+    #[test]
+    fn pr_identity_fallback_produces_pr_info_for_done_item() {
+        let rp = repo_path("alpha");
+        let branch = "feature-x";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Shipped feature",
+            WorkItemStatus::Done,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+                pr_identity: Some(crate::work_item_backend::PrIdentityRecord {
+                    number: 42,
+                    title: "Ship it".into(),
+                    url: "https://github.com/o/r/pull/42".into(),
+                }),
+            }],
+        );
+
+        // No live PRs in repo data.
+        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.status, WorkItemStatus::Done);
+        assert!(
+            item.status_derived,
+            "status_derived should be true when pr_identity fallback injects PrState::Merged",
+        );
+
+        let assoc = &item.repo_associations[0];
+        let pr = assoc
+            .pr
+            .as_ref()
+            .expect("pr_identity fallback should produce PrInfo");
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.title, "Ship it");
+        assert_eq!(pr.state, PrState::Merged);
+        assert_eq!(pr.url, "https://github.com/o/r/pull/42");
+    }
+
+    /// A live PR takes precedence over persisted pr_identity.
+    #[test]
+    fn live_pr_takes_precedence_over_pr_identity() {
+        let rp = repo_path("alpha");
+        let branch = "feature-x";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Work",
+            WorkItemStatus::Implementing,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+                pr_identity: Some(crate::work_item_backend::PrIdentityRecord {
+                    number: 42,
+                    title: "Old merged PR".into(),
+                    url: "https://github.com/o/r/pull/42".into(),
+                }),
+            }],
+        );
+
+        // A live PR exists on the same branch.
+        let live_pr = create_mock_pr(99, "New PR on same branch", branch, "", "PENDING");
+
+        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![live_pr], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        let assoc = &items[0].repo_associations[0];
+        let pr = assoc.pr.as_ref().expect("should have live PR info");
+        assert_eq!(
+            pr.number, 99,
+            "live PR should take precedence over pr_identity"
+        );
+        assert_eq!(pr.title, "New PR on same branch");
+        assert_eq!(pr.state, PrState::Open);
+    }
+
+    /// Persisted pr_identity is ignored when the item is NOT Done.
+    /// This prevents an irreversible Done lock when a merge is reverted
+    /// and the user moves the item back.
+    #[test]
+    fn pr_identity_ignored_when_item_not_done() {
+        let rp = repo_path("alpha");
+        let branch = "feature-x";
+
+        // Backend record is Implementing (user moved it back after merge revert).
+        let record = create_mock_record(
+            "wi-1",
+            "Reverted merge",
+            WorkItemStatus::Implementing,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+                pr_identity: Some(crate::work_item_backend::PrIdentityRecord {
+                    number: 42,
+                    title: "Old merged PR".into(),
+                    url: "https://github.com/o/r/pull/42".into(),
+                }),
+            }],
+        );
+
+        // No live PRs.
+        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+
+        // pr_identity should NOT be used because record.status != Done.
+        assert!(
+            item.repo_associations[0].pr.is_none(),
+            "pr_identity should be ignored for non-Done items, got: {:?}",
+            item.repo_associations[0].pr,
+        );
+
+        // Status should remain Implementing, NOT be derived to Done.
+        assert_eq!(
+            item.status,
+            WorkItemStatus::Implementing,
+            "non-Done item with pr_identity should not be forced to Done",
+        );
+        assert!(
+            !item.status_derived,
+            "status_derived should be false for non-Done item with pr_identity",
+        );
+    }
+
     /// F-1 regression: After importing a fork PR, reassembling should NOT
     /// show it as unlinked again. The import creates a work item that
     /// claims the (repo_path, branch), so collect_unlinked_prs must
@@ -1572,6 +1767,7 @@ mod tests {
             vec![RepoAssociationRecord {
                 repo_path: rp.clone(),
                 branch: Some(fork_branch.to_string()),
+                pr_identity: None,
             }],
         );
 

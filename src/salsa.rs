@@ -190,6 +190,52 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
         state.fetcher_handle = Some(handle);
     }
 
+    // Backfill PR identity for Done items that were merged before
+    // persistence was added. One-time startup migration - can be removed
+    // once no Done items with pr_identity=None remain on disk.
+    let backfill_requests = state.collect_backfill_requests();
+    if !backfill_requests.is_empty() {
+        let gc = Arc::clone(&ctx.github_client);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        std::thread::spawn(move || {
+            use std::collections::HashMap;
+            // Group by (owner, repo) to make one API call per repo.
+            let mut by_repo: HashMap<(String, String), Vec<_>> = HashMap::new();
+            for (wi_id, repo_path, branch, owner, repo_name) in backfill_requests {
+                by_repo
+                    .entry((owner, repo_name))
+                    .or_default()
+                    .push((wi_id, repo_path, branch));
+            }
+            for ((owner, repo_name), items) in by_repo {
+                let merged_prs = match gc.list_merged_prs(&owner, &repo_name) {
+                    Ok(prs) => prs,
+                    Err(e) => {
+                        let _ = tx.send(Err(format!(
+                            "failed to list merged PRs for {owner}/{repo_name}: {e}"
+                        )));
+                        continue;
+                    }
+                };
+                for (wi_id, repo_path, branch) in items {
+                    if let Some(pr) = merged_prs.iter().find(|p| p.head_branch == branch) {
+                        let identity = crate::work_item_backend::PrIdentityRecord {
+                            number: pr.number,
+                            title: pr.title.clone(),
+                            url: pr.url.clone(),
+                        };
+                        let _ = tx.send(Ok(crate::app::PrIdentityBackfillResult {
+                            wi_id,
+                            repo_path,
+                            identity,
+                        }));
+                    }
+                }
+            }
+        });
+        state.pr_identity_backfill_rx = Some(rx);
+    }
+
     Ok(())
 }
 
@@ -269,6 +315,13 @@ pub fn app_event(
 
             // Drain fetch results and reassemble if new data arrived.
             if state.drain_fetch_results() {
+                state.reassemble_work_items();
+                state.build_display_list();
+                state.global_mcp_context_dirty = true;
+            }
+
+            // Drain PR identity backfill results (one-time startup migration).
+            if state.drain_pr_identity_backfill() {
                 state.reassemble_work_items();
                 state.build_display_list();
                 state.global_mcp_context_dirty = true;
