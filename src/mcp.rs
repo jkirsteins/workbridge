@@ -1040,18 +1040,52 @@ pub fn run_bridge(socket_path: PathBuf) {
 
 /// Build MCP config JSON for passing to the claude CLI.
 /// Returns the JSON string for use with --mcp-config or .mcp.json.
-pub fn build_mcp_config(exe_path: &Path, socket_path: &Path) -> String {
-    let config = json!({
-        "mcpServers": {
-            "workbridge": {
-                "command": exe_path.to_string_lossy(),
-                "args": [
-                    "--mcp-bridge",
-                    "--socket", socket_path.to_string_lossy()
-                ]
+///
+/// `extra_servers` are per-repo MCP servers from the user's config. The
+/// workbridge server is always inserted last so it wins over any user entry
+/// with the same name.
+pub fn build_mcp_config(
+    exe_path: &Path,
+    socket_path: &Path,
+    extra_servers: &[crate::config::McpServerEntry],
+) -> String {
+    let mut servers = serde_json::Map::new();
+
+    // Insert user-configured servers first.
+    for entry in extra_servers {
+        let mut server = serde_json::Map::new();
+        if entry.server_type == "http" {
+            server.insert("type".to_string(), json!("http"));
+            if let Some(ref url) = entry.url {
+                server.insert("url".to_string(), json!(url));
+            }
+        } else {
+            if let Some(ref command) = entry.command {
+                server.insert("command".to_string(), json!(command));
+            }
+            if !entry.args.is_empty() {
+                server.insert("args".to_string(), json!(entry.args));
+            }
+            if !entry.env.is_empty() {
+                server.insert("env".to_string(), json!(entry.env));
             }
         }
-    });
+        servers.insert(entry.name.clone(), serde_json::Value::Object(server));
+    }
+
+    // Workbridge server is always inserted last so it cannot be overridden.
+    servers.insert(
+        "workbridge".to_string(),
+        json!({
+            "command": exe_path.to_string_lossy(),
+            "args": [
+                "--mcp-bridge",
+                "--socket", socket_path.to_string_lossy()
+            ]
+        }),
+    );
+
+    let config = json!({ "mcpServers": servers });
     serde_json::to_string_pretty(&config).unwrap_or_default()
 }
 
@@ -1330,7 +1364,7 @@ mod tests {
     fn build_mcp_config_produces_valid_json() {
         let exe = PathBuf::from("/usr/local/bin/workbridge");
         let sock = PathBuf::from("/tmp/test.sock");
-        let config_str = build_mcp_config(&exe, &sock);
+        let config_str = build_mcp_config(&exe, &sock, &[]);
         let config: Value = serde_json::from_str(&config_str).unwrap();
         assert!(
             config["mcpServers"]["workbridge"]["command"]
@@ -1343,6 +1377,71 @@ mod tests {
             .unwrap();
         assert!(args.iter().any(|a| a.as_str() == Some("--mcp-bridge")));
         assert!(args.iter().any(|a| a.as_str() == Some("--socket")));
+    }
+
+    #[test]
+    fn build_mcp_config_includes_extra_servers() {
+        use crate::config::McpServerEntry;
+        use std::collections::BTreeMap;
+        let exe = PathBuf::from("/usr/local/bin/workbridge");
+        let sock = PathBuf::from("/tmp/test.sock");
+        let extra = vec![McpServerEntry {
+            repo: "~/Projects/myrepo".into(),
+            name: "chrome-devtools".into(),
+            server_type: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
+            env: BTreeMap::new(),
+            url: None,
+        }];
+        let config_str = build_mcp_config(&exe, &sock, &extra);
+        let config: Value = serde_json::from_str(&config_str).unwrap();
+        // User server present.
+        assert_eq!(
+            config["mcpServers"]["chrome-devtools"]["command"]
+                .as_str()
+                .unwrap(),
+            "npx"
+        );
+        // Workbridge still present.
+        assert!(
+            config["mcpServers"]["workbridge"]["command"]
+                .as_str()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn build_mcp_config_workbridge_key_always_wins() {
+        use crate::config::McpServerEntry;
+        use std::collections::BTreeMap;
+        let exe = PathBuf::from("/usr/local/bin/workbridge");
+        let sock = PathBuf::from("/tmp/test.sock");
+        // User tries to register a server named "workbridge".
+        let extra = vec![McpServerEntry {
+            repo: "~/Projects/myrepo".into(),
+            name: "workbridge".into(),
+            server_type: "stdio".into(),
+            command: Some("evil".into()),
+            args: vec![],
+            env: BTreeMap::new(),
+            url: None,
+        }];
+        let config_str = build_mcp_config(&exe, &sock, &extra);
+        let config: Value = serde_json::from_str(&config_str).unwrap();
+        // Real workbridge server wins.
+        assert!(
+            config["mcpServers"]["workbridge"]["command"]
+                .as_str()
+                .unwrap()
+                .contains("workbridge")
+        );
+        assert_ne!(
+            config["mcpServers"]["workbridge"]["command"]
+                .as_str()
+                .unwrap(),
+            "evil"
+        );
     }
 
     // -----------------------------------------------------------------------
