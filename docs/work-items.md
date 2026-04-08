@@ -73,6 +73,11 @@ a persisted PR identity snapshot (saved at merge time), assembly synthesizes
 a PrInfo with PrState::Merged from the snapshot. This ensures Done items
 continue displaying their PR link after the branch/PR is cleaned up.
 
+For Done items that were merged before `pr_identity` persistence existed,
+a one-time startup backfill queries GitHub for merged PRs and populates
+the snapshot. This migration code (in `salsa.rs` / `app.rs`) can be
+removed once no Done items with `pr_identity=None` remain on disk.
+
 If no live PR exists and no persisted PR identity applies, there is no PR
 piece.
 

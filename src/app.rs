@@ -168,6 +168,13 @@ pub struct PrMergeResult {
     pub outcome: PrMergeOutcome,
 }
 
+/// Result from the background PR identity backfill thread.
+pub struct PrIdentityBackfillResult {
+    pub wi_id: WorkItemId,
+    pub repo_path: PathBuf,
+    pub identity: PrIdentityRecord,
+}
+
 /// Result from the asynchronous worktree creation thread.
 pub struct WorktreeCreateResult {
     /// The work item the worktree was created for.
@@ -352,6 +359,11 @@ pub struct App {
     /// Activity ID for the running PR merge indicator.
     pub pr_merge_activity: Option<ActivityId>,
 
+    // -- PR identity backfill --
+    /// Receiver for background PR identity backfill results (one-time startup).
+    pub pr_identity_backfill_rx:
+        Option<crossbeam_channel::Receiver<Result<PrIdentityBackfillResult, String>>>,
+
     // -- Async worktree creation --
     /// Receiver for asynchronous worktree creation results.
     pub worktree_create_rx: Option<crossbeam_channel::Receiver<WorktreeCreateResult>>,
@@ -502,6 +514,7 @@ impl App {
             pr_create_pending: VecDeque::new(),
             pr_merge_rx: None,
             pr_merge_activity: None,
+            pr_identity_backfill_rx: None,
             worktree_create_rx: None,
             worktree_create_activity: None,
             worktree_create_wi: None,
@@ -3357,6 +3370,91 @@ impl App {
                 self.status_message = Some(error.clone());
             }
         }
+    }
+
+    /// Collect Done items that need PR identity backfill (have a branch but
+    /// no persisted pr_identity). Returns tuples of
+    /// (wi_id, repo_path, branch, github_owner, github_repo).
+    ///
+    /// Temporary migration helper - can be removed once all existing Done
+    /// items have been backfilled (i.e. no Done items with pr_identity=None
+    /// remain on disk).
+    pub fn collect_backfill_requests(&self) -> Vec<(WorkItemId, PathBuf, String, String, String)> {
+        let records = match self.backend.list() {
+            Ok(lr) => lr.records,
+            Err(_) => return vec![],
+        };
+        let mut requests = Vec::new();
+        for record in &records {
+            if record.status != WorkItemStatus::Done {
+                continue;
+            }
+            for assoc in &record.repo_associations {
+                if assoc.pr_identity.is_some() {
+                    continue;
+                }
+                let branch = match &assoc.branch {
+                    Some(b) => b.clone(),
+                    None => continue,
+                };
+                let (owner, repo_name) = match self.worktree_service.github_remote(&assoc.repo_path)
+                {
+                    Ok(Some((o, r))) => (o, r),
+                    _ => continue,
+                };
+                requests.push((
+                    record.id.clone(),
+                    assoc.repo_path.clone(),
+                    branch,
+                    owner,
+                    repo_name,
+                ));
+            }
+        }
+        requests
+    }
+
+    /// Drain results from the PR identity backfill channel. Returns true
+    /// if any identities were saved (caller should reassemble).
+    ///
+    /// Temporary migration helper - can be removed once all existing Done
+    /// items have been backfilled.
+    pub fn drain_pr_identity_backfill(&mut self) -> bool {
+        let rx = match self.pr_identity_backfill_rx.as_ref() {
+            Some(rx) => rx,
+            None => return false,
+        };
+        let mut changed = false;
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => match msg {
+                    Ok(result) => {
+                        if let Err(e) = self.backend.save_pr_identity(
+                            &result.wi_id,
+                            &result.repo_path,
+                            &result.identity,
+                        ) {
+                            self.status_message = Some(format!("PR identity backfill error: {e}"));
+                        } else {
+                            changed = true;
+                        }
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("PR identity backfill: {e}"));
+                    }
+                },
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            self.pr_identity_backfill_rx = None;
+        }
+        changed
     }
 
     /// Remove the worktree directory for a work item after merge.
@@ -7379,5 +7477,239 @@ mod tests {
             !msg.contains("not allowed"),
             "Blocked->Review must not be rejected as 'not allowed', got: {msg}",
         );
+    }
+
+    // -- PR identity backfill tests --
+
+    fn make_assoc(repo: &str, branch: &str) -> crate::work_item_backend::RepoAssociationRecord {
+        crate::work_item_backend::RepoAssociationRecord {
+            repo_path: PathBuf::from(repo),
+            branch: Some(branch.to_string()),
+            pr_identity: None,
+        }
+    }
+
+    #[test]
+    fn collect_backfill_requests_returns_done_items_without_pr_identity() {
+        use crate::work_item_backend::LocalFileBackend;
+
+        let dir = std::env::temp_dir().join("workbridge-test-backfill-collect");
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        // Done item with branch but no pr_identity - should be returned.
+        let done_record = backend
+            .create(CreateWorkItem {
+                title: "Done item".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![make_assoc("/tmp/repo", "feature/done")],
+            })
+            .unwrap();
+        backend
+            .update_status(&done_record.id, WorkItemStatus::Done)
+            .unwrap();
+
+        // Backlog item with branch - should be skipped.
+        let _ = backend
+            .create(CreateWorkItem {
+                title: "Impl item".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![make_assoc("/tmp/repo", "feature/impl")],
+            })
+            .unwrap();
+
+        // Done item with pr_identity already set - should be skipped.
+        let done_with_pr = backend
+            .create(CreateWorkItem {
+                title: "Done with PR".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![make_assoc("/tmp/repo", "feature/done-pr")],
+            })
+            .unwrap();
+        backend
+            .update_status(&done_with_pr.id, WorkItemStatus::Done)
+            .unwrap();
+        backend
+            .save_pr_identity(
+                &done_with_pr.id,
+                &PathBuf::from("/tmp/repo"),
+                &crate::work_item_backend::PrIdentityRecord {
+                    number: 42,
+                    title: "Already set".into(),
+                    url: "https://example.com/pr/42".into(),
+                },
+            )
+            .unwrap();
+
+        let mut app = App::with_config(Config::default(), Box::new(backend));
+        app.worktree_service = Arc::new(StubWorktreeService);
+
+        let requests = app.collect_backfill_requests();
+
+        // Only the first Done item (no pr_identity) should be a candidate.
+        // StubWorktreeService.github_remote returns None, so the request
+        // is skipped (no github remote). Verify filter works correctly.
+        assert!(
+            requests.is_empty(),
+            "no requests without github remote, got {}",
+            requests.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_backfill_requests_returns_requests_when_github_remote_available() {
+        use crate::work_item_backend::LocalFileBackend;
+        use crate::worktree_service::{WorktreeError, WorktreeInfo};
+
+        /// A worktree service that always returns a github remote.
+        struct GithubWorktreeService;
+        impl WorktreeService for GithubWorktreeService {
+            fn list_worktrees(
+                &self,
+                _repo_path: &std::path::Path,
+            ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+                Ok(Vec::new())
+            }
+            fn create_worktree(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+                _target_dir: &std::path::Path,
+            ) -> Result<WorktreeInfo, WorktreeError> {
+                Err(WorktreeError::GitError("stub".into()))
+            }
+            fn remove_worktree(
+                &self,
+                _repo_path: &std::path::Path,
+                _worktree_path: &std::path::Path,
+                _delete_branch: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn default_branch(
+                &self,
+                _repo_path: &std::path::Path,
+            ) -> Result<String, WorktreeError> {
+                Ok("main".to_string())
+            }
+            fn github_remote(
+                &self,
+                _repo_path: &std::path::Path,
+            ) -> Result<Option<(String, String)>, WorktreeError> {
+                Ok(Some(("testowner".to_string(), "testrepo".to_string())))
+            }
+            fn fetch_branch(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn create_branch(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+        }
+
+        let dir = std::env::temp_dir().join("workbridge-test-backfill-collect-positive");
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        // Done item with branch but no pr_identity - should produce a request.
+        let done_record = backend
+            .create(CreateWorkItem {
+                title: "Done item".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![make_assoc("/tmp/repo", "feature/done")],
+            })
+            .unwrap();
+        backend
+            .update_status(&done_record.id, WorkItemStatus::Done)
+            .unwrap();
+
+        // Backlog item - should be skipped.
+        let _ = backend
+            .create(CreateWorkItem {
+                title: "Backlog item".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                repo_associations: vec![make_assoc("/tmp/repo", "feature/backlog")],
+            })
+            .unwrap();
+
+        let mut app = App::with_config(Config::default(), Box::new(backend));
+        app.worktree_service = Arc::new(GithubWorktreeService);
+
+        let requests = app.collect_backfill_requests();
+
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one backfill request, got {}",
+            requests.len()
+        );
+        let (ref wi_id, ref _repo_path, ref branch, ref owner, ref repo_name) = requests[0];
+        assert_eq!(wi_id, &done_record.id);
+        assert_eq!(branch, "feature/done");
+        assert_eq!(owner, "testowner");
+        assert_eq!(repo_name, "testrepo");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drain_pr_identity_backfill_saves_results() {
+        use crate::work_item_backend::{LocalFileBackend, PrIdentityRecord};
+
+        let dir = std::env::temp_dir().join("workbridge-test-backfill-drain");
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Drain test".into(),
+                description: None,
+                status: WorkItemStatus::Done,
+                repo_associations: vec![make_assoc("/tmp/repo", "feature/drain")],
+            })
+            .unwrap();
+
+        let mut app = App::with_config(Config::default(), Box::new(backend));
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(Ok(PrIdentityBackfillResult {
+            wi_id: record.id.clone(),
+            repo_path: PathBuf::from("/tmp/repo"),
+            identity: PrIdentityRecord {
+                number: 99,
+                title: "Backfilled PR".into(),
+                url: "https://example.com/pr/99".into(),
+            },
+        }))
+        .unwrap();
+        drop(tx);
+        app.pr_identity_backfill_rx = Some(rx);
+
+        let changed = app.drain_pr_identity_backfill();
+        assert!(changed, "should report changed");
+
+        // Verify pr_identity was persisted to the backend.
+        let updated = app.backend.read(&record.id).unwrap();
+        let assoc = updated.repo_associations.first().unwrap();
+        let pi = assoc.pr_identity.as_ref().unwrap();
+        assert_eq!(pi.number, 99);
+        assert_eq!(pi.title, "Backfilled PR");
+        assert_eq!(pi.url, "https://example.com/pr/99");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

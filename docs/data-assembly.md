@@ -48,6 +48,12 @@ url) persisted at merge time. After a PR is merged it leaves the open-PR
 list, so the assembly layer uses the persisted identity as a fallback to
 keep Done items showing their PR link.
 
+Done items that were merged before `pr_identity` persistence was added
+have their identity backfilled at startup: a background thread queries
+`gh pr list --state merged` once per repo and matches branches. This is
+a one-time migration - once all Done items have `pr_identity` on disk,
+the backfill code can be removed.
+
 ### Tier 0: Local git (instant, always available)
 
 - Worktree path and existence (matched by branch name)

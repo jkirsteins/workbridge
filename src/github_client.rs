@@ -68,6 +68,13 @@ pub trait GithubClient: Send + Sync {
 
     /// Get a single issue by number.
     fn get_issue(&self, owner: &str, repo: &str, number: u64) -> Result<GithubIssue, GithubError>;
+
+    /// List merged PRs for a given owner/repo. Used to backfill PR identity
+    /// for Done items that were merged before persistence was added.
+    fn list_merged_prs(&self, owner: &str, repo: &str) -> Result<Vec<GithubPr>, GithubError> {
+        let _ = (owner, repo);
+        Ok(vec![])
+    }
 }
 
 /// Mock GitHub client for tests. Returns configurable fixture data.
@@ -113,6 +120,18 @@ impl GithubClient for MockGithubClient {
             .find(|i| i.number == number)
             .cloned()
             .ok_or_else(|| GithubError::ApiError(format!("issue #{number} not found")))
+    }
+
+    fn list_merged_prs(&self, _owner: &str, _repo: &str) -> Result<Vec<GithubPr>, GithubError> {
+        if let Some(ref err) = self.error {
+            return Err(err.clone());
+        }
+        Ok(self
+            .prs
+            .iter()
+            .filter(|p| p.state == "MERGED")
+            .cloned()
+            .collect())
     }
 }
 
@@ -189,6 +208,28 @@ impl GithubClient for GhCliClient {
             .map_err(|e| GithubError::ParseError(format!("failed to parse issue JSON: {e}")))?;
 
         parse_issue_from_value(&value)
+    }
+
+    fn list_merged_prs(&self, owner: &str, repo: &str) -> Result<Vec<GithubPr>, GithubError> {
+        let repo_arg = format!("{owner}/{repo}");
+        let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner";
+        let stdout = self.run_gh(&[
+            "pr",
+            "list",
+            "--repo",
+            &repo_arg,
+            "--state",
+            "merged",
+            "--json",
+            json_fields,
+            "--limit",
+            "500",
+        ])?;
+
+        let items: Vec<Value> = serde_json::from_str(&stdout)
+            .map_err(|e| GithubError::ParseError(format!("failed to parse PR list JSON: {e}")))?;
+
+        items.iter().map(parse_pr_from_value).collect()
     }
 }
 
