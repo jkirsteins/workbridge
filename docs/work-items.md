@@ -115,13 +115,14 @@ Stage restrictions for ReviewRequest items:
 
 ## Work Item Status
 
-Work items follow a six-stage workflow:
+Work items follow a seven-stage workflow:
 
 - **Backlog** - Work has been identified but not started. (Stored as "Backlog" in the backend; legacy "Todo" values are accepted via serde alias.)
 - **Planning** - A Claude session produces an implementation plan. Advancing to Implementing requires the plan to be set via `workbridge_set_plan`; manual advance is blocked.
 - **Implementing** - Active development. A Claude session works on the code.
 - **Blocked** - The implementation is stuck and needs user input. Can move back to Implementing when unblocked.
 - **Review** - Implementation is complete and under review. Entering Review from Implementing or Blocked triggers a review gate (async plan-vs-implementation check) and auto-creates a PR.
+- **Mergequeue** - Waiting for a PR to be merged externally (e.g., by a CI merge queue, another person, or manual merge outside the TUI). The TUI polls the PR state every 30 seconds and auto-transitions to Done when the PR is detected as merged. Can retreat back to Review.
 - **Done** - Work is finished. This status is derived, not directly settable (see below).
 
 ### Status transitions
@@ -142,9 +143,22 @@ When a work item transitions from Implementing or Blocked to Review (whether use
 
 ### Merge gate
 
-Advancing from Review to Done is gated by PR merge. Instead of directly changing status, the user is prompted to choose a merge strategy (squash or merge). The TUI spawns an async `gh pr merge` command. Done is reached only after GitHub confirms the PR was merged.
+Advancing from Review to Done is gated by PR merge. Instead of directly changing status, the user is prompted to choose a merge strategy (squash, merge, or poll). The TUI spawns an async `gh pr merge` command for squash/merge. Done is reached only after GitHub confirms the PR was merged.
 
 If any prerequisite is missing - no repo association, no branch, no GitHub remote, or no open PR - the merge is blocked with an error message and the item stays in Review. Done cannot be set directly via MCP either; it always requires the merge gate.
+
+### Mergequeue (poll strategy)
+
+When the user selects "poll" at the merge prompt, the work item transitions to the Mergequeue state instead of attempting an immediate merge. This is for PRs that can't be merged directly from the TUI - for example, PRs that go through a CI merge queue, require approvals from others, or need to be merged by someone else.
+
+In the Mergequeue state:
+- The TUI polls the PR state via `gh pr view` every 30 seconds.
+- When the PR is detected as merged, the item auto-transitions to Done (via the `"pr_merge"` source, satisfying the merge-gate invariant).
+- If the PR is closed without merging, a warning is shown but the item stays in Mergequeue.
+- The user can retreat back to Review via Shift+Left at any time.
+- No Claude session runs in this state.
+- In the board view, Mergequeue items appear in the Review column with a `[MQ]` prefix.
+- On app restart, watches are reconstructed from backend records with Mergequeue status.
 
 ### Derived Done status
 

@@ -804,6 +804,12 @@ fn handle_merge_prompt(app: &mut App, key: KeyEvent) {
                 app.execute_merge(&wi_id, "merge");
             }
         }
+        (_, KeyCode::Char('p')) => {
+            app.confirm_merge = false;
+            if let Some(wi_id) = app.merge_wi_id.take() {
+                app.enter_mergequeue(&wi_id);
+            }
+        }
         (_, KeyCode::Esc) => {
             app.confirm_merge = false;
             app.merge_wi_id = None;

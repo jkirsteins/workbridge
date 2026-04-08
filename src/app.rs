@@ -184,6 +184,24 @@ pub struct PrMergeResult {
     pub outcome: PrMergeOutcome,
 }
 
+/// Information needed to poll a Mergequeue item's PR state.
+pub struct MergequeueWatch {
+    pub wi_id: WorkItemId,
+    pub pr_number: u64,
+    pub owner_repo: String,
+    pub branch: String,
+    pub repo_path: PathBuf,
+}
+
+/// Result from the background Mergequeue PR state poll.
+pub struct MergequeuePollResult {
+    pub wi_id: WorkItemId,
+    pub pr_state: String,
+    pub branch: String,
+    pub repo_path: PathBuf,
+    pub pr_identity: Option<PrIdentityRecord>,
+}
+
 /// Result from the background PR identity backfill thread.
 pub struct PrIdentityBackfillResult {
     pub wi_id: WorkItemId,
@@ -396,6 +414,16 @@ pub struct App {
     /// Activity ID for the running PR merge indicator.
     pub pr_merge_activity: Option<ActivityId>,
 
+    // -- Mergequeue polling --
+    /// Active mergequeue watches - items waiting for their PR to be merged.
+    pub mergequeue_watches: Vec<MergequeueWatch>,
+    /// Receiver for the current in-flight mergequeue poll result.
+    pub mergequeue_poll_rx: Option<crossbeam_channel::Receiver<MergequeuePollResult>>,
+    /// Activity ID for the mergequeue poll indicator.
+    pub mergequeue_poll_activity: Option<ActivityId>,
+    /// Timestamp of the last mergequeue poll to enforce cooldown.
+    pub mergequeue_last_poll: Option<std::time::Instant>,
+
     // -- PR identity backfill --
     /// Receiver for background PR identity backfill results (one-time startup).
     pub pr_identity_backfill_rx:
@@ -556,6 +584,10 @@ impl App {
             pr_create_pending: VecDeque::new(),
             pr_merge_rx: None,
             pr_merge_activity: None,
+            mergequeue_watches: Vec::new(),
+            mergequeue_poll_rx: None,
+            mergequeue_poll_activity: None,
+            mergequeue_last_poll: None,
             pr_identity_backfill_rx: None,
             worktree_create_rx: None,
             worktree_create_activity: None,
@@ -1136,6 +1168,10 @@ impl App {
         self.work_items = items;
         self.unlinked_prs = unlinked;
         self.review_requested_prs = review_requested;
+
+        // Reconstruct mergequeue watches for items that are in Mergequeue
+        // but don't have a watch (e.g., after app restart).
+        self.reconstruct_mergequeue_watches();
     }
 
     /// Build the display list from current work_items and unlinked_prs.
@@ -1157,6 +1193,9 @@ impl App {
                 let matches = if *drill_stage == WorkItemStatus::Implementing {
                     self.work_items[i].status == WorkItemStatus::Implementing
                         || self.work_items[i].status == WorkItemStatus::Blocked
+                } else if *drill_stage == WorkItemStatus::Review {
+                    self.work_items[i].status == WorkItemStatus::Review
+                        || self.work_items[i].status == WorkItemStatus::Mergequeue
                 } else {
                     self.work_items[i].status == *drill_stage
                 };
@@ -1442,6 +1481,8 @@ impl App {
                 if *status == WorkItemStatus::Implementing {
                     wi.status == WorkItemStatus::Implementing
                         || wi.status == WorkItemStatus::Blocked
+                } else if *status == WorkItemStatus::Review {
+                    wi.status == WorkItemStatus::Review || wi.status == WorkItemStatus::Mergequeue
                 } else {
                     wi.status == *status
                 }
@@ -1587,7 +1628,10 @@ impl App {
         let work_item_id = wi.id.clone();
 
         // Stages without sessions.
-        if matches!(wi.status, WorkItemStatus::Backlog | WorkItemStatus::Done) {
+        if matches!(
+            wi.status,
+            WorkItemStatus::Backlog | WorkItemStatus::Done | WorkItemStatus::Mergequeue
+        ) {
             return;
         }
 
@@ -1947,7 +1991,9 @@ impl App {
         // state the work item is in.  Uses the worktree path (not the main
         // repo path) so Claude runs commands in the right directory.
         let situation = match status {
-            WorkItemStatus::Backlog | WorkItemStatus::Done => return None,
+            WorkItemStatus::Backlog | WorkItemStatus::Done | WorkItemStatus::Mergequeue => {
+                return None;
+            }
             WorkItemStatus::Planning => {
                 if has_branch_commits {
                     format!(
@@ -2011,7 +2057,9 @@ impl App {
         // Backlog | Done already returned None above, so they are
         // unreachable here - the match uses a cloned status value.
         let prompt_key = match status {
-            WorkItemStatus::Backlog | WorkItemStatus::Done => unreachable!(),
+            WorkItemStatus::Backlog | WorkItemStatus::Done | WorkItemStatus::Mergequeue => {
+                unreachable!()
+            }
             WorkItemStatus::Planning => {
                 if has_branch_commits {
                     "planning_retroactive"
@@ -2938,6 +2986,11 @@ impl App {
             }
         }
 
+        // Cancel mergequeue watch for the deleted item. Any in-flight poll
+        // result for a deleted item is discarded by poll_mergequeue (the item
+        // won't be found in work_items after reassembly).
+        self.mergequeue_watches.retain(|w| w.wi_id != work_item_id);
+
         // -- Phase 6: Clean up in-memory state --
         self.rework_reasons.remove(&work_item_id);
         self.review_gate_findings.remove(&work_item_id);
@@ -3065,8 +3118,17 @@ impl App {
         if current_status == WorkItemStatus::Review && new_status == WorkItemStatus::Done {
             self.confirm_merge = true;
             self.merge_wi_id = Some(wi_id);
+            self.status_message = Some(
+                "Merge PR? [s]quash (default) / [m]erge / [p]oll (mergequeue) / [Esc] cancel"
+                    .into(),
+            );
+            return;
+        }
+
+        // Mergequeue items are waiting for an external merge - block manual advance.
+        if current_status == WorkItemStatus::Mergequeue {
             self.status_message =
-                Some("Merge PR? [s]quash (default) / [m]erge / [Esc] cancel".into());
+                Some("Waiting for PR to be merged - retreat with Shift+Left to cancel".into());
             return;
         }
 
@@ -3133,6 +3195,16 @@ impl App {
                 }
             }
             self.pr_create_pending.retain(|id| *id != wi_id);
+        }
+
+        // Clean up mergequeue watch and in-flight poll when retreating
+        // from Mergequeue back to Review.
+        if current_status == WorkItemStatus::Mergequeue {
+            self.mergequeue_watches.retain(|w| w.wi_id != wi_id);
+            self.mergequeue_poll_rx = None;
+            if let Some(aid) = self.mergequeue_poll_activity.take() {
+                self.end_activity(aid);
+            }
         }
 
         // Rework prompt: when retreating from Review to Implementing,
@@ -3246,7 +3318,10 @@ impl App {
         }
 
         // Auto-spawn a session for stages that have prompts.
-        if !matches!(new_status, WorkItemStatus::Backlog | WorkItemStatus::Done) {
+        if !matches!(
+            new_status,
+            WorkItemStatus::Backlog | WorkItemStatus::Done | WorkItemStatus::Mergequeue
+        ) {
             self.spawn_session(wi_id);
         }
     }
@@ -3780,6 +3855,299 @@ impl App {
             PrMergeOutcome::Failed { ref error } => {
                 self.status_message = Some(error.clone());
             }
+        }
+    }
+
+    /// Enter the Mergequeue state for a work item. The item must be in
+    /// Review with an open PR. Registers a watch so `poll_mergequeue()`
+    /// will check the PR state periodically.
+    pub fn enter_mergequeue(&mut self, wi_id: &WorkItemId) {
+        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
+            Some(w) => w,
+            None => return,
+        };
+        let assoc = match wi.repo_associations.first() {
+            Some(a) => a,
+            None => {
+                self.status_message = Some("Cannot enter mergequeue: no repo association".into());
+                return;
+            }
+        };
+        let branch = match assoc.branch.as_ref() {
+            Some(b) => b.clone(),
+            None => {
+                self.status_message = Some("Cannot enter mergequeue: no branch".into());
+                return;
+            }
+        };
+        let pr_number = match assoc.pr.as_ref() {
+            Some(pr) => pr.number,
+            None => {
+                self.status_message = Some("Cannot enter mergequeue: no PR found".into());
+                return;
+            }
+        };
+        let repo_path = assoc.repo_path.clone();
+        let (owner, repo_name) = match self.worktree_service.github_remote(&repo_path) {
+            Ok(Some((o, r))) => (o, r),
+            _ => {
+                self.status_message =
+                    Some("Cannot enter mergequeue: no GitHub remote found".into());
+                return;
+            }
+        };
+        let owner_repo = format!("{owner}/{repo_name}");
+
+        self.mergequeue_watches.push(MergequeueWatch {
+            wi_id: wi_id.clone(),
+            pr_number,
+            owner_repo,
+            branch,
+            repo_path,
+        });
+
+        self.apply_stage_change(
+            wi_id,
+            &WorkItemStatus::Review,
+            &WorkItemStatus::Mergequeue,
+            "user",
+        );
+        self.status_message = Some("Entered mergequeue - polling PR until merged".into());
+    }
+
+    /// Poll the PR state for items in the Mergequeue. Called on each timer
+    /// tick. Spawns at most one background thread at a time, with a 30-second
+    /// cooldown between polls.
+    pub fn poll_mergequeue(&mut self) {
+        // Phase 1: drain any in-flight result.
+        if let Some(ref rx) = self.mergequeue_poll_rx {
+            let result = match rx.try_recv() {
+                Ok(r) => r,
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.mergequeue_poll_rx = None;
+                    if let Some(aid) = self.mergequeue_poll_activity.take() {
+                        self.end_activity(aid);
+                    }
+                    return;
+                }
+            };
+
+            self.mergequeue_poll_rx = None;
+            if let Some(aid) = self.mergequeue_poll_activity.take() {
+                self.end_activity(aid);
+            }
+
+            // Check that the item is still in Mergequeue.
+            let actual_status = self
+                .work_items
+                .iter()
+                .find(|w| w.id == result.wi_id)
+                .map(|w| w.status.clone());
+
+            if actual_status.as_ref() != Some(&WorkItemStatus::Mergequeue) {
+                // Item moved away - remove watch and discard.
+                self.mergequeue_watches.retain(|w| w.wi_id != result.wi_id);
+                return;
+            }
+
+            match result.pr_state.as_str() {
+                "MERGED" => {
+                    // Persist PR identity.
+                    if let Some(identity) = &result.pr_identity
+                        && let Err(e) = self.backend.save_pr_identity(
+                            &result.wi_id,
+                            &result.repo_path,
+                            identity,
+                        )
+                    {
+                        self.status_message = Some(format!("PR identity save error: {e}"));
+                    }
+
+                    // Log merge to activity log.
+                    let log_entry = ActivityEntry {
+                        timestamp: now_iso8601(),
+                        event_type: "pr_merged".to_string(),
+                        payload: serde_json::json!({
+                            "strategy": "external",
+                            "branch": result.branch
+                        }),
+                    };
+                    if let Err(e) = self.backend.append_activity(&result.wi_id, &log_entry) {
+                        self.status_message = Some(format!("Activity log error: {e}"));
+                    }
+
+                    // Clean up worktree.
+                    self.cleanup_worktree_for_item(&result.wi_id);
+
+                    // Remove watch.
+                    self.mergequeue_watches.retain(|w| w.wi_id != result.wi_id);
+
+                    // Advance to Done.
+                    self.apply_stage_change(
+                        &result.wi_id,
+                        &WorkItemStatus::Mergequeue,
+                        &WorkItemStatus::Done,
+                        "pr_merge",
+                    );
+                    self.status_message = Some("PR merged externally - moved to [DN]".into());
+                }
+                "CLOSED" => {
+                    self.status_message = Some(
+                        "PR was closed without merging - retreat to Review or re-open the PR"
+                            .into(),
+                    );
+                }
+                s if s.starts_with("ERROR:") => {
+                    self.status_message = Some(format!(
+                        "Mergequeue poll error for {}: {}",
+                        result.branch, result.pr_state
+                    ));
+                    // Item stays in Mergequeue - will retry on next poll cycle.
+                }
+                _ => {
+                    // Still open - no action, will poll again next cycle.
+                }
+            }
+            return;
+        }
+
+        // Phase 2: spawn a new poll if cooldown elapsed and watches exist.
+        if self.mergequeue_watches.is_empty() {
+            return;
+        }
+        let cooldown = std::time::Duration::from_secs(30);
+        if let Some(last) = self.mergequeue_last_poll
+            && last.elapsed() < cooldown
+        {
+            return;
+        }
+
+        // Round-robin: rotate the first watch to the back after polling.
+        let watch = &self.mergequeue_watches[0];
+        let pr_number = watch.pr_number;
+        let owner_repo = watch.owner_repo.clone();
+        let wi_id = watch.wi_id.clone();
+        let branch = watch.branch.clone();
+        let repo_path = watch.repo_path.clone();
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        std::thread::spawn(move || {
+            let number_str = pr_number.to_string();
+            let outcome = match std::process::Command::new("gh")
+                .args([
+                    "pr",
+                    "view",
+                    &number_str,
+                    "--repo",
+                    &owner_repo,
+                    "--json",
+                    "state,number,title,url",
+                ])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let parsed: serde_json::Value = match serde_json::from_str(stdout.trim()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx.send(MergequeuePollResult {
+                                wi_id,
+                                pr_state: format!("ERROR: JSON parse failed: {e}"),
+                                branch,
+                                repo_path,
+                                pr_identity: None,
+                            });
+                            return;
+                        }
+                    };
+                    let state = parsed
+                        .get("state")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("UNKNOWN")
+                        .to_string();
+                    let pr_identity =
+                        parsed
+                            .get("number")
+                            .and_then(|n| n.as_u64())
+                            .and_then(|number| {
+                                let title = parsed.get("title")?.as_str()?.to_string();
+                                let url = parsed.get("url")?.as_str()?.to_string();
+                                Some(PrIdentityRecord { number, title, url })
+                            });
+                    MergequeuePollResult {
+                        wi_id,
+                        pr_state: state,
+                        branch,
+                        repo_path,
+                        pr_identity,
+                    }
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    MergequeuePollResult {
+                        wi_id,
+                        pr_state: format!("ERROR: {}", stderr.trim()),
+                        branch,
+                        repo_path,
+                        pr_identity: None,
+                    }
+                }
+                Err(e) => MergequeuePollResult {
+                    wi_id,
+                    pr_state: format!("ERROR: {e}"),
+                    branch,
+                    repo_path,
+                    pr_identity: None,
+                },
+            };
+            let _ = tx.send(outcome);
+        });
+
+        self.mergequeue_poll_rx = Some(rx);
+        self.mergequeue_last_poll = Some(std::time::Instant::now());
+
+        // Rotate the polled watch to the back for round-robin fairness.
+        if self.mergequeue_watches.len() > 1 {
+            let first = self.mergequeue_watches.remove(0);
+            self.mergequeue_watches.push(first);
+        }
+    }
+
+    /// Reconstruct mergequeue watches from backend records after reassembly.
+    /// Called after initial assembly and after each reassembly to ensure
+    /// watches exist for all Mergequeue items (handles app restart).
+    pub fn reconstruct_mergequeue_watches(&mut self) {
+        for wi in &self.work_items {
+            if wi.status != WorkItemStatus::Mergequeue {
+                continue;
+            }
+            // Skip if already watched.
+            if self.mergequeue_watches.iter().any(|w| w.wi_id == wi.id) {
+                continue;
+            }
+            let Some(assoc) = wi.repo_associations.first() else {
+                continue;
+            };
+            let Some(ref branch) = assoc.branch else {
+                continue;
+            };
+            let Some(ref pr) = assoc.pr else {
+                continue;
+            };
+            let Ok(Some((owner, repo_name))) =
+                self.worktree_service.github_remote(&assoc.repo_path)
+            else {
+                continue;
+            };
+            self.mergequeue_watches.push(MergequeueWatch {
+                wi_id: wi.id.clone(),
+                pr_number: pr.number,
+                owner_repo: format!("{owner}/{repo_name}"),
+                branch: branch.clone(),
+                repo_path: assoc.repo_path.clone(),
+            });
         }
     }
 

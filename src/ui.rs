@@ -282,6 +282,8 @@ fn format_board_item<'a>(
     // Title line(s) -- wrap, never truncate.
     let title_prefix = if wi.status == WorkItemStatus::Blocked {
         "[BK] "
+    } else if wi.status == WorkItemStatus::Mergequeue {
+        "[MQ] "
     } else {
         ""
     };
@@ -290,6 +292,8 @@ fn format_board_item<'a>(
     for (i, wl) in wrapped.into_iter().enumerate() {
         let style = if wi.status == WorkItemStatus::Blocked {
             theme.style_stage_badge(&WorkItemStatus::Blocked)
+        } else if wi.status == WorkItemStatus::Mergequeue {
+            theme.style_stage_badge(&WorkItemStatus::Mergequeue)
         } else if i == 0 {
             theme.style_text()
         } else {
@@ -364,6 +368,7 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
             WorkItemStatus::Implementing => "Implementing",
             WorkItemStatus::Blocked => "Blocked",
             WorkItemStatus::Review => "Review",
+            WorkItemStatus::Mergequeue => "Mergequeue",
             WorkItemStatus::Done => "Done",
         };
         let count = app
@@ -1034,6 +1039,7 @@ fn draw_work_item_detail(
         WorkItemStatus::Implementing => "Implementing",
         WorkItemStatus::Blocked => "Blocked",
         WorkItemStatus::Review => "Review",
+        WorkItemStatus::Mergequeue => "Mergequeue",
         WorkItemStatus::Done => "Done",
     };
 
