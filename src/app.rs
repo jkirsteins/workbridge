@@ -2615,6 +2615,21 @@ impl App {
             );
 
         let mut cmd: Vec<String> = vec!["claude".to_string()];
+        cmd.push("--allowedTools".to_string());
+        cmd.push(
+            "mcp__workbridge__workbridge_get_context,\
+             mcp__workbridge__workbridge_query_log,\
+             mcp__workbridge__workbridge_log_event,\
+             mcp__workbridge__workbridge_set_activity,\
+             mcp__workbridge__workbridge_set_status,\
+             mcp__workbridge__workbridge_set_plan,\
+             mcp__workbridge__workbridge_approve_review,\
+             mcp__workbridge__workbridge_request_changes,\
+             mcp__workbridge__workbridge_get_plan,\
+             mcp__workbridge__workbridge_set_title,\
+             mcp__workbridge__workbridge_set_description"
+                .to_string(),
+        );
         if is_planning {
             cmd.push("--permission-mode".to_string());
             cmd.push("plan".to_string());
@@ -9180,15 +9195,20 @@ mod tests {
         let cmd =
             App::build_claude_cmd(&WorkItemStatus::Planning, Some("system prompt here"), false);
         assert_eq!(cmd[0], "claude");
-        assert_eq!(cmd[1], "--permission-mode");
-        assert_eq!(cmd[2], "plan");
-        assert_eq!(cmd[3], "--settings");
+        assert_eq!(cmd[1], "--allowedTools");
         assert!(
-            cmd[4].contains("PostToolUse") && cmd[4].contains("workbridge_set_plan"),
+            cmd[2].contains("mcp__workbridge__workbridge_get_context"),
+            "should list workbridge MCP tools in --allowedTools",
+        );
+        assert_eq!(cmd[3], "--permission-mode");
+        assert_eq!(cmd[4], "plan");
+        assert_eq!(cmd[5], "--settings");
+        assert!(
+            cmd[6].contains("PostToolUse") && cmd[6].contains("workbridge_set_plan"),
             "planning sessions must include TodoWrite reminder hook via --settings",
         );
-        assert_eq!(cmd[5], "--system-prompt");
-        assert_eq!(cmd[6], "system prompt here");
+        assert_eq!(cmd[7], "--system-prompt");
+        assert_eq!(cmd[8], "system prompt here");
         // Positional prompt is the LAST element - callers append
         // --mcp-config after this, so it stays after the prompt.
         assert_eq!(
@@ -9207,8 +9227,13 @@ mod tests {
     fn build_claude_cmd_implementing_has_prompt() {
         let cmd = App::build_claude_cmd(&WorkItemStatus::Implementing, Some("impl prompt"), false);
         assert_eq!(cmd[0], "claude");
+        assert_eq!(cmd[1], "--allowedTools");
+        assert!(
+            cmd[2].contains("mcp__workbridge__workbridge_get_context"),
+            "should list workbridge MCP tools in --allowedTools",
+        );
         // No --permission-mode for implementing.
-        assert_eq!(cmd[1], "--system-prompt");
+        assert_eq!(cmd[3], "--system-prompt");
         assert!(
             cmd.last().unwrap().contains("start working"),
             "implementing should have auto-start prompt",
