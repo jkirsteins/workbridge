@@ -11,7 +11,6 @@ expression: output
 │  to create│ Base directories:                                    │           │
 │           │   + /tmp/workbridge-test-settings-overlay            │           │
 │           │                                                      │           │
-
 │           │ ┌ Managed repos (2) ─────┐┌ Available (1) ─────────┐ │           │
 │           │ │>  - /root/Forks/special││ + /tmp/workbridge-test-│ │           │
 │           │ │   + /tmp/workbridge-tes││                        │ │           │

@@ -1093,10 +1093,13 @@ mod tests {
         let record = backend
             .create(CreateWorkItem {
                 title: "Done test".into(),
+                description: None,
+                kind: WorkItemKind::Own,
                 status: WorkItemStatus::Done,
                 repo_associations: vec![RepoAssociationRecord {
                     repo_path: PathBuf::from("/repo"),
                     branch: Some("main".into()),
+                    pr_identity: None,
                 }],
             })
             .unwrap();
