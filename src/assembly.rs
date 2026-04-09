@@ -449,6 +449,11 @@ fn collect_unlinked_prs(
                 if pr.head_branch.is_empty() {
                     continue;
                 }
+                // Defensive: the fetcher queries --state open, but stale
+                // cached data can contain closed/merged PRs.
+                if pr.state != "OPEN" {
+                    continue;
+                }
                 if !claimed_branches.contains(&(repo_path.clone(), pr.head_branch.clone())) {
                     unlinked.push(UnlinkedPr {
                         repo_path: repo_path.clone(),
@@ -1869,5 +1874,33 @@ mod tests {
             unlinked.len(),
             unlinked.iter().map(|u| &u.pr.title).collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn closed_prs_excluded_from_unlinked() {
+        let mut closed_pr = create_mock_pr(10, "Closed PR", "closed-branch", "", "");
+        closed_pr.state = "CLOSED".to_string();
+        let mut merged_pr = create_mock_pr(11, "Merged PR", "merged-branch", "", "");
+        merged_pr.state = "MERGED".to_string();
+        let open_pr = create_mock_pr(12, "Open PR", "open-branch", "", "");
+
+        let repo_path = PathBuf::from("/repo");
+        let mut repo_data = HashMap::new();
+        repo_data.insert(
+            repo_path.clone(),
+            create_mock_repo_data(
+                repo_path,
+                vec![],
+                vec![closed_pr, merged_pr, open_pr],
+                vec![],
+            )
+            .1,
+        );
+
+        let claimed = HashSet::new();
+        let unlinked = collect_unlinked_prs(&repo_data, &claimed);
+
+        assert_eq!(unlinked.len(), 1, "only the OPEN PR should be unlinked");
+        assert_eq!(unlinked[0].pr.title, "Open PR");
     }
 }

@@ -63,10 +63,11 @@ auto-archive - the following resources are cleaned up in order via
    and review gate state are all cleared.
 
 Steps 4-6 involve blocking I/O (git commands, gh CLI) and are only
-executed for user-initiated deletes (Ctrl+D). Auto-archive skips them
-via `skip_resource_cleanup: true` to avoid blocking the UI thread during
-timer-driven reassembly. This is safe because Done items have already
-been through the merge flow which handles worktree/branch/PR cleanup.
+executed for user-initiated deletes (Ctrl+D). Auto-archive runs them
+with `skip_resource_cleanup: false` so orphaned worktrees/branches from
+failed post-merge cleanup are caught. This is safe because Done items
+have no OPEN PRs (no network calls), only local `git worktree remove`
+and `git branch -D` (fast).
 
 Steps 4-8 are best-effort: failures produce warning messages but do not
 abort the overall delete. Only a backend delete failure (step 1) is fatal.
@@ -95,3 +96,54 @@ deleted and a final reassembly updates the display state.
 For Done items, steps 4-6 (worktree, branch, PR) are typically no-ops because
 the merge flow already removes worktrees and branches, and merged PRs are not
 in "OPEN" state.
+
+## Unlinked PR cleanup
+
+Unlinked PRs (open PRs whose branch is not claimed by any work item) can
+be closed via Ctrl+D in the left panel. The cleanup flow runs entirely
+on a background thread to avoid blocking the UI.
+
+### User flow
+
+1. Select an unlinked item and press Ctrl+D. A confirmation dialog
+   appears with three options:
+   - [Enter] Close with a reason (posts a comment on the PR first)
+   - [d] Close directly (no comment)
+   - [Esc] Cancel
+2. After confirmation, the dialog transitions to a progress state: a
+   braille spinner with "Closing PR #N... Please wait." All keys are
+   swallowed during this phase.
+3. On completion, the dialog closes. Warnings (if any) appear as a red
+   alert dialog; success shows "Unlinked item closed" in the status bar.
+
+### Background thread operations
+
+The background thread (`spawn_unlinked_cleanup`) performs these steps:
+
+1. Post optional reason comment via `gh pr comment`
+2. Close the PR via `gh pr close`
+3. Get a **fresh** worktree list via `list_worktrees()` (not cached
+   `repo_data`, which may be stale if the user switched branches since
+   the last fetch)
+4. If the branch has a linked worktree: remove it, then delete branch
+5. If the branch is the main worktree's current branch: skip both
+   (git forbids deleting the currently checked-out branch)
+6. If no worktree: just delete the branch
+
+### Cache eviction
+
+After the background thread completes, the closed PR must be removed
+from the cached `repo_data.prs` to prevent it from reappearing as
+unlinked. A simple eviction (removing the PR once) is insufficient
+because an in-flight fetch (started before the close) can arrive later
+and overwrite the cache with stale data that includes the now-closed PR.
+
+To handle this, `cleanup_evicted_branches: Vec<(PathBuf, String)>`
+tracks recently-closed (repo_path, branch) pairs. After every
+`drain_fetch_results()` in the timer callback, `apply_cleanup_evictions()`
+re-removes these branches from `repo_data.prs`. The evictions become
+no-ops once a fresh fetch (which queries `--state open` and naturally
+excludes the closed PR) arrives.
+
+As a defensive measure, `collect_unlinked_prs()` in `assembly.rs` also
+filters out PRs whose state is not "OPEN".

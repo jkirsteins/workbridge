@@ -181,6 +181,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         sync_layout(app);
     }
 
+    // Ctrl+R - force refresh GitHub data (global, works in any view).
+    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('r') {
+        app.fetcher_repos_changed = true;
+        return true;
+    }
+
     // Board mode (without drill-down) has its own key handler.
     if app.view_mode == ViewMode::Board && !app.board_drill_down {
         handle_key_board(app, key);

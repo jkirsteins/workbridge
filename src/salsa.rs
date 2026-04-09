@@ -348,6 +348,11 @@ pub fn app_event(
 
                 // Drain fetch results and reassemble if new data arrived.
                 if state.drain_fetch_results() {
+                    // Re-apply evictions so stale in-flight fetches don't
+                    // resurrect recently-closed PRs in the unlinked list.
+                    if !state.cleanup_evicted_branches.is_empty() {
+                        state.apply_cleanup_evictions();
+                    }
                     state.reassemble_work_items();
                     state.build_display_list();
                     state.global_mcp_context_dirty = true;

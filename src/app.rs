@@ -307,6 +307,14 @@ pub struct App {
     pub cleanup_in_progress: bool,
     /// PR number shown in the in-progress dialog body.
     pub cleanup_progress_pr_number: Option<u64>,
+    /// Repo path of the in-progress cleanup target (for cache eviction on completion).
+    pub cleanup_progress_repo_path: Option<PathBuf>,
+    /// Branch name of the in-progress cleanup target (for cache eviction on completion).
+    pub cleanup_progress_branch: Option<String>,
+    /// Branches whose PRs were recently closed via cleanup. Used to suppress
+    /// stale fetch results from re-adding the PR as unlinked. Cleared when
+    /// a fresh fetch arrives (drain_fetch_results returns true).
+    pub cleanup_evicted_branches: Vec<(PathBuf, String)>,
     /// General-purpose alert dialog. When Some, a red-bordered modal is shown.
     /// Dismissed with Enter or Esc.
     pub alert_message: Option<String>,
@@ -612,6 +620,9 @@ impl App {
             cleanup_activity: None,
             cleanup_in_progress: false,
             cleanup_progress_pr_number: None,
+            cleanup_progress_repo_path: None,
+            cleanup_progress_branch: None,
+            cleanup_evicted_branches: Vec::new(),
             alert_message: None,
             no_plan_prompt_visible: false,
             no_plan_prompt_queue: VecDeque::new(),
@@ -1455,6 +1466,7 @@ impl App {
                 repo_path: PathBuf,
                 branch: Option<String>,
                 worktree_path: Option<PathBuf>,
+                branch_in_main_worktree: bool,
                 open_pr_number: Option<u64>,
                 github_remote: Option<(String, String)>,
             }
@@ -1462,15 +1474,21 @@ impl App {
             let cleanup_infos: Vec<CleanupInfo> = repo_associations
                 .iter()
                 .map(|assoc| {
-                    let worktree_path = self
+                    let wt_for_branch = self
                         .repo_data
                         .get(&assoc.repo_path)
                         .and_then(|rd| rd.worktrees.as_ref().ok())
                         .and_then(|wts| {
                             wts.iter()
                                 .find(|wt| wt.branch.as_deref() == assoc.branch.as_deref())
-                                .map(|wt| wt.path.clone())
                         });
+
+                    let worktree_path = wt_for_branch
+                        .filter(|wt| !wt.is_main)
+                        .map(|wt| wt.path.clone());
+
+                    let branch_in_main_worktree =
+                        wt_for_branch.map(|wt| wt.is_main).unwrap_or(false);
 
                     let open_pr_number = assoc.branch.as_deref().and_then(|branch| {
                         self.repo_data.get(&assoc.repo_path).and_then(|rd| {
@@ -1491,6 +1509,7 @@ impl App {
                         repo_path: assoc.repo_path.clone(),
                         branch: assoc.branch.clone(),
                         worktree_path,
+                        branch_in_main_worktree,
                         open_pr_number,
                         github_remote,
                     }
@@ -1508,7 +1527,10 @@ impl App {
                 {
                     warnings.push(format!("worktree: {e}"));
                 }
-                if let Some(ref branch) = info.branch
+                // Skip branch deletion when checked out in the main worktree
+                // (git forbids deleting the currently checked-out branch).
+                if !info.branch_in_main_worktree
+                    && let Some(ref branch) = info.branch
                     && let Err(e) =
                         self.worktree_service
                             .delete_branch(&info.repo_path, branch, true)
@@ -1636,24 +1658,14 @@ impl App {
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone());
 
-        // Look up worktree path for this branch so we can remove the worktree
-        // before deleting the branch (same pattern as delete_work_item_by_id Phase 4).
-        let worktree_path = self
-            .repo_data
-            .get(&repo_path)
-            .and_then(|rd| rd.worktrees.as_ref().ok())
-            .and_then(|wts| {
-                wts.iter()
-                    .find(|wt| wt.branch.as_deref() == Some(branch.as_str()))
-                    .map(|wt| wt.path.clone())
-            });
-
         // Transition to in-progress: clear the input fields but keep the dialog
         // open. The UI renders a spinner + "Please wait." instead of key options.
         self.cleanup_reason_input_active = false;
         self.cleanup_reason_input.clear();
         self.cleanup_in_progress = true;
         self.cleanup_progress_pr_number = Some(pr_number);
+        self.cleanup_progress_repo_path = Some(repo_path.clone());
+        self.cleanup_progress_branch = Some(branch.clone());
         self.selected_unlinked_branch = None;
 
         let reason_owned: Option<String> = reason.map(|s| s.to_string());
@@ -1707,15 +1719,35 @@ impl App {
                 warnings.push("No GitHub remote found; skipping PR close".into());
             }
 
-            // Remove worktree first (if one exists), then delete branch.
-            // This prevents "branch used by worktree" errors.
-            if let Some(ref wt_path) = worktree_path
-                && let Err(e) = ws.remove_worktree(&repo_path, wt_path, false, true)
-            {
-                warnings.push(format!("worktree: {e}"));
-            }
-            if let Err(e) = ws.delete_branch(&repo_path, &branch, true) {
-                warnings.push(format!("branch: {e}"));
+            // Get a fresh worktree list so we don't rely on potentially stale
+            // cached repo_data (e.g., if the user switched branches since last fetch).
+            let fresh_worktrees = ws.list_worktrees(&repo_path).unwrap_or_default();
+            let wt_for_branch = fresh_worktrees
+                .iter()
+                .find(|wt| wt.branch.as_deref() == Some(branch.as_str()));
+
+            match wt_for_branch {
+                Some(wt) if wt.is_main => {
+                    // Branch is the main worktree's current branch; git forbids
+                    // deleting the checked-out branch. Skip silently - the PR
+                    // was closed, and the user can switch branches later.
+                }
+                Some(wt) => {
+                    // Remove the linked worktree first, then delete the branch.
+                    let wt_path = wt.path.clone();
+                    if let Err(e) = ws.remove_worktree(&repo_path, &wt_path, false, true) {
+                        warnings.push(format!("worktree: {e}"));
+                    }
+                    if let Err(e) = ws.delete_branch(&repo_path, &branch, true) {
+                        warnings.push(format!("branch: {e}"));
+                    }
+                }
+                None => {
+                    // No worktree for this branch - just delete the branch.
+                    if let Err(e) = ws.delete_branch(&repo_path, &branch, true) {
+                        warnings.push(format!("branch: {e}"));
+                    }
+                }
             }
 
             let _ = tx.send(CleanupResult { warnings });
@@ -1740,6 +1772,8 @@ impl App {
                 self.cleanup_prompt_visible = false;
                 self.cleanup_in_progress = false;
                 self.cleanup_progress_pr_number = None;
+                self.cleanup_progress_repo_path = None;
+                self.cleanup_progress_branch = None;
                 if let Some(aid) = self.cleanup_activity.take() {
                     self.end_activity(aid);
                 }
@@ -1751,10 +1785,22 @@ impl App {
         self.cleanup_rx = None;
         self.cleanup_prompt_visible = false;
         self.cleanup_in_progress = false;
-        self.cleanup_progress_pr_number = None;
         if let Some(aid) = self.cleanup_activity.take() {
             self.end_activity(aid);
         }
+
+        // Track the closed branch so stale fetch results (from in-flight
+        // fetches that started before the close) don't re-add the PR.
+        // apply_cleanup_evictions() removes these from repo_data after every
+        // drain_fetch_results, and drain clears the list on fresh data.
+        if let Some(repo_path) = self.cleanup_progress_repo_path.take()
+            && let Some(branch) = self.cleanup_progress_branch.take()
+        {
+            self.cleanup_evicted_branches.push((repo_path, branch));
+        }
+        self.cleanup_progress_pr_number = None;
+
+        self.apply_cleanup_evictions();
 
         self.reassemble_work_items();
         self.build_display_list();
@@ -1767,6 +1813,19 @@ impl App {
                 "Closed with warnings: {}",
                 result.warnings.join("; ")
             ));
+        }
+    }
+
+    /// Remove recently-closed PRs from cached repo_data. Called after
+    /// poll_unlinked_cleanup and after drain_fetch_results to ensure stale
+    /// fetch data doesn't resurrect closed PRs in the unlinked list.
+    pub fn apply_cleanup_evictions(&mut self) {
+        for (repo_path, branch) in &self.cleanup_evicted_branches {
+            if let Some(rd) = self.repo_data.get_mut(repo_path)
+                && let Ok(ref mut prs) = rd.prs
+            {
+                prs.retain(|pr| pr.head_branch != *branch);
+            }
         }
     }
 

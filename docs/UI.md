@@ -139,6 +139,17 @@ shows a segmented tab bar (using the ratatui `Tabs` widget) with
 keybinding hints appear right-aligned in the header (e.g., board mode
 shows arrow key and Shift+arrow controls).
 
+## Global Shortcuts
+
+These shortcuts are intercepted in `handle_key()` after dialog/overlay
+checks but before panel-specific handlers. They work in both flat list
+and board views but not inside open dialogs or overlays.
+
+- Ctrl+R: force refresh GitHub data. Restarts the background fetcher,
+  triggering an immediate fetch cycle. The status bar shows the
+  "Refreshing GitHub data" spinner during the fetch, using the same
+  code path as the periodic 120-second auto-refresh.
+
 ## Focus Model
 
 ### Top-Level: Left/Right Panel (Flat List Mode)
