@@ -3115,8 +3115,7 @@ impl App {
                     }
 
                     // Review gate: when MCP requests Implementing/Blocked -> Review,
-                    // the review gate is the single chokepoint - the transition
-                    // is blocked unless the gate spawns and later approves it.
+                    // a per-item review gate must approve the transition.
                     if (current_status.as_ref() == Some(&WorkItemStatus::Implementing)
                         || current_status.as_ref() == Some(&WorkItemStatus::Blocked))
                         && new_status == WorkItemStatus::Review
@@ -3127,7 +3126,7 @@ impl App {
                                     Some("Claude requested Review - running review gate...".into());
                             }
                             ReviewGateSpawn::Blocked(reason) => {
-                                // If a gate is already running (for this or another item),
+                                // If a gate is already running for this item,
                                 // just inform Claude - don't rework, the event is dropped
                                 // and Claude will need to request Review again.
                                 if reason.contains("already running") {
@@ -3893,10 +3892,9 @@ impl App {
             return;
         }
 
-        // Review gate: the single chokepoint for entering Review.
-        // The gate runs asynchronously in a background thread to avoid
-        // blocking the TUI. The transition is blocked unless the gate
-        // spawns and later approves it via poll_review_gate.
+        // Review gate: each item gets its own async gate that must approve
+        // the transition. Multiple gates can run concurrently for different
+        // work items.
         if (current_status == WorkItemStatus::Implementing
             || current_status == WorkItemStatus::Blocked)
             && new_status == WorkItemStatus::Review
