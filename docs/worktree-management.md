@@ -147,6 +147,11 @@ checked out, diverged) is not yet handled in the UI. Currently
 branch) and `fetch_branch` + `create_worktree` handles the remote-only
 case during import.
 
+`create_branch` refuses to create a new branch when the repo has
+uncommitted changes (staged, unstaged, or untracked files). This
+prevents branching from an ambiguous state where the working tree does
+not match the committed base.
+
 ## Multi-Machine Workflow
 
 WorkBridge does not synchronize state between machines. It relies on git
