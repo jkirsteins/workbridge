@@ -3666,6 +3666,44 @@ impl App {
         }
     }
 
+    /// Create a quick-start work item for a specific repo. Used by the
+    /// create dialog fallback when the user selects a repo from multiple
+    /// options. Creates a Planning item and spawns a Claude session.
+    pub fn create_quickstart_work_item_for_repo(&mut self, repo: PathBuf) -> Result<(), String> {
+        let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+        let suffix = crate::create_dialog::random_suffix();
+        let branch = format!("{username}/quickstart-{suffix}");
+
+        let request = CreateWorkItem {
+            title: QUICKSTART_TITLE.to_string(),
+            description: None,
+            status: WorkItemStatus::Planning,
+            kind: WorkItemKind::Own,
+            repo_associations: vec![RepoAssociationRecord {
+                repo_path: repo,
+                branch: Some(branch),
+                pr_identity: None,
+            }],
+        };
+
+        match self.backend.create(request) {
+            Ok(record) => {
+                let wi_id = record.id.clone();
+                self.reassemble_work_items();
+                self.fetcher_repos_changed = true;
+                self.selected_work_item = Some(wi_id.clone());
+                self.build_display_list();
+                self.spawn_session(&wi_id);
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("Create error: {e}");
+                self.status_message = Some(msg.clone());
+                Err(msg)
+            }
+        }
+    }
+
     /// Determine the repo to use for a quick-start work item.
     ///
     /// Strategy:

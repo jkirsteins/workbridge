@@ -171,10 +171,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                     app.settings_keybindings_scroll += 1;
                 }
             },
-            (_, KeyCode::Enter) if app.settings_list_focus == SettingsListFocus::Managed => {
+            (_, KeyCode::Enter)
+                if app.settings_tab == SettingsTab::Repos
+                    && app.settings_list_focus == SettingsListFocus::Managed =>
+            {
                 app.unmanage_selected_repo();
             }
-            (_, KeyCode::Enter) if app.settings_list_focus == SettingsListFocus::Available => {
+            (_, KeyCode::Enter)
+                if app.settings_tab == SettingsTab::Repos
+                    && app.settings_list_focus == SettingsListFocus::Available =>
+            {
                 app.manage_selected_repo();
             }
             _ => {}
@@ -343,7 +349,7 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
                     .filter(|r| r.git_dir_present)
                     .map(|r| r.path.clone())
                     .collect();
-                app.create_dialog.open(&active_repos, None);
+                app.create_dialog.open_quickstart(&active_repos);
                 app.status_message = Some("Multiple repos - select one and press Enter".into());
             }
             Err(msg) => {
@@ -427,7 +433,7 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                     .filter(|r| r.git_dir_present)
                     .map(|r| r.path.clone())
                     .collect();
-                app.create_dialog.open(&active_repos, None);
+                app.create_dialog.open_quickstart(&active_repos);
                 app.status_message = Some("Multiple repos - select one and press Enter".into());
             }
             Err(msg) => {
@@ -1187,6 +1193,38 @@ fn handle_create_dialog(app: &mut App, key: KeyEvent) {
                 app.create_dialog
                     .description_input
                     .ensure_visible(crate::ui::DESC_TEXTAREA_HEIGHT as usize);
+                return;
+            }
+            if app.create_dialog.quickstart_mode {
+                // Quick-start mode: only need a selected repo, then create
+                // a Planning item and spawn Claude immediately.
+                let selected: Vec<std::path::PathBuf> = app
+                    .create_dialog
+                    .repo_list
+                    .iter()
+                    .filter(|(_, sel)| *sel)
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                if selected.is_empty() {
+                    app.create_dialog.error_message = Some("Select a repo first".into());
+                    return;
+                }
+                let repo = selected[0].clone();
+                let had_status = app.has_visible_status_bar();
+                let had_context = app.selected_work_item_context().is_some();
+                match app.create_quickstart_work_item_for_repo(repo) {
+                    Ok(()) => {
+                        app.create_dialog.close();
+                        if app.has_visible_status_bar() != had_status
+                            || app.selected_work_item_context().is_some() != had_context
+                        {
+                            sync_layout(app);
+                        }
+                    }
+                    Err(msg) => {
+                        app.create_dialog.error_message = Some(msg);
+                    }
+                }
                 return;
             }
             match app.create_dialog.validate() {
