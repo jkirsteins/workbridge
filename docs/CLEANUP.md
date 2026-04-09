@@ -62,19 +62,23 @@ cleaned up in order via `delete_work_item_by_id()`:
    suppression, no-plan prompt queue, rework prompt state, merge prompt state,
    and review gate state are all cleared.
 
-Steps 4-6 involve blocking I/O (git commands, gh CLI) and are executed
-for user-initiated deletes (Ctrl+D) and MCP-triggered deletes
-(`workbridge_delete`). Auto-archive skips them
-(`skip_resource_cleanup: true`) because blocking I/O is prohibited on
-the UI thread where auto-archive runs during timer-driven reassembly.
+Steps 4-6 involve blocking I/O (git commands, gh CLI). The Ctrl+D
+path currently runs them synchronously on the UI thread. The MCP
+delete path (`workbridge_delete`) runs them on a background thread
+via `spawn_delete_cleanup()` / `poll_delete_cleanup()` to avoid
+blocking the UI. Auto-archive skips them entirely
+(`skip_resource_cleanup: true`) because Done items have already been
+through the merge flow which handles resource cleanup.
 
 Steps 4-8 are best-effort: failures produce warning messages but do not
 abort the overall delete. Only a backend delete failure (step 1) is fatal.
 
 Both manual delete (Ctrl+D) and MCP delete (`workbridge_delete`)
 additionally reset UI selection state and rebuild the display list after
-the shared cleanup completes. MCP delete always uses force mode (dirty
-worktree check is skipped since there is no interactive confirmation).
+the non-blocking phases complete. MCP delete always uses force mode
+(dirty worktree check is skipped since there is no interactive
+confirmation). The `workbridge_delete` tool is only available for
+regular work items (Own kind), not review requests.
 
 ### Force delete
 

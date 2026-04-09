@@ -266,6 +266,17 @@ pub struct CleanupResult {
     pub warnings: Vec<String>,
 }
 
+/// Info gathered on the main thread for one repo association, passed to
+/// the background delete-cleanup thread for resource removal.
+pub(crate) struct DeleteCleanupInfo {
+    repo_path: PathBuf,
+    branch: Option<String>,
+    worktree_path: Option<PathBuf>,
+    branch_in_main_worktree: bool,
+    open_pr_number: Option<u64>,
+    github_remote: Option<(String, String)>,
+}
+
 /// Result from the asynchronous worktree creation thread.
 pub struct WorktreeCreateResult {
     /// The work item the worktree was created for.
@@ -335,6 +346,10 @@ pub struct App {
     /// stale fetch results from re-adding the PR as unlinked. Applied and
     /// cleared when a fresh fetch arrives (drain_fetch_results returns true).
     pub cleanup_evicted_branches: Vec<(PathBuf, String)>,
+    /// Receiver for the async MCP-triggered work item delete cleanup thread.
+    pub delete_cleanup_rx: Option<crossbeam_channel::Receiver<CleanupResult>>,
+    /// Activity ID for the running delete-cleanup indicator.
+    pub delete_cleanup_activity: Option<ActivityId>,
     /// General-purpose alert dialog. When Some, a red-bordered modal is shown.
     /// Dismissed with Enter or Esc.
     pub alert_message: Option<String>,
@@ -639,6 +654,8 @@ impl App {
             cleanup_progress_repo_path: None,
             cleanup_progress_branch: None,
             cleanup_evicted_branches: Vec::new(),
+            delete_cleanup_rx: None,
+            delete_cleanup_activity: None,
             alert_message: None,
             no_plan_prompt_visible: false,
             no_plan_prompt_queue: VecDeque::new(),
@@ -1841,6 +1858,154 @@ impl App {
         } else {
             self.alert_message = Some(format!(
                 "Closed with warnings: {}",
+                result.warnings.join("; ")
+            ));
+        }
+    }
+
+    /// Gather resource cleanup info for a work item's repo associations.
+    /// Pure data lookup from `repo_data` - no I/O. Used to prepare data
+    /// for the background delete-cleanup thread.
+    fn gather_delete_cleanup_infos(
+        &self,
+        repo_associations: &[crate::work_item_backend::RepoAssociationRecord],
+    ) -> Vec<DeleteCleanupInfo> {
+        repo_associations
+            .iter()
+            .map(|assoc| {
+                let wt_for_branch = self
+                    .repo_data
+                    .get(&assoc.repo_path)
+                    .and_then(|rd| rd.worktrees.as_ref().ok())
+                    .and_then(|wts| {
+                        wts.iter()
+                            .find(|wt| wt.branch.as_deref() == assoc.branch.as_deref())
+                    });
+
+                let worktree_path = wt_for_branch
+                    .filter(|wt| !wt.is_main)
+                    .map(|wt| wt.path.clone());
+
+                let branch_in_main_worktree = wt_for_branch.map(|wt| wt.is_main).unwrap_or(false);
+
+                let open_pr_number = assoc.branch.as_deref().and_then(|branch| {
+                    self.repo_data.get(&assoc.repo_path).and_then(|rd| {
+                        rd.prs.as_ref().ok().and_then(|prs| {
+                            prs.iter()
+                                .find(|pr| pr.head_branch == branch && pr.state == "OPEN")
+                                .map(|pr| pr.number)
+                        })
+                    })
+                });
+
+                let github_remote = self
+                    .repo_data
+                    .get(&assoc.repo_path)
+                    .and_then(|rd| rd.github_remote.clone());
+
+                DeleteCleanupInfo {
+                    repo_path: assoc.repo_path.clone(),
+                    branch: assoc.branch.clone(),
+                    worktree_path,
+                    branch_in_main_worktree,
+                    open_pr_number,
+                    github_remote,
+                }
+            })
+            .collect()
+    }
+
+    /// Spawn a background thread to perform resource cleanup (worktree
+    /// removal, branch deletion, PR close) for a deleted work item.
+    /// Called from the MCP delete handler after the backend record and
+    /// session have already been cleaned up on the main thread.
+    /// poll_delete_cleanup() receives the result.
+    pub fn spawn_delete_cleanup(&mut self, cleanup_infos: Vec<DeleteCleanupInfo>) {
+        if self.delete_cleanup_rx.is_some() {
+            // A previous delete cleanup is still running. The new one
+            // will run inline warnings-only (best effort already done
+            // for the backend record). Log it but don't block.
+            self.status_message = Some("Delete cleanup: previous cleanup still in progress".into());
+            return;
+        }
+
+        let ws = Arc::clone(&self.worktree_service);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        std::thread::spawn(move || {
+            let mut warnings = Vec::new();
+
+            for info in &cleanup_infos {
+                if let Some(ref wt_path) = info.worktree_path
+                    && let Err(e) = ws.remove_worktree(&info.repo_path, wt_path, false, true)
+                {
+                    warnings.push(format!("worktree: {e}"));
+                }
+                // Skip branch deletion when checked out in the main worktree
+                // (git forbids deleting the currently checked-out branch).
+                if !info.branch_in_main_worktree
+                    && let Some(ref branch) = info.branch
+                    && let Err(e) = ws.delete_branch(&info.repo_path, branch, true)
+                {
+                    warnings.push(format!("branch: {e}"));
+                }
+                if let Some(pr_number) = info.open_pr_number
+                    && let Some((ref owner, ref repo)) = info.github_remote
+                {
+                    let owner_repo = format!("{owner}/{repo}");
+                    match std::process::Command::new("gh")
+                        .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
+                        .output()
+                    {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                            warnings.push(format!("PR close: {stderr}"));
+                        }
+                        Err(e) => warnings.push(format!("PR close: {e}")),
+                        _ => {}
+                    }
+                }
+            }
+
+            let _ = tx.send(CleanupResult { warnings });
+        });
+
+        self.delete_cleanup_rx = Some(rx);
+        self.delete_cleanup_activity = Some(self.start_activity("Deleting work item resources..."));
+    }
+
+    /// Poll the async delete-cleanup thread for a result. Called on each
+    /// timer tick from the event loop.
+    pub fn poll_delete_cleanup(&mut self) {
+        let rx = match self.delete_cleanup_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.delete_cleanup_rx = None;
+                if let Some(aid) = self.delete_cleanup_activity.take() {
+                    self.end_activity(aid);
+                }
+                self.alert_message =
+                    Some("Delete cleanup: background thread exited unexpectedly".into());
+                return;
+            }
+        };
+
+        self.delete_cleanup_rx = None;
+        if let Some(aid) = self.delete_cleanup_activity.take() {
+            self.end_activity(aid);
+        }
+
+        if result.warnings.is_empty() {
+            self.status_message = Some("Work item resource cleanup complete".into());
+        } else {
+            self.alert_message = Some(format!(
+                "Delete cleanup warnings: {}",
                 result.warnings.join("; ")
             ));
         }
@@ -3307,17 +3472,28 @@ impl App {
                             })
                             .unwrap_or_default();
 
-                    // Full cleanup with force=true (no interactive confirmation).
+                    // Gather cleanup info BEFORE deleting (needs repo_data lookups).
+                    let cleanup_infos = self.gather_delete_cleanup_infos(&repo_associations);
+
+                    // Non-blocking phases: backend delete, session kill, in-memory
+                    // cleanup. Resource cleanup (Phase 4) is skipped here - it runs
+                    // on a background thread below.
                     let mut warnings: Vec<String> = Vec::new();
                     if let Err(e) = self.delete_work_item_by_id(
                         &wi_id,
                         &repo_associations,
                         &mut warnings,
                         true,
-                        false,
+                        true, // skip_resource_cleanup: Phase 4 runs on background thread
                     ) {
                         self.status_message = Some(format!("MCP delete error: {e}"));
                         continue;
+                    }
+
+                    // Spawn background thread for blocking resource cleanup
+                    // (worktree removal, branch deletion, PR close).
+                    if !cleanup_infos.is_empty() {
+                        self.spawn_delete_cleanup(cleanup_infos);
                     }
 
                     // Clear selection identity if the deleted item was selected.
@@ -3356,7 +3532,8 @@ impl App {
 
                     self.focus = FocusPanel::Left;
                     if warnings.is_empty() {
-                        self.status_message = Some("Work item deleted (via MCP)".into());
+                        self.status_message =
+                            Some("Work item deleted via MCP (resource cleanup in progress)".into());
                     } else {
                         self.status_message = Some(format!(
                             "Deleted via MCP (with warnings: {})",

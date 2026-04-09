@@ -480,18 +480,10 @@ fn handle_message(
                     "required": ["working"]
                 }
             }));
-            tools.push(json!({
-                "name": "workbridge_delete",
-                "description": "Delete the current work item. This performs full resource cleanup: kills the session, removes worktrees and branches, closes open PRs, and deletes the backend record. This action is irreversible.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }));
-
             if is_review_request {
                 // Review request items get approve/request-changes tools
-                // instead of set_status/set_plan.
+                // instead of set_status/set_plan. No delete tool - review
+                // sessions are constrained to approve/request-changes.
                 tools.push(json!({
                     "name": "workbridge_approve_review",
                     "description": "Approve the PR review. Submits your approval via GitHub and completes this review request work item.",
@@ -566,6 +558,14 @@ fn handle_message(
                             }
                         },
                         "required": ["title"]
+                    }
+                }));
+                tools.push(json!({
+                    "name": "workbridge_delete",
+                    "description": "Delete the current work item. This is irreversible. The backend record is deleted immediately and the session is killed. Resource cleanup (worktree removal, branch deletion, PR closure) runs asynchronously in the background.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
                     }
                 }));
             }
@@ -898,7 +898,7 @@ fn handle_message(
                             "result": {
                                 "content": [{
                                     "type": "text",
-                                    "text": "Delete requested - the work item and all associated resources will be cleaned up."
+                                    "text": "Delete request sent to TUI. The backend record will be deleted and the session killed on the next event loop tick. Resource cleanup (worktree removal, branch deletion, PR closure) runs asynchronously in the background. This session will be terminated."
                                 }]
                             }
                         }))
@@ -2017,5 +2017,26 @@ mod tests {
             !text.contains("NOT changed"),
             "Blocked response must NOT contain 'NOT changed', got: {text}",
         );
+    }
+
+    #[test]
+    fn review_request_session_excludes_delete_tool() {
+        let tx = make_tx();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list"
+        });
+        let resp =
+            handle_message(&msg, "test-id", "ReviewRequest", "{}", None, &tx, false).unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(
+            !names.contains(&"workbridge_delete"),
+            "workbridge_delete must not be available in review request sessions"
+        );
+        // Verify review-specific tools are present.
+        assert!(names.contains(&"workbridge_approve_review"));
+        assert!(names.contains(&"workbridge_request_changes"));
     }
 }
