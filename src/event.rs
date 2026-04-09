@@ -45,6 +45,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    // When an alert dialog is shown, Enter or Esc dismisses it.
+    // This must be checked before other prompts since alerts overlay everything.
+    if app.alert_message.is_some() {
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Enter) | (_, KeyCode::Esc) => {
+                app.alert_message = None;
+            }
+            _ => {}
+        }
+        return true;
+    }
+
     // When the rework reason prompt is visible, route keys to it.
     if app.rework_prompt_visible {
         handle_rework_prompt(app, key);
@@ -56,6 +68,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // are true during text input.
     if app.cleanup_reason_input_active {
         handle_cleanup_reason_input(app, key);
+        return true;
+    }
+
+    // When the cleanup is in progress (background thread running), swallow
+    // all keys - the dialog shows a spinner and cannot be interacted with.
+    if app.cleanup_in_progress {
         return true;
     }
 
@@ -1787,5 +1805,62 @@ mod tests {
         );
         // 3x Down arrow
         assert_eq!(data, Some(b"\x1b[B\x1b[B\x1b[B".to_vec()));
+    }
+
+    /// Alert dialog: Enter dismisses it.
+    #[test]
+    fn alert_dialog_enter_dismisses() {
+        let mut app = App::new();
+        app.alert_message = Some("Some error".into());
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(&mut app, enter);
+
+        assert!(app.alert_message.is_none());
+    }
+
+    /// Alert dialog: Esc dismisses it.
+    #[test]
+    fn alert_dialog_esc_dismisses() {
+        let mut app = App::new();
+        app.alert_message = Some("Some error".into());
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, esc);
+
+        assert!(app.alert_message.is_none());
+    }
+
+    /// Alert dialog: other keys are swallowed (alert stays visible).
+    #[test]
+    fn alert_dialog_swallows_other_keys() {
+        let mut app = App::new();
+        app.alert_message = Some("Some error".into());
+
+        let key_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+        handle_key(&mut app, key_n);
+
+        // Alert must still be visible - 'n' was swallowed, not passed to the main handler.
+        assert!(app.alert_message.is_some());
+    }
+
+    /// Cleanup in-progress: all keys are swallowed, dialog stays open.
+    #[test]
+    fn cleanup_in_progress_swallows_keys() {
+        let mut app = App::new();
+        app.cleanup_prompt_visible = true;
+        app.cleanup_in_progress = true;
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, esc);
+
+        assert!(
+            app.cleanup_prompt_visible,
+            "dialog should stay open during progress"
+        );
+        assert!(
+            app.cleanup_in_progress,
+            "in-progress flag must not clear on Esc"
+        );
     }
 }

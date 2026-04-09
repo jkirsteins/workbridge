@@ -177,25 +177,40 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
             },
         );
     } else if app.cleanup_prompt_visible {
-        let pr_num = app
-            .cleanup_unlinked_target
-            .as_ref()
-            .map(|t| t.2)
-            .unwrap_or(0);
-        draw_prompt_dialog(
-            buf,
-            theme,
-            area,
-            PromptDialogKind::KeyChoice {
-                title: "Close Unlinked PR",
-                body: &format!("Close PR #{pr_num} and delete branch?"),
-                options: &[
-                    ("[Enter]", "Close with reason"),
-                    ("[d]", "Close directly"),
-                    ("[Esc]", "Cancel"),
-                ],
-            },
-        );
+        if app.cleanup_in_progress {
+            let pr_num = app.cleanup_progress_pr_number.unwrap_or(0);
+            let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+            draw_prompt_dialog(
+                buf,
+                theme,
+                area,
+                PromptDialogKind::KeyChoice {
+                    title: "Close Unlinked PR",
+                    body: &format!("{spinner} Closing PR #{pr_num}... Please wait."),
+                    options: &[],
+                },
+            );
+        } else {
+            let pr_num = app
+                .cleanup_unlinked_target
+                .as_ref()
+                .map(|t| t.2)
+                .unwrap_or(0);
+            draw_prompt_dialog(
+                buf,
+                theme,
+                area,
+                PromptDialogKind::KeyChoice {
+                    title: "Close Unlinked PR",
+                    body: &format!("Close PR #{pr_num} and delete branch?"),
+                    options: &[
+                        ("[Enter]", "Close with reason"),
+                        ("[d]", "Close directly"),
+                        ("[Esc]", "Cancel"),
+                    ],
+                },
+            );
+        }
     } else if app.no_plan_prompt_visible {
         draw_prompt_dialog(
             buf,
@@ -205,6 +220,19 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
                 title: "No Plan Available",
                 body: "No implementation plan found.",
                 options: &[("[p]", "Plan from branch"), ("[Esc]", "Stay blocked")],
+            },
+        );
+    }
+
+    // Alert dialog (renders above prompt dialogs, below global drawer and create dialog).
+    if let Some(ref msg) = app.alert_message {
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::Alert {
+                title: "Error",
+                body: msg,
             },
         );
     }
@@ -2197,6 +2225,8 @@ enum PromptDialogKind<'a> {
         input: &'a crate::create_dialog::SimpleTextInput,
         hint: &'a str,
     },
+    /// Red-bordered alert for errors/warnings. Dismissed with Enter or Esc.
+    Alert { title: &'a str, body: &'a str },
 }
 
 /// Draw a modal prompt dialog centered on screen with a dimmed background.
@@ -2226,6 +2256,11 @@ fn draw_prompt_dialog(buf: &mut Buffer, theme: &Theme, area: Rect, kind: PromptD
             let h = 1u16 + 1 + 1 + 1 + 1;
             (*title, *body, h)
         }
+        PromptDialogKind::Alert { title, body } => {
+            // body(1) + blank(1) + hint(1) + blank(1)
+            let h = 1u16 + 1 + 1 + 1;
+            (*title, *body, h)
+        }
     };
 
     // Minimum width: longest line + 2 (padding) + 2 (border).
@@ -2239,13 +2274,18 @@ fn draw_prompt_dialog(buf: &mut Buffer, theme: &Theme, area: Rect, kind: PromptD
     let popup = centered_rect_fixed(dialog_width, dialog_height, area);
     Clear.render(popup, buf);
 
-    // 4. Draw rounded-border block (visually distinct from plain-border overlays).
+    // 4. Draw rounded-border block. Alert dialogs use a red border;
+    //    all other prompt dialogs use the standard cyan overlay border.
+    let border_style = match &kind {
+        PromptDialogKind::Alert { .. } => theme.style_border_alert(),
+        _ => theme.style_border_overlay(),
+    };
     let block = Block::default()
         .title(format!(" {title} "))
         .title_style(theme.style_title())
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(theme.style_border_overlay());
+        .border_style(border_style);
     let block_inner = block.inner(popup);
     block.render(popup, buf);
 
@@ -2316,6 +2356,29 @@ fn draw_prompt_dialog(buf: &mut Buffer, theme: &Theme, area: Rect, kind: PromptD
             Paragraph::new(hint)
                 .style(theme.style_text_muted())
                 .render(rows[4], buf);
+        }
+        PromptDialogKind::Alert { body, .. } => {
+            // Rows: body, blank, hint.
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1), // body
+                    Constraint::Length(1), // blank
+                    Constraint::Length(1), // hint
+                    Constraint::Min(0),    // remaining
+                ])
+                .split(inner);
+
+            Paragraph::new(body)
+                .style(theme.style_error())
+                .render(rows[0], buf);
+            // rows[1] is blank.
+            let hint_line = Line::from(vec![
+                Span::styled("[Enter/Esc]", theme.style_heading()),
+                Span::raw("  "),
+                Span::styled("OK", theme.style_text()),
+            ]);
+            Paragraph::new(hint_line).render(rows[2], buf);
         }
     }
 }
@@ -3565,6 +3628,23 @@ mod snapshot_tests {
         app.cleanup_unlinked_target =
             Some((PathBuf::from("/tmp/repo"), "feature-branch".to_string(), 42));
         app.cleanup_reason_input.set_text("closing - abandoned");
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn cleanup_progress_dialog() {
+        let mut app = App::new();
+        app.cleanup_prompt_visible = true;
+        app.cleanup_in_progress = true;
+        app.cleanup_progress_pr_number = Some(42);
+        app.spinner_tick = 3; // deterministic spinner frame
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn alert_dialog() {
+        let mut app = App::new();
+        app.alert_message = Some("PR close failed: permission denied".to_string());
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 }

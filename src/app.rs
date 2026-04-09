@@ -302,6 +302,14 @@ pub struct App {
     pub cleanup_rx: Option<crossbeam_channel::Receiver<CleanupResult>>,
     /// Activity ID for the running cleanup indicator.
     pub cleanup_activity: Option<ActivityId>,
+    /// True while the cleanup background thread is running.
+    /// The dialog stays open with a spinner in this state.
+    pub cleanup_in_progress: bool,
+    /// PR number shown in the in-progress dialog body.
+    pub cleanup_progress_pr_number: Option<u64>,
+    /// General-purpose alert dialog. When Some, a red-bordered modal is shown.
+    /// Dismissed with Enter or Esc.
+    pub alert_message: Option<String>,
     /// True when the no-plan prompt is visible (offered when Claude blocks
     /// because no implementation plan exists).
     pub no_plan_prompt_visible: bool,
@@ -602,6 +610,9 @@ impl App {
             cleanup_unlinked_target: None,
             cleanup_rx: None,
             cleanup_activity: None,
+            cleanup_in_progress: false,
+            cleanup_progress_pr_number: None,
+            alert_message: None,
             no_plan_prompt_visible: false,
             no_plan_prompt_queue: VecDeque::new(),
             shutting_down: false,
@@ -1611,8 +1622,9 @@ impl App {
         Ok(())
     }
 
-    /// Close the prompt dialogs, then spawn a background thread to close the
-    /// PR and delete the branch. Results are picked up by poll_unlinked_cleanup().
+    /// Keep the dialog open in progress mode and spawn a background thread to
+    /// close the PR and delete the branch. The dialog shows a spinner until
+    /// poll_unlinked_cleanup() receives the result.
     pub fn spawn_unlinked_cleanup(&mut self, reason: Option<&str>) {
         let Some((repo_path, branch, pr_number)) = self.cleanup_unlinked_target.take() else {
             return;
@@ -1624,10 +1636,24 @@ impl App {
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone());
 
-        // Close the dialog immediately so the UI is no longer blocked.
-        self.cleanup_prompt_visible = false;
+        // Look up worktree path for this branch so we can remove the worktree
+        // before deleting the branch (same pattern as delete_work_item_by_id Phase 4).
+        let worktree_path = self
+            .repo_data
+            .get(&repo_path)
+            .and_then(|rd| rd.worktrees.as_ref().ok())
+            .and_then(|wts| {
+                wts.iter()
+                    .find(|wt| wt.branch.as_deref() == Some(branch.as_str()))
+                    .map(|wt| wt.path.clone())
+            });
+
+        // Transition to in-progress: clear the input fields but keep the dialog
+        // open. The UI renders a spinner + "Please wait." instead of key options.
         self.cleanup_reason_input_active = false;
         self.cleanup_reason_input.clear();
+        self.cleanup_in_progress = true;
+        self.cleanup_progress_pr_number = Some(pr_number);
         self.selected_unlinked_branch = None;
 
         let reason_owned: Option<String> = reason.map(|s| s.to_string());
@@ -1681,7 +1707,13 @@ impl App {
                 warnings.push("No GitHub remote found; skipping PR close".into());
             }
 
-            // Force-delete the local branch.
+            // Remove worktree first (if one exists), then delete branch.
+            // This prevents "branch used by worktree" errors.
+            if let Some(ref wt_path) = worktree_path
+                && let Err(e) = ws.remove_worktree(&repo_path, wt_path, false, true)
+            {
+                warnings.push(format!("worktree: {e}"));
+            }
             if let Err(e) = ws.delete_branch(&repo_path, &branch, true) {
                 warnings.push(format!("branch: {e}"));
             }
@@ -1691,7 +1723,6 @@ impl App {
 
         self.cleanup_rx = Some(rx);
         self.cleanup_activity = Some(self.start_activity(format!("Closing PR #{pr_number}...")));
-        self.status_message = Some(format!("Closing PR #{pr_number}..."));
     }
 
     /// Poll the async unlinked-item cleanup thread for a result. Called on each timer tick.
@@ -1706,15 +1737,21 @@ impl App {
             Err(crossbeam_channel::TryRecvError::Empty) => return,
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 self.cleanup_rx = None;
+                self.cleanup_prompt_visible = false;
+                self.cleanup_in_progress = false;
+                self.cleanup_progress_pr_number = None;
                 if let Some(aid) = self.cleanup_activity.take() {
                     self.end_activity(aid);
                 }
-                self.status_message = Some("Cleanup: background thread exited unexpectedly".into());
+                self.alert_message = Some("Cleanup: background thread exited unexpectedly".into());
                 return;
             }
         };
 
         self.cleanup_rx = None;
+        self.cleanup_prompt_visible = false;
+        self.cleanup_in_progress = false;
+        self.cleanup_progress_pr_number = None;
         if let Some(aid) = self.cleanup_activity.take() {
             self.end_activity(aid);
         }
@@ -1726,7 +1763,7 @@ impl App {
         if result.warnings.is_empty() {
             self.status_message = Some("Unlinked item closed".into());
         } else {
-            self.status_message = Some(format!(
+            self.alert_message = Some(format!(
                 "Closed with warnings: {}",
                 result.warnings.join("; ")
             ));
@@ -1769,7 +1806,7 @@ impl App {
                     &record.repo_associations,
                     &mut warnings,
                     false,
-                    true, // skip_resource_cleanup: Done items already went through merge flow
+                    false, // run resource cleanup to catch orphaned worktrees/branches
                 ) {
                     Ok(()) => {
                         archived_count += 1;

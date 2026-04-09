@@ -261,6 +261,15 @@ Rendering in `draw_to_buffer()` (in the prompt dialog block):
 Do NOT set `app.status_message` to show prompt content - the dialog
 renders its own content.
 
+For errors that require acknowledgment from async operations or other
+flows, use `app.alert_message` (a general-purpose facility):
+
+```rust
+// On error:
+app.alert_message = Some(format!("Operation failed: {e}"));
+// The alert dialog dismisses itself when the user presses Enter or Esc.
+```
+
 ## Rendering
 
 All rendering is Buffer-based (not Frame-based). Widgets use the
@@ -356,25 +365,33 @@ Two distinct visual identities separate overlay types:
 | Overlay type | Border type | Border color | Use for |
 |---|---|---|---|
 | **Prompt dialog** | `Rounded` | Cyan | Blocking choice/input prompts |
+| **Alert dialog** | `Rounded` | Red | Error messages (dismissed with Enter/Esc) |
 | **Full dialog** | `Plain` | Cyan | Complex forms (create, settings) |
 | **Drawer** | `Plain` | Cyan | Global assistant panel |
 
-`Rounded` borders (`+-...-+` style corners) are the visual signal for
-"a choice is required right now." Never use `Rounded` for non-blocking
-overlays.
+`Rounded` borders are the visual signal for "attention required." Cyan
+`Rounded` = choice prompt; Red `Rounded` = error/alert. Never use `Rounded`
+for non-blocking overlays.
+
+For error messages that require acknowledgment, set `app.alert_message =
+Some(msg)` instead of `status_message`. This surfaces a red-bordered alert
+dialog that blocks interaction until dismissed with Enter or Esc.
 
 ### Overlay z-order (back to front)
 
 1. Main UI (panels, context bar, status bar)
 2. Settings overlay
 3. Prompt dialogs (merge, rework, no-plan, cleanup)
-4. Global assistant drawer
-5. Create dialog
+4. Alert dialog (renders above all other prompts)
+5. Global assistant drawer
+6. Create dialog
 
 ### What NOT to do
 
 - Do not set `app.status_message` to show prompt content. Prompt dialogs
   render their own content; the status bar is for transient notifications.
+- Do not set `app.status_message` for error messages that need acknowledgment.
+  Use `app.alert_message` instead so a red alert dialog appears.
 - Same-key-repeat confirmations (delete, quit) stay in the status bar -
   they are not blocking choice prompts and do not need dialog boxes.
 - Do not skip `dim_background()` in new overlays.
