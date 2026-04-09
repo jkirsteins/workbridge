@@ -269,7 +269,9 @@ pub fn app_event(
         AppEvent::Crossterm(ct_event) => {
             match ct_event {
                 ct::event::Event::Key(key) => {
-                    event::handle_key(state, *key);
+                    if !event::handle_key(state, *key) {
+                        return Ok(Control::Continue);
+                    }
                 }
                 ct::event::Event::Resize(cols, rows) => {
                     event::handle_resize(state, *cols, *rows);
