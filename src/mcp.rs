@@ -886,6 +886,23 @@ fn handle_message(
                     }
                 }
                 "workbridge_delete" => {
+                    // Server-side guard: block delete for ReviewRequest items.
+                    // tools/list already excludes this tool for review sessions,
+                    // but a misbehaving client could call it directly.
+                    if work_item_kind == "ReviewRequest" {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": "Error: workbridge_delete is not available for ReviewRequest work items"
+                                }],
+                                "isError": true
+                            }
+                        }));
+                    }
+
                     let event = McpEvent::DeleteWorkItem {
                         work_item_id: work_item_id.to_string(),
                     };
@@ -2038,5 +2055,33 @@ mod tests {
         // Verify review-specific tools are present.
         assert!(names.contains(&"workbridge_approve_review"));
         assert!(names.contains(&"workbridge_request_changes"));
+    }
+
+    #[test]
+    fn review_request_session_rejects_delete_call() {
+        // Server-side guard: even if a misbehaving client calls workbridge_delete
+        // directly, the handler must reject it for ReviewRequest items.
+        let tx = make_tx();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": {
+                "name": "workbridge_delete",
+                "arguments": {}
+            }
+        });
+        let resp =
+            handle_message(&msg, "test-id", "ReviewRequest", "{}", None, &tx, false).unwrap();
+        let is_error = resp["result"]["isError"].as_bool().unwrap_or(false);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            is_error,
+            "workbridge_delete must return isError for ReviewRequest"
+        );
+        assert!(
+            text.contains("not available for ReviewRequest"),
+            "error text must mention ReviewRequest, got: {text}"
+        );
     }
 }

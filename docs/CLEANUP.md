@@ -78,7 +78,22 @@ additionally reset UI selection state and rebuild the display list after
 the non-blocking phases complete. MCP delete always uses force mode
 (dirty worktree check is skipped since there is no interactive
 confirmation). The `workbridge_delete` tool is only available for
-regular work items (Own kind), not review requests.
+regular work items (Own kind), not review requests - enforced both by
+excluding it from `tools/list` for review sessions and by a server-side
+guard in `tools/call` that rejects the call with an error if
+`work_item_kind == "ReviewRequest"`.
+
+When the background delete-cleanup thread closes a PR, the
+(repo_path, branch) pair is returned in `CleanupResult::closed_pr_branches`
+and added to `cleanup_evicted_branches` so that stale fetch data does
+not resurrect the closed PR as a phantom unlinked item. This mirrors the
+eviction tracking used by the unlinked PR cleanup flow.
+
+If a second MCP delete is requested while a previous cleanup thread is
+still running, the resource cleanup is skipped and an alert dialog is
+shown to the user warning that worktrees, branches, and open PRs may
+need manual cleanup. The backend record and session are still deleted
+immediately.
 
 ### Force delete
 

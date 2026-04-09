@@ -264,6 +264,10 @@ pub struct PrIdentityBackfillResult {
 pub struct CleanupResult {
     /// Best-effort warnings (non-fatal failures during PR close / branch delete).
     pub warnings: Vec<String>,
+    /// (repo_path, branch) pairs for PRs that were successfully closed.
+    /// Used to populate `cleanup_evicted_branches` so stale fetch data
+    /// does not resurrect closed PRs as phantom unlinked items.
+    pub closed_pr_branches: Vec<(PathBuf, String)>,
 }
 
 /// Info gathered on the main thread for one repo association, passed to
@@ -1754,7 +1758,10 @@ impl App {
             // Otherwise the user would lose their local branch while the PR
             // remains open, and any unpushed commits would be permanently lost.
             if !pr_close_ok {
-                let _ = tx.send(CleanupResult { warnings });
+                let _ = tx.send(CleanupResult {
+                    warnings,
+                    closed_pr_branches: Vec::new(),
+                });
                 return;
             }
 
@@ -1797,7 +1804,10 @@ impl App {
                 }
             }
 
-            let _ = tx.send(CleanupResult { warnings });
+            let _ = tx.send(CleanupResult {
+                warnings,
+                closed_pr_branches: Vec::new(),
+            });
         });
 
         self.cleanup_rx = Some(rx);
@@ -1922,10 +1932,14 @@ impl App {
     /// poll_delete_cleanup() receives the result.
     pub fn spawn_delete_cleanup(&mut self, cleanup_infos: Vec<DeleteCleanupInfo>) {
         if self.delete_cleanup_rx.is_some() {
-            // A previous delete cleanup is still running. The new one
-            // will run inline warnings-only (best effort already done
-            // for the backend record). Log it but don't block.
-            self.status_message = Some("Delete cleanup: previous cleanup still in progress".into());
+            // A previous delete cleanup is still running. Alert the user
+            // so orphaned resources (worktrees, branches, open PRs) are
+            // visible rather than silently dropped.
+            self.alert_message = Some(
+                "Delete cleanup skipped: a previous cleanup is still in progress. \
+                 Worktrees, branches, and open PRs for this item may need manual cleanup."
+                    .into(),
+            );
             return;
         }
 
@@ -1934,6 +1948,7 @@ impl App {
 
         std::thread::spawn(move || {
             let mut warnings = Vec::new();
+            let mut closed_pr_branches = Vec::new();
 
             for info in &cleanup_infos {
                 if let Some(ref wt_path) = info.worktree_path
@@ -1962,12 +1977,20 @@ impl App {
                             warnings.push(format!("PR close: {stderr}"));
                         }
                         Err(e) => warnings.push(format!("PR close: {e}")),
-                        _ => {}
+                        _ => {
+                            // PR was successfully closed - track for eviction.
+                            if let Some(ref branch) = info.branch {
+                                closed_pr_branches.push((info.repo_path.clone(), branch.clone()));
+                            }
+                        }
                     }
                 }
             }
 
-            let _ = tx.send(CleanupResult { warnings });
+            let _ = tx.send(CleanupResult {
+                warnings,
+                closed_pr_branches,
+            });
         });
 
         self.delete_cleanup_rx = Some(rx);
@@ -1999,6 +2022,14 @@ impl App {
         self.delete_cleanup_rx = None;
         if let Some(aid) = self.delete_cleanup_activity.take() {
             self.end_activity(aid);
+        }
+
+        // Track closed PRs for cache eviction so stale fetch data
+        // does not resurrect them as phantom unlinked items.
+        if !result.closed_pr_branches.is_empty() {
+            self.cleanup_evicted_branches
+                .extend(result.closed_pr_branches);
+            self.apply_cleanup_evictions();
         }
 
         if result.warnings.is_empty() {
