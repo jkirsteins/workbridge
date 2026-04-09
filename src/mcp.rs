@@ -38,6 +38,8 @@ pub enum McpEvent {
     SetTitle { work_item_id: String, title: String },
     /// Claude called workbridge_set_activity.
     SetActivity { work_item_id: String, working: bool },
+    /// Claude called workbridge_delete.
+    DeleteWorkItem { work_item_id: String },
     /// Claude called workbridge_approve_review or workbridge_request_changes.
     SubmitReview {
         work_item_id: String,
@@ -478,6 +480,14 @@ fn handle_message(
                     "required": ["working"]
                 }
             }));
+            tools.push(json!({
+                "name": "workbridge_delete",
+                "description": "Delete the current work item. This performs full resource cleanup: kills the session, removes worktrees and branches, closes open PRs, and deletes the backend record. This action is irreversible.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }));
 
             if is_review_request {
                 // Review request items get approve/request-changes tools
@@ -858,6 +868,37 @@ fn handle_message(
                                 "content": [{
                                     "type": "text",
                                     "text": format!("Activity state set to {state_text}")
+                                }]
+                            }
+                        }))
+                    } else {
+                        Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": "Error: TUI channel disconnected"
+                                }],
+                                "isError": true
+                            }
+                        }))
+                    }
+                }
+                "workbridge_delete" => {
+                    let event = McpEvent::DeleteWorkItem {
+                        work_item_id: work_item_id.to_string(),
+                    };
+                    let send_ok = tx.send(event).is_ok();
+
+                    if send_ok {
+                        Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": "Delete requested - the work item and all associated resources will be cleaned up."
                                 }]
                             }
                         }))
@@ -1329,7 +1370,7 @@ mod tests {
         });
         let resp = handle_message(&msg, "test-id", "", "{}", None, &tx, false).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"workbridge_set_status"));
         assert!(names.contains(&"workbridge_get_context"));
@@ -1338,6 +1379,7 @@ mod tests {
         assert!(names.contains(&"workbridge_set_plan"));
         assert!(names.contains(&"workbridge_set_activity"));
         assert!(names.contains(&"workbridge_set_title"));
+        assert!(names.contains(&"workbridge_delete"));
         assert!(!names.contains(&"workbridge_get_plan"));
         assert!(
             !names.contains(&"workbridge_review_gate_result"),

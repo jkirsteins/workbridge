@@ -3279,6 +3279,91 @@ impl App {
                         self.claude_working.remove(&wi_id);
                     }
                 }
+                McpEvent::DeleteWorkItem {
+                    work_item_id: wi_id_str,
+                } => {
+                    let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            continue;
+                        }
+                    };
+
+                    // Gather repo associations from the assembled work item.
+                    let repo_associations: Vec<crate::work_item_backend::RepoAssociationRecord> =
+                        self.work_items
+                            .iter()
+                            .find(|w| w.id == wi_id)
+                            .map(|wi| {
+                                wi.repo_associations
+                                    .iter()
+                                    .map(|a| crate::work_item_backend::RepoAssociationRecord {
+                                        repo_path: a.repo_path.clone(),
+                                        branch: a.branch.clone(),
+                                        pr_identity: None,
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                    // Full cleanup with force=true (no interactive confirmation).
+                    let mut warnings: Vec<String> = Vec::new();
+                    if let Err(e) = self.delete_work_item_by_id(
+                        &wi_id,
+                        &repo_associations,
+                        &mut warnings,
+                        true,
+                        false,
+                    ) {
+                        self.status_message = Some(format!("MCP delete error: {e}"));
+                        continue;
+                    }
+
+                    // Clear selection identity if the deleted item was selected.
+                    if self.selected_work_item_id() == Some(wi_id) {
+                        self.selected_work_item = None;
+                        self.selected_unlinked_branch = None;
+                        self.selected_review_request_branch = None;
+                    }
+
+                    let old_idx = self.selected_item;
+                    self.reassemble_work_items();
+                    self.build_display_list();
+                    self.fetcher_repos_changed = true;
+
+                    // Re-sync cursor position.
+                    if let Some(old) = old_idx {
+                        let mut found = false;
+                        for i in (0..self.display_list.len().min(old + 1)).rev() {
+                            if is_selectable(&self.display_list[i]) {
+                                self.selected_item = Some(i);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            self.selected_item = None;
+                            for i in 0..self.display_list.len() {
+                                if is_selectable(&self.display_list[i]) {
+                                    self.selected_item = Some(i);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    self.sync_selection_identity();
+
+                    self.focus = FocusPanel::Left;
+                    if warnings.is_empty() {
+                        self.status_message = Some("Work item deleted (via MCP)".into());
+                    } else {
+                        self.status_message = Some(format!(
+                            "Deleted via MCP (with warnings: {})",
+                            warnings.join("; ")
+                        ));
+                    }
+                }
                 McpEvent::SubmitReview {
                     work_item_id: wi_id_str,
                     action,

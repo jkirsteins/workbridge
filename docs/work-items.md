@@ -181,6 +181,8 @@ Most forward transitions are triggered by the user via TUI keybinds (advance/ret
 
 All other transitions must go through TUI keybinds.
 
+Claude sessions can also delete the current work item via the `workbridge_delete` MCP tool. This performs the same full resource cleanup as Ctrl+D (backend delete, session kill, worktree removal, branch deletion, PR closure) with force mode enabled. See docs/CLEANUP.md for the deletion phases.
+
 ### Review gate
 
 When a work item transitions from Implementing or Blocked to Review (whether
