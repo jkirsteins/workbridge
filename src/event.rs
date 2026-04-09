@@ -947,7 +947,7 @@ fn handle_cleanup_prompt(app: &mut App, key: KeyEvent) {
         }
         (_, KeyCode::Char('d')) => {
             // Close directly without a reason.
-            app.finalize_unlinked_cleanup(None);
+            app.spawn_unlinked_cleanup(None);
         }
         _ => {
             // Cancel (Esc or any unrecognized key).
@@ -983,7 +983,7 @@ fn handle_cleanup_reason_input(app: &mut App, key: KeyEvent) {
             } else {
                 Some(reason.as_str())
             };
-            app.finalize_unlinked_cleanup(reason_opt);
+            app.spawn_unlinked_cleanup(reason_opt);
         }
         (_, KeyCode::Char(c)) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.cleanup_reason_input.insert_char(c);

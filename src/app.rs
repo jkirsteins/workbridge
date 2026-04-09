@@ -240,6 +240,12 @@ pub struct PrIdentityBackfillResult {
     pub identity: PrIdentityRecord,
 }
 
+/// Result from the asynchronous unlinked-item cleanup thread.
+pub struct CleanupResult {
+    /// Best-effort warnings (non-fatal failures during PR close / branch delete).
+    pub warnings: Vec<String>,
+}
+
 /// Result from the asynchronous worktree creation thread.
 pub struct WorktreeCreateResult {
     /// The work item the worktree was created for.
@@ -292,6 +298,10 @@ pub struct App {
     /// Identity of the unlinked PR being cleaned up: (repo_path, branch, pr_number).
     /// Stored by identity rather than index so it survives reassembly.
     pub cleanup_unlinked_target: Option<(PathBuf, String, u64)>,
+    /// Receiver for the async unlinked-item cleanup thread result.
+    pub cleanup_rx: Option<crossbeam_channel::Receiver<CleanupResult>>,
+    /// Activity ID for the running cleanup indicator.
+    pub cleanup_activity: Option<ActivityId>,
     /// True when the no-plan prompt is visible (offered when Claude blocks
     /// because no implementation plan exists).
     pub no_plan_prompt_visible: bool,
@@ -590,6 +600,8 @@ impl App {
             cleanup_reason_input_active: false,
             cleanup_reason_input: crate::create_dialog::SimpleTextInput::new(),
             cleanup_unlinked_target: None,
+            cleanup_rx: None,
+            cleanup_activity: None,
             no_plan_prompt_visible: false,
             no_plan_prompt_queue: VecDeque::new(),
             shutting_down: false,
@@ -1599,99 +1611,125 @@ impl App {
         Ok(())
     }
 
-    /// Close a PR and delete the branch for an unlinked item.
-    ///
-    /// If `reason` is `Some` and non-empty, posts a comment on the PR before
-    /// closing it. Branch is force-deleted. Returns a list of warnings for
-    /// best-effort failures (non-fatal).
-    pub fn cleanup_unlinked_item(
-        &mut self,
-        repo_path: &PathBuf,
-        branch: &str,
-        pr_number: u64,
-        reason: Option<&str>,
-    ) -> Vec<String> {
-        let mut warnings = Vec::new();
-
-        let github_remote = self
-            .repo_data
-            .get(repo_path)
-            .and_then(|rd| rd.github_remote.clone());
-
-        if let Some((ref owner, ref repo)) = github_remote {
-            let owner_repo = format!("{owner}/{repo}");
-
-            // Post optional reason as a comment before closing.
-            if let Some(r) = reason
-                && !r.is_empty()
-            {
-                match std::process::Command::new("gh")
-                    .args([
-                        "pr",
-                        "comment",
-                        &pr_number.to_string(),
-                        "--repo",
-                        &owner_repo,
-                        "--body",
-                        r,
-                    ])
-                    .output()
-                {
-                    Ok(output) if !output.status.success() => {
-                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                        warnings.push(format!("PR comment: {stderr}"));
-                    }
-                    Err(e) => warnings.push(format!("PR comment: {e}")),
-                    _ => {}
-                }
-            }
-
-            // Close the PR.
-            match std::process::Command::new("gh")
-                .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
-                .output()
-            {
-                Ok(output) if !output.status.success() => {
-                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    warnings.push(format!("PR close: {stderr}"));
-                }
-                Err(e) => warnings.push(format!("PR close: {e}")),
-                _ => {}
-            }
-        } else {
-            warnings.push("No GitHub remote found; skipping PR close".into());
-        }
-
-        // Force-delete the local branch.
-        if let Err(e) = self.worktree_service.delete_branch(repo_path, branch, true) {
-            warnings.push(format!("branch: {e}"));
-        }
-
-        warnings
-    }
-
-    /// Execute unlinked item cleanup, clear prompt state, reassemble the
-    /// display list, and show a status message.
-    pub fn finalize_unlinked_cleanup(&mut self, reason: Option<&str>) {
+    /// Close the prompt dialogs, then spawn a background thread to close the
+    /// PR and delete the branch. Results are picked up by poll_unlinked_cleanup().
+    pub fn spawn_unlinked_cleanup(&mut self, reason: Option<&str>) {
         let Some((repo_path, branch, pr_number)) = self.cleanup_unlinked_target.take() else {
             return;
         };
 
-        let warnings = self.cleanup_unlinked_item(&repo_path, &branch, pr_number, reason);
+        // Extract github remote before leaving the main thread.
+        let github_remote = self
+            .repo_data
+            .get(&repo_path)
+            .and_then(|rd| rd.github_remote.clone());
 
+        // Close the dialog immediately so the UI is no longer blocked.
         self.cleanup_prompt_visible = false;
         self.cleanup_reason_input_active = false;
         self.cleanup_reason_input.clear();
-
         self.selected_unlinked_branch = None;
+
+        let reason_owned: Option<String> = reason.map(|s| s.to_string());
+        let ws = Arc::clone(&self.worktree_service);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        std::thread::spawn(move || {
+            let mut warnings = Vec::new();
+
+            if let Some((ref owner, ref repo)) = github_remote {
+                let owner_repo = format!("{owner}/{repo}");
+
+                // Post optional reason as a comment before closing.
+                if let Some(ref r) = reason_owned
+                    && !r.is_empty()
+                {
+                    match std::process::Command::new("gh")
+                        .args([
+                            "pr",
+                            "comment",
+                            &pr_number.to_string(),
+                            "--repo",
+                            &owner_repo,
+                            "--body",
+                            r.as_str(),
+                        ])
+                        .output()
+                    {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                            warnings.push(format!("PR comment: {stderr}"));
+                        }
+                        Err(e) => warnings.push(format!("PR comment: {e}")),
+                        _ => {}
+                    }
+                }
+
+                // Close the PR.
+                match std::process::Command::new("gh")
+                    .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
+                    .output()
+                {
+                    Ok(output) if !output.status.success() => {
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        warnings.push(format!("PR close: {stderr}"));
+                    }
+                    Err(e) => warnings.push(format!("PR close: {e}")),
+                    _ => {}
+                }
+            } else {
+                warnings.push("No GitHub remote found; skipping PR close".into());
+            }
+
+            // Force-delete the local branch.
+            if let Err(e) = ws.delete_branch(&repo_path, &branch, true) {
+                warnings.push(format!("branch: {e}"));
+            }
+
+            let _ = tx.send(CleanupResult { warnings });
+        });
+
+        self.cleanup_rx = Some(rx);
+        self.cleanup_activity = Some(self.start_activity(format!("Closing PR #{pr_number}...")));
+        self.status_message = Some(format!("Closing PR #{pr_number}..."));
+    }
+
+    /// Poll the async unlinked-item cleanup thread for a result. Called on each timer tick.
+    pub fn poll_unlinked_cleanup(&mut self) {
+        let rx = match self.cleanup_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.cleanup_rx = None;
+                if let Some(aid) = self.cleanup_activity.take() {
+                    self.end_activity(aid);
+                }
+                self.status_message = Some("Cleanup: background thread exited unexpectedly".into());
+                return;
+            }
+        };
+
+        self.cleanup_rx = None;
+        if let Some(aid) = self.cleanup_activity.take() {
+            self.end_activity(aid);
+        }
+
         self.reassemble_work_items();
         self.build_display_list();
         self.fetcher_repos_changed = true;
 
-        if warnings.is_empty() {
+        if result.warnings.is_empty() {
             self.status_message = Some("Unlinked item closed".into());
         } else {
-            self.status_message = Some(format!("Closed with warnings: {}", warnings.join("; ")));
+            self.status_message = Some(format!(
+                "Closed with warnings: {}",
+                result.warnings.join("; ")
+            ));
         }
     }
 

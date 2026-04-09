@@ -392,6 +392,9 @@ pub fn app_event(
                 // Poll async worktree creation result.
                 state.poll_worktree_creation();
 
+                // Poll async unlinked-item cleanup result.
+                state.poll_unlinked_cleanup();
+
                 // Surface queued fetch errors.
                 state.drain_pending_fetch_errors();
 
