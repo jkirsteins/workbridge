@@ -50,6 +50,7 @@ included_repos = [
 [defaults]
 worktree_dir = ".worktrees"
 branch_issue_pattern = "^(\\d+)-"
+archive_after_days = 7
 ```
 
 ### Fields
@@ -71,6 +72,10 @@ repo root. Defaults to `.worktrees`.
 **defaults.branch_issue_pattern**: Regex for extracting issue identifiers
 from branch names. The first capture group is the issue identifier.
 Defaults to `^(\d+)-` (leading number).
+
+**defaults.archive_after_days**: Number of days to keep Done work items before
+auto-archiving (deleting) them. Set to 0 to disable auto-archive. Defaults
+to 7.
 
 ### Atomic Writes
 

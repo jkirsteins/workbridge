@@ -78,8 +78,8 @@ rebuilds the display list after the shared cleanup completes.
 
 When the selected work item's worktree has uncommitted changes, Ctrl+D shows
 a confirmation prompt ("delete anyway?"). If confirmed, the worktree is
-removed with `--force` and the branch with `-D`. Auto-archive never
-force-removes dirty worktrees - it logs a warning instead.
+removed with `--force` and the branch with `-D`. Auto-archive skips
+resource cleanup entirely (steps 4-6 are bypassed).
 
 ### Auto-archive
 
@@ -88,8 +88,10 @@ Done work items are automatically deleted after `archive_after_days` (default:
 action or derived from a merged PR). Items without a `done_at` timestamp are
 never auto-archived. Setting `archive_after_days` to 0 disables auto-archive.
 
-Auto-archive runs during `reassemble_work_items()`, before the assembly step.
-Expired items are deleted and excluded from the record list passed to assembly.
+Auto-archive runs during `reassemble_work_items()`, after assembly and re-open
+detection. This ordering ensures re-opened items have their `done_at` cleared
+before the archive check, preventing incorrect deletion. Expired items are
+deleted and a final reassembly updates the display state.
 For Done items, steps 4-6 (worktree, branch, PR) are typically no-ops because
 the merge flow already removes worktrees and branches, and merged PRs are not
 in "OPEN" state.

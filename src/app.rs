@@ -1260,12 +1260,9 @@ impl App {
             ));
         }
 
-        // Auto-archive: delete Done items that have exceeded the retention period.
-        let records = self.auto_archive_done_items(list_result.records);
-
         let issue_pattern = &self.config.defaults.branch_issue_pattern;
         let (items, unlinked, review_requested, mut reopen_ids) =
-            assembly::reassemble(&records, &self.repo_data, issue_pattern);
+            assembly::reassemble(&list_result.records, &self.repo_data, issue_pattern);
         self.work_items = items;
         self.unlinked_prs = unlinked;
         self.review_requested_prs = review_requested;
@@ -1273,19 +1270,26 @@ impl App {
         // Start the archival clock for items that became Done through PR merge
         // (derived status) but don't yet have a done_at timestamp.
         if self.config.defaults.archive_after_days > 0 {
-            let epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            for record in &records {
-                if record.status != WorkItemStatus::Done
-                    && record.done_at.is_none()
-                    && let Some(wi) = self.work_items.iter().find(|w| w.id == record.id)
-                    && wi.status == WorkItemStatus::Done
-                    && wi.status_derived
-                    && let Err(e) = self.backend.set_done_at(&record.id, Some(epoch))
-                {
-                    self.status_message = Some(format!("Failed to set archive timestamp: {e}"));
+            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => {
+                    let epoch = duration.as_secs();
+                    for record in &list_result.records {
+                        if record.status != WorkItemStatus::Done
+                            && record.done_at.is_none()
+                            && let Some(wi) = self.work_items.iter().find(|w| w.id == record.id)
+                            && wi.status == WorkItemStatus::Done
+                            && wi.status_derived
+                            && let Err(e) = self.backend.set_done_at(&record.id, Some(epoch))
+                        {
+                            self.status_message =
+                                Some(format!("Failed to set archive timestamp: {e}"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.status_message = Some(format!(
+                        "System clock error, skipping archive timestamps: {e}"
+                    ));
                 }
             }
         }
@@ -1301,6 +1305,11 @@ impl App {
                 if let Err(e) = self.backend.update_status(wi_id, WorkItemStatus::Review) {
                     self.status_message = Some(format!("Re-open error: {e}"));
                     continue;
+                }
+                // Clear done_at so auto-archive won't delete the re-opened item.
+                if let Err(e) = self.backend.set_done_at(wi_id, None) {
+                    self.status_message =
+                        Some(format!("Failed to clear archive timestamp on re-open: {e}"));
                 }
                 let entry = ActivityEntry {
                     timestamp: now_iso8601(),
@@ -1326,6 +1335,32 @@ impl App {
 
             let count = reopen_ids.len();
             self.status_message = Some(format!("{count} review request(s) re-opened"));
+        }
+
+        // Auto-archive: delete Done items that have exceeded the retention period.
+        // This runs AFTER re-open detection so that re-opened items have their
+        // done_at cleared and won't be incorrectly archived.
+        // Skip entirely when archive is disabled (archive_after_days == 0).
+        if self.config.defaults.archive_after_days > 0 {
+            match self.backend.list() {
+                Ok(pre_archive_list) => {
+                    let pre_archive_count = pre_archive_list.records.len();
+                    let kept = self.auto_archive_done_items(pre_archive_list.records);
+                    if kept.len() < pre_archive_count {
+                        // Items were archived; reassemble to update display state.
+                        let pattern = &self.config.defaults.branch_issue_pattern;
+                        let (items, unlinked, review_requested, _) =
+                            assembly::reassemble(&kept, &self.repo_data, pattern);
+                        self.work_items = items;
+                        self.unlinked_prs = unlinked;
+                        self.review_requested_prs = review_requested;
+                    }
+                }
+                Err(e) => {
+                    self.status_message =
+                        Some(format!("Failed to list items for auto-archive: {e}"));
+                }
+            }
         }
 
         // Reconstruct mergequeue watches for items that are in Mergequeue
@@ -1464,19 +1499,36 @@ impl App {
 
         // -- Phase 5: Cancel in-flight operations --
         if self.worktree_create_wi.as_ref() == Some(wi_id) {
-            if let Some(ref rx) = self.worktree_create_rx
-                && let Ok(result) = rx.try_recv()
-            {
-                // Thread completed - clean up the orphaned worktree.
-                if let Some(ref path) = result.path
-                    && let Err(e) =
-                        self.worktree_service
-                            .remove_worktree(&result.repo_path, path, true, true)
-                {
-                    warnings.push(format!("orphan worktree cleanup: {e}"));
+            let thread_done = if let Some(ref rx) = self.worktree_create_rx {
+                match rx.try_recv() {
+                    Ok(result) => {
+                        // Thread completed - clean up the orphaned worktree.
+                        if let Some(ref path) = result.path
+                            && let Err(e) = self.worktree_service.remove_worktree(
+                                &result.repo_path,
+                                path,
+                                true,
+                                true,
+                            )
+                        {
+                            warnings.push(format!("orphan worktree cleanup: {e}"));
+                        }
+                        true
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => true,
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        // Thread still running. Leave the receiver intact so
+                        // poll_worktree_creation can drain it on the next timer
+                        // tick and run its orphan-cleanup path.
+                        false
+                    }
                 }
+            } else {
+                true
+            };
+            if thread_done {
+                self.worktree_create_rx = None;
             }
-            self.worktree_create_rx = None;
             self.worktree_create_wi = None;
             if let Some(aid) = self.worktree_create_activity.take() {
                 self.end_activity(aid);
@@ -1545,10 +1597,14 @@ impl App {
             return records;
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(e) => {
+                self.status_message =
+                    Some(format!("System clock error, skipping auto-archive: {e}"));
+                return records;
+            }
+        };
         let archive_secs = archive_days * 86400;
 
         let mut kept = Vec::with_capacity(records.len());
@@ -1556,8 +1612,7 @@ impl App {
         let mut all_warnings: Vec<String> = Vec::new();
 
         for record in records {
-            if record.status == WorkItemStatus::Done
-                && let Some(done_at) = record.done_at
+            if let Some(done_at) = record.done_at
                 && now.saturating_sub(done_at) >= archive_secs
             {
                 let mut warnings: Vec<String> = Vec::new();
@@ -3601,23 +3656,34 @@ impl App {
         }
 
         // Track when items enter/leave Done for auto-archival.
+        let mut done_at_error = false;
         if *new_status == WorkItemStatus::Done {
-            let epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if let Err(e) = self.backend.set_done_at(wi_id, Some(epoch)) {
-                self.status_message = Some(format!("Failed to set archive timestamp: {e}"));
+            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => {
+                    if let Err(e) = self.backend.set_done_at(wi_id, Some(duration.as_secs())) {
+                        self.status_message = Some(format!("Failed to set archive timestamp: {e}"));
+                        done_at_error = true;
+                    }
+                }
+                Err(e) => {
+                    self.status_message = Some(format!(
+                        "System clock error, skipping archive timestamp: {e}"
+                    ));
+                    done_at_error = true;
+                }
             }
         } else if *current_status == WorkItemStatus::Done
             && let Err(e) = self.backend.set_done_at(wi_id, None)
         {
             self.status_message = Some(format!("Failed to clear archive timestamp: {e}"));
+            done_at_error = true;
         }
 
         self.reassemble_work_items();
         self.build_display_list();
-        self.status_message = Some(format!("Moved to {}", new_status.badge_text()));
+        if !done_at_error {
+            self.status_message = Some(format!("Moved to {}", new_status.badge_text()));
+        }
 
         // Feature 1: Auto-create PR when entering Review (async).
         // Skip for review requests - the PR already exists (it's someone else's).
@@ -10446,6 +10512,34 @@ mod tests {
         app.reassemble_work_items();
 
         assert_eq!(app.work_items.len(), 1, "recent Done items should be kept");
+    }
+
+    #[test]
+    fn auto_archive_works_for_derived_done_items() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // done_at 8 days ago, but backend status is Review (derived-Done via merged PR).
+        let eight_days_ago = now - (8 * 86400);
+        let backend = ArchiveTestBackend {
+            records: std::sync::Mutex::new(vec![make_archive_record(
+                "derived-done",
+                WorkItemStatus::Review,
+                Some(eight_days_ago),
+            )]),
+        };
+
+        let mut cfg = Config::for_test();
+        cfg.defaults.archive_after_days = 7;
+        let mut app = App::with_config(cfg, Box::new(backend));
+        app.reassemble_work_items();
+
+        assert_eq!(
+            app.work_items.len(),
+            0,
+            "derived-Done items with expired done_at should be archived"
+        );
     }
 
     #[test]
