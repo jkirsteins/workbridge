@@ -2588,6 +2588,9 @@ mod snapshot_tests {
         fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
             Ok(None)
         }
+        fn set_done_at(&self, _id: &WorkItemId, _done_at: Option<u64>) -> Result<(), BackendError> {
+            Ok(())
+        }
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
         }

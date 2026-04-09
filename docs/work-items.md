@@ -28,6 +28,7 @@ The backend record anchors the work item's identity. It is a local JSON file
 - Title
 - Status (Backlog, Planning, Implementing, Blocked, or Review)
 - Repo associations (repo path + optional branch name + optional PR identity snapshot)
+- done_at (optional Unix timestamp, set when the item enters Done state)
 
 The UI can render a work item list immediately from backend records alone,
 before any git or GitHub data is fetched.
@@ -204,6 +205,36 @@ In the Mergequeue state:
 During assembly, if any repo association has a merged PR (`PrState::Merged`), the work item's status is set to Done regardless of what the backend record says. This is marked as a derived status (`status_derived = true`). When the status is derived, manual stage transitions (advance/retreat) and MCP transitions are blocked.
 
 This includes synthetic PrInfo produced by the PR identity fallback: when a backend record is Done and has a persisted PR identity snapshot but no live PR, assembly injects a PrInfo with PrState::Merged. The derived-Done logic then fires on this synthetic PR, setting `status_derived = true`. Because the fallback only activates when the backend record is already Done, non-Done items are never forced into derived-Done by a stale snapshot.
+
+### Auto-archive of Done items
+
+Done work items are automatically deleted after a configurable retention period.
+The `archive_after_days` config setting (default 7, 0 disables) controls how
+long a Done item is kept before cleanup.
+
+The archival clock starts when `done_at` is set on the backend record. This
+happens in two cases:
+
+- **Explicit Done** (merge gate): `apply_stage_change` sets `done_at` when the
+  item transitions to Done via the merge gate.
+- **Derived Done** (merged PR detected during reassembly): if reassembly finds
+  a merged PR and derives Done status, it sets `done_at` on the backend record
+  if not already present.
+
+If the item retreats from Done (e.g., re-open on re-request for review items),
+`done_at` is cleared.
+
+Auto-archive runs during reassembly, after re-open detection. This ordering
+ensures that review requests re-opened in the current cycle have their
+`done_at` cleared before auto-archive evaluates them. Any record with a
+`done_at` timestamp that exceeds the retention period is deleted. The archive
+condition checks `done_at` directly - not the backend status field - so both
+explicitly-Done and derived-Done items are archived correctly.
+
+Auto-archive skips resource cleanup (steps 4-6: worktree removal, branch
+deletion, PR closing) since Done items have already been through the merge
+flow. The backend record is deleted, sessions are killed, in-flight
+operations are cancelled, and in-memory state is cleared.
 
 ## Sessions
 

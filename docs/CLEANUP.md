@@ -35,3 +35,63 @@
   sends SIGHUP to the child's process group. Most well-behaved programs treat
   SIGHUP as a termination signal.
 - The reader thread detects the closed fd via EOF (read returns 0) and exits.
+
+## Work item deletion
+
+When a work item is deleted - either manually (Ctrl+D) or automatically via
+auto-archive - the following resources are cleaned up in order via
+`delete_work_item_by_id()`:
+
+1. **Backend record** - `pre_delete_cleanup()` is called (no-op for
+   LocalFileBackend; reserved for future backends), then the JSON file is
+   deleted from disk.
+2. **Session** - if a Claude Code PTY session is running, it receives SIGKILL
+   and the session entry is removed from the sessions map.
+3. **MCP server** - the MCP socket server and `.mcp.json` config file are
+   removed via `cleanup_session_state_for()`.
+4. **Worktree** - the git worktree directory is removed via
+   `git worktree remove`. Worktree paths are looked up from the last
+   fetched `repo_data` by matching branch name.
+5. **Local branch** - the local git branch is deleted via `git branch -D`.
+   Best-effort: warnings are collected but do not abort the delete.
+6. **Open PR** - if a GitHub PR is open for this branch, it is closed via
+   `gh pr close`. Merged or already-closed PRs are skipped (state != "OPEN").
+7. **In-flight operations** - any pending worktree creation, PR creation/merge,
+   review submission, or mergequeue watch for this item is cancelled.
+8. **In-memory state** - rework reasons, review gate findings, review reopen
+   suppression, no-plan prompt queue, rework prompt state, merge prompt state,
+   and review gate state are all cleared.
+
+Steps 4-6 involve blocking I/O (git commands, gh CLI) and are only
+executed for user-initiated deletes (Ctrl+D). Auto-archive skips them
+via `skip_resource_cleanup: true` to avoid blocking the UI thread during
+timer-driven reassembly. This is safe because Done items have already
+been through the merge flow which handles worktree/branch/PR cleanup.
+
+Steps 4-8 are best-effort: failures produce warning messages but do not
+abort the overall delete. Only a backend delete failure (step 1) is fatal.
+
+The manual delete (Ctrl+D) additionally resets UI selection state and
+rebuilds the display list after the shared cleanup completes.
+
+### Force delete
+
+When the selected work item's worktree has uncommitted changes, Ctrl+D shows
+a confirmation prompt ("delete anyway?"). If confirmed, the worktree is
+removed with `--force` and the branch with `-D`. Auto-archive skips
+resource cleanup entirely (steps 4-6 are bypassed).
+
+### Auto-archive
+
+Done work items are automatically deleted after `archive_after_days` (default:
+7 days). The clock starts when the item enters Done state (either via user
+action or derived from a merged PR). Items without a `done_at` timestamp are
+never auto-archived. Setting `archive_after_days` to 0 disables auto-archive.
+
+Auto-archive runs during `reassemble_work_items()`, after assembly and re-open
+detection. This ordering ensures re-opened items have their `done_at` cleared
+before the archive check, preventing incorrect deletion. Expired items are
+deleted and a final reassembly updates the display state.
+For Done items, steps 4-6 (worktree, branch, PR) are typically no-ops because
+the merge flow already removes worktrees and branches, and merged PRs are not
+in "OPEN" state.

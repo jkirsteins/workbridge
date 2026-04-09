@@ -1259,12 +1259,40 @@ impl App {
                 first.reason,
             ));
         }
+
         let issue_pattern = &self.config.defaults.branch_issue_pattern;
         let (items, unlinked, review_requested, mut reopen_ids) =
             assembly::reassemble(&list_result.records, &self.repo_data, issue_pattern);
         self.work_items = items;
         self.unlinked_prs = unlinked;
         self.review_requested_prs = review_requested;
+
+        // Start the archival clock for items that became Done through PR merge
+        // (derived status) but don't yet have a done_at timestamp.
+        if self.config.defaults.archive_after_days > 0 {
+            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => {
+                    let epoch = duration.as_secs();
+                    for record in &list_result.records {
+                        if record.status != WorkItemStatus::Done
+                            && record.done_at.is_none()
+                            && let Some(wi) = self.work_items.iter().find(|w| w.id == record.id)
+                            && wi.status == WorkItemStatus::Done
+                            && wi.status_derived
+                            && let Err(e) = self.backend.set_done_at(&record.id, Some(epoch))
+                        {
+                            self.status_message =
+                                Some(format!("Failed to set archive timestamp: {e}"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.status_message = Some(format!(
+                        "System clock error, skipping archive timestamps: {e}"
+                    ));
+                }
+            }
+        }
 
         // Exclude items whose reviews were recently submitted. Stale
         // repo_data may still list them as review-requested until the
@@ -1277,6 +1305,11 @@ impl App {
                 if let Err(e) = self.backend.update_status(wi_id, WorkItemStatus::Review) {
                     self.status_message = Some(format!("Re-open error: {e}"));
                     continue;
+                }
+                // Clear done_at so auto-archive won't delete the re-opened item.
+                if let Err(e) = self.backend.set_done_at(wi_id, None) {
+                    self.status_message =
+                        Some(format!("Failed to clear archive timestamp on re-open: {e}"));
                 }
                 let entry = ActivityEntry {
                     timestamp: now_iso8601(),
@@ -1304,9 +1337,320 @@ impl App {
             self.status_message = Some(format!("{count} review request(s) re-opened"));
         }
 
+        // Auto-archive: delete Done items that have exceeded the retention period.
+        // This runs AFTER re-open detection so that re-opened items have their
+        // done_at cleared and won't be incorrectly archived.
+        // Skip entirely when archive is disabled (archive_after_days == 0).
+        if self.config.defaults.archive_after_days > 0 {
+            match self.backend.list() {
+                Ok(pre_archive_list) => {
+                    let pre_archive_count = pre_archive_list.records.len();
+                    let kept = self.auto_archive_done_items(pre_archive_list.records);
+                    if kept.len() < pre_archive_count {
+                        // Items were archived; reassemble to update display state.
+                        let pattern = &self.config.defaults.branch_issue_pattern;
+                        let (items, unlinked, review_requested, _) =
+                            assembly::reassemble(&kept, &self.repo_data, pattern);
+                        self.work_items = items;
+                        self.unlinked_prs = unlinked;
+                        self.review_requested_prs = review_requested;
+                    }
+                }
+                Err(e) => {
+                    self.status_message =
+                        Some(format!("Failed to list items for auto-archive: {e}"));
+                }
+            }
+        }
+
         // Reconstruct mergequeue watches for items that are in Mergequeue
         // but don't have a watch (e.g., after app restart).
         self.reconstruct_mergequeue_watches();
+    }
+
+    /// Core work-item deletion. Removes ALL associated resources:
+    /// backend record, session (killed), MCP server, worktrees, local branches,
+    /// open PRs (closed via gh), in-flight operations, and all in-memory state.
+    ///
+    /// Does NOT touch selection/cursor/display state - callers handle that.
+    ///
+    /// `repo_associations` is the list of repo+branch associations from the
+    /// backend record. Worktree paths and live PR state are looked up from
+    /// self.repo_data (populated by the background fetcher).
+    ///
+    /// When `skip_resource_cleanup` is true, Phase 4 (worktree removal,
+    /// branch deletion, PR close) is skipped. Used by auto-archive where
+    /// Done items have already been through the merge flow which handles
+    /// resource cleanup, avoiding blocking I/O on the UI thread.
+    ///
+    /// Warnings (best-effort cleanup failures) are appended to `warnings`.
+    /// Returns Err only if the backend delete itself fails (fatal).
+    fn delete_work_item_by_id(
+        &mut self,
+        wi_id: &WorkItemId,
+        repo_associations: &[crate::work_item_backend::RepoAssociationRecord],
+        warnings: &mut Vec<String>,
+        force: bool,
+        skip_resource_cleanup: bool,
+    ) -> Result<(), crate::work_item_backend::BackendError> {
+        // -- Phase 2: Backend cleanup (fatal on delete failure) --
+        if let Err(e) = self.backend.pre_delete_cleanup(wi_id) {
+            warnings.push(format!("pre-delete cleanup: {e}"));
+        }
+        self.backend.delete(wi_id)?;
+
+        // -- Phase 3: Kill session and clean up MCP --
+        self.cleanup_session_state_for(wi_id);
+        if let Some(key) = self.session_key_for(wi_id)
+            && let Some(mut entry) = self.sessions.remove(&key)
+            && let Some(ref mut session) = entry.session
+        {
+            session.kill();
+        }
+
+        // -- Phase 4: Resource cleanup (worktrees, branches, open PRs) --
+        // Skipped for auto-archive: Done items have already been through the
+        // merge flow which handles resource cleanup. This avoids blocking I/O
+        // (git worktree remove, git branch -D, gh pr close) on the UI thread
+        // during timer-driven reassembly.
+        if !skip_resource_cleanup {
+            struct CleanupInfo {
+                repo_path: PathBuf,
+                branch: Option<String>,
+                worktree_path: Option<PathBuf>,
+                open_pr_number: Option<u64>,
+                github_remote: Option<(String, String)>,
+            }
+
+            let cleanup_infos: Vec<CleanupInfo> = repo_associations
+                .iter()
+                .map(|assoc| {
+                    let worktree_path = self
+                        .repo_data
+                        .get(&assoc.repo_path)
+                        .and_then(|rd| rd.worktrees.as_ref().ok())
+                        .and_then(|wts| {
+                            wts.iter()
+                                .find(|wt| wt.branch.as_deref() == assoc.branch.as_deref())
+                                .map(|wt| wt.path.clone())
+                        });
+
+                    let open_pr_number = assoc.branch.as_deref().and_then(|branch| {
+                        self.repo_data.get(&assoc.repo_path).and_then(|rd| {
+                            rd.prs.as_ref().ok().and_then(|prs| {
+                                prs.iter()
+                                    .find(|pr| pr.head_branch == branch && pr.state == "OPEN")
+                                    .map(|pr| pr.number)
+                            })
+                        })
+                    });
+
+                    let github_remote = self
+                        .repo_data
+                        .get(&assoc.repo_path)
+                        .and_then(|rd| rd.github_remote.clone());
+
+                    CleanupInfo {
+                        repo_path: assoc.repo_path.clone(),
+                        branch: assoc.branch.clone(),
+                        worktree_path,
+                        open_pr_number,
+                        github_remote,
+                    }
+                })
+                .collect();
+
+            for info in &cleanup_infos {
+                if let Some(ref wt_path) = info.worktree_path
+                    && let Err(e) = self.worktree_service.remove_worktree(
+                        &info.repo_path,
+                        wt_path,
+                        false,
+                        force,
+                    )
+                {
+                    warnings.push(format!("worktree: {e}"));
+                }
+                if let Some(ref branch) = info.branch
+                    && let Err(e) =
+                        self.worktree_service
+                            .delete_branch(&info.repo_path, branch, true)
+                {
+                    warnings.push(format!("branch: {e}"));
+                }
+                if let Some(pr_number) = info.open_pr_number
+                    && let Some((ref owner, ref repo)) = info.github_remote
+                {
+                    let owner_repo = format!("{owner}/{repo}");
+                    match std::process::Command::new("gh")
+                        .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
+                        .output()
+                    {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                            warnings.push(format!("PR close: {stderr}"));
+                        }
+                        Err(e) => warnings.push(format!("PR close: {e}")),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // -- Phase 5: Cancel in-flight operations --
+        if self.worktree_create_wi.as_ref() == Some(wi_id) {
+            let thread_done = if let Some(ref rx) = self.worktree_create_rx {
+                match rx.try_recv() {
+                    Ok(result) => {
+                        // Thread completed - clean up the orphaned worktree.
+                        if let Some(ref path) = result.path
+                            && let Err(e) = self.worktree_service.remove_worktree(
+                                &result.repo_path,
+                                path,
+                                true,
+                                true,
+                            )
+                        {
+                            warnings.push(format!("orphan worktree cleanup: {e}"));
+                        }
+                        true
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => true,
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        // Thread still running. Leave the receiver intact so
+                        // poll_worktree_creation can drain it on the next timer
+                        // tick and run its orphan-cleanup path.
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            if thread_done {
+                self.worktree_create_rx = None;
+            }
+            self.worktree_create_wi = None;
+            if let Some(aid) = self.worktree_create_activity.take() {
+                self.end_activity(aid);
+            }
+        }
+        if self.pr_create_wi.as_ref() == Some(wi_id) {
+            self.pr_create_rx = None;
+            self.pr_create_wi = None;
+            if let Some(aid) = self.pr_create_activity.take() {
+                self.end_activity(aid);
+            }
+        }
+        self.pr_create_pending.retain(|id| id != wi_id);
+        if self.merge_wi_id.as_ref() == Some(wi_id) && self.pr_merge_rx.is_some() {
+            self.pr_merge_rx = None;
+            if let Some(aid) = self.pr_merge_activity.take() {
+                self.end_activity(aid);
+            }
+        }
+        if self.review_submit_wi.as_ref() == Some(wi_id) {
+            self.review_submit_rx = None;
+            self.review_submit_wi = None;
+            if let Some(aid) = self.review_submit_activity.take() {
+                self.end_activity(aid);
+            }
+        }
+        self.mergequeue_watches.retain(|w| w.wi_id != *wi_id);
+
+        // -- Phase 6: In-memory state cleanup --
+        self.rework_reasons.remove(wi_id);
+        self.review_gate_findings.remove(wi_id);
+        self.review_reopen_suppress.remove(wi_id);
+        self.no_plan_prompt_queue.retain(|id| id != wi_id);
+        if self.no_plan_prompt_queue.is_empty() {
+            self.no_plan_prompt_visible = false;
+        }
+        if self.rework_prompt_wi.as_ref() == Some(wi_id) {
+            self.rework_prompt_wi = None;
+            self.rework_prompt_visible = false;
+        }
+        if self.merge_wi_id.as_ref() == Some(wi_id) {
+            self.merge_wi_id = None;
+            self.confirm_merge = false;
+        }
+        if self.review_gate_wi.as_ref() == Some(wi_id) {
+            self.review_gate_wi = None;
+            self.review_gate_rx = None;
+            self.review_gate_progress = None;
+            if let Some(aid) = self.review_gate_activity.take() {
+                self.end_activity(aid);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete Done work items whose `done_at` timestamp exceeds the
+    /// configured `archive_after_days` retention period. Returns the
+    /// remaining (non-archived) records for assembly.
+    fn auto_archive_done_items(
+        &mut self,
+        records: Vec<crate::work_item_backend::WorkItemRecord>,
+    ) -> Vec<crate::work_item_backend::WorkItemRecord> {
+        let archive_days = self.config.defaults.archive_after_days;
+        if archive_days == 0 {
+            return records;
+        }
+
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(e) => {
+                self.status_message =
+                    Some(format!("System clock error, skipping auto-archive: {e}"));
+                return records;
+            }
+        };
+        let archive_secs = archive_days * 86400;
+
+        let mut kept = Vec::with_capacity(records.len());
+        let mut archived_count = 0u32;
+        let mut all_warnings: Vec<String> = Vec::new();
+
+        for record in records {
+            if let Some(done_at) = record.done_at
+                && now.saturating_sub(done_at) >= archive_secs
+            {
+                let mut warnings: Vec<String> = Vec::new();
+                match self.delete_work_item_by_id(
+                    &record.id,
+                    &record.repo_associations,
+                    &mut warnings,
+                    false,
+                    true, // skip_resource_cleanup: Done items already went through merge flow
+                ) {
+                    Ok(()) => {
+                        archived_count += 1;
+                        all_warnings.extend(warnings);
+                    }
+                    Err(e) => {
+                        all_warnings.push(format!("delete {}: {e}", record.title));
+                        kept.push(record);
+                    }
+                }
+                continue;
+            }
+            kept.push(record);
+        }
+
+        if archived_count > 0 {
+            if all_warnings.is_empty() {
+                self.status_message = Some(format!("Auto-archived {archived_count} done item(s)"));
+            } else {
+                self.status_message = Some(format!(
+                    "Auto-archived {archived_count} done item(s) (warnings: {})",
+                    all_warnings.join("; ")
+                ));
+            }
+        } else if !all_warnings.is_empty() {
+            self.status_message = Some(format!("Auto-archive errors: {}", all_warnings.join("; ")));
+        }
+
+        kept
     }
 
     /// Build the display list from current work_items and unlinked_prs.
@@ -2995,219 +3339,36 @@ impl App {
             return;
         };
 
-        // Warnings are collected across phases and reported in Phase 8.
-        let mut warnings: Vec<String> = Vec::new();
-
-        // -- Phase 1: Snapshot resource info before backend delete --
-        // Collect (repo_path, branch, worktree_path, open_pr_number, owner/repo)
-        // for each repo association so we can clean up after the backend record
-        // is gone.
-        struct RepoCleanupInfo {
-            repo_path: PathBuf,
-            branch: Option<String>,
-            worktree_path: Option<PathBuf>,
-            open_pr_number: Option<u64>,
-            github_remote: Option<(String, String)>,
-        }
-
-        let cleanup_infos: Vec<RepoCleanupInfo> = self
+        // Gather repo associations from the assembled work item so the
+        // shared cleanup helper can look up worktrees and PRs via repo_data.
+        let repo_associations: Vec<crate::work_item_backend::RepoAssociationRecord> = self
             .work_items
             .iter()
             .find(|w| w.id == work_item_id)
             .map(|wi| {
                 wi.repo_associations
                     .iter()
-                    .map(|assoc| {
-                        let open_pr_number = assoc.pr.as_ref().and_then(|pr| {
-                            if pr.state == crate::work_item::PrState::Open {
-                                Some(pr.number)
-                            } else {
-                                None
-                            }
-                        });
-                        let github_remote =
-                            match self.worktree_service.github_remote(&assoc.repo_path) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    warnings.push(format!("github remote: {e}"));
-                                    None
-                                }
-                            };
-                        RepoCleanupInfo {
-                            repo_path: assoc.repo_path.clone(),
-                            branch: assoc.branch.clone(),
-                            worktree_path: assoc.worktree_path.clone(),
-                            open_pr_number,
-                            github_remote,
-                        }
+                    .map(|a| crate::work_item_backend::RepoAssociationRecord {
+                        repo_path: a.repo_path.clone(),
+                        branch: a.branch.clone(),
+                        pr_identity: None,
                     })
                     .collect()
             })
             .unwrap_or_default();
 
-        // -- Phase 2: Backend cleanup --
-        if let Err(e) = self.backend.pre_delete_cleanup(&work_item_id) {
-            // Non-fatal: warn but continue with delete.
-            warnings.push(format!("pre-delete cleanup: {e}"));
-        }
-
-        if let Err(e) = self.backend.delete(&work_item_id) {
+        // Phases 2-6: backend delete, session kill, resource cleanup,
+        // in-flight cancellation, in-memory state. Warnings collected here.
+        let mut warnings: Vec<String> = Vec::new();
+        if let Err(e) = self.delete_work_item_by_id(
+            &work_item_id,
+            &repo_associations,
+            &mut warnings,
+            force,
+            false,
+        ) {
             self.status_message = Some(format!("Delete error: {e}"));
             return;
-        }
-
-        // -- Phase 3: Kill session and clean up MCP --
-        self.cleanup_session_state_for(&work_item_id);
-        if let Some(key) = self.session_key_for(&work_item_id)
-            && let Some(mut entry) = self.sessions.remove(&key)
-            && let Some(ref mut session) = entry.session
-        {
-            session.kill();
-        }
-
-        // -- Phase 4: Resource cleanup (all best-effort with warnings) --
-
-        for info in &cleanup_infos {
-            // 4a: Remove worktree (don't delete branch here - handled separately)
-            if let Some(ref wt_path) = info.worktree_path
-                && let Err(e) =
-                    self.worktree_service
-                        .remove_worktree(&info.repo_path, wt_path, false, force)
-            {
-                warnings.push(format!("worktree: {e}"));
-            }
-
-            // 4b: Delete local branch (force=true since user chose to destroy the item)
-            if let Some(ref branch) = info.branch
-                && let Err(e) = self
-                    .worktree_service
-                    .delete_branch(&info.repo_path, branch, true)
-            {
-                warnings.push(format!("branch: {e}"));
-            }
-
-            // 4c: Close open PR via `gh pr close`
-            // Runs synchronously (unlike pr create/merge which are async). This is
-            // deliberate: delete is a user-confirmed destructive operation where all
-            // cleanup should complete before the user continues interacting. Making
-            // this async would risk orphaned PRs if the user quits during the gap.
-            if let Some(pr_number) = info.open_pr_number
-                && let Some((ref owner, ref repo)) = info.github_remote
-            {
-                let owner_repo = format!("{owner}/{repo}");
-                match std::process::Command::new("gh")
-                    .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
-                    .output()
-                {
-                    Ok(output) if !output.status.success() => {
-                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                        warnings.push(format!("PR close: {stderr}"));
-                    }
-                    Err(e) => {
-                        warnings.push(format!("PR close: {e}"));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // -- Phase 5: Cancel in-flight operations --
-        // Cancel in-flight worktree creation and clean up any orphaned worktree.
-        if self.worktree_create_wi.as_ref() == Some(&work_item_id) {
-            // Try to drain the result in case the thread already completed.
-            let thread_done = if let Some(ref rx) = self.worktree_create_rx {
-                match rx.try_recv() {
-                    Ok(result) => {
-                        // Thread completed - clean up the orphaned worktree now.
-                        if let Some(ref path) = result.path
-                            && let Err(e) = self.worktree_service.remove_worktree(
-                                &result.repo_path,
-                                path,
-                                true,
-                                true,
-                            )
-                        {
-                            warnings.push(format!("orphan worktree cleanup: {e}"));
-                        }
-                        true
-                    }
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => true,
-                    Err(crossbeam_channel::TryRecvError::Empty) => {
-                        // Thread still running. Leave the receiver intact so
-                        // poll_worktree_creation can drain it on the next timer
-                        // tick and run the orphan-cleanup path (line 1774).
-                        false
-                    }
-                }
-            } else {
-                true
-            };
-            if thread_done {
-                self.worktree_create_rx = None;
-            }
-            self.worktree_create_wi = None;
-            if let Some(aid) = self.worktree_create_activity.take() {
-                self.end_activity(aid);
-            }
-        }
-
-        // Cancel in-flight PR creation if it was for the deleted item.
-        if self.pr_create_wi.as_ref() == Some(&work_item_id) {
-            self.pr_create_rx = None;
-            self.pr_create_wi = None;
-            if let Some(aid) = self.pr_create_activity.take() {
-                self.end_activity(aid);
-            }
-        }
-
-        // Remove the deleted item from the PR creation pending queue.
-        self.pr_create_pending.retain(|id| *id != work_item_id);
-
-        // Cancel in-flight PR merge if it was for the deleted item.
-        if self.merge_wi_id.as_ref() == Some(&work_item_id) && self.pr_merge_rx.is_some() {
-            self.pr_merge_rx = None;
-            if let Some(aid) = self.pr_merge_activity.take() {
-                self.end_activity(aid);
-            }
-        }
-
-        // Cancel in-flight review submission if it was for the deleted item.
-        if self.review_submit_wi.as_ref() == Some(&work_item_id) {
-            self.review_submit_rx = None;
-            self.review_submit_wi = None;
-            if let Some(aid) = self.review_submit_activity.take() {
-                self.end_activity(aid);
-            }
-        }
-
-        // Cancel mergequeue watch for the deleted item. Any in-flight poll
-        // result for a deleted item is discarded by poll_mergequeue (the item
-        // won't be found in work_items after reassembly).
-        self.mergequeue_watches.retain(|w| w.wi_id != work_item_id);
-
-        // -- Phase 6: Clean up in-memory state --
-        self.rework_reasons.remove(&work_item_id);
-        self.review_gate_findings.remove(&work_item_id);
-        self.review_reopen_suppress.remove(&work_item_id);
-        self.no_plan_prompt_queue.retain(|id| *id != work_item_id);
-        if self.no_plan_prompt_queue.is_empty() {
-            self.no_plan_prompt_visible = false;
-        }
-        if self.rework_prompt_wi.as_ref() == Some(&work_item_id) {
-            self.rework_prompt_wi = None;
-            self.rework_prompt_visible = false;
-        }
-        if self.merge_wi_id.as_ref() == Some(&work_item_id) {
-            self.merge_wi_id = None;
-            self.confirm_merge = false;
-        }
-        if self.review_gate_wi.as_ref() == Some(&work_item_id) {
-            self.review_gate_wi = None;
-            self.review_gate_rx = None;
-            self.review_gate_progress = None;
-            if let Some(aid) = self.review_gate_activity.take() {
-                self.end_activity(aid);
-            }
         }
 
         // -- Phase 7: Clear identity trackers and reassemble --
@@ -3493,9 +3654,36 @@ impl App {
             self.status_message = Some(format!("Stage update error: {e}"));
             return;
         }
+
+        // Track when items enter/leave Done for auto-archival.
+        let mut done_at_error = false;
+        if *new_status == WorkItemStatus::Done {
+            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => {
+                    if let Err(e) = self.backend.set_done_at(wi_id, Some(duration.as_secs())) {
+                        self.status_message = Some(format!("Failed to set archive timestamp: {e}"));
+                        done_at_error = true;
+                    }
+                }
+                Err(e) => {
+                    self.status_message = Some(format!(
+                        "System clock error, skipping archive timestamp: {e}"
+                    ));
+                    done_at_error = true;
+                }
+            }
+        } else if *current_status == WorkItemStatus::Done
+            && let Err(e) = self.backend.set_done_at(wi_id, None)
+        {
+            self.status_message = Some(format!("Failed to clear archive timestamp: {e}"));
+            done_at_error = true;
+        }
+
         self.reassemble_work_items();
         self.build_display_list();
-        self.status_message = Some(format!("Moved to {}", new_status.badge_text()));
+        if !done_at_error {
+            self.status_message = Some(format!("Moved to {}", new_status.badge_text()));
+        }
 
         // Feature 1: Auto-create PR when entering Review (async).
         // Skip for review requests - the PR already exists (it's someone else's).
@@ -5703,6 +5891,9 @@ impl WorkItemBackend for StubBackend {
     fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
         Ok(None)
     }
+    fn set_done_at(&self, _id: &WorkItemId, _done_at: Option<u64>) -> Result<(), BackendError> {
+        Ok(())
+    }
     fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
         None
     }
@@ -5909,6 +6100,7 @@ mod tests {
                         pr_identity: None,
                     }],
                     plan: None,
+                    done_at: None,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -5929,6 +6121,7 @@ mod tests {
                     }],
                     plan: None,
                     description: None,
+                    done_at: None,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -5948,6 +6141,13 @@ mod tests {
             }
             fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
                 Ok(None)
+            }
+            fn set_done_at(
+                &self,
+                _id: &WorkItemId,
+                _done_at: Option<u64>,
+            ) -> Result<(), BackendError> {
+                Ok(())
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
@@ -6042,6 +6242,7 @@ mod tests {
                     kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: req.repo_associations,
                     plan: None,
+                    done_at: None,
                 })
             }
             fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
@@ -6081,6 +6282,13 @@ mod tests {
             }
             fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
                 Ok(None)
+            }
+            fn set_done_at(
+                &self,
+                _id: &WorkItemId,
+                _done_at: Option<u64>,
+            ) -> Result<(), BackendError> {
+                Ok(())
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
@@ -6507,6 +6715,13 @@ mod tests {
             fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
                 Ok(None)
             }
+            fn set_done_at(
+                &self,
+                _id: &WorkItemId,
+                _done_at: Option<u64>,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
             }
@@ -6530,6 +6745,7 @@ mod tests {
                 pr_identity: None,
             }],
             plan: None,
+            done_at: None,
         };
         let record_b = crate::work_item_backend::WorkItemRecord {
             id: id_b.clone(),
@@ -6543,6 +6759,7 @@ mod tests {
                 pr_identity: None,
             }],
             plan: None,
+            done_at: None,
         };
 
         // Start with order A, B.
@@ -6647,6 +6864,7 @@ mod tests {
                     pr_identity: None,
                 }],
                 plan: None,
+                done_at: None,
             };
             let json = serde_json::to_string_pretty(&record).unwrap();
             std::fs::write(dir.join(name), json).unwrap();
@@ -7092,6 +7310,7 @@ mod tests {
                         pr_identity: None,
                     }],
                     plan: None,
+                    done_at: None,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -7112,6 +7331,7 @@ mod tests {
                     }],
                     plan: None,
                     description: None,
+                    done_at: None,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -7131,6 +7351,13 @@ mod tests {
             }
             fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
                 Ok(None)
+            }
+            fn set_done_at(
+                &self,
+                _id: &WorkItemId,
+                _done_at: Option<u64>,
+            ) -> Result<(), BackendError> {
+                Ok(())
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
@@ -7366,6 +7593,7 @@ mod tests {
                         pr_identity: None,
                     }],
                     plan: None,
+                    done_at: None,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -7386,6 +7614,7 @@ mod tests {
                     }],
                     plan: None,
                     description: None,
+                    done_at: None,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -7405,6 +7634,13 @@ mod tests {
             }
             fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
                 Ok(None)
+            }
+            fn set_done_at(
+                &self,
+                _id: &WorkItemId,
+                _done_at: Option<u64>,
+            ) -> Result<(), BackendError> {
+                Ok(())
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
@@ -7662,6 +7898,7 @@ mod tests {
                         pr_identity: None,
                     }],
                     plan: None,
+                    done_at: None,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -7682,6 +7919,7 @@ mod tests {
                     }],
                     plan: None,
                     description: None,
+                    done_at: None,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -7701,6 +7939,13 @@ mod tests {
             }
             fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
                 Ok(None)
+            }
+            fn set_done_at(
+                &self,
+                _id: &WorkItemId,
+                _done_at: Option<u64>,
+            ) -> Result<(), BackendError> {
+                Ok(())
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
@@ -7818,6 +8063,7 @@ mod tests {
                     kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: req.repo_associations,
                     plan: None,
+                    done_at: None,
                 };
                 Ok(record)
             }
@@ -7858,6 +8104,13 @@ mod tests {
             }
             fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
                 Ok(None)
+            }
+            fn set_done_at(
+                &self,
+                _id: &WorkItemId,
+                _done_at: Option<u64>,
+            ) -> Result<(), BackendError> {
+                Ok(())
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
@@ -9567,6 +9820,7 @@ mod tests {
                         pr_identity: None,
                     }],
                     plan: None,
+                    done_at: None,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -9592,6 +9846,13 @@ mod tests {
             }
             fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
                 Ok(None)
+            }
+            fn set_done_at(
+                &self,
+                _id: &WorkItemId,
+                _done_at: Option<u64>,
+            ) -> Result<(), BackendError> {
+                Ok(())
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
@@ -9713,6 +9974,7 @@ mod tests {
                         pr_identity: None,
                     }],
                     plan: None,
+                    done_at: None,
                 }],
             }
         }
@@ -9774,6 +10036,9 @@ mod tests {
         }
         fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
             Ok(None)
+        }
+        fn set_done_at(&self, _id: &WorkItemId, _done_at: Option<u64>) -> Result<(), BackendError> {
+            Ok(())
         }
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
@@ -9970,11 +10235,24 @@ mod tests {
             Box::new(InMemoryConfigProvider::new()),
         );
 
-        // Inject a fake worktree path so remove_worktree has something
-        // to clean up.
+        // Inject a fake RepoFetchResult so delete_work_item_by_id can
+        // find the worktree path via repo_data.
         assert_eq!(app.work_items.len(), 1);
-        app.work_items[0].repo_associations[0].worktree_path =
-            Some(PathBuf::from("/my/repo/.worktrees/feature-branch"));
+        app.repo_data.insert(
+            PathBuf::from("/my/repo"),
+            crate::work_item::RepoFetchResult {
+                repo_path: PathBuf::from("/my/repo"),
+                github_remote: None,
+                worktrees: Ok(vec![crate::worktree_service::WorktreeInfo {
+                    path: PathBuf::from("/my/repo/.worktrees/feature-branch"),
+                    branch: Some("feature-branch".into()),
+                    is_main: false,
+                }]),
+                prs: Ok(vec![]),
+                review_requested_prs: Ok(vec![]),
+                issues: vec![],
+            },
+        );
         app.build_display_list();
 
         // Select the work item.
@@ -10024,6 +10302,313 @@ mod tests {
         assert!(
             db_calls[0].2,
             "delete_branch force should be true (user chose to destroy the item)"
+        );
+    }
+
+    // -- Auto-archival tests --
+
+    /// Backend that tracks records in memory and supports set_done_at.
+    /// Used by auto-archive tests that need functional delete/update_status.
+    struct ArchiveTestBackend {
+        records: std::sync::Mutex<Vec<crate::work_item_backend::WorkItemRecord>>,
+    }
+
+    impl WorkItemBackend for ArchiveTestBackend {
+        fn list(&self) -> Result<crate::work_item_backend::ListResult, BackendError> {
+            Ok(crate::work_item_backend::ListResult {
+                records: self.records.lock().unwrap().clone(),
+                corrupt: Vec::new(),
+            })
+        }
+        fn read(
+            &self,
+            id: &WorkItemId,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::NotFound(id.clone()))
+        }
+        fn create(
+            &self,
+            _req: CreateWorkItem,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation("not used".into()))
+        }
+        fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
+            let mut records = self.records.lock().unwrap();
+            if let Some(pos) = records.iter().position(|r| r.id == *id) {
+                records.remove(pos);
+                Ok(())
+            } else {
+                Err(BackendError::NotFound(id.clone()))
+            }
+        }
+        fn update_status(
+            &self,
+            id: &WorkItemId,
+            status: WorkItemStatus,
+        ) -> Result<(), BackendError> {
+            let mut records = self.records.lock().unwrap();
+            if let Some(record) = records.iter_mut().find(|r| r.id == *id) {
+                record.status = status;
+                Ok(())
+            } else {
+                Err(BackendError::NotFound(id.clone()))
+            }
+        }
+        fn import(
+            &self,
+            _unlinked: &crate::work_item::UnlinkedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation("not used".into()))
+        }
+        fn import_review_request(
+            &self,
+            _rr: &crate::work_item::ReviewRequestedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation("not supported in test".into()))
+        }
+        fn append_activity(
+            &self,
+            _id: &WorkItemId,
+            _entry: &ActivityEntry,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
+            Ok(Vec::new())
+        }
+        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
+            Ok(None)
+        }
+        fn set_done_at(&self, id: &WorkItemId, done_at: Option<u64>) -> Result<(), BackendError> {
+            let mut records = self.records.lock().unwrap();
+            if let Some(record) = records.iter_mut().find(|r| r.id == *id) {
+                record.done_at = done_at;
+                Ok(())
+            } else {
+                Err(BackendError::NotFound(id.clone()))
+            }
+        }
+        fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn backend_type(&self) -> crate::work_item::BackendType {
+            crate::work_item::BackendType::LocalFile
+        }
+    }
+
+    fn make_archive_record(
+        name: &str,
+        status: WorkItemStatus,
+        done_at: Option<u64>,
+    ) -> crate::work_item_backend::WorkItemRecord {
+        crate::work_item_backend::WorkItemRecord {
+            id: WorkItemId::LocalFile(PathBuf::from(format!("/tmp/{name}.json"))),
+            title: name.into(),
+            description: None,
+            status,
+            kind: crate::work_item::WorkItemKind::Own,
+            repo_associations: vec![RepoAssociationRecord {
+                repo_path: PathBuf::from("/repo"),
+                branch: None,
+                pr_identity: None,
+            }],
+            plan: None,
+            done_at,
+        }
+    }
+
+    #[test]
+    fn auto_archive_deletes_expired_done_items() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // done_at 8 days ago (exceeds default 7-day period).
+        let eight_days_ago = now - (8 * 86400);
+        let backend = ArchiveTestBackend {
+            records: std::sync::Mutex::new(vec![
+                make_archive_record("expired", WorkItemStatus::Done, Some(eight_days_ago)),
+                make_archive_record("active", WorkItemStatus::Implementing, None),
+            ]),
+        };
+
+        let mut cfg = Config::for_test();
+        cfg.defaults.archive_after_days = 7;
+        let mut app = App::with_config(cfg, Box::new(backend));
+        app.reassemble_work_items();
+
+        // Only the active item should remain.
+        assert_eq!(app.work_items.len(), 1);
+        assert_eq!(app.work_items[0].title, "active");
+    }
+
+    #[test]
+    fn auto_archive_skips_when_disabled() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let old = now - (30 * 86400);
+        let backend = ArchiveTestBackend {
+            records: std::sync::Mutex::new(vec![make_archive_record(
+                "old-done",
+                WorkItemStatus::Done,
+                Some(old),
+            )]),
+        };
+
+        let mut cfg = Config::for_test();
+        cfg.defaults.archive_after_days = 0; // disabled
+        let mut app = App::with_config(cfg, Box::new(backend));
+        app.reassemble_work_items();
+
+        assert_eq!(app.work_items.len(), 1, "should not archive when disabled");
+    }
+
+    #[test]
+    fn auto_archive_skips_done_without_done_at() {
+        let backend = ArchiveTestBackend {
+            records: std::sync::Mutex::new(vec![make_archive_record(
+                "done-no-ts",
+                WorkItemStatus::Done,
+                None, // no done_at timestamp
+            )]),
+        };
+
+        let mut cfg = Config::for_test();
+        cfg.defaults.archive_after_days = 7;
+        let mut app = App::with_config(cfg, Box::new(backend));
+        app.reassemble_work_items();
+
+        assert_eq!(
+            app.work_items.len(),
+            1,
+            "should not archive Done items without done_at"
+        );
+    }
+
+    #[test]
+    fn auto_archive_keeps_recent_done_items() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // done_at 3 days ago (within 7-day period).
+        let three_days_ago = now - (3 * 86400);
+        let backend = ArchiveTestBackend {
+            records: std::sync::Mutex::new(vec![make_archive_record(
+                "recent-done",
+                WorkItemStatus::Done,
+                Some(three_days_ago),
+            )]),
+        };
+
+        let mut cfg = Config::for_test();
+        cfg.defaults.archive_after_days = 7;
+        let mut app = App::with_config(cfg, Box::new(backend));
+        app.reassemble_work_items();
+
+        assert_eq!(app.work_items.len(), 1, "recent Done items should be kept");
+    }
+
+    #[test]
+    fn auto_archive_works_for_derived_done_items() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // done_at 8 days ago, but backend status is Review (derived-Done via merged PR).
+        let eight_days_ago = now - (8 * 86400);
+        let backend = ArchiveTestBackend {
+            records: std::sync::Mutex::new(vec![make_archive_record(
+                "derived-done",
+                WorkItemStatus::Review,
+                Some(eight_days_ago),
+            )]),
+        };
+
+        let mut cfg = Config::for_test();
+        cfg.defaults.archive_after_days = 7;
+        let mut app = App::with_config(cfg, Box::new(backend));
+        app.reassemble_work_items();
+
+        assert_eq!(
+            app.work_items.len(),
+            0,
+            "derived-Done items with expired done_at should be archived"
+        );
+    }
+
+    #[test]
+    fn apply_stage_change_sets_done_at() {
+        let backend = ArchiveTestBackend {
+            records: std::sync::Mutex::new(vec![make_archive_record(
+                "review-item",
+                WorkItemStatus::Review,
+                None,
+            )]),
+        };
+
+        let mut cfg = Config::for_test();
+        cfg.defaults.archive_after_days = 7;
+        let mut app = App::with_config(cfg, Box::new(backend));
+        app.reassemble_work_items();
+        app.build_display_list();
+
+        let wi_id = app.work_items[0].id.clone();
+        app.apply_stage_change(
+            &wi_id,
+            &WorkItemStatus::Review,
+            &WorkItemStatus::Done,
+            "pr_merge",
+        );
+
+        // Verify done_at was set on the backend record.
+        let records = app.backend.list().unwrap().records;
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].done_at.is_some(),
+            "done_at should be set when entering Done"
+        );
+    }
+
+    #[test]
+    fn apply_stage_change_clears_done_at_on_retreat() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let backend = ArchiveTestBackend {
+            records: std::sync::Mutex::new(vec![make_archive_record(
+                "done-item",
+                WorkItemStatus::Done,
+                Some(now),
+            )]),
+        };
+
+        let mut cfg = Config::for_test();
+        cfg.defaults.archive_after_days = 7;
+        let mut app = App::with_config(cfg, Box::new(backend));
+        app.reassemble_work_items();
+        app.build_display_list();
+
+        let wi_id = app.work_items[0].id.clone();
+        app.apply_stage_change(
+            &wi_id,
+            &WorkItemStatus::Done,
+            &WorkItemStatus::Review,
+            "test",
+        );
+
+        // Verify done_at was cleared.
+        let records = app.backend.list().unwrap().records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].done_at, None,
+            "done_at should be cleared when retreating from Done"
         );
     }
 }
