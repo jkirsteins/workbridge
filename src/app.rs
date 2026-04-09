@@ -2615,13 +2615,27 @@ impl App {
             );
 
         let mut cmd: Vec<String> = vec!["claude".to_string()];
-        cmd.push("--dangerously-skip-permissions".to_string());
         if is_planning {
+            cmd.push("--permission-mode".to_string());
+            cmd.push("plan".to_string());
+            // Pre-approve workbridge MCP tools so plan mode does not prompt.
+            cmd.push("--allowedTools".to_string());
+            cmd.push(
+                "mcp__workbridge__workbridge_get_context,\
+                 mcp__workbridge__workbridge_query_log,\
+                 mcp__workbridge__workbridge_log_event,\
+                 mcp__workbridge__workbridge_set_activity,\
+                 mcp__workbridge__workbridge_set_status,\
+                 mcp__workbridge__workbridge_set_plan"
+                    .to_string(),
+            );
             cmd.push("--settings".to_string());
             cmd.push(
                 r#"{"hooks":{"PostToolUse":[{"matcher":"TodoWrite","hooks":[{"type":"command","command":"bash -c 'cat | grep -q workbridge_set_plan || echo \"REMINDER: Your plan MUST include a step to call workbridge_set_plan MCP tool to persist the plan. Add this as the FIRST step.\" >&2; true'"}]}]}}"#
                     .to_string(),
             );
+        } else {
+            cmd.push("--dangerously-skip-permissions".to_string());
         }
         if let Some(prompt) = system_prompt {
             cmd.push("--system-prompt".to_string());
@@ -9204,18 +9218,26 @@ mod tests {
     /// a config file path and exits with "MCP config file not found".
     #[test]
     fn build_claude_cmd_prompt_before_mcp_config() {
-        // Planning session: has --dangerously-skip-permissions, --settings hook, and positional prompt.
+        // Planning session: has --permission-mode plan, --allowedTools, --settings hook, and positional prompt.
         let cmd =
             App::build_claude_cmd(&WorkItemStatus::Planning, Some("system prompt here"), false);
         assert_eq!(cmd[0], "claude");
-        assert_eq!(cmd[1], "--dangerously-skip-permissions");
-        assert_eq!(cmd[2], "--settings");
+        assert_eq!(cmd[1], "--permission-mode");
+        assert_eq!(cmd[2], "plan");
+        assert_eq!(cmd[3], "--allowedTools");
         assert!(
-            cmd[3].contains("PostToolUse") && cmd[3].contains("workbridge_set_plan"),
+            cmd[4].contains("workbridge_get_context")
+                && cmd[4].contains("workbridge_set_plan")
+                && cmd[4].contains("workbridge_set_activity"),
+            "planning sessions must pre-approve workbridge MCP tools",
+        );
+        assert_eq!(cmd[5], "--settings");
+        assert!(
+            cmd[6].contains("PostToolUse") && cmd[6].contains("workbridge_set_plan"),
             "planning sessions must include TodoWrite reminder hook via --settings",
         );
-        assert_eq!(cmd[4], "--system-prompt");
-        assert_eq!(cmd[5], "system prompt here");
+        assert_eq!(cmd[7], "--system-prompt");
+        assert_eq!(cmd[8], "system prompt here");
         // Positional prompt is the LAST element - callers append
         // --mcp-config after this, so it stays after the prompt.
         assert_eq!(
