@@ -282,6 +282,16 @@ pub struct App {
     /// approves, consumed one-shot by `stage_system_prompt` to select the
     /// "review_with_findings" prompt template and inject the assessment.
     pub review_gate_findings: HashMap<WorkItemId, String>,
+    /// True when the unlinked-item cleanup confirmation prompt is visible.
+    pub cleanup_prompt_visible: bool,
+    /// True when the cleanup reason text input is active (user pressed Enter
+    /// from the confirmation prompt to type an optional close reason).
+    pub cleanup_reason_input_active: bool,
+    /// Text input for the optional close reason.
+    pub cleanup_reason_input: crate::create_dialog::SimpleTextInput,
+    /// Identity of the unlinked PR being cleaned up: (repo_path, branch, pr_number).
+    /// Stored by identity rather than index so it survives reassembly.
+    pub cleanup_unlinked_target: Option<(PathBuf, String, u64)>,
     /// True when the no-plan prompt is visible (offered when Claude blocks
     /// because no implementation plan exists).
     pub no_plan_prompt_visible: bool,
@@ -576,6 +586,10 @@ impl App {
             rework_prompt_wi: None,
             rework_reasons: HashMap::new(),
             review_gate_findings: HashMap::new(),
+            cleanup_prompt_visible: false,
+            cleanup_reason_input_active: false,
+            cleanup_reason_input: crate::create_dialog::SimpleTextInput::new(),
+            cleanup_unlinked_target: None,
             no_plan_prompt_visible: false,
             no_plan_prompt_queue: VecDeque::new(),
             shutting_down: false,
@@ -1583,6 +1597,102 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Close a PR and delete the branch for an unlinked item.
+    ///
+    /// If `reason` is `Some` and non-empty, posts a comment on the PR before
+    /// closing it. Branch is force-deleted. Returns a list of warnings for
+    /// best-effort failures (non-fatal).
+    pub fn cleanup_unlinked_item(
+        &mut self,
+        repo_path: &PathBuf,
+        branch: &str,
+        pr_number: u64,
+        reason: Option<&str>,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        let github_remote = self
+            .repo_data
+            .get(repo_path)
+            .and_then(|rd| rd.github_remote.clone());
+
+        if let Some((ref owner, ref repo)) = github_remote {
+            let owner_repo = format!("{owner}/{repo}");
+
+            // Post optional reason as a comment before closing.
+            if let Some(r) = reason
+                && !r.is_empty()
+            {
+                match std::process::Command::new("gh")
+                    .args([
+                        "pr",
+                        "comment",
+                        &pr_number.to_string(),
+                        "--repo",
+                        &owner_repo,
+                        "--body",
+                        r,
+                    ])
+                    .output()
+                {
+                    Ok(output) if !output.status.success() => {
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        warnings.push(format!("PR comment: {stderr}"));
+                    }
+                    Err(e) => warnings.push(format!("PR comment: {e}")),
+                    _ => {}
+                }
+            }
+
+            // Close the PR.
+            match std::process::Command::new("gh")
+                .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
+                .output()
+            {
+                Ok(output) if !output.status.success() => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    warnings.push(format!("PR close: {stderr}"));
+                }
+                Err(e) => warnings.push(format!("PR close: {e}")),
+                _ => {}
+            }
+        } else {
+            warnings.push("No GitHub remote found; skipping PR close".into());
+        }
+
+        // Force-delete the local branch.
+        if let Err(e) = self.worktree_service.delete_branch(repo_path, branch, true) {
+            warnings.push(format!("branch: {e}"));
+        }
+
+        warnings
+    }
+
+    /// Execute unlinked item cleanup, clear prompt state, reassemble the
+    /// display list, and show a status message.
+    pub fn finalize_unlinked_cleanup(&mut self, reason: Option<&str>) {
+        let Some((repo_path, branch, pr_number)) = self.cleanup_unlinked_target.take() else {
+            return;
+        };
+
+        let warnings = self.cleanup_unlinked_item(&repo_path, &branch, pr_number, reason);
+
+        self.cleanup_prompt_visible = false;
+        self.cleanup_reason_input_active = false;
+        self.cleanup_reason_input.clear();
+
+        self.selected_unlinked_branch = None;
+        self.reassemble_work_items();
+        self.build_display_list();
+        self.fetcher_repos_changed = true;
+
+        if warnings.is_empty() {
+            self.status_message = Some("Unlinked item closed".into());
+        } else {
+            self.status_message = Some(format!("Closed with warnings: {}", warnings.join("; ")));
+        }
     }
 
     /// Delete Done work items whose `done_at` timestamp exceeds the
@@ -2819,10 +2929,6 @@ impl App {
                         }
                         if !self.no_plan_prompt_visible {
                             self.no_plan_prompt_visible = true;
-                            self.status_message = Some(
-                                "No plan available. [p] Plan from branch  [Esc] Stay blocked"
-                                    .to_string(),
-                            );
                         }
                         continue;
                     }
@@ -3473,10 +3579,6 @@ impl App {
         if current_status == WorkItemStatus::Review && new_status == WorkItemStatus::Done {
             self.confirm_merge = true;
             self.merge_wi_id = Some(wi_id);
-            self.status_message = Some(
-                "Merge PR? [s]quash (default) / [m]erge / [p]oll (mergequeue) / [Esc] cancel"
-                    .into(),
-            );
             return;
         }
 
@@ -3568,7 +3670,6 @@ impl App {
             self.rework_prompt_visible = true;
             self.rework_prompt_input.clear();
             self.rework_prompt_wi = Some(wi_id);
-            self.status_message = Some("Rework reason: (Enter to submit, Esc to cancel)".into());
             return;
         }
 
@@ -8401,11 +8502,7 @@ mod tests {
             Some(&wi_id),
             "merge_wi_id should be set to the work item",
         );
-        let msg = app.status_message.as_deref().unwrap_or("");
-        assert!(
-            msg.contains("quash"),
-            "status should mention squash option, got: {msg}",
-        );
+        // The merge prompt is now a dialog overlay; it no longer sets status_message.
     }
 
     // -- Regression: execute_merge must not advance to Done without a real merge --
@@ -8614,11 +8711,7 @@ mod tests {
             Some(&wi_id),
             "rework_prompt_wi should be set",
         );
-        let msg = app.status_message.as_deref().unwrap_or("");
-        assert!(
-            msg.contains("Rework reason"),
-            "status should mention rework reason, got: {msg}",
-        );
+        // The rework prompt is now a dialog overlay; it no longer sets status_message.
     }
 
     /// Rework reasons are stored per work item and influence prompt key.

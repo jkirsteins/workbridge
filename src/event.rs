@@ -51,6 +51,20 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    // When the cleanup reason text input is active, route keys to it.
+    // This must be checked before cleanup_prompt_visible because both flags
+    // are true during text input.
+    if app.cleanup_reason_input_active {
+        handle_cleanup_reason_input(app, key);
+        return true;
+    }
+
+    // When the unlinked cleanup confirmation prompt is visible, route keys.
+    if app.cleanup_prompt_visible {
+        handle_cleanup_prompt(app, key);
+        return true;
+    }
+
     // When the no-plan prompt is visible, route keys to it.
     if app.no_plan_prompt_visible {
         handle_no_plan_prompt(app, key);
@@ -337,42 +351,56 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 .and_then(|cwd| app.managed_repo_root(&cwd));
             app.create_dialog.open(&active_repos, cwd_repo.as_ref());
         }
-        // Ctrl+D or Delete - delete work item with 3-step confirmation
+        // Ctrl+D or Delete - delete work item or clean up unlinked item
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Delete) => {
-            if app.selected_work_item_id().is_none() {
-                return;
-            }
-            match app.confirm_delete {
-                DeleteConfirmState::None => {
-                    app.confirm_delete = DeleteConfirmState::AwaitingConfirm;
-                    app.status_message = Some("Press again to delete this work item".into());
-                    sync_layout(app);
-                }
-                DeleteConfirmState::AwaitingConfirm => {
-                    let had_status = app.has_visible_status_bar();
-                    let had_context = app.selected_work_item_context().is_some();
-                    app.attempt_delete_selected_work_item();
-                    app.confirm_delete = match app.confirm_delete {
-                        // attempt_delete may have escalated to AwaitingForce
-                        DeleteConfirmState::AwaitingForce => DeleteConfirmState::AwaitingForce,
-                        _ => DeleteConfirmState::None,
-                    };
-                    if app.has_visible_status_bar() != had_status
-                        || app.selected_work_item_context().is_some() != had_context
-                    {
+            if app.selected_work_item_id().is_some() {
+                // Work item selected: 3-step confirmation delete flow.
+                match app.confirm_delete {
+                    DeleteConfirmState::None => {
+                        app.confirm_delete = DeleteConfirmState::AwaitingConfirm;
+                        app.status_message = Some("Press again to delete this work item".into());
                         sync_layout(app);
                     }
-                }
-                DeleteConfirmState::AwaitingForce => {
-                    app.confirm_delete = DeleteConfirmState::None;
-                    let had_status = app.has_visible_status_bar();
-                    let had_context = app.selected_work_item_context().is_some();
-                    app.delete_selected_work_item(true);
-                    if app.has_visible_status_bar() != had_status
-                        || app.selected_work_item_context().is_some() != had_context
-                    {
-                        sync_layout(app);
+                    DeleteConfirmState::AwaitingConfirm => {
+                        let had_status = app.has_visible_status_bar();
+                        let had_context = app.selected_work_item_context().is_some();
+                        app.attempt_delete_selected_work_item();
+                        app.confirm_delete = match app.confirm_delete {
+                            // attempt_delete may have escalated to AwaitingForce
+                            DeleteConfirmState::AwaitingForce => DeleteConfirmState::AwaitingForce,
+                            _ => DeleteConfirmState::None,
+                        };
+                        if app.has_visible_status_bar() != had_status
+                            || app.selected_work_item_context().is_some() != had_context
+                        {
+                            sync_layout(app);
+                        }
                     }
+                    DeleteConfirmState::AwaitingForce => {
+                        app.confirm_delete = DeleteConfirmState::None;
+                        let had_status = app.has_visible_status_bar();
+                        let had_context = app.selected_work_item_context().is_some();
+                        app.delete_selected_work_item(true);
+                        if app.has_visible_status_bar() != had_status
+                            || app.selected_work_item_context().is_some() != had_context
+                        {
+                            sync_layout(app);
+                        }
+                    }
+                }
+            } else if let Some(unlinked_idx) =
+                app.selected_item
+                    .and_then(|idx| match app.display_list.get(idx) {
+                        Some(crate::app::DisplayEntry::UnlinkedItem(i)) => Some(*i),
+                        _ => None,
+                    })
+            {
+                // Unlinked item selected: show cleanup confirmation prompt.
+                if let Some(ul) = app.unlinked_prs.get(unlinked_idx) {
+                    let pr_number = ul.pr.number;
+                    app.cleanup_unlinked_target =
+                        Some((ul.repo_path.clone(), ul.branch.clone(), pr_number));
+                    app.cleanup_prompt_visible = true;
                 }
             }
         }
@@ -878,15 +906,12 @@ fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
         // Route text input keys to the SimpleTextInput.
         (_, KeyCode::Char(c)) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.rework_prompt_input.insert_char(c);
-            app.status_message = Some(format!("Rework reason: {}", app.rework_prompt_input.text()));
         }
         (_, KeyCode::Backspace) => {
             app.rework_prompt_input.backspace();
-            app.status_message = Some(format!("Rework reason: {}", app.rework_prompt_input.text()));
         }
         (_, KeyCode::Delete) => {
             app.rework_prompt_input.delete();
-            app.status_message = Some(format!("Rework reason: {}", app.rework_prompt_input.text()));
         }
         (_, KeyCode::Left) => {
             app.rework_prompt_input.move_left();
@@ -907,6 +932,87 @@ fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Handle key events for the unlinked item cleanup confirmation prompt.
+///
+/// [Enter] transitions to the reason text input.
+/// [d] closes directly without a reason.
+/// [Esc] or any other key cancels.
+fn handle_cleanup_prompt(app: &mut App, key: KeyEvent) {
+    let had_status = app.has_visible_status_bar();
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Enter) => {
+            // Transition to reason text input.
+            app.cleanup_reason_input_active = true;
+            app.cleanup_reason_input.clear();
+        }
+        (_, KeyCode::Char('d')) => {
+            // Close directly without a reason.
+            app.finalize_unlinked_cleanup(None);
+        }
+        _ => {
+            // Cancel (Esc or any unrecognized key).
+            app.cleanup_prompt_visible = false;
+            app.cleanup_unlinked_target = None;
+            app.status_message = None;
+        }
+    }
+    if app.has_visible_status_bar() != had_status {
+        sync_layout(app);
+    }
+}
+
+/// Handle key events when the cleanup reason text input is active.
+///
+/// All printable characters are routed to the text input.
+/// [Enter] submits (comments on PR then closes), [Esc] cancels the entire flow.
+fn handle_cleanup_reason_input(app: &mut App, key: KeyEvent) {
+    let had_status = app.has_visible_status_bar();
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Esc) => {
+            // Cancel the entire cleanup.
+            app.cleanup_prompt_visible = false;
+            app.cleanup_reason_input_active = false;
+            app.cleanup_reason_input.clear();
+            app.cleanup_unlinked_target = None;
+            app.status_message = None;
+        }
+        (_, KeyCode::Enter) => {
+            let reason = app.cleanup_reason_input.text().trim().to_string();
+            let reason_opt = if reason.is_empty() {
+                None
+            } else {
+                Some(reason.as_str())
+            };
+            app.finalize_unlinked_cleanup(reason_opt);
+        }
+        (_, KeyCode::Char(c)) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.cleanup_reason_input.insert_char(c);
+        }
+        (_, KeyCode::Backspace) => {
+            app.cleanup_reason_input.backspace();
+        }
+        (_, KeyCode::Delete) => {
+            app.cleanup_reason_input.delete();
+        }
+        (_, KeyCode::Left) => {
+            app.cleanup_reason_input.move_left();
+        }
+        (_, KeyCode::Right) => {
+            app.cleanup_reason_input.move_right();
+        }
+        (_, KeyCode::Home) => {
+            app.cleanup_reason_input.home();
+        }
+        (_, KeyCode::End) => {
+            app.cleanup_reason_input.end();
+        }
+        _ => {}
+    }
+    if app.has_visible_status_bar() != had_status {
+        sync_layout(app);
+    }
+}
+
 /// Handle key events when the no-plan prompt is visible.
 ///
 /// [p] retreats the blocked item to Planning for retroactive plan creation.
@@ -919,10 +1025,9 @@ fn handle_no_plan_prompt(app: &mut App, key: KeyEvent) {
             if app.no_plan_prompt_queue.is_empty() {
                 app.no_plan_prompt_visible = false;
                 app.status_message = None;
-            } else {
-                app.status_message =
-                    Some("No plan available. [p] Plan from branch  [Esc] Stay blocked".to_string());
             }
+            // If queue still has items, the dialog stays visible with the
+            // next item automatically (no status_message needed).
         }
         (KeyModifiers::NONE, KeyCode::Char('p')) => {
             let wi_id = match app.no_plan_prompt_queue.pop_front() {
@@ -933,13 +1038,10 @@ fn handle_no_plan_prompt(app: &mut App, key: KeyEvent) {
                 }
             };
             app.plan_from_branch(&wi_id);
-            // Re-set prompt text AFTER plan_from_branch (which overwrites
-            // status_message), or clear prompt if queue is empty.
+            // Clear prompt if queue is empty; otherwise dialog stays for
+            // the next item (plan_from_branch may set status_message - keep it).
             if app.no_plan_prompt_queue.is_empty() {
                 app.no_plan_prompt_visible = false;
-            } else {
-                app.status_message =
-                    Some("No plan available. [p] Plan from branch  [Esc] Stay blocked".to_string());
             }
         }
         _ => {}
@@ -1451,13 +1553,12 @@ mod tests {
 
     /// Rework prompt: typing characters updates the status message.
     #[test]
-    fn rework_prompt_typing_updates_status() {
+    fn rework_prompt_typing_updates_input() {
         let mut app = App::new();
         app.rework_prompt_visible = true;
         app.rework_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
             "/tmp/test.json",
         )));
-        app.status_message = Some("Rework reason: ".into());
 
         // Type 'a'
         let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
@@ -1465,11 +1566,7 @@ mod tests {
 
         assert!(app.rework_prompt_visible, "prompt should still be visible");
         assert_eq!(app.rework_prompt_input.text(), "a");
-        assert_eq!(
-            app.status_message.as_deref(),
-            Some("Rework reason: a"),
-            "status should show typed text",
-        );
+        // Input is shown in the dialog overlay, not the status bar.
     }
 
     /// Rework prompt blocks other keys (settings, quit, etc.).
@@ -1537,8 +1634,6 @@ mod tests {
             .push_back(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
                 "/tmp/second.json",
             )));
-        app.status_message =
-            Some("No plan available. [p] Plan from branch  [Esc] Stay blocked".into());
 
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         handle_key(&mut app, esc);
@@ -1552,10 +1647,8 @@ mod tests {
             1,
             "first item should be popped, second remains",
         );
-        assert!(
-            app.status_message.as_deref().unwrap_or("").contains("[p]"),
-            "status should show prompt for next item",
-        );
+        // The dialog is now a rendered overlay; status_message is no longer used
+        // to show prompt content. Dialog content comes from draw_prompt_dialog().
     }
 
     /// No-plan prompt blocks other keys (quit, settings, etc.).

@@ -1,0 +1,29 @@
+---
+source: src/ui.rs
+assertion_line: 3513
+expression: "render(&app, 80, 24)"
+---
+  List    Board                                                Tab: switch view
+┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
+│                       ││                                                     │
+│  No work items.       ││  Welcome to workbridge                              │
+│                       ││                                                     │
+│  Press Ctrl+N         ││  Ctrl+N    - Create work item                       │
+│  to create one.   ╭ Merge Strategy ──────────────────────╮                   │
+│                   │                                      │t                  │
+│                   │ Merge PR?                            │                   │
+│                   │                                      │                   │
+│                   │ [s]  Squash (default)                │                   │
+│                   │ [m]  Merge                           │                   │
+│                   │ [p]  Poll (mergequeue)               │                   │
+│                   │ [Esc]  Cancel                        │                   │
+│                   │                                      │                   │
+│                   │                                      │                   │
+│                   ╰──────────────────────────────────────╯                   │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+└───────────────────────┘└─────────────────────────────────────────────────────┘
