@@ -1283,8 +1283,9 @@ impl App {
                     && let Some(wi) = self.work_items.iter().find(|w| w.id == record.id)
                     && wi.status == WorkItemStatus::Done
                     && wi.status_derived
+                    && let Err(e) = self.backend.set_done_at(&record.id, Some(epoch))
                 {
-                    let _ = self.backend.set_done_at(&record.id, Some(epoch));
+                    self.status_message = Some(format!("Failed to set archive timestamp: {e}"));
                 }
             }
         }
@@ -1342,6 +1343,11 @@ impl App {
     /// backend record. Worktree paths and live PR state are looked up from
     /// self.repo_data (populated by the background fetcher).
     ///
+    /// When `skip_resource_cleanup` is true, Phase 4 (worktree removal,
+    /// branch deletion, PR close) is skipped. Used by auto-archive where
+    /// Done items have already been through the merge flow which handles
+    /// resource cleanup, avoiding blocking I/O on the UI thread.
+    ///
     /// Warnings (best-effort cleanup failures) are appended to `warnings`.
     /// Returns Err only if the backend delete itself fails (fatal).
     fn delete_work_item_by_id(
@@ -1350,54 +1356,8 @@ impl App {
         repo_associations: &[crate::work_item_backend::RepoAssociationRecord],
         warnings: &mut Vec<String>,
         force: bool,
+        skip_resource_cleanup: bool,
     ) -> Result<(), crate::work_item_backend::BackendError> {
-        // -- Phase 1: snapshot resource info before mutating anything --
-        struct CleanupInfo {
-            repo_path: PathBuf,
-            branch: Option<String>,
-            worktree_path: Option<PathBuf>,
-            open_pr_number: Option<u64>,
-            github_remote: Option<(String, String)>,
-        }
-
-        let cleanup_infos: Vec<CleanupInfo> = repo_associations
-            .iter()
-            .map(|assoc| {
-                let worktree_path = self
-                    .repo_data
-                    .get(&assoc.repo_path)
-                    .and_then(|rd| rd.worktrees.as_ref().ok())
-                    .and_then(|wts| {
-                        wts.iter()
-                            .find(|wt| wt.branch.as_deref() == assoc.branch.as_deref())
-                            .map(|wt| wt.path.clone())
-                    });
-
-                let open_pr_number = assoc.branch.as_deref().and_then(|branch| {
-                    self.repo_data.get(&assoc.repo_path).and_then(|rd| {
-                        rd.prs.as_ref().ok().and_then(|prs| {
-                            prs.iter()
-                                .find(|pr| pr.head_branch == branch && pr.state == "OPEN")
-                                .map(|pr| pr.number)
-                        })
-                    })
-                });
-
-                let github_remote = self
-                    .repo_data
-                    .get(&assoc.repo_path)
-                    .and_then(|rd| rd.github_remote.clone());
-
-                CleanupInfo {
-                    repo_path: assoc.repo_path.clone(),
-                    branch: assoc.branch.clone(),
-                    worktree_path,
-                    open_pr_number,
-                    github_remote,
-                }
-            })
-            .collect();
-
         // -- Phase 2: Backend cleanup (fatal on delete failure) --
         if let Err(e) = self.backend.pre_delete_cleanup(wi_id) {
             warnings.push(format!("pre-delete cleanup: {e}"));
@@ -1414,35 +1374,90 @@ impl App {
         }
 
         // -- Phase 4: Resource cleanup (worktrees, branches, open PRs) --
-        for info in &cleanup_infos {
-            if let Some(ref wt_path) = info.worktree_path
-                && let Err(e) =
-                    self.worktree_service
-                        .remove_worktree(&info.repo_path, wt_path, false, force)
-            {
-                warnings.push(format!("worktree: {e}"));
+        // Skipped for auto-archive: Done items have already been through the
+        // merge flow which handles resource cleanup. This avoids blocking I/O
+        // (git worktree remove, git branch -D, gh pr close) on the UI thread
+        // during timer-driven reassembly.
+        if !skip_resource_cleanup {
+            struct CleanupInfo {
+                repo_path: PathBuf,
+                branch: Option<String>,
+                worktree_path: Option<PathBuf>,
+                open_pr_number: Option<u64>,
+                github_remote: Option<(String, String)>,
             }
-            if let Some(ref branch) = info.branch
-                && let Err(e) = self
-                    .worktree_service
-                    .delete_branch(&info.repo_path, branch, true)
-            {
-                warnings.push(format!("branch: {e}"));
-            }
-            if let Some(pr_number) = info.open_pr_number
-                && let Some((ref owner, ref repo)) = info.github_remote
-            {
-                let owner_repo = format!("{owner}/{repo}");
-                match std::process::Command::new("gh")
-                    .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
-                    .output()
-                {
-                    Ok(output) if !output.status.success() => {
-                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                        warnings.push(format!("PR close: {stderr}"));
+
+            let cleanup_infos: Vec<CleanupInfo> = repo_associations
+                .iter()
+                .map(|assoc| {
+                    let worktree_path = self
+                        .repo_data
+                        .get(&assoc.repo_path)
+                        .and_then(|rd| rd.worktrees.as_ref().ok())
+                        .and_then(|wts| {
+                            wts.iter()
+                                .find(|wt| wt.branch.as_deref() == assoc.branch.as_deref())
+                                .map(|wt| wt.path.clone())
+                        });
+
+                    let open_pr_number = assoc.branch.as_deref().and_then(|branch| {
+                        self.repo_data.get(&assoc.repo_path).and_then(|rd| {
+                            rd.prs.as_ref().ok().and_then(|prs| {
+                                prs.iter()
+                                    .find(|pr| pr.head_branch == branch && pr.state == "OPEN")
+                                    .map(|pr| pr.number)
+                            })
+                        })
+                    });
+
+                    let github_remote = self
+                        .repo_data
+                        .get(&assoc.repo_path)
+                        .and_then(|rd| rd.github_remote.clone());
+
+                    CleanupInfo {
+                        repo_path: assoc.repo_path.clone(),
+                        branch: assoc.branch.clone(),
+                        worktree_path,
+                        open_pr_number,
+                        github_remote,
                     }
-                    Err(e) => warnings.push(format!("PR close: {e}")),
-                    _ => {}
+                })
+                .collect();
+
+            for info in &cleanup_infos {
+                if let Some(ref wt_path) = info.worktree_path
+                    && let Err(e) = self.worktree_service.remove_worktree(
+                        &info.repo_path,
+                        wt_path,
+                        false,
+                        force,
+                    )
+                {
+                    warnings.push(format!("worktree: {e}"));
+                }
+                if let Some(ref branch) = info.branch
+                    && let Err(e) =
+                        self.worktree_service
+                            .delete_branch(&info.repo_path, branch, true)
+                {
+                    warnings.push(format!("branch: {e}"));
+                }
+                if let Some(pr_number) = info.open_pr_number
+                    && let Some((ref owner, ref repo)) = info.github_remote
+                {
+                    let owner_repo = format!("{owner}/{repo}");
+                    match std::process::Command::new("gh")
+                        .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
+                        .output()
+                    {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                            warnings.push(format!("PR close: {stderr}"));
+                        }
+                        Err(e) => warnings.push(format!("PR close: {e}")),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -1538,6 +1553,7 @@ impl App {
 
         let mut kept = Vec::with_capacity(records.len());
         let mut archived_count = 0u32;
+        let mut all_warnings: Vec<String> = Vec::new();
 
         for record in records {
             if record.status == WorkItemStatus::Done
@@ -1550,16 +1566,14 @@ impl App {
                     &record.repo_associations,
                     &mut warnings,
                     false,
+                    true, // skip_resource_cleanup: Done items already went through merge flow
                 ) {
                     Ok(()) => {
                         archived_count += 1;
-                        if !warnings.is_empty() {
-                            self.status_message =
-                                Some(format!("Auto-archive warning: {}", warnings.join("; ")));
-                        }
+                        all_warnings.extend(warnings);
                     }
                     Err(e) => {
-                        self.status_message = Some(format!("Auto-archive delete error: {e}"));
+                        all_warnings.push(format!("delete {}: {e}", record.title));
                         kept.push(record);
                     }
                 }
@@ -1569,7 +1583,16 @@ impl App {
         }
 
         if archived_count > 0 {
-            self.status_message = Some(format!("Auto-archived {archived_count} done item(s)"));
+            if all_warnings.is_empty() {
+                self.status_message = Some(format!("Auto-archived {archived_count} done item(s)"));
+            } else {
+                self.status_message = Some(format!(
+                    "Auto-archived {archived_count} done item(s) (warnings: {})",
+                    all_warnings.join("; ")
+                ));
+            }
+        } else if !all_warnings.is_empty() {
+            self.status_message = Some(format!("Auto-archive errors: {}", all_warnings.join("; ")));
         }
 
         kept
@@ -3282,9 +3305,13 @@ impl App {
         // Phases 2-6: backend delete, session kill, resource cleanup,
         // in-flight cancellation, in-memory state. Warnings collected here.
         let mut warnings: Vec<String> = Vec::new();
-        if let Err(e) =
-            self.delete_work_item_by_id(&work_item_id, &repo_associations, &mut warnings, force)
-        {
+        if let Err(e) = self.delete_work_item_by_id(
+            &work_item_id,
+            &repo_associations,
+            &mut warnings,
+            force,
+            false,
+        ) {
             self.status_message = Some(format!("Delete error: {e}"));
             return;
         }
@@ -3579,9 +3606,13 @@ impl App {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let _ = self.backend.set_done_at(wi_id, Some(epoch));
-        } else if *current_status == WorkItemStatus::Done {
-            let _ = self.backend.set_done_at(wi_id, None);
+            if let Err(e) = self.backend.set_done_at(wi_id, Some(epoch)) {
+                self.status_message = Some(format!("Failed to set archive timestamp: {e}"));
+            }
+        } else if *current_status == WorkItemStatus::Done
+            && let Err(e) = self.backend.set_done_at(wi_id, None)
+        {
+            self.status_message = Some(format!("Failed to clear archive timestamp: {e}"));
         }
 
         self.reassemble_work_items();

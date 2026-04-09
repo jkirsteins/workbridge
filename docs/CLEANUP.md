@@ -62,8 +62,14 @@ auto-archive - the following resources are cleaned up in order via
    suppression, no-plan prompt queue, rework prompt state, merge prompt state,
    and review gate state are all cleared.
 
-Steps 4-8 are best-effort: failures produce warning messages but do not abort
-the overall delete. Only a backend delete failure (step 1) is fatal.
+Steps 4-6 involve blocking I/O (git commands, gh CLI) and are only
+executed for user-initiated deletes (Ctrl+D). Auto-archive skips them
+via `skip_resource_cleanup: true` to avoid blocking the UI thread during
+timer-driven reassembly. This is safe because Done items have already
+been through the merge flow which handles worktree/branch/PR cleanup.
+
+Steps 4-8 are best-effort: failures produce warning messages but do not
+abort the overall delete. Only a backend delete failure (step 1) is fatal.
 
 The manual delete (Ctrl+D) additionally resets UI selection state and
 rebuilds the display list after the shared cleanup completes.
