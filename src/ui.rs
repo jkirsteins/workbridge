@@ -1363,7 +1363,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
             let review_gate_active = app
                 .work_items
                 .get(*wi_idx)
-                .map(|wi| app.review_gate_wi.as_ref() == Some(&wi.id))
+                .map(|wi| app.review_gates.contains_key(&wi.id))
                 .unwrap_or(false);
 
             if review_gate_active {
@@ -1371,8 +1371,10 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 let frame = app.spinner_tick % spinner_chars.len();
                 let spinner = spinner_chars[frame] as char;
                 let progress_text = app
-                    .review_gate_progress
-                    .as_deref()
+                    .work_items
+                    .get(*wi_idx)
+                    .and_then(|wi| app.review_gates.get(&wi.id))
+                    .and_then(|gate| gate.progress.as_deref())
                     .unwrap_or("Checking implementation against plan.");
                 let text = Text::from(vec![
                     Line::from(""),

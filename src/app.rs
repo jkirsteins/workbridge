@@ -166,6 +166,13 @@ pub enum ReviewGateMessage {
     Result(ReviewGateResult),
 }
 
+/// Per-work-item state for an in-flight review gate.
+pub struct ReviewGateState {
+    pub rx: crossbeam_channel::Receiver<ReviewGateMessage>,
+    pub activity: ActivityId,
+    pub progress: Option<String>,
+}
+
 /// A single CI check as returned by `gh pr checks --json name,bucket`.
 struct CiCheck {
     name: String,
@@ -451,16 +458,8 @@ pub struct App {
     pub mcp_rx: Option<crossbeam_channel::Receiver<McpEvent>>,
     /// Sender for MCP events (cloned for each socket server).
     pub mcp_tx: crossbeam_channel::Sender<McpEvent>,
-    /// The work item ID that the current review gate was spawned for.
-    /// Used to verify the gate result is still relevant (the user may have
-    /// retreated the item while the gate was running).
-    pub review_gate_wi: Option<WorkItemId>,
-    /// Receiver for asynchronous review gate messages (progress + final result).
-    pub review_gate_rx: Option<crossbeam_channel::Receiver<ReviewGateMessage>>,
-    /// Activity ID for the running review gate indicator.
-    pub review_gate_activity: Option<ActivityId>,
-    /// Progress summary from the review gate, shown in the right panel.
-    pub review_gate_progress: Option<String>,
+    /// Per-work-item review gate state. Multiple gates can run concurrently.
+    pub review_gates: HashMap<WorkItemId, ReviewGateState>,
 
     // -- Activity indicator --
     /// Monotonic counter for generating unique ActivityId values.
@@ -689,10 +688,7 @@ impl App {
             claude_working: std::collections::HashSet::new(),
             mcp_rx: Some(mcp_rx),
             mcp_tx,
-            review_gate_wi: None,
-            review_gate_rx: None,
-            review_gate_activity: None,
-            review_gate_progress: None,
+            review_gates: HashMap::new(),
             activity_counter: 0,
             activities: Vec::new(),
             spinner_tick: 0,
@@ -954,7 +950,7 @@ impl App {
                 Some(w) => w,
                 None => continue,
             };
-            if wi.status != WorkItemStatus::Implementing || self.review_gate_wi.is_some() {
+            if wi.status != WorkItemStatus::Implementing || self.review_gates.contains_key(&wi_id) {
                 continue;
             }
             // Extract paths before calling &mut self methods.
@@ -1094,12 +1090,10 @@ impl App {
             }
             entry.alive = false;
         }
-        // Cancel any in-flight review gate.
-        self.review_gate_rx = None;
-        self.review_gate_wi = None;
-        self.review_gate_progress = None;
-        if let Some(aid) = self.review_gate_activity.take() {
-            self.end_activity(aid);
+        // Cancel all in-flight review gates.
+        let gates: Vec<_> = self.review_gates.drain().collect();
+        for (_, gate) in gates {
+            self.end_activity(gate.activity);
         }
         if let Some(ref mut entry) = self.global_session {
             if let Some(ref mut session) = entry.session {
@@ -1651,13 +1645,8 @@ impl App {
             self.merge_wi_id = None;
             self.confirm_merge = false;
         }
-        if self.review_gate_wi.as_ref() == Some(wi_id) {
-            self.review_gate_wi = None;
-            self.review_gate_rx = None;
-            self.review_gate_progress = None;
-            if let Some(aid) = self.review_gate_activity.take() {
-                self.end_activity(aid);
-            }
+        if let Some(gate) = self.review_gates.remove(wi_id) {
+            self.end_activity(gate.activity);
         }
 
         Ok(())
@@ -3968,13 +3957,8 @@ impl App {
 
         // If the retreating item has a pending review gate, cancel it.
         // The gate result would be stale since the user intentionally moved away.
-        if self.review_gate_wi.as_ref() == Some(&wi_id) {
-            self.review_gate_rx = None;
-            self.review_gate_wi = None;
-            self.review_gate_progress = None;
-            if let Some(aid) = self.review_gate_activity.take() {
-                self.end_activity(aid);
-            }
+        if let Some(gate) = self.review_gates.remove(&wi_id) {
+            self.end_activity(gate.activity);
         }
 
         // Cancel any in-flight PR merge. Merges are only spawned from Review,
@@ -5343,9 +5327,8 @@ impl App {
     /// Returns `Spawned` if the gate is running (caller should wait),
     /// or `Blocked(reason)` if the transition must not proceed.
     fn spawn_review_gate(&mut self, wi_id: &WorkItemId) -> ReviewGateSpawn {
-        // Guard: if a review gate is already running, don't spawn another one.
-        // A second call would overwrite the fields and leak the first session.
-        if self.review_gate_wi.is_some() {
+        // Guard: if a review gate is already running for this item, don't spawn a duplicate.
+        if self.review_gates.contains_key(wi_id) {
             return ReviewGateSpawn::Blocked("Review gate already running".into());
         }
 
@@ -5708,163 +5691,184 @@ impl App {
             let _ = tx.send(ReviewGateMessage::Result(result));
         });
 
-        self.review_gate_rx = Some(rx);
-        self.review_gate_wi = Some(wi_id.clone());
-        self.review_gate_activity = Some(self.start_activity("Running review gate..."));
+        let activity = self.start_activity("Running review gate...");
+        self.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                activity,
+                progress: None,
+            },
+        );
         ReviewGateSpawn::Spawned
     }
 
-    /// Poll the async review gate for a result. Called on each timer tick.
-    /// If the gate has completed, processes the result: advances to Review
+    /// Poll all async review gates for results. Called on each timer tick.
+    /// If a gate has completed, processes the result: advances to Review
     /// if approved, stays in Implementing if rejected.
     pub fn poll_review_gate(&mut self) {
-        let rx = match self.review_gate_rx.as_ref() {
-            Some(rx) => rx,
-            None => return,
-        };
-
-        // Drain all pending messages. There may be multiple Progress updates
-        // queued before a final Result.
-        let mut result: Option<ReviewGateResult> = None;
-        loop {
-            match rx.try_recv() {
-                Ok(ReviewGateMessage::Progress(text)) => {
-                    self.review_gate_progress = Some(text);
-                    // Continue draining - a Result may follow.
-                }
-                Ok(ReviewGateMessage::Result(r)) => {
-                    result = Some(r);
-                    break;
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => break, // No more messages.
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    // Thread exited without sending a Result - treat as gate error.
-                    self.review_gate_rx = None;
-                    self.review_gate_wi = None;
-                    self.review_gate_progress = None;
-                    if let Some(aid) = self.review_gate_activity.take() {
-                        self.end_activity(aid);
-                    }
-                    self.status_message =
-                        Some("Review gate: background thread exited unexpectedly".into());
-                    return;
-                }
-            }
-        }
-
-        let result = match result {
-            Some(r) => r,
-            None => return, // Only progress updates this tick, no final result yet.
-        };
-
-        // Gate completed - clear the receiver and tracked work item.
-        self.review_gate_rx = None;
-        self.review_gate_wi = None;
-        self.review_gate_progress = None;
-        if let Some(aid) = self.review_gate_activity.take() {
-            self.end_activity(aid);
-        }
-
-        let wi_id = result.work_item_id.clone();
-
-        // Verify the work item is still eligible for the gate result.
-        // Both Implementing and Blocked are valid pre-gate states (Blocked->Review
-        // is allowed per Fix #6). If the user retreated the item while the gate
-        // was running, we discard the result silently.
-        let gate_eligible = self
-            .work_items
-            .iter()
-            .find(|w| w.id == wi_id)
-            .map(|w| {
-                w.status == WorkItemStatus::Implementing || w.status == WorkItemStatus::Blocked
-            })
-            .unwrap_or(false);
-
-        if !gate_eligible {
+        if self.review_gates.is_empty() {
             return;
         }
 
-        if result.approved {
-            // Log approval and advance to Review.
-            let entry = ActivityEntry {
-                timestamp: now_iso8601(),
-                event_type: "review_gate".to_string(),
-                payload: serde_json::json!({
-                    "result": "approved",
-                    "response": result.detail
-                }),
+        // Collect keys to avoid borrowing self during iteration.
+        let wi_ids: Vec<WorkItemId> = self.review_gates.keys().cloned().collect();
+
+        for wi_id in wi_ids {
+            let gate = match self.review_gates.get(&wi_id) {
+                Some(g) => g,
+                None => continue,
             };
-            if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
-                self.status_message = Some(format!("Activity log error: {e}"));
-            }
 
-            // Store the gate's assessment so the Review session can present
-            // it to the user (consumed one-shot by stage_system_prompt).
-            self.review_gate_findings
-                .insert(wi_id.clone(), result.detail.clone());
+            // Drain all pending messages for this gate.
+            let mut result: Option<ReviewGateResult> = None;
+            let mut disconnected = false;
+            let mut last_progress: Option<String> = None;
 
-            // Get the actual current status for apply_stage_change.
-            let current_status = self
-                .work_items
-                .iter()
-                .find(|w| w.id == wi_id)
-                .map(|w| w.status.clone())
-                .unwrap_or(WorkItemStatus::Implementing);
-
-            self.apply_stage_change(
-                &wi_id,
-                &current_status,
-                &WorkItemStatus::Review,
-                "review_gate",
-            );
-        } else {
-            // Log rejection and stay in current stage.
-            let entry = ActivityEntry {
-                timestamp: now_iso8601(),
-                event_type: "review_gate".to_string(),
-                payload: serde_json::json!({
-                    "result": "rejected",
-                    "reason": result.detail
-                }),
-            };
-            if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
-                self.status_message = Some(format!("Activity log error: {e}"));
-            }
-            // Store the rejection reason so the next Claude session uses the
-            // implementing_rework prompt with specific feedback, rather than
-            // a generic implementing prompt.
-            self.rework_reasons
-                .insert(wi_id.clone(), result.detail.clone());
-            self.status_message = Some(format!("Review gate rejected: {}", result.detail));
-
-            // If Blocked, transition to Implementing so the implementing_rework
-            // prompt (which has {rework_reason}) is used instead of the "blocked"
-            // prompt (which has no rework_reason placeholder).
-            {
-                let wi_status = self
-                    .work_items
-                    .iter()
-                    .find(|w| w.id == wi_id)
-                    .map(|w| w.status.clone());
-                if wi_status == Some(WorkItemStatus::Blocked) {
-                    let _ = self
-                        .backend
-                        .update_status(&wi_id, WorkItemStatus::Implementing);
-                    self.reassemble_work_items();
-                    self.build_display_list();
+            loop {
+                match gate.rx.try_recv() {
+                    Ok(ReviewGateMessage::Progress(text)) => {
+                        last_progress = Some(text);
+                    }
+                    Ok(ReviewGateMessage::Result(r)) => {
+                        result = Some(r);
+                        break;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
                 }
             }
 
-            // Kill the current session and respawn with the implementing_rework
-            // prompt that includes the rejection feedback.
-            if let Some(key) = self.session_key_for(&wi_id)
-                && let Some(mut entry) = self.sessions.remove(&key)
-                && let Some(ref mut session) = entry.session
+            // Apply progress update if any.
+            if let Some(progress) = last_progress
+                && let Some(gate) = self.review_gates.get_mut(&wi_id)
             {
-                session.kill();
+                gate.progress = Some(progress);
             }
-            self.cleanup_session_state_for(&wi_id);
-            self.spawn_session(&wi_id);
+
+            if disconnected {
+                // Thread exited without sending a Result - treat as gate error.
+                if let Some(gate) = self.review_gates.remove(&wi_id) {
+                    self.end_activity(gate.activity);
+                }
+                self.status_message =
+                    Some("Review gate: background thread exited unexpectedly".into());
+                continue;
+            }
+
+            let result = match result {
+                Some(r) => r,
+                None => continue, // Only progress this tick, no final result yet.
+            };
+
+            // Gate completed - remove from map.
+            debug_assert_eq!(result.work_item_id, wi_id);
+            if let Some(gate) = self.review_gates.remove(&wi_id) {
+                self.end_activity(gate.activity);
+            }
+
+            // Verify the work item is still eligible for the gate result.
+            // Both Implementing and Blocked are valid pre-gate states (Blocked->Review
+            // is allowed per Fix #6). If the user retreated the item while the gate
+            // was running, we discard the result silently.
+            let gate_eligible = self
+                .work_items
+                .iter()
+                .find(|w| w.id == wi_id)
+                .map(|w| {
+                    w.status == WorkItemStatus::Implementing || w.status == WorkItemStatus::Blocked
+                })
+                .unwrap_or(false);
+
+            if !gate_eligible {
+                continue;
+            }
+
+            if result.approved {
+                // Log approval and advance to Review.
+                let entry = ActivityEntry {
+                    timestamp: now_iso8601(),
+                    event_type: "review_gate".to_string(),
+                    payload: serde_json::json!({
+                        "result": "approved",
+                        "response": result.detail
+                    }),
+                };
+                if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
+                    self.status_message = Some(format!("Activity log error: {e}"));
+                }
+
+                // Store the gate's assessment so the Review session can present
+                // it to the user (consumed one-shot by stage_system_prompt).
+                self.review_gate_findings
+                    .insert(wi_id.clone(), result.detail.clone());
+
+                // Get the actual current status for apply_stage_change.
+                let current_status = self
+                    .work_items
+                    .iter()
+                    .find(|w| w.id == wi_id)
+                    .map(|w| w.status.clone())
+                    .unwrap_or(WorkItemStatus::Implementing);
+
+                self.apply_stage_change(
+                    &wi_id,
+                    &current_status,
+                    &WorkItemStatus::Review,
+                    "review_gate",
+                );
+            } else {
+                // Log rejection and stay in current stage.
+                let entry = ActivityEntry {
+                    timestamp: now_iso8601(),
+                    event_type: "review_gate".to_string(),
+                    payload: serde_json::json!({
+                        "result": "rejected",
+                        "reason": result.detail
+                    }),
+                };
+                if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
+                    self.status_message = Some(format!("Activity log error: {e}"));
+                }
+                // Store the rejection reason so the next Claude session uses the
+                // implementing_rework prompt with specific feedback, rather than
+                // a generic implementing prompt.
+                self.rework_reasons
+                    .insert(wi_id.clone(), result.detail.clone());
+                self.status_message = Some(format!("Review gate rejected: {}", result.detail));
+
+                // If Blocked, transition to Implementing so the implementing_rework
+                // prompt (which has {rework_reason}) is used instead of the "blocked"
+                // prompt (which has no rework_reason placeholder).
+                {
+                    let wi_status = self
+                        .work_items
+                        .iter()
+                        .find(|w| w.id == wi_id)
+                        .map(|w| w.status.clone());
+                    if wi_status == Some(WorkItemStatus::Blocked) {
+                        let _ = self
+                            .backend
+                            .update_status(&wi_id, WorkItemStatus::Implementing);
+                        self.reassemble_work_items();
+                        self.build_display_list();
+                    }
+                }
+
+                // Kill the current session and respawn with the implementing_rework
+                // prompt that includes the rejection feedback.
+                if let Some(key) = self.session_key_for(&wi_id)
+                    && let Some(mut entry) = self.sessions.remove(&key)
+                    && let Some(ref mut session) = entry.session
+                {
+                    session.kill();
+                }
+                self.cleanup_session_state_for(&wi_id);
+                self.spawn_session(&wi_id);
+            }
         }
     }
 
@@ -9702,9 +9706,15 @@ mod tests {
             detail: "Tests are missing for the new feature".into(),
         }))
         .unwrap();
-        app.review_gate_rx = Some(rx);
-        app.review_gate_wi = Some(wi_id.clone());
-        app.review_gate_activity = Some(app.start_activity("test gate"));
+        let activity = app.start_activity("test gate");
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                activity,
+                progress: None,
+            },
+        );
 
         app.poll_review_gate();
 
@@ -9741,9 +9751,15 @@ mod tests {
             detail: "All plan items implemented".into(),
         }))
         .unwrap();
-        app.review_gate_rx = Some(rx);
-        app.review_gate_wi = Some(wi_id.clone());
-        app.review_gate_activity = Some(app.start_activity("test gate"));
+        let activity = app.start_activity("test gate");
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                activity,
+                progress: None,
+            },
+        );
 
         app.poll_review_gate();
 
@@ -9758,9 +9774,11 @@ mod tests {
             app.review_gate_findings.get(&wi_id).unwrap(),
             "All plan items implemented",
         );
-        // Verify the receiver and tracked WI are cleared.
-        assert!(app.review_gate_rx.is_none(), "gate rx should be cleared");
-        assert!(app.review_gate_wi.is_none(), "gate wi should be cleared");
+        // Verify the gate is cleared from the map.
+        assert!(
+            !app.review_gates.contains_key(&wi_id),
+            "gate should be cleared"
+        );
     }
 
     /// Test: Progress messages update review_gate_progress without completing
@@ -9776,24 +9794,28 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(ReviewGateMessage::Progress("2 / 3 CI checks green".into()))
             .unwrap();
-        app.review_gate_rx = Some(rx);
-        app.review_gate_wi = Some(wi_id.clone());
-        app.review_gate_activity = Some(app.start_activity("test gate"));
+        let activity = app.start_activity("test gate");
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                activity,
+                progress: None,
+            },
+        );
 
         app.poll_review_gate();
 
         // Progress should be updated but gate should still be running.
         assert_eq!(
-            app.review_gate_progress.as_deref(),
+            app.review_gates
+                .get(&wi_id)
+                .and_then(|g| g.progress.as_deref()),
             Some("2 / 3 CI checks green"),
         );
         assert!(
-            app.review_gate_rx.is_some(),
-            "gate rx should still be present (gate not done)",
-        );
-        assert!(
-            app.review_gate_wi.is_some(),
-            "gate wi should still be present (gate not done)",
+            app.review_gates.contains_key(&wi_id),
+            "gate should still be present (gate not done)",
         );
     }
 
@@ -9817,15 +9839,23 @@ mod tests {
             detail: "Missing error handling".into(),
         }))
         .unwrap();
-        app.review_gate_rx = Some(rx);
-        app.review_gate_wi = Some(wi_id.clone());
-        app.review_gate_activity = Some(app.start_activity("test gate"));
+        let activity = app.start_activity("test gate");
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                activity,
+                progress: None,
+            },
+        );
 
         app.poll_review_gate();
 
         // Result should have been processed - gate is done.
-        assert!(app.review_gate_rx.is_none(), "gate rx should be cleared");
-        assert!(app.review_gate_wi.is_none(), "gate wi should be cleared");
+        assert!(
+            !app.review_gates.contains_key(&wi_id),
+            "gate should be cleared"
+        );
         assert!(
             app.rework_reasons.contains_key(&wi_id),
             "rework_reasons must be populated after rejection",
@@ -9847,15 +9877,23 @@ mod tests {
         ))
         .unwrap();
         drop(tx); // Simulate thread exit without sending Result.
-        app.review_gate_rx = Some(rx);
-        app.review_gate_wi = Some(wi_id.clone());
-        app.review_gate_activity = Some(app.start_activity("test gate"));
+        let activity = app.start_activity("test gate");
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                activity,
+                progress: None,
+            },
+        );
 
         app.poll_review_gate();
 
         // Gate should be cleaned up with an error message.
-        assert!(app.review_gate_rx.is_none(), "gate rx should be cleared");
-        assert!(app.review_gate_wi.is_none(), "gate wi should be cleared");
+        assert!(
+            !app.review_gates.contains_key(&wi_id),
+            "gate should be cleared"
+        );
         let msg = app.status_message.as_deref().unwrap_or("");
         assert!(
             msg.contains("unexpectedly"),
@@ -9900,10 +9938,11 @@ mod tests {
     }
 
     /// Test 9: When a review gate is already running for item A, an MCP
-    /// StatusUpdate for Review on item B should NOT populate rework_reasons
-    /// for item B. It should be silently skipped (gate busy).
+    /// StatusUpdate for Review on item B should independently attempt to
+    /// spawn its own gate. With StubBackend (no plan), it fails with a
+    /// "no plan" error and triggers the rework flow for item B.
     #[test]
-    fn gate_busy_for_different_item_does_not_rework() {
+    fn concurrent_gate_spawn_independent_of_other_items() {
         let mut app = App::new();
 
         // Item A: gate is running for this one.
@@ -9949,8 +9988,16 @@ mod tests {
         });
 
         // Simulate gate running for item A.
-        app.review_gate_wi = Some(wi_id_a.clone());
-        // (We don't need a real rx - spawn_review_gate checks review_gate_wi first.)
+        let (_dummy_tx, dummy_rx) = crossbeam_channel::unbounded();
+        let activity = app.start_activity("test gate");
+        app.review_gates.insert(
+            wi_id_a.clone(),
+            ReviewGateState {
+                rx: dummy_rx,
+                activity,
+                progress: None,
+            },
+        );
 
         // Send MCP StatusUpdate for item B.
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -9965,23 +10012,28 @@ mod tests {
 
         app.poll_mcp_status_updates();
 
-        // Item B's status must be unchanged.
+        // Item B's status must be unchanged (gate spawn failed due to no plan).
         let wi_b = app.work_items.iter().find(|w| w.id == wi_id_b).unwrap();
         assert_eq!(
             wi_b.status,
             WorkItemStatus::Implementing,
-            "item B should remain Implementing when gate is busy",
+            "item B should remain Implementing when gate cannot spawn (no plan)",
         );
-        // rework_reasons must NOT contain item B (gate busy is not a failure).
+        // rework_reasons should be populated - gate spawn failure (no plan)
+        // triggers the rework flow, unlike the old behavior where it was silently skipped.
         assert!(
-            !app.rework_reasons.contains_key(&wi_id_b),
-            "rework_reasons must NOT be set for item B when gate is busy for item A",
+            app.rework_reasons.contains_key(&wi_id_b),
+            "rework_reasons must be set for item B (gate spawn failure, not blocked by item A)",
         );
-        // Status message should mention "already running".
-        let msg = app.status_message.as_deref().unwrap_or("");
+        let reason = app.rework_reasons.get(&wi_id_b).unwrap();
         assert!(
-            msg.contains("already running"),
-            "status should mention gate already running, got: {msg}",
+            reason.contains("no plan"),
+            "rework reason should mention no plan, got: {reason}",
+        );
+        // Item A's gate should still be running.
+        assert!(
+            app.review_gates.contains_key(&wi_id_a),
+            "item A's gate should still be running",
         );
     }
 

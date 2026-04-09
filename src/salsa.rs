@@ -339,8 +339,8 @@ pub fn app_event(
 
                 // Poll MCP status updates BEFORE liveness check so that a
                 // review gate verdict arriving in the same tick as session
-                // exit is processed before check_liveness clears
-                // review_gate_wi.
+                // exit is processed before check_liveness clears the gate
+                // from review_gates.
                 state.poll_mcp_status_updates();
 
                 // Liveness check on all sessions.
