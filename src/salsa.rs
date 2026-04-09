@@ -313,6 +313,15 @@ pub fn app_event(
             Ok(Control::Changed)
         }
         AppEvent::Timer(timeout) => {
+            // Flush any buffered PTY writes before rendering. Key events
+            // that forward to the PTY buffer bytes instead of writing
+            // immediately, so rapid keystrokes (e.g. drag-and-drop
+            // arriving as individual key events) are batched into a
+            // single write(). The child process receives them in one
+            // read() and echoes atomically - matching native terminal
+            // behavior.
+            state.flush_pty_buffers();
+
             // The render tick fires at ~120fps (8ms).  Heavy background
             // work only runs every BACKGROUND_TICK_DIVISOR-th tick to
             // keep CPU usage reasonable (~200ms cadence).

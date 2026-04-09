@@ -460,12 +460,12 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
 /// key, matching telnet/SSH conventions). Escape is forwarded to the PTY
 /// so Claude Code can use it.
 fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
-    let had_status = app.has_visible_status_bar();
-
     // Check if the active session is dead before forwarding keys. If dead,
     // auto-return focus to the left panel instead of spamming errors.
+    // Flush any buffered PTY bytes before changing state.
     if let Some(entry) = app.active_session_entry() {
         if !entry.alive {
+            app.flush_pty_buffers();
             app.focus = FocusPanel::Left;
             app.status_message = Some("Session has ended - returned to work items".into());
             sync_layout(app);
@@ -473,13 +473,14 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
         }
     } else {
         // No session for this work item - return to left panel.
+        app.flush_pty_buffers();
         app.focus = FocusPanel::Left;
         app.status_message = None;
         sync_layout(app);
         return true;
     }
 
-    let forwarded_to_pty = match key.code {
+    match key.code {
         // Ctrl+] returns focus to the left panel.
         //
         // We match BOTH Char(']') and Char('5') with CONTROL because
@@ -488,6 +489,7 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char(']') | KeyCode::Char('5')
             if key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
+            app.flush_pty_buffers();
             app.focus = FocusPanel::Left;
             app.status_message = None;
             // If returning from board drill-down, restore the full board view.
@@ -502,13 +504,11 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
         }
         // Forward Escape to PTY.
         KeyCode::Esc => {
-            app.send_bytes_to_active(b"\x1b");
-            true
+            app.buffer_bytes_to_active(b"\x1b");
         }
         // Forward Enter to PTY.
         KeyCode::Enter => {
-            app.send_bytes_to_active(b"\r");
-            true
+            app.buffer_bytes_to_active(b"\r");
         }
         // Forward regular characters.
         KeyCode::Char(c) => {
@@ -518,7 +518,7 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
                     .wrapping_sub(b'a')
                     .wrapping_add(1);
                 if byte <= 26 {
-                    app.send_bytes_to_active(&[byte]);
+                    app.buffer_bytes_to_active(&[byte]);
                 }
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 // Alt+<char> = ESC byte (0x1B) followed by the character.
@@ -526,94 +526,66 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
                 let s = c.encode_utf8(&mut buf);
                 let mut data = vec![0x1bu8];
                 data.extend_from_slice(s.as_bytes());
-                app.send_bytes_to_active(&data);
+                app.buffer_bytes_to_active(&data);
             } else {
                 let mut buf = [0u8; 4];
                 let s = c.encode_utf8(&mut buf);
-                app.send_bytes_to_active(s.as_bytes());
+                app.buffer_bytes_to_active(s.as_bytes());
             }
-            true
         }
         KeyCode::Backspace => {
             if key.modifiers.contains(KeyModifiers::ALT) {
                 // Alt+Backspace = ESC + DEL (0x1B 0x7F)
-                app.send_bytes_to_active(&[0x1b, 0x7f]);
+                app.buffer_bytes_to_active(&[0x1b, 0x7f]);
             } else {
-                app.send_bytes_to_active(&[0x7f]);
+                app.buffer_bytes_to_active(&[0x7f]);
             }
-            true
         }
         KeyCode::Tab => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 // Shift+Tab = CSI Z
-                app.send_bytes_to_active(b"\x1b[Z");
+                app.buffer_bytes_to_active(b"\x1b[Z");
             } else {
-                app.send_bytes_to_active(&[0x09]);
+                app.buffer_bytes_to_active(&[0x09]);
             }
-            true
         }
         KeyCode::BackTab => {
             // Shift+Tab = CSI Z
-            app.send_bytes_to_active(b"\x1b[Z");
-            true
+            app.buffer_bytes_to_active(b"\x1b[Z");
         }
         KeyCode::Up => {
-            send_arrow_key(app, b'A', key.modifiers);
-            true
+            buffer_arrow_key(app, b'A', key.modifiers);
         }
         KeyCode::Down => {
-            send_arrow_key(app, b'B', key.modifiers);
-            true
+            buffer_arrow_key(app, b'B', key.modifiers);
         }
         KeyCode::Right => {
-            send_arrow_key(app, b'C', key.modifiers);
-            true
+            buffer_arrow_key(app, b'C', key.modifiers);
         }
         KeyCode::Left => {
-            send_arrow_key(app, b'D', key.modifiers);
-            true
+            buffer_arrow_key(app, b'D', key.modifiers);
         }
         KeyCode::Home => {
-            send_special_key(app, b'H', key.modifiers);
-            true
+            buffer_special_key(app, b'H', key.modifiers);
         }
         KeyCode::End => {
-            send_special_key(app, b'F', key.modifiers);
-            true
+            buffer_special_key(app, b'F', key.modifiers);
         }
         KeyCode::PageUp => {
-            app.send_bytes_to_active(b"\x1b[5~");
-            true
+            app.buffer_bytes_to_active(b"\x1b[5~");
         }
         KeyCode::PageDown => {
-            app.send_bytes_to_active(b"\x1b[6~");
-            true
+            app.buffer_bytes_to_active(b"\x1b[6~");
         }
         KeyCode::Delete => {
-            app.send_bytes_to_active(b"\x1b[3~");
-            true
+            app.buffer_bytes_to_active(b"\x1b[3~");
         }
         KeyCode::F(n) => {
             let seq = f_key_sequence(n);
-            app.send_bytes_to_active(seq.as_bytes());
-            true
+            app.buffer_bytes_to_active(seq.as_bytes());
         }
-        _ => false,
+        _ => {}
     };
-
-    // If a send error caused a status message to appear (or disappear),
-    // the status bar visibility changed and pane dimensions need updating.
-    // That is also an app state change requiring re-render.
-    if app.has_visible_status_bar() != had_status {
-        sync_layout(app);
-        return true;
-    }
-
-    // Keys forwarded to the PTY did not change app state - the 8ms timer
-    // tick will render the PTY echo within one frame.
-    if forwarded_to_pty {
-        return false;
-    }
 
     false
 }
@@ -649,13 +621,13 @@ fn handle_global_drawer_key(app: &mut App, key: KeyEvent) -> bool {
             app.focus = app.pre_drawer_focus;
             true
         }
-        // Forward all other keys to the global session PTY.
+        // Forward all other keys to the global session PTY via buffer.
         KeyCode::Esc => {
-            app.send_bytes_to_global(b"\x1b");
+            app.buffer_bytes_to_global(b"\x1b");
             false
         }
         KeyCode::Enter => {
-            app.send_bytes_to_global(b"\r");
+            app.buffer_bytes_to_global(b"\r");
             false
         }
         KeyCode::Char(c) => {
@@ -664,128 +636,128 @@ fn handle_global_drawer_key(app: &mut App, key: KeyEvent) -> bool {
                     .wrapping_sub(b'a')
                     .wrapping_add(1);
                 if byte <= 26 {
-                    app.send_bytes_to_global(&[byte]);
+                    app.buffer_bytes_to_global(&[byte]);
                 }
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 let mut buf = [0u8; 5];
                 let s = c.encode_utf8(&mut buf);
                 let mut data = vec![0x1bu8];
                 data.extend_from_slice(s.as_bytes());
-                app.send_bytes_to_global(&data);
+                app.buffer_bytes_to_global(&data);
             } else {
                 let mut buf = [0u8; 4];
                 let s = c.encode_utf8(&mut buf);
-                app.send_bytes_to_global(s.as_bytes());
+                app.buffer_bytes_to_global(s.as_bytes());
             }
             false
         }
         KeyCode::Backspace => {
             if key.modifiers.contains(KeyModifiers::ALT) {
-                app.send_bytes_to_global(&[0x1b, 0x7f]);
+                app.buffer_bytes_to_global(&[0x1b, 0x7f]);
             } else {
-                app.send_bytes_to_global(&[0x7f]);
+                app.buffer_bytes_to_global(&[0x7f]);
             }
             false
         }
         KeyCode::Tab => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
-                app.send_bytes_to_global(b"\x1b[Z");
+                app.buffer_bytes_to_global(b"\x1b[Z");
             } else {
-                app.send_bytes_to_global(&[0x09]);
+                app.buffer_bytes_to_global(&[0x09]);
             }
             false
         }
         KeyCode::BackTab => {
-            app.send_bytes_to_global(b"\x1b[Z");
+            app.buffer_bytes_to_global(b"\x1b[Z");
             false
         }
         KeyCode::Up => {
-            send_global_arrow(app, b'A', key.modifiers);
+            buffer_global_arrow(app, b'A', key.modifiers);
             false
         }
         KeyCode::Down => {
-            send_global_arrow(app, b'B', key.modifiers);
+            buffer_global_arrow(app, b'B', key.modifiers);
             false
         }
         KeyCode::Right => {
-            send_global_arrow(app, b'C', key.modifiers);
+            buffer_global_arrow(app, b'C', key.modifiers);
             false
         }
         KeyCode::Left => {
-            send_global_arrow(app, b'D', key.modifiers);
+            buffer_global_arrow(app, b'D', key.modifiers);
             false
         }
         KeyCode::Home => {
-            send_global_special(app, b'H', key.modifiers);
+            buffer_global_special(app, b'H', key.modifiers);
             false
         }
         KeyCode::End => {
-            send_global_special(app, b'F', key.modifiers);
+            buffer_global_special(app, b'F', key.modifiers);
             false
         }
         KeyCode::PageUp => {
-            app.send_bytes_to_global(b"\x1b[5~");
+            app.buffer_bytes_to_global(b"\x1b[5~");
             false
         }
         KeyCode::PageDown => {
-            app.send_bytes_to_global(b"\x1b[6~");
+            app.buffer_bytes_to_global(b"\x1b[6~");
             false
         }
         KeyCode::Delete => {
-            app.send_bytes_to_global(b"\x1b[3~");
+            app.buffer_bytes_to_global(b"\x1b[3~");
             false
         }
         KeyCode::F(n) => {
             let seq = f_key_sequence(n);
-            app.send_bytes_to_global(seq.as_bytes());
+            app.buffer_bytes_to_global(seq.as_bytes());
             false
         }
         _ => false,
     }
 }
 
-fn send_global_arrow(app: &mut App, arrow: u8, modifiers: KeyModifiers) {
+fn buffer_global_arrow(app: &mut App, arrow: u8, modifiers: KeyModifiers) {
     let modifier_code = modifier_param(modifiers);
     if modifier_code > 1 {
         let seq = format!("\x1b[1;{modifier_code}{}", arrow as char);
-        app.send_bytes_to_global(seq.as_bytes());
+        app.buffer_bytes_to_global(seq.as_bytes());
     } else {
-        app.send_bytes_to_global(&[0x1b, b'[', arrow]);
+        app.buffer_bytes_to_global(&[0x1b, b'[', arrow]);
     }
 }
 
-fn send_global_special(app: &mut App, key_char: u8, modifiers: KeyModifiers) {
+fn buffer_global_special(app: &mut App, key_char: u8, modifiers: KeyModifiers) {
     let modifier_code = modifier_param(modifiers);
     if modifier_code > 1 {
         let seq = format!("\x1b[1;{modifier_code}{}", key_char as char);
-        app.send_bytes_to_global(seq.as_bytes());
+        app.buffer_bytes_to_global(seq.as_bytes());
     } else {
-        app.send_bytes_to_global(&[0x1b, b'[', key_char]);
+        app.buffer_bytes_to_global(&[0x1b, b'[', key_char]);
     }
 }
 
-/// Send an arrow key with optional modifiers as an ANSI escape sequence.
+/// Buffer an arrow key with optional modifiers as an ANSI escape sequence.
 /// Arrow keys: A=Up, B=Down, C=Right, D=Left.
-fn send_arrow_key(app: &mut App, arrow: u8, modifiers: KeyModifiers) {
+fn buffer_arrow_key(app: &mut App, arrow: u8, modifiers: KeyModifiers) {
     let modifier_code = modifier_param(modifiers);
     if modifier_code > 1 {
         // Modified arrow: CSI 1 ; <modifier> <arrow>
         let seq = format!("\x1b[1;{modifier_code}{}", arrow as char);
-        app.send_bytes_to_active(seq.as_bytes());
+        app.buffer_bytes_to_active(seq.as_bytes());
     } else {
         // Plain arrow: CSI <arrow>
-        app.send_bytes_to_active(&[0x1b, b'[', arrow]);
+        app.buffer_bytes_to_active(&[0x1b, b'[', arrow]);
     }
 }
 
-/// Send Home/End with optional modifiers as an ANSI escape sequence.
-fn send_special_key(app: &mut App, key_char: u8, modifiers: KeyModifiers) {
+/// Buffer Home/End with optional modifiers as an ANSI escape sequence.
+fn buffer_special_key(app: &mut App, key_char: u8, modifiers: KeyModifiers) {
     let modifier_code = modifier_param(modifiers);
     if modifier_code > 1 {
         let seq = format!("\x1b[1;{modifier_code}{}", key_char as char);
-        app.send_bytes_to_active(seq.as_bytes());
+        app.buffer_bytes_to_active(seq.as_bytes());
     } else {
-        app.send_bytes_to_active(&[0x1b, b'[', key_char]);
+        app.buffer_bytes_to_active(&[0x1b, b'[', key_char]);
     }
 }
 
