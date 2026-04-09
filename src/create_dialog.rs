@@ -342,6 +342,10 @@ pub struct CreateDialog {
     /// Whether the user has manually edited the branch field.
     /// When true, auto_fill_branch() will not overwrite their input.
     pub branch_user_edited: bool,
+    /// When true, submitting the dialog creates a Planning item and spawns
+    /// a Claude session immediately (quick-start mode) instead of creating
+    /// a Backlog item.
+    pub quickstart_mode: bool,
 }
 
 impl Default for CreateDialog {
@@ -356,6 +360,7 @@ impl Default for CreateDialog {
             focus_field: CreateDialogFocus::Title,
             error_message: None,
             branch_user_edited: false,
+            quickstart_mode: false,
         }
     }
 }
@@ -374,6 +379,7 @@ impl CreateDialog {
         self.branch_input.clear();
         self.error_message = None;
         self.branch_user_edited = false;
+        self.quickstart_mode = false;
         self.focus_field = CreateDialogFocus::Title;
 
         self.repo_list = active_repos
@@ -390,6 +396,13 @@ impl CreateDialog {
         }
 
         self.repo_cursor = 0;
+    }
+
+    /// Open in quick-start mode: the user only selects a repo. On submit,
+    /// a Planning item is created and a Claude session spawns immediately.
+    pub fn open_quickstart(&mut self, active_repos: &[PathBuf]) {
+        self.open(active_repos, None);
+        self.quickstart_mode = true;
     }
 
     /// Close the dialog without creating anything.
@@ -548,7 +561,7 @@ fn truncate_slug(slug: &str, max_len: usize) -> String {
 }
 
 /// Generate a 4-character hex suffix for branch name uniqueness.
-fn random_suffix() -> String {
+pub(crate) fn random_suffix() -> String {
     let bytes = uuid::Uuid::new_v4();
     let b = bytes.as_bytes();
     format!("{:02x}{:02x}", b[0], b[1])

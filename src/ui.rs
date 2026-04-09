@@ -18,8 +18,8 @@ use tui_term::widget::PseudoTerminal;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, BOARD_COLUMNS, DisplayEntry, FocusPanel, GroupHeaderKind, SettingsListFocus, ViewMode,
-    WorkItemContext,
+    App, BOARD_COLUMNS, DisplayEntry, FocusPanel, GroupHeaderKind, SettingsListFocus, SettingsTab,
+    ViewMode, WorkItemContext,
 };
 use crate::config;
 use crate::create_dialog::{CreateDialog, CreateDialogFocus};
@@ -505,8 +505,8 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 Line::from(""),
                 Line::from("  No work items."),
                 Line::from(""),
-                Line::from("  Press Ctrl+N"),
-                Line::from("  to create one."),
+                Line::from("  Ctrl+N: quick start"),
+                Line::from("  Ctrl+B: backlog ticket"),
             ])
         };
         let paragraph = Paragraph::new(text)
@@ -1518,7 +1518,8 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 Line::from(""),
                 Line::from("  Welcome to workbridge"),
                 Line::from(""),
-                Line::from("  Ctrl+N    - Create work item"),
+                Line::from("  Ctrl+N    - Quick start session"),
+                Line::from("  Ctrl+B    - New backlog ticket"),
                 Line::from("  Up/Down   - Navigate items"),
                 Line::from("  Enter     - Open session / Import"),
                 Line::from("  Ctrl+]    - Return to item list"),
@@ -1675,6 +1676,49 @@ fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect)
         height: block_inner.height.saturating_sub(2),
     };
 
+    // Top-level layout: tab bar (1 row) + body (rest).
+    let [tab_bar_area, body_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .areas(inner);
+
+    // Tab bar.
+    let tab_selected = if app.settings_tab == SettingsTab::Keybindings {
+        1
+    } else {
+        0
+    };
+    let tabs = Tabs::new(vec![" Repos ", " Keybindings "])
+        .select(tab_selected)
+        .style(theme.style_text_muted())
+        .highlight_style(theme.style_view_mode_tab_active())
+        .divider("|");
+    tabs.render(tab_bar_area, buf);
+
+    // Body layout: content (fills) + hint line (1 row).
+    let [content_area, hint_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .areas(body_area);
+
+    if app.settings_tab == SettingsTab::Keybindings {
+        draw_settings_keybindings_tab(buf, app, theme, content_area);
+        let hint = Line::styled(
+            "Tab: switch tab   Up/Down: scroll   ?: close",
+            theme.style_text_muted(),
+        );
+        Paragraph::new(hint).render(hint_area, buf);
+    } else {
+        draw_settings_repos_tab(buf, app, theme, content_area);
+        let hint = Line::styled(
+            "Tab: switch tab   Left/Right: switch column   Enter: move repo   Up/Down: navigate",
+            theme.style_text_muted(),
+        );
+        Paragraph::new(hint).render(hint_area, buf);
+    }
+}
+
+fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // Build managed repo items.
     let managed_repos = &app.active_repo_cache;
     let mut managed_items: Vec<ListItem<'_>> = Vec::new();
@@ -1724,7 +1768,6 @@ fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect)
     let source_height = 2;
     let base_dirs_height = 1 + base_dirs_lines + 1;
     let defaults_height = 3;
-    let hint_height = 1;
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
@@ -1734,10 +1777,9 @@ fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect)
             Constraint::Length(repos_section_height),
             Constraint::Length(1), // blank
             Constraint::Length(defaults_height),
-            Constraint::Length(hint_height),
             Constraint::Min(0), // absorb remaining space
         ])
-        .split(inner);
+        .split(area);
 
     // Section 0: Config source.
     let source_text = Text::from(vec![
@@ -1759,7 +1801,7 @@ fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect)
     }
     Paragraph::new(Text::from(base_lines)).render(sections[1], buf);
 
-    // Section 2: Repos - horizontal split of Active and Excluded lists.
+    // Section 2: Repos - horizontal split of Managed and Available lists.
     let repo_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -1771,7 +1813,7 @@ fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect)
     } else {
         theme.style_border_subtle()
     };
-    let managed_title = format!(" Managed repos ({}) ", managed_count);
+    let managed_title = format!(" Managed repos ({managed_count}) ");
     let managed_block = Block::default()
         .title(managed_title.as_str())
         .title_style(theme.style_title())
@@ -1803,7 +1845,7 @@ fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect)
     } else {
         theme.style_border_subtle()
     };
-    let available_title = format!(" Available ({}) ", available_count);
+    let available_title = format!(" Available ({available_count}) ");
     let available_block = Block::default()
         .title(available_title.as_str())
         .title_style(theme.style_title())
@@ -1842,13 +1884,66 @@ fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect)
         )),
     ]);
     Paragraph::new(defaults_text).render(sections[4], buf);
+}
 
-    // Section 5: Hint line.
-    let hint = Line::styled(
-        "Tab: switch list, Enter: move, Up/Down: navigate",
-        theme.style_text_muted(),
-    );
-    Paragraph::new(hint).render(sections[5], buf);
+fn draw_settings_keybindings_tab(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+    let h = theme.style_heading();
+    let k = theme.style_text(); // key name style
+    let d = theme.style_text_muted(); // description style
+
+    let binding = |key: &'static str, desc: &'static str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("  {key:<26}"), k),
+            Span::styled(desc, d),
+        ])
+    };
+
+    let lines: Vec<Line<'_>> = vec![
+        Line::styled("Global", h),
+        binding("Ctrl+N", "Quick-start session"),
+        binding("Ctrl+B", "New backlog ticket"),
+        binding("Ctrl+G", "Global assistant"),
+        binding("?", "Settings / keybindings (this overlay)"),
+        binding("Q / Ctrl+Q", "Quit"),
+        Line::from(""),
+        Line::styled("List focused", h),
+        binding("Up / Down", "Navigate items"),
+        binding("Enter", "Open session / Import"),
+        binding("Shift+Right", "Advance stage"),
+        binding("Shift+Left", "Retreat stage"),
+        binding("Ctrl+D / Delete", "Delete work item"),
+        binding("Ctrl+]", "Focus session panel"),
+        Line::from(""),
+        Line::styled("Board view", h),
+        binding("Left / Right", "Move between columns"),
+        binding("Shift+Left / Shift+Right", "Move item to adjacent column"),
+        binding("Up / Down", "Navigate within column"),
+        binding("Enter", "Open drill-down / session"),
+        Line::from(""),
+        Line::styled("Session active (right panel)", h),
+        binding("Ctrl+]", "Return to item list"),
+        Line::from(vec![Span::styled(
+            "  (all other keys forwarded to Claude)",
+            d,
+        )]),
+        Line::from(""),
+        Line::styled("Creation dialog  (Ctrl+B)", h),
+        binding("Tab / Shift+Tab", "Cycle fields"),
+        binding("Enter", "Create  (newline in description)"),
+        binding("Space", "Toggle repo selection"),
+        binding("Esc", "Cancel"),
+        Line::from(""),
+        Line::styled("Settings overlay  (?)", h),
+        binding("Tab", "Switch tab (Repos / Keybindings)"),
+        binding("Left / Right", "Switch column focus  (Repos tab)"),
+        binding("Up / Down", "Navigate / scroll"),
+        binding("Enter", "Move repo in or out of managed"),
+        binding("? / Esc", "Close"),
+    ];
+
+    Paragraph::new(Text::from(lines))
+        .scroll((app.settings_keybindings_scroll, 0))
+        .render(area, buf);
 }
 
 /// Draw the work item creation dialog as a centered popup overlay.

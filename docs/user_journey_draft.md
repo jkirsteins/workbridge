@@ -268,7 +268,8 @@ Toggled via a global keybind (e.g. Tab) at the root work item overview level.
 | Shift+Left | Item selected | Retreat to previous stage |
 | Enter | Item selected | Focus right panel, spawn Claude session if needed |
 | Ctrl+] | Right panel focused | Return to left panel / board view |
-| Ctrl+N | Left panel | Create new work item (existing) |
+| Ctrl+N | Left panel | Quick-start: create Planning item and spawn Claude immediately |
+| Ctrl+B | Left panel | Create new backlog work item |
 | Up/Down | Left panel / board | Navigate items |
 | Left/Right | Board view | Navigate between columns |
 
@@ -278,22 +279,21 @@ Toggled via a global keybind (e.g. Tab) at the root work item overview level.
 
 ### 7.1 Happy Path: Idea to Done
 
-1. User presses Ctrl+N, enters title "Add response caching to /api/users", selects repo.
-2. Item appears with [BL] badge.
-3. User selects item, presses Shift+Right -> moves to [PL].
-4. User presses Enter -> Claude session spawns in Planning mode.
-5. User discusses approach with Claude: "We should use Redis with a 5min TTL..."
-6. Claude logs decisions to activity log via MCP.
-7. Plan is written to the backend.
-8. User satisfied, presses Ctrl+] to return to list.
-9. User presses Shift+Right -> moves to [IM].
-10. System auto-spawns Claude with plan context. Claude starts working.
-11. User can watch live PTY output or switch to other items.
-12. Claude finishes, signals done via MCP.
-13. TUI creates PR, item moves to [RV].
-14. User reviews, runs review skills, monitors CI.
-15. External reviewer approves. User presses Shift+Right -> [DN].
-16. Item visible for 7 days, then archived.
+1. User presses Ctrl+N to quick-start a new session.
+2. Item appears with [PL] badge and a Claude session spawns immediately in Planning mode.
+3. Claude asks the user what they want to work on, and sets the title/description via MCP.
+4. User discusses approach with Claude: "We should use Redis with a 5min TTL..."
+5. Claude logs decisions to activity log via MCP.
+6. Plan is written to the backend.
+7. User satisfied, presses Ctrl+] to return to list.
+8. User presses Shift+Right -> moves to [IM].
+9. System auto-spawns Claude with plan context. Claude starts working.
+10. User can watch live PTY output or switch to other items.
+11. Claude finishes, signals done via MCP.
+12. TUI creates PR, item moves to [RV].
+13. User reviews, runs review skills, monitors CI.
+14. External reviewer approves. User presses Shift+Right -> [DN].
+15. Item visible for 7 days, then archived.
 
 ### 7.2 Claude Gets Blocked
 
@@ -357,7 +357,7 @@ Toggled via a global keybind (e.g. Tab) at the root work item overview level.
 ### What stays manual (MVP):
 
 - All stage transitions initiated by user (Shift+Arrow)
-- Creating backlog items (Ctrl+N)
+- Quick-starting new sessions (Ctrl+N) and creating backlog items (Ctrl+B)
 - Approving plans (user judgment)
 - Final approval to move to Done
 - Choosing which review skills to run

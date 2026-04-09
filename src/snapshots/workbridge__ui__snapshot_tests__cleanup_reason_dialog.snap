@@ -1,6 +1,5 @@
 ---
 source: src/ui.rs
-assertion_line: 3558
 expression: "render(&app, 80, 24)"
 ---
   List    Board                                                Tab: switch view
@@ -8,8 +7,8 @@ expression: "render(&app, 80, 24)"
 │                       ││                                                     │
 │  No work items.       ││  Welcome to workbridge                              │
 │                       ││                                                     │
-│  Press Ctrl+N         ││  Ctrl+N    - Create work item                       │
-│  to create one.       ││  Up/Down   - Navigate items                         │
+│  Ctrl+N: quick start  ││  Ctrl+N    - Quick start session                    │
+│  Ctrl+B: backlog ticke││  Ctrl+B    - New backlog ticket                     │
 │                 ╭ Close Reason ───────────────────────────╮                  │
 │                 │                                         │                  │
 │                 │ Reason to comment on the PR (optional): │                  │
