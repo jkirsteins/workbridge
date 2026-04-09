@@ -786,6 +786,24 @@ pub fn handle_resize(app: &mut App, cols: u16, rows: u16) {
     app.resize_pty_panes();
 }
 
+/// Handle a paste event (e.g. drag-and-drop file path) by forwarding the
+/// pasted text to the focused PTY session as raw bytes.
+pub fn handle_paste(app: &mut App, data: &str) {
+    if app.shutting_down {
+        return;
+    }
+    if app.global_drawer_open {
+        app.send_bytes_to_global(data.as_bytes());
+        return;
+    }
+    match app.focus {
+        FocusPanel::Right => {
+            app.send_bytes_to_active(data.as_bytes());
+        }
+        FocusPanel::Left => {}
+    }
+}
+
 /// Handle key events when the merge strategy prompt is visible.
 ///
 /// 's' or Enter = squash merge, 'm' = normal merge, Esc = cancel.
