@@ -8,7 +8,11 @@ use crate::layout;
 
 /// Handle a key event by dispatching based on focus panel.
 /// Called from the rat-salsa event callback in salsa.rs.
-pub fn handle_key(app: &mut App, key: KeyEvent) {
+///
+/// Returns `true` when app state changed and a re-render is needed.
+/// Returns `false` when the key was only forwarded to a PTY session
+/// (the 8ms timer tick will render the PTY echo within one frame).
+pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // During shutdown, only Q triggers force quit. All other keys are ignored.
     // Check this before the create dialog so users cannot create work items
     // while sessions are winding down.
@@ -27,37 +31,36 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             app.force_kill_all();
             app.should_quit = true;
         }
-        return;
+        return true;
     }
 
     // When the global assistant drawer is open, route all keys to it.
     if app.global_drawer_open {
-        handle_global_drawer_key(app, key);
-        return;
+        return handle_global_drawer_key(app, key);
     }
 
     // When the create dialog is open, route all keys to it.
     if app.create_dialog.visible {
         handle_create_dialog(app, key);
-        return;
+        return true;
     }
 
     // When the rework reason prompt is visible, route keys to it.
     if app.rework_prompt_visible {
         handle_rework_prompt(app, key);
-        return;
+        return true;
     }
 
     // When the no-plan prompt is visible, route keys to it.
     if app.no_plan_prompt_visible {
         handle_no_plan_prompt(app, key);
-        return;
+        return true;
     }
 
     // When the merge strategy prompt is visible, handle it.
     if app.confirm_merge {
         handle_merge_prompt(app, key);
-        return;
+        return true;
     }
 
     // When the settings overlay is open, handle overlay-specific keys.
@@ -110,10 +113,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             }
             _ => {}
         }
-        return;
+        return true;
     }
 
     // Any key other than the expected confirmation clears pending confirmations.
+    // Track whether any confirmation state was actually cleared so we know
+    // if app state changed even when the sub-handler only forwards to a PTY.
     let is_quit_confirm = app.confirm_quit
         && matches!(
             (key.modifiers, key.code),
@@ -126,14 +131,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         && (key.code == KeyCode::Delete
             || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d')));
 
+    let mut state_changed = false;
     let had_status = app.has_visible_status_bar();
     if app.confirm_quit && !is_quit_confirm {
         app.confirm_quit = false;
         app.status_message = None;
+        state_changed = true;
     }
     if app.confirm_delete != DeleteConfirmState::None && !is_delete_confirm {
         app.confirm_delete = DeleteConfirmState::None;
         app.status_message = None;
+        state_changed = true;
     }
     // If cancelling a confirmation hid the status bar, resync layout so
     // pane dimensions match the new visible area.
@@ -144,12 +152,15 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // Board mode (without drill-down) has its own key handler.
     if app.view_mode == ViewMode::Board && !app.board_drill_down {
         handle_key_board(app, key);
-        return;
+        return true;
     }
 
     match app.focus {
-        FocusPanel::Left => handle_key_left(app, key),
-        FocusPanel::Right => handle_key_right(app, key),
+        FocusPanel::Left => {
+            handle_key_left(app, key);
+            true
+        }
+        FocusPanel::Right => state_changed || handle_key_right(app, key),
     }
 }
 
@@ -448,24 +459,24 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
 /// Ctrl+] returns focus to the left panel (standard "escape from session"
 /// key, matching telnet/SSH conventions). Escape is forwarded to the PTY
 /// so Claude Code can use it.
-fn handle_key_right(app: &mut App, key: KeyEvent) {
-    let had_status = app.has_visible_status_bar();
-
-    // Check if the active session is dead before forwarding keys. If dead,
-    // auto-return focus to the left panel instead of spamming errors.
+fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
+    // Check if the active session is dead before forwarding keys.
+    // Flush any buffered PTY bytes before changing state.
     if let Some(entry) = app.active_session_entry() {
         if !entry.alive {
+            app.flush_pty_buffers();
             app.focus = FocusPanel::Left;
             app.status_message = Some("Session has ended - returned to work items".into());
             sync_layout(app);
-            return;
+            return true;
         }
     } else {
         // No session for this work item - return to left panel.
+        app.flush_pty_buffers();
         app.focus = FocusPanel::Left;
         app.status_message = None;
         sync_layout(app);
-        return;
+        return true;
     }
 
     match key.code {
@@ -477,6 +488,7 @@ fn handle_key_right(app: &mut App, key: KeyEvent) {
         KeyCode::Char(']') | KeyCode::Char('5')
             if key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
+            app.flush_pty_buffers();
             app.focus = FocusPanel::Left;
             app.status_message = None;
             // If returning from board drill-down, restore the full board view.
@@ -487,14 +499,15 @@ fn handle_key_right(app: &mut App, key: KeyEvent) {
             }
             // Status bar visibility changed - resize PTY to match.
             sync_layout(app);
+            return true;
         }
         // Forward Escape to PTY.
         KeyCode::Esc => {
-            app.send_bytes_to_active(b"\x1b");
+            app.buffer_bytes_to_active(b"\x1b");
         }
         // Forward Enter to PTY.
         KeyCode::Enter => {
-            app.send_bytes_to_active(b"\r");
+            app.buffer_bytes_to_active(b"\r");
         }
         // Forward regular characters.
         KeyCode::Char(c) => {
@@ -504,7 +517,7 @@ fn handle_key_right(app: &mut App, key: KeyEvent) {
                     .wrapping_sub(b'a')
                     .wrapping_add(1);
                 if byte <= 26 {
-                    app.send_bytes_to_active(&[byte]);
+                    app.buffer_bytes_to_active(&[byte]);
                 }
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 // Alt+<char> = ESC byte (0x1B) followed by the character.
@@ -512,72 +525,68 @@ fn handle_key_right(app: &mut App, key: KeyEvent) {
                 let s = c.encode_utf8(&mut buf);
                 let mut data = vec![0x1bu8];
                 data.extend_from_slice(s.as_bytes());
-                app.send_bytes_to_active(&data);
+                app.buffer_bytes_to_active(&data);
             } else {
                 let mut buf = [0u8; 4];
                 let s = c.encode_utf8(&mut buf);
-                app.send_bytes_to_active(s.as_bytes());
+                app.buffer_bytes_to_active(s.as_bytes());
             }
         }
         KeyCode::Backspace => {
             if key.modifiers.contains(KeyModifiers::ALT) {
                 // Alt+Backspace = ESC + DEL (0x1B 0x7F)
-                app.send_bytes_to_active(&[0x1b, 0x7f]);
+                app.buffer_bytes_to_active(&[0x1b, 0x7f]);
             } else {
-                app.send_bytes_to_active(&[0x7f]);
+                app.buffer_bytes_to_active(&[0x7f]);
             }
         }
         KeyCode::Tab => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 // Shift+Tab = CSI Z
-                app.send_bytes_to_active(b"\x1b[Z");
+                app.buffer_bytes_to_active(b"\x1b[Z");
             } else {
-                app.send_bytes_to_active(&[0x09]);
+                app.buffer_bytes_to_active(&[0x09]);
             }
         }
         KeyCode::BackTab => {
             // Shift+Tab = CSI Z
-            app.send_bytes_to_active(b"\x1b[Z");
+            app.buffer_bytes_to_active(b"\x1b[Z");
         }
         KeyCode::Up => {
-            send_arrow_key(app, b'A', key.modifiers);
+            buffer_csi_key(app, b'A', key.modifiers);
         }
         KeyCode::Down => {
-            send_arrow_key(app, b'B', key.modifiers);
+            buffer_csi_key(app, b'B', key.modifiers);
         }
         KeyCode::Right => {
-            send_arrow_key(app, b'C', key.modifiers);
+            buffer_csi_key(app, b'C', key.modifiers);
         }
         KeyCode::Left => {
-            send_arrow_key(app, b'D', key.modifiers);
+            buffer_csi_key(app, b'D', key.modifiers);
         }
         KeyCode::Home => {
-            send_special_key(app, b'H', key.modifiers);
+            buffer_csi_key(app, b'H', key.modifiers);
         }
         KeyCode::End => {
-            send_special_key(app, b'F', key.modifiers);
+            buffer_csi_key(app, b'F', key.modifiers);
         }
         KeyCode::PageUp => {
-            app.send_bytes_to_active(b"\x1b[5~");
+            app.buffer_bytes_to_active(b"\x1b[5~");
         }
         KeyCode::PageDown => {
-            app.send_bytes_to_active(b"\x1b[6~");
+            app.buffer_bytes_to_active(b"\x1b[6~");
         }
         KeyCode::Delete => {
-            app.send_bytes_to_active(b"\x1b[3~");
+            app.buffer_bytes_to_active(b"\x1b[3~");
         }
         KeyCode::F(n) => {
             let seq = f_key_sequence(n);
-            app.send_bytes_to_active(seq.as_bytes());
+            app.buffer_bytes_to_active(seq.as_bytes());
         }
         _ => {}
-    }
+    };
 
-    // If a send error caused a status message to appear (or disappear),
-    // the status bar visibility changed and pane dimensions need updating.
-    if app.has_visible_status_bar() != had_status {
-        sync_layout(app);
-    }
+    false
 }
 
 /// Key handling when the global assistant drawer is open.
@@ -585,11 +594,11 @@ fn handle_key_right(app: &mut App, key: KeyEvent) {
 /// died). Ctrl+] also closes the drawer. Esc is forwarded to the PTY as
 /// \x1b. All other keys are forwarded to the global session PTY using
 /// the same encoding as handle_key_right.
-fn handle_global_drawer_key(app: &mut App, key: KeyEvent) {
+fn handle_global_drawer_key(app: &mut App, key: KeyEvent) -> bool {
     // Ctrl+G toggles the drawer (handles dead-session respawn internally).
     if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.toggle_global_drawer();
-        return;
+        return true;
     }
 
     // For any other key, check if the global session is alive. If dead,
@@ -599,7 +608,7 @@ fn handle_global_drawer_key(app: &mut App, key: KeyEvent) {
         app.focus = app.pre_drawer_focus;
         app.status_message = Some("Global assistant session ended".into());
         sync_layout(app);
-        return;
+        return true;
     }
 
     match key.code {
@@ -609,13 +618,14 @@ fn handle_global_drawer_key(app: &mut App, key: KeyEvent) {
         {
             app.global_drawer_open = false;
             app.focus = app.pre_drawer_focus;
+            return true;
         }
-        // Forward all other keys to the global session PTY.
+        // Forward all other keys to the global session PTY via buffer.
         KeyCode::Esc => {
-            app.send_bytes_to_global(b"\x1b");
+            app.buffer_bytes_to_global(b"\x1b");
         }
         KeyCode::Enter => {
-            app.send_bytes_to_global(b"\r");
+            app.buffer_bytes_to_global(b"\r");
         }
         KeyCode::Char(c) => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -623,114 +633,80 @@ fn handle_global_drawer_key(app: &mut App, key: KeyEvent) {
                     .wrapping_sub(b'a')
                     .wrapping_add(1);
                 if byte <= 26 {
-                    app.send_bytes_to_global(&[byte]);
+                    app.buffer_bytes_to_global(&[byte]);
                 }
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 let mut buf = [0u8; 5];
                 let s = c.encode_utf8(&mut buf);
                 let mut data = vec![0x1bu8];
                 data.extend_from_slice(s.as_bytes());
-                app.send_bytes_to_global(&data);
+                app.buffer_bytes_to_global(&data);
             } else {
                 let mut buf = [0u8; 4];
                 let s = c.encode_utf8(&mut buf);
-                app.send_bytes_to_global(s.as_bytes());
+                app.buffer_bytes_to_global(s.as_bytes());
             }
         }
         KeyCode::Backspace => {
             if key.modifiers.contains(KeyModifiers::ALT) {
-                app.send_bytes_to_global(&[0x1b, 0x7f]);
+                app.buffer_bytes_to_global(&[0x1b, 0x7f]);
             } else {
-                app.send_bytes_to_global(&[0x7f]);
+                app.buffer_bytes_to_global(&[0x7f]);
             }
         }
         KeyCode::Tab => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
-                app.send_bytes_to_global(b"\x1b[Z");
+                app.buffer_bytes_to_global(b"\x1b[Z");
             } else {
-                app.send_bytes_to_global(&[0x09]);
+                app.buffer_bytes_to_global(&[0x09]);
             }
         }
         KeyCode::BackTab => {
-            app.send_bytes_to_global(b"\x1b[Z");
+            app.buffer_bytes_to_global(b"\x1b[Z");
         }
-        KeyCode::Up => {
-            send_global_arrow(app, b'A', key.modifiers);
-        }
-        KeyCode::Down => {
-            send_global_arrow(app, b'B', key.modifiers);
-        }
-        KeyCode::Right => {
-            send_global_arrow(app, b'C', key.modifiers);
-        }
-        KeyCode::Left => {
-            send_global_arrow(app, b'D', key.modifiers);
-        }
-        KeyCode::Home => {
-            send_global_special(app, b'H', key.modifiers);
-        }
-        KeyCode::End => {
-            send_global_special(app, b'F', key.modifiers);
-        }
+        KeyCode::Up => buffer_global_csi_key(app, b'A', key.modifiers),
+        KeyCode::Down => buffer_global_csi_key(app, b'B', key.modifiers),
+        KeyCode::Right => buffer_global_csi_key(app, b'C', key.modifiers),
+        KeyCode::Left => buffer_global_csi_key(app, b'D', key.modifiers),
+        KeyCode::Home => buffer_global_csi_key(app, b'H', key.modifiers),
+        KeyCode::End => buffer_global_csi_key(app, b'F', key.modifiers),
         KeyCode::PageUp => {
-            app.send_bytes_to_global(b"\x1b[5~");
+            app.buffer_bytes_to_global(b"\x1b[5~");
         }
         KeyCode::PageDown => {
-            app.send_bytes_to_global(b"\x1b[6~");
+            app.buffer_bytes_to_global(b"\x1b[6~");
         }
         KeyCode::Delete => {
-            app.send_bytes_to_global(b"\x1b[3~");
+            app.buffer_bytes_to_global(b"\x1b[3~");
         }
         KeyCode::F(n) => {
             let seq = f_key_sequence(n);
-            app.send_bytes_to_global(seq.as_bytes());
+            app.buffer_bytes_to_global(seq.as_bytes());
         }
         _ => {}
     }
+    false
 }
 
-fn send_global_arrow(app: &mut App, arrow: u8, modifiers: KeyModifiers) {
+/// Buffer a CSI key sequence (arrow, Home, End) for the global PTY.
+fn buffer_global_csi_key(app: &mut App, key: u8, modifiers: KeyModifiers) {
     let modifier_code = modifier_param(modifiers);
     if modifier_code > 1 {
-        let seq = format!("\x1b[1;{modifier_code}{}", arrow as char);
-        app.send_bytes_to_global(seq.as_bytes());
+        let seq = format!("\x1b[1;{modifier_code}{}", key as char);
+        app.buffer_bytes_to_global(seq.as_bytes());
     } else {
-        app.send_bytes_to_global(&[0x1b, b'[', arrow]);
+        app.buffer_bytes_to_global(&[0x1b, b'[', key]);
     }
 }
 
-fn send_global_special(app: &mut App, key_char: u8, modifiers: KeyModifiers) {
+/// Buffer a CSI key sequence (arrow, Home, End) for the active PTY.
+fn buffer_csi_key(app: &mut App, key: u8, modifiers: KeyModifiers) {
     let modifier_code = modifier_param(modifiers);
     if modifier_code > 1 {
-        let seq = format!("\x1b[1;{modifier_code}{}", key_char as char);
-        app.send_bytes_to_global(seq.as_bytes());
+        let seq = format!("\x1b[1;{modifier_code}{}", key as char);
+        app.buffer_bytes_to_active(seq.as_bytes());
     } else {
-        app.send_bytes_to_global(&[0x1b, b'[', key_char]);
-    }
-}
-
-/// Send an arrow key with optional modifiers as an ANSI escape sequence.
-/// Arrow keys: A=Up, B=Down, C=Right, D=Left.
-fn send_arrow_key(app: &mut App, arrow: u8, modifiers: KeyModifiers) {
-    let modifier_code = modifier_param(modifiers);
-    if modifier_code > 1 {
-        // Modified arrow: CSI 1 ; <modifier> <arrow>
-        let seq = format!("\x1b[1;{modifier_code}{}", arrow as char);
-        app.send_bytes_to_active(seq.as_bytes());
-    } else {
-        // Plain arrow: CSI <arrow>
-        app.send_bytes_to_active(&[0x1b, b'[', arrow]);
-    }
-}
-
-/// Send Home/End with optional modifiers as an ANSI escape sequence.
-fn send_special_key(app: &mut App, key_char: u8, modifiers: KeyModifiers) {
-    let modifier_code = modifier_param(modifiers);
-    if modifier_code > 1 {
-        let seq = format!("\x1b[1;{modifier_code}{}", key_char as char);
-        app.send_bytes_to_active(seq.as_bytes());
-    } else {
-        app.send_bytes_to_active(&[0x1b, b'[', key_char]);
+        app.buffer_bytes_to_active(&[0x1b, b'[', key]);
     }
 }
 
@@ -784,6 +760,33 @@ pub fn handle_resize(app: &mut App, cols: u16, rows: u16) {
     app.global_pane_rows = dl.pane_rows;
 
     app.resize_pty_panes();
+}
+
+/// Handle a paste event (e.g. drag-and-drop file path, system clipboard)
+/// by forwarding the pasted text to the focused PTY session as a bracketed
+/// paste sequence so the receiving application handles it atomically.
+pub fn handle_paste(app: &mut App, data: &str) -> bool {
+    if app.shutting_down
+        || app.create_dialog.visible
+        || app.show_settings
+        || app.rework_prompt_visible
+        || app.no_plan_prompt_visible
+        || app.confirm_merge
+    {
+        return false;
+    }
+    let bracketed = format!("\x1b[200~{data}\x1b[201~");
+    if app.global_drawer_open {
+        app.send_bytes_to_global(bracketed.as_bytes());
+        return true;
+    }
+    match app.focus {
+        FocusPanel::Right => {
+            app.send_bytes_to_active(bracketed.as_bytes());
+            true
+        }
+        FocusPanel::Left => false,
+    }
 }
 
 /// Handle key events when the merge strategy prompt is visible.

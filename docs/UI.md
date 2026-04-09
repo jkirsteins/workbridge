@@ -11,8 +11,8 @@ The application runs via `rat_salsa::run_tui()` which manages terminal
 setup/teardown, event polling, and the render cycle. Four callbacks drive
 the application:
 
-- **init**: starts the background fetcher, installs a 200ms tick timer,
-  sets initial pane dimensions
+- **init**: starts the background fetcher, installs an 8ms render tick
+  timer (see invariant 15), sets initial pane dimensions
 - **render**: draws the UI to a Buffer (not a Frame)
 - **event**: dispatches crossterm events to key/resize handlers, timer
   events to periodic work (liveness, fetch drain, signal checks, shutdown)
@@ -64,7 +64,8 @@ Pattern for background I/O:
    the result through `tx`.
 3. Store the `rx` receiver on the App struct.
 4. Poll `rx.try_recv()` in a timer-driven poll method (called every
-   200ms tick) to pick up results without blocking.
+   ~200ms via the background-work throttle) to pick up results without
+   blocking.
 
 See `spawn_import_worktree()` and `poll_worktree_creation()` in
 `src/app.rs` as reference implementations.
@@ -100,15 +101,27 @@ Examples of operations that MUST be async:
 - Any `std::process::Command::output()` call
 - Large file reads/writes
 
-### Timer-Driven Periodic Work
+### Timer and Render Tick
 
-A 200ms repeating timer drives:
-1. Session liveness checks (`check_liveness`)
-2. Fetch result drain (`drain_fetch_results`)
-3. Pending fetch error drain
-4. Signal handling (SIGTERM/SIGINT via AtomicBool)
-5. Shutdown deadline enforcement (10s)
-6. Fetcher restart when managed repos change
+The application uses a single 8ms (~120fps) repeating timer that serves
+two purposes:
+
+1. **Render tick** (every 8ms): every timer fire returns
+   `Control::Changed`, triggering a re-render. This keeps embedded PTY
+   output smooth - reader threads update the vt100 parser continuously,
+   but only a re-render makes changes visible.
+
+2. **Background work tick** (every 25th fire, ~200ms): heavy periodic
+   work is throttled via `timeout.counter % BACKGROUND_TICK_DIVISOR == 0`
+   to avoid wasting CPU. This drives:
+   - Session liveness checks (`check_liveness`)
+   - Fetch result drain (`drain_fetch_results`)
+   - Pending fetch error drain
+   - Signal handling (SIGTERM/SIGINT via AtomicBool)
+   - Shutdown deadline enforcement (10s)
+   - Fetcher restart when managed repos change
+
+See invariant 15 for the render rate requirement.
 
 ## View Modes
 

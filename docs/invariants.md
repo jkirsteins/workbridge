@@ -196,3 +196,17 @@ A work item cannot be created without a branch name. The branch is the
 identity of the work (invariant 2) and is needed to create worktrees and
 spawn sessions. The creation dialog auto-fills a branch from the title
 but the user can edit it. An empty branch is rejected at validation time.
+
+### 15. Render tick must be >= 120fps
+
+The UI timer must fire at 8ms or faster (~120fps). PTY output from
+embedded sessions arrives on background reader threads and is fed to the
+vt100 parser, but only a timer-driven re-render makes those updates
+visible. A slower tick (e.g. 200ms) causes visibly progressive rendering
+of paste events, scrolling output, and other PTY content that should
+appear instantaneous.
+
+Heavy background work (liveness checks, fetch drains, signal handling)
+is throttled inside the timer handler to run only every ~200ms
+(BACKGROUND_TICK_DIVISOR). The fast tick drives rendering only; it must
+not increase the frequency of expensive periodic work.

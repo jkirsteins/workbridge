@@ -139,11 +139,17 @@ impl SalsaContext<AppEvent, AppError> for Global {
 /// Initialization callback. Called once after rat-salsa sets up the terminal.
 /// Starts the tick timer, runs initial assembly, and starts the background fetcher.
 pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
-    // Start a repeating tick timer (200ms) for periodic work (liveness,
-    // fetch drain, signal checks, shutdown deadline).
+    // Render tick: ~120fps (8ms).  PTY output arrives on reader threads
+    // and updates the vt100 parser, but only a timer-driven re-render
+    // makes it visible.  A fast tick keeps embedded terminal rendering
+    // smooth (drag-and-drop paste, scrolling output, etc.).
+    //
+    // Heavy background work (liveness, fetch drain, signal checks,
+    // shutdown deadline) is throttled inside the handler to run only
+    // every BACKGROUND_TICK_DIVISOR-th tick (~200ms).
     ctx.add_timer(
         TimerDef::new()
-            .timer(Duration::from_millis(200))
+            .timer(Duration::from_millis(8))
             .repeat_forever(),
     );
 
@@ -263,7 +269,9 @@ pub fn app_event(
         AppEvent::Crossterm(ct_event) => {
             match ct_event {
                 ct::event::Event::Key(key) => {
-                    event::handle_key(state, *key);
+                    if !event::handle_key(state, *key) {
+                        return Ok(Control::Continue);
+                    }
                 }
                 ct::event::Event::Resize(cols, rows) => {
                     event::handle_resize(state, *cols, *rows);
@@ -273,6 +281,11 @@ pub fn app_event(
                         // Mouse event did not modify state (e.g. motion,
                         // click, or scroll that wasn't forwarded). Skip
                         // re-render.
+                        return Ok(Control::Continue);
+                    }
+                }
+                ct::event::Event::Paste(data) => {
+                    if !event::handle_paste(state, data) {
                         return Ok(Control::Continue);
                     }
                 }
@@ -299,148 +312,172 @@ pub fn app_event(
             }
             Ok(Control::Changed)
         }
-        AppEvent::Timer(_) => {
-            // Advance spinner for activity indicator animation.
-            // Tick when status-bar activities exist OR when any work item
-            // has Claude actively working (the list/board spinner needs it).
-            if !state.activities.is_empty() || !state.claude_working.is_empty() {
-                state.spinner_tick = state.spinner_tick.wrapping_add(1);
-            }
+        AppEvent::Timer(timeout) => {
+            // Flush any buffered PTY writes before rendering. Key events
+            // that forward to the PTY buffer bytes instead of writing
+            // immediately, so rapid keystrokes (e.g. drag-and-drop
+            // arriving as individual key events) are batched into a
+            // single write(). The child process receives them in one
+            // read() and echoes atomically - matching native terminal
+            // behavior.
+            state.flush_pty_buffers();
 
-            // Poll MCP status updates BEFORE liveness check so that a
-            // review gate verdict arriving in the same tick as session
-            // exit is processed before check_liveness clears review_gate_wi.
-            state.poll_mcp_status_updates();
+            // The render tick fires at ~120fps (8ms).  Heavy background
+            // work only runs every BACKGROUND_TICK_DIVISOR-th tick to
+            // keep CPU usage reasonable (~200ms cadence).
+            const BACKGROUND_TICK_DIVISOR: usize = 25;
+            let is_background_tick = timeout.counter % BACKGROUND_TICK_DIVISOR == 0;
 
-            // Liveness check on all sessions.
-            state.check_liveness();
+            if is_background_tick {
+                // Advance spinner for activity indicator animation.
+                // Tick when status-bar activities exist OR when any work
+                // item has Claude actively working (the list/board spinner
+                // needs it).
+                if !state.activities.is_empty() || !state.claude_working.is_empty() {
+                    state.spinner_tick = state.spinner_tick.wrapping_add(1);
+                }
 
-            // Drain fetch results and reassemble if new data arrived.
-            if state.drain_fetch_results() {
-                state.reassemble_work_items();
-                state.build_display_list();
-                state.global_mcp_context_dirty = true;
-            }
+                // Poll MCP status updates BEFORE liveness check so that a
+                // review gate verdict arriving in the same tick as session
+                // exit is processed before check_liveness clears
+                // review_gate_wi.
+                state.poll_mcp_status_updates();
 
-            // Drain PR identity backfill results (one-time startup migration).
-            if state.drain_pr_identity_backfill() {
-                state.reassemble_work_items();
-                state.build_display_list();
-                state.global_mcp_context_dirty = true;
-            }
+                // Liveness check on all sessions.
+                state.check_liveness();
 
-            // Refresh dynamic context for the global MCP server only when
-            // underlying data has changed, avoiding redundant JSON
-            // serialization on every tick.
-            if state.global_mcp_context_dirty && state.global_mcp_server.is_some() {
-                state.refresh_global_mcp_context();
-                state.global_mcp_context_dirty = false;
-            }
+                // Drain fetch results and reassemble if new data arrived.
+                if state.drain_fetch_results() {
+                    state.reassemble_work_items();
+                    state.build_display_list();
+                    state.global_mcp_context_dirty = true;
+                }
 
-            // Poll async operations. Capture status bar visibility before
-            // and after so we can sync layout if an activity started or ended.
-            let had_status = state.has_visible_status_bar();
+                // Drain PR identity backfill results (one-time startup
+                // migration).
+                if state.drain_pr_identity_backfill() {
+                    state.reassemble_work_items();
+                    state.build_display_list();
+                    state.global_mcp_context_dirty = true;
+                }
 
-            // Poll async review gate result.
-            state.poll_review_gate();
+                // Refresh dynamic context for the global MCP server only
+                // when underlying data has changed, avoiding redundant
+                // JSON serialization on every tick.
+                if state.global_mcp_context_dirty && state.global_mcp_server.is_some() {
+                    state.refresh_global_mcp_context();
+                    state.global_mcp_context_dirty = false;
+                }
 
-            // Poll async PR creation result.
-            state.poll_pr_creation();
+                // Poll async operations. Capture status bar visibility
+                // before and after so we can sync layout if an activity
+                // started or ended.
+                let had_status = state.has_visible_status_bar();
 
-            // Poll async PR merge result.
-            state.poll_pr_merge();
+                // Poll async review gate result.
+                state.poll_review_gate();
 
-            // Poll async review submission result.
-            state.poll_review_submission();
+                // Poll async PR creation result.
+                state.poll_pr_creation();
 
-            // Poll mergequeue items for externally merged PRs.
-            state.poll_mergequeue();
+                // Poll async PR merge result.
+                state.poll_pr_merge();
 
-            // Poll async worktree creation result.
-            state.poll_worktree_creation();
+                // Poll async review submission result.
+                state.poll_review_submission();
 
-            // Surface queued fetch errors.
-            state.drain_pending_fetch_errors();
+                // Poll mergequeue items for externally merged PRs.
+                state.poll_mergequeue();
 
-            // If status bar visibility changed (activity started/ended),
-            // resync layout so pane dimensions match the actual display area.
-            if state.has_visible_status_bar() != had_status {
-                event::sync_layout(state);
-            }
+                // Poll async worktree creation result.
+                state.poll_worktree_creation();
 
-            // Check for external signals (SIGTERM, SIGINT).
-            if ctx.signal_received.swap(false, Ordering::Relaxed) {
+                // Surface queued fetch errors.
+                state.drain_pending_fetch_errors();
+
+                // If status bar visibility changed (activity started/
+                // ended), resync layout so pane dimensions match the
+                // actual display area.
+                if state.has_visible_status_bar() != had_status {
+                    event::sync_layout(state);
+                }
+
+                // Check for external signals (SIGTERM, SIGINT).
+                if ctx.signal_received.swap(false, Ordering::Relaxed) {
+                    if state.shutting_down {
+                        // Second signal during shutdown - force kill and
+                        // exit.
+                        state.force_kill_all();
+                        return Ok(Control::Quit);
+                    } else {
+                        // First signal - initiate graceful shutdown.
+                        state.send_sigterm_all();
+                        state.cleanup_all_mcp();
+                        state.shutting_down = true;
+                        state.shutdown_started = Some(std::time::Instant::now());
+                        state.status_message =
+                            Some("Waiting for sessions (force quit in 10s, or press Q)".into());
+                        if state.all_dead() {
+                            return Ok(Control::Quit);
+                        }
+                    }
+                }
+
+                // Shutdown deadline checks.
                 if state.shutting_down {
-                    // Second signal during shutdown - force kill and exit.
-                    state.force_kill_all();
-                    return Ok(Control::Quit);
-                } else {
-                    // First signal - initiate graceful shutdown.
-                    state.send_sigterm_all();
-                    state.cleanup_all_mcp();
-                    state.shutting_down = true;
-                    state.shutdown_started = Some(std::time::Instant::now());
-                    state.status_message =
-                        Some("Waiting for sessions (force quit in 10s, or press Q)".into());
                     if state.all_dead() {
                         return Ok(Control::Quit);
                     }
-                }
-            }
-
-            // Shutdown deadline checks.
-            if state.shutting_down {
-                if state.all_dead() {
-                    return Ok(Control::Quit);
-                }
-                if state.should_quit {
-                    return Ok(Control::Quit);
-                }
-                if let Some(started) = state.shutdown_started {
-                    let elapsed = started.elapsed();
-                    if elapsed >= Duration::from_secs(10) {
-                        state.force_kill_all();
+                    if state.should_quit {
                         return Ok(Control::Quit);
                     }
-                    let remaining = 10u64.saturating_sub(elapsed.as_secs());
-                    state.status_message = Some(format!(
-                        "Waiting for sessions (force quit in {remaining}s, or press Q)"
-                    ));
+                    if let Some(started) = state.shutdown_started {
+                        let elapsed = started.elapsed();
+                        if elapsed >= Duration::from_secs(10) {
+                            state.force_kill_all();
+                            return Ok(Control::Quit);
+                        }
+                        let remaining = 10u64.saturating_sub(elapsed.as_secs());
+                        state.status_message = Some(format!(
+                            "Waiting for sessions (force quit in {remaining}s, or press Q)"
+                        ));
+                    }
                 }
-            }
 
-            // Restart the background fetcher if repo management changed.
-            if state.fetcher_repos_changed {
-                state.fetcher_repos_changed = false;
-                state.fetcher_disconnected = false;
-                // Stop the old fetcher.
-                if let Some(handle) = state.fetcher_handle.take() {
-                    handle.stop();
-                }
-                state.fetch_rx = None;
-                // Start a new fetcher with the updated repo list.
-                let new_repos: Vec<PathBuf> = state
-                    .active_repo_cache
-                    .iter()
-                    .filter(|r| r.git_dir_present)
-                    .map(|r| r.path.clone())
-                    .collect();
-                // Prune stale repo_data entries.
-                state.repo_data.retain(|k, _| new_repos.contains(k));
-                // Reassemble immediately so stale data is cleared.
-                state.reassemble_work_items();
-                state.build_display_list();
-                if !new_repos.is_empty() {
-                    let new_extra = state.extra_branches_from_backend();
-                    let (rx, handle) = fetcher::start_with_extra_branches(
-                        new_repos,
-                        Arc::clone(&ctx.worktree_service),
-                        Arc::clone(&ctx.github_client),
-                        state.config.defaults.branch_issue_pattern.clone(),
-                        new_extra,
-                    );
-                    state.fetch_rx = Some(rx);
-                    state.fetcher_handle = Some(handle);
+                // Restart the background fetcher if repo management
+                // changed.
+                if state.fetcher_repos_changed {
+                    state.fetcher_repos_changed = false;
+                    state.fetcher_disconnected = false;
+                    // Stop the old fetcher.
+                    if let Some(handle) = state.fetcher_handle.take() {
+                        handle.stop();
+                    }
+                    state.fetch_rx = None;
+                    // Start a new fetcher with the updated repo list.
+                    let new_repos: Vec<PathBuf> = state
+                        .active_repo_cache
+                        .iter()
+                        .filter(|r| r.git_dir_present)
+                        .map(|r| r.path.clone())
+                        .collect();
+                    // Prune stale repo_data entries.
+                    state.repo_data.retain(|k, _| new_repos.contains(k));
+                    // Reassemble immediately so stale data is cleared.
+                    state.reassemble_work_items();
+                    state.build_display_list();
+                    if !new_repos.is_empty() {
+                        let new_extra = state.extra_branches_from_backend();
+                        let (rx, handle) = fetcher::start_with_extra_branches(
+                            new_repos,
+                            Arc::clone(&ctx.worktree_service),
+                            Arc::clone(&ctx.github_client),
+                            state.config.defaults.branch_issue_pattern.clone(),
+                            new_extra,
+                        );
+                        state.fetch_rx = Some(rx);
+                        state.fetcher_handle = Some(handle);
+                    }
                 }
             }
 

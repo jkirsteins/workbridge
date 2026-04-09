@@ -503,6 +503,14 @@ pub struct App {
     /// `refresh_global_mcp_context` call. Set by `drain_fetch_results`
     /// returning true; cleared after the refresh runs.
     pub global_mcp_context_dirty: bool,
+    /// Buffered bytes destined for the active PTY session. Key events
+    /// that forward to the PTY push here instead of writing immediately.
+    /// Flushed as a single write on the next timer tick so the child
+    /// process receives all characters in one read() - matching how a
+    /// native terminal delivers drag-and-drop or fast paste.
+    pub pending_active_pty_bytes: Vec<u8>,
+    /// Same buffer for the global assistant session.
+    pub pending_global_pty_bytes: Vec<u8>,
 }
 
 impl App {
@@ -650,6 +658,8 @@ impl App {
             global_pane_rows: 24,
             global_mcp_config_path: None,
             global_mcp_context_dirty: false,
+            pending_active_pty_bytes: Vec::new(),
+            pending_global_pty_bytes: Vec::new(),
         };
         app.reassemble_work_items();
         app.build_display_list();
@@ -1036,6 +1046,33 @@ impl App {
     /// Find the session key for a work item ID (any stage).
     pub fn session_key_for(&self, wi_id: &WorkItemId) -> Option<(WorkItemId, WorkItemStatus)> {
         self.sessions.keys().find(|(id, _)| id == wi_id).cloned()
+    }
+
+    /// Buffer bytes for the active PTY session. The bytes are not written
+    /// immediately - they accumulate until `flush_pty_buffers()` is called
+    /// (every timer tick). This batches rapid keystrokes (e.g. drag-and-drop
+    /// arriving as individual key events) into a single PTY write so the
+    /// child process receives them in one `read()`.
+    pub fn buffer_bytes_to_active(&mut self, data: &[u8]) {
+        self.pending_active_pty_bytes.extend_from_slice(data);
+    }
+
+    /// Buffer bytes for the global assistant PTY session.
+    pub fn buffer_bytes_to_global(&mut self, data: &[u8]) {
+        self.pending_global_pty_bytes.extend_from_slice(data);
+    }
+
+    /// Flush buffered PTY bytes to their respective sessions as single
+    /// writes. Called on each timer tick before rendering.
+    pub fn flush_pty_buffers(&mut self) {
+        if !self.pending_active_pty_bytes.is_empty() {
+            let data = std::mem::take(&mut self.pending_active_pty_bytes);
+            self.send_bytes_to_active(&data);
+        }
+        if !self.pending_global_pty_bytes.is_empty() {
+            let data = std::mem::take(&mut self.pending_global_pty_bytes);
+            self.send_bytes_to_global(&data);
+        }
     }
 
     /// Send raw bytes to the active session's PTY.
