@@ -312,8 +312,8 @@ pub struct App {
     /// Branch name of the in-progress cleanup target (for cache eviction on completion).
     pub cleanup_progress_branch: Option<String>,
     /// Branches whose PRs were recently closed via cleanup. Used to suppress
-    /// stale fetch results from re-adding the PR as unlinked. Cleared when
-    /// a fresh fetch arrives (drain_fetch_results returns true).
+    /// stale fetch results from re-adding the PR as unlinked. Applied and
+    /// cleared when a fresh fetch arrives (drain_fetch_results returns true).
     pub cleanup_evicted_branches: Vec<(PathBuf, String)>,
     /// General-purpose alert dialog. When Some, a red-bordered modal is shown.
     /// Dismissed with Enter or Esc.
@@ -1675,7 +1675,7 @@ impl App {
         std::thread::spawn(move || {
             let mut warnings = Vec::new();
 
-            if let Some((ref owner, ref repo)) = github_remote {
+            let pr_close_ok = if let Some((ref owner, ref repo)) = github_remote {
                 let owner_repo = format!("{owner}/{repo}");
 
                 // Post optional reason as a comment before closing.
@@ -1704,6 +1704,7 @@ impl App {
                 }
 
                 // Close the PR.
+                let mut close_succeeded = false;
                 match std::process::Command::new("gh")
                     .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
                     .output()
@@ -1713,40 +1714,61 @@ impl App {
                         warnings.push(format!("PR close: {stderr}"));
                     }
                     Err(e) => warnings.push(format!("PR close: {e}")),
-                    _ => {}
+                    _ => {
+                        close_succeeded = true;
+                    }
                 }
+                close_succeeded
             } else {
-                warnings.push("No GitHub remote found; skipping PR close".into());
+                // No GitHub remote - local-only cleanup is safe to proceed.
+                true
+            };
+
+            // Only proceed with destructive local operations (worktree removal,
+            // branch deletion) if the PR was successfully closed on GitHub.
+            // Otherwise the user would lose their local branch while the PR
+            // remains open, and any unpushed commits would be permanently lost.
+            if !pr_close_ok {
+                let _ = tx.send(CleanupResult { warnings });
+                return;
             }
 
             // Get a fresh worktree list so we don't rely on potentially stale
             // cached repo_data (e.g., if the user switched branches since last fetch).
-            let fresh_worktrees = ws.list_worktrees(&repo_path).unwrap_or_default();
-            let wt_for_branch = fresh_worktrees
-                .iter()
-                .find(|wt| wt.branch.as_deref() == Some(branch.as_str()));
+            match ws.list_worktrees(&repo_path) {
+                Ok(fresh_worktrees) => {
+                    let wt_for_branch = fresh_worktrees
+                        .iter()
+                        .find(|wt| wt.branch.as_deref() == Some(branch.as_str()));
 
-            match wt_for_branch {
-                Some(wt) if wt.is_main => {
-                    // Branch is the main worktree's current branch; git forbids
-                    // deleting the checked-out branch. Skip silently - the PR
-                    // was closed, and the user can switch branches later.
+                    match wt_for_branch {
+                        Some(wt) if wt.is_main => {
+                            // Branch is the main worktree's current branch; git forbids
+                            // deleting the checked-out branch. Skip silently - the PR
+                            // was closed, and the user can switch branches later.
+                        }
+                        Some(wt) => {
+                            // Remove the linked worktree first, then delete the branch.
+                            let wt_path = wt.path.clone();
+                            if let Err(e) = ws.remove_worktree(&repo_path, &wt_path, false, true) {
+                                warnings.push(format!("worktree: {e}"));
+                            }
+                            if let Err(e) = ws.delete_branch(&repo_path, &branch, true) {
+                                warnings.push(format!("branch: {e}"));
+                            }
+                        }
+                        None => {
+                            // No worktree for this branch - just delete the branch.
+                            if let Err(e) = ws.delete_branch(&repo_path, &branch, true) {
+                                warnings.push(format!("branch: {e}"));
+                            }
+                        }
+                    }
                 }
-                Some(wt) => {
-                    // Remove the linked worktree first, then delete the branch.
-                    let wt_path = wt.path.clone();
-                    if let Err(e) = ws.remove_worktree(&repo_path, &wt_path, false, true) {
-                        warnings.push(format!("worktree: {e}"));
-                    }
-                    if let Err(e) = ws.delete_branch(&repo_path, &branch, true) {
-                        warnings.push(format!("branch: {e}"));
-                    }
-                }
-                None => {
-                    // No worktree for this branch - just delete the branch.
-                    if let Err(e) = ws.delete_branch(&repo_path, &branch, true) {
-                        warnings.push(format!("branch: {e}"));
-                    }
+                Err(e) => {
+                    warnings.push(format!(
+                        "list worktrees: {e}; skipping worktree/branch cleanup"
+                    ));
                 }
             }
 
@@ -1865,7 +1887,7 @@ impl App {
                     &record.repo_associations,
                     &mut warnings,
                     false,
-                    false, // run resource cleanup to catch orphaned worktrees/branches
+                    true, // skip resource cleanup: blocking I/O prohibited on UI thread
                 ) {
                     Ok(()) => {
                         archived_count += 1;

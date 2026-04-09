@@ -72,8 +72,26 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // When the cleanup is in progress (background thread running), swallow
-    // all keys - the dialog shows a spinner and cannot be interacted with.
+    // most keys - the dialog shows a spinner and cannot be interacted with.
+    // Handle Q/Ctrl+Q directly here so the user can force-quit if a subprocess
+    // hangs, rather than falling through to cleanup_prompt_visible which would
+    // swallow the key in its catch-all arm.
     if app.cleanup_in_progress {
+        if matches!(
+            (key.modifiers, key.code),
+            (
+                KeyModifiers::NONE | KeyModifiers::SHIFT,
+                KeyCode::Char('q' | 'Q')
+            ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
+        ) {
+            if !app.has_any_session() || app.confirm_quit {
+                app.should_quit = true;
+            } else {
+                app.confirm_quit = true;
+                app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                sync_layout(app);
+            }
+        }
         return true;
     }
 
@@ -973,11 +991,14 @@ fn handle_cleanup_prompt(app: &mut App, key: KeyEvent) {
             // Close directly without a reason.
             app.spawn_unlinked_cleanup(None);
         }
-        _ => {
-            // Cancel (Esc or any unrecognized key).
+        (_, KeyCode::Esc) => {
+            // Cancel on explicit Esc only.
             app.cleanup_prompt_visible = false;
             app.cleanup_unlinked_target = None;
             app.status_message = None;
+        }
+        _ => {
+            // Swallow unrecognized keys (arrows, function keys, etc.).
         }
     }
     if app.has_visible_status_bar() != had_status {

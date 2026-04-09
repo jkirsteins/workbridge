@@ -352,6 +352,7 @@ pub fn app_event(
                     // resurrect recently-closed PRs in the unlinked list.
                     if !state.cleanup_evicted_branches.is_empty() {
                         state.apply_cleanup_evictions();
+                        state.cleanup_evicted_branches.clear();
                     }
                     state.reassemble_work_items();
                     state.build_display_list();

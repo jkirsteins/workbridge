@@ -63,11 +63,9 @@ auto-archive - the following resources are cleaned up in order via
    and review gate state are all cleared.
 
 Steps 4-6 involve blocking I/O (git commands, gh CLI) and are only
-executed for user-initiated deletes (Ctrl+D). Auto-archive runs them
-with `skip_resource_cleanup: false` so orphaned worktrees/branches from
-failed post-merge cleanup are caught. This is safe because Done items
-have no OPEN PRs (no network calls), only local `git worktree remove`
-and `git branch -D` (fast).
+executed for user-initiated deletes (Ctrl+D). Auto-archive skips them
+(`skip_resource_cleanup: true`) because blocking I/O is prohibited on
+the UI thread where auto-archive runs during timer-driven reassembly.
 
 Steps 4-8 are best-effort: failures produce warning messages but do not
 abort the overall delete. Only a backend delete failure (step 1) is fatal.
@@ -141,9 +139,10 @@ and overwrite the cache with stale data that includes the now-closed PR.
 To handle this, `cleanup_evicted_branches: Vec<(PathBuf, String)>`
 tracks recently-closed (repo_path, branch) pairs. After every
 `drain_fetch_results()` in the timer callback, `apply_cleanup_evictions()`
-re-removes these branches from `repo_data.prs`. The evictions become
-no-ops once a fresh fetch (which queries `--state open` and naturally
-excludes the closed PR) arrives.
+re-removes these branches from `repo_data.prs` and then clears the
+vector. A single application is sufficient because the fresh fetch that
+triggered `drain_fetch_results()` queries `--state open` and naturally
+excludes the closed PR.
 
 As a defensive measure, `collect_unlinked_prs()` in `assembly.rs` also
 filters out PRs whose state is not "OPEN".

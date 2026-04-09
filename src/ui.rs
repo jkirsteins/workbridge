@@ -10,7 +10,7 @@ use ratatui_widgets::{
     borders::{BorderType, Borders},
     clear::Clear,
     list::{List, ListItem, ListState},
-    paragraph::Paragraph,
+    paragraph::{Paragraph, Wrap},
     scrollbar::{Scrollbar, ScrollbarOrientation, ScrollbarState},
     tabs::Tabs,
 };
@@ -2257,9 +2257,9 @@ fn draw_prompt_dialog(buf: &mut Buffer, theme: &Theme, area: Rect, kind: PromptD
             (*title, *body, h)
         }
         PromptDialogKind::Alert { title, body } => {
-            // body(1) + blank(1) + hint(1) + blank(1)
-            let h = 1u16 + 1 + 1 + 1;
-            (*title, *body, h)
+            // Height is computed after dialog_width is known (body may wrap).
+            // Use 0 as placeholder; overridden below for Alert.
+            (*title, *body, 0u16)
         }
     };
 
@@ -2267,6 +2267,23 @@ fn draw_prompt_dialog(buf: &mut Buffer, theme: &Theme, area: Rect, kind: PromptD
     // Clamp between 40 and 60, further clamped to terminal width.
     let min_content_width = body.len().max(title.len() + 4) as u16;
     let dialog_width = (min_content_width + 4).clamp(40, 60).min(area.width);
+
+    // For Alert dialogs, compute body line count based on actual word-wrapping.
+    let inner_height = if matches!(kind, PromptDialogKind::Alert { .. }) {
+        // Usable content width: dialog - 2 (border) - 2 (padding).
+        let content_width = dialog_width.saturating_sub(4).max(1) as usize;
+        let body_lines = if body.is_empty() {
+            1u16
+        } else {
+            // Use word-wrap simulation to get accurate line count.
+            // wrap_text_flat breaks at word boundaries like ratatui's Wrap.
+            (wrap_text_flat(body, content_width).len() as u16).max(1)
+        };
+        // body(N) + blank(1) + hint(1) + blank(1)
+        body_lines + 1 + 1 + 1
+    } else {
+        inner_height
+    };
     // Height: border(2) + blank(1) + inner_height + blank(1) = inner_height + 4.
     let dialog_height = (inner_height + 4).min(area.height);
 
@@ -2358,19 +2375,28 @@ fn draw_prompt_dialog(buf: &mut Buffer, theme: &Theme, area: Rect, kind: PromptD
                 .render(rows[4], buf);
         }
         PromptDialogKind::Alert { body, .. } => {
-            // Rows: body, blank, hint.
+            // Compute wrapped body line count for layout.
+            let content_w = inner.width.max(1) as usize;
+            let body_lines = if body.is_empty() {
+                1u16
+            } else {
+                // Use word-wrap simulation for accurate line count.
+                (wrap_text_flat(body, content_w).len() as u16).max(1)
+            };
+            // Rows: body (may wrap to multiple lines), blank, hint.
             let rows = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1), // body
-                    Constraint::Length(1), // blank
-                    Constraint::Length(1), // hint
-                    Constraint::Min(0),    // remaining
+                    Constraint::Length(body_lines), // body
+                    Constraint::Length(1),          // blank
+                    Constraint::Length(1),          // hint
+                    Constraint::Min(0),             // remaining
                 ])
                 .split(inner);
 
             Paragraph::new(body)
                 .style(theme.style_error())
+                .wrap(Wrap { trim: false })
                 .render(rows[0], buf);
             // rows[1] is blank.
             let hint_line = Line::from(vec![
