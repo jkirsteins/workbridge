@@ -191,6 +191,26 @@ pub trait WorkItemBackend: Send + Sync {
     /// Read all activity entries for a work item.
     fn read_activity(&self, id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError>;
 
+    /// Update the title of a work item.
+    ///
+    /// Default implementation returns an unsupported error. Override in
+    /// backends that support title mutation (LocalFileBackend).
+    fn update_title(&self, id: &WorkItemId, _title: &str) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedId(id.clone()))
+    }
+
+    /// Update the description of a work item. Pass `None` to clear it.
+    ///
+    /// Default implementation returns an unsupported error. Override in
+    /// backends that support description mutation (LocalFileBackend).
+    fn update_description(
+        &self,
+        id: &WorkItemId,
+        _description: Option<&str>,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedId(id.clone()))
+    }
+
     /// Update the implementation plan for a work item.
     fn update_plan(&self, id: &WorkItemId, plan: &str) -> Result<(), BackendError>;
 
@@ -459,6 +479,24 @@ impl WorkItemBackend for LocalFileBackend {
     fn update_status(&self, id: &WorkItemId, status: WorkItemStatus) -> Result<(), BackendError> {
         self.modify_record(id, |record| {
             record.status = status;
+        })
+    }
+
+    fn update_title(&self, id: &WorkItemId, title: &str) -> Result<(), BackendError> {
+        let title = title.to_string();
+        self.modify_record(id, |record| {
+            record.title = title;
+        })
+    }
+
+    fn update_description(
+        &self,
+        id: &WorkItemId,
+        description: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let description = description.map(|s| s.to_string());
+        self.modify_record(id, |record| {
+            record.description = description;
         })
     }
 
@@ -891,6 +929,91 @@ mod tests {
             BackendError::NotFound(_) => {}
             other => panic!("expected NotFound, got: {other}"),
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_title_persists() {
+        let dir = temp_dir("update-title");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Quick start".into(),
+                description: None,
+                status: WorkItemStatus::Planning,
+                kind: WorkItemKind::Own,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: Some("user/quickstart-ab12".into()),
+                    pr_identity: None,
+                }],
+            })
+            .unwrap();
+
+        backend
+            .update_title(&record.id, "Implement dark mode toggle")
+            .unwrap();
+
+        let result = backend.list().unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].title, "Implement dark mode toggle");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_title_not_found() {
+        let dir = temp_dir("update-title-notfound");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let result =
+            backend.update_title(&WorkItemId::LocalFile(dir.join("nonexistent.json")), "Hi");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BackendError::NotFound(_) => {}
+            other => panic!("expected NotFound, got: {other}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_description_persists() {
+        let dir = temp_dir("update-desc");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Quick start".into(),
+                description: None,
+                status: WorkItemStatus::Planning,
+                kind: WorkItemKind::Own,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: Some("user/quickstart-ab12".into()),
+                    pr_identity: None,
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(record.description, None);
+
+        backend
+            .update_description(&record.id, Some("Add a toggle in the settings panel"))
+            .unwrap();
+
+        let result = backend.list().unwrap();
+        assert_eq!(
+            result.records[0].description,
+            Some("Add a toggle in the settings panel".into())
+        );
+
+        // Clear description.
+        backend.update_description(&record.id, None).unwrap();
+        let result = backend.list().unwrap();
+        assert_eq!(result.records[0].description, None);
 
         let _ = fs::remove_dir_all(&dir);
     }

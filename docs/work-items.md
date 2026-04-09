@@ -131,6 +131,33 @@ To avoid false re-opens from stale GitHub data, recently-submitted review
 items are suppressed from re-open detection until fresh data arrives from
 the next GitHub fetch cycle.
 
+## Quick-Start Flow
+
+Pressing Ctrl+N starts a quick-start session without showing any creation
+dialog. A Planning work item is created immediately with a placeholder title
+("Quick start") and a session is spawned at once.
+
+The Claude agent running in this session uses the `planning_quickstart` system
+prompt, which instructs it to:
+1. Ask the user what they want to work on.
+2. Call `workbridge_set_title` and `workbridge_set_description` via MCP once
+   the task is understood.
+3. Proceed through the normal Phase 1 refinement and Phase 2 planning process,
+   ending with a `workbridge_set_plan` call.
+
+The title and description updates via MCP are reflected immediately in the
+left panel. After the first session sets a real title, any subsequent Planning
+session for the same item uses the normal `planning` prompt.
+
+Ctrl+B opens the full creation dialog (title, description, repos, branch) and
+creates a Backlog item, matching the previous Ctrl+N behavior.
+
+Repo selection for quick-start follows this priority:
+1. The managed repo root of the current working directory, if available.
+2. The only managed repo with a git directory, if exactly one exists.
+3. If multiple repos are present and CWD is not in one, the full creation
+   dialog opens for the user to select a repo.
+
 ## Work Item Status
 
 Work items follow a seven-stage workflow:

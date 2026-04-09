@@ -1,7 +1,8 @@
 use crate::salsa::ct::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::app::{
-    App, BOARD_COLUMNS, DeleteConfirmState, DisplayEntry, FocusPanel, SettingsListFocus, ViewMode,
+    App, BOARD_COLUMNS, DeleteConfirmState, DisplayEntry, FocusPanel, SettingsListFocus,
+    SettingsTab, ViewMode,
 };
 use crate::create_dialog::CreateDialogFocus;
 use crate::layout;
@@ -118,47 +119,62 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) | (_, KeyCode::Esc) => {
                 app.show_settings = false;
+                app.settings_tab = SettingsTab::Repos;
                 app.settings_repo_selected = 0;
                 app.settings_available_selected = 0;
                 app.settings_list_focus = SettingsListFocus::Managed;
+                app.settings_keybindings_scroll = 0;
             }
-            (_, KeyCode::Up) => match app.settings_list_focus {
-                SettingsListFocus::Managed => {
-                    app.settings_repo_selected = app.settings_repo_selected.saturating_sub(1);
-                }
-                SettingsListFocus::Available => {
-                    app.settings_available_selected =
-                        app.settings_available_selected.saturating_sub(1);
-                }
-            },
-            (_, KeyCode::Down) => match app.settings_list_focus {
-                SettingsListFocus::Managed => {
-                    let max = app.total_repos().saturating_sub(1);
-                    if app.settings_repo_selected < max {
-                        app.settings_repo_selected += 1;
-                    }
-                }
-                SettingsListFocus::Available => {
-                    let max = app.available_repos().len().saturating_sub(1);
-                    if app.settings_available_selected < max {
-                        app.settings_available_selected += 1;
-                    }
-                }
-            },
             (_, KeyCode::Tab) => {
-                app.settings_list_focus = match app.settings_list_focus {
-                    SettingsListFocus::Managed => SettingsListFocus::Available,
-                    SettingsListFocus::Available => SettingsListFocus::Managed,
+                app.settings_tab = match app.settings_tab {
+                    SettingsTab::Repos => SettingsTab::Keybindings,
+                    SettingsTab::Keybindings => SettingsTab::Repos,
                 };
             }
-            (_, KeyCode::Enter) | (_, KeyCode::Right)
-                if app.settings_list_focus == SettingsListFocus::Managed =>
-            {
+            (_, KeyCode::Left) if app.settings_tab == SettingsTab::Repos => {
+                app.settings_list_focus = SettingsListFocus::Managed;
+            }
+            (_, KeyCode::Right) if app.settings_tab == SettingsTab::Repos => {
+                app.settings_list_focus = SettingsListFocus::Available;
+            }
+            (_, KeyCode::Up) => match app.settings_tab {
+                SettingsTab::Repos => match app.settings_list_focus {
+                    SettingsListFocus::Managed => {
+                        app.settings_repo_selected = app.settings_repo_selected.saturating_sub(1);
+                    }
+                    SettingsListFocus::Available => {
+                        app.settings_available_selected =
+                            app.settings_available_selected.saturating_sub(1);
+                    }
+                },
+                SettingsTab::Keybindings => {
+                    app.settings_keybindings_scroll =
+                        app.settings_keybindings_scroll.saturating_sub(1);
+                }
+            },
+            (_, KeyCode::Down) => match app.settings_tab {
+                SettingsTab::Repos => match app.settings_list_focus {
+                    SettingsListFocus::Managed => {
+                        let max = app.total_repos().saturating_sub(1);
+                        if app.settings_repo_selected < max {
+                            app.settings_repo_selected += 1;
+                        }
+                    }
+                    SettingsListFocus::Available => {
+                        let max = app.available_repos().len().saturating_sub(1);
+                        if app.settings_available_selected < max {
+                            app.settings_available_selected += 1;
+                        }
+                    }
+                },
+                SettingsTab::Keybindings => {
+                    app.settings_keybindings_scroll += 1;
+                }
+            },
+            (_, KeyCode::Enter) if app.settings_list_focus == SettingsListFocus::Managed => {
                 app.unmanage_selected_repo();
             }
-            (_, KeyCode::Enter) | (_, KeyCode::Left)
-                if app.settings_list_focus == SettingsListFocus::Available =>
-            {
+            (_, KeyCode::Enter) if app.settings_list_focus == SettingsListFocus::Available => {
                 app.manage_selected_repo();
             }
             _ => {}
@@ -315,8 +331,27 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
                 sync_layout(app);
             }
         }
-        // Ctrl+N - open work item creation dialog
-        (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
+        // Ctrl+N - quick-start a new session (creates Planning item, spawns Claude immediately)
+        (KeyModifiers::CONTROL, KeyCode::Char('n')) => match app.create_quickstart_work_item() {
+            Ok(()) => {
+                sync_layout(app);
+            }
+            Err(ref msg) if msg == "MULTIPLE_REPOS" => {
+                let active_repos: Vec<std::path::PathBuf> = app
+                    .active_repo_cache
+                    .iter()
+                    .filter(|r| r.git_dir_present)
+                    .map(|r| r.path.clone())
+                    .collect();
+                app.create_dialog.open(&active_repos, None);
+                app.status_message = Some("Multiple repos - select one and press Enter".into());
+            }
+            Err(msg) => {
+                app.status_message = Some(msg);
+            }
+        },
+        // Ctrl+B - open the new backlog ticket creation dialog
+        (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
             let active_repos: Vec<std::path::PathBuf> = app
                 .active_repo_cache
                 .iter()
@@ -380,8 +415,27 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 sync_layout(app);
             }
         }
-        // Ctrl+N - open the work item creation dialog
-        (KeyModifiers::CONTROL, KeyCode::Char('n')) => {
+        // Ctrl+N - quick-start a new session (creates Planning item, spawns Claude immediately)
+        (KeyModifiers::CONTROL, KeyCode::Char('n')) => match app.create_quickstart_work_item() {
+            Ok(()) => {
+                sync_layout(app);
+            }
+            Err(ref msg) if msg == "MULTIPLE_REPOS" => {
+                let active_repos: Vec<std::path::PathBuf> = app
+                    .active_repo_cache
+                    .iter()
+                    .filter(|r| r.git_dir_present)
+                    .map(|r| r.path.clone())
+                    .collect();
+                app.create_dialog.open(&active_repos, None);
+                app.status_message = Some("Multiple repos - select one and press Enter".into());
+            }
+            Err(msg) => {
+                app.status_message = Some(msg);
+            }
+        },
+        // Ctrl+B - open the new backlog ticket creation dialog
+        (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
             let active_repos: Vec<std::path::PathBuf> = app
                 .active_repo_cache
                 .iter()

@@ -6,9 +6,10 @@ expression: output
 ┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │           ┌ Settings (press ? or Esc to close) ──────────────────┐           │
 │  No work i│                                                      │           │
-│           │ Config source:                                       │           │
-│  Press Ctr│   in-memory (test)                                   │           │
-│  to create│ Base directories:                                    │           │
+│           │   Repos  |  Keybindings                              │           │
+│  Ctrl+N: q│ Config source:                                       │           │
+│  Ctrl+B: b│   in-memory (test)                                   │           │
+│           │ Base directories:                                    │           │
 │           │   + /tmp/workbridge-test-settings-overlay            │           │
 │           │                                                      │           │
 │           │ ┌ Managed repos (2) ─────┐┌ Available (1) ─────────┐ │           │
@@ -19,8 +20,7 @@ expression: output
 │           │ Defaults:                                            │           │
 │           │   worktree_dir: .worktrees                           │           │
 │           │   branch_issue_pattern: ^(\d+)-                      │           │
-│           │ Tab: switch list, Enter: move, Up/Down: navigate     │           │
-│           │                                                      │           │
+│           │ Tab: switch tab   Left/Right: switch column   Enter: │           │
 │           │                                                      │           │
 │           └──────────────────────────────────────────────────────┘           │
 │                       ││                                                     │

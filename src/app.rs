@@ -44,6 +44,12 @@ pub struct BoardCursor {
 }
 
 /// The four visible columns in the board view (Done is hidden).
+/// Sentinel title used when a quick-start work item is created before the
+/// user has specified what they want to work on. The planning_quickstart
+/// system prompt instructs Claude to call workbridge_set_title once the
+/// user explains the task, replacing this placeholder.
+pub const QUICKSTART_TITLE: &str = "Quick start";
+
 pub const BOARD_COLUMNS: &[WorkItemStatus] = &[
     WorkItemStatus::Backlog,
     WorkItemStatus::Planning,
@@ -51,7 +57,14 @@ pub const BOARD_COLUMNS: &[WorkItemStatus] = &[
     WorkItemStatus::Review,
 ];
 
-/// Which list has focus inside the settings overlay.
+/// Which top-level tab is active inside the settings overlay.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    Repos,
+    Keybindings,
+}
+
+/// Which column has focus inside the Repos tab of the settings overlay.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsListFocus {
     Managed,
@@ -349,8 +362,12 @@ pub struct App {
     pub settings_repo_selected: usize,
     /// Cursor position in the available repos list.
     pub settings_available_selected: usize,
-    /// Which list has focus inside the settings overlay.
+    /// Which top-level tab is active in the settings overlay.
+    pub settings_tab: SettingsTab,
+    /// Which column has focus inside the Repos tab.
     pub settings_list_focus: SettingsListFocus,
+    /// Scroll offset for the keybindings tab in the settings overlay.
+    pub settings_keybindings_scroll: u16,
     /// State for the work item creation modal dialog.
     pub create_dialog: CreateDialog,
 
@@ -636,7 +653,9 @@ impl App {
             active_repo_cache,
             settings_repo_selected: 0,
             settings_available_selected: 0,
+            settings_tab: SettingsTab::Repos,
             settings_list_focus: SettingsListFocus::Managed,
+            settings_keybindings_scroll: 0,
             create_dialog: CreateDialog::new(),
             backend,
             worktree_service,
@@ -2823,6 +2842,8 @@ impl App {
             WorkItemStatus::Planning => {
                 if has_branch_commits {
                     "planning_retroactive"
+                } else if title == QUICKSTART_TITLE {
+                    "planning_quickstart"
                 } else {
                     "planning"
                 }
@@ -3236,6 +3257,47 @@ impl App {
                         }
                     }
                 }
+                McpEvent::SetTitle {
+                    work_item_id: wi_id_str,
+                    title,
+                } => {
+                    let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            continue;
+                        }
+                    };
+                    if let Err(e) = self.backend.update_title(&wi_id, &title) {
+                        self.status_message = Some(format!("Title update error: {e}"));
+                    } else {
+                        self.reassemble_work_items();
+                        self.build_display_list();
+                    }
+                }
+                McpEvent::SetDescription {
+                    work_item_id: wi_id_str,
+                    description,
+                } => {
+                    let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            continue;
+                        }
+                    };
+                    let desc = if description.is_empty() {
+                        None
+                    } else {
+                        Some(description.as_str())
+                    };
+                    if let Err(e) = self.backend.update_description(&wi_id, desc) {
+                        self.status_message = Some(format!("Description update error: {e}"));
+                    } else {
+                        self.reassemble_work_items();
+                        self.build_display_list();
+                    }
+                }
                 McpEvent::SetActivity {
                     work_item_id: wi_id_str,
                     working,
@@ -3541,6 +3603,84 @@ impl App {
                 self.status_message = Some(msg.clone());
                 Err(msg)
             }
+        }
+    }
+
+    /// Create a quick-start work item in Planning status and immediately spawn
+    /// a Claude session without asking the user anything. The Claude agent
+    /// will ask the user what they want to work on and set title/description
+    /// via MCP tools.
+    ///
+    /// Returns `Err("MULTIPLE_REPOS")` when the repo cannot be determined
+    /// automatically and the caller should fall back to the create dialog.
+    pub fn create_quickstart_work_item(&mut self) -> Result<(), String> {
+        let repo = self.resolve_quickstart_repo()?;
+
+        let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+        let suffix = crate::create_dialog::random_suffix();
+        let branch = format!("{username}/quickstart-{suffix}");
+
+        let request = CreateWorkItem {
+            title: QUICKSTART_TITLE.to_string(),
+            description: None,
+            status: WorkItemStatus::Planning,
+            kind: WorkItemKind::Own,
+            repo_associations: vec![RepoAssociationRecord {
+                repo_path: repo,
+                branch: Some(branch),
+                pr_identity: None,
+            }],
+        };
+
+        match self.backend.create(request) {
+            Ok(record) => {
+                let wi_id = record.id.clone();
+                self.reassemble_work_items();
+                self.fetcher_repos_changed = true;
+                // Set identity so build_display_list restores selection.
+                self.selected_work_item = Some(wi_id.clone());
+                self.build_display_list();
+                self.spawn_session(&wi_id);
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("Create error: {e}");
+                self.status_message = Some(msg.clone());
+                Err(msg)
+            }
+        }
+    }
+
+    /// Determine the repo to use for a quick-start work item.
+    ///
+    /// Strategy:
+    /// 1. CWD resolved to a managed repo root - use it.
+    /// 2. Exactly one managed repo with a git directory - use it.
+    /// 3. Multiple repos and CWD doesn't resolve - return "MULTIPLE_REPOS".
+    /// 4. No repos at all - return an error message.
+    fn resolve_quickstart_repo(&self) -> Result<PathBuf, String> {
+        if let Some(repo) = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| self.managed_repo_root(&cwd))
+            && self
+                .active_repo_cache
+                .iter()
+                .any(|r| r.path == repo && r.git_dir_present)
+        {
+            return Ok(repo);
+        }
+
+        let git_repos: Vec<&PathBuf> = self
+            .active_repo_cache
+            .iter()
+            .filter(|r| r.git_dir_present)
+            .map(|r| &r.path)
+            .collect();
+
+        match git_repos.len() {
+            0 => Err("No managed repos available. Add one in Settings (?)".to_string()),
+            1 => Ok(git_repos[0].clone()),
+            _ => Err("MULTIPLE_REPOS".to_string()),
         }
     }
 
@@ -6142,6 +6282,18 @@ impl WorkItemBackend for StubBackend {
     }
 
     fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn update_title(&self, _id: &WorkItemId, _title: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn update_description(
+        &self,
+        _id: &WorkItemId,
+        _description: Option<&str>,
+    ) -> Result<(), BackendError> {
         Ok(())
     }
 

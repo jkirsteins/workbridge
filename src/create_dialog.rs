@@ -548,7 +548,7 @@ fn truncate_slug(slug: &str, max_len: usize) -> String {
 }
 
 /// Generate a 4-character hex suffix for branch name uniqueness.
-fn random_suffix() -> String {
+pub(crate) fn random_suffix() -> String {
     let bytes = uuid::Uuid::new_v4();
     let b = bytes.as_bytes();
     format!("{:02x}{:02x}", b[0], b[1])

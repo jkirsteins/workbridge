@@ -7,8 +7,8 @@ expression: "render(&app, 80, 24)"
 │               │                                              │               │
 │  No work items│ Title:                                       │               │
 │               │  My feature                                  │               │
-│  Press Ctrl+N │                                              │               │
-│  to create one│ Description (optional):                      │               │
+│  Ctrl+N: quick│                                              │               │
+│  Ctrl+B: backl│ Description (optional):                      │               │
 │               │  (empty)                                     │               │
 │               │                                              │               │
 │               │                                              │               │

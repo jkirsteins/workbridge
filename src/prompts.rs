@@ -86,6 +86,23 @@ mod tests {
     }
 
     #[test]
+    fn render_planning_quickstart_prompt() {
+        let mut vars = HashMap::new();
+        vars.insert(
+            "situation",
+            "Worktree: /tmp/wt. Branch: user/quickstart-ab12. No plan exists yet.",
+        );
+        let result = render("planning_quickstart", &vars).unwrap();
+        assert!(result.contains("workbridge_set_title"));
+        assert!(result.contains("workbridge_set_description"));
+        assert!(result.contains("workbridge_set_plan"));
+        assert!(result.contains("PHASE 0"));
+        assert!(result.contains("PHASE 1: REFINEMENT"));
+        assert!(result.contains("PHASE 2: PLANNING"));
+        assert!(result.contains("Acceptance Criteria"));
+    }
+
+    #[test]
     fn render_implementing_with_plan() {
         let mut vars = HashMap::new();
         vars.insert("title", "Add feature");
@@ -118,6 +135,7 @@ mod tests {
     fn all_prompt_keys_valid() {
         let prompts: HashMap<String, PromptEntry> = serde_json::from_str(PROMPTS_JSON).unwrap();
         assert!(prompts.contains_key("planning"));
+        assert!(prompts.contains_key("planning_quickstart"));
         assert!(prompts.contains_key("implementing_with_plan"));
         assert!(prompts.contains_key("implementing_no_plan"));
         assert!(prompts.contains_key("implementing_rework"));
@@ -163,6 +181,13 @@ mod tests {
     fn render_no_unsubstituted_markers() {
         // Verify that when all known variables are provided, no {key} markers remain.
         let cases = vec![
+            (
+                "planning_quickstart",
+                vec![(
+                    "situation",
+                    "Worktree: /tmp/wt. Branch: user/quickstart-ab12.",
+                )],
+            ),
             (
                 "planning",
                 vec![("title", "Test"), ("situation", "Sit"), ("description", "")],
