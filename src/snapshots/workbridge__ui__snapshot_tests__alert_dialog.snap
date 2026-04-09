@@ -1,0 +1,28 @@
+---
+source: src/ui.rs
+expression: "render(&app, 80, 24)"
+---
+  List    Board                                                Tab: switch view
+┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
+│                       ││                                                     │
+│  No work items.       ││  Welcome to workbridge                              │
+│                       ││                                                     │
+│  Press Ctrl+N         ││  Ctrl+N    - Create work item                       │
+│  to create one.       ││  Up/Down   - Navigate items                         │
+│                       ││  Enter     - Open session / Import                  │
+│                   ╭ Error ───────────────────────────────╮                   │
+│                   │                                      │                   │
+│                   │ PR close failed: permission denied   │                   │
+│                   │                                      │                   │
+│                   │ [Enter/Esc]  OK                      │                   │
+│                   │                                      │                   │
+│                   │                                      │                   │
+│                   ╰──────────────────────────────────────╯                   │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+└───────────────────────┘└─────────────────────────────────────────────────────┘

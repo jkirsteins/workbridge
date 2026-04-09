@@ -1,0 +1,29 @@
+---
+source: src/ui.rs
+assertion_line: 3523
+expression: "render(&app, 80, 24)"
+---
+  List    Board                                                Tab: switch view
+┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
+│                       ││                                                     │
+│  No work items.       ││  Welcome to workbridge                              │
+│                       ││                                                     │
+│  Press Ctrl+N         ││  Ctrl+N    - Create work item                       │
+│  to create one.       ││  Up/Down   - Navigate items                         │
+│                   ╭ Rework Reason ───────────────────────╮t                  │
+│                   │                                      │                   │
+│                   │ Why is rework needed?                │                   │
+│                   │                                      │                   │
+│                   │  needs more error handling           │                   │
+│                   │                                      │                   │
+│                   │ Enter: Submit   Esc: Cancel          │                   │
+│                   │                                      │                   │
+│                   ╰──────────────────────────────────────╯                   │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+└───────────────────────┘└─────────────────────────────────────────────────────┘

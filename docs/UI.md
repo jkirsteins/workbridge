@@ -139,6 +139,17 @@ shows a segmented tab bar (using the ratatui `Tabs` widget) with
 keybinding hints appear right-aligned in the header (e.g., board mode
 shows arrow key and Shift+arrow controls).
 
+## Global Shortcuts
+
+These shortcuts are intercepted in `handle_key()` after dialog/overlay
+checks but before panel-specific handlers. They work in both flat list
+and board views but not inside open dialogs or overlays.
+
+- Ctrl+R: force refresh GitHub data. Restarts the background fetcher,
+  triggering an immediate fetch cycle. The status bar shows the
+  "Refreshing GitHub data" spinner during the fetch, using the same
+  code path as the periodic 120-second auto-refresh.
+
 ## Focus Model
 
 ### Top-Level: Left/Right Panel (Flat List Mode)
@@ -172,12 +183,19 @@ into its new column.
 
 ### Within Dialogs
 
-Dialogs (creation modal, settings overlay) have their own focus
-management. The creation dialog cycles through fields with Tab/Shift+Tab.
-When a dialog is visible, it intercepts all key events before the
-left/right panel handlers.
+Dialogs and prompt overlays intercept all key events before the
+left/right panel handlers. The creation dialog cycles through fields
+with Tab/Shift+Tab. Prompt dialogs have simpler focus (one active
+element at a time).
 
-## Adding a New Dialog
+## Adding a New Overlay
+
+There are two overlay patterns depending on complexity.
+
+### Full Dialog (complex forms, multi-field input)
+
+Use for dialogs with multiple fields, validation, or complex focus.
+See `src/create_dialog.rs` as the reference implementation.
 
 1. Create a dialog struct in `src/<dialog_name>.rs` with:
    - `visible: bool`
@@ -187,24 +205,81 @@ left/right panel handlers.
 
 2. Add the dialog field to `App` in `src/app.rs`
 
-3. In `src/event.rs`, add an intercept block at the top of `handle_key`:
+3. In `src/event.rs`, add an intercept block near the top of `handle_key`:
    ```rust
    if app.<dialog>.visible {
        handle_<dialog>_key(app, key);
-       return;
+       return true;
    }
    ```
 
-4. In `src/ui.rs`, add rendering after the main layout:
+4. In `src/ui.rs`, add rendering at the end of `draw_to_buffer()` (after
+   prompt dialogs, before or after global drawer as appropriate):
    ```rust
-   if state.<dialog>.visible {
-       draw_<dialog>(area, buf, state, theme);
+   if app.<dialog>.visible {
+       draw_<dialog>(buf, &app.<dialog>, theme, area);
    }
    ```
 
 5. Wire the trigger key in `handle_key_left`
 
-See `src/create_dialog.rs` as the reference implementation.
+### Prompt Dialog (simple choice or single text input)
+
+Use for blocking prompts that require a choice or a single text field.
+These are rendered via the shared `draw_prompt_dialog()` function with
+`PromptDialogKind` - no separate struct or file needed.
+
+State fields live directly on `App`:
+
+```rust
+pub my_prompt_visible: bool,
+pub my_prompt_input: SimpleTextInput,    // if text input needed
+pub my_prompt_target: Option<MyTarget>,  // relevant context
+```
+
+Key handler function in `event.rs`:
+
+```rust
+fn handle_my_prompt(app: &mut App, key: KeyEvent) {
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Esc) | _ => { /* cancel */ }
+        (_, KeyCode::Char('y')) => { /* confirm */ }
+    }
+}
+```
+
+Intercept in `handle_key()`:
+
+```rust
+if app.my_prompt_visible {
+    handle_my_prompt(app, key);
+    return true;
+}
+```
+
+Rendering in `draw_to_buffer()` (in the prompt dialog block):
+
+```rust
+} else if app.my_prompt_visible {
+    draw_prompt_dialog(buf, theme, area, PromptDialogKind::KeyChoice {
+        title: "My Prompt",
+        body: "Are you sure?",
+        options: &[("[y]", "Yes"), ("[Esc]", "Cancel")],
+    });
+}
+```
+
+Do NOT set `app.status_message` to show prompt content - the dialog
+renders its own content.
+
+For errors that require acknowledgment from async operations or other
+flows, use `app.alert_message` (a general-purpose facility):
+
+```rust
+// On error:
+app.alert_message = Some(format!("Operation failed: {e}"));
+// The alert dialog dismisses itself when the user presses Enter or Esc.
+```
 
 ## Rendering
 
@@ -282,14 +357,55 @@ PTY panel on the right. Ctrl+] returns to the full board view.
 
 ### Overlays
 
-Overlays (settings, creation dialog) render on top using:
-1. `Clear` widget to blank the popup area
-2. `Block` with border and title
-3. Content widgets inside the block's inner area
-4. 1-cell padding inside the border
+All overlays must call `dim_background(buf, area)` before rendering
+their own content. This applies `Modifier::DIM` and forces foreground
+to `Color::DarkGray` across every cell, ensuring the overlay is the
+clear focal point regardless of existing colors or borders.
 
-When an overlay is visible, background panel borders use unfocused style
-to create visual hierarchy.
+Overlay rendering pattern:
+1. `dim_background(buf, area)` - dim the entire screen
+2. `Clear` widget to blank the popup area (restores default cell style)
+3. `Block` with border, title, and appropriate `BorderType`
+4. Content widgets inside the block's inner area
+5. 1-cell padding inside the border
+
+### Overlay visual conventions
+
+Two distinct visual identities separate overlay types:
+
+| Overlay type | Border type | Border color | Use for |
+|---|---|---|---|
+| **Prompt dialog** | `Rounded` | Cyan | Blocking choice/input prompts |
+| **Alert dialog** | `Rounded` | Red | Error messages (dismissed with Enter/Esc) |
+| **Full dialog** | `Plain` | Cyan | Complex forms (create, settings) |
+| **Drawer** | `Plain` | Cyan | Global assistant panel |
+
+`Rounded` borders are the visual signal for "attention required." Cyan
+`Rounded` = choice prompt; Red `Rounded` = error/alert. Never use `Rounded`
+for non-blocking overlays.
+
+For error messages that require acknowledgment, set `app.alert_message =
+Some(msg)` instead of `status_message`. This surfaces a red-bordered alert
+dialog that blocks interaction until dismissed with Enter or Esc.
+
+### Overlay z-order (back to front)
+
+1. Main UI (panels, context bar, status bar)
+2. Settings overlay
+3. Prompt dialogs (merge, rework, no-plan, cleanup)
+4. Alert dialog (renders above all other prompts)
+5. Global assistant drawer
+6. Create dialog
+
+### What NOT to do
+
+- Do not set `app.status_message` to show prompt content. Prompt dialogs
+  render their own content; the status bar is for transient notifications.
+- Do not set `app.status_message` for error messages that need acknowledgment.
+  Use `app.alert_message` instead so a red alert dialog appears.
+- Same-key-repeat confirmations (delete, quit) stay in the status bar -
+  they are not blocking choice prompts and do not need dialog boxes.
+- Do not skip `dim_background()` in new overlays.
 
 ## Theme
 

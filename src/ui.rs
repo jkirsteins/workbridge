@@ -7,10 +7,10 @@ use ratatui_core::{
 };
 use ratatui_widgets::{
     block::Block,
-    borders::Borders,
+    borders::{BorderType, Borders},
     clear::Clear,
     list::{List, ListItem, ListState},
-    paragraph::Paragraph,
+    paragraph::{Paragraph, Wrap},
     scrollbar::{Scrollbar, ScrollbarOrientation, ScrollbarState},
     tabs::Tabs,
 };
@@ -131,6 +131,110 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
     // Settings overlay (rendered on top of everything).
     if app.show_settings {
         draw_settings_overlay(buf, app, theme, area);
+    }
+
+    // Prompt dialogs: blocking choice/input prompts rendered as centered modal
+    // dialogs with dimmed backgrounds. Order matches the handle_key() intercept
+    // chain (cleanup_reason_input_active before cleanup_prompt_visible).
+    if app.confirm_merge {
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::KeyChoice {
+                title: "Merge Strategy",
+                body: "Merge PR?",
+                options: &[
+                    ("[s]", "Squash (default)"),
+                    ("[m]", "Merge"),
+                    ("[p]", "Poll (mergequeue)"),
+                    ("[Esc]", "Cancel"),
+                ],
+            },
+        );
+    } else if app.rework_prompt_visible {
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::TextInput {
+                title: "Rework Reason",
+                body: "Why is rework needed?",
+                input: &app.rework_prompt_input,
+                hint: "Enter: Submit   Esc: Cancel",
+            },
+        );
+    } else if app.cleanup_reason_input_active {
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::TextInput {
+                title: "Close Reason",
+                body: "Reason to comment on the PR (optional):",
+                input: &app.cleanup_reason_input,
+                hint: "Enter: Submit   Esc: Cancel",
+            },
+        );
+    } else if app.cleanup_prompt_visible {
+        if app.cleanup_in_progress {
+            let pr_num = app.cleanup_progress_pr_number.unwrap_or(0);
+            let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+            draw_prompt_dialog(
+                buf,
+                theme,
+                area,
+                PromptDialogKind::KeyChoice {
+                    title: "Close Unlinked PR",
+                    body: &format!("{spinner} Closing PR #{pr_num}... Please wait."),
+                    options: &[],
+                },
+            );
+        } else {
+            let pr_num = app
+                .cleanup_unlinked_target
+                .as_ref()
+                .map(|t| t.2)
+                .unwrap_or(0);
+            draw_prompt_dialog(
+                buf,
+                theme,
+                area,
+                PromptDialogKind::KeyChoice {
+                    title: "Close Unlinked PR",
+                    body: &format!("Close PR #{pr_num} and delete branch?"),
+                    options: &[
+                        ("[Enter]", "Close with reason"),
+                        ("[d]", "Close directly"),
+                        ("[Esc]", "Cancel"),
+                    ],
+                },
+            );
+        }
+    } else if app.no_plan_prompt_visible {
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::KeyChoice {
+                title: "No Plan Available",
+                body: "No implementation plan found.",
+                options: &[("[p]", "Plan from branch"), ("[Esc]", "Stay blocked")],
+            },
+        );
+    }
+
+    // Alert dialog (renders above prompt dialogs, below global drawer and create dialog).
+    if let Some(ref msg) = app.alert_message {
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::Alert {
+                title: "Error",
+                body: msg,
+            },
+        );
     }
 
     // Global assistant drawer (rendered on top, below create dialog).
@@ -1364,7 +1468,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                         pr: &unlinked.pr,
                         repo_path: &unlinked.repo_path,
                         branch: &unlinked.branch,
-                        hint: "Press Enter to import this PR as a work item.",
+                        hint: "Press Enter to import this PR as a work item.  Ctrl+D to close PR and delete branch.",
                     },
                     theme,
                     block,
@@ -1438,18 +1542,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
 /// dimmed to give visual depth.
 fn draw_global_drawer(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // 1. Dim every cell in the buffer to push the background behind the drawer.
-    //    DIM modifier alone is insufficient because borders and colored
-    //    elements don't respond well to it. Override foreground to dark gray
-    //    for consistent visual separation regardless of existing styling.
-    let dim_fg = ratatui_core::style::Color::DarkGray;
-    for y in area.y..area.y + area.height {
-        for x in area.x..area.x + area.width {
-            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
-                let style = cell.style().add_modifier(Modifier::DIM).fg(dim_fg);
-                cell.set_style(style);
-            }
-        }
-    }
+    dim_background(buf, area);
 
     // 2. Compute drawer rect via shared helper (overflow-safe).
     let dl = crate::layout::compute_drawer(area.width, area.height);
@@ -1559,6 +1652,9 @@ const REPOS_LIST_MAX_ROWS: u16 = 6;
 ///   - Defaults (2 lines)
 ///   - Hint line
 fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+    // Dim the background so the overlay is the clear focal point.
+    dim_background(buf, area);
+
     let popup = centered_rect(70, 80, area);
     Clear.render(popup, buf);
 
@@ -1777,6 +1873,9 @@ fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect)
 pub const DESC_TEXTAREA_HEIGHT: u16 = 3;
 
 fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, area: Rect) {
+    // Dim the background so the dialog is the clear focal point.
+    dim_background(buf, area);
+
     // Compute dialog height based on content.
     // Rows: border(1) + blank(1) + "Title:" label(1) + input(1) + blank(1)
     //   + "Description:" label(1) + textarea(3) + blank(1)
@@ -2091,6 +2190,223 @@ fn centered_rect_fixed(width: u16, height: u16, outer: Rect) -> Rect {
     let x = outer.x + (outer.width.saturating_sub(w)) / 2;
     let y = outer.y + (outer.height.saturating_sub(h)) / 2;
     Rect::new(x, y, w, h)
+}
+
+/// Dim every cell in the buffer area to visually push content behind an overlay.
+///
+/// Applies `Modifier::DIM` and overrides foreground to `Color::DarkGray`. The
+/// dual approach is necessary because DIM alone does not reliably dim borders
+/// and colored elements on all terminals.
+fn dim_background(buf: &mut Buffer, area: Rect) {
+    let dim_fg = ratatui_core::style::Color::DarkGray;
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                let style = cell.style().add_modifier(Modifier::DIM).fg(dim_fg);
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
+/// Content variants for prompt dialogs.
+///
+/// `KeyChoice` presents a question with labelled key options.
+/// `TextInput` presents a text field with a hint line.
+enum PromptDialogKind<'a> {
+    KeyChoice {
+        title: &'a str,
+        body: &'a str,
+        options: &'a [(&'a str, &'a str)],
+    },
+    TextInput {
+        title: &'a str,
+        body: &'a str,
+        input: &'a crate::create_dialog::SimpleTextInput,
+        hint: &'a str,
+    },
+    /// Red-bordered alert for errors/warnings. Dismissed with Enter or Esc.
+    Alert { title: &'a str, body: &'a str },
+}
+
+/// Draw a modal prompt dialog centered on screen with a dimmed background.
+///
+/// Prompt dialogs use `BorderType::Rounded` to be visually distinct from
+/// other overlays (settings, create dialog) which use plain borders.
+fn draw_prompt_dialog(buf: &mut Buffer, theme: &Theme, area: Rect, kind: PromptDialogKind<'_>) {
+    // 1. Dim the entire background so the dialog is the clear focal point.
+    dim_background(buf, area);
+
+    // 2. Compute dialog dimensions.
+    let (title, body, inner_height) = match &kind {
+        PromptDialogKind::KeyChoice {
+            title,
+            body,
+            options,
+        } => {
+            // body(1) + blank(1) + options(N) + blank(1)
+            let h = 1u16 + 1 + options.len() as u16 + 1;
+            (*title, *body, h)
+        }
+        PromptDialogKind::TextInput {
+            title, body, hint, ..
+        } => {
+            // body(1) + blank(1) + input(1) + blank(1) + hint(1)
+            let _ = hint;
+            let h = 1u16 + 1 + 1 + 1 + 1;
+            (*title, *body, h)
+        }
+        PromptDialogKind::Alert { title, body } => {
+            // Height is computed after dialog_width is known (body may wrap).
+            // Use 0 as placeholder; overridden below for Alert.
+            (*title, *body, 0u16)
+        }
+    };
+
+    // Minimum width: longest line + 2 (padding) + 2 (border).
+    // Clamp between 40 and 60, further clamped to terminal width.
+    let min_content_width = body.len().max(title.len() + 4) as u16;
+    let dialog_width = (min_content_width + 4).clamp(40, 60).min(area.width);
+
+    // For Alert dialogs, compute body line count based on actual word-wrapping.
+    let inner_height = if matches!(kind, PromptDialogKind::Alert { .. }) {
+        // Usable content width: dialog - 2 (border) - 2 (padding).
+        let content_width = dialog_width.saturating_sub(4).max(1) as usize;
+        let body_lines = if body.is_empty() {
+            1u16
+        } else {
+            // Use word-wrap simulation to get accurate line count.
+            // wrap_text_flat breaks at word boundaries like ratatui's Wrap.
+            (wrap_text_flat(body, content_width).len() as u16).max(1)
+        };
+        // body(N) + blank(1) + hint(1) + blank(1)
+        body_lines + 1 + 1 + 1
+    } else {
+        inner_height
+    };
+    // Height: border(2) + blank(1) + inner_height + blank(1) = inner_height + 4.
+    let dialog_height = (inner_height + 4).min(area.height);
+
+    // 3. Center and clear the popup area.
+    let popup = centered_rect_fixed(dialog_width, dialog_height, area);
+    Clear.render(popup, buf);
+
+    // 4. Draw rounded-border block. Alert dialogs use a red border;
+    //    all other prompt dialogs use the standard cyan overlay border.
+    let border_style = match &kind {
+        PromptDialogKind::Alert { .. } => theme.style_border_alert(),
+        _ => theme.style_border_overlay(),
+    };
+    let block = Block::default()
+        .title(format!(" {title} "))
+        .title_style(theme.style_title())
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style);
+    let block_inner = block.inner(popup);
+    block.render(popup, buf);
+
+    // 5. 1-cell padding inside the border.
+    let inner = Rect {
+        x: block_inner.x + 1,
+        y: block_inner.y + 1,
+        width: block_inner.width.saturating_sub(2),
+        height: block_inner.height.saturating_sub(2),
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // 6. Render content rows using a vertical layout.
+    match kind {
+        PromptDialogKind::KeyChoice { body, options, .. } => {
+            // Rows: body, blank, option*N, blank.
+            let mut constraints = vec![
+                Constraint::Length(1), // body
+                Constraint::Length(1), // blank
+            ];
+            for _ in options {
+                constraints.push(Constraint::Length(1));
+            }
+            constraints.push(Constraint::Min(0)); // remaining space
+
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(constraints)
+                .split(inner);
+
+            Paragraph::new(body)
+                .style(theme.style_text())
+                .render(rows[0], buf);
+            // rows[1] is blank.
+            for (i, (key_label, description)) in options.iter().enumerate() {
+                let line = Line::from(vec![
+                    Span::styled(*key_label, theme.style_heading()),
+                    Span::raw("  "),
+                    Span::styled(*description, theme.style_text()),
+                ]);
+                Paragraph::new(line).render(rows[2 + i], buf);
+            }
+        }
+        PromptDialogKind::TextInput {
+            body, input, hint, ..
+        } => {
+            // Rows: body, blank, input, blank, hint.
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1), // body
+                    Constraint::Length(1), // blank
+                    Constraint::Length(1), // input field
+                    Constraint::Length(1), // blank
+                    Constraint::Length(1), // hint
+                    Constraint::Min(0),    // remaining
+                ])
+                .split(inner);
+
+            Paragraph::new(body)
+                .style(theme.style_text())
+                .render(rows[0], buf);
+            // rows[1] is blank.
+            draw_text_input_field(buf, input, theme, rows[2], true);
+            // rows[3] is blank.
+            Paragraph::new(hint)
+                .style(theme.style_text_muted())
+                .render(rows[4], buf);
+        }
+        PromptDialogKind::Alert { body, .. } => {
+            // Compute wrapped body line count for layout.
+            let content_w = inner.width.max(1) as usize;
+            let body_lines = if body.is_empty() {
+                1u16
+            } else {
+                // Use word-wrap simulation for accurate line count.
+                (wrap_text_flat(body, content_w).len() as u16).max(1)
+            };
+            // Rows: body (may wrap to multiple lines), blank, hint.
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(body_lines), // body
+                    Constraint::Length(1),          // blank
+                    Constraint::Length(1),          // hint
+                    Constraint::Min(0),             // remaining
+                ])
+                .split(inner);
+
+            Paragraph::new(body)
+                .style(theme.style_error())
+                .wrap(Wrap { trim: false })
+                .render(rows[0], buf);
+            // rows[1] is blank.
+            let hint_line = Line::from(vec![
+                Span::styled("[Enter/Esc]", theme.style_heading()),
+                Span::raw("  "),
+                Span::styled("OK", theme.style_text()),
+            ]);
+            Paragraph::new(hint_line).render(rows[2], buf);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3290,5 +3606,71 @@ mod snapshot_tests {
         app.sync_board_cursor();
         // At 120x40, each column is 30 wide (28 inner). No title should clip.
         insta::assert_snapshot!(render(&app, 120, 40));
+    }
+
+    // -- Prompt dialog snapshot tests --
+
+    #[test]
+    fn merge_prompt_dialog() {
+        let mut app = App::new();
+        app.confirm_merge = true;
+        app.merge_wi_id = Some(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn rework_prompt_dialog() {
+        let mut app = App::new();
+        app.rework_prompt_visible = true;
+        app.rework_prompt_wi = Some(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
+        app.rework_prompt_input
+            .set_text("needs more error handling");
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn no_plan_prompt_dialog() {
+        let mut app = App::new();
+        app.no_plan_prompt_visible = true;
+        app.no_plan_prompt_queue
+            .push_back(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn cleanup_confirm_dialog() {
+        let mut app = App::new();
+        app.cleanup_prompt_visible = true;
+        app.cleanup_unlinked_target =
+            Some((PathBuf::from("/tmp/repo"), "feature-branch".to_string(), 42));
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn cleanup_reason_dialog() {
+        let mut app = App::new();
+        app.cleanup_prompt_visible = true;
+        app.cleanup_reason_input_active = true;
+        app.cleanup_unlinked_target =
+            Some((PathBuf::from("/tmp/repo"), "feature-branch".to_string(), 42));
+        app.cleanup_reason_input.set_text("closing - abandoned");
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn cleanup_progress_dialog() {
+        let mut app = App::new();
+        app.cleanup_prompt_visible = true;
+        app.cleanup_in_progress = true;
+        app.cleanup_progress_pr_number = Some(42);
+        app.spinner_tick = 3; // deterministic spinner frame
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn alert_dialog() {
+        let mut app = App::new();
+        app.alert_message = Some("PR close failed: permission denied".to_string());
+        insta::assert_snapshot!(render(&app, 80, 24));
     }
 }

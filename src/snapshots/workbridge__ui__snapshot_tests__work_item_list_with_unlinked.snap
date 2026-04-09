@@ -15,7 +15,7 @@ expression: "render(&app, 80, 24)"
 │                       ││  Review      (none)                                 │
 │                       ││  Checks      (none)                                 │
 │                       ││                                                     │
-│                       ││  Press Enter to import this PR as a work item.      │
+│                       ││  Press Enter to import this PR as a work item.  Ctrl│
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

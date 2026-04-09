@@ -100,6 +100,27 @@ A 3-step confirmation flow protects against accidental deletion:
 
 All cleanup failures are non-blocking - warnings are shown but the delete proceeds.
 
+### Cleanup ordering and main worktree handling
+
+Worktree removal and branch deletion must happen in the correct order:
+
+1. **Remove worktree first** (`git worktree remove`), then delete branch
+   (`git branch -D`). Reversing this order causes "branch used by
+   worktree" errors.
+
+2. **Main worktree detection**: `WorktreeInfo.is_main` indicates whether
+   a worktree is the repo's primary checkout. When the branch to be
+   deleted is checked out in the main worktree, both worktree removal
+   and branch deletion are skipped - git forbids deleting the currently
+   checked-out branch, and the main worktree cannot be removed via
+   `git worktree remove`.
+
+3. **Fresh worktree state**: `spawn_unlinked_cleanup()` calls
+   `list_worktrees()` directly in the background thread rather than
+   using the cached `repo_data` worktree list. This avoids acting on
+   stale data when the user has switched branches since the last fetch
+   cycle.
+
 ### Post-merge cleanup
 
 After a PR is merged (Review -> Done transition), WorkBridge cleans up:

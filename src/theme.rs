@@ -17,6 +17,8 @@ pub struct Theme {
     pub border_default: Color,
     /// Settings overlay border.
     pub border_overlay: Color,
+    /// Alert/error dialog border.
+    pub border_alert: Color,
     /// Subtle borders (e.g., inner list in settings).
     pub border_subtle: Color,
 
@@ -127,6 +129,7 @@ impl Theme {
             border_input: Color::Green,
             border_default: Color::Reset,
             border_overlay: Color::Cyan,
+            border_alert: Color::Red,
             border_subtle: Color::Reset,
 
             scrollbar_thumb: Color::Gray,
@@ -200,6 +203,10 @@ impl Theme {
 
     pub fn style_border_overlay(&self) -> Style {
         Style::default().fg(self.border_overlay)
+    }
+
+    pub fn style_border_alert(&self) -> Style {
+        Style::default().fg(self.border_alert)
     }
 
     pub fn style_border_subtle(&self) -> Style {

@@ -348,6 +348,12 @@ pub fn app_event(
 
                 // Drain fetch results and reassemble if new data arrived.
                 if state.drain_fetch_results() {
+                    // Re-apply evictions so stale in-flight fetches don't
+                    // resurrect recently-closed PRs in the unlinked list.
+                    if !state.cleanup_evicted_branches.is_empty() {
+                        state.apply_cleanup_evictions();
+                        state.cleanup_evicted_branches.clear();
+                    }
                     state.reassemble_work_items();
                     state.build_display_list();
                     state.global_mcp_context_dirty = true;
@@ -391,6 +397,9 @@ pub fn app_event(
 
                 // Poll async worktree creation result.
                 state.poll_worktree_creation();
+
+                // Poll async unlinked-item cleanup result.
+                state.poll_unlinked_cleanup();
 
                 // Surface queued fetch errors.
                 state.drain_pending_fetch_errors();

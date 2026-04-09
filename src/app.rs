@@ -240,6 +240,12 @@ pub struct PrIdentityBackfillResult {
     pub identity: PrIdentityRecord,
 }
 
+/// Result from the asynchronous unlinked-item cleanup thread.
+pub struct CleanupResult {
+    /// Best-effort warnings (non-fatal failures during PR close / branch delete).
+    pub warnings: Vec<String>,
+}
+
 /// Result from the asynchronous worktree creation thread.
 pub struct WorktreeCreateResult {
     /// The work item the worktree was created for.
@@ -282,6 +288,36 @@ pub struct App {
     /// approves, consumed one-shot by `stage_system_prompt` to select the
     /// "review_with_findings" prompt template and inject the assessment.
     pub review_gate_findings: HashMap<WorkItemId, String>,
+    /// True when the unlinked-item cleanup confirmation prompt is visible.
+    pub cleanup_prompt_visible: bool,
+    /// True when the cleanup reason text input is active (user pressed Enter
+    /// from the confirmation prompt to type an optional close reason).
+    pub cleanup_reason_input_active: bool,
+    /// Text input for the optional close reason.
+    pub cleanup_reason_input: crate::create_dialog::SimpleTextInput,
+    /// Identity of the unlinked PR being cleaned up: (repo_path, branch, pr_number).
+    /// Stored by identity rather than index so it survives reassembly.
+    pub cleanup_unlinked_target: Option<(PathBuf, String, u64)>,
+    /// Receiver for the async unlinked-item cleanup thread result.
+    pub cleanup_rx: Option<crossbeam_channel::Receiver<CleanupResult>>,
+    /// Activity ID for the running cleanup indicator.
+    pub cleanup_activity: Option<ActivityId>,
+    /// True while the cleanup background thread is running.
+    /// The dialog stays open with a spinner in this state.
+    pub cleanup_in_progress: bool,
+    /// PR number shown in the in-progress dialog body.
+    pub cleanup_progress_pr_number: Option<u64>,
+    /// Repo path of the in-progress cleanup target (for cache eviction on completion).
+    pub cleanup_progress_repo_path: Option<PathBuf>,
+    /// Branch name of the in-progress cleanup target (for cache eviction on completion).
+    pub cleanup_progress_branch: Option<String>,
+    /// Branches whose PRs were recently closed via cleanup. Used to suppress
+    /// stale fetch results from re-adding the PR as unlinked. Applied and
+    /// cleared when a fresh fetch arrives (drain_fetch_results returns true).
+    pub cleanup_evicted_branches: Vec<(PathBuf, String)>,
+    /// General-purpose alert dialog. When Some, a red-bordered modal is shown.
+    /// Dismissed with Enter or Esc.
+    pub alert_message: Option<String>,
     /// True when the no-plan prompt is visible (offered when Claude blocks
     /// because no implementation plan exists).
     pub no_plan_prompt_visible: bool,
@@ -576,6 +612,18 @@ impl App {
             rework_prompt_wi: None,
             rework_reasons: HashMap::new(),
             review_gate_findings: HashMap::new(),
+            cleanup_prompt_visible: false,
+            cleanup_reason_input_active: false,
+            cleanup_reason_input: crate::create_dialog::SimpleTextInput::new(),
+            cleanup_unlinked_target: None,
+            cleanup_rx: None,
+            cleanup_activity: None,
+            cleanup_in_progress: false,
+            cleanup_progress_pr_number: None,
+            cleanup_progress_repo_path: None,
+            cleanup_progress_branch: None,
+            cleanup_evicted_branches: Vec::new(),
+            alert_message: None,
             no_plan_prompt_visible: false,
             no_plan_prompt_queue: VecDeque::new(),
             shutting_down: false,
@@ -1418,6 +1466,7 @@ impl App {
                 repo_path: PathBuf,
                 branch: Option<String>,
                 worktree_path: Option<PathBuf>,
+                branch_in_main_worktree: bool,
                 open_pr_number: Option<u64>,
                 github_remote: Option<(String, String)>,
             }
@@ -1425,15 +1474,21 @@ impl App {
             let cleanup_infos: Vec<CleanupInfo> = repo_associations
                 .iter()
                 .map(|assoc| {
-                    let worktree_path = self
+                    let wt_for_branch = self
                         .repo_data
                         .get(&assoc.repo_path)
                         .and_then(|rd| rd.worktrees.as_ref().ok())
                         .and_then(|wts| {
                             wts.iter()
                                 .find(|wt| wt.branch.as_deref() == assoc.branch.as_deref())
-                                .map(|wt| wt.path.clone())
                         });
+
+                    let worktree_path = wt_for_branch
+                        .filter(|wt| !wt.is_main)
+                        .map(|wt| wt.path.clone());
+
+                    let branch_in_main_worktree =
+                        wt_for_branch.map(|wt| wt.is_main).unwrap_or(false);
 
                     let open_pr_number = assoc.branch.as_deref().and_then(|branch| {
                         self.repo_data.get(&assoc.repo_path).and_then(|rd| {
@@ -1454,6 +1509,7 @@ impl App {
                         repo_path: assoc.repo_path.clone(),
                         branch: assoc.branch.clone(),
                         worktree_path,
+                        branch_in_main_worktree,
                         open_pr_number,
                         github_remote,
                     }
@@ -1471,7 +1527,10 @@ impl App {
                 {
                     warnings.push(format!("worktree: {e}"));
                 }
-                if let Some(ref branch) = info.branch
+                // Skip branch deletion when checked out in the main worktree
+                // (git forbids deleting the currently checked-out branch).
+                if !info.branch_in_main_worktree
+                    && let Some(ref branch) = info.branch
                     && let Err(e) =
                         self.worktree_service
                             .delete_branch(&info.repo_path, branch, true)
@@ -1585,6 +1644,213 @@ impl App {
         Ok(())
     }
 
+    /// Keep the dialog open in progress mode and spawn a background thread to
+    /// close the PR and delete the branch. The dialog shows a spinner until
+    /// poll_unlinked_cleanup() receives the result.
+    pub fn spawn_unlinked_cleanup(&mut self, reason: Option<&str>) {
+        let Some((repo_path, branch, pr_number)) = self.cleanup_unlinked_target.take() else {
+            return;
+        };
+
+        // Extract github remote before leaving the main thread.
+        let github_remote = self
+            .repo_data
+            .get(&repo_path)
+            .and_then(|rd| rd.github_remote.clone());
+
+        // Transition to in-progress: clear the input fields but keep the dialog
+        // open. The UI renders a spinner + "Please wait." instead of key options.
+        self.cleanup_reason_input_active = false;
+        self.cleanup_reason_input.clear();
+        self.cleanup_in_progress = true;
+        self.cleanup_progress_pr_number = Some(pr_number);
+        self.cleanup_progress_repo_path = Some(repo_path.clone());
+        self.cleanup_progress_branch = Some(branch.clone());
+        self.selected_unlinked_branch = None;
+
+        let reason_owned: Option<String> = reason.map(|s| s.to_string());
+        let ws = Arc::clone(&self.worktree_service);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        std::thread::spawn(move || {
+            let mut warnings = Vec::new();
+
+            let pr_close_ok = if let Some((ref owner, ref repo)) = github_remote {
+                let owner_repo = format!("{owner}/{repo}");
+
+                // Post optional reason as a comment before closing.
+                if let Some(ref r) = reason_owned
+                    && !r.is_empty()
+                {
+                    match std::process::Command::new("gh")
+                        .args([
+                            "pr",
+                            "comment",
+                            &pr_number.to_string(),
+                            "--repo",
+                            &owner_repo,
+                            "--body",
+                            r.as_str(),
+                        ])
+                        .output()
+                    {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                            warnings.push(format!("PR comment: {stderr}"));
+                        }
+                        Err(e) => warnings.push(format!("PR comment: {e}")),
+                        _ => {}
+                    }
+                }
+
+                // Close the PR.
+                let mut close_succeeded = false;
+                match std::process::Command::new("gh")
+                    .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
+                    .output()
+                {
+                    Ok(output) if !output.status.success() => {
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        warnings.push(format!("PR close: {stderr}"));
+                    }
+                    Err(e) => warnings.push(format!("PR close: {e}")),
+                    _ => {
+                        close_succeeded = true;
+                    }
+                }
+                close_succeeded
+            } else {
+                // No GitHub remote - local-only cleanup is safe to proceed.
+                true
+            };
+
+            // Only proceed with destructive local operations (worktree removal,
+            // branch deletion) if the PR was successfully closed on GitHub.
+            // Otherwise the user would lose their local branch while the PR
+            // remains open, and any unpushed commits would be permanently lost.
+            if !pr_close_ok {
+                let _ = tx.send(CleanupResult { warnings });
+                return;
+            }
+
+            // Get a fresh worktree list so we don't rely on potentially stale
+            // cached repo_data (e.g., if the user switched branches since last fetch).
+            match ws.list_worktrees(&repo_path) {
+                Ok(fresh_worktrees) => {
+                    let wt_for_branch = fresh_worktrees
+                        .iter()
+                        .find(|wt| wt.branch.as_deref() == Some(branch.as_str()));
+
+                    match wt_for_branch {
+                        Some(wt) if wt.is_main => {
+                            // Branch is the main worktree's current branch; git forbids
+                            // deleting the checked-out branch. Skip silently - the PR
+                            // was closed, and the user can switch branches later.
+                        }
+                        Some(wt) => {
+                            // Remove the linked worktree first, then delete the branch.
+                            let wt_path = wt.path.clone();
+                            if let Err(e) = ws.remove_worktree(&repo_path, &wt_path, false, true) {
+                                warnings.push(format!("worktree: {e}"));
+                            }
+                            if let Err(e) = ws.delete_branch(&repo_path, &branch, true) {
+                                warnings.push(format!("branch: {e}"));
+                            }
+                        }
+                        None => {
+                            // No worktree for this branch - just delete the branch.
+                            if let Err(e) = ws.delete_branch(&repo_path, &branch, true) {
+                                warnings.push(format!("branch: {e}"));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warnings.push(format!(
+                        "list worktrees: {e}; skipping worktree/branch cleanup"
+                    ));
+                }
+            }
+
+            let _ = tx.send(CleanupResult { warnings });
+        });
+
+        self.cleanup_rx = Some(rx);
+        self.cleanup_activity = Some(self.start_activity(format!("Closing PR #{pr_number}...")));
+    }
+
+    /// Poll the async unlinked-item cleanup thread for a result. Called on each timer tick.
+    pub fn poll_unlinked_cleanup(&mut self) {
+        let rx = match self.cleanup_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.cleanup_rx = None;
+                self.cleanup_prompt_visible = false;
+                self.cleanup_in_progress = false;
+                self.cleanup_progress_pr_number = None;
+                self.cleanup_progress_repo_path = None;
+                self.cleanup_progress_branch = None;
+                if let Some(aid) = self.cleanup_activity.take() {
+                    self.end_activity(aid);
+                }
+                self.alert_message = Some("Cleanup: background thread exited unexpectedly".into());
+                return;
+            }
+        };
+
+        self.cleanup_rx = None;
+        self.cleanup_prompt_visible = false;
+        self.cleanup_in_progress = false;
+        if let Some(aid) = self.cleanup_activity.take() {
+            self.end_activity(aid);
+        }
+
+        // Track the closed branch so stale fetch results (from in-flight
+        // fetches that started before the close) don't re-add the PR.
+        // apply_cleanup_evictions() removes these from repo_data after every
+        // drain_fetch_results, and drain clears the list on fresh data.
+        if let Some(repo_path) = self.cleanup_progress_repo_path.take()
+            && let Some(branch) = self.cleanup_progress_branch.take()
+        {
+            self.cleanup_evicted_branches.push((repo_path, branch));
+        }
+        self.cleanup_progress_pr_number = None;
+
+        self.apply_cleanup_evictions();
+
+        self.reassemble_work_items();
+        self.build_display_list();
+        self.fetcher_repos_changed = true;
+
+        if result.warnings.is_empty() {
+            self.status_message = Some("Unlinked item closed".into());
+        } else {
+            self.alert_message = Some(format!(
+                "Closed with warnings: {}",
+                result.warnings.join("; ")
+            ));
+        }
+    }
+
+    /// Remove recently-closed PRs from cached repo_data. Called after
+    /// poll_unlinked_cleanup and after drain_fetch_results to ensure stale
+    /// fetch data doesn't resurrect closed PRs in the unlinked list.
+    pub fn apply_cleanup_evictions(&mut self) {
+        for (repo_path, branch) in &self.cleanup_evicted_branches {
+            if let Some(rd) = self.repo_data.get_mut(repo_path)
+                && let Ok(ref mut prs) = rd.prs
+            {
+                prs.retain(|pr| pr.head_branch != *branch);
+            }
+        }
+    }
+
     /// Delete Done work items whose `done_at` timestamp exceeds the
     /// configured `archive_after_days` retention period. Returns the
     /// remaining (non-archived) records for assembly.
@@ -1621,7 +1887,7 @@ impl App {
                     &record.repo_associations,
                     &mut warnings,
                     false,
-                    true, // skip_resource_cleanup: Done items already went through merge flow
+                    true, // skip resource cleanup: blocking I/O prohibited on UI thread
                 ) {
                     Ok(()) => {
                         archived_count += 1;
@@ -2819,10 +3085,6 @@ impl App {
                         }
                         if !self.no_plan_prompt_visible {
                             self.no_plan_prompt_visible = true;
-                            self.status_message = Some(
-                                "No plan available. [p] Plan from branch  [Esc] Stay blocked"
-                                    .to_string(),
-                            );
                         }
                         continue;
                     }
@@ -3473,10 +3735,6 @@ impl App {
         if current_status == WorkItemStatus::Review && new_status == WorkItemStatus::Done {
             self.confirm_merge = true;
             self.merge_wi_id = Some(wi_id);
-            self.status_message = Some(
-                "Merge PR? [s]quash (default) / [m]erge / [p]oll (mergequeue) / [Esc] cancel"
-                    .into(),
-            );
             return;
         }
 
@@ -3568,7 +3826,6 @@ impl App {
             self.rework_prompt_visible = true;
             self.rework_prompt_input.clear();
             self.rework_prompt_wi = Some(wi_id);
-            self.status_message = Some("Rework reason: (Enter to submit, Esc to cancel)".into());
             return;
         }
 
@@ -8401,11 +8658,7 @@ mod tests {
             Some(&wi_id),
             "merge_wi_id should be set to the work item",
         );
-        let msg = app.status_message.as_deref().unwrap_or("");
-        assert!(
-            msg.contains("quash"),
-            "status should mention squash option, got: {msg}",
-        );
+        // The merge prompt is now a dialog overlay; it no longer sets status_message.
     }
 
     // -- Regression: execute_merge must not advance to Done without a real merge --
@@ -8614,11 +8867,7 @@ mod tests {
             Some(&wi_id),
             "rework_prompt_wi should be set",
         );
-        let msg = app.status_message.as_deref().unwrap_or("");
-        assert!(
-            msg.contains("Rework reason"),
-            "status should mention rework reason, got: {msg}",
-        );
+        // The rework prompt is now a dialog overlay; it no longer sets status_message.
     }
 
     /// Rework reasons are stored per work item and influence prompt key.
