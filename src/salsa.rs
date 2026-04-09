@@ -277,7 +277,9 @@ pub fn app_event(
                     }
                 }
                 ct::event::Event::Paste(data) => {
-                    event::handle_paste(state, data);
+                    if !event::handle_paste(state, data) {
+                        return Ok(Control::Continue);
+                    }
                 }
                 _ => {
                     return Ok(Control::Continue);

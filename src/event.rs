@@ -786,21 +786,30 @@ pub fn handle_resize(app: &mut App, cols: u16, rows: u16) {
     app.resize_pty_panes();
 }
 
-/// Handle a paste event (e.g. drag-and-drop file path) by forwarding the
-/// pasted text to the focused PTY session as raw bytes.
-pub fn handle_paste(app: &mut App, data: &str) {
-    if app.shutting_down {
-        return;
+/// Handle a paste event (e.g. drag-and-drop file path, system clipboard)
+/// by forwarding the pasted text to the focused PTY session as a bracketed
+/// paste sequence so the receiving application handles it atomically.
+pub fn handle_paste(app: &mut App, data: &str) -> bool {
+    if app.shutting_down
+        || app.create_dialog.visible
+        || app.show_settings
+        || app.rework_prompt_visible
+        || app.no_plan_prompt_visible
+        || app.confirm_merge
+    {
+        return false;
     }
+    let bracketed = format!("\x1b[200~{data}\x1b[201~");
     if app.global_drawer_open {
-        app.send_bytes_to_global(data.as_bytes());
-        return;
+        app.send_bytes_to_global(bracketed.as_bytes());
+        return true;
     }
     match app.focus {
         FocusPanel::Right => {
-            app.send_bytes_to_active(data.as_bytes());
+            app.send_bytes_to_active(bracketed.as_bytes());
+            true
         }
-        FocusPanel::Left => {}
+        FocusPanel::Left => false,
     }
 }
 
