@@ -54,10 +54,7 @@ created but the worktree creation is queued with a status message.
 
 When a session is spawned for a work item that has a branch but no worktree,
 WorkBridge creates the worktree automatically before launching the Claude
-Code session. When the branch does not exist on origin (e.g., quickstart
-work items), `create_branch` fetches the default branch from origin before
-branching so the new branch starts from the latest upstream commit rather
-than a potentially stale local ref.
+Code session.
 
 ## Placement Convention
 
@@ -150,10 +147,10 @@ checked out, diverged) is not yet handled in the UI. Currently
 branch) and `fetch_branch` + `create_worktree` handles the remote-only
 case during import.
 
-`create_branch` fetches the default branch from origin and uses
-`origin/<default>` as the branch start point, so new branches always
-reflect the latest upstream state. If the fetch fails (e.g., offline or
-no remote configured), it falls back to the local default branch ref.
+`create_branch` refuses to create a new branch when the repo has
+uncommitted changes (staged, unstaged, or untracked files). This
+prevents branching from an ambiguous state where the working tree does
+not match the committed base.
 
 ## Multi-Machine Workflow
 

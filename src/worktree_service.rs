@@ -413,29 +413,18 @@ impl WorktreeService for GitWorktreeService {
             .default_branch(repo_path)
             .unwrap_or_else(|_| "HEAD".to_string());
 
-        // Fetch the default branch from origin so the remote tracking ref
-        // is up to date, then use origin/<base> as the branch point.
-        let start_point = if base != "HEAD" {
-            let _ = Self::run_git(repo_path, &["fetch", "origin", &base]);
-            let remote_ref = format!("origin/{base}");
-            if Self::run_git(
-                repo_path,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    &format!("refs/remotes/{remote_ref}"),
-                ],
-            )
-            .is_ok()
-            {
-                remote_ref
-            } else {
-                base
-            }
-        } else {
-            base
-        };
-        Self::run_git(repo_path, &["branch", branch, &start_point])?;
+        // Refuse to branch when the repo has uncommitted changes (staged
+        // or unstaged) or untracked files.  A dirty working tree means the
+        // base branch does not match its committed state, so any branch
+        // created from it would start from an ambiguous point.
+        let status_output = Self::run_git(repo_path, &["status", "--porcelain"])?;
+        if !status_output.trim().is_empty() {
+            return Err(WorktreeError::GitError(format!(
+                "cannot create branch '{branch}': repo has uncommitted changes"
+            )));
+        }
+
+        Self::run_git(repo_path, &["branch", branch, &base])?;
         Ok(())
     }
 }
@@ -1125,80 +1114,53 @@ mod integration_tests {
     }
 
     #[test]
-    fn create_branch_uses_remote_tracking_ref() {
+    fn create_branch_rejects_dirty_repo() {
         let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        setup_git_repo(&repo_dir);
 
-        // 1. Create a bare "remote" repo.
-        let remote_dir = tmp.path().join("remote.git");
-        fs::create_dir_all(&remote_dir).unwrap();
-        run_in(&remote_dir, &["git", "init", "--bare"]);
+        // Leave an unstaged modification in the working tree.
+        fs::write(repo_dir.join("README"), "dirty").unwrap();
 
-        // 2. Create a local repo and push to the remote.
-        let local_dir = tmp.path().join("local");
-        fs::create_dir_all(&local_dir).unwrap();
-        setup_git_repo(&local_dir);
-        run_in(&local_dir, &["git", "branch", "-m", "master"]);
-        run_in(
-            &local_dir,
-            &[
-                "git",
-                "remote",
-                "add",
-                "origin",
-                remote_dir.to_str().unwrap(),
-            ],
-        );
-        run_in(&local_dir, &["git", "push", "origin", "master"]);
-
-        // 3. Record the stale local master SHA.
-        let stale_sha =
-            GitWorktreeService::run_git(&local_dir, &["rev-parse", "refs/heads/master"])
-                .unwrap()
-                .trim()
-                .to_string();
-
-        // 4. Advance the remote via a second clone.
-        let clone_dir = tmp.path().join("clone");
-        run_in(
-            tmp.path(),
-            &["git", "clone", remote_dir.to_str().unwrap(), "clone"],
-        );
-        // Ensure the clone is on a branch named "master" to match the
-        // local repo (git clone may default to a different name).
-        run_in(
-            &clone_dir,
-            &["git", "checkout", "-B", "master", "origin/master"],
-        );
-        let new_file = clone_dir.join("new.txt");
-        fs::write(&new_file, "new content").unwrap();
-        run_in(&clone_dir, &["git", "add", "new.txt"]);
-        commit_in(&clone_dir, "advance master");
-        run_in(&clone_dir, &["git", "push", "origin", "master"]);
-
-        // 5. Call create_branch in the original local repo.
         let svc = GitWorktreeService;
-        svc.create_branch(&local_dir, "my-feature").unwrap();
-
-        // 6. The new branch should NOT equal the stale local master SHA.
-        let feature_sha =
-            GitWorktreeService::run_git(&local_dir, &["rev-parse", "refs/heads/my-feature"])
-                .unwrap()
-                .trim()
-                .to_string();
-        assert_ne!(
-            feature_sha, stale_sha,
-            "new branch should NOT be based on stale local master",
+        let result = svc.create_branch(&repo_dir, "my-feature");
+        assert!(
+            result.is_err(),
+            "create_branch should fail when repo is dirty",
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("uncommitted changes"),
+            "error should mention uncommitted changes, got: {err_msg}",
         );
 
-        // 7. The new branch should match origin/master (the fetched ref).
-        let origin_master_sha =
-            GitWorktreeService::run_git(&local_dir, &["rev-parse", "refs/remotes/origin/master"])
-                .unwrap()
-                .trim()
-                .to_string();
-        assert_eq!(
-            feature_sha, origin_master_sha,
-            "new branch should match origin/master after fetch",
+        // Branch should not have been created.
+        let check = GitWorktreeService::run_git(
+            &repo_dir,
+            &["rev-parse", "--verify", "refs/heads/my-feature"],
+        );
+        assert!(
+            check.is_err(),
+            "branch should not exist after dirty-state rejection",
+        );
+    }
+
+    #[test]
+    fn create_branch_rejects_untracked_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        setup_git_repo(&repo_dir);
+
+        // Add an untracked file.
+        fs::write(repo_dir.join("stray.txt"), "stray").unwrap();
+
+        let svc = GitWorktreeService;
+        let result = svc.create_branch(&repo_dir, "my-feature");
+        assert!(
+            result.is_err(),
+            "create_branch should fail with untracked files",
         );
     }
 
