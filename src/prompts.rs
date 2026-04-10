@@ -159,6 +159,19 @@ mod tests {
     }
 
     #[test]
+    fn all_prompts_prohibit_git_checkout() {
+        let prompts: HashMap<String, PromptEntry> = serde_json::from_str(PROMPTS_JSON).unwrap();
+        let prohibition = "NEVER run 'git checkout'";
+        for (key, entry) in &prompts {
+            assert!(
+                entry.template.contains(prohibition),
+                "prompt '{}' is missing git checkout prohibition",
+                key
+            );
+        }
+    }
+
+    #[test]
     fn render_implementing_rework() {
         let mut vars = HashMap::new();
         vars.insert("title", "Fix auth bug");

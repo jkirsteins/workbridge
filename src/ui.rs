@@ -236,6 +236,17 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
                 options: &[("[p]", "Plan from branch"), ("[Esc]", "Stay blocked")],
             },
         );
+    } else if let Some((_, ref error)) = app.branch_gone_prompt {
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::KeyChoice {
+                title: "Worktree Creation Failed",
+                body: error,
+                options: &[("[d]", "Delete work item"), ("[Esc]", "Dismiss")],
+            },
+        );
     }
 
     // Alert dialog (renders above prompt dialogs, below global drawer and create dialog).
