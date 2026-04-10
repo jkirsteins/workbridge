@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -409,6 +410,10 @@ pub struct App {
     pub worktree_errors_shown: std::collections::HashSet<PathBuf>,
     /// Currently selected index in the display list (items only, not headers).
     pub selected_item: Option<usize>,
+    /// Scroll offset for the left-panel work item list. Persisted between
+    /// render frames so the viewport stays stable during navigation.
+    /// Uses `Cell` for interior mutability since rendering takes `&App`.
+    pub list_scroll_offset: Cell<usize>,
     /// Flat display list for the left panel.
     pub display_list: Vec<DisplayEntry>,
     /// Which view mode the root overview is in.
@@ -669,6 +674,7 @@ impl App {
             gh_auth_required_shown: false,
             worktree_errors_shown: std::collections::HashSet::new(),
             selected_item: None,
+            list_scroll_offset: Cell::new(0),
             display_list: Vec::new(),
             view_mode: ViewMode::FlatList,
             board_cursor: BoardCursor {

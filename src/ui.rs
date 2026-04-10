@@ -556,10 +556,13 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         .block(block)
         .highlight_style(theme.style_tab_highlight_bg());
 
-    let mut state = ListState::default();
+    let mut state = ListState::default().with_offset(app.list_scroll_offset.get());
     state.select(app.selected_item);
 
     StatefulWidget::render(list, area, buf, &mut state);
+
+    // Persist the (possibly adjusted) offset for the next frame.
+    app.list_scroll_offset.set(state.offset());
 
     // Scrollbar - only when content overflows the viewport.
     let inner_height = area.height.saturating_sub(2) as usize;
