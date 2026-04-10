@@ -3262,29 +3262,6 @@ impl App {
                         self.build_display_list();
                     }
                 }
-                McpEvent::SetDescription {
-                    work_item_id: wi_id_str,
-                    description,
-                } => {
-                    let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
-                            continue;
-                        }
-                    };
-                    let desc = if description.is_empty() {
-                        None
-                    } else {
-                        Some(description.as_str())
-                    };
-                    if let Err(e) = self.backend.update_description(&wi_id, desc) {
-                        self.status_message = Some(format!("Description update error: {e}"));
-                    } else {
-                        self.reassemble_work_items();
-                        self.build_display_list();
-                    }
-                }
                 McpEvent::SetActivity {
                     work_item_id: wi_id_str,
                     working,
@@ -6326,14 +6303,6 @@ impl WorkItemBackend for StubBackend {
     }
 
     fn update_title(&self, _id: &WorkItemId, _title: &str) -> Result<(), BackendError> {
-        Ok(())
-    }
-
-    fn update_description(
-        &self,
-        _id: &WorkItemId,
-        _description: Option<&str>,
-    ) -> Result<(), BackendError> {
         Ok(())
     }
 

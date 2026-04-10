@@ -140,13 +140,12 @@ dialog. A Planning work item is created immediately with a placeholder title
 The Claude agent running in this session uses the `planning_quickstart` system
 prompt, which instructs it to:
 1. Ask the user what they want to work on.
-2. Call `workbridge_set_title` and `workbridge_set_description` via MCP once
-   the task is understood.
+2. Call `workbridge_set_title` via MCP once the task is understood.
 3. Proceed through the normal Phase 1 refinement and Phase 2 planning process,
    ending with a `workbridge_set_plan` call.
 
-The title and description updates via MCP are reflected immediately in the
-left panel. After the first session sets a real title, any subsequent Planning
+The title update via MCP is reflected immediately in the left panel. After
+the first session sets a real title, any subsequent Planning
 session for the same item uses the normal `planning` prompt.
 
 Ctrl+B opens the full creation dialog (title, description, repos, branch) and

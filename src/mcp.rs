@@ -36,11 +36,6 @@ pub enum McpEvent {
     SetPlan { work_item_id: String, plan: String },
     /// Claude called workbridge_set_title.
     SetTitle { work_item_id: String, title: String },
-    /// Claude called workbridge_set_description.
-    SetDescription {
-        work_item_id: String,
-        description: String,
-    },
     /// Claude called workbridge_set_activity.
     SetActivity { work_item_id: String, working: bool },
     /// Claude called workbridge_approve_review or workbridge_request_changes.
@@ -563,20 +558,6 @@ fn handle_message(
                         "required": ["title"]
                     }
                 }));
-                tools.push(json!({
-                    "name": "workbridge_set_description",
-                    "description": "Set or update the description of this work item. Call this to store a brief summary of the work once you understand what is needed.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "description": {
-                                "type": "string",
-                                "description": "A brief description of the work item"
-                            }
-                        },
-                        "required": ["description"]
-                    }
-                }));
             }
 
             Some(json!({
@@ -843,38 +824,6 @@ fn handle_message(
                             "id": id,
                             "result": {
                                 "content": [{"type": "text", "text": "Title updated"}]
-                            }
-                        }))
-                    } else {
-                        Some(json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "content": [{"type": "text", "text": "Error: TUI channel disconnected"}],
-                                "isError": true
-                            }
-                        }))
-                    }
-                }
-                "workbridge_set_description" => {
-                    let description = arguments
-                        .get("description")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    let event = McpEvent::SetDescription {
-                        work_item_id: work_item_id.to_string(),
-                        description,
-                    };
-                    let send_ok = tx.send(event).is_ok();
-
-                    if send_ok {
-                        Some(json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "content": [{"type": "text", "text": "Description updated"}]
                             }
                         }))
                     } else {
@@ -1380,7 +1329,7 @@ mod tests {
         });
         let resp = handle_message(&msg, "test-id", "", "{}", None, &tx, false).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 7);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"workbridge_set_status"));
         assert!(names.contains(&"workbridge_get_context"));
@@ -1389,7 +1338,6 @@ mod tests {
         assert!(names.contains(&"workbridge_set_plan"));
         assert!(names.contains(&"workbridge_set_activity"));
         assert!(names.contains(&"workbridge_set_title"));
-        assert!(names.contains(&"workbridge_set_description"));
         assert!(!names.contains(&"workbridge_get_plan"));
         assert!(
             !names.contains(&"workbridge_review_gate_result"),
