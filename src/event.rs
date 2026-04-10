@@ -620,6 +620,7 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
                     app.right_panel_tab = RightPanelTab::ClaudeCode;
                     app.status_message =
                         Some("Terminal session has ended - switched to Claude Code".into());
+                    sync_layout(app);
                     return true;
                 }
             } else {
@@ -660,6 +661,21 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Enter => {
             app.buffer_bytes_to_right_panel(b"\r");
         }
+        // Ctrl+T: cycle right panel tab (Claude Code <-> Terminal).
+        // Intercept before the generic Ctrl+Char handler.
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            match app.right_panel_tab {
+                RightPanelTab::ClaudeCode => {
+                    if app.selected_work_item_has_worktree() {
+                        app.right_panel_tab = RightPanelTab::Terminal;
+                        app.spawn_terminal_session();
+                    }
+                }
+                RightPanelTab::Terminal => {
+                    app.right_panel_tab = RightPanelTab::ClaudeCode;
+                }
+            }
+        }
         // Forward regular characters.
         KeyCode::Char(c) => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -696,18 +712,8 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
                 // Shift+Tab = CSI Z - forward to PTY.
                 app.buffer_bytes_to_right_panel(b"\x1b[Z");
             } else {
-                // Plain Tab: cycle right panel tab.
-                match app.right_panel_tab {
-                    RightPanelTab::ClaudeCode => {
-                        if app.selected_work_item_has_worktree() {
-                            app.right_panel_tab = RightPanelTab::Terminal;
-                            app.spawn_terminal_session();
-                        }
-                    }
-                    RightPanelTab::Terminal => {
-                        app.right_panel_tab = RightPanelTab::ClaudeCode;
-                    }
-                }
+                // Plain Tab (0x09) - always forward to PTY for tab completion.
+                app.buffer_bytes_to_right_panel(&[0x09]);
             }
         }
         KeyCode::BackTab => {
