@@ -1397,7 +1397,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     Line::from(""),
                     Line::from("  Terminal session has ended."),
                     Line::from(""),
-                    Line::from("  Press Ctrl+T to switch back to Claude Code."),
+                    Line::from("  Press Tab to switch back to Claude Code."),
                 ]);
                 let paragraph = Paragraph::new(text).block(block).style(theme.style_error());
                 paragraph.render(area, buf);

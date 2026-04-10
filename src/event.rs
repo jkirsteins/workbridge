@@ -664,10 +664,6 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Enter => {
             app.buffer_bytes_to_right_panel(b"\r");
         }
-        // Ctrl+T: forward to PTY as 0x14 (standard Ctrl+T byte).
-        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.buffer_bytes_to_right_panel(&[0x14]);
-        }
         // Forward regular characters.
         KeyCode::Char(c) => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
