@@ -27,6 +27,13 @@ pub enum FocusPanel {
     Right,
 }
 
+/// Which tab is active in the right panel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RightPanelTab {
+    ClaudeCode,
+    Terminal,
+}
+
 /// Which view mode the root overview is in.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
@@ -585,6 +592,14 @@ pub struct App {
     pub pending_active_pty_bytes: Vec<u8>,
     /// Same buffer for the global assistant session.
     pub pending_global_pty_bytes: Vec<u8>,
+
+    /// Which tab is active in the right panel (Claude Code or Terminal).
+    pub right_panel_tab: RightPanelTab,
+    /// Terminal shell sessions keyed by work item ID. One terminal per
+    /// work item, spawned lazily on first tab switch.
+    pub terminal_sessions: HashMap<WorkItemId, SessionEntry>,
+    /// Buffered bytes destined for the active terminal PTY session.
+    pub pending_terminal_pty_bytes: Vec<u8>,
 }
 
 impl App {
@@ -748,6 +763,9 @@ impl App {
             global_mcp_context_dirty: false,
             pending_active_pty_bytes: Vec::new(),
             pending_global_pty_bytes: Vec::new(),
+            right_panel_tab: RightPanelTab::ClaudeCode,
+            terminal_sessions: HashMap::new(),
+            pending_terminal_pty_bytes: Vec::new(),
         };
         app.reassemble_work_items();
         app.build_display_list();
@@ -1034,6 +1052,30 @@ impl App {
                 self.global_mcp_server = None;
             }
         }
+
+        // Check terminal session liveness.
+        for entry in self.terminal_sessions.values_mut() {
+            if let Some(ref mut session) = entry.session {
+                entry.alive = session.is_alive();
+            } else {
+                entry.alive = false;
+            }
+        }
+
+        // Remove terminal sessions whose work item no longer exists.
+        let terminal_orphans: Vec<_> = self
+            .terminal_sessions
+            .keys()
+            .filter(|wi_id| !self.work_items.iter().any(|w| &w.id == *wi_id))
+            .cloned()
+            .collect();
+        for wi_id in terminal_orphans {
+            if let Some(mut entry) = self.terminal_sessions.remove(&wi_id)
+                && let Some(mut session) = entry.session.take()
+            {
+                session.kill();
+            }
+        }
     }
 
     /// Stop MCP server and clear activity state for a work item.
@@ -1076,6 +1118,15 @@ impl App {
         {
             first_error = Some(e);
         }
+        // Resize terminal sessions to the same dimensions as the right pane.
+        for entry in self.terminal_sessions.values() {
+            if let Some(ref session) = entry.session
+                && let Err(e) = session.resize(self.pane_cols, self.pane_rows)
+                && first_error.is_none()
+            {
+                first_error = Some(e);
+            }
+        }
         if let Some(e) = first_error {
             self.status_message = Some(format!("PTY resize error: {e}"));
         }
@@ -1098,12 +1149,20 @@ impl App {
         {
             session.send_sigterm();
         }
+        for entry in self.terminal_sessions.values_mut() {
+            if entry.alive
+                && let Some(ref mut session) = entry.session
+            {
+                session.send_sigterm();
+            }
+        }
     }
 
     /// Check if all sessions are dead (or there are no sessions).
     pub fn all_dead(&self) -> bool {
         self.sessions.values().all(|entry| !entry.alive)
             && self.global_session.as_ref().is_none_or(|s| !s.alive)
+            && self.terminal_sessions.values().all(|entry| !entry.alive)
     }
 
     /// SIGKILL all remaining alive sessions. Used for force-quit during
@@ -1124,6 +1183,12 @@ impl App {
             entry.alive = false;
         }
         self.global_mcp_server = None;
+        for entry in self.terminal_sessions.values_mut() {
+            if let Some(ref mut session) = entry.session {
+                session.force_kill();
+            }
+            entry.alive = false;
+        }
     }
 
     /// Find the session key for a work item ID (any stage).
@@ -1156,6 +1221,10 @@ impl App {
             let data = std::mem::take(&mut self.pending_global_pty_bytes);
             self.send_bytes_to_global(&data);
         }
+        if !self.pending_terminal_pty_bytes.is_empty() {
+            let data = std::mem::take(&mut self.pending_terminal_pty_bytes);
+            self.send_bytes_to_terminal(&data);
+        }
     }
 
     /// Send raw bytes to the active session's PTY.
@@ -1177,6 +1246,98 @@ impl App {
         {
             self.status_message = Some(format!("Send error: {e}"));
         }
+    }
+
+    /// Lazily spawn a terminal shell session for the currently selected
+    /// work item. Uses `$SHELL` (falling back to `/bin/sh`) with the
+    /// worktree path as cwd.
+    pub fn spawn_terminal_session(&mut self) {
+        let Some(wi_id) = self.selected_work_item_id() else {
+            return;
+        };
+        // Already spawned and still alive?
+        if self.terminal_sessions.get(&wi_id).is_some_and(|e| e.alive) {
+            return;
+        }
+        // Remove dead entry so we can respawn.
+        if self.terminal_sessions.get(&wi_id).is_some_and(|e| !e.alive) {
+            self.terminal_sessions.remove(&wi_id);
+        }
+        let Some(wi) = self.work_items.iter().find(|w| w.id == wi_id) else {
+            return;
+        };
+        let Some(cwd) = wi
+            .repo_associations
+            .iter()
+            .find_map(|a| a.worktree_path.clone())
+        else {
+            self.status_message = Some("No worktree available for terminal".into());
+            return;
+        };
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        match Session::spawn(self.pane_cols, self.pane_rows, Some(&cwd), &[&shell]) {
+            Ok(session) => {
+                let parser = Arc::clone(&session.parser);
+                self.terminal_sessions.insert(
+                    wi_id,
+                    SessionEntry {
+                        parser,
+                        alive: true,
+                        session: Some(session),
+                    },
+                );
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Terminal spawn error: {e}"));
+            }
+        }
+    }
+
+    /// Get the terminal SessionEntry for the currently selected work item.
+    pub fn active_terminal_entry(&self) -> Option<&SessionEntry> {
+        let wi_id = self.selected_work_item_id()?;
+        self.terminal_sessions.get(&wi_id)
+    }
+
+    /// Buffer bytes for the terminal PTY session.
+    pub fn buffer_bytes_to_terminal(&mut self, data: &[u8]) {
+        self.pending_terminal_pty_bytes.extend_from_slice(data);
+    }
+
+    /// Send raw bytes to the terminal session for the selected work item.
+    pub fn send_bytes_to_terminal(&mut self, data: &[u8]) {
+        let Some(wi_id) = self.selected_work_item_id() else {
+            return;
+        };
+        let Some(entry) = self.terminal_sessions.get(&wi_id) else {
+            return;
+        };
+        if let Some(ref session) = entry.session
+            && let Err(e) = session.write_bytes(data)
+        {
+            self.status_message = Some(format!("Terminal send error: {e}"));
+        }
+    }
+
+    /// Route buffered bytes to whichever right-panel tab is active.
+    pub fn buffer_bytes_to_right_panel(&mut self, data: &[u8]) {
+        match self.right_panel_tab {
+            RightPanelTab::ClaudeCode => self.buffer_bytes_to_active(data),
+            RightPanelTab::Terminal => self.buffer_bytes_to_terminal(data),
+        }
+    }
+
+    /// Returns true if the currently selected work item has a worktree path.
+    pub fn selected_work_item_has_worktree(&self) -> bool {
+        let Some(wi_id) = self.selected_work_item_id() else {
+            return false;
+        };
+        let Some(wi) = self.work_items.iter().find(|w| w.id == wi_id) else {
+            return false;
+        };
+        wi.repo_associations
+            .iter()
+            .any(|a| a.worktree_path.is_some())
     }
 
     /// Drain pending fetch results from the background fetcher channel.
@@ -1486,6 +1647,12 @@ impl App {
         self.cleanup_session_state_for(wi_id);
         if let Some(key) = self.session_key_for(wi_id)
             && let Some(mut entry) = self.sessions.remove(&key)
+            && let Some(ref mut session) = entry.session
+        {
+            session.kill();
+        }
+        // Kill associated terminal session.
+        if let Some(mut entry) = self.terminal_sessions.remove(wi_id)
             && let Some(ref mut session) = entry.session
         {
             session.kill();
@@ -6124,6 +6291,7 @@ impl App {
     pub fn has_any_session(&self) -> bool {
         self.sessions.values().any(|e| e.alive)
             || self.global_session.as_ref().is_some_and(|s| s.alive)
+            || self.terminal_sessions.values().any(|e| e.alive)
     }
 
     // -- Global assistant --------------------------------------------------

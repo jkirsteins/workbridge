@@ -18,8 +18,8 @@ use tui_term::widget::PseudoTerminal;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, BOARD_COLUMNS, DisplayEntry, FocusPanel, GroupHeaderKind, SettingsListFocus, SettingsTab,
-    ViewMode, WorkItemContext,
+    App, BOARD_COLUMNS, DisplayEntry, FocusPanel, GroupHeaderKind, RightPanelTab,
+    SettingsListFocus, SettingsTab, ViewMode, WorkItemContext,
 };
 use crate::config;
 use crate::create_dialog::{CreateDialog, CreateDialogFocus};
@@ -1356,20 +1356,75 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         theme.style_border_default()
     };
 
-    let title = if app.focus == FocusPanel::Right {
-        " Claude Code [INPUT] "
+    let has_worktree = app.selected_work_item_has_worktree();
+    let input_suffix = if app.focus == FocusPanel::Right {
+        " [INPUT] "
     } else {
-        " Claude Code "
+        " "
+    };
+
+    let title_line: Line = if has_worktree {
+        let (cc_style, term_style) = match app.right_panel_tab {
+            RightPanelTab::ClaudeCode => (
+                theme.style_view_mode_tab_active(),
+                theme.style_view_mode_tab(),
+            ),
+            RightPanelTab::Terminal => (
+                theme.style_view_mode_tab(),
+                theme.style_view_mode_tab_active(),
+            ),
+        };
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled(" Claude Code ", cc_style),
+            Span::styled(" | ", theme.style_title()),
+            Span::styled(" Terminal ", term_style),
+            Span::styled(input_suffix, theme.style_title()),
+        ])
+    } else {
+        let title_text = format!(" Claude Code{input_suffix}");
+        Line::from(Span::styled(title_text, theme.style_title()))
     };
 
     let block = Block::default()
-        .title(title)
-        .title_style(theme.style_title())
+        .title(title_line)
         .borders(Borders::ALL)
         .border_style(border_style);
 
     // Determine what to show based on the selected display list entry.
     let selected_entry = app.selected_item.and_then(|idx| app.display_list.get(idx));
+
+    // If the Terminal tab is active, render the terminal PTY instead of Claude Code.
+    if app.right_panel_tab == RightPanelTab::Terminal {
+        if let Some(entry) = app.active_terminal_entry() {
+            if entry.alive {
+                if let Ok(parser) = entry.parser.lock() {
+                    let pseudo_term = PseudoTerminal::new(parser.screen()).block(block);
+                    pseudo_term.render(area, buf);
+                } else {
+                    let text = Text::from(vec![Line::from(""), Line::from("  [render error]")]);
+                    let paragraph = Paragraph::new(text).block(block).style(theme.style_error());
+                    paragraph.render(area, buf);
+                }
+            } else {
+                let text = Text::from(vec![
+                    Line::from(""),
+                    Line::from("  Terminal session has ended."),
+                    Line::from(""),
+                    Line::from("  Press Tab to switch back to Claude Code."),
+                ]);
+                let paragraph = Paragraph::new(text).block(block).style(theme.style_error());
+                paragraph.render(area, buf);
+            }
+        } else {
+            let text = Text::from(vec![Line::from(""), Line::from("  Starting terminal...")]);
+            let paragraph = Paragraph::new(text)
+                .block(block)
+                .style(theme.style_text_muted());
+            paragraph.render(area, buf);
+        }
+        return;
+    }
 
     match selected_entry {
         Some(DisplayEntry::WorkItemEntry(wi_idx)) => {

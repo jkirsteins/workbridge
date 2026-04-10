@@ -274,18 +274,25 @@ operations are cancelled, and in-memory state is cleared.
 
 ## Sessions
 
-Each work item may have an associated Claude Code session running inside
-its worktree. The session is the interactive element - it is where the user
-does the actual work.
+Each work item may have associated PTY sessions running inside its worktree.
+There are two session types:
 
-Session states:
+- **Claude Code session** - the interactive Claude Code process where the user
+  does the actual work. Spawned automatically when entering certain stages.
+- **Terminal session** - a shell (`$SHELL`, falling back to `/bin/sh`) launched
+  in the worktree directory. Spawned lazily when the user switches to the
+  Terminal tab in the right panel. Available whenever the work item has a
+  worktree, regardless of whether a Claude Code session exists.
 
-- **Alive**: Claude Code process is running
+Session states (both types):
+
+- **Alive**: The process is running.
 - **Dead**: The process has exited. The worktree still exists.
 
 A dead session does not destroy the work item. The worktree persists, and
-the session can be respawned. Only deleting the backend record destroys the
-work item.
+the session can be respawned. Dead terminal sessions are automatically
+cleaned up and respawned when the user switches to the Terminal tab again.
+Only deleting the backend record destroys the work item.
 
 ## Work Item Identity
 
@@ -314,7 +321,8 @@ warnings but do not prevent the delete.
 - Worktree directory on disk
 - Local git branch (force-deleted with `-D`)
 - Open PR on GitHub (closed via `gh pr close`)
-- Active Claude session (killed)
+- Active Claude Code session (killed)
+- Active terminal session (killed)
 - MCP socket server and .mcp.json config file
 - In-memory state: rework reasons, review gate findings, no-plan prompt queue,
   merge/rework prompt visibility flags

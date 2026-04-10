@@ -45,8 +45,10 @@ cleaned up in order via `delete_work_item_by_id()`:
 1. **Backend record** - `pre_delete_cleanup()` is called (no-op for
    LocalFileBackend; reserved for future backends), then the JSON file is
    deleted from disk.
-2. **Session** - if a Claude Code PTY session is running, it receives SIGKILL
-   and the session entry is removed from the sessions map.
+2. **Sessions** - if a Claude Code PTY session is running, it receives SIGKILL
+   and the session entry is removed from the sessions map. If a terminal PTY
+   session is running (spawned via the Terminal tab), it also receives SIGKILL
+   and is removed from the terminal sessions map.
 3. **MCP server** - the MCP socket server and `.mcp.json` config file are
    removed via `cleanup_session_state_for()`.
 4. **Worktree** - the git worktree directory is removed via
