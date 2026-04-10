@@ -322,8 +322,6 @@ pub struct App {
     pub cleanup_unlinked_target: Option<(PathBuf, String, u64)>,
     /// Receiver for the async unlinked-item cleanup thread result.
     pub cleanup_rx: Option<crossbeam_channel::Receiver<CleanupResult>>,
-    /// Activity ID for the running cleanup indicator.
-    pub cleanup_activity: Option<ActivityId>,
     /// True while the cleanup background thread is running.
     /// The dialog stays open with a spinner in this state.
     pub cleanup_in_progress: bool,
@@ -634,7 +632,6 @@ impl App {
             cleanup_reason_input: crate::create_dialog::SimpleTextInput::new(),
             cleanup_unlinked_target: None,
             cleanup_rx: None,
-            cleanup_activity: None,
             cleanup_in_progress: false,
             cleanup_progress_pr_number: None,
             cleanup_progress_repo_path: None,
@@ -1777,7 +1774,6 @@ impl App {
         });
 
         self.cleanup_rx = Some(rx);
-        self.cleanup_activity = Some(self.start_activity(format!("Closing PR #{pr_number}...")));
     }
 
     /// Poll the async unlinked-item cleanup thread for a result. Called on each timer tick.
@@ -1797,9 +1793,6 @@ impl App {
                 self.cleanup_progress_pr_number = None;
                 self.cleanup_progress_repo_path = None;
                 self.cleanup_progress_branch = None;
-                if let Some(aid) = self.cleanup_activity.take() {
-                    self.end_activity(aid);
-                }
                 self.alert_message = Some("Cleanup: background thread exited unexpectedly".into());
                 return;
             }
@@ -1808,9 +1801,6 @@ impl App {
         self.cleanup_rx = None;
         self.cleanup_prompt_visible = false;
         self.cleanup_in_progress = false;
-        if let Some(aid) = self.cleanup_activity.take() {
-            self.end_activity(aid);
-        }
 
         // Track the closed branch so stale fetch results (from in-flight
         // fetches that started before the close) don't re-add the PR.

@@ -947,13 +947,13 @@ fn handle_merge_prompt(app: &mut App, key: KeyEvent) {
     let had_status = app.has_visible_status_bar();
     match (key.modifiers, key.code) {
         (_, KeyCode::Char('s')) | (_, KeyCode::Enter) => {
-            if let Some(ref wi_id) = app.merge_wi_id.clone() {
-                app.execute_merge(wi_id, "squash");
+            if let Some(wi_id) = app.merge_wi_id.clone() {
+                app.execute_merge(&wi_id, "squash");
             }
         }
         (_, KeyCode::Char('m')) => {
-            if let Some(ref wi_id) = app.merge_wi_id.clone() {
-                app.execute_merge(wi_id, "merge");
+            if let Some(wi_id) = app.merge_wi_id.clone() {
+                app.execute_merge(&wi_id, "merge");
             }
         }
         (_, KeyCode::Char('p')) => {
