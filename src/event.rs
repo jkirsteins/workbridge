@@ -1,8 +1,8 @@
 use crate::salsa::ct::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::app::{
-    App, BOARD_COLUMNS, DeleteConfirmState, DisplayEntry, FocusPanel, SettingsListFocus,
-    SettingsTab, ViewMode,
+    App, BOARD_COLUMNS, DeleteConfirmState, DisplayEntry, FocusPanel, RightPanelTab,
+    SettingsListFocus, SettingsTab, ViewMode,
 };
 use crate::create_dialog::CreateDialogFocus;
 use crate::layout;
@@ -510,6 +510,7 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
         (_, KeyCode::Up) => {
             let had_context = app.selected_work_item_context().is_some();
             app.select_prev_item();
+            app.right_panel_tab = RightPanelTab::ClaudeCode;
             if app.selected_work_item_context().is_some() != had_context {
                 sync_layout(app);
             }
@@ -518,6 +519,7 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
         (_, KeyCode::Down) => {
             let had_context = app.selected_work_item_context().is_some();
             app.select_next_item();
+            app.right_panel_tab = RightPanelTab::ClaudeCode;
             if app.selected_work_item_context().is_some() != had_context {
                 sync_layout(app);
             }
@@ -590,23 +592,42 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
 /// key, matching telnet/SSH conventions). Escape is forwarded to the PTY
 /// so Claude Code can use it.
 fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
-    // Check if the active session is dead before forwarding keys.
+    // Check if the active session/terminal is dead before forwarding keys.
     // Flush any buffered PTY bytes before changing state.
-    if let Some(entry) = app.active_session_entry() {
-        if !entry.alive {
-            app.flush_pty_buffers();
-            app.focus = FocusPanel::Left;
-            app.status_message = Some("Session has ended - returned to work items".into());
-            sync_layout(app);
-            return true;
+    match app.right_panel_tab {
+        RightPanelTab::ClaudeCode => {
+            if let Some(entry) = app.active_session_entry() {
+                if !entry.alive {
+                    app.flush_pty_buffers();
+                    app.focus = FocusPanel::Left;
+                    app.status_message = Some("Session has ended - returned to work items".into());
+                    sync_layout(app);
+                    return true;
+                }
+            } else {
+                // No session for this work item - return to left panel.
+                app.flush_pty_buffers();
+                app.focus = FocusPanel::Left;
+                app.status_message = None;
+                sync_layout(app);
+                return true;
+            }
         }
-    } else {
-        // No session for this work item - return to left panel.
-        app.flush_pty_buffers();
-        app.focus = FocusPanel::Left;
-        app.status_message = None;
-        sync_layout(app);
-        return true;
+        RightPanelTab::Terminal => {
+            if let Some(entry) = app.active_terminal_entry() {
+                if !entry.alive {
+                    app.flush_pty_buffers();
+                    app.right_panel_tab = RightPanelTab::ClaudeCode;
+                    app.status_message =
+                        Some("Terminal session has ended - switched to Claude Code".into());
+                    return true;
+                }
+            } else {
+                // No terminal session yet - fall back to Claude Code tab.
+                app.right_panel_tab = RightPanelTab::ClaudeCode;
+                return true;
+            }
+        }
     }
 
     match key.code {
@@ -633,11 +654,11 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
         }
         // Forward Escape to PTY.
         KeyCode::Esc => {
-            app.buffer_bytes_to_active(b"\x1b");
+            app.buffer_bytes_to_right_panel(b"\x1b");
         }
         // Forward Enter to PTY.
         KeyCode::Enter => {
-            app.buffer_bytes_to_active(b"\r");
+            app.buffer_bytes_to_right_panel(b"\r");
         }
         // Forward regular characters.
         KeyCode::Char(c) => {
@@ -647,7 +668,7 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
                     .wrapping_sub(b'a')
                     .wrapping_add(1);
                 if byte <= 26 {
-                    app.buffer_bytes_to_active(&[byte]);
+                    app.buffer_bytes_to_right_panel(&[byte]);
                 }
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 // Alt+<char> = ESC byte (0x1B) followed by the character.
@@ -655,32 +676,43 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
                 let s = c.encode_utf8(&mut buf);
                 let mut data = vec![0x1bu8];
                 data.extend_from_slice(s.as_bytes());
-                app.buffer_bytes_to_active(&data);
+                app.buffer_bytes_to_right_panel(&data);
             } else {
                 let mut buf = [0u8; 4];
                 let s = c.encode_utf8(&mut buf);
-                app.buffer_bytes_to_active(s.as_bytes());
+                app.buffer_bytes_to_right_panel(s.as_bytes());
             }
         }
         KeyCode::Backspace => {
             if key.modifiers.contains(KeyModifiers::ALT) {
                 // Alt+Backspace = ESC + DEL (0x1B 0x7F)
-                app.buffer_bytes_to_active(&[0x1b, 0x7f]);
+                app.buffer_bytes_to_right_panel(&[0x1b, 0x7f]);
             } else {
-                app.buffer_bytes_to_active(&[0x7f]);
+                app.buffer_bytes_to_right_panel(&[0x7f]);
             }
         }
         KeyCode::Tab => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
-                // Shift+Tab = CSI Z
-                app.buffer_bytes_to_active(b"\x1b[Z");
+                // Shift+Tab = CSI Z - forward to PTY.
+                app.buffer_bytes_to_right_panel(b"\x1b[Z");
             } else {
-                app.buffer_bytes_to_active(&[0x09]);
+                // Plain Tab: cycle right panel tab.
+                match app.right_panel_tab {
+                    RightPanelTab::ClaudeCode => {
+                        if app.selected_work_item_has_worktree() {
+                            app.right_panel_tab = RightPanelTab::Terminal;
+                            app.spawn_terminal_session();
+                        }
+                    }
+                    RightPanelTab::Terminal => {
+                        app.right_panel_tab = RightPanelTab::ClaudeCode;
+                    }
+                }
             }
         }
         KeyCode::BackTab => {
-            // Shift+Tab = CSI Z
-            app.buffer_bytes_to_active(b"\x1b[Z");
+            // Shift+Tab = CSI Z - forward to PTY.
+            app.buffer_bytes_to_right_panel(b"\x1b[Z");
         }
         KeyCode::Up => {
             buffer_csi_key(app, b'A', key.modifiers);
@@ -701,17 +733,17 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
             buffer_csi_key(app, b'F', key.modifiers);
         }
         KeyCode::PageUp => {
-            app.buffer_bytes_to_active(b"\x1b[5~");
+            app.buffer_bytes_to_right_panel(b"\x1b[5~");
         }
         KeyCode::PageDown => {
-            app.buffer_bytes_to_active(b"\x1b[6~");
+            app.buffer_bytes_to_right_panel(b"\x1b[6~");
         }
         KeyCode::Delete => {
-            app.buffer_bytes_to_active(b"\x1b[3~");
+            app.buffer_bytes_to_right_panel(b"\x1b[3~");
         }
         KeyCode::F(n) => {
             let seq = f_key_sequence(n);
-            app.buffer_bytes_to_active(seq.as_bytes());
+            app.buffer_bytes_to_right_panel(seq.as_bytes());
         }
         _ => {}
     };
@@ -829,14 +861,14 @@ fn buffer_global_csi_key(app: &mut App, key: u8, modifiers: KeyModifiers) {
     }
 }
 
-/// Buffer a CSI key sequence (arrow, Home, End) for the active PTY.
+/// Buffer a CSI key sequence (arrow, Home, End) for the active right-panel PTY.
 fn buffer_csi_key(app: &mut App, key: u8, modifiers: KeyModifiers) {
     let modifier_code = modifier_param(modifiers);
     if modifier_code > 1 {
         let seq = format!("\x1b[1;{modifier_code}{}", key as char);
-        app.buffer_bytes_to_active(seq.as_bytes());
+        app.buffer_bytes_to_right_panel(seq.as_bytes());
     } else {
-        app.buffer_bytes_to_active(&[0x1b, b'[', key]);
+        app.buffer_bytes_to_right_panel(&[0x1b, b'[', key]);
     }
 }
 
@@ -912,7 +944,10 @@ pub fn handle_paste(app: &mut App, data: &str) -> bool {
     }
     match app.focus {
         FocusPanel::Right => {
-            app.send_bytes_to_active(bracketed.as_bytes());
+            match app.right_panel_tab {
+                RightPanelTab::ClaudeCode => app.send_bytes_to_active(bracketed.as_bytes()),
+                RightPanelTab::Terminal => app.send_bytes_to_terminal(bracketed.as_bytes()),
+            }
             true
         }
         FocusPanel::Left => false,
@@ -1540,25 +1575,28 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
             local_col,
             local_row,
         } => {
-            // Extract mouse protocol info from the active session parser,
-            // then drop the lock before calling send_bytes_to_active.
-            // Skip if the session is not alive to avoid writing to a dead PTY.
-            let proto = app
-                .active_session_entry()
-                .filter(|s| s.alive)
-                .and_then(|s| {
-                    let parser = s.parser.lock().ok()?;
-                    let screen = parser.screen();
-                    Some((
-                        screen.mouse_protocol_mode(),
-                        screen.mouse_protocol_encoding(),
-                    ))
-                });
+            // Extract mouse protocol info from the correct session based on
+            // which tab is active. Skip if the session is not alive.
+            let entry_ref = match app.right_panel_tab {
+                RightPanelTab::ClaudeCode => app.active_session_entry(),
+                RightPanelTab::Terminal => app.active_terminal_entry(),
+            };
+            let proto = entry_ref.filter(|s| s.alive).and_then(|s| {
+                let parser = s.parser.lock().ok()?;
+                let screen = parser.screen();
+                Some((
+                    screen.mouse_protocol_mode(),
+                    screen.mouse_protocol_encoding(),
+                ))
+            });
             if let Some((mode, encoding)) = proto
                 && let Some(data) =
                     encode_mouse_scroll(scroll_up, local_col, local_row, mode, encoding)
             {
-                app.send_bytes_to_active(&data);
+                match app.right_panel_tab {
+                    RightPanelTab::ClaudeCode => app.send_bytes_to_active(&data),
+                    RightPanelTab::Terminal => app.send_bytes_to_terminal(&data),
+                }
                 return true;
             }
             false

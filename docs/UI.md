@@ -42,7 +42,8 @@ any) the cursor is over:
 1. **Global drawer** - checked first because it overlays everything.
    When the drawer is open, coordinates outside its inner area return
    `MouseTarget::None` so the dimmed background does not receive events.
-2. **Right panel** - the per-work-item PTY session area.
+2. **Right panel** - the per-work-item PTY session area (Claude Code
+   or Terminal tab, depending on `right_panel_tab`).
 
 If a target is found and the underlying session is alive, the scroll
 event is encoded according to the child process's mouse protocol mode
@@ -128,7 +129,8 @@ See invariant 15 for the render rate requirement.
 The `ViewMode` enum controls the root overview layout:
 
 - `FlatList` (default): two-panel layout with work item list (left) and
-  PTY session (right). See Layout section below.
+  PTY session (right). The right panel has two tabs: Claude Code and
+  Terminal. See Layout and Right Panel Tabs sections below.
 - `Board`: kanban board with 4 columns organized by workflow stage.
   See Board View section below.
 
@@ -160,9 +162,11 @@ because the right panel forwards almost all keys to the PTY, which is
 incompatible with rat-focus's widget navigation model.
 
 - Enter on a work item: focus right panel
+- Tab (when right panel focused): cycle between Claude Code and Terminal tabs
 - Ctrl+]: return to left panel
 - Ctrl+D / Delete: delete selected work item (3-step confirmation)
 - Dead session: auto-return to left panel
+- Up/Down in left panel: reset right panel tab to Claude Code
 
 ### Board Mode Navigation
 
@@ -292,7 +296,7 @@ ratatui-core.
 
 ```
   List   Board                          Tab: switch view
-+-- Work Items --+-- Claude Code -----------------+
++-- Work Items --+-- Claude Code | Terminal -------+
 |                |                                 |
 | UNLINKED (N)   |  [PTY output or placeholder]    |
 | ? pr-branch    |                                 |
@@ -354,6 +358,33 @@ other columns use `style_board_column_unfocused()`.
 Drill-down (Enter on a board item) switches to a filtered two-panel
 layout showing only items from the selected column's stage, with the
 PTY panel on the right. Ctrl+] returns to the full board view.
+
+### Right Panel Tabs
+
+The right panel has two tabs: **Claude Code** and **Terminal**. The
+`RightPanelTab` enum tracks which tab is active. The tab bar is shown
+in the right panel's block title when the selected work item has a
+worktree; otherwise only "Claude Code" is shown.
+
+- **Claude Code**: the per-work-item Claude Code PTY session (existing
+  behavior). Shows session output, dead-session prompts, work item
+  details, or error lists depending on session state.
+- **Terminal**: a shell session (`$SHELL`, falling back to `/bin/sh`)
+  with cwd set to the work item's worktree path. Spawned lazily on
+  first tab switch. One terminal session per work item, stored in
+  `App::terminal_sessions` keyed by `WorkItemId`.
+
+Tab switching (while right panel is focused):
+- Plain Tab: cycle between Claude Code and Terminal
+- Shift+Tab: forwarded to PTY as CSI Z (not intercepted)
+
+Terminal sessions are cleaned up on:
+- Work item deletion (killed in `delete_work_item_by_id`)
+- Orphan detection (work item removed from `work_items` list)
+- App shutdown (SIGTERM then SIGKILL like Claude sessions)
+
+Navigating to a different work item (Up/Down in left panel) resets the
+tab to Claude Code.
 
 ### Overlays
 
