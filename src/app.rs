@@ -1233,9 +1233,13 @@ impl App {
         let Some(wi_id) = self.selected_work_item_id() else {
             return;
         };
-        // Already spawned?
-        if self.terminal_sessions.contains_key(&wi_id) {
+        // Already spawned and still alive?
+        if self.terminal_sessions.get(&wi_id).is_some_and(|e| e.alive) {
             return;
+        }
+        // Remove dead entry so we can respawn.
+        if self.terminal_sessions.get(&wi_id).is_some_and(|e| !e.alive) {
+            self.terminal_sessions.remove(&wi_id);
         }
         let Some(wi) = self.work_items.iter().find(|w| w.id == wi_id) else {
             return;
