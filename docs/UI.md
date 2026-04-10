@@ -281,6 +281,48 @@ app.alert_message = Some(format!("Operation failed: {e}"));
 // The alert dialog dismisses itself when the user presses Enter or Esc.
 ```
 
+### Activity indicator placement
+
+Activity indicators follow a strict ownership rule based on who
+initiated the action:
+
+**User-initiated actions from a dialog** must show progress inline in
+that dialog. The dialog stays open with a spinner until the operation
+completes. The user triggered the action and is watching the dialog -
+progress and errors must appear where they are looking. Never close the
+dialog and move feedback to the status bar; that disconnects the result
+from the action.
+
+**System-initiated actions** (triggered by Claude, periodic background
+fetches, or automatic transitions) belong in the status bar. The user
+did not explicitly trigger these, so a non-blocking global indicator is
+appropriate.
+
+Pattern for user-initiated dialog operations:
+
+1. Add a `<name>_in_progress: bool` field to App.
+2. When the user confirms in the dialog handler, call the spawn function
+   but do NOT close the dialog (the `_visible` / `confirm_` flag stays
+   true).
+3. The spawn function sets `in_progress = true` and spawns the thread.
+4. In the UI rendering, check `in_progress`: when true, render the
+   dialog body with a spinner and empty options (no key choices).
+5. In the event handler, add an `in_progress` guard that swallows all
+   keys except Q/Ctrl+Q (force quit). This prevents the user from
+   dismissing or re-triggering the dialog while the operation runs.
+6. In the poll function, on completion (success or failure):
+   - Set `in_progress = false`
+   - Close the dialog
+   - For errors: use `app.alert_message` (red alert dialog), NOT
+     `app.status_message` (transient status bar text)
+   - For success: use `app.status_message` for positive confirmation
+
+Reference implementations:
+- Cleanup dialog: `spawn_unlinked_cleanup()`, `poll_unlinked_cleanup()`,
+  `cleanup_in_progress` guard in event.rs
+- Merge dialog: `execute_merge()`, `poll_pr_merge()`,
+  `merge_in_progress` guard in event.rs
+
 ## Rendering
 
 All rendering is Buffer-based (not Frame-based). Widgets use the

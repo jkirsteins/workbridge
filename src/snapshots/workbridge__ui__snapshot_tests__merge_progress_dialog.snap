@@ -1,0 +1,28 @@
+---
+source: src/ui.rs
+expression: "render(&app, 80, 24)"
+---
+  List    Board                                                Tab: switch view
+┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
+│                       ││                                                     │
+│  No work items.       ││  Welcome to workbridge                              │
+│                       ││                                                     │
+│  Ctrl+N: quick start  ││  Ctrl+N    - Quick start session                    │
+│  Ctrl+B: backlog ticke││  Ctrl+B    - New backlog ticket                     │
+│                       ││  Up/Down   - Navigate items                         │
+│                 ╭ Merge Strategy ──────────────────────────╮                 │
+│                 │                                          │                 │
+│                 │ ⠸ Merging pull request... Please wait.   │                 │
+│                 │                                          │                 │
+│                 │                                          │                 │
+│                 │                                          │                 │
+│                 ╰──────────────────────────────────────────╯                 │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+└───────────────────────┘└─────────────────────────────────────────────────────┘

@@ -170,7 +170,6 @@ pub enum ReviewGateMessage {
 /// Per-work-item state for an in-flight review gate.
 pub struct ReviewGateState {
     pub rx: crossbeam_channel::Receiver<ReviewGateMessage>,
-    pub activity: ActivityId,
     pub progress: Option<String>,
 }
 
@@ -311,6 +310,9 @@ pub struct App {
     pub confirm_merge: bool,
     /// The work item ID that the merge prompt applies to.
     pub merge_wi_id: Option<WorkItemId>,
+    /// True while the merge background thread is running.
+    /// The dialog stays open with a spinner in this state.
+    pub merge_in_progress: bool,
     /// True when the rework reason text input is visible (Review -> Implementing).
     pub rework_prompt_visible: bool,
     /// Text input for the rework reason.
@@ -336,8 +338,6 @@ pub struct App {
     pub cleanup_unlinked_target: Option<(PathBuf, String, u64)>,
     /// Receiver for the async unlinked-item cleanup thread result.
     pub cleanup_rx: Option<crossbeam_channel::Receiver<CleanupResult>>,
-    /// Activity ID for the running cleanup indicator.
-    pub cleanup_activity: Option<ActivityId>,
     /// True while the cleanup background thread is running.
     /// The dialog stays open with a spinner in this state.
     pub cleanup_in_progress: bool,
@@ -518,8 +518,6 @@ pub struct App {
     // -- Async PR merge --
     /// Receiver for asynchronous PR merge results.
     pub pr_merge_rx: Option<crossbeam_channel::Receiver<PrMergeResult>>,
-    /// Activity ID for the running PR merge indicator.
-    pub pr_merge_activity: Option<ActivityId>,
 
     // -- Async review submission --
     /// Receiver for asynchronous review submission results.
@@ -647,6 +645,7 @@ impl App {
             confirm_delete: DeleteConfirmState::None,
             confirm_merge: false,
             merge_wi_id: None,
+            merge_in_progress: false,
             rework_prompt_visible: false,
             rework_prompt_input: crate::create_dialog::SimpleTextInput::new(),
             rework_prompt_wi: None,
@@ -657,7 +656,6 @@ impl App {
             cleanup_reason_input: crate::create_dialog::SimpleTextInput::new(),
             cleanup_unlinked_target: None,
             cleanup_rx: None,
-            cleanup_activity: None,
             cleanup_in_progress: false,
             cleanup_progress_pr_number: None,
             cleanup_progress_repo_path: None,
@@ -727,7 +725,6 @@ impl App {
             pr_create_wi: None,
             pr_create_pending: VecDeque::new(),
             pr_merge_rx: None,
-            pr_merge_activity: None,
             review_submit_rx: None,
             review_submit_wi: None,
             review_submit_activity: None,
@@ -1119,10 +1116,7 @@ impl App {
             entry.alive = false;
         }
         // Cancel all in-flight review gates.
-        let gates: Vec<_> = self.review_gates.drain().collect();
-        for (_, gate) in gates {
-            self.end_activity(gate.activity);
-        }
+        self.review_gates.clear();
         if let Some(ref mut entry) = self.global_session {
             if let Some(ref mut session) = entry.session {
                 session.force_kill();
@@ -1644,9 +1638,7 @@ impl App {
         self.pr_create_pending.retain(|id| id != wi_id);
         if self.merge_wi_id.as_ref() == Some(wi_id) && self.pr_merge_rx.is_some() {
             self.pr_merge_rx = None;
-            if let Some(aid) = self.pr_merge_activity.take() {
-                self.end_activity(aid);
-            }
+            self.merge_in_progress = false;
         }
         if self.review_submit_wi.as_ref() == Some(wi_id) {
             self.review_submit_rx = None;
@@ -1673,9 +1665,7 @@ impl App {
             self.merge_wi_id = None;
             self.confirm_merge = false;
         }
-        if let Some(gate) = self.review_gates.remove(wi_id) {
-            self.end_activity(gate.activity);
-        }
+        self.review_gates.remove(wi_id);
 
         Ok(())
     }
@@ -1818,7 +1808,6 @@ impl App {
         });
 
         self.cleanup_rx = Some(rx);
-        self.cleanup_activity = Some(self.start_activity(format!("Closing PR #{pr_number}...")));
     }
 
     /// Poll the async unlinked-item cleanup thread for a result. Called on each timer tick.
@@ -1838,9 +1827,6 @@ impl App {
                 self.cleanup_progress_pr_number = None;
                 self.cleanup_progress_repo_path = None;
                 self.cleanup_progress_branch = None;
-                if let Some(aid) = self.cleanup_activity.take() {
-                    self.end_activity(aid);
-                }
                 self.alert_message = Some("Cleanup: background thread exited unexpectedly".into());
                 return;
             }
@@ -1849,9 +1835,6 @@ impl App {
         self.cleanup_rx = None;
         self.cleanup_prompt_visible = false;
         self.cleanup_in_progress = false;
-        if let Some(aid) = self.cleanup_activity.take() {
-            self.end_activity(aid);
-        }
 
         // Track the closed branch so stale fetch results (from in-flight
         // fetches that started before the close) don't re-add the PR.
@@ -4226,9 +4209,7 @@ impl App {
 
         // If the retreating item has a pending review gate, cancel it.
         // The gate result would be stale since the user intentionally moved away.
-        if let Some(gate) = self.review_gates.remove(&wi_id) {
-            self.end_activity(gate.activity);
-        }
+        self.review_gates.remove(&wi_id);
 
         // Cancel any in-flight PR merge. Merges are only spawned from Review,
         // so when retreating from Review we drop the receiver to prevent
@@ -4236,9 +4217,9 @@ impl App {
         // will finish on its own; we just ignore its result.
         if current_status == WorkItemStatus::Review && self.pr_merge_rx.is_some() {
             self.pr_merge_rx = None;
-            if let Some(aid) = self.pr_merge_activity.take() {
-                self.end_activity(aid);
-            }
+            self.merge_in_progress = false;
+            self.confirm_merge = false;
+            self.merge_wi_id = None;
         }
 
         // Cancel any in-flight or pending PR creation for the retreating item.
@@ -4704,7 +4685,7 @@ impl App {
         // The background thread may have already merged a PR on GitHub;
         // replacing the receiver would silently lose its result.
         if self.pr_merge_rx.is_some() {
-            self.status_message = Some("PR merge already in progress".into());
+            self.alert_message = Some("PR merge already in progress".into());
             return;
         }
 
@@ -4715,14 +4696,18 @@ impl App {
         let assoc = match wi.repo_associations.first() {
             Some(a) => a,
             None => {
-                self.status_message = Some("Cannot merge: no repo association".into());
+                self.confirm_merge = false;
+                self.merge_wi_id = None;
+                self.alert_message = Some("Cannot merge: no repo association".into());
                 return;
             }
         };
         let branch = match assoc.branch.as_ref() {
             Some(b) => b.clone(),
             None => {
-                self.status_message = Some("Cannot merge: no branch associated".into());
+                self.confirm_merge = false;
+                self.merge_wi_id = None;
+                self.alert_message = Some("Cannot merge: no branch associated".into());
                 return;
             }
         };
@@ -4732,7 +4717,9 @@ impl App {
         let (owner, repo_name) = match self.worktree_service.github_remote(&repo_path) {
             Ok(Some((o, r))) => (o, r),
             _ => {
-                self.status_message = Some("Cannot merge: no GitHub remote found".into());
+                self.confirm_merge = false;
+                self.merge_wi_id = None;
+                self.alert_message = Some("Cannot merge: no GitHub remote found".into());
                 return;
             }
         };
@@ -4824,10 +4811,7 @@ impl App {
         });
 
         self.pr_merge_rx = Some(rx);
-        if let Some(aid) = self.pr_merge_activity.take() {
-            self.end_activity(aid);
-        }
-        self.pr_merge_activity = Some(self.start_activity("Merging pull request..."));
+        self.merge_in_progress = true;
     }
 
     /// Poll the async PR merge thread for a result. Called on each timer tick.
@@ -4842,19 +4826,18 @@ impl App {
             Err(crossbeam_channel::TryRecvError::Empty) => return,
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 self.pr_merge_rx = None;
-                if let Some(aid) = self.pr_merge_activity.take() {
-                    self.end_activity(aid);
-                }
-                self.status_message =
-                    Some("PR merge: background thread exited unexpectedly".into());
+                self.merge_in_progress = false;
+                self.confirm_merge = false;
+                self.merge_wi_id = None;
+                self.alert_message = Some("PR merge: background thread exited unexpectedly".into());
                 return;
             }
         };
 
         self.pr_merge_rx = None;
-        if let Some(aid) = self.pr_merge_activity.take() {
-            self.end_activity(aid);
-        }
+        self.merge_in_progress = false;
+        self.confirm_merge = false;
+        self.merge_wi_id = None;
 
         // Guard: if the item's status changed while the merge was in-flight
         // (e.g. user retreated to Implementing), discard the stale result to
@@ -4867,7 +4850,7 @@ impl App {
 
         match result.outcome {
             PrMergeOutcome::NoPr => {
-                self.status_message =
+                self.alert_message =
                     Some("Cannot merge: no PR found. Push branch and open a PR first.".into());
             }
             PrMergeOutcome::Merged {
@@ -4943,12 +4926,12 @@ impl App {
                     &WorkItemStatus::Implementing,
                     "merge_conflict",
                 );
-                self.status_message = Some(
+                self.alert_message = Some(
                     "Merge conflict detected - moved back to [IM] for rebase/resolve".to_string(),
                 );
             }
             PrMergeOutcome::Failed { ref error } => {
-                self.status_message = Some(error.clone());
+                self.alert_message = Some(error.clone());
             }
         }
     }
@@ -5960,15 +5943,8 @@ impl App {
             let _ = tx.send(ReviewGateMessage::Result(result));
         });
 
-        let activity = self.start_activity("Running review gate...");
-        self.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                activity,
-                progress: None,
-            },
-        );
+        self.review_gates
+            .insert(wi_id.clone(), ReviewGateState { rx, progress: None });
         ReviewGateSpawn::Spawned
     }
 
@@ -6020,9 +5996,7 @@ impl App {
 
             if disconnected {
                 // Thread exited without sending a Result - treat as gate error.
-                if let Some(gate) = self.review_gates.remove(&wi_id) {
-                    self.end_activity(gate.activity);
-                }
+                self.review_gates.remove(&wi_id);
                 self.status_message =
                     Some("Review gate: background thread exited unexpectedly".into());
                 continue;
@@ -6035,9 +6009,7 @@ impl App {
 
             // Gate completed - remove from map.
             debug_assert_eq!(result.work_item_id, wi_id);
-            if let Some(gate) = self.review_gates.remove(&wi_id) {
-                self.end_activity(gate.activity);
-            }
+            self.review_gates.remove(&wi_id);
 
             // Verify the work item is still eligible for the gate result.
             // Both Implementing and Blocked are valid pre-gate states (Blocked->Review
@@ -9148,7 +9120,7 @@ mod tests {
             .status
             .clone();
         assert_eq!(status, WorkItemStatus::Review, "must stay in Review");
-        let msg = app.status_message.as_deref().unwrap_or("");
+        let msg = app.alert_message.as_deref().unwrap_or("");
         assert!(msg.contains("no repo association"), "got: {msg}");
     }
 
@@ -9183,7 +9155,7 @@ mod tests {
             .status
             .clone();
         assert_eq!(status, WorkItemStatus::Review, "must stay in Review");
-        let msg = app.status_message.as_deref().unwrap_or("");
+        let msg = app.alert_message.as_deref().unwrap_or("");
         assert!(msg.contains("no branch"), "got: {msg}");
     }
 
@@ -9219,7 +9191,7 @@ mod tests {
             .status
             .clone();
         assert_eq!(status, WorkItemStatus::Review, "must stay in Review");
-        let msg = app.status_message.as_deref().unwrap_or("");
+        let msg = app.alert_message.as_deref().unwrap_or("");
         assert!(msg.contains("no GitHub remote"), "got: {msg}");
     }
 
@@ -9256,7 +9228,7 @@ mod tests {
             .status
             .clone();
         assert_eq!(status, WorkItemStatus::Review, "must stay in Review");
-        let msg = app.status_message.as_deref().unwrap_or("");
+        let msg = app.alert_message.as_deref().unwrap_or("");
         assert!(msg.contains("no PR found"), "got: {msg}");
     }
 
@@ -9947,15 +9919,8 @@ mod tests {
             detail: "Tests are missing for the new feature".into(),
         }))
         .unwrap();
-        let activity = app.start_activity("test gate");
-        app.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                activity,
-                progress: None,
-            },
-        );
+        app.review_gates
+            .insert(wi_id.clone(), ReviewGateState { rx, progress: None });
 
         app.poll_review_gate();
 
@@ -9992,15 +9957,8 @@ mod tests {
             detail: "All plan items implemented".into(),
         }))
         .unwrap();
-        let activity = app.start_activity("test gate");
-        app.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                activity,
-                progress: None,
-            },
-        );
+        app.review_gates
+            .insert(wi_id.clone(), ReviewGateState { rx, progress: None });
 
         app.poll_review_gate();
 
@@ -10035,15 +9993,8 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(ReviewGateMessage::Progress("2 / 3 CI checks green".into()))
             .unwrap();
-        let activity = app.start_activity("test gate");
-        app.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                activity,
-                progress: None,
-            },
-        );
+        app.review_gates
+            .insert(wi_id.clone(), ReviewGateState { rx, progress: None });
 
         app.poll_review_gate();
 
@@ -10080,15 +10031,8 @@ mod tests {
             detail: "Missing error handling".into(),
         }))
         .unwrap();
-        let activity = app.start_activity("test gate");
-        app.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                activity,
-                progress: None,
-            },
-        );
+        app.review_gates
+            .insert(wi_id.clone(), ReviewGateState { rx, progress: None });
 
         app.poll_review_gate();
 
@@ -10118,15 +10062,8 @@ mod tests {
         ))
         .unwrap();
         drop(tx); // Simulate thread exit without sending Result.
-        let activity = app.start_activity("test gate");
-        app.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                activity,
-                progress: None,
-            },
-        );
+        app.review_gates
+            .insert(wi_id.clone(), ReviewGateState { rx, progress: None });
 
         app.poll_review_gate();
 
@@ -10230,12 +10167,10 @@ mod tests {
 
         // Simulate gate running for item A.
         let (_dummy_tx, dummy_rx) = crossbeam_channel::unbounded();
-        let activity = app.start_activity("test gate");
         app.review_gates.insert(
             wi_id_a.clone(),
             ReviewGateState {
                 rx: dummy_rx,
-                activity,
                 progress: None,
             },
         );
