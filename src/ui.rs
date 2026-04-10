@@ -1,7 +1,7 @@
 use ratatui_core::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Margin, Position, Rect},
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{StatefulWidget, Widget},
 };
@@ -467,6 +467,24 @@ fn format_board_item<'a>(
     ListItem::new(Text::from(lines))
 }
 
+/// Find the index of the group header that applies to the item at `offset`.
+/// Walks backwards from `offset` (clamped to the last valid index) and returns
+/// the first `GroupHeader` encountered. Returns `None` when there are no
+/// headers before or at `offset` (e.g., board drill-down mode or offset 0 with
+/// no leading header).
+fn find_current_group_header(display_list: &[DisplayEntry], offset: usize) -> Option<usize> {
+    if display_list.is_empty() {
+        return None;
+    }
+    let start = offset.min(display_list.len() - 1);
+    for i in (0..=start).rev() {
+        if matches!(display_list[i], DisplayEntry::GroupHeader { .. }) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // When the settings overlay is open, dim background panels so the
     // overlay is the clear focal point.
@@ -570,10 +588,57 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         .block(block)
         .highlight_style(theme.style_tab_highlight_bg());
 
-    let mut state = ListState::default();
+    let mut state = ListState::default().with_offset(app.list_scroll_offset.get());
     state.select(app.selected_item);
 
     StatefulWidget::render(list, area, buf, &mut state);
+
+    // Persist the (possibly adjusted) offset for the next frame.
+    app.list_scroll_offset.set(state.offset());
+
+    // --- Sticky group header overlay ---
+    // When a group header has scrolled above the viewport, render it pinned
+    // at the top of the list's inner area so the user always knows which
+    // group the visible items belong to.
+    if app.board_drill_stage.is_none() {
+        let offset = state.offset();
+        if let Some(header_idx) = find_current_group_header(&app.display_list, offset) {
+            // Only show sticky header when the original is NOT visible
+            // (i.e., it has scrolled above the viewport).
+            if header_idx < offset
+                && let DisplayEntry::GroupHeader {
+                    ref label,
+                    count,
+                    ref kind,
+                } = app.display_list[header_idx]
+            {
+                let text = format!("{label} ({count})");
+                let style = match kind {
+                    GroupHeaderKind::Blocked => theme.style_sticky_header_blocked(),
+                    GroupHeaderKind::Normal => theme.style_sticky_header(),
+                };
+                // The block has Borders::ALL, so the inner area has 1-cell
+                // margin on each side.
+                let inner = area.inner(Margin::new(1, 1));
+                let sticky_area = Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: 1,
+                };
+                // Fill the entire row with the sticky background so it
+                // visually separates from the highlighted item below.
+                let bg_style = Style::default().bg(theme.sticky_header_bg);
+                let line = Line::from(vec![
+                    Span::styled("  ", bg_style),
+                    Span::styled(text, style),
+                ]);
+                Paragraph::new(line)
+                    .style(bg_style)
+                    .render(sticky_area, buf);
+            }
+        }
+    }
 
     // Scrollbar - only when content overflows the viewport.
     let inner_height = area.height.saturating_sub(2) as usize;
@@ -3035,6 +3100,165 @@ mod format_entry_tests {
 }
 
 #[cfg(test)]
+mod sticky_header_tests {
+    use super::find_current_group_header;
+    use crate::app::{DisplayEntry, GroupHeaderKind};
+
+    fn make_display_list() -> Vec<DisplayEntry> {
+        vec![
+            DisplayEntry::GroupHeader {
+                label: "ACTIVE (repo)".into(),
+                count: 2,
+                kind: GroupHeaderKind::Normal,
+            },
+            DisplayEntry::WorkItemEntry(0),
+            DisplayEntry::WorkItemEntry(1),
+            DisplayEntry::GroupHeader {
+                label: "BACKLOGGED (repo)".into(),
+                count: 1,
+                kind: GroupHeaderKind::Normal,
+            },
+            DisplayEntry::WorkItemEntry(2),
+        ]
+    }
+
+    #[test]
+    fn header_at_offset_zero() {
+        let list = make_display_list();
+        // Offset 0 is the ACTIVE header itself.
+        assert_eq!(find_current_group_header(&list, 0), Some(0));
+    }
+
+    #[test]
+    fn header_for_first_group_item() {
+        let list = make_display_list();
+        // Offset 1 is the first item under ACTIVE - header is at 0.
+        assert_eq!(find_current_group_header(&list, 1), Some(0));
+    }
+
+    #[test]
+    fn header_for_second_group_item() {
+        let list = make_display_list();
+        // Offset 2 is the second item under ACTIVE - header still at 0.
+        assert_eq!(find_current_group_header(&list, 2), Some(0));
+    }
+
+    #[test]
+    fn header_switches_at_second_group() {
+        let list = make_display_list();
+        // Offset 3 is the BACKLOGGED header - returns itself.
+        assert_eq!(find_current_group_header(&list, 3), Some(3));
+    }
+
+    #[test]
+    fn header_for_item_in_second_group() {
+        let list = make_display_list();
+        // Offset 4 is the item under BACKLOGGED - header is at 3.
+        assert_eq!(find_current_group_header(&list, 4), Some(3));
+    }
+
+    #[test]
+    fn empty_display_list() {
+        let list: Vec<DisplayEntry> = vec![];
+        assert_eq!(find_current_group_header(&list, 0), None);
+    }
+
+    #[test]
+    fn no_headers_at_all() {
+        let list = vec![
+            DisplayEntry::WorkItemEntry(0),
+            DisplayEntry::WorkItemEntry(1),
+        ];
+        assert_eq!(find_current_group_header(&list, 0), None);
+        assert_eq!(find_current_group_header(&list, 1), None);
+    }
+
+    #[test]
+    fn offset_beyond_list_length() {
+        let list = make_display_list();
+        // Offset far beyond the list - clamps to last valid index, finds
+        // the BACKLOGGED header at index 3.
+        assert_eq!(find_current_group_header(&list, 100), Some(3));
+    }
+
+    #[test]
+    fn consecutive_headers_returns_nearest() {
+        // Two consecutive headers (empty first group).
+        let list = vec![
+            DisplayEntry::GroupHeader {
+                label: "EMPTY GROUP".into(),
+                count: 0,
+                kind: GroupHeaderKind::Normal,
+            },
+            DisplayEntry::GroupHeader {
+                label: "POPULATED GROUP".into(),
+                count: 1,
+                kind: GroupHeaderKind::Normal,
+            },
+            DisplayEntry::WorkItemEntry(0),
+        ];
+        // Offset 0: finds the first header.
+        assert_eq!(find_current_group_header(&list, 0), Some(0));
+        // Offset 1: finds the second header (closest).
+        assert_eq!(find_current_group_header(&list, 1), Some(1));
+        // Offset 2: item in second group, header at 1.
+        assert_eq!(find_current_group_header(&list, 2), Some(1));
+    }
+
+    #[test]
+    fn blocked_header_kind_preserved() {
+        let list = vec![
+            DisplayEntry::GroupHeader {
+                label: "BLOCKED (repo)".into(),
+                count: 1,
+                kind: GroupHeaderKind::Blocked,
+            },
+            DisplayEntry::WorkItemEntry(0),
+        ];
+        let idx = find_current_group_header(&list, 1).unwrap();
+        assert_eq!(idx, 0);
+        // Verify it's the blocked header (the caller can inspect the kind).
+        match &list[idx] {
+            DisplayEntry::GroupHeader { kind, .. } => {
+                assert_eq!(*kind, GroupHeaderKind::Blocked);
+            }
+            _ => panic!("expected GroupHeader"),
+        }
+    }
+
+    #[test]
+    fn three_groups_scrolled_to_middle() {
+        let list = vec![
+            DisplayEntry::GroupHeader {
+                label: "GROUP A".into(),
+                count: 1,
+                kind: GroupHeaderKind::Normal,
+            },
+            DisplayEntry::WorkItemEntry(0),
+            DisplayEntry::GroupHeader {
+                label: "GROUP B".into(),
+                count: 2,
+                kind: GroupHeaderKind::Normal,
+            },
+            DisplayEntry::WorkItemEntry(1),
+            DisplayEntry::WorkItemEntry(2),
+            DisplayEntry::GroupHeader {
+                label: "GROUP C".into(),
+                count: 1,
+                kind: GroupHeaderKind::Normal,
+            },
+            DisplayEntry::WorkItemEntry(3),
+        ];
+        // Scrolled to second item of GROUP B (index 4).
+        assert_eq!(find_current_group_header(&list, 4), Some(2));
+        // Scrolled to GROUP C header (index 5).
+        assert_eq!(find_current_group_header(&list, 5), Some(5));
+        // Scrolled to item in GROUP C (index 6).
+        assert_eq!(find_current_group_header(&list, 6), Some(5));
+    }
+}
+
+#[cfg(test)]
 mod snapshot_tests {
     use super::draw_to_buffer;
     use crate::app::{App, FocusPanel, StubBackend, ViewMode, is_selectable};
@@ -3910,5 +4134,80 @@ mod snapshot_tests {
         let mut app = App::new();
         app.alert_message = Some("PR close failed: permission denied".to_string());
         insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    // -- Sticky group header tests --
+
+    #[test]
+    fn sticky_header_visible_when_scrolled() {
+        // Create enough items to force scrolling in a short viewport.
+        // All items are in the same repo so they share one ACTIVE header.
+        let items = vec![
+            make_work_item("a1", "Item A1", WorkItemStatus::Implementing, None, 1),
+            make_work_item("a2", "Item A2", WorkItemStatus::Implementing, None, 1),
+            make_work_item("a3", "Item A3", WorkItemStatus::Implementing, None, 1),
+            make_work_item("a4", "Item A4", WorkItemStatus::Implementing, None, 1),
+            make_work_item("a5", "Item A5", WorkItemStatus::Implementing, None, 1),
+            make_work_item("b1", "Item B1", WorkItemStatus::Backlog, None, 1),
+            make_work_item("b2", "Item B2", WorkItemStatus::Backlog, None, 1),
+        ];
+        let mut app = app_with_items(items, vec![]);
+        // Select the last selectable item to force the viewport to scroll.
+        if let Some(pos) = app.display_list.iter().rposition(is_selectable) {
+            app.selected_item = Some(pos);
+        }
+        // Short viewport forces the ACTIVE header off-screen -> sticky.
+        insta::assert_snapshot!(render(&app, 80, 12));
+    }
+
+    #[test]
+    fn no_sticky_header_at_top_of_list() {
+        // With only a few items, the header is always visible at the top.
+        let items = vec![
+            make_work_item("a", "Item A", WorkItemStatus::Implementing, None, 1),
+            make_work_item("b", "Item B", WorkItemStatus::Backlog, None, 1),
+        ];
+        let app = app_with_items(items, vec![]);
+        // Offset 0, header is visible - no sticky header should appear.
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn no_sticky_header_in_drill_down() {
+        // In board drill-down mode, the display list has no group headers.
+        let items = vec![
+            make_work_item("a", "Item A", WorkItemStatus::Implementing, None, 1),
+            make_work_item("b", "Item B", WorkItemStatus::Implementing, None, 1),
+            make_work_item("c", "Item C", WorkItemStatus::Implementing, None, 1),
+        ];
+        let mut app = app_with_items(items, vec![]);
+        app.board_drill_stage = Some(WorkItemStatus::Implementing);
+        app.board_drill_down = true;
+        app.build_display_list();
+        app.selected_item = app.display_list.iter().rposition(is_selectable);
+        insta::assert_snapshot!(render(&app, 80, 12));
+    }
+
+    #[test]
+    fn sticky_header_shows_correct_group_when_multiple_groups() {
+        // Create items across two groups - when scrolled to the second group,
+        // the second group's header should be sticky (not the first).
+        let items = vec![
+            make_work_item("a1", "Active 1", WorkItemStatus::Implementing, None, 1),
+            make_work_item("a2", "Active 2", WorkItemStatus::Implementing, None, 1),
+            make_work_item("a3", "Active 3", WorkItemStatus::Implementing, None, 1),
+            make_work_item("b1", "Backlog 1", WorkItemStatus::Backlog, None, 1),
+            make_work_item("b2", "Backlog 2", WorkItemStatus::Backlog, None, 1),
+            make_work_item("b3", "Backlog 3", WorkItemStatus::Backlog, None, 1),
+            make_work_item("b4", "Backlog 4", WorkItemStatus::Backlog, None, 1),
+            make_work_item("b5", "Backlog 5", WorkItemStatus::Backlog, None, 1),
+        ];
+        let mut app = app_with_items(items, vec![]);
+        // Select the last backlog item to scroll deep into the BACKLOGGED group.
+        if let Some(pos) = app.display_list.iter().rposition(is_selectable) {
+            app.selected_item = Some(pos);
+        }
+        // Short viewport so the BACKLOGGED header scrolls off -> sticky.
+        insta::assert_snapshot!(render(&app, 80, 12));
     }
 }
