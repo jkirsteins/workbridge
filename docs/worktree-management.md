@@ -85,7 +85,19 @@ The issue number extraction pattern is configurable per-repo (default:
 
 ### Worktree removal on delete
 
-Deleting a work item (Ctrl+D/Delete) performs comprehensive resource cleanup:
+Deleting a work item performs comprehensive resource cleanup. There are
+two entry points:
+
+- **Manual delete (Ctrl+D/Delete)** - runs resource cleanup (worktree
+  removal, branch deletion, PR closure) synchronously on the UI thread
+  via `delete_work_item_by_id()`.
+- **MCP delete (`workbridge_delete` tool)** - runs the non-blocking
+  phases (backend delete, session kill, in-memory cleanup) on the main
+  thread, then spawns resource cleanup on a background thread via
+  `spawn_delete_cleanup()` / `poll_delete_cleanup()` to avoid blocking
+  the UI.
+
+Both paths perform the same cleanup steps:
 
 1. Removes worktree directories via `remove_worktree`
 2. Deletes local git branches via `delete_branch` (force delete)
@@ -93,10 +105,14 @@ Deleting a work item (Ctrl+D/Delete) performs comprehensive resource cleanup:
 4. Kills active sessions and MCP servers
 5. Cleans up in-memory state (rework reasons, review gate findings, etc.)
 
-A 3-step confirmation flow protects against accidental deletion:
+The manual delete path uses a 3-step confirmation flow to protect
+against accidental deletion:
 - First press: "Press again to delete this work item"
 - If dirty worktree detected: "Worktree has uncommitted changes! Press again to force-delete"
 - Final press: deletes with `--force` for dirty worktrees
+
+The MCP delete path always uses force mode (no interactive confirmation
+is possible via MCP).
 
 All cleanup failures are non-blocking - warnings are shown but the delete proceeds.
 
@@ -115,11 +131,30 @@ Worktree removal and branch deletion must happen in the correct order:
    checked-out branch, and the main worktree cannot be removed via
    `git worktree remove`.
 
-3. **Fresh worktree state**: `spawn_unlinked_cleanup()` calls
-   `list_worktrees()` directly in the background thread rather than
-   using the cached `repo_data` worktree list. This avoids acting on
-   stale data when the user has switched branches since the last fetch
-   cycle.
+3. **Fresh vs. cached worktree state**: Different cleanup paths use
+   different data strategies:
+   - `spawn_unlinked_cleanup()` calls `list_worktrees()` directly in
+     the background thread rather than using the cached `repo_data`
+     worktree list. This avoids acting on stale data when the user has
+     switched branches since the last fetch cycle.
+   - `spawn_delete_cleanup()` uses cached data gathered on the main
+     thread before spawning (via `gather_delete_cleanup_infos()`). This
+     is acceptable because the work item's worktree and branch are
+     known at delete time and unlikely to change between gathering and
+     cleanup execution.
+
+4. **Concurrent cleanup protection**: Only one `spawn_delete_cleanup()`
+   thread can run at a time. If a second MCP delete is requested while
+   a previous cleanup is still running, the resource cleanup phase is
+   skipped and an alert dialog warns the user that worktrees, branches,
+   and open PRs may need manual cleanup. The backend record and session
+   are still deleted immediately.
+
+5. **PR eviction tracking**: When the background cleanup thread closes a
+   PR, the (repo_path, branch) pair is added to
+   `cleanup_evicted_branches` so that stale fetch data does not
+   resurrect the closed PR as a phantom unlinked item. This mirrors the
+   eviction tracking used by the unlinked PR cleanup flow.
 
 ### Post-merge cleanup
 

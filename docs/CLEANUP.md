@@ -38,9 +38,9 @@
 
 ## Work item deletion
 
-When a work item is deleted - either manually (Ctrl+D) or automatically via
-auto-archive - the following resources are cleaned up in order via
-`delete_work_item_by_id()`:
+When a work item is deleted - manually (Ctrl+D), via the `workbridge_delete`
+MCP tool, or automatically via auto-archive - the following resources are
+cleaned up in order via `delete_work_item_by_id()`:
 
 1. **Backend record** - `pre_delete_cleanup()` is called (no-op for
    LocalFileBackend; reserved for future backends), then the JSON file is
@@ -62,16 +62,35 @@ auto-archive - the following resources are cleaned up in order via
    suppression, no-plan prompt queue, rework prompt state, merge prompt state,
    and review gate state are all cleared.
 
-Steps 4-6 involve blocking I/O (git commands, gh CLI) and are only
-executed for user-initiated deletes (Ctrl+D). Auto-archive skips them
-(`skip_resource_cleanup: true`) because blocking I/O is prohibited on
-the UI thread where auto-archive runs during timer-driven reassembly.
+Steps 4-6 involve blocking I/O (git commands, gh CLI). The Ctrl+D
+path currently runs them synchronously on the UI thread. The MCP
+delete path (`workbridge_delete`) runs them on a background thread
+via `spawn_delete_cleanup()` / `poll_delete_cleanup()` to avoid
+blocking the UI. Auto-archive skips them entirely
+(`skip_resource_cleanup: true`) because Done items have already been
+through the merge flow which handles resource cleanup.
 
 Steps 4-8 are best-effort: failures produce warning messages but do not
 abort the overall delete. Only a backend delete failure (step 1) is fatal.
 
-The manual delete (Ctrl+D) additionally resets UI selection state and
-rebuilds the display list after the shared cleanup completes.
+Both manual delete (Ctrl+D) and MCP delete (`workbridge_delete`)
+additionally reset UI selection state and rebuild the display list after
+the non-blocking phases complete. MCP delete always uses force mode
+(dirty worktree check is skipped since there is no interactive
+confirmation). The `workbridge_delete` tool is available for all
+non-read-only sessions (both regular work items and review requests).
+
+When the background delete-cleanup thread closes a PR, the
+(repo_path, branch) pair is returned in `CleanupResult::closed_pr_branches`
+and added to `cleanup_evicted_branches` so that stale fetch data does
+not resurrect the closed PR as a phantom unlinked item. This mirrors the
+eviction tracking used by the unlinked PR cleanup flow.
+
+If a second MCP delete is requested while a previous cleanup thread is
+still running, the resource cleanup is skipped and an alert dialog is
+shown to the user warning that worktrees, branches, and open PRs may
+need manual cleanup. The backend record and session are still deleted
+immediately.
 
 ### Force delete
 

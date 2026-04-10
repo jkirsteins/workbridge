@@ -181,6 +181,8 @@ Most forward transitions are triggered by the user via TUI keybinds (advance/ret
 
 All other transitions must go through TUI keybinds.
 
+Claude sessions can also delete the current work item via the `workbridge_delete` MCP tool, available for all non-read-only sessions (both regular work items and review requests). The backend record is deleted and the session is killed immediately on the main thread. Resource cleanup (worktree removal, branch deletion, PR closure) runs asynchronously on a background thread to avoid blocking the UI. Force mode is always used (no interactive dirty-worktree confirmation). See docs/CLEANUP.md for the deletion phases.
+
 ### Review gate
 
 When a work item transitions from Implementing or Blocked to Review (whether

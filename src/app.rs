@@ -264,6 +264,21 @@ pub struct PrIdentityBackfillResult {
 pub struct CleanupResult {
     /// Best-effort warnings (non-fatal failures during PR close / branch delete).
     pub warnings: Vec<String>,
+    /// (repo_path, branch) pairs for PRs that were successfully closed.
+    /// Used to populate `cleanup_evicted_branches` so stale fetch data
+    /// does not resurrect closed PRs as phantom unlinked items.
+    pub closed_pr_branches: Vec<(PathBuf, String)>,
+}
+
+/// Info gathered on the main thread for one repo association, passed to
+/// the background delete-cleanup thread for resource removal.
+pub(crate) struct DeleteCleanupInfo {
+    repo_path: PathBuf,
+    branch: Option<String>,
+    worktree_path: Option<PathBuf>,
+    branch_in_main_worktree: bool,
+    open_pr_number: Option<u64>,
+    github_remote: Option<(String, String)>,
 }
 
 /// Result from the asynchronous worktree creation thread.
@@ -335,6 +350,10 @@ pub struct App {
     /// stale fetch results from re-adding the PR as unlinked. Applied and
     /// cleared when a fresh fetch arrives (drain_fetch_results returns true).
     pub cleanup_evicted_branches: Vec<(PathBuf, String)>,
+    /// Receiver for the async MCP-triggered work item delete cleanup thread.
+    pub delete_cleanup_rx: Option<crossbeam_channel::Receiver<CleanupResult>>,
+    /// Activity ID for the running delete-cleanup indicator.
+    pub delete_cleanup_activity: Option<ActivityId>,
     /// General-purpose alert dialog. When Some, a red-bordered modal is shown.
     /// Dismissed with Enter or Esc.
     pub alert_message: Option<String>,
@@ -639,6 +658,8 @@ impl App {
             cleanup_progress_repo_path: None,
             cleanup_progress_branch: None,
             cleanup_evicted_branches: Vec::new(),
+            delete_cleanup_rx: None,
+            delete_cleanup_activity: None,
             alert_message: None,
             no_plan_prompt_visible: false,
             no_plan_prompt_queue: VecDeque::new(),
@@ -1737,7 +1758,10 @@ impl App {
             // Otherwise the user would lose their local branch while the PR
             // remains open, and any unpushed commits would be permanently lost.
             if !pr_close_ok {
-                let _ = tx.send(CleanupResult { warnings });
+                let _ = tx.send(CleanupResult {
+                    warnings,
+                    closed_pr_branches: Vec::new(),
+                });
                 return;
             }
 
@@ -1780,7 +1804,10 @@ impl App {
                 }
             }
 
-            let _ = tx.send(CleanupResult { warnings });
+            let _ = tx.send(CleanupResult {
+                warnings,
+                closed_pr_branches: Vec::new(),
+            });
         });
 
         self.cleanup_rx = Some(rx);
@@ -1841,6 +1868,175 @@ impl App {
         } else {
             self.alert_message = Some(format!(
                 "Closed with warnings: {}",
+                result.warnings.join("; ")
+            ));
+        }
+    }
+
+    /// Gather resource cleanup info for a work item's repo associations.
+    /// Pure data lookup from `repo_data` - no I/O. Used to prepare data
+    /// for the background delete-cleanup thread.
+    fn gather_delete_cleanup_infos(
+        &self,
+        repo_associations: &[crate::work_item_backend::RepoAssociationRecord],
+    ) -> Vec<DeleteCleanupInfo> {
+        repo_associations
+            .iter()
+            .map(|assoc| {
+                let wt_for_branch = self
+                    .repo_data
+                    .get(&assoc.repo_path)
+                    .and_then(|rd| rd.worktrees.as_ref().ok())
+                    .and_then(|wts| {
+                        wts.iter()
+                            .find(|wt| wt.branch.as_deref() == assoc.branch.as_deref())
+                    });
+
+                let worktree_path = wt_for_branch
+                    .filter(|wt| !wt.is_main)
+                    .map(|wt| wt.path.clone());
+
+                let branch_in_main_worktree = wt_for_branch.map(|wt| wt.is_main).unwrap_or(false);
+
+                let open_pr_number = assoc.branch.as_deref().and_then(|branch| {
+                    self.repo_data.get(&assoc.repo_path).and_then(|rd| {
+                        rd.prs.as_ref().ok().and_then(|prs| {
+                            prs.iter()
+                                .find(|pr| pr.head_branch == branch && pr.state == "OPEN")
+                                .map(|pr| pr.number)
+                        })
+                    })
+                });
+
+                let github_remote = self
+                    .repo_data
+                    .get(&assoc.repo_path)
+                    .and_then(|rd| rd.github_remote.clone());
+
+                DeleteCleanupInfo {
+                    repo_path: assoc.repo_path.clone(),
+                    branch: assoc.branch.clone(),
+                    worktree_path,
+                    branch_in_main_worktree,
+                    open_pr_number,
+                    github_remote,
+                }
+            })
+            .collect()
+    }
+
+    /// Spawn a background thread to perform resource cleanup (worktree
+    /// removal, branch deletion, PR close) for a deleted work item.
+    /// Called from the MCP delete handler after the backend record and
+    /// session have already been cleaned up on the main thread.
+    /// poll_delete_cleanup() receives the result.
+    pub fn spawn_delete_cleanup(&mut self, cleanup_infos: Vec<DeleteCleanupInfo>) {
+        if self.delete_cleanup_rx.is_some() {
+            // A previous delete cleanup is still running. Alert the user
+            // so orphaned resources (worktrees, branches, open PRs) are
+            // visible rather than silently dropped.
+            self.alert_message = Some(
+                "Delete cleanup skipped: a previous cleanup is still in progress. \
+                 Worktrees, branches, and open PRs for this item may need manual cleanup."
+                    .into(),
+            );
+            return;
+        }
+
+        let ws = Arc::clone(&self.worktree_service);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        std::thread::spawn(move || {
+            let mut warnings = Vec::new();
+            let mut closed_pr_branches = Vec::new();
+
+            for info in &cleanup_infos {
+                if let Some(ref wt_path) = info.worktree_path
+                    && let Err(e) = ws.remove_worktree(&info.repo_path, wt_path, false, true)
+                {
+                    warnings.push(format!("worktree: {e}"));
+                }
+                // Skip branch deletion when checked out in the main worktree
+                // (git forbids deleting the currently checked-out branch).
+                if !info.branch_in_main_worktree
+                    && let Some(ref branch) = info.branch
+                    && let Err(e) = ws.delete_branch(&info.repo_path, branch, true)
+                {
+                    warnings.push(format!("branch: {e}"));
+                }
+                if let Some(pr_number) = info.open_pr_number
+                    && let Some((ref owner, ref repo)) = info.github_remote
+                {
+                    let owner_repo = format!("{owner}/{repo}");
+                    match std::process::Command::new("gh")
+                        .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
+                        .output()
+                    {
+                        Ok(output) if !output.status.success() => {
+                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                            warnings.push(format!("PR close: {stderr}"));
+                        }
+                        Err(e) => warnings.push(format!("PR close: {e}")),
+                        _ => {
+                            // PR was successfully closed - track for eviction.
+                            if let Some(ref branch) = info.branch {
+                                closed_pr_branches.push((info.repo_path.clone(), branch.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+
+            let _ = tx.send(CleanupResult {
+                warnings,
+                closed_pr_branches,
+            });
+        });
+
+        self.delete_cleanup_rx = Some(rx);
+        self.delete_cleanup_activity = Some(self.start_activity("Deleting work item resources..."));
+    }
+
+    /// Poll the async delete-cleanup thread for a result. Called on each
+    /// timer tick from the event loop.
+    pub fn poll_delete_cleanup(&mut self) {
+        let rx = match self.delete_cleanup_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.delete_cleanup_rx = None;
+                if let Some(aid) = self.delete_cleanup_activity.take() {
+                    self.end_activity(aid);
+                }
+                self.alert_message =
+                    Some("Delete cleanup: background thread exited unexpectedly".into());
+                return;
+            }
+        };
+
+        self.delete_cleanup_rx = None;
+        if let Some(aid) = self.delete_cleanup_activity.take() {
+            self.end_activity(aid);
+        }
+
+        // Track closed PRs for cache eviction so stale fetch data
+        // does not resurrect them as phantom unlinked items.
+        if !result.closed_pr_branches.is_empty() {
+            self.cleanup_evicted_branches
+                .extend(result.closed_pr_branches);
+            self.apply_cleanup_evictions();
+        }
+
+        if result.warnings.is_empty() {
+            self.status_message = Some("Work item resource cleanup complete".into());
+        } else {
+            self.alert_message = Some(format!(
+                "Delete cleanup warnings: {}",
                 result.warnings.join("; ")
             ));
         }
@@ -3277,6 +3473,103 @@ impl App {
                         self.claude_working.insert(wi_id);
                     } else {
                         self.claude_working.remove(&wi_id);
+                    }
+                }
+                McpEvent::DeleteWorkItem {
+                    work_item_id: wi_id_str,
+                } => {
+                    let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            continue;
+                        }
+                    };
+
+                    // Gather repo associations from the assembled work item.
+                    let repo_associations: Vec<crate::work_item_backend::RepoAssociationRecord> =
+                        self.work_items
+                            .iter()
+                            .find(|w| w.id == wi_id)
+                            .map(|wi| {
+                                wi.repo_associations
+                                    .iter()
+                                    .map(|a| crate::work_item_backend::RepoAssociationRecord {
+                                        repo_path: a.repo_path.clone(),
+                                        branch: a.branch.clone(),
+                                        pr_identity: None,
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                    // Gather cleanup info BEFORE deleting (needs repo_data lookups).
+                    let cleanup_infos = self.gather_delete_cleanup_infos(&repo_associations);
+
+                    // Non-blocking phases: backend delete, session kill, in-memory
+                    // cleanup. Resource cleanup (Phase 4) is skipped here - it runs
+                    // on a background thread below.
+                    let mut warnings: Vec<String> = Vec::new();
+                    if let Err(e) = self.delete_work_item_by_id(
+                        &wi_id,
+                        &repo_associations,
+                        &mut warnings,
+                        true,
+                        true, // skip_resource_cleanup: Phase 4 runs on background thread
+                    ) {
+                        self.status_message = Some(format!("MCP delete error: {e}"));
+                        continue;
+                    }
+
+                    // Spawn background thread for blocking resource cleanup
+                    // (worktree removal, branch deletion, PR close).
+                    if !cleanup_infos.is_empty() {
+                        self.spawn_delete_cleanup(cleanup_infos);
+                    }
+
+                    // Clear selection identity if the deleted item was selected.
+                    if self.selected_work_item_id() == Some(wi_id) {
+                        self.selected_work_item = None;
+                        self.selected_unlinked_branch = None;
+                        self.selected_review_request_branch = None;
+                    }
+
+                    let old_idx = self.selected_item;
+                    self.reassemble_work_items();
+                    self.build_display_list();
+                    self.fetcher_repos_changed = true;
+
+                    // Re-sync cursor position.
+                    if let Some(old) = old_idx {
+                        let mut found = false;
+                        for i in (0..self.display_list.len().min(old + 1)).rev() {
+                            if is_selectable(&self.display_list[i]) {
+                                self.selected_item = Some(i);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            self.selected_item = None;
+                            for i in 0..self.display_list.len() {
+                                if is_selectable(&self.display_list[i]) {
+                                    self.selected_item = Some(i);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    self.sync_selection_identity();
+
+                    self.focus = FocusPanel::Left;
+                    if warnings.is_empty() {
+                        self.status_message =
+                            Some("Work item deleted via MCP (resource cleanup in progress)".into());
+                    } else {
+                        self.status_message = Some(format!(
+                            "Deleted via MCP (with warnings: {})",
+                            warnings.join("; ")
+                        ));
                     }
                 }
                 McpEvent::SubmitReview {
