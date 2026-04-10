@@ -712,7 +712,7 @@ fn format_work_item_entry<'a>(
 
     // -- Left margin: activity indicator or selection caret --
     let has_session = app.session_key_for(&wi.id).is_some();
-    let is_working = app.claude_working.contains(&wi.id);
+    let is_working = app.claude_working.contains(&wi.id) || app.review_gates.contains_key(&wi.id);
     let (margin_text, margin_style): (String, ratatui_core::style::Style) = if is_working {
         let frame = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
         (format!("{frame} "), theme.style_badge_session_working())

@@ -49,6 +49,11 @@ pub enum McpEvent {
         action: String,
         comment: String,
     },
+    /// Claude called workbridge_report_progress during review gate.
+    ReviewGateProgress {
+        work_item_id: String,
+        message: String,
+    },
 }
 
 /// Handle to the MCP socket server. Holds the socket path for cleanup
@@ -423,6 +428,20 @@ fn handle_message(
                         "properties": {}
                     }
                 }));
+                tools.push(json!({
+                    "name": "workbridge_report_progress",
+                    "description": "Report progress on the current review. Call this to update the user on what you are doing.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "message": {
+                                "type": "string",
+                                "description": "Short progress message, e.g. 'Reviewing authentication changes' or 'Found 3 issues, checking severity'"
+                            }
+                        },
+                        "required": ["message"]
+                    }
+                }));
                 return Some(json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -578,7 +597,10 @@ fn handle_message(
             // caller somehow discovers the tool name, the call is blocked.
             if read_only {
                 match tool_name {
-                    "workbridge_get_context" | "workbridge_get_plan" | "workbridge_query_log" => {
+                    "workbridge_get_context"
+                    | "workbridge_get_plan"
+                    | "workbridge_query_log"
+                    | "workbridge_report_progress" => {
                         // Allowed - fall through to normal handling.
                     }
                     _ => {
@@ -713,6 +735,27 @@ fn handle_message(
                             "content": [{
                                 "type": "text",
                                 "text": log_text
+                            }]
+                        }
+                    }))
+                }
+                "workbridge_report_progress" => {
+                    let message = arguments
+                        .get("message")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let _ = tx.send(McpEvent::ReviewGateProgress {
+                        work_item_id: work_item_id.to_string(),
+                        message,
+                    });
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": "Progress reported."
                             }]
                         }
                     }))
@@ -1364,11 +1407,12 @@ mod tests {
         });
         let resp = handle_message(&msg, "test-id", "", "{}", None, &tx, true).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"workbridge_get_context"));
         assert!(names.contains(&"workbridge_query_log"));
         assert!(names.contains(&"workbridge_get_plan"));
+        assert!(names.contains(&"workbridge_report_progress"));
         assert!(!names.contains(&"workbridge_set_status"));
         assert!(!names.contains(&"workbridge_set_plan"));
         assert!(!names.contains(&"workbridge_set_activity"));

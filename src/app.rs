@@ -3327,6 +3327,16 @@ impl App {
                     }
                     self.spawn_review_submission(&wi_id, &action, &comment);
                 }
+                McpEvent::ReviewGateProgress {
+                    work_item_id: wi_id_str,
+                    message,
+                } => {
+                    if let Ok(wi_id) = serde_json::from_str::<WorkItemId>(&wi_id_str)
+                        && let Some(gate) = self.review_gates.get_mut(&wi_id)
+                    {
+                        gate.progress = Some(message);
+                    }
+                }
             }
         }
     }
