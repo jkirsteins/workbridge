@@ -162,7 +162,7 @@ because the right panel forwards almost all keys to the PTY, which is
 incompatible with rat-focus's widget navigation model.
 
 - Enter on a work item: focus right panel
-- Ctrl+T (when right panel focused): cycle between Claude Code and Terminal tabs
+- Tab (when right panel focused): cycle between Claude Code and Terminal tabs
 - Ctrl+]: return to left panel
 - Ctrl+D / Delete: delete selected work item (3-step confirmation)
 - Dead session: auto-return to left panel
@@ -375,8 +375,7 @@ worktree; otherwise only "Claude Code" is shown.
   `App::terminal_sessions` keyed by `WorkItemId`.
 
 Tab switching (while right panel is focused):
-- Ctrl+T: cycle between Claude Code and Terminal
-- Tab: forwarded to PTY as 0x09 (for tab completion)
+- Tab: cycle between Claude Code and Terminal
 - Shift+Tab: forwarded to PTY as CSI Z (not intercepted)
 
 Terminal sessions are cleaned up on:
