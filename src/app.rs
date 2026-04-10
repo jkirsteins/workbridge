@@ -2493,10 +2493,39 @@ impl App {
         let session_key = (work_item_id.clone(), work_item_status.clone());
         let has_gate_findings = self.review_gate_findings.contains_key(work_item_id);
         let system_prompt = self.stage_system_prompt(work_item_id, cwd);
+
+        // For planning sessions, write the Stop hook script to a temp file.
+        let planning_hook_script_path = if work_item_status == WorkItemStatus::Planning {
+            let path = std::env::temp_dir()
+                .join(format!("workbridge-plan-gate-{}.sh", uuid::Uuid::new_v4()));
+            match std::fs::write(&path, Self::PLANNING_STOP_HOOK_SCRIPT) {
+                Ok(()) => {
+                    // Make executable
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ =
+                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+                    }
+                    Some(path)
+                }
+                Err(e) => {
+                    self.status_message = Some(format!("Failed to write plan gate script: {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut cmd = Self::build_claude_cmd(
             &work_item_status,
             system_prompt.as_deref(),
             has_gate_findings,
+            planning_hook_script_path
+                .as_ref()
+                .map(|p| p.to_string_lossy())
+                .as_deref(),
         );
 
         // Write MCP config as .mcp.json in the worktree AND pass via --mcp-config.
@@ -2577,6 +2606,44 @@ impl App {
         }
     }
 
+    /// Shell script for the planning Stop hook.
+    ///
+    /// The script reads the session transcript (JSONL) and checks whether a
+    /// `tool_use` block for `workbridge_set_plan` was actually invoked (not
+    /// just mentioned in assistant text). A marker file keyed by session_id
+    /// prevents infinite loops: if the hook already blocked once and the
+    /// agent still hasn't called the tool, the second stop attempt is allowed.
+    const PLANNING_STOP_HOOK_SCRIPT: &'static str = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+# The session transcript path comes from CLAUDE_SESSION_TRANSCRIPT env var.
+# The session id comes from CLAUDE_SESSION_ID.
+transcript="${CLAUDE_SESSION_TRANSCRIPT:-}"
+session_id="${CLAUDE_SESSION_ID:-}"
+
+if [ -z "$transcript" ] || [ ! -f "$transcript" ]; then
+  # No transcript available - allow stop to avoid blocking forever.
+  exit 0
+fi
+
+# Check if workbridge_set_plan was called as a tool_use in the transcript.
+if jq -e 'select(.type == "tool_use" and .name == "workbridge_set_plan")' "$transcript" >/dev/null 2>&1; then
+  exit 0
+fi
+
+# Infinite-loop guard: if we already blocked once, allow stop.
+marker="/tmp/workbridge-plan-gate-blocked-${session_id}"
+if [ -f "$marker" ]; then
+  rm -f "$marker"
+  exit 0
+fi
+
+# First block: create marker and reject the stop.
+touch "$marker"
+echo "You MUST call the workbridge_set_plan MCP tool to persist your plan before stopping. Do that now."
+exit 2
+"#;
+
     /// Build the `claude` CLI argument list.
     ///
     /// The positional prompt (for planning sessions) MUST come before
@@ -2587,6 +2654,7 @@ impl App {
         status: &WorkItemStatus,
         system_prompt: Option<&str>,
         force_auto_start: bool,
+        planning_hook_script: Option<&str>,
     ) -> Vec<String> {
         let is_planning = *status == WorkItemStatus::Planning;
         let auto_start = force_auto_start
@@ -2599,11 +2667,14 @@ impl App {
         if is_planning {
             cmd.push("--permission-mode".to_string());
             cmd.push("plan".to_string());
-            cmd.push("--settings".to_string());
-            cmd.push(
-                r#"{"hooks":{"PostToolUse":[{"matcher":"TodoWrite","hooks":[{"type":"command","command":"bash -c 'cat | grep -q workbridge_set_plan || echo \"REMINDER: Your plan MUST include a step to call workbridge_set_plan MCP tool to persist the plan. Add this as the FIRST step.\" >&2; true'"}]}]}}"#
-                    .to_string(),
-            );
+            if let Some(script_path) = planning_hook_script {
+                let settings_json = format!(
+                    r#"{{"hooks":{{"Stop":[{{"matcher":"","hooks":[{{"type":"command","command":"bash {}"}}]}}]}}}}"#,
+                    script_path
+                );
+                cmd.push("--settings".to_string());
+                cmd.push(settings_json);
+            }
         }
         if let Some(prompt) = system_prompt {
             cmd.push("--system-prompt".to_string());
@@ -9024,16 +9095,21 @@ mod tests {
     /// a config file path and exits with "MCP config file not found".
     #[test]
     fn build_claude_cmd_prompt_before_mcp_config() {
-        // Planning session: has --permission-mode plan, --settings hook, and positional prompt.
-        let cmd =
-            App::build_claude_cmd(&WorkItemStatus::Planning, Some("system prompt here"), false);
+        // Planning session: has --permission-mode plan, --settings Stop hook, and positional prompt.
+        let cmd = App::build_claude_cmd(
+            &WorkItemStatus::Planning,
+            Some("system prompt here"),
+            false,
+            Some("/tmp/test-hook.sh"),
+        );
         assert_eq!(cmd[0], "claude");
         assert_eq!(cmd[1], "--permission-mode");
         assert_eq!(cmd[2], "plan");
         assert_eq!(cmd[3], "--settings");
         assert!(
-            cmd[4].contains("PostToolUse") && cmd[4].contains("workbridge_set_plan"),
-            "planning sessions must include TodoWrite reminder hook via --settings",
+            cmd[4].contains("Stop") && cmd[4].contains("/tmp/test-hook.sh"),
+            "planning sessions must include Stop hook via --settings, got: {}",
+            cmd[4],
         );
         assert_eq!(cmd[5], "--system-prompt");
         assert_eq!(cmd[6], "system prompt here");
@@ -9053,7 +9129,12 @@ mod tests {
     /// Implementing sessions also get an auto-start prompt.
     #[test]
     fn build_claude_cmd_implementing_has_prompt() {
-        let cmd = App::build_claude_cmd(&WorkItemStatus::Implementing, Some("impl prompt"), false);
+        let cmd = App::build_claude_cmd(
+            &WorkItemStatus::Implementing,
+            Some("impl prompt"),
+            false,
+            None,
+        );
         assert_eq!(cmd[0], "claude");
         // No --permission-mode for implementing.
         assert_eq!(cmd[1], "--system-prompt");
@@ -9246,7 +9327,7 @@ mod tests {
     #[test]
     fn build_claude_cmd_blocked_review_no_prompt() {
         for status in [WorkItemStatus::Blocked, WorkItemStatus::Review] {
-            let cmd = App::build_claude_cmd(&status, Some("prompt"), false);
+            let cmd = App::build_claude_cmd(&status, Some("prompt"), false, None);
             // Last arg should be the system prompt value, not a positional prompt.
             assert_eq!(cmd.last().unwrap(), "prompt");
         }
@@ -9255,10 +9336,46 @@ mod tests {
     /// Review sessions auto-start when force_auto_start is true (gate findings present).
     #[test]
     fn build_claude_cmd_review_force_auto_start() {
-        let cmd = App::build_claude_cmd(&WorkItemStatus::Review, Some("review prompt"), true);
+        let cmd = App::build_claude_cmd(&WorkItemStatus::Review, Some("review prompt"), true, None);
         assert!(
             cmd.last().unwrap().contains("review gate assessment"),
             "review with force_auto_start should have gate-specific prompt",
+        );
+    }
+
+    /// Planning Stop hook script checks for workbridge_set_plan tool_use in transcript.
+    #[test]
+    fn planning_stop_hook_script_content() {
+        let script = App::PLANNING_STOP_HOOK_SCRIPT;
+        assert!(
+            script.contains("workbridge_set_plan"),
+            "script must check for workbridge_set_plan tool_use",
+        );
+        assert!(
+            script.contains("tool_use"),
+            "script must verify actual tool_use blocks, not text mentions",
+        );
+        assert!(
+            script.contains("exit 2"),
+            "script must exit 2 to block the stop",
+        );
+        assert!(
+            script.contains("workbridge-plan-gate-blocked"),
+            "script must use a marker file for infinite-loop prevention",
+        );
+    }
+
+    /// Planning sessions without a hook script path omit --settings.
+    #[test]
+    fn build_claude_cmd_planning_no_hook_script() {
+        let cmd = App::build_claude_cmd(&WorkItemStatus::Planning, Some("prompt"), false, None);
+        assert_eq!(cmd[0], "claude");
+        assert_eq!(cmd[1], "--permission-mode");
+        assert_eq!(cmd[2], "plan");
+        // No --settings when no hook script path is provided.
+        assert!(
+            !cmd.iter().any(|a| a == "--settings"),
+            "planning without hook script should not include --settings",
         );
     }
 
