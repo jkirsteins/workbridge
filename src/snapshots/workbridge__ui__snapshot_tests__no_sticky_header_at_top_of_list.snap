@@ -1,0 +1,28 @@
+---
+source: src/ui.rs
+expression: "render(&app, 80, 24)"
+---
+  List    Board                                                Tab: switch view
+┌ Work Items (2) ───────┐┌ Claude Code ────────────────────────────────────────┐
+│  ACTIVE (0) (1)       ││                                                     │
+│> [IM] Item A          ││  Item A                                             │
+│  branch-a [no wt]     ││                                                     │
+│  BACKLOGGED (0) (1)   ││  Status      Implementing                           │
+│  [BL] Item B          ││  Backend     Local file                             │
+│  branch-b [no wt]     ││  Repo        /repo/a/0                              │
+│                       ││  Branch      branch-a                               │
+│                       ││  Worktree    (none)                                 │
+│                       ││  PR          (none)                                 │
+│                       ││  Issue       (none)                                 │
+│                       ││  Errors      (none)                                 │
+│                       ││                                                     │
+│                       ││  Press Enter to start a session.                    │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+│                       ││                                                     │
+└───────────────────────┘└─────────────────────────────────────────────────────┘
+Item A | [Implementing] | /repo/a/0

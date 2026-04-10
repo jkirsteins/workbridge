@@ -1,0 +1,16 @@
+---
+source: src/ui.rs
+expression: "render(&app, 80, 12)"
+---
+  List    Board                                                Tab: switch view
+┌ Implementing (3) ─────┐┌ Claude Code ────────────────────────────────────────┐
+│  [IM] Item A          ││                                                     │
+│  branch-a [no wt]     ││  Item C                                             │
+│  [IM] Item B          ││                                                     │
+│  branch-b [no wt]     ││  Status      Implementing                           │
+│> [IM] Item C          ││  Backend     Local file                             │
+│  branch-c [no wt]     ││  Repo        /repo/c/0                              │
+│                       ││  Branch      branch-c                               │
+│                       ││  Worktree    (none)                                 │
+└───────────────────────┘└─────────────────────────────────────────────────────┘
+Item C | [Implementing] | /repo/c/0

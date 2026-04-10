@@ -317,6 +317,32 @@ cycle). This prevents stale offsets from a previous list shape carrying
 over into a structurally different list. ratatui re-clamps the offset
 on the next render frame based on the selected item position.
 
+### Sticky Group Headers
+
+When the left-panel work item list is scrolled down and a group header
+(e.g., "ACTIVE (repo)", "BACKLOGGED (repo)") has scrolled above the
+viewport, a "sticky" copy of that header is rendered at the top of the
+list's inner area. This ensures the user always knows which group the
+currently visible items belong to.
+
+The sticky header is rendered as a `Paragraph` widget overlay after the
+`List` widget has already rendered, overwriting the first row of the
+inner area. It is styled identically to a normal group header.
+
+Behavior:
+- Only active in flat list mode (not board drill-down, which has no
+  group headers)
+- Shows the most recent `GroupHeader` that precedes the current scroll
+  offset
+- Disappears automatically when the original header scrolls back into
+  view (i.e., the user scrolls up past it)
+- Does not affect scrollbar position or item selection
+- Overlays the first visible row - does not insert an extra row
+
+The header lookup is performed by `find_current_group_header()` in
+`ui.rs`, which walks backwards from the scroll offset to find the
+nearest `GroupHeader` entry.
+
 ### Layout: Flat List Mode
 
 ```
