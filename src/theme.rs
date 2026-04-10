@@ -77,6 +77,8 @@ pub struct Theme {
     // -- Work item groups and badges --
     /// Group header text color (e.g., "TODO (2)").
     pub group_header: Color,
+    /// Background for sticky group headers pinned at the top of the list.
+    pub sticky_header_bg: Color,
     /// PR badge color (open PR).
     pub badge_pr: Color,
     /// CI passing badge color.
@@ -159,6 +161,7 @@ impl Theme {
             context_bg: Color::Reset,
 
             group_header: Color::Cyan,
+            sticky_header_bg: Color::DarkGray,
             badge_pr: Color::Green,
             badge_ci_pass: Color::Green,
             badge_ci_fail: Color::Red,
@@ -295,6 +298,20 @@ impl Theme {
     pub fn style_group_header_blocked(&self) -> Style {
         Style::default()
             .fg(self.badge_blocked)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn style_sticky_header(&self) -> Style {
+        Style::default()
+            .fg(self.group_header)
+            .bg(self.sticky_header_bg)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn style_sticky_header_blocked(&self) -> Style {
+        Style::default()
+            .fg(self.badge_blocked)
+            .bg(self.sticky_header_bg)
             .add_modifier(Modifier::BOLD)
     }
 

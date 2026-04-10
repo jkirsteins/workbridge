@@ -1,7 +1,7 @@
 use ratatui_core::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Margin, Position, Rect},
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{StatefulWidget, Widget},
 };
@@ -600,8 +600,8 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
             {
                 let text = format!("{label} ({count})");
                 let style = match kind {
-                    GroupHeaderKind::Blocked => theme.style_group_header_blocked(),
-                    GroupHeaderKind::Normal => theme.style_group_header(),
+                    GroupHeaderKind::Blocked => theme.style_sticky_header_blocked(),
+                    GroupHeaderKind::Normal => theme.style_sticky_header(),
                 };
                 // The block has Borders::ALL, so the inner area has 1-cell
                 // margin on each side.
@@ -612,10 +612,16 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     width: inner.width,
                     height: 1,
                 };
-                // Render identically to how the List widget renders headers:
-                // 2-char left margin + styled text.
-                let line = Line::from(vec![Span::raw("  "), Span::styled(text, style)]);
-                Paragraph::new(line).render(sticky_area, buf);
+                // Fill the entire row with the sticky background so it
+                // visually separates from the highlighted item below.
+                let bg_style = Style::default().bg(theme.sticky_header_bg);
+                let line = Line::from(vec![
+                    Span::styled("  ", bg_style),
+                    Span::styled(text, style),
+                ]);
+                Paragraph::new(line)
+                    .style(bg_style)
+                    .render(sticky_area, buf);
             }
         }
     }

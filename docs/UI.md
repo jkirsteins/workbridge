@@ -327,7 +327,9 @@ currently visible items belong to.
 
 The sticky header is rendered as a `Paragraph` widget overlay after the
 `List` widget has already rendered, overwriting the first row of the
-inner area. It is styled identically to a normal group header.
+inner area. It uses a DarkGray background (`style_sticky_header()` /
+`style_sticky_header_blocked()`) to visually separate it from the
+highlighted item below, which uses a Cyan background.
 
 Behavior:
 - Only active in flat list mode (not board drill-down, which has no
