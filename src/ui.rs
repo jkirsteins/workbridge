@@ -137,21 +137,35 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
     // dialogs with dimmed backgrounds. Order matches the handle_key() intercept
     // chain (cleanup_reason_input_active before cleanup_prompt_visible).
     if app.confirm_merge {
-        draw_prompt_dialog(
-            buf,
-            theme,
-            area,
-            PromptDialogKind::KeyChoice {
-                title: "Merge Strategy",
-                body: "Merge PR?",
-                options: &[
-                    ("[s]", "Squash (default)"),
-                    ("[m]", "Merge"),
-                    ("[p]", "Poll (mergequeue)"),
-                    ("[Esc]", "Cancel"),
-                ],
-            },
-        );
+        if app.merge_in_progress {
+            let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+            draw_prompt_dialog(
+                buf,
+                theme,
+                area,
+                PromptDialogKind::KeyChoice {
+                    title: "Merge Strategy",
+                    body: &format!("{spinner} Merging pull request... Please wait."),
+                    options: &[],
+                },
+            );
+        } else {
+            draw_prompt_dialog(
+                buf,
+                theme,
+                area,
+                PromptDialogKind::KeyChoice {
+                    title: "Merge Strategy",
+                    body: "Merge PR?",
+                    options: &[
+                        ("[s]", "Squash (default)"),
+                        ("[m]", "Merge"),
+                        ("[p]", "Poll (mergequeue)"),
+                        ("[Esc]", "Cancel"),
+                    ],
+                },
+            );
+        }
     } else if app.rework_prompt_visible {
         draw_prompt_dialog(
             buf,
@@ -3712,6 +3726,16 @@ mod snapshot_tests {
         let mut app = App::new();
         app.confirm_merge = true;
         app.merge_wi_id = Some(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
+        insta::assert_snapshot!(render(&app, 80, 24));
+    }
+
+    #[test]
+    fn merge_progress_dialog() {
+        let mut app = App::new();
+        app.confirm_merge = true;
+        app.merge_in_progress = true;
+        app.merge_wi_id = Some(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
+        app.spinner_tick = 3;
         insta::assert_snapshot!(render(&app, 80, 24));
     }
 

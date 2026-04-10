@@ -108,6 +108,27 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    // When a merge is in progress (background thread running), swallow
+    // most keys - the dialog shows a spinner and cannot be interacted with.
+    if app.merge_in_progress {
+        if matches!(
+            (key.modifiers, key.code),
+            (
+                KeyModifiers::NONE | KeyModifiers::SHIFT,
+                KeyCode::Char('q' | 'Q')
+            ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
+        ) {
+            if !app.has_any_session() || app.confirm_quit {
+                app.should_quit = true;
+            } else {
+                app.confirm_quit = true;
+                app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                sync_layout(app);
+            }
+        }
+        return true;
+    }
+
     // When the merge strategy prompt is visible, handle it.
     if app.confirm_merge {
         handle_merge_prompt(app, key);
@@ -926,15 +947,13 @@ fn handle_merge_prompt(app: &mut App, key: KeyEvent) {
     let had_status = app.has_visible_status_bar();
     match (key.modifiers, key.code) {
         (_, KeyCode::Char('s')) | (_, KeyCode::Enter) => {
-            app.confirm_merge = false;
-            if let Some(wi_id) = app.merge_wi_id.take() {
-                app.execute_merge(&wi_id, "squash");
+            if let Some(ref wi_id) = app.merge_wi_id.clone() {
+                app.execute_merge(wi_id, "squash");
             }
         }
         (_, KeyCode::Char('m')) => {
-            app.confirm_merge = false;
-            if let Some(wi_id) = app.merge_wi_id.take() {
-                app.execute_merge(&wi_id, "merge");
+            if let Some(ref wi_id) = app.merge_wi_id.clone() {
+                app.execute_merge(wi_id, "merge");
             }
         }
         (_, KeyCode::Char('p')) => {
@@ -1833,6 +1852,30 @@ mod tests {
         assert!(
             !app.confirm_merge,
             "merge should be cancelled by unknown key"
+        );
+    }
+
+    /// Merge in-progress swallows keys (dialog shows spinner, no interaction).
+    #[test]
+    fn merge_in_progress_swallows_keys() {
+        let mut app = App::new();
+        app.confirm_merge = true;
+        app.merge_in_progress = true;
+        app.merge_wi_id = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
+            "/tmp/test.json",
+        )));
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, esc);
+
+        assert!(app.confirm_merge, "dialog should stay open during progress");
+        assert!(
+            app.merge_in_progress,
+            "in-progress flag must not clear on Esc"
+        );
+        assert!(
+            app.merge_wi_id.is_some(),
+            "merge_wi_id must not clear during progress"
         );
     }
 
