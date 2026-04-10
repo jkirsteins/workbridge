@@ -558,7 +558,7 @@ dialog that blocks interaction until dismissed with Enter or Esc.
 
 1. Main UI (panels, context bar, status bar)
 2. Settings overlay
-3. Prompt dialogs (merge, rework, no-plan, cleanup)
+3. Prompt dialogs (merge, rework, no-plan, cleanup, branch-gone)
 4. Alert dialog (renders above all other prompts)
 5. Global assistant drawer
 6. Create dialog

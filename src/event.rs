@@ -111,6 +111,31 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    // Branch-gone dialog: user can delete the work item or dismiss.
+    if app.branch_gone_prompt.is_some() {
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Char('d')) => {
+                let (wi_id, _) = app.branch_gone_prompt.take().unwrap();
+                // Find the work item in the display list and delete it.
+                // If the work item was removed between showing the dialog
+                // and pressing 'd', bail out to avoid deleting the wrong item.
+                if let Some(idx) = app.work_items.iter().position(|w| w.id == wi_id)
+                    && let Some(di) = app.display_list.iter().position(
+                        |e| matches!(e, crate::app::DisplayEntry::WorkItemEntry(i) if *i == idx),
+                    )
+                {
+                    app.selected_item = Some(di);
+                    app.delete_selected_work_item(true);
+                }
+            }
+            (_, KeyCode::Esc) => {
+                app.branch_gone_prompt = None;
+            }
+            _ => {}
+        }
+        return true;
+    }
+
     // When a merge is in progress (background thread running), swallow
     // most keys - the dialog shows a spinner and cannot be interacted with.
     if app.merge_in_progress {
@@ -1079,6 +1104,7 @@ pub fn handle_paste(app: &mut App, data: &str) -> bool {
         || app.show_settings
         || app.rework_prompt_visible
         || app.no_plan_prompt_visible
+        || app.branch_gone_prompt.is_some()
         || app.confirm_merge
     {
         return false;
@@ -1694,6 +1720,7 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
         || app.show_settings
         || app.rework_prompt_visible
         || app.no_plan_prompt_visible
+        || app.branch_gone_prompt.is_some()
         || app.confirm_merge
     {
         return false;

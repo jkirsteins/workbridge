@@ -302,6 +302,10 @@ pub struct WorktreeCreateResult {
     /// When true, automatically open a Claude session after worktree creation.
     /// Set to false for import operations that only need the worktree.
     pub open_session: bool,
+    /// True when the failure is specifically because the branch could not be
+    /// fetched or created (branch gone). False for other worktree errors
+    /// (permissions, disk full, path conflict).
+    pub branch_gone: bool,
 }
 
 /// App holds the entire application state.
@@ -366,6 +370,10 @@ pub struct App {
     /// General-purpose alert dialog. When Some, a red-bordered modal is shown.
     /// Dismissed with Enter or Esc.
     pub alert_message: Option<String>,
+    /// Branch-gone dialog. Shown when worktree creation fails because the
+    /// work item's branch no longer exists. Holds (work_item_id, error_message).
+    /// The user can choose to delete the work item or dismiss.
+    pub branch_gone_prompt: Option<(WorkItemId, String)>,
     /// True when the no-plan prompt is visible (offered when Claude blocks
     /// because no implementation plan exists).
     pub no_plan_prompt_visible: bool,
@@ -684,6 +692,7 @@ impl App {
             delete_cleanup_rx: None,
             delete_cleanup_activity: None,
             alert_message: None,
+            branch_gone_prompt: None,
             no_plan_prompt_visible: false,
             no_plan_prompt_queue: VecDeque::new(),
             shutting_down: false,
@@ -1847,6 +1856,14 @@ impl App {
             self.confirm_merge = false;
         }
         self.review_gates.remove(wi_id);
+        if self
+            .branch_gone_prompt
+            .as_ref()
+            .map(|(id, _)| id == wi_id)
+            .unwrap_or(false)
+        {
+            self.branch_gone_prompt = None;
+        }
 
         Ok(())
     }
@@ -2813,6 +2830,7 @@ impl App {
                                         branch,
                                     )),
                                     open_session: true,
+                                    branch_gone: true,
                                 });
                                 return;
                             }
@@ -2824,6 +2842,7 @@ impl App {
                                         path: Some(wt_info.path),
                                         error: None,
                                         open_session: true,
+                                        branch_gone: false,
                                     });
                                 }
                                 Err(e) => {
@@ -2836,6 +2855,7 @@ impl App {
                                             branch,
                                         )),
                                         open_session: true,
+                                        branch_gone: false,
                                     });
                                 }
                             }
@@ -3086,7 +3106,20 @@ impl App {
                 }
             }
             (None, Some(error)) => {
-                self.status_message = Some(error);
+                if result.branch_gone {
+                    // Branch no longer exists. Show a dialog so the user
+                    // can delete the orphaned work item or dismiss.
+                    self.branch_gone_prompt = Some((result.wi_id.clone(), error));
+                } else {
+                    // Generic worktree error (permissions, disk, path
+                    // conflict) or import fetch failure. Use alert for
+                    // session errors, status message for imports.
+                    if result.open_session {
+                        self.alert_message = Some(error);
+                    } else {
+                        self.status_message = Some(error);
+                    }
+                }
             }
             (None, None) => {
                 // Unexpected - no path and no error.
@@ -3973,6 +4006,7 @@ impl App {
                          Manual checkout required."
                     )),
                     open_session: false,
+                    branch_gone: false,
                 });
                 return;
             }
@@ -3985,6 +4019,7 @@ impl App {
                         path: Some(wt_info.path),
                         error: None,
                         open_session: false,
+                        branch_gone: false,
                     });
                 }
                 Err(e) => {
@@ -3994,6 +4029,7 @@ impl App {
                         path: None,
                         error: Some(format!("Imported: {title} (worktree not created: {e})")),
                         open_session: false,
+                        branch_gone: false,
                     });
                 }
             }
