@@ -1290,6 +1290,7 @@ impl App {
                         parser,
                         alive: true,
                         session: Some(session),
+                        scrollback_offset: 0,
                     },
                 );
             }
@@ -2929,6 +2930,7 @@ impl App {
                     parser,
                     alive: true,
                     session: Some(session),
+                    scrollback_offset: 0,
                 };
                 self.sessions.insert(session_key.clone(), entry);
                 match mcp_result {
@@ -6320,6 +6322,14 @@ impl App {
         self.sessions.get(&key)
     }
 
+    /// Get a mutable reference to the SessionEntry for the currently selected
+    /// work item. Needed by mouse scroll handling to update scrollback_offset.
+    pub fn active_session_entry_mut(&mut self) -> Option<&mut SessionEntry> {
+        let work_item_id = self.selected_work_item_id()?;
+        let key = self.session_key_for(&work_item_id)?;
+        self.sessions.get_mut(&key)
+    }
+
     /// Returns true if any session is alive (including the global session).
     pub fn has_any_session(&self) -> bool {
         self.sessions.values().any(|e| e.alive)
@@ -6454,6 +6464,7 @@ impl App {
                     parser,
                     alive: true,
                     session: Some(session),
+                    scrollback_offset: 0,
                 });
                 self.global_mcp_server = Some(mcp_server);
             }
@@ -9613,6 +9624,7 @@ mod tests {
                 parser,
                 alive: true,
                 session: None,
+                scrollback_offset: 0,
             },
         );
 

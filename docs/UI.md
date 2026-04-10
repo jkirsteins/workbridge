@@ -45,11 +45,28 @@ any) the cursor is over:
 2. **Right panel** - the per-work-item PTY session area (Claude Code
    or Terminal tab, depending on `right_panel_tab`).
 
-If a target is found and the underlying session is alive, the scroll
-event is encoded according to the child process's mouse protocol mode
-and encoding (queried from the vt100 parser). The resulting bytes are
-written to the PTY master fd. When the child has not enabled mouse
-reporting, scrolls are converted to arrow-key sequences (Up/Down).
+Scroll events drive a local scrollback viewport rather than being
+forwarded directly to the child process:
+
+- **Scroll-up** always enters or advances local scrollback mode. The
+  viewport shifts into the scrollback buffer. Due to a limitation in
+  vt100's `visible_rows()` API (usize underflow when offset exceeds
+  terminal rows), the maximum scrollback depth is clamped to the
+  terminal's row count (typically one screenful). These events are
+  never forwarded to the PTY.
+- **Scroll-down while in scrollback** moves the viewport back toward
+  the live terminal. When the offset reaches 0, the user is back at
+  the live view.
+- **Scroll-down while NOT in scrollback** is forwarded to the child
+  process, encoded according to its mouse protocol mode and encoding
+  (queried from the vt100 parser). When the child has not enabled
+  mouse reporting, scrolls are converted to arrow-key sequences.
+- **Any keypress** while in scrollback mode resets the offset to 0,
+  returning to the live terminal view. The key is still forwarded to
+  the PTY so the user seamlessly resumes typing.
+
+When scrollback mode is active, the panel title shows a [SCROLLBACK]
+indicator so the user knows they are viewing history.
 
 ### Blocking I/O Prohibition
 

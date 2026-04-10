@@ -697,6 +697,16 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
 /// key, matching telnet/SSH conventions). Escape is forwarded to the PTY
 /// so Claude Code can use it.
 fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
+    // Exit scrollback mode on any keypress. The key is still forwarded
+    // to the PTY so the user seamlessly resumes typing.
+    if app
+        .active_session_entry()
+        .is_some_and(|e| e.scrollback_offset > 0)
+        && let Some(entry) = app.active_session_entry_mut()
+    {
+        entry.scrollback_offset = 0;
+    }
+
     // Check if the active session/terminal is dead before forwarding keys.
     // Flush any buffered PTY bytes before changing state.
     match app.right_panel_tab {
@@ -870,6 +880,14 @@ fn handle_global_drawer_key(app: &mut App, key: KeyEvent) -> bool {
     if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.toggle_global_drawer();
         return true;
+    }
+
+    // Exit scrollback mode on any keypress. The key is still forwarded
+    // to the PTY so the user seamlessly resumes typing.
+    if let Some(entry) = app.global_session.as_mut()
+        && entry.scrollback_offset > 0
+    {
+        entry.scrollback_offset = 0;
     }
 
     // For any other key, check if the global session is alive. If dead,
@@ -1654,9 +1672,32 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
             local_col,
             local_row,
         } => {
-            // Extract mouse protocol info from the global session parser,
-            // then drop the lock before calling send_bytes_to_global.
-            // Skip if the session is not alive to avoid writing to a dead PTY.
+            // Scroll-up always enters/advances local scrollback (never forwarded to PTY).
+            // Clamp to the terminal row count because vt100's visible_rows()
+            // panics if scrollback_offset > rows (usize underflow).
+            if scroll_up {
+                if let Some(entry) = app.global_session.as_mut() {
+                    let max = entry
+                        .parser
+                        .lock()
+                        .ok()
+                        .map(|p| p.screen().size().0 as usize)
+                        .unwrap_or(0);
+                    entry.scrollback_offset = (entry.scrollback_offset + 3).min(max);
+                }
+                return true;
+            }
+            // Scroll-down while in scrollback: decrement offset locally.
+            if app
+                .global_session
+                .as_ref()
+                .is_some_and(|s| s.scrollback_offset > 0)
+            {
+                let entry = app.global_session.as_mut().unwrap();
+                entry.scrollback_offset = entry.scrollback_offset.saturating_sub(3);
+                return true;
+            }
+            // Scroll-down while NOT in scrollback: forward to PTY as before.
             let proto = app
                 .global_session
                 .as_ref()
@@ -1682,6 +1723,32 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
             local_col,
             local_row,
         } => {
+            // Scroll-up always enters/advances local scrollback (never forwarded to PTY).
+            // Clamp to the terminal row count because vt100's visible_rows()
+            // panics if scrollback_offset > rows (usize underflow).
+            if scroll_up {
+                if let Some(entry) = app.active_session_entry_mut() {
+                    let max = entry
+                        .parser
+                        .lock()
+                        .ok()
+                        .map(|p| p.screen().size().0 as usize)
+                        .unwrap_or(0);
+                    entry.scrollback_offset = (entry.scrollback_offset + 3).min(max);
+                }
+                return true;
+            }
+            // Scroll-down while in scrollback: decrement offset locally.
+            if app
+                .active_session_entry()
+                .is_some_and(|s| s.scrollback_offset > 0)
+            {
+                if let Some(entry) = app.active_session_entry_mut() {
+                    entry.scrollback_offset = entry.scrollback_offset.saturating_sub(3);
+                }
+                return true;
+            }
+            // Scroll-down while NOT in scrollback: forward to PTY as before.
             // Extract mouse protocol info from the correct session based on
             // which tab is active. Skip if the session is not alive.
             let entry_ref = match app.right_panel_tab {

@@ -12,6 +12,16 @@ use std::time::Duration;
 /// to avoid noticeable UI lag.
 const SIGTERM_GRACE_MS: u64 = 50;
 
+/// Number of scrollback lines retained by the vt100 parser. Lines that
+/// scroll off the top of the visible terminal are kept in this buffer so
+/// the user can scroll back through past output.
+///
+/// Note: vt100's `visible_rows()` has a usize underflow bug when
+/// `scrollback_offset > terminal_rows`, so the viewport can only scroll
+/// back one screenful at a time. The full buffer is still retained for
+/// future use (e.g. if vt100 is patched or a custom renderer is added).
+pub const SCROLLBACK_LINES: usize = 10_000;
+
 /// A PTY-backed session running a child process (e.g. `claude`).
 ///
 /// The session owns the PTY master fd and the child process handle.
@@ -140,7 +150,7 @@ impl Session {
         // The Command::spawn consumed the Stdio objects which close the fds
         // in the parent after fork. No explicit close needed here.
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
 
         // Spawn the reader thread. It takes ownership of reader_fd (the
         // dup'd master OwnedFd) and a clone of the parser Arc. When the
@@ -482,5 +492,37 @@ mod tests {
             !session.is_alive(),
             "is_alive should return false after reap"
         );
+    }
+
+    /// Regression: vt100's visible_rows() panics when scrollback_offset
+    /// exceeds terminal rows due to usize underflow at
+    /// `rows_len - self.scrollback_offset`. This test documents the bug
+    /// so we know when/if vt100 fixes it.
+    #[test]
+    #[should_panic]
+    fn scrollback_offset_exceeding_rows_panics_in_vt100() {
+        let mut parser = vt100::Parser::new(24, 80, 100);
+        for i in 0..200 {
+            parser.process(format!("line {i}\r\n").as_bytes());
+        }
+        // set_scrollback clamps to scrollback.len() (100), so 30 is
+        // valid from its perspective but exceeds rows (24).
+        parser.set_scrollback(30);
+        let _ = parser.screen().cell(0, 0);
+    }
+
+    /// Verify that clamping scrollback_offset to terminal rows avoids
+    /// the vt100 panic.
+    #[test]
+    fn scrollback_offset_clamped_to_rows_does_not_panic() {
+        let mut parser = vt100::Parser::new(24, 80, 100);
+        for i in 0..200 {
+            parser.process(format!("line {i}\r\n").as_bytes());
+        }
+        let rows = parser.screen().size().0 as usize;
+        // Simulate what the render path does: clamp before set_scrollback.
+        let clamped = 30_usize.min(rows);
+        parser.set_scrollback(clamped);
+        assert!(parser.screen().cell(0, 0).is_some());
     }
 }
