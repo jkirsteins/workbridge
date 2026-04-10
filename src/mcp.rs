@@ -480,10 +480,17 @@ fn handle_message(
                     "required": ["working"]
                 }
             }));
+            tools.push(json!({
+                "name": "workbridge_delete",
+                "description": "Delete the current work item. This is irreversible. The backend record is deleted immediately and the session is killed. Resource cleanup (worktree removal, branch deletion, PR closure) runs asynchronously in the background.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }));
             if is_review_request {
                 // Review request items get approve/request-changes tools
-                // instead of set_status/set_plan. No delete tool - review
-                // sessions are constrained to approve/request-changes.
+                // instead of set_status/set_plan.
                 tools.push(json!({
                     "name": "workbridge_approve_review",
                     "description": "Approve the PR review. Submits your approval via GitHub and completes this review request work item.",
@@ -558,14 +565,6 @@ fn handle_message(
                             }
                         },
                         "required": ["title"]
-                    }
-                }));
-                tools.push(json!({
-                    "name": "workbridge_delete",
-                    "description": "Delete the current work item. This is irreversible. The backend record is deleted immediately and the session is killed. Resource cleanup (worktree removal, branch deletion, PR closure) runs asynchronously in the background.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {}
                     }
                 }));
             }
@@ -886,23 +885,6 @@ fn handle_message(
                     }
                 }
                 "workbridge_delete" => {
-                    // Server-side guard: block delete for ReviewRequest items.
-                    // tools/list already excludes this tool for review sessions,
-                    // but a misbehaving client could call it directly.
-                    if work_item_kind == "ReviewRequest" {
-                        return Some(json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {
-                                "content": [{
-                                    "type": "text",
-                                    "text": "Error: workbridge_delete is not available for ReviewRequest work items"
-                                }],
-                                "isError": true
-                            }
-                        }));
-                    }
-
                     let event = McpEvent::DeleteWorkItem {
                         work_item_id: work_item_id.to_string(),
                     };
@@ -2037,7 +2019,7 @@ mod tests {
     }
 
     #[test]
-    fn review_request_session_excludes_delete_tool() {
+    fn review_request_session_includes_delete_tool() {
         let tx = make_tx();
         let msg = json!({
             "jsonrpc": "2.0",
@@ -2049,19 +2031,19 @@ mod tests {
         let tools = resp["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(
-            !names.contains(&"workbridge_delete"),
-            "workbridge_delete must not be available in review request sessions"
+            names.contains(&"workbridge_delete"),
+            "workbridge_delete must be available in review request sessions"
         );
-        // Verify review-specific tools are present.
+        // Verify review-specific tools are also present.
         assert!(names.contains(&"workbridge_approve_review"));
         assert!(names.contains(&"workbridge_request_changes"));
     }
 
     #[test]
-    fn review_request_session_rejects_delete_call() {
-        // Server-side guard: even if a misbehaving client calls workbridge_delete
-        // directly, the handler must reject it for ReviewRequest items.
-        let tx = make_tx();
+    fn review_request_session_accepts_delete_call() {
+        // workbridge_delete is available for all non-read-only sessions,
+        // including ReviewRequest items.
+        let (tx, _rx) = unbounded();
         let msg = json!({
             "jsonrpc": "2.0",
             "id": 99,
@@ -2076,12 +2058,12 @@ mod tests {
         let is_error = resp["result"]["isError"].as_bool().unwrap_or(false);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
-            is_error,
-            "workbridge_delete must return isError for ReviewRequest"
+            !is_error,
+            "workbridge_delete must not return isError for ReviewRequest, got: {text}"
         );
         assert!(
-            text.contains("not available for ReviewRequest"),
-            "error text must mention ReviewRequest, got: {text}"
+            text.contains("Delete request sent"),
+            "response must confirm delete was sent, got: {text}"
         );
     }
 }

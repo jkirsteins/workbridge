@@ -77,11 +77,8 @@ Both manual delete (Ctrl+D) and MCP delete (`workbridge_delete`)
 additionally reset UI selection state and rebuild the display list after
 the non-blocking phases complete. MCP delete always uses force mode
 (dirty worktree check is skipped since there is no interactive
-confirmation). The `workbridge_delete` tool is only available for
-regular work items (Own kind), not review requests - enforced both by
-excluding it from `tools/list` for review sessions and by a server-side
-guard in `tools/call` that rejects the call with an error if
-`work_item_kind == "ReviewRequest"`.
+confirmation). The `workbridge_delete` tool is available for all
+non-read-only sessions (both regular work items and review requests).
 
 When the background delete-cleanup thread closes a PR, the
 (repo_path, branch) pair is returned in `CleanupResult::closed_pr_branches`
