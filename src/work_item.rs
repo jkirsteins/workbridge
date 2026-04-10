@@ -288,6 +288,10 @@ pub struct SessionEntry {
     pub parser: Arc<Mutex<vt100::Parser>>,
     pub alive: bool,
     pub session: Option<Session>,
+    /// How many lines into the scrollback history the user has scrolled.
+    /// 0 means live view (no scrollback). Positive values shift the
+    /// viewport into the past.
+    pub scrollback_offset: usize,
 }
 
 /// Data fetched per repo by a background thread. Sent through a channel

@@ -12,6 +12,11 @@ use std::time::Duration;
 /// to avoid noticeable UI lag.
 const SIGTERM_GRACE_MS: u64 = 50;
 
+/// Number of scrollback lines retained by the vt100 parser. Lines that
+/// scroll off the top of the visible terminal are kept in this buffer so
+/// the user can scroll back through past output.
+pub const SCROLLBACK_LINES: usize = 10_000;
+
 /// A PTY-backed session running a child process (e.g. `claude`).
 ///
 /// The session owns the PTY master fd and the child process handle.
@@ -140,7 +145,7 @@ impl Session {
         // The Command::spawn consumed the Stdio objects which close the fds
         // in the parent after fork. No explicit close needed here.
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
 
         // Spawn the reader thread. It takes ownership of reader_fd (the
         // dup'd master OwnedFd) and a clone of the parser Arc. When the

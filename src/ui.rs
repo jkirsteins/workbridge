@@ -1422,7 +1422,14 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     };
 
     let has_worktree = app.selected_work_item_has_worktree();
-    let input_suffix = if app.focus == FocusPanel::Right {
+
+    let in_scrollback = app
+        .active_session_entry()
+        .is_some_and(|e| e.scrollback_offset > 0);
+
+    let input_suffix = if in_scrollback {
+        " [SCROLLBACK] "
+    } else if app.focus == FocusPanel::Right {
         " [INPUT] "
     } else {
         " "
@@ -1543,7 +1550,8 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 }
                 Some(entry) => {
                     // Lock the shared parser to get the current screen state.
-                    if let Ok(parser) = entry.parser.lock() {
+                    if let Ok(mut parser) = entry.parser.lock() {
+                        parser.set_scrollback(entry.scrollback_offset);
                         let pseudo_term = PseudoTerminal::new(parser.screen()).block(block);
                         pseudo_term.render(area, buf);
                     } else {
@@ -1692,8 +1700,18 @@ fn draw_global_drawer(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // 3. Clear the drawer area and draw the border.
     Clear.render(drawer_rect, buf);
 
+    let drawer_in_scrollback = app
+        .global_session
+        .as_ref()
+        .is_some_and(|e| e.scrollback_offset > 0);
+    let drawer_title = if drawer_in_scrollback {
+        " Global Assistant [SCROLLBACK] (Ctrl+G to close) "
+    } else {
+        " Global Assistant (Ctrl+G to close) "
+    };
+
     let block = Block::default()
-        .title(" Global Assistant (Ctrl+G to close) ")
+        .title(drawer_title)
         .title_style(theme.style_title())
         .borders(Borders::ALL)
         .border_style(theme.style_border_overlay());
@@ -1703,7 +1721,8 @@ fn draw_global_drawer(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // 4. Render the global session PTY or a placeholder.
     match &app.global_session {
         Some(entry) if entry.alive => {
-            if let Ok(parser) = entry.parser.lock() {
+            if let Ok(mut parser) = entry.parser.lock() {
+                parser.set_scrollback(entry.scrollback_offset);
                 let pseudo_term = PseudoTerminal::new(parser.screen());
                 pseudo_term.render(inner, buf);
             } else {
