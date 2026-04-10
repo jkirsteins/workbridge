@@ -1,4 +1,7 @@
-use crate::salsa::ct::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crate::salsa::ct::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use crate::work_item::SelectionState;
 
 use crate::app::{
     App, BOARD_COLUMNS, DeleteConfirmState, DisplayEntry, FocusPanel, RightPanelTab,
@@ -697,6 +700,17 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
 /// key, matching telnet/SSH conventions). Escape is forwarded to the PTY
 /// so Claude Code can use it.
 fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
+    // Clear any active text selection on keypress.
+    if let Some(entry) = app.active_session_entry_mut() {
+        entry.selection = None;
+    }
+    if let Some(entry) = app.active_terminal_entry_mut() {
+        entry.selection = None;
+    }
+    if let Some(entry) = app.global_session.as_mut() {
+        entry.selection = None;
+    }
+
     // Exit scrollback mode on any keypress. The key is still forwarded
     // to the PTY so the user seamlessly resumes typing.
     if app
@@ -880,6 +894,11 @@ fn handle_global_drawer_key(app: &mut App, key: KeyEvent) -> bool {
     if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.toggle_global_drawer();
         return true;
+    }
+
+    // Clear any active text selection on keypress.
+    if let Some(entry) = app.global_session.as_mut() {
+        entry.selection = None;
     }
 
     // Exit scrollback mode on any keypress. The key is still forwarded
@@ -1639,20 +1658,33 @@ fn encode_mouse_scroll(
     }
 }
 
-/// Handle a mouse event. Only scroll events (ScrollUp/ScrollDown) are
-/// processed; all other mouse events are ignored.
+/// Handle a mouse event. Processes scroll events (ScrollUp/ScrollDown) and
+/// left-button click/drag/release for text selection.
 ///
 /// Scroll events are hit-tested against the global drawer and right panel
 /// areas. If the mouse is over a PTY area, the scroll is encoded and
 /// forwarded to the corresponding PTY session.
-/// Returns `true` if the event modified app state (i.e. forwarded scroll data
-/// to a PTY), `false` otherwise. The caller uses this to decide whether a
-/// re-render is needed.
+///
+/// Left-button events drive text selection: click starts a selection, drag
+/// updates it, and release finalizes it and copies the selected text to the
+/// system clipboard. Selection is only intercepted when the child process
+/// has NOT enabled mouse reporting (or when in local scrollback mode).
+///
+/// Returns `true` if the event modified app state, `false` otherwise.
 pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
-    // Only handle scroll events.
-    let scroll_up = match mouse.kind {
-        MouseEventKind::ScrollUp => true,
-        MouseEventKind::ScrollDown => false,
+    // Categorize the event.
+    enum MouseAction {
+        Scroll { up: bool },
+        SelectDown,
+        SelectDrag,
+        SelectUp,
+    }
+    let action = match mouse.kind {
+        MouseEventKind::ScrollUp => MouseAction::Scroll { up: true },
+        MouseEventKind::ScrollDown => MouseAction::Scroll { up: false },
+        MouseEventKind::Down(MouseButton::Left) => MouseAction::SelectDown,
+        MouseEventKind::Drag(MouseButton::Left) => MouseAction::SelectDrag,
+        MouseEventKind::Up(MouseButton::Left) => MouseAction::SelectUp,
         _ => return false,
     };
 
@@ -1671,111 +1703,315 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
         MouseTarget::GlobalDrawer {
             local_col,
             local_row,
-        } => {
-            // Scroll-up always enters/advances local scrollback (never forwarded to PTY).
-            // Clamp to the terminal row count because vt100's visible_rows()
-            // panics if scrollback_offset > rows (usize underflow).
-            if scroll_up {
-                if let Some(entry) = app.global_session.as_mut() {
-                    let max = entry
-                        .parser
-                        .lock()
-                        .ok()
-                        .map(|p| p.screen().size().0 as usize)
-                        .unwrap_or(0);
-                    entry.scrollback_offset = (entry.scrollback_offset + 3).min(max);
+        } => match action {
+            MouseAction::Scroll { up: scroll_up } => {
+                handle_scroll_global(app, scroll_up, local_col, local_row)
+            }
+            MouseAction::SelectDown => {
+                // Check if child wants mouse events and we are NOT in scrollback.
+                if child_wants_mouse_global(app) {
+                    return false;
                 }
-                return true;
+                if let Some(entry) = app.global_session.as_mut() {
+                    entry.selection = Some(SelectionState {
+                        anchor: (local_row, local_col),
+                        current: (local_row, local_col),
+                        dragging: true,
+                    });
+                }
+                true
             }
-            // Scroll-down while in scrollback: decrement offset locally.
-            if app
-                .global_session
-                .as_ref()
-                .is_some_and(|s| s.scrollback_offset > 0)
-            {
-                let entry = app.global_session.as_mut().unwrap();
-                entry.scrollback_offset = entry.scrollback_offset.saturating_sub(3);
-                return true;
+            MouseAction::SelectDrag => {
+                if let Some(entry) = app.global_session.as_mut()
+                    && entry.selection.as_ref().is_some_and(|s| s.dragging)
+                {
+                    if let Some(sel) = entry.selection.as_mut() {
+                        sel.current = (local_row, local_col);
+                    }
+                    return true;
+                }
+                false
             }
-            // Scroll-down while NOT in scrollback: forward to PTY as before.
-            let proto = app
-                .global_session
-                .as_ref()
-                .filter(|s| s.alive)
-                .and_then(|s| {
-                    let parser = s.parser.lock().ok()?;
-                    let screen = parser.screen();
-                    Some((
-                        screen.mouse_protocol_mode(),
-                        screen.mouse_protocol_encoding(),
-                    ))
-                });
-            if let Some((mode, encoding)) = proto
-                && let Some(data) =
-                    encode_mouse_scroll(scroll_up, local_col, local_row, mode, encoding)
-            {
-                app.send_bytes_to_global(&data);
-                return true;
-            }
-            false
-        }
+            MouseAction::SelectUp => handle_selection_up_global(app, local_row, local_col),
+        },
         MouseTarget::RightPanel {
             local_col,
             local_row,
-        } => {
-            // Scroll-up always enters/advances local scrollback (never forwarded to PTY).
-            // Clamp to the terminal row count because vt100's visible_rows()
-            // panics if scrollback_offset > rows (usize underflow).
-            if scroll_up {
-                if let Some(entry) = app.active_session_entry_mut() {
-                    let max = entry
-                        .parser
-                        .lock()
-                        .ok()
-                        .map(|p| p.screen().size().0 as usize)
-                        .unwrap_or(0);
-                    entry.scrollback_offset = (entry.scrollback_offset + 3).min(max);
-                }
-                return true;
+        } => match action {
+            MouseAction::Scroll { up: scroll_up } => {
+                handle_scroll_right(app, scroll_up, local_col, local_row)
             }
-            // Scroll-down while in scrollback: decrement offset locally.
-            if app
-                .active_session_entry()
-                .is_some_and(|s| s.scrollback_offset > 0)
-            {
-                if let Some(entry) = app.active_session_entry_mut() {
-                    entry.scrollback_offset = entry.scrollback_offset.saturating_sub(3);
+            MouseAction::SelectDown => {
+                // Check if child wants mouse events and we are NOT in scrollback.
+                if child_wants_mouse_right(app) {
+                    return false;
                 }
-                return true;
-            }
-            // Scroll-down while NOT in scrollback: forward to PTY as before.
-            // Extract mouse protocol info from the correct session based on
-            // which tab is active. Skip if the session is not alive.
-            let entry_ref = match app.right_panel_tab {
-                RightPanelTab::ClaudeCode => app.active_session_entry(),
-                RightPanelTab::Terminal => app.active_terminal_entry(),
-            };
-            let proto = entry_ref.filter(|s| s.alive).and_then(|s| {
-                let parser = s.parser.lock().ok()?;
-                let screen = parser.screen();
-                Some((
-                    screen.mouse_protocol_mode(),
-                    screen.mouse_protocol_encoding(),
-                ))
-            });
-            if let Some((mode, encoding)) = proto
-                && let Some(data) =
-                    encode_mouse_scroll(scroll_up, local_col, local_row, mode, encoding)
-            {
-                match app.right_panel_tab {
-                    RightPanelTab::ClaudeCode => app.send_bytes_to_active(&data),
-                    RightPanelTab::Terminal => app.send_bytes_to_terminal(&data),
+                if let Some(entry) = active_session_entry_mut_for_tab(app) {
+                    entry.selection = Some(SelectionState {
+                        anchor: (local_row, local_col),
+                        current: (local_row, local_col),
+                        dragging: true,
+                    });
                 }
-                return true;
+                true
             }
-            false
-        }
+            MouseAction::SelectDrag => {
+                if let Some(entry) = active_session_entry_mut_for_tab(app)
+                    && entry.selection.as_ref().is_some_and(|s| s.dragging)
+                {
+                    if let Some(sel) = entry.selection.as_mut() {
+                        sel.current = (local_row, local_col);
+                    }
+                    return true;
+                }
+                false
+            }
+            MouseAction::SelectUp => handle_selection_up_right(app, local_row, local_col),
+        },
         MouseTarget::None => false,
+    }
+}
+
+/// Check whether the child process in the global drawer has enabled mouse
+/// reporting and we are NOT in local scrollback mode. When the child wants
+/// mouse events, we should forward them rather than intercepting for selection.
+fn child_wants_mouse_global(app: &App) -> bool {
+    // In scrollback mode, always intercept for selection.
+    if app
+        .global_session
+        .as_ref()
+        .is_some_and(|e| e.scrollback_offset > 0)
+    {
+        return false;
+    }
+    app.global_session
+        .as_ref()
+        .filter(|s| s.alive)
+        .and_then(|s| s.parser.lock().ok())
+        .is_some_and(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
+}
+
+/// Check whether the child process in the right panel has enabled mouse
+/// reporting and we are NOT in local scrollback mode.
+fn child_wants_mouse_right(app: &App) -> bool {
+    // In scrollback mode, always intercept for selection.
+    let in_scrollback = match app.right_panel_tab {
+        RightPanelTab::ClaudeCode => app
+            .active_session_entry()
+            .is_some_and(|e| e.scrollback_offset > 0),
+        RightPanelTab::Terminal => app
+            .active_terminal_entry()
+            .is_some_and(|e| e.scrollback_offset > 0),
+    };
+    if in_scrollback {
+        return false;
+    }
+    let entry_ref = match app.right_panel_tab {
+        RightPanelTab::ClaudeCode => app.active_session_entry(),
+        RightPanelTab::Terminal => app.active_terminal_entry(),
+    };
+    entry_ref
+        .filter(|s| s.alive)
+        .and_then(|s| s.parser.lock().ok())
+        .is_some_and(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
+}
+
+/// Get a mutable reference to the active session entry based on the current
+/// right panel tab.
+fn active_session_entry_mut_for_tab(app: &mut App) -> Option<&mut crate::work_item::SessionEntry> {
+    match app.right_panel_tab {
+        RightPanelTab::ClaudeCode => app.active_session_entry_mut(),
+        RightPanelTab::Terminal => app.active_terminal_entry_mut(),
+    }
+}
+
+/// Handle scroll events for the global drawer.
+fn handle_scroll_global(app: &mut App, scroll_up: bool, local_col: u16, local_row: u16) -> bool {
+    // Scroll-up always enters/advances local scrollback (never forwarded to PTY).
+    // Clamp to the terminal row count because vt100's visible_rows()
+    // panics if scrollback_offset > rows (usize underflow).
+    if scroll_up {
+        if let Some(entry) = app.global_session.as_mut() {
+            let max = entry
+                .parser
+                .lock()
+                .ok()
+                .map(|p| p.screen().size().0 as usize)
+                .unwrap_or(0);
+            entry.scrollback_offset = (entry.scrollback_offset + 3).min(max);
+        }
+        return true;
+    }
+    // Scroll-down while in scrollback: decrement offset locally.
+    if app
+        .global_session
+        .as_ref()
+        .is_some_and(|s| s.scrollback_offset > 0)
+    {
+        let entry = app.global_session.as_mut().unwrap();
+        entry.scrollback_offset = entry.scrollback_offset.saturating_sub(3);
+        return true;
+    }
+    // Scroll-down while NOT in scrollback: forward to PTY as before.
+    let proto = app
+        .global_session
+        .as_ref()
+        .filter(|s| s.alive)
+        .and_then(|s| {
+            let parser = s.parser.lock().ok()?;
+            let screen = parser.screen();
+            Some((
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+            ))
+        });
+    if let Some((mode, encoding)) = proto
+        && let Some(data) = encode_mouse_scroll(scroll_up, local_col, local_row, mode, encoding)
+    {
+        app.send_bytes_to_global(&data);
+        return true;
+    }
+    false
+}
+
+/// Handle scroll events for the right panel.
+fn handle_scroll_right(app: &mut App, scroll_up: bool, local_col: u16, local_row: u16) -> bool {
+    // Scroll-up always enters/advances local scrollback (never forwarded to PTY).
+    // Clamp to the terminal row count because vt100's visible_rows()
+    // panics if scrollback_offset > rows (usize underflow).
+    if scroll_up {
+        if let Some(entry) = app.active_session_entry_mut() {
+            let max = entry
+                .parser
+                .lock()
+                .ok()
+                .map(|p| p.screen().size().0 as usize)
+                .unwrap_or(0);
+            entry.scrollback_offset = (entry.scrollback_offset + 3).min(max);
+        }
+        return true;
+    }
+    // Scroll-down while in scrollback: decrement offset locally.
+    if app
+        .active_session_entry()
+        .is_some_and(|s| s.scrollback_offset > 0)
+    {
+        if let Some(entry) = app.active_session_entry_mut() {
+            entry.scrollback_offset = entry.scrollback_offset.saturating_sub(3);
+        }
+        return true;
+    }
+    // Scroll-down while NOT in scrollback: forward to PTY as before.
+    // Extract mouse protocol info from the correct session based on
+    // which tab is active. Skip if the session is not alive.
+    let entry_ref = match app.right_panel_tab {
+        RightPanelTab::ClaudeCode => app.active_session_entry(),
+        RightPanelTab::Terminal => app.active_terminal_entry(),
+    };
+    let proto = entry_ref.filter(|s| s.alive).and_then(|s| {
+        let parser = s.parser.lock().ok()?;
+        let screen = parser.screen();
+        Some((
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+        ))
+    });
+    if let Some((mode, encoding)) = proto
+        && let Some(data) = encode_mouse_scroll(scroll_up, local_col, local_row, mode, encoding)
+    {
+        match app.right_panel_tab {
+            RightPanelTab::ClaudeCode => app.send_bytes_to_active(&data),
+            RightPanelTab::Terminal => app.send_bytes_to_terminal(&data),
+        }
+        return true;
+    }
+    false
+}
+
+/// Finalize selection on mouse-up for the global drawer session.
+fn handle_selection_up_global(app: &mut App, local_row: u16, local_col: u16) -> bool {
+    let entry = match app.global_session.as_mut() {
+        Some(e) => e,
+        None => return false,
+    };
+    let sel = match entry.selection.as_mut() {
+        Some(s) if s.dragging => s,
+        _ => return false,
+    };
+    sel.current = (local_row, local_col);
+    sel.dragging = false;
+    // If anchor == current (click with no drag), clear selection.
+    if sel.anchor == sel.current {
+        entry.selection = None;
+        return true;
+    }
+    copy_selection_to_clipboard(entry);
+    true
+}
+
+/// Finalize selection on mouse-up for the right panel session.
+fn handle_selection_up_right(app: &mut App, local_row: u16, local_col: u16) -> bool {
+    let entry = match active_session_entry_mut_for_tab(app) {
+        Some(e) => e,
+        None => return false,
+    };
+    let sel = match entry.selection.as_mut() {
+        Some(s) if s.dragging => s,
+        _ => return false,
+    };
+    sel.current = (local_row, local_col);
+    sel.dragging = false;
+    // If anchor == current (click with no drag), clear selection.
+    if sel.anchor == sel.current {
+        entry.selection = None;
+        return true;
+    }
+    copy_selection_to_clipboard(entry);
+    true
+}
+
+/// Extract the selected text from a session's terminal and copy it to the
+/// system clipboard.
+fn copy_selection_to_clipboard(entry: &crate::work_item::SessionEntry) {
+    let sel = match entry.selection.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let Ok(mut parser) = entry.parser.lock() else {
+        return;
+    };
+
+    // Set scrollback to match the viewport the user sees.
+    let rows = parser.screen().size().0 as usize;
+    let clamped = entry.scrollback_offset.min(rows);
+    parser.set_scrollback(clamped);
+
+    // Normalize selection range so start is before end.
+    let (start_row, start_col, end_row, end_col) = normalize_selection(sel);
+
+    let text = parser
+        .screen()
+        .contents_between(start_row, start_col, end_row, end_col);
+
+    if text.is_empty() {
+        return;
+    }
+
+    // Copy to system clipboard.
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        let _ = clipboard.set_text(text);
+    }
+}
+
+/// Normalize a selection so (start_row, start_col) is before (end_row, end_col).
+fn normalize_selection(sel: &SelectionState) -> (u16, u16, u16, u16) {
+    let (ar, ac) = sel.anchor;
+    let (cr, cc) = sel.current;
+    if ar < cr || (ar == cr && ac <= cc) {
+        (ar, ac, cr, cc)
+    } else {
+        (cr, cc, ar, ac)
     }
 }
 

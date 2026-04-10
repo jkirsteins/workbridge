@@ -1291,6 +1291,7 @@ impl App {
                         alive: true,
                         session: Some(session),
                         scrollback_offset: 0,
+                        selection: None,
                     },
                 );
             }
@@ -1304,6 +1305,12 @@ impl App {
     pub fn active_terminal_entry(&self) -> Option<&SessionEntry> {
         let wi_id = self.selected_work_item_id()?;
         self.terminal_sessions.get(&wi_id)
+    }
+
+    /// Get a mutable terminal SessionEntry for the currently selected work item.
+    pub fn active_terminal_entry_mut(&mut self) -> Option<&mut SessionEntry> {
+        let wi_id = self.selected_work_item_id()?;
+        self.terminal_sessions.get_mut(&wi_id)
     }
 
     /// Buffer bytes for the terminal PTY session.
@@ -2931,6 +2938,7 @@ impl App {
                     alive: true,
                     session: Some(session),
                     scrollback_offset: 0,
+                    selection: None,
                 };
                 self.sessions.insert(session_key.clone(), entry);
                 match mcp_result {
@@ -6522,6 +6530,7 @@ impl App {
                     alive: true,
                     session: Some(session),
                     scrollback_offset: 0,
+                    selection: None,
                 });
                 self.global_mcp_server = Some(mcp_server);
             }
@@ -9682,6 +9691,7 @@ mod tests {
                 alive: true,
                 session: None,
                 scrollback_offset: 0,
+                selection: None,
             },
         );
 

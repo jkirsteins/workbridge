@@ -23,6 +23,7 @@ ratatui-core = "0.1"
 ratatui-crossterm = "0.1"
 ratatui-widgets = "0.3"
 unicode-width = "0.2"
+arboard = "3"
 
 [features]
 integration = []
