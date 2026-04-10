@@ -140,13 +140,12 @@ dialog. A Planning work item is created immediately with a placeholder title
 The Claude agent running in this session uses the `planning_quickstart` system
 prompt, which instructs it to:
 1. Ask the user what they want to work on.
-2. Call `workbridge_set_title` and `workbridge_set_description` via MCP once
-   the task is understood.
+2. Call `workbridge_set_title` via MCP once the task is understood.
 3. Proceed through the normal Phase 1 refinement and Phase 2 planning process,
    ending with a `workbridge_set_plan` call.
 
-The title and description updates via MCP are reflected immediately in the
-left panel. After the first session sets a real title, any subsequent Planning
+The title update via MCP is reflected immediately in the left panel. After
+the first session sets a real title, any subsequent Planning
 session for the same item uses the normal `planning` prompt.
 
 Ctrl+B opens the full creation dialog (title, description, repos, branch) and
@@ -202,7 +201,10 @@ user- or MCP-initiated), a review gate runs asynchronously in three phases:
 3. **Adversarial code review** - spawns a `claude --print` session with MCP
    access to fetch the plan (via `workbridge_get_plan`) and run `git diff`
    itself, then compares the plan against the implementation. If no plan
-   exists, the gate is blocked before it can start.
+   exists, the gate is blocked before it can start. During this phase, Claude
+   reports live progress via the `workbridge_report_progress` MCP tool (e.g.
+   "Reviewing 8 changed files against plan", "Found 3 potential issues,
+   verifying..."). These messages are shown in the right panel.
 
 If the gate approves, the work item advances to Review. If it rejects (at any
 phase), the rejection reason is fed back to the implementing Claude session as

@@ -94,7 +94,6 @@ mod tests {
         );
         let result = render("planning_quickstart", &vars).unwrap();
         assert!(result.contains("workbridge_set_title"));
-        assert!(result.contains("workbridge_set_description"));
         assert!(result.contains("workbridge_set_plan"));
         assert!(result.contains("PHASE 0"));
         assert!(result.contains("PHASE 1: REFINEMENT"));
