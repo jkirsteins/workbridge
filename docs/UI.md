@@ -49,9 +49,11 @@ Scroll events drive a local scrollback viewport rather than being
 forwarded directly to the child process:
 
 - **Scroll-up** always enters or advances local scrollback mode. The
-  viewport shifts into the scrollback buffer (up to 10,000 lines of
-  history retained by the vt100 parser). These events are never
-  forwarded to the PTY.
+  viewport shifts into the scrollback buffer. Due to a limitation in
+  vt100's `visible_rows()` API (usize underflow when offset exceeds
+  terminal rows), the maximum scrollback depth is clamped to the
+  terminal's row count (typically one screenful). These events are
+  never forwarded to the PTY.
 - **Scroll-down while in scrollback** moves the viewport back toward
   the live terminal. When the offset reaches 0, the user is back at
   the live view.

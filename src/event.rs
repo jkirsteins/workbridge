@@ -1673,9 +1673,17 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
             local_row,
         } => {
             // Scroll-up always enters/advances local scrollback (never forwarded to PTY).
+            // Clamp to the terminal row count because vt100's visible_rows()
+            // panics if scrollback_offset > rows (usize underflow).
             if scroll_up {
                 if let Some(entry) = app.global_session.as_mut() {
-                    entry.scrollback_offset += 3;
+                    let max = entry
+                        .parser
+                        .lock()
+                        .ok()
+                        .map(|p| p.screen().size().0 as usize)
+                        .unwrap_or(0);
+                    entry.scrollback_offset = (entry.scrollback_offset + 3).min(max);
                 }
                 return true;
             }

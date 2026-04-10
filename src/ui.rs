@@ -1551,7 +1551,14 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 Some(entry) => {
                     // Lock the shared parser to get the current screen state.
                     if let Ok(mut parser) = entry.parser.lock() {
-                        parser.set_scrollback(entry.scrollback_offset);
+                        // vt100's visible_rows() computes
+                        // `rows_len - scrollback_offset` which is a usize
+                        // subtraction that panics on underflow when
+                        // scrollback_offset > terminal rows. Clamp to the
+                        // terminal height to prevent this.
+                        let rows = parser.screen().size().0 as usize;
+                        let clamped = entry.scrollback_offset.min(rows);
+                        parser.set_scrollback(clamped);
                         let pseudo_term = PseudoTerminal::new(parser.screen()).block(block);
                         pseudo_term.render(area, buf);
                     } else {
@@ -1722,7 +1729,10 @@ fn draw_global_drawer(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     match &app.global_session {
         Some(entry) if entry.alive => {
             if let Ok(mut parser) = entry.parser.lock() {
-                parser.set_scrollback(entry.scrollback_offset);
+                // Same clamp as draw_pane_output - see comment there.
+                let rows = parser.screen().size().0 as usize;
+                let clamped = entry.scrollback_offset.min(rows);
+                parser.set_scrollback(clamped);
                 let pseudo_term = PseudoTerminal::new(parser.screen());
                 pseudo_term.render(inner, buf);
             } else {

@@ -1290,6 +1290,7 @@ impl App {
                         parser,
                         alive: true,
                         session: Some(session),
+                        scrollback_offset: 0,
                     },
                 );
             }
