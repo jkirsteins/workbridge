@@ -68,6 +68,25 @@ forwarded directly to the child process:
 When scrollback mode is active, the panel title shows a [SCROLLBACK]
 indicator so the user knows they are viewing history.
 
+### Mouse Text Selection
+
+When mouse capture is enabled, users can select text in PTY areas
+(right panel, global drawer) by clicking and dragging with the left
+mouse button. Selection works like a standard terminal emulator:
+
+- Click-and-drag highlights the selected text (inverted colors).
+- On mouse release, the selected text is automatically copied to the
+  system clipboard via the arboard crate.
+- Clicking without dragging clears any existing selection.
+- Any keypress clears the selection.
+- Selection works in both live view and scrollback mode.
+
+Mouse selection is only intercepted when the child process has NOT
+enabled mouse reporting (MouseProtocolMode::None). When the child
+has enabled mouse reporting (e.g., vim, htop), mouse events are
+forwarded to the PTY as before. Exception: in local scrollback mode,
+selection is always available since the PTY is not receiving events.
+
 ### Blocking I/O Prohibition
 
 The event loop runs on a single thread. Any blocking I/O (network

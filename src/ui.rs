@@ -26,7 +26,8 @@ use crate::create_dialog::{CreateDialog, CreateDialogFocus};
 use crate::layout;
 use crate::theme::Theme;
 use crate::work_item::{
-    BackendType, CheckStatus, PrState, ReviewDecision, WorkItemError, WorkItemKind, WorkItemStatus,
+    BackendType, CheckStatus, PrState, ReviewDecision, SelectionState, WorkItemError, WorkItemKind,
+    WorkItemStatus,
 };
 
 /// Braille-dot spinner frames for the activity indicator.
@@ -1473,6 +1474,10 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 if let Ok(parser) = entry.parser.lock() {
                     let pseudo_term = PseudoTerminal::new(parser.screen()).block(block);
                     pseudo_term.render(area, buf);
+                    if let Some(ref sel) = entry.selection {
+                        let inner = area.inner(Margin::new(1, 1));
+                        render_selection_overlay(buf, inner, sel);
+                    }
                 } else {
                     let text = Text::from(vec![Line::from(""), Line::from("  [render error]")]);
                     let paragraph = Paragraph::new(text).block(block).style(theme.style_error());
@@ -1561,6 +1566,10 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                         parser.set_scrollback(clamped);
                         let pseudo_term = PseudoTerminal::new(parser.screen()).block(block);
                         pseudo_term.render(area, buf);
+                        if let Some(ref sel) = entry.selection {
+                            let inner = area.inner(Margin::new(1, 1));
+                            render_selection_overlay(buf, inner, sel);
+                        }
                     } else {
                         // Parser lock poisoned - show a fallback message.
                         let text = Text::from(vec![Line::from(""), Line::from("  [render error]")]);
@@ -1735,6 +1744,9 @@ fn draw_global_drawer(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 parser.set_scrollback(clamped);
                 let pseudo_term = PseudoTerminal::new(parser.screen());
                 pseudo_term.render(inner, buf);
+                if let Some(ref sel) = entry.selection {
+                    render_selection_overlay(buf, inner, sel);
+                }
             } else {
                 let text = Text::from(vec![Line::from(""), Line::from("  [render error]")]);
                 let paragraph = Paragraph::new(text).style(theme.style_error());
@@ -1758,6 +1770,51 @@ fn draw_global_drawer(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
             ]);
             let paragraph = Paragraph::new(text).style(theme.style_text_muted());
             paragraph.render(inner, buf);
+        }
+    }
+}
+
+/// Render a selection highlight overlay on top of already-rendered terminal content.
+///
+/// For each cell in the selection range, the style modifier is set to
+/// `Modifier::REVERSED` which inverts fg/bg to show the selection, matching
+/// standard terminal emulator highlighting.
+fn render_selection_overlay(buf: &mut Buffer, inner_area: Rect, selection: &SelectionState) {
+    let (start_row, start_col, end_row, end_col) = {
+        let (ar, ac) = selection.anchor;
+        let (cr, cc) = selection.current;
+        if ar < cr || (ar == cr && ac <= cc) {
+            (ar, ac, cr, cc)
+        } else {
+            (cr, cc, ar, ac)
+        }
+    };
+
+    let max_col = inner_area.width;
+
+    for row in start_row..=end_row {
+        if row >= inner_area.height {
+            break;
+        }
+
+        let col_start = if row == start_row { start_col } else { 0 };
+        let col_end = if row == end_row {
+            end_col
+        } else {
+            max_col.saturating_sub(1)
+        };
+        // Single-row selection: start_col to end_col.
+        // (Already handled by the above logic since start_row == end_row.)
+
+        for col in col_start..=col_end {
+            if col >= max_col {
+                break;
+            }
+            let x = inner_area.x + col;
+            let y = inner_area.y + row;
+            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
         }
     }
 }

@@ -282,6 +282,16 @@ pub struct ReviewRequestedPr {
     pub branch: String,
 }
 
+/// Mouse text selection state for a terminal session.
+pub struct SelectionState {
+    /// The anchor point where the selection started (row, col in terminal cell coordinates).
+    pub anchor: (u16, u16),
+    /// The current/end point of the selection (row, col).
+    pub current: (u16, u16),
+    /// Whether the user is actively dragging (mouse button held down).
+    pub dragging: bool,
+}
+
 /// A session associated with a work item. Replaces the old Tab struct's
 /// fields minus `name` (the title comes from the work item).
 pub struct SessionEntry {
@@ -292,6 +302,8 @@ pub struct SessionEntry {
     /// 0 means live view (no scrollback). Positive values shift the
     /// viewport into the past.
     pub scrollback_offset: usize,
+    /// Active mouse text selection, if any.
+    pub selection: Option<SelectionState>,
 }
 
 /// Data fetched per repo by a background thread. Sent through a channel
