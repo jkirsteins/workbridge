@@ -288,6 +288,35 @@ All rendering is Buffer-based (not Frame-based). Widgets use the
 `StatefulWidget::render(widget, area, buf, &mut state)` patterns from
 ratatui-core.
 
+### Scroll Offset Persistence
+
+The left-panel work item list persists its scroll offset between render
+frames via `App::list_scroll_offset`, a `Cell<usize>`. This field uses
+interior mutability (`Cell`) because rendering takes `&App` (immutable),
+but the offset must be written back after each render so the viewport
+stays stable during keyboard navigation.
+
+The render flow in `draw_work_item_list` (ui.rs):
+
+1. Create a `ListState` seeded with the persisted offset:
+   `ListState::default().with_offset(app.list_scroll_offset.get())`
+2. Set the selected item: `state.select(app.selected_item)`
+3. Render via `StatefulWidget::render` - ratatui's `get_items_bounds()`
+   checks whether the selected item falls within the visible range and
+   only adjusts the offset when it does not
+4. Write the (possibly adjusted) offset back:
+   `app.list_scroll_offset.set(state.offset())`
+
+This means the highlight moves freely within the visible viewport. The
+viewport only scrolls when the highlight reaches a border (top or
+bottom edge).
+
+The offset is reset to 0 in `build_display_list()` whenever the display
+list is rebuilt (view mode toggle, drill-down, item deletion, fetch
+cycle). This prevents stale offsets from a previous list shape carrying
+over into a structurally different list. ratatui re-clamps the offset
+on the next render frame based on the selected item position.
+
 ### Layout: Flat List Mode
 
 ```

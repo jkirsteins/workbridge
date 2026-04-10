@@ -2036,6 +2036,12 @@ impl App {
             );
         }
 
+        // Reset scroll offset when the display list is rebuilt so stale
+        // offsets from a previous list shape (view mode toggle, drill-down,
+        // item deletion) do not carry over. ratatui will re-clamp on the
+        // next render frame based on the selected item.
+        self.list_scroll_offset.set(0);
+
         self.display_list = list;
 
         // Restore selection by identity (WorkItemId or unlinked branch name)
