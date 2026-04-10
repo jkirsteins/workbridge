@@ -276,7 +276,7 @@ mod tests {
         assert!(result.contains("cross-project assistant"));
         assert!(result.contains("/Users/foo/project-a"));
         assert!(result.contains("workbridge_list_repos"));
-        assert!(result.contains("read-only mode"));
+        assert!(result.contains("workbridge_create_work_item"));
     }
 
     #[test]

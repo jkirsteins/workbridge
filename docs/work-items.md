@@ -157,6 +157,29 @@ Repo selection for quick-start follows this priority:
 3. If multiple repos are present and CWD is not in one, the full creation
    dialog opens for the user to select a repo.
 
+## Global Assistant Transfer
+
+The global assistant (Ctrl+G) can create work items via the
+`workbridge_create_work_item` MCP tool. This allows the user to explore code
+and ideas in the global assistant, then transfer that exploration context into
+a proper work item for later action.
+
+When Claude calls `workbridge_create_work_item`, it provides:
+- A concise title summarizing the work
+- A description capturing the exploration context and findings
+- The target repo path (must be a managed repo)
+
+The main thread handles the event by:
+1. Validating the repo path against the active repo cache
+2. Generating a branch name (`{username}/workitem-{suffix}`)
+3. Creating the work item in Planning status
+4. Closing the global drawer
+5. Spawning a planning session for the new work item
+
+The planning session receives the description in its system prompt, so the
+exploration context from the global assistant carries forward into the
+planning phase.
+
 ## Work Item Status
 
 Work items follow a seven-stage workflow:

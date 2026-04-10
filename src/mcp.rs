@@ -51,6 +51,12 @@ pub enum McpEvent {
         work_item_id: String,
         message: String,
     },
+    /// Claude called workbridge_create_work_item from the global assistant.
+    CreateWorkItem {
+        title: String,
+        description: String,
+        repo_path: String,
+    },
 }
 
 /// Handle to the MCP socket server. Holds the socket path for cleanup
@@ -111,7 +117,11 @@ impl McpSocketServer {
     ///
     /// Unlike `start()`, the context is shared via `Arc<Mutex<String>>` so the
     /// main thread can refresh it periodically as repos/work items change.
-    pub fn start_global(socket_path: PathBuf, context: Arc<Mutex<String>>) -> io::Result<Self> {
+    pub fn start_global(
+        socket_path: PathBuf,
+        context: Arc<Mutex<String>>,
+        tx: Sender<McpEvent>,
+    ) -> io::Result<Self> {
         let _ = std::fs::remove_file(&socket_path);
 
         let listener = UnixListener::bind(&socket_path)?;
@@ -122,7 +132,7 @@ impl McpSocketServer {
         let path_clone = socket_path.clone();
 
         std::thread::spawn(move || {
-            global_accept_loop(listener, &context, &stop_clone);
+            global_accept_loop(listener, &context, &tx, &stop_clone);
             let _ = std::fs::remove_file(&path_clone);
         });
 
@@ -197,7 +207,12 @@ fn accept_loop(
 /// Accept loop for the global assistant MCP server.
 /// Passes the shared context mutex to each connection handler so that
 /// tool calls always read the latest context (not a stale snapshot).
-fn global_accept_loop(listener: UnixListener, context: &Arc<Mutex<String>>, stop: &AtomicBool) {
+fn global_accept_loop(
+    listener: UnixListener,
+    context: &Arc<Mutex<String>>,
+    tx: &Sender<McpEvent>,
+    stop: &AtomicBool,
+) {
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -205,8 +220,9 @@ fn global_accept_loop(listener: UnixListener, context: &Arc<Mutex<String>>, stop
         match listener.accept() {
             Ok((stream, _)) => {
                 let ctx = Arc::clone(context);
+                let tx = tx.clone();
                 std::thread::spawn(move || {
-                    handle_global_connection(stream, &ctx);
+                    handle_global_connection(stream, &ctx, &tx);
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -223,7 +239,11 @@ fn global_accept_loop(listener: UnixListener, context: &Arc<Mutex<String>>, stop
 ///
 /// Accepts the shared context mutex so that each tools/call re-reads the
 /// latest context rather than using a stale snapshot from connection time.
-fn handle_global_connection(stream: UnixStream, context: &Arc<Mutex<String>>) {
+fn handle_global_connection(
+    stream: UnixStream,
+    context: &Arc<Mutex<String>>,
+    tx: &Sender<McpEvent>,
+) {
     if stream.set_nonblocking(false).is_err() {
         return;
     }
@@ -243,7 +263,7 @@ fn handle_global_connection(stream: UnixStream, context: &Arc<Mutex<String>>) {
                 "{}".to_string()
             }
         };
-        let response = handle_global_message(&msg, &ctx_snapshot);
+        let response = handle_global_message(&msg, &ctx_snapshot, tx);
         if let Some(resp) = response
             && write_message(&mut writer, &resp).is_err()
         {
@@ -1019,8 +1039,8 @@ fn handle_message(
 }
 
 /// Handle an incoming JSON-RPC message for the global assistant.
-/// Only read-only tools are available.
-fn handle_global_message(msg: &Value, context_json: &str) -> Option<Value> {
+/// Exposes read-only query tools plus `workbridge_create_work_item`.
+fn handle_global_message(msg: &Value, context_json: &str, tx: &Sender<McpEvent>) -> Option<Value> {
     let method = msg.get("method")?.as_str()?;
     let id = msg.get("id");
 
@@ -1074,6 +1094,28 @@ fn handle_global_message(msg: &Value, context_json: &str) -> Option<Value> {
                             }
                         },
                         "required": ["repo_path"]
+                    }
+                }),
+                json!({
+                    "name": "workbridge_create_work_item",
+                    "description": "Create a new work item from the current exploration context. Use this when the user wants to turn their research into actionable work. The work item will be created in Planning status and a planning session will be spawned automatically.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "title": {
+                                "type": "string",
+                                "description": "Concise title for the work item"
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Description capturing the exploration context, findings, and intended work"
+                            },
+                            "repo_path": {
+                                "type": "string",
+                                "description": "Absolute path to the target repository (must be one of the managed repos)"
+                            }
+                        },
+                        "required": ["title", "description", "repo_path"]
                     }
                 }),
             ];
@@ -1158,6 +1200,80 @@ fn handle_global_message(msg: &Value, context_json: &str) -> Option<Value> {
                             "content": [{
                                 "type": "text",
                                 "text": text
+                            }]
+                        }
+                    }))
+                }
+                "workbridge_create_work_item" => {
+                    let title = arguments
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let description = arguments
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let repo_path = arguments
+                        .get("repo_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    if title.is_empty() || repo_path.is_empty() {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": "Error: title and repo_path are required"
+                                }],
+                                "isError": true
+                            }
+                        }));
+                    }
+
+                    // Verify repo_path is in the managed repos list.
+                    let repo_known = ctx
+                        .get("repos")
+                        .and_then(|repos| repos.as_array())
+                        .is_some_and(|arr| {
+                            arr.iter().any(|r| {
+                                r.get("path")
+                                    .and_then(|p| p.as_str())
+                                    .is_some_and(|p| p == repo_path)
+                            })
+                        });
+
+                    if !repo_known {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": format!("Error: '{}' is not a managed repository", repo_path)
+                                }],
+                                "isError": true
+                            }
+                        }));
+                    }
+
+                    let _ = tx.send(McpEvent::CreateWorkItem {
+                        title: title.clone(),
+                        description,
+                        repo_path: repo_path.clone(),
+                    });
+
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": format!("Work item '{}' creation requested for repo '{}'. A planning session will start automatically once the main thread processes the request.", title, repo_path)
                             }]
                         }
                     }))

@@ -3799,6 +3799,62 @@ impl App {
                         gate.progress = Some(message);
                     }
                 }
+                McpEvent::CreateWorkItem {
+                    title,
+                    description,
+                    repo_path,
+                } => {
+                    let repo = PathBuf::from(&repo_path);
+
+                    // Validate that the repo exists in active_repo_cache.
+                    let repo_valid = self
+                        .active_repo_cache
+                        .iter()
+                        .any(|r| r.path == repo && r.git_dir_present);
+                    if !repo_valid {
+                        self.status_message = Some(format!(
+                            "MCP: repo '{}' not found or has no git dir",
+                            repo_path
+                        ));
+                        continue;
+                    }
+
+                    let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+                    let suffix = crate::create_dialog::random_suffix();
+                    let branch = format!("{username}/workitem-{suffix}");
+
+                    let request = CreateWorkItem {
+                        title: title.clone(),
+                        description: Some(description),
+                        status: WorkItemStatus::Planning,
+                        kind: WorkItemKind::Own,
+                        repo_associations: vec![RepoAssociationRecord {
+                            repo_path: repo,
+                            branch: Some(branch),
+                            pr_identity: None,
+                        }],
+                    };
+
+                    match self.backend.create(request) {
+                        Ok(record) => {
+                            let wi_id = record.id.clone();
+                            self.reassemble_work_items();
+                            self.fetcher_repos_changed = true;
+                            self.selected_work_item = Some(wi_id.clone());
+                            self.build_display_list();
+
+                            // Close the global drawer and spawn the planning session.
+                            self.global_drawer_open = false;
+                            self.focus = self.pre_drawer_focus;
+                            self.spawn_session(&wi_id);
+                            self.status_message = Some(format!("Created work item: {title}"));
+                        }
+                        Err(e) => {
+                            self.status_message =
+                                Some(format!("MCP: failed to create work item: {e}"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -6367,6 +6423,7 @@ impl App {
         let mcp_server = match McpSocketServer::start_global(
             socket_path.clone(),
             Arc::clone(&self.global_mcp_context),
+            self.mcp_tx.clone(),
         ) {
             Ok(server) => server,
             Err(e) => {
