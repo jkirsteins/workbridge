@@ -117,25 +117,107 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // When the settings overlay is open, handle overlay-specific keys.
     if app.show_settings {
         match (key.modifiers, key.code) {
-            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) | (_, KeyCode::Esc) => {
+            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) | (_, KeyCode::Esc)
+                if !app.settings_review_skill_editing =>
+            {
                 app.show_settings = false;
                 app.settings_tab = SettingsTab::Repos;
                 app.settings_repo_selected = 0;
                 app.settings_available_selected = 0;
                 app.settings_list_focus = SettingsListFocus::Managed;
                 app.settings_keybindings_scroll = 0;
+                app.settings_review_skill_editing = false;
+                app.settings_review_skill_input.clear();
             }
-            (_, KeyCode::Tab) => {
+            (_, KeyCode::Tab) if !app.settings_review_skill_editing => {
                 app.settings_tab = match app.settings_tab {
-                    SettingsTab::Repos => SettingsTab::Keybindings,
+                    SettingsTab::Repos => SettingsTab::ReviewGate,
+                    SettingsTab::ReviewGate => SettingsTab::Keybindings,
                     SettingsTab::Keybindings => SettingsTab::Repos,
                 };
+                // Reset editing state when leaving ReviewGate tab.
+                app.settings_review_skill_editing = false;
+                app.settings_review_skill_input.clear();
             }
             (_, KeyCode::Left) if app.settings_tab == SettingsTab::Repos => {
                 app.settings_list_focus = SettingsListFocus::Managed;
             }
             (_, KeyCode::Right) if app.settings_tab == SettingsTab::Repos => {
                 app.settings_list_focus = SettingsListFocus::Available;
+            }
+            // ReviewGate tab: editing mode routes keys to the text input.
+            (_, KeyCode::Esc)
+                if app.settings_tab == SettingsTab::ReviewGate
+                    && app.settings_review_skill_editing =>
+            {
+                app.settings_review_skill_editing = false;
+                app.settings_review_skill_input.clear();
+            }
+            (_, KeyCode::Enter)
+                if app.settings_tab == SettingsTab::ReviewGate
+                    && app.settings_review_skill_editing =>
+            {
+                let new_value = app.settings_review_skill_input.text().trim().to_string();
+                let old_value = app.config.defaults.review_skill.clone();
+                app.config.defaults.review_skill = new_value.clone();
+                if let Err(e) = app.config_provider.save(&app.config) {
+                    // Rollback on save failure.
+                    app.config.defaults.review_skill = old_value;
+                    app.status_message = Some(format!("Error saving config: {e}"));
+                } else {
+                    app.status_message = Some(format!("Review skill set to: {new_value}"));
+                }
+                app.settings_review_skill_editing = false;
+                app.settings_review_skill_input.clear();
+            }
+            (_, KeyCode::Enter) if app.settings_tab == SettingsTab::ReviewGate => {
+                // Start editing with the current config value.
+                let current = app.config.defaults.review_skill.clone();
+                app.settings_review_skill_input.set_text(&current);
+                app.settings_review_skill_editing = true;
+            }
+            (_, KeyCode::Char(c))
+                if app.settings_tab == SettingsTab::ReviewGate
+                    && app.settings_review_skill_editing
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                app.settings_review_skill_input.insert_char(c);
+            }
+            (_, KeyCode::Backspace)
+                if app.settings_tab == SettingsTab::ReviewGate
+                    && app.settings_review_skill_editing =>
+            {
+                app.settings_review_skill_input.backspace();
+            }
+            (_, KeyCode::Delete)
+                if app.settings_tab == SettingsTab::ReviewGate
+                    && app.settings_review_skill_editing =>
+            {
+                app.settings_review_skill_input.delete();
+            }
+            (_, KeyCode::Left)
+                if app.settings_tab == SettingsTab::ReviewGate
+                    && app.settings_review_skill_editing =>
+            {
+                app.settings_review_skill_input.move_left();
+            }
+            (_, KeyCode::Right)
+                if app.settings_tab == SettingsTab::ReviewGate
+                    && app.settings_review_skill_editing =>
+            {
+                app.settings_review_skill_input.move_right();
+            }
+            (_, KeyCode::Home)
+                if app.settings_tab == SettingsTab::ReviewGate
+                    && app.settings_review_skill_editing =>
+            {
+                app.settings_review_skill_input.home();
+            }
+            (_, KeyCode::End)
+                if app.settings_tab == SettingsTab::ReviewGate
+                    && app.settings_review_skill_editing =>
+            {
+                app.settings_review_skill_input.end();
             }
             (_, KeyCode::Up) => match app.settings_tab {
                 SettingsTab::Repos => match app.settings_list_focus {
@@ -147,6 +229,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                             app.settings_available_selected.saturating_sub(1);
                     }
                 },
+                SettingsTab::ReviewGate => {}
                 SettingsTab::Keybindings => {
                     app.settings_keybindings_scroll =
                         app.settings_keybindings_scroll.saturating_sub(1);
@@ -167,6 +250,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                         }
                     }
                 },
+                SettingsTab::ReviewGate => {}
                 SettingsTab::Keybindings => {
                     app.settings_keybindings_scroll += 1;
                 }
