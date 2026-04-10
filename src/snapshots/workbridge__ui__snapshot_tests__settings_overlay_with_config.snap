@@ -6,7 +6,7 @@ expression: output
 ┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │           ┌ Settings (press ? or Esc to close) ──────────────────┐           │
 │  No work i│                                                      │           │
-│           │   Repos  |  Keybindings                              │           │
+│           │   Repos  |  Review Gate  |  Keybindings              │           │
 │  Ctrl+N: q│ Config source:                                       │           │
 │  Ctrl+B: b│   in-memory (test)                                   │           │
 │           │ Base directories:                                    │           │

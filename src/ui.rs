@@ -1685,12 +1685,12 @@ fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect)
         .areas(inner);
 
     // Tab bar.
-    let tab_selected = if app.settings_tab == SettingsTab::Keybindings {
-        1
-    } else {
-        0
+    let tab_selected = match app.settings_tab {
+        SettingsTab::Repos => 0,
+        SettingsTab::ReviewGate => 1,
+        SettingsTab::Keybindings => 2,
     };
-    let tabs = Tabs::new(vec![" Repos ", " Keybindings "])
+    let tabs = Tabs::new(vec![" Repos ", " Review Gate ", " Keybindings "])
         .select(tab_selected)
         .style(theme.style_text_muted())
         .highlight_style(theme.style_view_mode_tab_active())
@@ -1703,20 +1703,35 @@ fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .areas(body_area);
 
-    if app.settings_tab == SettingsTab::Keybindings {
-        draw_settings_keybindings_tab(buf, app, theme, content_area);
-        let hint = Line::styled(
-            "Tab: switch tab   Up/Down: scroll   ?: close",
-            theme.style_text_muted(),
-        );
-        Paragraph::new(hint).render(hint_area, buf);
-    } else {
-        draw_settings_repos_tab(buf, app, theme, content_area);
-        let hint = Line::styled(
-            "Tab: switch tab   Left/Right: switch column   Enter: move repo   Up/Down: navigate",
-            theme.style_text_muted(),
-        );
-        Paragraph::new(hint).render(hint_area, buf);
+    match app.settings_tab {
+        SettingsTab::Keybindings => {
+            draw_settings_keybindings_tab(buf, app, theme, content_area);
+            let hint = Line::styled(
+                "Tab: switch tab   Up/Down: scroll   ?: close",
+                theme.style_text_muted(),
+            );
+            Paragraph::new(hint).render(hint_area, buf);
+        }
+        SettingsTab::ReviewGate => {
+            draw_settings_review_gate_tab(buf, app, theme, content_area);
+            let hint = if app.settings_review_skill_editing {
+                Line::styled("Enter: save   Esc: cancel", theme.style_text_muted())
+            } else {
+                Line::styled(
+                    "Tab: switch tab   Enter: edit   ?: close",
+                    theme.style_text_muted(),
+                )
+            };
+            Paragraph::new(hint).render(hint_area, buf);
+        }
+        SettingsTab::Repos => {
+            draw_settings_repos_tab(buf, app, theme, content_area);
+            let hint = Line::styled(
+                "Tab: switch tab   Left/Right: switch column   Enter: move repo   Up/Down: navigate",
+                theme.style_text_muted(),
+            );
+            Paragraph::new(hint).render(hint_area, buf);
+        }
     }
 }
 
@@ -1886,6 +1901,53 @@ fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area: Rec
         )),
     ]);
     Paragraph::new(defaults_text).render(sections[4], buf);
+}
+
+fn draw_settings_review_gate_tab(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+    // Layout: heading (1) + blank (1) + label (1) + input (1) + blank (1) + description.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // heading
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // label
+            Constraint::Length(1), // value / input field
+            Constraint::Length(1), // blank
+            Constraint::Min(0),    // description
+        ])
+        .split(area);
+
+    let heading = Line::styled("Review Gate Skill", theme.style_heading());
+    Paragraph::new(heading).render(rows[0], buf);
+
+    let label = Line::styled("Skill (slash command):", theme.style_text());
+    Paragraph::new(label).render(rows[2], buf);
+
+    if app.settings_review_skill_editing {
+        draw_text_input_field(buf, &app.settings_review_skill_input, theme, rows[3], true);
+    } else {
+        // Show the current value; style matches draw_text_input_field unfocused.
+        let value = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                app.config.defaults.review_skill.as_str(),
+                theme.style_text(),
+            ),
+        ]);
+        Paragraph::new(value).render(rows[3], buf);
+    }
+
+    let desc = Text::from(vec![
+        Line::styled(
+            "The slash command passed to `claude --print -p` during the review gate.",
+            theme.style_text_muted(),
+        ),
+        Line::styled(
+            "Default: /claude-adversarial-review",
+            theme.style_text_muted(),
+        ),
+    ]);
+    Paragraph::new(desc).render(rows[5], buf);
 }
 
 fn draw_settings_keybindings_tab(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {

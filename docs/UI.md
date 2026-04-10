@@ -397,6 +397,21 @@ dialog that blocks interaction until dismissed with Enter or Esc.
 5. Global assistant drawer
 6. Create dialog
 
+### Settings overlay tabs
+
+The settings overlay (opened with `?`) has three tabs, cycled with Tab:
+
+1. **Repos** - manage which repositories are tracked (Left/Right to switch
+   columns, Enter to move a repo between managed/available).
+2. **Review Gate** - edit the review skill (slash command) used by the review
+   gate. Enter starts inline editing, Enter saves to `config.toml`, Esc cancels.
+   The value is stored in `defaults.review_skill`.
+3. **Keybindings** - scrollable reference of all keyboard shortcuts.
+
+When the Review Gate tab is in editing mode, Tab and `?`/Esc are captured by
+the text input. Esc cancels editing first; a second Esc (or `?`) closes the
+overlay.
+
 ### What NOT to do
 
 - Do not set `app.status_message` to show prompt content. Prompt dialogs

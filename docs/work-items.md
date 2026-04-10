@@ -211,6 +211,11 @@ If the gate approves, the work item advances to Review. If it rejects (at any
 phase), the rejection reason is fed back to the implementing Claude session as
 rework feedback.
 
+The skill (slash command) used in phase 3 is configurable via
+`defaults.review_skill` in `config.toml` (default: `/claude-adversarial-review`).
+It can also be edited from the Settings overlay's "Review Gate" tab (press `?`
+then Tab to the Review Gate tab, Enter to edit, Enter to save, Esc to cancel).
+
 ### Merge gate
 
 Advancing from Review to Done is gated by PR merge. Instead of directly changing status, the user is prompted to choose a merge strategy (squash, merge, or poll). The TUI spawns an async `gh pr merge` command for squash/merge. Done is reached only after GitHub confirms the PR was merged.

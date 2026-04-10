@@ -61,6 +61,7 @@ pub const BOARD_COLUMNS: &[WorkItemStatus] = &[
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     Repos,
+    ReviewGate,
     Keybindings,
 }
 
@@ -375,6 +376,10 @@ pub struct App {
     pub settings_list_focus: SettingsListFocus,
     /// Scroll offset for the keybindings tab in the settings overlay.
     pub settings_keybindings_scroll: u16,
+    /// Text input for editing the review skill in the Review Gate tab.
+    pub settings_review_skill_input: crate::create_dialog::SimpleTextInput,
+    /// Whether the review skill text input is in editing mode.
+    pub settings_review_skill_editing: bool,
     /// State for the work item creation modal dialog.
     pub create_dialog: CreateDialog,
 
@@ -655,6 +660,8 @@ impl App {
             settings_tab: SettingsTab::Repos,
             settings_list_focus: SettingsListFocus::Managed,
             settings_keybindings_scroll: 0,
+            settings_review_skill_input: crate::create_dialog::SimpleTextInput::new(),
+            settings_review_skill_editing: false,
             create_dialog: CreateDialog::new(),
             backend,
             worktree_service,
