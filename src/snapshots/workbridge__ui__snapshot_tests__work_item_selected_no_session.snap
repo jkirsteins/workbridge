@@ -16,10 +16,10 @@ expression: "render(&app, 80, 24)"
 │                       ││  Issue       (none)                                 │
 │                       ││  Errors      (none)                                 │
 │                       ││                                                     │
+│                       ││  PR URL                                             │
+│                       ││  https://github.com/o/r/pull/14                     │
+│                       ││                                                     │
 │                       ││  Press Shift+Right to move to Planning.             │
-│                       ││                                                     │
-│                       ││                                                     │
-│                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

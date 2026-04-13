@@ -251,13 +251,15 @@ If any prerequisite is missing - no repo association, no branch, no GitHub remot
 When the user selects "poll" at the merge prompt, the work item transitions to the Mergequeue state instead of attempting an immediate merge. This is for PRs that can't be merged directly from the TUI - for example, PRs that go through a CI merge queue, require approvals from others, or need to be merged by someone else.
 
 In the Mergequeue state:
-- The TUI polls the PR state via `gh pr view` every 30 seconds.
-- When the PR is detected as merged, the item auto-transitions to Done (via the `"pr_merge"` source, satisfying the merge-gate invariant).
+- The TUI polls the PR state via `gh pr view <target> --repo <owner/repo> --json state,number,title,url` every 30 seconds, where `<target>` is the PR number when known and the branch name as a fallback. While a poll is in flight, a "Polling PR for merge (<branch>)" activity indicator is shown at the bottom of the screen. `enter_mergequeue` pins `pr_number` on the in-memory watch from `assoc.pr.number` immediately, so the live-entry path always targets the exact PR unambiguously. On app restart, the rebuilt watch starts with `pr_number = None` and falls back to `gh pr view <branch>` for the first poll, then writes the resolved number back onto the watch so subsequent polls are pinned.
+- When the PR is detected as merged, the item auto-transitions to Done (via the `"pr_merge"` source, satisfying the merge-gate invariant). The merged PR's identity is persisted into `pr_identity` at this point so the Done item retains its merged-PR link in the UI after the branch is cleaned up.
 - If the PR is closed without merging, a warning is shown but the item stays in Mergequeue.
-- The user can retreat back to Review via Shift+Left at any time.
+- If `gh pr view` itself fails (auth error, network error, etc.), the error is stored on the work item and shown in the right-side detail pane as "Last poll error: ...". It persists across ticks until the next successful poll, so users do not miss failures when the transient `status_message` gets overwritten.
+- The user can retreat back to Review via Shift+Left at any time. This stops polling and clears the watch and any stored poll error.
+- The right-side detail pane shows the full PR URL and a multi-line hint: "Waiting for PR to be merged. Polling GitHub every 30s. Shift+Left to move back to Review and stop polling."
 - No Claude session runs in this state.
 - In the board view, Mergequeue items appear in the Review column with a `[MQ]` prefix.
-- On app restart, watches are reconstructed from backend records with Mergequeue status.
+- On app restart, `reconstruct_mergequeue_watches` rebuilds a watch for every backend record with Mergequeue status, using the record's branch and the resolved GitHub remote. Nothing new has to be persisted at `enter_mergequeue` time, so existing Mergequeue tickets (created before this mechanism existed) resume polling correctly on next launch, even if their PR was merged while the app was closed.
 
 ### Derived Done status
 

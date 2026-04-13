@@ -16,10 +16,10 @@ expression: "render(&app, 80, 24)"
 │  authentication bug   ││  Issue       (none)                                 │
 │  branch-todo-1 [no wt]││  Errors      (none)                                 │
 │  [BL] Add user        ││                                                     │
-│  settings page        ││  Press Enter to start a session.                    │
-│  branch-todo-2 [no wt]││                                                     │
+│  settings page        ││  PR URL                                             │
+│  branch-todo-2 [no wt]││  https://github.com/o/r/pull/88                     │
 │                       ││                                                     │
-│                       ││                                                     │
+│                       ││  Press Enter to start a session.                    │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

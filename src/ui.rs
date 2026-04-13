@@ -1202,14 +1202,17 @@ fn format_work_item_error(error: &WorkItemError) -> (String, Option<String>) {
 
 /// Draw a structured detail view for a work item with no active session.
 ///
-/// Shows title, status, backend type, repo, branch, worktree, PR, issue,
-/// and errors, followed by a prompt to start a session.
+/// Shows title, status, backend type, repo, branch, worktree, PR, PR URL,
+/// issue, and errors, followed by a stage-specific hint. When a
+/// mergequeue poll error is supplied, it is rendered below the hint so
+/// it survives longer than a transient `status_message`.
 fn draw_work_item_detail(
     buf: &mut Buffer,
     wi: Option<&crate::work_item::WorkItem>,
     theme: &Theme,
     block: Block<'_>,
     area: Rect,
+    mergequeue_poll_error: Option<&str>,
 ) {
     let Some(wi) = wi else {
         let text = Text::from(vec![
@@ -1262,6 +1265,14 @@ fn draw_work_item_detail(
         .map(|pr| format!("#{} - {}", pr.number, pr.title))
         .unwrap_or_else(|| "(none)".to_string());
 
+    // PR URL is rendered on its own dedicated line below the field block
+    // (not as a regular `label  value` row) so that the URL gets the full
+    // inner width of the panel instead of just the few columns left after
+    // the label prefix. Long real-world URLs (`/<long-org>/<long-repo>/
+    // pull/<n>`) would silently truncate at the panel edge inside the
+    // single-line `Paragraph` otherwise.
+    let pr_url = first_assoc.and_then(|a| a.pr.as_ref()).map(|pr| &pr.url);
+
     let issue_str = first_assoc
         .and_then(|a| a.issue.as_ref())
         .map(|issue| format!("#{} - {}", issue.number, issue.title))
@@ -1311,13 +1322,41 @@ fn draw_work_item_detail(
         ]));
     }
 
+    // PR URL on its own line so it gets the full inner width.
+    if let Some(url) = pr_url {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  PR URL", label_style)));
+        lines.push(Line::from(Span::styled(
+            format!("  {url}"),
+            theme.style_text(),
+        )));
+    }
+
     lines.push(Line::from(""));
-    let hint = match wi.status {
-        WorkItemStatus::Backlog => "  Press Shift+Right to move to Planning.",
-        WorkItemStatus::Done => "  Done.",
-        _ => "  Press Enter to start a session.",
+    let hint_lines: &[&str] = match wi.status {
+        WorkItemStatus::Backlog => &["  Press Shift+Right to move to Planning."],
+        WorkItemStatus::Done => &["  Done."],
+        WorkItemStatus::Mergequeue => &[
+            "  Waiting for PR to be merged.",
+            "  Polling GitHub every 30s.",
+            "  Shift+Left to move back to Review and stop polling.",
+        ],
+        WorkItemStatus::Planning
+        | WorkItemStatus::Implementing
+        | WorkItemStatus::Blocked
+        | WorkItemStatus::Review => &["  Press Enter to start a session."],
     };
-    lines.push(Line::from(Span::styled(hint, none_style)));
+    for hint in hint_lines {
+        lines.push(Line::from(Span::styled(*hint, none_style)));
+    }
+
+    if let Some(err) = mergequeue_poll_error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  Last poll error: {err}"),
+            theme.style_error(),
+        )));
+    }
 
     let text = Text::from(lines);
     let paragraph = Paragraph::new(text).block(block);
@@ -1644,19 +1683,29 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                             }
                         }
                         lines.push(Line::from(""));
-                        let hint = match wi.map(|w| &w.status) {
+                        let hint_lines: &[&str] = match wi.map(|w| &w.status) {
                             Some(WorkItemStatus::Backlog) => {
-                                "  Press Shift+Right to move to Planning."
+                                &["  Press Shift+Right to move to Planning."]
                             }
-                            Some(WorkItemStatus::Done) => "  Done.",
-                            _ => "  Press Enter to start a session.",
+                            Some(WorkItemStatus::Done) => &["  Done."],
+                            Some(WorkItemStatus::Mergequeue) => &[
+                                "  Waiting for PR to be merged.",
+                                "  Polling GitHub every 30s.",
+                                "  Shift+Left to move back to Review and stop polling.",
+                            ],
+                            _ => &["  Press Enter to start a session."],
                         };
-                        lines.push(Line::from(Span::styled(hint, theme.style_text_muted())));
+                        for hint in hint_lines {
+                            lines.push(Line::from(Span::styled(*hint, theme.style_text_muted())));
+                        }
                         let text = Text::from(lines);
                         let paragraph = Paragraph::new(text).block(block);
                         paragraph.render(area, buf);
                     } else {
-                        draw_work_item_detail(buf, wi, theme, block, area);
+                        let poll_error = wi
+                            .and_then(|w| app.mergequeue_poll_errors.get(&w.id))
+                            .map(String::as_str);
+                        draw_work_item_detail(buf, wi, theme, block, area, poll_error);
                     }
                 }
             }
@@ -4313,6 +4362,80 @@ mod snapshot_tests {
         app.build_display_list();
         app.selected_item = app.display_list.iter().rposition(is_selectable);
         insta::assert_snapshot!(render(&app, 80, 12));
+    }
+
+    #[test]
+    fn work_item_mergequeue_hint_and_pr_url() {
+        let items = vec![make_work_item(
+            "mq-1",
+            "Waiting for merge",
+            WorkItemStatus::Mergequeue,
+            Some(make_pr_info(42, CheckStatus::Passing)),
+            1,
+        )];
+        let mut app = app_with_items(items, vec![]);
+        app.selected_item = app.display_list.iter().position(is_selectable);
+
+        let rendered = render(&app, 100, 30);
+        assert!(
+            rendered.contains("Waiting for PR to be merged"),
+            "should render mergequeue hint: {rendered}"
+        );
+        assert!(
+            rendered.contains("Shift+Left"),
+            "should mention Shift+Left to cancel: {rendered}"
+        );
+        assert!(
+            rendered.contains("https://github.com/o/r/pull/42"),
+            "should render full PR URL: {rendered}"
+        );
+    }
+
+    /// Regression for F-2: long PR URLs must not lose horizontal space
+    /// to the field-label prefix. Before the fix the URL was rendered as
+    /// a labelled row (`  PR URL      <url>`), which left only ~40 cols
+    /// of value space; a real URL would clip well before the panel edge.
+    /// The fix renders the URL on its own dedicated line after the field
+    /// block, so it uses the full inner width of the right pane and only
+    /// clips at the terminal boundary itself.
+    #[test]
+    fn work_item_long_pr_url_uses_full_panel_width() {
+        let mut item = make_work_item(
+            "long-url",
+            "Has long URL",
+            WorkItemStatus::Review,
+            Some(make_pr_info(123456, CheckStatus::Passing)),
+            1,
+        );
+        let long_url =
+            "https://github.com/very-long-org-name/very-long-repo-name/pull/123456".to_string();
+        item.repo_associations[0].pr.as_mut().unwrap().url = long_url.clone();
+
+        let mut app = app_with_items(vec![item], vec![]);
+        app.selected_item = app.display_list.iter().position(is_selectable);
+
+        // At a wide terminal the entire URL fits and must appear in full.
+        let wide = render(&app, 160, 30);
+        assert!(
+            wide.contains(&long_url),
+            "long PR URL should appear in full at 160-col width:\n{wide}"
+        );
+
+        // At 80 cols the right pane is narrower than the URL, so the URL
+        // necessarily clips at the panel boundary - but it must clip
+        // strictly later than the old labelled-row layout would have. The
+        // old layout reserved ~14 cols for the label prefix, so any
+        // visible URL prefix longer than 14 chars + 14 chars (~28) of URL
+        // body proves the dedicated-line layout is in use. Use 40 chars
+        // as a comfortable lower bound that the labelled-row layout could
+        // never have produced.
+        let narrow = render(&app, 80, 24);
+        let prefix = &long_url[..40];
+        assert!(
+            narrow.contains(prefix),
+            "narrow render should still show at least the first 40 chars of \
+             the URL on a dedicated line; got:\n{narrow}"
+        );
     }
 
     #[test]

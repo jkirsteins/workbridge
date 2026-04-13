@@ -16,10 +16,10 @@ expression: "render(&app, 80, 24)"
 │  Update       PR#50 ok││  Issue       (none)                                 │
 │  dependencies         ││  Errors      (none)                                 │
 │  branch-done-1 [no wt]││                                                     │
+│                       ││  PR URL                                             │
+│                       ││  https://github.com/o/r/pull/88                     │
+│                       ││                                                     │
 │                       ││  Press Enter to start a session.                    │
-│                       ││                                                     │
-│                       ││                                                     │
-│                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

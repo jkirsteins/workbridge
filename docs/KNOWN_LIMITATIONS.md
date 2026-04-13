@@ -85,3 +85,58 @@ feeds it to the vt100 parser. The UI thread only locks parsers briefly to call
 not a bottleneck. The render tick fires at ~120fps (8ms) so PTY output renders
 smoothly, and heavy background work (liveness checks, fetch drains) is throttled
 to roughly every 25th tick (~200ms) to keep CPU usage reasonable.
+
+## Mergequeue watch can bind to the wrong PR after an app restart
+
+**What:** When a work item is in Mergequeue and the TUI is closed, the
+in-memory `MergequeueWatch.pr_number` pin is lost. On next launch,
+`reconstruct_mergequeue_watches` rebuilds the watch with `pr_number = None`
+and the first poll falls back to `gh pr view <branch>`. `gh` resolves a
+branch name to "the most recent PR for that branch", not the specific PR
+the user pressed `[p] Poll` on. After the first successful poll, the
+watch is pinned to whatever PR `gh` returned, and subsequent polls (and
+any eventual auto-transition to Done via `save_pr_identity`) reference
+that PR.
+
+**When it is a problem:** A branch has more than one PR over its lifetime.
+Concretely: user opens PR A on branch `foo`, enters Mergequeue, quits the
+TUI. PR A is closed (manually or by `gh pr close`). Someone opens PR B on
+branch `foo`. User relaunches the TUI. `reconstruct_mergequeue_watches`
+rebuilds the watch; the first poll resolves `foo` to PR B. If PR B then
+merges, the work item auto-advances to Done with PR B's number, title,
+and URL persisted into `pr_identity`. The work item is stamped with a PR
+it was never associated with.
+
+**Why it is accepted:** The live-entry path (pressing `[p] Poll` while
+the TUI is running) already pins `pr_number` from `assoc.pr.number`
+immediately and is never vulnerable. The remaining window is narrow:
+TUI closed AND original PR closed AND new PR opened on same branch AND
+first poll of reconstructed watch - all before the user retreats the
+item or re-enters Mergequeue against the new PR. In practice the user
+who entered Mergequeue usually owns the branch and would notice the
+swap. Pinning across restarts would require persisting `pr_number` on
+the backend record, which adds migration complexity for existing
+Mergequeue tickets without a stored number.
+
+**Impact:** The Done item carries `pr_identity` for the wrong PR
+(number, title, URL). Any audit log or detail pane keyed on
+`pr_identity` shows the replacement PR. The backend record's other
+fields are untouched.
+
+**Workaround:** If you suspect the branch has had a different PR opened
+on it while the TUI was closed, retreat the work item back to Review
+with Shift+Left before the first poll cycle completes (inside the first
+30 seconds after relaunch), then re-enter Mergequeue against the
+intended PR.
+
+**Future fix options:**
+- Persist `pr_number` (and a short-lived `pr_identity`) on the backend
+  record at `enter_mergequeue` time, and reconstruct watches directly
+  from the persisted number so the branch-fallback path is never used.
+- Reject `MERGED` results from the first poll of a reconstructed watch
+  unless the returned `pr_identity.number` matches some fingerprint the
+  user confirmed.
+- Surface a warning in the detail pane when the first poll of a
+  reconstructed watch resolves to a PR number that differs from anything
+  the work item has referenced before.
+
