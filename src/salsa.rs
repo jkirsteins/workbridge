@@ -408,11 +408,23 @@ pub fn app_event(
                 // Poll async worktree creation result.
                 state.poll_worktree_creation();
 
+                // Poll async session-open plan reads. Must run AFTER
+                // poll_worktree_creation so a just-created worktree can
+                // kick off its plan read on the same tick and see its
+                // result on the next one. The plan read itself runs on
+                // a background thread - see `App::begin_session_open`
+                // and `docs/UI.md` "Blocking I/O Prohibition".
+                state.poll_session_opens();
+
                 // Poll async unlinked-item cleanup result.
                 state.poll_unlinked_cleanup();
 
                 // Poll async MCP-triggered delete cleanup result.
                 state.poll_delete_cleanup();
+
+                // Drain any warnings from fire-and-forget orphan
+                // worktree cleanups (delete-during-create races).
+                state.poll_orphan_cleanup_warnings();
 
                 // Surface queued fetch errors.
                 state.drain_pending_fetch_errors();

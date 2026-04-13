@@ -3141,6 +3141,7 @@ mod format_entry_tests {
     use crate::theme::Theme;
     use crate::work_item::*;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use unicode_width::UnicodeWidthStr;
 
     /// Render a ListItem to a string by putting it in a List widget and
@@ -3171,7 +3172,7 @@ mod format_entry_tests {
     }
 
     fn make_app_with_work_item(wi: WorkItem) -> App {
-        let mut app = App::with_config(crate::config::Config::default(), Box::new(StubBackend));
+        let mut app = App::with_config(crate::config::Config::default(), Arc::new(StubBackend));
         app.work_items = vec![wi];
         app
     }
@@ -3487,6 +3488,7 @@ mod snapshot_tests {
     use crate::work_item_backend::{BackendError, CreateWorkItem, WorkItemBackend, WorkItemRecord};
     use ratatui_core::{backend::TestBackend, terminal::Terminal};
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     /// Helper: render the app into a TestBackend and return the buffer as a string.
     fn render(app: &App, width: u16, height: u16) -> String {
@@ -3905,7 +3907,7 @@ mod snapshot_tests {
             included_repos: vec![discovered_a],
             ..Config::for_test()
         };
-        let mut app = App::with_config(config, Box::new(StubBackend));
+        let mut app = App::with_config(config, Arc::new(StubBackend));
         app.show_settings = true;
         let output = render(&app, 80, 24);
 

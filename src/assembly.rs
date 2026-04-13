@@ -588,6 +588,7 @@ mod tests {
             path: PathBuf::from(path),
             branch: branch.map(|s| s.to_string()),
             is_main: false,
+            has_commits_ahead: None,
         }
     }
 

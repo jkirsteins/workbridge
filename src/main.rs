@@ -460,13 +460,13 @@ fn main() -> Result<(), AppError> {
             (config::Config::default(), Some(msg))
         }
     };
-    let (backend, backend_error): (Box<dyn work_item_backend::WorkItemBackend>, Option<String>) =
+    let (backend, backend_error): (Arc<dyn work_item_backend::WorkItemBackend>, Option<String>) =
         match work_item_backend::LocalFileBackend::new() {
-            Ok(b) => (Box::new(b), None),
+            Ok(b) => (Arc::new(b), None),
             Err(e) => {
                 let msg = format!("Backend error: {e} (using stub)");
                 eprintln!("workbridge: {msg}");
-                (Box::new(app::StubBackend), Some(msg))
+                (Arc::new(app::StubBackend), Some(msg))
             }
         };
     let worktree_service: Arc<dyn worktree_service::WorktreeService + Send + Sync> =

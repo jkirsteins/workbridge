@@ -72,32 +72,46 @@ cleaned up in order via `delete_work_item_by_id()`:
    suppression, no-plan prompt queue, rework prompt state, merge prompt state,
    and review gate state are all cleared.
 
-Steps 4-6 involve blocking I/O (git commands, gh CLI). BOTH the Ctrl+D
-path and the MCP delete path (`workbridge_delete`) run these steps on
-a background thread via `spawn_delete_cleanup()` /
-`poll_delete_cleanup()` so the UI thread is not blocked by the main
-cleanup phase. Auto-archive skips them entirely
-(`skip_resource_cleanup: true`) because Done items have already been
-through the merge flow which handles resource cleanup.
+Steps 4-6 involve blocking I/O (git commands, gh CLI) and are NEVER run
+from `delete_work_item_by_id` itself - that function now performs only
+the non-blocking phases (backend delete, session kill, in-flight
+cancellation, in-memory cleanup). Callers that need resource cleanup
+first snapshot the per-association data via `gather_delete_cleanup_infos`
+(pure cache lookups against `repo_data`) and then spawn a background
+thread via `spawn_delete_cleanup()` / `poll_delete_cleanup()` so the UI
+thread is never blocked. Auto-archive does not gather any cleanup infos
+at all because Done items have already been through the merge flow,
+which handles worktree/branch/PR removal.
 
-One edge case is still handled synchronously: if a worktree-creation
-background thread has already completed (its result is queued in
-`worktree_create_rx`) at the moment the user confirms the delete,
-`delete_work_item_by_id()` Phase 5 drains the receiver and runs a
-single `remove_worktree` inline to clean up the orphan. Refactoring
-this into the background cleanup is cross-cutting (the same Phase 5
-also cancels pr_create, merge, and review_submit state) and is
-deferred to a follow-up change - see `docs/worktree-management.md`
-for the tradeoff.
+The worktree-creation race is also handled off the UI thread: if a
+worktree-creation background thread has already completed (its result
+is queued in `worktree_create_rx`) at the moment the user confirms the
+delete, `delete_work_item_by_id()` Phase 5 drains the receiver and
+appends the orphan's `(repo_path, worktree_path, branch)` to an
+`orphan_worktrees` vector passed in by the caller. Each orphan entry
+is then forwarded to `spawn_delete_cleanup()` as a synthesized
+`DeleteCleanupInfo` (with `branch_in_main_worktree: false` because a
+freshly-created worktree is never the main worktree), so
+`git worktree remove --force` and `git branch -D` both run on the same
+background thread used for the normal delete cleanup path. There is
+no remaining synchronous `git worktree remove` or `git branch -D` on
+the UI thread.
 
-The Ctrl+D path invokes `confirm_delete_from_prompt()`, which in turn
-calls `delete_work_item_by_id()` with `skip_resource_cleanup: true` and
-then spawns the background cleanup thread. The MCP path
-(`McpEvent::DeleteWorkItem`) does the same ordering: delete the backend
-record and kill sessions on the main thread, then spawn the background
-cleanup. In both cases the `delete_cleanup_rx` receiver is polled from
-`poll_delete_cleanup()` on each timer tick and the result is surfaced
-via the modal (Ctrl+D) or the status-bar activity (MCP).
+The related "worktree created after work item was deleted" race - the
+worktree-creation thread finishes while the item is already gone and
+there is no active delete cleanup to join - is handled by
+`spawn_orphan_worktree_cleanup()` (a dedicated fire-and-forget
+background thread), not by `spawn_delete_cleanup()`. See
+`docs/worktree-management.md` for details.
+
+The Ctrl+D path invokes `confirm_delete_from_prompt()`, which calls
+`delete_work_item_by_id()` (backend delete + session kill + in-flight
+cancellation) and then spawns the background cleanup thread. The MCP
+path (`McpEvent::DeleteWorkItem`) does the same ordering: delete the
+backend record and kill sessions on the main thread, then spawn the
+background cleanup. In both cases the `delete_cleanup_rx` receiver is
+polled from `poll_delete_cleanup()` on each timer tick and the result
+is surfaced via the modal (Ctrl+D) or the status-bar activity (MCP).
 
 Steps 4-8 are best-effort: failures produce warning messages but do not
 abort the overall delete. Only a backend delete failure (step 1) is
