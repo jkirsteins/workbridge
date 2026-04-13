@@ -4,8 +4,8 @@ use crate::salsa::ct::event::{
 use crate::work_item::SelectionState;
 
 use crate::app::{
-    App, BOARD_COLUMNS, DeleteConfirmState, DisplayEntry, FocusPanel, RightPanelTab,
-    SettingsListFocus, SettingsTab, ViewMode,
+    App, BOARD_COLUMNS, DisplayEntry, FocusPanel, RightPanelTab, SettingsListFocus, SettingsTab,
+    ViewMode,
 };
 use crate::create_dialog::CreateDialogFocus;
 use crate::layout;
@@ -116,23 +116,55 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         match (key.modifiers, key.code) {
             (_, KeyCode::Char('d')) => {
                 let (wi_id, _) = app.branch_gone_prompt.take().unwrap();
-                // Find the work item in the display list and delete it.
-                // If the work item was removed between showing the dialog
-                // and pressing 'd', bail out to avoid deleting the wrong item.
-                if let Some(idx) = app.work_items.iter().position(|w| w.id == wi_id)
-                    && let Some(di) = app.display_list.iter().position(
-                        |e| matches!(e, crate::app::DisplayEntry::WorkItemEntry(i) if *i == idx),
-                    )
-                {
-                    app.selected_item = Some(di);
-                    app.delete_selected_work_item(true);
-                }
+                // Target the work item by identity rather than going
+                // through selected_work_item_id(), which in Board view
+                // reads from board_cursor rather than selected_item. The
+                // modal still renders a "Delete '<title>'?" confirmation
+                // so a mis-click on [d] in the branch-gone dialog does
+                // not destroy the work item without a second keypress.
+                // `open_delete_prompt_for` looks up the target by id and
+                // surfaces "Work item not found" if the item vanished
+                // between the prompt appearing and this keypress, so no
+                // outer existence check is needed.
+                app.open_delete_prompt_for(wi_id);
             }
             (_, KeyCode::Esc) => {
                 app.branch_gone_prompt = None;
             }
             _ => {}
         }
+        return true;
+    }
+
+    // In-progress guard: while the delete background thread is running,
+    // swallow all keys (including Claude session input) so the modal
+    // cannot be dismissed and the PTY panel cannot receive keystrokes.
+    // Q/Ctrl+Q still triggers force-quit so a hung delete never traps
+    // the user. Must come before delete_prompt_visible because both
+    // flags are true during in-progress.
+    if app.delete_in_progress {
+        if matches!(
+            (key.modifiers, key.code),
+            (
+                KeyModifiers::NONE | KeyModifiers::SHIFT,
+                KeyCode::Char('q' | 'Q')
+            ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
+        ) {
+            if !app.has_any_session() || app.confirm_quit {
+                app.should_quit = true;
+            } else {
+                app.confirm_quit = true;
+                app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                sync_layout(app);
+            }
+        }
+        return true;
+    }
+
+    // Delete confirmation modal: route keys to it while the prompt is
+    // visible but the background thread has not yet started.
+    if app.delete_prompt_visible {
+        handle_delete_prompt(app, key);
         return true;
     }
 
@@ -332,19 +364,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 KeyCode::Char('q' | 'Q')
             ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
         );
-    let is_delete_confirm = app.confirm_delete != DeleteConfirmState::None
-        && (key.code == KeyCode::Delete
-            || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d')));
 
     let mut state_changed = false;
     let had_status = app.has_visible_status_bar();
     if app.confirm_quit && !is_quit_confirm {
         app.confirm_quit = false;
-        app.status_message = None;
-        state_changed = true;
-    }
-    if app.confirm_delete != DeleteConfirmState::None && !is_delete_confirm {
-        app.confirm_delete = DeleteConfirmState::None;
         app.status_message = None;
         state_changed = true;
     }
@@ -502,32 +526,13 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
                 .and_then(|cwd| app.managed_repo_root(&cwd));
             app.create_dialog.open(&active_repos, cwd_repo.as_ref());
         }
-        // Ctrl+D or Delete - delete work item with 3-step confirmation
+        // Ctrl+D or Delete - open the delete confirmation modal.
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Delete) => {
             if app.selected_work_item_id().is_none() {
                 return;
             }
-            match app.confirm_delete {
-                DeleteConfirmState::None => {
-                    app.confirm_delete = DeleteConfirmState::AwaitingConfirm;
-                    app.status_message = Some("Press again to delete this work item".into());
-                    sync_layout(app);
-                }
-                DeleteConfirmState::AwaitingConfirm => {
-                    app.attempt_delete_selected_work_item();
-                    // Preserve AwaitingForce if attempt_delete escalated; reset otherwise.
-                    app.confirm_delete = match app.confirm_delete {
-                        DeleteConfirmState::AwaitingForce => DeleteConfirmState::AwaitingForce,
-                        _ => DeleteConfirmState::None,
-                    };
-                    sync_layout(app);
-                }
-                DeleteConfirmState::AwaitingForce => {
-                    app.confirm_delete = DeleteConfirmState::None;
-                    app.delete_selected_work_item(true);
-                    sync_layout(app);
-                }
-            }
+            app.open_delete_prompt();
+            sync_layout(app);
         }
         // ? - toggle settings overlay
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
@@ -589,40 +594,12 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
         // Ctrl+D or Delete - delete work item or clean up unlinked item
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Delete) => {
             if app.selected_work_item_id().is_some() {
-                // Work item selected: 3-step confirmation delete flow.
-                match app.confirm_delete {
-                    DeleteConfirmState::None => {
-                        app.confirm_delete = DeleteConfirmState::AwaitingConfirm;
-                        app.status_message = Some("Press again to delete this work item".into());
-                        sync_layout(app);
-                    }
-                    DeleteConfirmState::AwaitingConfirm => {
-                        let had_status = app.has_visible_status_bar();
-                        let had_context = app.selected_work_item_context().is_some();
-                        app.attempt_delete_selected_work_item();
-                        app.confirm_delete = match app.confirm_delete {
-                            // attempt_delete may have escalated to AwaitingForce
-                            DeleteConfirmState::AwaitingForce => DeleteConfirmState::AwaitingForce,
-                            _ => DeleteConfirmState::None,
-                        };
-                        if app.has_visible_status_bar() != had_status
-                            || app.selected_work_item_context().is_some() != had_context
-                        {
-                            sync_layout(app);
-                        }
-                    }
-                    DeleteConfirmState::AwaitingForce => {
-                        app.confirm_delete = DeleteConfirmState::None;
-                        let had_status = app.has_visible_status_bar();
-                        let had_context = app.selected_work_item_context().is_some();
-                        app.delete_selected_work_item(true);
-                        if app.has_visible_status_bar() != had_status
-                            || app.selected_work_item_context().is_some() != had_context
-                        {
-                            sync_layout(app);
-                        }
-                    }
-                }
+                // Open the delete confirmation modal. Further keystrokes
+                // are routed to handle_delete_prompt via the intercept at
+                // the top of handle_key while delete_prompt_visible is
+                // true, so there is no per-step state machine here.
+                app.open_delete_prompt();
+                sync_layout(app);
             } else if let Some(unlinked_idx) =
                 app.selected_item
                     .and_then(|idx| match app.display_list.get(idx) {
@@ -1095,18 +1072,33 @@ pub fn handle_resize(app: &mut App, cols: u16, rows: u16) {
     app.resize_pty_panes();
 }
 
-/// Handle a paste event (e.g. drag-and-drop file path, system clipboard)
-/// by forwarding the pasted text to the focused PTY session as a bracketed
-/// paste sequence so the receiving application handles it atomically.
-pub fn handle_paste(app: &mut App, data: &str) -> bool {
-    if app.shutting_down
-        || app.create_dialog.visible
+/// Returns `true` when any modal overlay (dialog, confirmation, in-progress
+/// operation spinner, etc.) is currently visible. Used by paste/mouse/key
+/// handlers to swallow input so stray events cannot reach the underlying
+/// PTY or left-panel state while a modal owns the screen.
+///
+/// Keep this list exhaustive: every new overlay must be added here or the
+/// modal will not reliably swallow paste and mouse events.
+fn any_modal_visible(app: &App) -> bool {
+    app.create_dialog.visible
         || app.show_settings
         || app.rework_prompt_visible
         || app.no_plan_prompt_visible
         || app.branch_gone_prompt.is_some()
         || app.confirm_merge
-    {
+        || app.cleanup_prompt_visible
+        || app.cleanup_in_progress
+        || app.merge_in_progress
+        || app.delete_prompt_visible
+        || app.delete_in_progress
+        || app.alert_message.is_some()
+}
+
+/// Handle a paste event (e.g. drag-and-drop file path, system clipboard)
+/// by forwarding the pasted text to the focused PTY session as a bracketed
+/// paste sequence so the receiving application handles it atomically.
+pub fn handle_paste(app: &mut App, data: &str) -> bool {
+    if app.shutting_down || any_modal_visible(app) {
         return false;
     }
     let bracketed = format!("\x1b[200~{data}\x1b[201~");
@@ -1353,6 +1345,24 @@ fn handle_no_plan_prompt(app: &mut App, key: KeyEvent) {
             if app.no_plan_prompt_queue.is_empty() {
                 app.no_plan_prompt_visible = false;
             }
+        }
+        _ => {}
+    }
+}
+
+/// Handle key events while the delete confirmation modal is visible but
+/// the background cleanup thread has not started yet. Once confirmed,
+/// delete_in_progress becomes true and a separate intercept higher up
+/// in handle_key swallows further input.
+fn handle_delete_prompt(app: &mut App, key: KeyEvent) {
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Esc) => {
+            app.cancel_delete_prompt();
+            sync_layout(app);
+        }
+        (_, KeyCode::Char('y' | 'Y')) => {
+            app.confirm_delete_from_prompt();
+            sync_layout(app);
         }
         _ => {}
     }
@@ -1720,14 +1730,7 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
     };
 
     // Ignore during shutdown or when overlays are visible.
-    if app.shutting_down
-        || app.create_dialog.visible
-        || app.show_settings
-        || app.rework_prompt_visible
-        || app.no_plan_prompt_visible
-        || app.branch_gone_prompt.is_some()
-        || app.confirm_merge
-    {
+    if app.shutting_down || any_modal_visible(app) {
         return false;
     }
 
@@ -2484,6 +2487,73 @@ mod tests {
         assert!(
             app.cleanup_in_progress,
             "in-progress flag must not clear on Esc"
+        );
+    }
+
+    /// Delete prompt: Esc cancels the prompt and clears target state.
+    #[test]
+    fn delete_prompt_esc_cancels() {
+        let mut app = App::new();
+        app.delete_prompt_visible = true;
+        app.delete_target_title = Some("Test item".into());
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, esc);
+
+        assert!(
+            !app.delete_prompt_visible,
+            "Esc should dismiss the delete prompt"
+        );
+        assert!(
+            app.delete_target_title.is_none(),
+            "target title should be cleared on cancel"
+        );
+    }
+
+    /// Delete prompt: unrelated keys are swallowed so stray keystrokes
+    /// cannot accidentally confirm or leak into the Claude session
+    /// pane beneath the modal.
+    #[test]
+    fn delete_prompt_swallows_other_keys() {
+        let mut app = App::new();
+        app.delete_prompt_visible = true;
+
+        for ch in ['a', 'n', 'q', ' ', '\u{1b}'] {
+            if ch == '\u{1b}' {
+                continue; // Esc is tested separately.
+            }
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+            handle_key(&mut app, key);
+            assert!(
+                app.delete_prompt_visible,
+                "prompt should still be visible after pressing '{ch}'"
+            );
+        }
+    }
+
+    /// Delete in-progress: even the modal's own 'y' confirm is swallowed
+    /// once the background thread is running. Only Q/Ctrl+Q (force-quit
+    /// escape hatch) has any effect.
+    #[test]
+    fn delete_in_progress_swallows_keys() {
+        let mut app = App::new();
+        app.delete_prompt_visible = true;
+        app.delete_in_progress = true;
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, esc);
+        let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        handle_key(&mut app, y);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(&mut app, enter);
+
+        assert!(
+            app.delete_prompt_visible,
+            "dialog must stay open while cleanup is running"
+        );
+        assert!(
+            app.delete_in_progress,
+            "in-progress flag must not clear on stray keys"
         );
     }
 }

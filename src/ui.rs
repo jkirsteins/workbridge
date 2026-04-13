@@ -248,6 +248,47 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
                 options: &[("[d]", "Delete work item"), ("[Esc]", "Dismiss")],
             },
         );
+    } else if app.delete_prompt_visible {
+        if app.delete_in_progress {
+            let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+            draw_prompt_dialog(
+                buf,
+                theme,
+                area,
+                PromptDialogKind::KeyChoice {
+                    title: "Delete Work Item",
+                    body: &format!("{spinner} Removing worktree, branches, and open PRs..."),
+                    options: &[],
+                },
+            );
+        } else {
+            // draw_prompt_dialog's KeyChoice variant renders the body as
+            // exactly one line. Long titles are elided so the dialog
+            // still fits the 60-column max width. The body always warns
+            // that uncommitted changes will be lost, because we no
+            // longer shell out to `git status --porcelain` on the UI
+            // thread to pre-detect dirty worktrees.
+            let raw_title = app
+                .delete_target_title
+                .as_deref()
+                .unwrap_or("this work item");
+            // 60 - len("Delete '' (uncommitted changes will be lost)?") - borders - padding
+            let short_title = truncate_str(raw_title, 24);
+            let body = format!("Delete '{short_title}' (uncommitted changes will be lost)?");
+            draw_prompt_dialog(
+                buf,
+                theme,
+                area,
+                PromptDialogKind::KeyChoice {
+                    title: "Delete Work Item",
+                    body: &body,
+                    options: &[
+                        ("[y]", "Delete (worktree, branch, PR)"),
+                        ("[Esc]", "Cancel"),
+                    ],
+                },
+            );
+        }
     }
 
     // Alert dialog (renders above prompt dialogs, below global drawer and create dialog).

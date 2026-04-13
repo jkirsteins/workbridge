@@ -200,7 +200,7 @@ incompatible with rat-focus's widget navigation model.
 - Enter on a work item: focus right panel
 - Tab (when right panel focused): cycle between Claude Code and Terminal tabs
 - Ctrl+]: return to left panel
-- Ctrl+D / Delete: delete selected work item (3-step confirmation)
+- Ctrl+D / Delete: delete selected work item (modal confirmation)
 - Dead session: auto-return to left panel
 - Up/Down in left panel: reset right panel tab to Claude Code
 
@@ -214,7 +214,7 @@ and row index independently.
 - Up/Down arrows: move between items within a column
 - Shift+Right: advance item to next stage
 - Shift+Left: retreat item to previous stage
-- Ctrl+D / Delete: delete selected work item (3-step confirmation)
+- Ctrl+D / Delete: delete selected work item (modal confirmation)
 - Enter: drill down into selected column (filtered flat list + PTY)
 - Ctrl+]: return from drill-down to board view
 
@@ -558,7 +558,7 @@ dialog that blocks interaction until dismissed with Enter or Esc.
 
 1. Main UI (panels, context bar, status bar)
 2. Settings overlay
-3. Prompt dialogs (merge, rework, no-plan, cleanup, branch-gone)
+3. Prompt dialogs (merge, rework, no-plan, cleanup, branch-gone, delete)
 4. Alert dialog (renders above all other prompts)
 5. Global assistant drawer
 6. Create dialog
@@ -584,8 +584,12 @@ overlay.
   render their own content; the status bar is for transient notifications.
 - Do not set `app.status_message` for error messages that need acknowledgment.
   Use `app.alert_message` instead so a red alert dialog appears.
-- Same-key-repeat confirmations (delete, quit) stay in the status bar -
+- Same-key-repeat confirmations (quit) stay in the status bar -
   they are not blocking choice prompts and do not need dialog boxes.
+  Destructive operations on real git state (e.g., work item deletion)
+  use a modal prompt dialog instead, both to block the Claude session
+  from receiving stray keystrokes during cleanup and because the
+  operation should not feel like a "tap twice" shortcut.
 - Do not skip `dim_background()` in new overlays.
 
 ## Theme

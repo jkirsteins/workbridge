@@ -289,10 +289,6 @@ mod tests {
             ))
         }
 
-        fn is_worktree_dirty(&self, _worktree_path: &Path) -> Result<bool, WorktreeError> {
-            Ok(false)
-        }
-
         fn default_branch(&self, _repo_path: &Path) -> Result<String, WorktreeError> {
             Ok("main".to_string())
         }

@@ -98,20 +98,6 @@ pub struct WorkItemContext {
     pub last_activity: Option<String>,
 }
 
-/// State for the 3-step delete confirmation flow.
-///
-/// None -> AwaitingConfirm (first press) -> AwaitingForce (dirty worktree) -> deleted
-/// None -> AwaitingConfirm (first press) -> deleted (clean worktree)
-#[derive(Clone, Debug, PartialEq)]
-pub enum DeleteConfirmState {
-    /// No delete in progress.
-    None,
-    /// First press received - "Press again to delete".
-    AwaitingConfirm,
-    /// Dirty worktree detected - "Press again to force-delete".
-    AwaitingForce,
-}
-
 /// Visual style variant for group headers.
 #[derive(Clone, Debug, PartialEq)]
 pub enum GroupHeaderKind {
@@ -347,8 +333,24 @@ pub struct App {
     pub status_message: Option<String>,
     /// True when waiting for a second press to confirm quit.
     pub confirm_quit: bool,
-    /// State of the delete confirmation flow (None/AwaitingConfirm/AwaitingForce).
-    pub confirm_delete: DeleteConfirmState,
+    /// True when the delete confirmation modal is visible.
+    pub delete_prompt_visible: bool,
+    /// Identity of the work item targeted by the open delete modal. Stored
+    /// by identity (not display index) so it survives list reassembly.
+    pub delete_target_wi_id: Option<WorkItemId>,
+    /// Title of the targeted work item, shown in the dialog body.
+    pub delete_target_title: Option<String>,
+    /// True while the async delete cleanup thread is running on behalf of
+    /// the user-initiated (modal) delete path. The dialog stays visible
+    /// with a spinner and the event loop swallows all keys except Q/Ctrl+Q.
+    pub delete_in_progress: bool,
+    /// Warnings collected synchronously during the modal delete's
+    /// `delete_work_item_by_id` call (Phase 2 backend pre-delete hook,
+    /// Phase 5 inline orphan-worktree cleanup). Stashed here so
+    /// `poll_delete_cleanup` can fold them into the final status/alert
+    /// message alongside the background thread's warnings - otherwise
+    /// they would be silently dropped when `cleanup_infos` is non-empty.
+    pub delete_sync_warnings: Vec<String>,
     /// True when the merge strategy prompt is visible (Review -> Done).
     pub confirm_merge: bool,
     /// The work item ID that the merge prompt applies to.
@@ -454,6 +456,10 @@ pub struct App {
     pub backend: Box<dyn WorkItemBackend>,
     /// Worktree service for creating/listing worktrees.
     pub worktree_service: Arc<dyn WorktreeService + Send + Sync>,
+    /// GitHub pull-request closer, injected via trait so the background
+    /// delete-cleanup thread can be exercised in tests without shelling
+    /// out to `gh`. Production uses `GhPullRequestCloser`.
+    pub pr_closer: Arc<dyn crate::pr_service::PullRequestCloser>,
     /// Assembled work items (from backend records + repo data).
     pub work_items: Vec<WorkItem>,
     /// PRs not linked to any work item (only the user's own).
@@ -703,11 +709,16 @@ impl App {
         let active_repo_cache = canonicalize_repo_entries(config.active_repos());
         let (mcp_tx, mcp_rx) = crossbeam_channel::unbounded();
         let mut app = Self {
+            pr_closer: crate::pr_service::default_pr_closer(),
             should_quit: false,
             focus: FocusPanel::Left,
             status_message: None,
             confirm_quit: false,
-            confirm_delete: DeleteConfirmState::None,
+            delete_prompt_visible: false,
+            delete_target_wi_id: None,
+            delete_target_title: None,
+            delete_in_progress: false,
+            delete_sync_warnings: Vec::new(),
             confirm_merge: false,
             merge_wi_id: None,
             merge_in_progress: false,
@@ -2159,10 +2170,22 @@ impl App {
 
     /// Spawn a background thread to perform resource cleanup (worktree
     /// removal, branch deletion, PR close) for a deleted work item.
-    /// Called from the MCP delete handler after the backend record and
-    /// session have already been cleaned up on the main thread.
-    /// poll_delete_cleanup() receives the result.
-    pub fn spawn_delete_cleanup(&mut self, cleanup_infos: Vec<DeleteCleanupInfo>) {
+    /// Called from the MCP delete handler or from the user-initiated modal
+    /// delete flow after the backend record and session have already been
+    /// cleaned up on the main thread. poll_delete_cleanup() receives the
+    /// result.
+    ///
+    /// When `show_status_activity` is true, a "Deleting work item
+    /// resources..." spinner is pushed onto the status bar. The modal
+    /// delete path passes `false` because its own dialog already shows
+    /// an in-progress spinner - a second status-bar indicator would be
+    /// redundant and mislead the user about what is waiting on what.
+    pub fn spawn_delete_cleanup(
+        &mut self,
+        cleanup_infos: Vec<DeleteCleanupInfo>,
+        force: bool,
+        show_status_activity: bool,
+    ) {
         if self.delete_cleanup_rx.is_some() {
             // A previous delete cleanup is still running. Alert the user
             // so orphaned resources (worktrees, branches, open PRs) are
@@ -2176,15 +2199,65 @@ impl App {
         }
 
         let ws = Arc::clone(&self.worktree_service);
+        let pr_closer = Arc::clone(&self.pr_closer);
         let (tx, rx) = crossbeam_channel::bounded(1);
 
         std::thread::spawn(move || {
             let mut warnings = Vec::new();
             let mut closed_pr_branches = Vec::new();
 
+            // Per-association ordering: close the remote PR FIRST, and
+            // only run destructive local cleanup (worktree removal,
+            // branch deletion) if the close succeeds. Reversing this
+            // order means a `gh pr close` failure (auth, network, merge
+            // queue state) would leave the user with an open PR AND no
+            // local branch/worktree to recover unpushed commits from.
+            // This mirrors `spawn_unlinked_cleanup`'s ordering.
             for info in &cleanup_infos {
+                let pr_close_ok = if let Some(pr_number) = info.open_pr_number
+                    && let Some((ref owner, ref repo)) = info.github_remote
+                {
+                    match pr_closer.close_pr(owner, repo, pr_number) {
+                        Ok(()) => {
+                            // Track for eviction so stale fetch data does
+                            // not resurrect the closed PR as a phantom
+                            // unlinked item.
+                            if let Some(ref branch) = info.branch {
+                                closed_pr_branches.push((info.repo_path.clone(), branch.clone()));
+                            }
+                            true
+                        }
+                        Err(msg) => {
+                            warnings.push(format!("PR close: {msg}"));
+                            false
+                        }
+                    }
+                } else {
+                    // No open PR for this association - local-only
+                    // cleanup is safe to proceed.
+                    true
+                };
+
+                if !pr_close_ok {
+                    // Preserve local worktree and branch so the user can
+                    // recover unpushed work and manually retry the PR
+                    // close. The backend record is already gone, so this
+                    // warning is the user's only breadcrumb pointing at
+                    // the preserved paths.
+                    if let Some(ref wt_path) = info.worktree_path {
+                        warnings.push(format!(
+                            "preserved local worktree {} (PR close failed)",
+                            wt_path.display()
+                        ));
+                    }
+                    if let Some(ref branch) = info.branch {
+                        warnings.push(format!("preserved local branch {branch} (PR close failed)"));
+                    }
+                    continue;
+                }
+
                 if let Some(ref wt_path) = info.worktree_path
-                    && let Err(e) = ws.remove_worktree(&info.repo_path, wt_path, false, true)
+                    && let Err(e) = ws.remove_worktree(&info.repo_path, wt_path, false, force)
                 {
                     warnings.push(format!("worktree: {e}"));
                 }
@@ -2196,27 +2269,6 @@ impl App {
                 {
                     warnings.push(format!("branch: {e}"));
                 }
-                if let Some(pr_number) = info.open_pr_number
-                    && let Some((ref owner, ref repo)) = info.github_remote
-                {
-                    let owner_repo = format!("{owner}/{repo}");
-                    match std::process::Command::new("gh")
-                        .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
-                        .output()
-                    {
-                        Ok(output) if !output.status.success() => {
-                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                            warnings.push(format!("PR close: {stderr}"));
-                        }
-                        Err(e) => warnings.push(format!("PR close: {e}")),
-                        _ => {
-                            // PR was successfully closed - track for eviction.
-                            if let Some(ref branch) = info.branch {
-                                closed_pr_branches.push((info.repo_path.clone(), branch.clone()));
-                            }
-                        }
-                    }
-                }
             }
 
             let _ = tx.send(CleanupResult {
@@ -2226,7 +2278,10 @@ impl App {
         });
 
         self.delete_cleanup_rx = Some(rx);
-        self.delete_cleanup_activity = Some(self.start_activity("Deleting work item resources..."));
+        if show_status_activity {
+            self.delete_cleanup_activity =
+                Some(self.start_activity("Deleting work item resources..."));
+        }
     }
 
     /// Poll the async delete-cleanup thread for a result. Called on each
@@ -2245,8 +2300,20 @@ impl App {
                 if let Some(aid) = self.delete_cleanup_activity.take() {
                     self.end_activity(aid);
                 }
-                self.alert_message =
-                    Some("Delete cleanup: background thread exited unexpectedly".into());
+                let sync_warnings = std::mem::take(&mut self.delete_sync_warnings);
+                if self.delete_in_progress {
+                    self.delete_in_progress = false;
+                    self.delete_prompt_visible = false;
+                    self.delete_target_wi_id = None;
+                    self.delete_target_title = None;
+                }
+                let mut msg = String::from("Delete cleanup: background thread exited unexpectedly");
+                if !sync_warnings.is_empty() {
+                    msg.push_str(" (sync warnings: ");
+                    msg.push_str(&sync_warnings.join("; "));
+                    msg.push(')');
+                }
+                self.alert_message = Some(msg);
                 return;
             }
         };
@@ -2256,8 +2323,21 @@ impl App {
             self.end_activity(aid);
         }
 
-        // Track closed PRs for cache eviction so stale fetch data
-        // does not resurrect them as phantom unlinked items.
+        // Modal-initiated delete: route through finish_delete_cleanup so
+        // the dialog closes, evictions are applied, and the final message
+        // uses the "Work item deleted" wording seen in the manual flow.
+        // Drain delete_sync_warnings so Phase 2/Phase 5 warnings collected
+        // on the UI thread (e.g. pre-delete hook failure, inline orphan
+        // worktree cleanup) are folded into the final status/alert.
+        if self.delete_in_progress {
+            let sync_warnings = std::mem::take(&mut self.delete_sync_warnings);
+            self.finish_delete_cleanup(result.warnings, result.closed_pr_branches, sync_warnings);
+            return;
+        }
+
+        // MCP-initiated delete: no modal to close, just track evictions
+        // and surface a status/alert. Wording differs from the modal path
+        // because the user didn't explicitly trigger the delete.
         if !result.closed_pr_branches.is_empty() {
             self.cleanup_evicted_branches
                 .extend(result.closed_pr_branches);
@@ -3836,6 +3916,24 @@ impl App {
                         }
                     };
 
+                    // Guard against concurrent cleanup: if a prior delete (from
+                    // the modal OR a previous MCP call) is still running, refuse
+                    // THIS delete before touching the backend. Without this check
+                    // the backend record and session would be destroyed but
+                    // spawn_delete_cleanup would early-return, silently orphaning
+                    // the worktree, branch, and open PR. Mirror the modal's guard
+                    // (confirm_delete_from_prompt) here so both entry points have
+                    // the same ordering: check availability -> delete backend ->
+                    // spawn cleanup.
+                    if self.delete_cleanup_rx.is_some() {
+                        self.alert_message = Some(
+                            "MCP delete refused: another delete cleanup is still \
+                             in progress. Wait for it to finish and try again."
+                                .into(),
+                        );
+                        continue;
+                    }
+
                     // Gather repo associations from the assembled work item.
                     let repo_associations: Vec<crate::work_item_backend::RepoAssociationRecord> =
                         self.work_items
@@ -3872,9 +3970,13 @@ impl App {
                     }
 
                     // Spawn background thread for blocking resource cleanup
-                    // (worktree removal, branch deletion, PR close).
+                    // (worktree removal, branch deletion, PR close). The MCP
+                    // path always forces removal (no interactive confirmation
+                    // is possible) and shows progress in the status bar
+                    // because the user did not explicitly trigger the delete
+                    // from a dialog.
                     if !cleanup_infos.is_empty() {
-                        self.spawn_delete_cleanup(cleanup_infos);
+                        self.spawn_delete_cleanup(cleanup_infos, true, true);
                     }
 
                     // Clear selection identity if the deleted item was selected.
@@ -4410,65 +4512,80 @@ impl App {
         }
     }
 
-    /// Gateway between AwaitingConfirm and actual delete. Checks for dirty
-    /// worktrees and either proceeds to delete or escalates to AwaitingForce.
-    pub fn attempt_delete_selected_work_item(&mut self) {
+    /// Open the delete confirmation modal for the currently selected work
+    /// item.
+    ///
+    /// Does not touch the backend, shell out to git, or spawn any cleanup.
+    /// The dialog body warns that any uncommitted changes will be lost so
+    /// we can unconditionally pass `--force` to the background cleanup
+    /// thread without blocking the UI thread on `git status --porcelain`.
+    /// The actual work runs in `confirm_delete_from_prompt` after the
+    /// user presses 'y'.
+    pub fn open_delete_prompt(&mut self) {
         let Some(work_item_id) = self.selected_work_item_id() else {
             self.status_message = Some("No work item selected".into());
             return;
         };
-
-        // Check each repo association's worktree for dirty status.
-        // On error, default to dirty (safer: forces user to confirm force-delete).
-        let has_dirty = self
-            .work_items
-            .iter()
-            .find(|w| w.id == work_item_id)
-            .map(|wi| {
-                wi.repo_associations.iter().any(|assoc| {
-                    assoc
-                        .worktree_path
-                        .as_ref()
-                        .map(
-                            |wt_path| match self.worktree_service.is_worktree_dirty(wt_path) {
-                                Ok(dirty) => dirty,
-                                Err(e) => {
-                                    self.status_message = Some(format!(
-                                        "Could not check worktree status: {e} - treating as dirty"
-                                    ));
-                                    true
-                                }
-                            },
-                        )
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false);
-
-        if has_dirty {
-            self.confirm_delete = DeleteConfirmState::AwaitingForce;
-            self.status_message =
-                Some("Worktree has uncommitted changes! Press again to force-delete".into());
-        } else {
-            self.delete_selected_work_item(false);
-        }
+        self.open_delete_prompt_for(work_item_id);
     }
 
-    /// Delete the currently selected work item with comprehensive resource cleanup.
-    ///
-    /// Kills any active session, removes worktrees and branches, closes open PRs,
-    /// deletes the backend record, and cleans up in-memory state.
-    ///
-    /// When `force` is true, dirty worktrees are removed with `--force` and
-    /// branches are deleted with `-D`.
-    pub fn delete_selected_work_item(&mut self, force: bool) {
-        let Some(work_item_id) = self.selected_work_item_id() else {
-            self.status_message = Some("No work item selected".into());
+    /// Variant of `open_delete_prompt` that targets a specific work item by
+    /// ID rather than reading `selected_work_item_id()`. Used by the
+    /// branch-gone dialog which already knows the target and must not
+    /// depend on `selected_item` because Board view stores the cursor in
+    /// `board_cursor` instead.
+    pub fn open_delete_prompt_for(&mut self, work_item_id: WorkItemId) {
+        // Look up the target work item to fetch its title for the modal.
+        let Some(target) = self.work_items.iter().find(|w| w.id == work_item_id) else {
+            self.status_message = Some("Work item not found".into());
             return;
         };
 
-        // Gather repo associations from the assembled work item so the
-        // shared cleanup helper can look up worktrees and PRs via repo_data.
+        let title = target.title.clone();
+        self.delete_target_wi_id = Some(work_item_id);
+        self.delete_target_title = Some(title);
+        self.delete_prompt_visible = true;
+    }
+
+    /// Dismiss the delete confirmation modal without deleting anything.
+    /// Safe to call when the modal is not visible; it just clears any
+    /// residual target state.
+    pub fn cancel_delete_prompt(&mut self) {
+        self.delete_prompt_visible = false;
+        self.delete_target_wi_id = None;
+        self.delete_target_title = None;
+    }
+
+    /// Execute the delete once the user has confirmed via the modal.
+    ///
+    /// Synchronously kills sessions and deletes the backend record, then
+    /// spawns a background thread for the slow I/O (git worktree remove,
+    /// git branch -D, gh pr close) following docs/UI.md "Blocking I/O
+    /// Prohibition". The modal stays open with a spinner while the
+    /// background thread runs; `poll_delete_cleanup` closes it on
+    /// completion.
+    pub fn confirm_delete_from_prompt(&mut self) {
+        let Some(work_item_id) = self.delete_target_wi_id.clone() else {
+            // Defensive: dialog was confirmed without a target. Just close it.
+            self.cancel_delete_prompt();
+            return;
+        };
+
+        // If a prior cleanup (MCP or modal) is still running, refuse to
+        // start a second one. Alert the user and leave the modal closed -
+        // they can retry once the other cleanup drains.
+        if self.delete_cleanup_rx.is_some() {
+            self.cancel_delete_prompt();
+            self.alert_message = Some(
+                "Another delete cleanup is still in progress. \
+                 Wait for it to finish and try again."
+                    .into(),
+            );
+            return;
+        }
+
+        // Gather repo associations BEFORE touching the backend - once the
+        // record is deleted we can no longer read its associations.
         let repo_associations: Vec<crate::work_item_backend::RepoAssociationRecord> = self
             .work_items
             .iter()
@@ -4485,17 +4602,30 @@ impl App {
             })
             .unwrap_or_default();
 
-        // Phases 2-6: backend delete, session kill, resource cleanup,
-        // in-flight cancellation, in-memory state. Warnings collected here.
+        // Resource-cleanup data must be gathered before reassembly so the
+        // repo_data lookups still reflect the pre-delete state.
+        let cleanup_infos = self.gather_delete_cleanup_infos(&repo_associations);
+        // The modal always passes force=true: we no longer shell out to
+        // `git status --porcelain` from the UI thread to detect dirty
+        // worktrees, and the dialog body warns the user that uncommitted
+        // changes will be lost. See open_delete_prompt for the rationale.
+        let force = true;
+
+        // Phases 2-6: backend delete, session kill, in-flight cancellation,
+        // in-memory state cleanup. Resource cleanup (Phase 4) is skipped
+        // here and runs on the background thread below.
         let mut warnings: Vec<String> = Vec::new();
         if let Err(e) = self.delete_work_item_by_id(
             &work_item_id,
             &repo_associations,
             &mut warnings,
             force,
-            false,
+            true, // skip_resource_cleanup: deferred to spawn_delete_cleanup
         ) {
-            self.status_message = Some(format!("Delete error: {e}"));
+            // Backend delete failed; nothing was spawned. Close the modal
+            // and surface the error as an alert.
+            self.cancel_delete_prompt();
+            self.alert_message = Some(format!("Delete error: {e}"));
             return;
         }
 
@@ -4531,13 +4661,63 @@ impl App {
             }
         }
         self.sync_selection_identity();
-
-        // -- Phase 8: Status message --
         self.focus = FocusPanel::Left;
-        if warnings.is_empty() {
+
+        // Spawn the background cleanup thread. Keep the modal visible and
+        // flip it into the in-progress state; poll_delete_cleanup closes
+        // it on completion and surfaces the final status/alert.
+        self.delete_in_progress = true;
+        if cleanup_infos.is_empty() {
+            // No git/GitHub cleanup needed (e.g. work item never had a
+            // worktree). Still go through finish_delete_cleanup so the
+            // dialog closes via the same code path and warnings are
+            // surfaced uniformly.
+            self.finish_delete_cleanup(Vec::new(), Vec::new(), warnings);
+        } else {
+            // Stash the synchronous-phase warnings so poll_delete_cleanup
+            // can merge them with the background thread's warnings when
+            // the dialog closes. Previously these were dropped on the
+            // floor in this branch, silently hiding Phase 2/Phase 5
+            // errors from the user.
+            self.delete_sync_warnings = warnings;
+            // show_status_activity=false: the modal already shows a
+            // spinner, a duplicate status-bar indicator would just be
+            // noise. `force=true` is always passed because the modal
+            // body warns the user that uncommitted changes will be lost.
+            self.spawn_delete_cleanup(cleanup_infos, force, false);
+        }
+    }
+
+    /// Finalize the modal delete flow after the background cleanup thread
+    /// returns (or is skipped because there was nothing to clean up).
+    /// Closes the modal, applies PR-eviction tracking, and surfaces
+    /// either a success status message or an error alert.
+    fn finish_delete_cleanup(
+        &mut self,
+        cleanup_warnings: Vec<String>,
+        closed_pr_branches: Vec<(PathBuf, String)>,
+        mut pre_warnings: Vec<String>,
+    ) {
+        self.delete_in_progress = false;
+        self.delete_prompt_visible = false;
+        self.delete_target_wi_id = None;
+        self.delete_target_title = None;
+
+        if !closed_pr_branches.is_empty() {
+            self.cleanup_evicted_branches.extend(closed_pr_branches);
+            self.apply_cleanup_evictions();
+            self.reassemble_work_items();
+            self.build_display_list();
+        }
+
+        pre_warnings.extend(cleanup_warnings);
+        if pre_warnings.is_empty() {
             self.status_message = Some("Work item deleted".into());
         } else {
-            self.status_message = Some(format!("Deleted (with warnings: {})", warnings.join("; ")));
+            self.alert_message = Some(format!(
+                "Deleted with warnings: {}",
+                pre_warnings.join("; ")
+            ));
         }
     }
 
@@ -7010,13 +7190,6 @@ impl WorktreeService for StubWorktreeService {
         Ok(())
     }
 
-    fn is_worktree_dirty(
-        &self,
-        _worktree_path: &std::path::Path,
-    ) -> Result<bool, crate::worktree_service::WorktreeError> {
-        Ok(false)
-    }
-
     fn default_branch(
         &self,
         _repo_path: &std::path::Path,
@@ -7435,7 +7608,9 @@ mod tests {
             .position(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
             .expect("should have a work item in display list after import");
         app.selected_item = Some(work_item_idx);
-        app.delete_selected_work_item(false);
+        app.sync_selection_identity();
+        app.open_delete_prompt();
+        app.confirm_delete_from_prompt();
         assert!(
             app.fetcher_repos_changed,
             "fetcher_repos_changed should be true after delete",
@@ -8449,13 +8624,6 @@ mod tests {
                 Ok(())
             }
 
-            fn is_worktree_dirty(
-                &self,
-                _worktree_path: &std::path::Path,
-            ) -> Result<bool, WorktreeError> {
-                Ok(false)
-            }
-
             fn default_branch(
                 &self,
                 _repo_path: &std::path::Path,
@@ -8729,13 +8897,6 @@ mod tests {
                 _force: bool,
             ) -> Result<(), WorktreeError> {
                 Ok(())
-            }
-
-            fn is_worktree_dirty(
-                &self,
-                _worktree_path: &std::path::Path,
-            ) -> Result<bool, WorktreeError> {
-                Ok(false)
             }
 
             fn default_branch(
@@ -9024,12 +9185,6 @@ mod tests {
             ) -> Result<(), WorktreeError> {
                 Ok(())
             }
-            fn is_worktree_dirty(
-                &self,
-                _worktree_path: &std::path::Path,
-            ) -> Result<bool, WorktreeError> {
-                Ok(false)
-            }
             fn default_branch(
                 &self,
                 _repo_path: &std::path::Path,
@@ -9205,13 +9360,6 @@ mod tests {
                 _force: bool,
             ) -> Result<(), WorktreeError> {
                 Ok(())
-            }
-
-            fn is_worktree_dirty(
-                &self,
-                _worktree_path: &std::path::Path,
-            ) -> Result<bool, WorktreeError> {
-                Ok(false)
             }
 
             fn default_branch(
@@ -11700,7 +11848,9 @@ mod tests {
             .position(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
             .unwrap();
         app.selected_item = Some(work_item_idx);
-        app.delete_selected_work_item(false);
+        app.sync_selection_identity();
+        app.open_delete_prompt();
+        app.confirm_delete_from_prompt();
 
         // Verify all in-memory state is cleaned up.
         assert!(
@@ -11836,27 +11986,16 @@ mod tests {
         }
     }
 
-    /// Worktree service that delegates to StubWorktreeService defaults but
-    /// overrides `is_worktree_dirty` to always return the configured value,
-    /// and optionally records `remove_worktree` / `delete_branch` calls.
+    /// Worktree service that records `remove_worktree` / `delete_branch`
+    /// calls so tests can verify the delete flow invoked git correctly.
     struct ConfigurableWorktreeService {
-        always_dirty: bool,
         remove_worktree_calls: std::sync::Mutex<Vec<(PathBuf, PathBuf, bool, bool)>>,
         delete_branch_calls: std::sync::Mutex<Vec<(PathBuf, String, bool)>>,
     }
 
     impl ConfigurableWorktreeService {
-        fn dirty() -> Self {
-            Self {
-                always_dirty: true,
-                remove_worktree_calls: std::sync::Mutex::new(Vec::new()),
-                delete_branch_calls: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-
         fn recording() -> Self {
             Self {
-                always_dirty: false,
                 remove_worktree_calls: std::sync::Mutex::new(Vec::new()),
                 delete_branch_calls: std::sync::Mutex::new(Vec::new()),
             }
@@ -11912,12 +12051,6 @@ mod tests {
             ));
             Ok(())
         }
-        fn is_worktree_dirty(
-            &self,
-            _worktree_path: &std::path::Path,
-        ) -> Result<bool, crate::worktree_service::WorktreeError> {
-            Ok(self.always_dirty)
-        }
         fn default_branch(
             &self,
             _repo_path: &std::path::Path,
@@ -11946,26 +12079,31 @@ mod tests {
         }
     }
 
-    /// When a worktree has uncommitted changes, attempt_delete escalates
-    /// the confirmation state to AwaitingForce instead of deleting.
+    /// open_delete_prompt must NOT call any blocking worktree check on
+    /// the UI thread. This is enforced structurally by the
+    /// `WorktreeService` trait, which no longer exposes
+    /// `is_worktree_dirty`, so any attempt to reintroduce a dirty check
+    /// through the injected service would fail to compile. This test
+    /// additionally verifies that opening the prompt does not touch the
+    /// backend, so a stray 'y' keypress is required before anything is
+    /// destroyed.
     #[test]
-    fn dirty_worktree_triggers_force_prompt() {
+    fn open_delete_prompt_does_not_touch_backend() {
         use crate::config::InMemoryConfigProvider;
 
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
             Box::new(FixedListBackend::one_item(
-                "/tmp/dirty-test.json",
-                "Dirty worktree item",
+                "/tmp/prompt-test.json",
+                "Prompt test item",
                 "/repo",
-                "dirty-branch",
+                "test-branch",
             )),
-            Arc::new(ConfigurableWorktreeService::dirty()),
+            Arc::new(ConfigurableWorktreeService::recording()),
             Box::new(InMemoryConfigProvider::new()),
         );
 
-        // Inject a fake worktree path into the assembled work item so
-        // is_worktree_dirty has something to check.
+        // Inject a fake worktree path into the assembled work item.
         assert_eq!(app.work_items.len(), 1);
         app.work_items[0].repo_associations[0].worktree_path =
             Some(PathBuf::from("/tmp/fake-worktree"));
@@ -11980,27 +12118,15 @@ mod tests {
         app.selected_item = Some(wi_idx);
         app.sync_selection_identity();
 
-        // Attempt delete - should escalate to AwaitingForce.
-        app.attempt_delete_selected_work_item();
-        assert_eq!(
-            app.confirm_delete,
-            DeleteConfirmState::AwaitingForce,
-            "dirty worktree should trigger AwaitingForce state"
-        );
-        assert!(
-            app.status_message
-                .as_deref()
-                .unwrap_or("")
-                .contains("uncommitted changes"),
-            "status should mention uncommitted changes, got: {:?}",
-            app.status_message,
-        );
+        app.open_delete_prompt();
+        assert!(app.delete_prompt_visible, "delete prompt should be visible");
+        assert_eq!(app.delete_target_title.as_deref(), Some("Prompt test item"),);
 
-        // Work item should NOT be deleted yet.
+        // Opening the prompt must not touch the backend.
         assert_eq!(
             app.work_items.len(),
             1,
-            "work item should still exist after AwaitingForce"
+            "work item should still exist after opening the prompt"
         );
     }
 
@@ -12052,8 +12178,23 @@ mod tests {
         app.selected_item = Some(wi_idx);
         app.sync_selection_identity();
 
-        // Delete (non-force).
-        app.delete_selected_work_item(false);
+        // Open the prompt, confirm, then drain the background cleanup
+        // thread via poll_delete_cleanup (matches how the real event
+        // loop consumes results). Spin for up to ~1s so flaky CI still
+        // passes despite thread scheduling jitter.
+        app.open_delete_prompt();
+        app.confirm_delete_from_prompt();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while app.delete_in_progress && std::time::Instant::now() < deadline {
+            app.poll_delete_cleanup();
+            if app.delete_in_progress {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        assert!(
+            !app.delete_in_progress,
+            "background delete cleanup should have completed within 1s"
+        );
 
         // Verify remove_worktree was called with correct arguments.
         let rw_calls = recording_ws.remove_worktree_calls.lock().unwrap();
@@ -12073,8 +12214,9 @@ mod tests {
             "remove_worktree delete_branch should be false (handled separately)"
         );
         assert!(
-            !rw_calls[0].3,
-            "remove_worktree force should be false for non-force delete"
+            rw_calls[0].3,
+            "remove_worktree force should be true: modal always passes \
+             --force to avoid blocking the UI thread on is_worktree_dirty"
         );
         drop(rw_calls);
 
@@ -12090,6 +12232,170 @@ mod tests {
         assert!(
             db_calls[0].2,
             "delete_branch force should be true (user chose to destroy the item)"
+        );
+    }
+
+    /// When `gh pr close` fails for an association with an open PR, the
+    /// delete flow must PRESERVE the local worktree and branch for that
+    /// association so the user can recover unpushed commits. If it
+    /// instead force-deleted local resources and then only noticed the
+    /// PR close failure afterward, the user would be left with an open
+    /// PR and no local branch to recover from - which is exactly the
+    /// data-loss path spawn_unlinked_cleanup already guards against.
+    #[test]
+    fn delete_preserves_local_resources_when_pr_close_fails() {
+        use crate::config::InMemoryConfigProvider;
+        use crate::pr_service::PullRequestCloser;
+
+        /// Records calls and always fails. Mirrors the shape of the
+        /// `RecordingWorktreeService` stub already used in this test
+        /// module.
+        struct FailingCloser {
+            calls: std::sync::Mutex<Vec<(String, String, u64)>>,
+        }
+
+        impl PullRequestCloser for FailingCloser {
+            fn close_pr(&self, owner: &str, repo: &str, pr_number: u64) -> Result<(), String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((owner.into(), repo.into(), pr_number));
+                Err("simulated gh auth error".into())
+            }
+        }
+
+        let recording_ws = Arc::new(ConfigurableWorktreeService::recording());
+        let failing_closer = Arc::new(FailingCloser {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Box::new(FixedListBackend::one_item(
+                "/tmp/pr-close-fail-test.json",
+                "PR close fail item",
+                "/my/repo",
+                "feature-branch",
+            )),
+            recording_ws.clone(),
+            Box::new(InMemoryConfigProvider::new()),
+        );
+        // Replace the production gh-based closer with the failing stub
+        // before driving the delete. The delete path reads `app.pr_closer`
+        // once inside `spawn_delete_cleanup` and Arc::clones it into the
+        // background thread, so this assignment must happen before
+        // `confirm_delete_from_prompt`.
+        app.pr_closer = failing_closer.clone();
+
+        // Inject cached RepoFetchResult so gather_delete_cleanup_infos
+        // finds both the worktree path AND an open PR. The combination
+        // of `github_remote: Some(...)` and an OPEN pr with
+        // `head_branch == "feature-branch"` is what populates
+        // DeleteCleanupInfo.open_pr_number and drives the PR-close path.
+        assert_eq!(app.work_items.len(), 1);
+        app.repo_data.insert(
+            PathBuf::from("/my/repo"),
+            crate::work_item::RepoFetchResult {
+                repo_path: PathBuf::from("/my/repo"),
+                github_remote: Some(("my-org".into(), "my-repo".into())),
+                worktrees: Ok(vec![crate::worktree_service::WorktreeInfo {
+                    path: PathBuf::from("/my/repo/.worktrees/feature-branch"),
+                    branch: Some("feature-branch".into()),
+                    is_main: false,
+                }]),
+                prs: Ok(vec![crate::github_client::GithubPr {
+                    number: 42,
+                    title: "Test PR".into(),
+                    state: "OPEN".into(),
+                    is_draft: false,
+                    head_branch: "feature-branch".into(),
+                    url: "https://example.com/pr/42".into(),
+                    review_decision: String::new(),
+                    status_check_rollup: String::new(),
+                    head_repo_owner: None,
+                    author: None,
+                }]),
+                review_requested_prs: Ok(vec![]),
+                issues: vec![],
+            },
+        );
+        app.build_display_list();
+
+        // Select the work item and drive the delete flow.
+        let wi_idx = app
+            .display_list
+            .iter()
+            .position(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
+            .unwrap();
+        app.selected_item = Some(wi_idx);
+        app.sync_selection_identity();
+
+        app.open_delete_prompt();
+        app.confirm_delete_from_prompt();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while app.delete_in_progress && std::time::Instant::now() < deadline {
+            app.poll_delete_cleanup();
+            if app.delete_in_progress {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        assert!(
+            !app.delete_in_progress,
+            "background delete cleanup should have completed within 1s"
+        );
+
+        // The closer must have been invoked with the correct arguments
+        // so we know we actually exercised the PR-close-first branch,
+        // not some unrelated short-circuit.
+        let close_calls = failing_closer.calls.lock().unwrap();
+        assert_eq!(
+            close_calls.len(),
+            1,
+            "close_pr should have been called exactly once"
+        );
+        assert_eq!(
+            close_calls[0],
+            ("my-org".into(), "my-repo".into(), 42u64),
+            "close_pr arguments"
+        );
+        drop(close_calls);
+
+        // Data-loss guard: destructive local cleanup MUST NOT have run
+        // after the PR close failed. This is the whole point of the
+        // ordering - failure here means an unpushed branch was still
+        // force-deleted while the PR stayed open upstream.
+        let rw_calls = recording_ws.remove_worktree_calls.lock().unwrap();
+        assert!(
+            rw_calls.is_empty(),
+            "remove_worktree must NOT be called when PR close fails, got: {rw_calls:?}"
+        );
+        drop(rw_calls);
+
+        let db_calls = recording_ws.delete_branch_calls.lock().unwrap();
+        assert!(
+            db_calls.is_empty(),
+            "delete_branch must NOT be called when PR close fails, got: {db_calls:?}"
+        );
+        drop(db_calls);
+
+        // The user's only breadcrumb to the preserved paths is the
+        // alert dialog - verify it points at both the worktree and
+        // branch so the user can find them manually.
+        let alert = app
+            .alert_message
+            .as_deref()
+            .expect("alert_message must surface the PR-close failure");
+        assert!(
+            alert.contains("preserved local worktree"),
+            "alert should mention preserved worktree, got: {alert}"
+        );
+        assert!(
+            alert.contains("preserved local branch"),
+            "alert should mention preserved branch, got: {alert}"
+        );
+        assert!(
+            alert.contains("feature-branch"),
+            "alert should include the branch name, got: {alert}"
         );
     }
 

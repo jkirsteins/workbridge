@@ -7,6 +7,7 @@ mod fetcher;
 mod github_client;
 mod layout;
 mod mcp;
+mod pr_service;
 mod prompts;
 mod salsa;
 mod session;

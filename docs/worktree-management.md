@@ -19,12 +19,13 @@ worktree operations:
   `--force` for dirty worktrees and `-D` for unmerged branches.
 - `delete_branch(repo_path, branch, force)` - Delete a local branch.
   Uses `-d` (safe) or `-D` (force) based on the `force` parameter.
-- `is_worktree_dirty(worktree_path)` - Check if a worktree has uncommitted
-  changes (staged or unstaged) via `git status --porcelain`.
 - `default_branch(repo_path)` - Get the default branch name (checks
   symbolic-ref, falls back to local main/master)
 - `github_remote(repo_path)` - Get the GitHub remote owner/repo pair
 - `fetch_branch(repo_path, branch)` - Fetch a branch from origin
+- `create_branch(repo_path, branch)` - Create a new local branch from
+  the repo's default branch (or HEAD). Used as a fallback when
+  `fetch_branch` fails (e.g., the branch does not exist on origin yet).
 
 `GitWorktreeService` implements this trait by shelling out to the git CLI.
 A `StubWorktreeService` exists for tests.
@@ -116,53 +117,104 @@ The issue number extraction pattern is configurable per-repo (default:
 
 ### Worktree removal on delete
 
-Deleting a work item performs comprehensive resource cleanup. There are
-two entry points:
+Deleting a work item performs comprehensive resource cleanup. There
+are two entry points; both run the slow git/GitHub I/O (worktree
+removal, branch deletion, `gh pr close`) on a background thread via
+`spawn_delete_cleanup()` / `poll_delete_cleanup()` so the UI thread
+is not blocked by those steps (see `docs/UI.md` "Blocking I/O
+Prohibition"):
 
-- **Manual delete (Ctrl+D/Delete)** - runs resource cleanup (worktree
-  removal, branch deletion, PR closure) synchronously on the UI thread
-  via `delete_work_item_by_id()`.
+- **Manual delete (Ctrl+D/Delete)** - opens a `Delete Work Item`
+  confirmation modal. The modal body warns that uncommitted changes
+  will be lost and offers `[y]` to confirm or `[Esc]` to cancel. On
+  'y', synchronous in-memory phases (backend delete, session kill,
+  in-flight cancellation) run on the UI thread and the modal flips
+  into an in-progress state with a spinner while the background
+  thread performs resource cleanup. All input (keystrokes, paste
+  events, mouse events) is swallowed while the spinner is visible so
+  the user cannot interact with stale state. On completion the modal
+  closes and a status message (success) or red alert dialog
+  (warnings) is shown.
 - **MCP delete (`workbridge_delete` tool)** - runs the non-blocking
-  phases (backend delete, session kill, in-memory cleanup) on the main
-  thread, then spawns resource cleanup on a background thread via
-  `spawn_delete_cleanup()` / `poll_delete_cleanup()` to avoid blocking
-  the UI.
+  phases on the main thread and spawns the same background resource
+  cleanup. Progress is surfaced via a status-bar activity spinner
+  (`"Deleting work item resources..."`) rather than a modal because
+  the user did not explicitly trigger the delete from a dialog.
 
-Both paths perform the same cleanup steps:
+Both paths perform the same cleanup steps, in this order per repo
+association:
 
-1. Removes worktree directories via `remove_worktree`
-2. Deletes local git branches via `delete_branch` (force delete)
-3. Closes open PRs on GitHub via `gh pr close`
-4. Kills active sessions and MCP servers
+1. Closes the open GitHub PR via `gh pr close` FIRST. If the close
+   fails (auth, network, merge queue state), local worktree and
+   branch for that association are preserved so the user can recover
+   unpushed commits and retry the close manually - the subsequent
+   destructive local steps are skipped for that association and a
+   warning is surfaced.
+2. Removes worktree directories via `remove_worktree` (always with
+   `--force`). Only runs if step 1 succeeded (or there was no open PR).
+3. Deletes local git branches via `delete_branch` (force delete).
+   Only runs if step 1 succeeded (or there was no open PR).
+4. Kills active sessions and MCP servers (these run on the UI thread
+   before the background cleanup spawn).
 5. Cleans up in-memory state (rework reasons, review gate findings, etc.)
 
-The manual delete path uses a 3-step confirmation flow to protect
-against accidental deletion:
-- First press: "Press again to delete this work item"
-- If dirty worktree detected: "Worktree has uncommitted changes! Press again to force-delete"
-- Final press: deletes with `--force` for dirty worktrees
+Both paths always pass `force=true` through to
+`spawn_delete_cleanup()`. The modal body warns the user that
+uncommitted changes will be lost, and the MCP path has no interactive
+confirmation, so there is no scenario in which the non-force code
+path would be safer. Critically, `open_delete_prompt()` does NOT
+shell out to `git status --porcelain` before opening the modal -
+doing so would be blocking I/O on the UI thread. The
+`WorktreeService` trait no longer exposes a dirty-check method at
+all, making this violation structurally impossible.
 
-The MCP delete path always uses force mode (no interactive confirmation
-is possible via MCP).
+There is one remaining edge case where the delete flow still runs a
+synchronous `remove_worktree` on the UI thread: if a worktree-creation
+background thread has already completed (its result is sitting
+in `worktree_create_rx`) at the moment the user confirms the delete,
+`delete_work_item_by_id()` Phase 5 drains the receiver and
+force-removes the orphan worktree inline. This is rare (the window is
+a single tick between `poll_worktree_creation` firings) and the
+refactor to push this into the background cleanup thread is deferred
+to a follow-up change because it cross-cuts the Phase 5 cancellation
+logic for pr_create, merge, and review_submit.
+
+Both entry points guard against concurrent cleanup: if a previous
+`spawn_delete_cleanup()` is still running (either path) when a new
+delete is confirmed, the new delete is refused BEFORE the backend
+record or session is touched, with an alert asking the user to wait.
+This preserves the "only one `spawn_delete_cleanup()` in flight at a
+time" invariant that prevents concurrent git worktree operations from
+clobbering each other AND eliminates the orphaned-resource hole where
+`spawn_delete_cleanup` would otherwise early-return after the backend
+had already been destroyed.
 
 All cleanup failures are non-blocking - warnings are shown but the delete proceeds.
 
 ### Cleanup ordering and main worktree handling
 
-Worktree removal and branch deletion must happen in the correct order:
+Cleanup steps must happen in the correct order:
 
-1. **Remove worktree first** (`git worktree remove`), then delete branch
-   (`git branch -D`). Reversing this order causes "branch used by
+1. **Close the remote PR first** (`gh pr close`), then run destructive
+   local cleanup (worktree removal and branch deletion). Reversing this
+   order creates a data-loss hazard: a `gh pr close` failure would
+   leave the user with an open PR and no local branch or worktree to
+   recover unpushed commits from. When PR close fails, both local
+   destructive steps are skipped for that association and a warning
+   is surfaced pointing the user at the preserved paths.
+
+2. **Remove worktree before branch** (`git worktree remove`, then
+   `git branch -D`). Reversing these two causes "branch used by
    worktree" errors.
 
-2. **Main worktree detection**: `WorktreeInfo.is_main` indicates whether
+3. **Main worktree detection**: `WorktreeInfo.is_main` indicates whether
    a worktree is the repo's primary checkout. When the branch to be
    deleted is checked out in the main worktree, both worktree removal
    and branch deletion are skipped - git forbids deleting the currently
    checked-out branch, and the main worktree cannot be removed via
    `git worktree remove`.
 
-3. **Fresh vs. cached worktree state**: Different cleanup paths use
+4. **Fresh vs. cached worktree state**: Different cleanup paths use
    different data strategies:
    - `spawn_unlinked_cleanup()` calls `list_worktrees()` directly in
      the background thread rather than using the cached `repo_data`
@@ -174,14 +226,14 @@ Worktree removal and branch deletion must happen in the correct order:
      known at delete time and unlikely to change between gathering and
      cleanup execution.
 
-4. **Concurrent cleanup protection**: Only one `spawn_delete_cleanup()`
+5. **Concurrent cleanup protection**: Only one `spawn_delete_cleanup()`
    thread can run at a time. If a second MCP delete is requested while
    a previous cleanup is still running, the resource cleanup phase is
    skipped and an alert dialog warns the user that worktrees, branches,
    and open PRs may need manual cleanup. The backend record and session
    are still deleted immediately.
 
-5. **PR eviction tracking**: When the background cleanup thread closes a
+6. **PR eviction tracking**: When the background cleanup thread closes a
    PR, the (repo_path, branch) pair is added to
    `cleanup_evicted_branches` so that stale fetch data does not
    resurrect the closed PR as a phantom unlinked item. This mirrors the

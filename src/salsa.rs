@@ -330,10 +330,20 @@ pub fn app_event(
 
             if is_background_tick {
                 // Advance spinner for activity indicator animation.
-                // Tick when status-bar activities exist OR when any work
-                // item has Claude actively working (the list/board spinner
-                // needs it).
-                if !state.activities.is_empty() || !state.claude_working.is_empty() {
+                // Tick when status-bar activities exist, when any work
+                // item has Claude actively working (the list/board
+                // spinner needs it), or when any modal in-progress flag
+                // is set (the modal spinner needs it). Without the
+                // modal-flag branch the delete/merge/cleanup modal
+                // spinners would freeze as soon as no status-bar
+                // activity or Claude session is running.
+                let modal_in_progress = state.delete_in_progress
+                    || state.merge_in_progress
+                    || state.cleanup_in_progress;
+                if !state.activities.is_empty()
+                    || !state.claude_working.is_empty()
+                    || modal_in_progress
+                {
                     state.spinner_tick = state.spinner_tick.wrapping_add(1);
                 }
 
