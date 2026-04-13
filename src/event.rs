@@ -1611,15 +1611,20 @@ fn mouse_target(app: &App, column: u16, row: u16) -> MouseTarget {
         return MouseTarget::None;
     }
 
-    // Compute right panel geometry.
+    // Compute right panel geometry. Must mirror draw_to_buffer in ui.rs:
+    // the full area is split into a 1-row view-mode header + main_area +
+    // optional bottom bars, so layout::compute is called with main_area's
+    // height (rows - header - bottom_bars), not the raw terminal height.
+    const HEADER_ROWS: u16 = 1;
     let bottom_rows = u16::from(app.has_visible_status_bar())
         + u16::from(app.selected_work_item_context().is_some());
-    let pl = layout::compute(cols, rows, bottom_rows);
+    let main_area_height = rows.saturating_sub(HEADER_ROWS).saturating_sub(bottom_rows);
+    let pl = layout::compute(cols, main_area_height, 0);
 
-    // Right panel inner area starts after the left panel + 1 border column,
-    // and after the top border row.
+    // Right panel inner area: past the left panel + its left border column,
+    // and past the view-mode header + the right panel's top border row.
     let inner_x = pl.left_width + 1;
-    let inner_y = 1u16;
+    let inner_y = HEADER_ROWS + 1;
 
     if column >= inner_x
         && column < inner_x + pl.pane_cols
