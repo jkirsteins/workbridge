@@ -51,35 +51,67 @@ cleaned up in order via `delete_work_item_by_id()`:
    and is removed from the terminal sessions map.
 3. **MCP server** - the MCP socket server and `.mcp.json` config file are
    removed via `cleanup_session_state_for()`.
-4. **Worktree** - the git worktree directory is removed via
+4. **Open PR** - if a GitHub PR is open for this branch, it is closed
+   FIRST via `gh pr close`. Merged or already-closed PRs are skipped
+   (state != "OPEN"). If the close fails (auth error, network error,
+   merge queue state, etc.), the local worktree and branch for that
+   association are **preserved** so the user can recover unpushed
+   commits and retry the PR close manually - the backend record is
+   already gone at this point, so a loud "preserved local worktree X
+   (PR close failed)" warning is the user's only breadcrumb.
+5. **Worktree** - the git worktree directory is removed via
    `git worktree remove`. Worktree paths are looked up from the last
-   fetched `repo_data` by matching branch name.
-5. **Local branch** - the local git branch is deleted via `git branch -D`.
+   fetched `repo_data` by matching branch name. Only runs if step 4
+   succeeded (or the association had no open PR).
+6. **Local branch** - the local git branch is deleted via `git branch -D`.
+   Only runs if step 4 succeeded (or the association had no open PR).
    Best-effort: warnings are collected but do not abort the delete.
-6. **Open PR** - if a GitHub PR is open for this branch, it is closed via
-   `gh pr close`. Merged or already-closed PRs are skipped (state != "OPEN").
 7. **In-flight operations** - any pending worktree creation, PR creation/merge,
    review submission, or mergequeue watch for this item is cancelled.
 8. **In-memory state** - rework reasons, review gate findings, review reopen
    suppression, no-plan prompt queue, rework prompt state, merge prompt state,
    and review gate state are all cleared.
 
-Steps 4-6 involve blocking I/O (git commands, gh CLI). The Ctrl+D
-path currently runs them synchronously on the UI thread. The MCP
-delete path (`workbridge_delete`) runs them on a background thread
-via `spawn_delete_cleanup()` / `poll_delete_cleanup()` to avoid
-blocking the UI. Auto-archive skips them entirely
+Steps 4-6 involve blocking I/O (git commands, gh CLI). BOTH the Ctrl+D
+path and the MCP delete path (`workbridge_delete`) run these steps on
+a background thread via `spawn_delete_cleanup()` /
+`poll_delete_cleanup()` so the UI thread is not blocked by the main
+cleanup phase. Auto-archive skips them entirely
 (`skip_resource_cleanup: true`) because Done items have already been
 through the merge flow which handles resource cleanup.
 
+One edge case is still handled synchronously: if a worktree-creation
+background thread has already completed (its result is queued in
+`worktree_create_rx`) at the moment the user confirms the delete,
+`delete_work_item_by_id()` Phase 5 drains the receiver and runs a
+single `remove_worktree` inline to clean up the orphan. Refactoring
+this into the background cleanup is cross-cutting (the same Phase 5
+also cancels pr_create, merge, and review_submit state) and is
+deferred to a follow-up change - see `docs/worktree-management.md`
+for the tradeoff.
+
+The Ctrl+D path invokes `confirm_delete_from_prompt()`, which in turn
+calls `delete_work_item_by_id()` with `skip_resource_cleanup: true` and
+then spawns the background cleanup thread. The MCP path
+(`McpEvent::DeleteWorkItem`) does the same ordering: delete the backend
+record and kill sessions on the main thread, then spawn the background
+cleanup. In both cases the `delete_cleanup_rx` receiver is polled from
+`poll_delete_cleanup()` on each timer tick and the result is surfaced
+via the modal (Ctrl+D) or the status-bar activity (MCP).
+
 Steps 4-8 are best-effort: failures produce warning messages but do not
-abort the overall delete. Only a backend delete failure (step 1) is fatal.
+abort the overall delete. Only a backend delete failure (step 1) is
+fatal. Note that a step 4 (`gh pr close`) failure does NOT abort the
+delete either, but it does gate steps 5 and 6 (local destructive
+cleanup) for that specific repo association, so the user is never left
+with an open PR and no local branch to recover commits from.
 
 Both manual delete (Ctrl+D) and MCP delete (`workbridge_delete`)
 additionally reset UI selection state and rebuild the display list after
-the non-blocking phases complete. MCP delete always uses force mode
-(dirty worktree check is skipped since there is no interactive
-confirmation). The `workbridge_delete` tool is available for all
+the non-blocking phases complete. Both paths always pass `force=true`
+to the background thread: the modal body warns the user that
+uncommitted changes will be lost, and the MCP path has no interactive
+confirmation. The `workbridge_delete` tool is available for all
 non-read-only sessions (both regular work items and review requests).
 
 When the background delete-cleanup thread closes a PR, the
@@ -88,18 +120,38 @@ and added to `cleanup_evicted_branches` so that stale fetch data does
 not resurrect the closed PR as a phantom unlinked item. This mirrors the
 eviction tracking used by the unlinked PR cleanup flow.
 
-If a second MCP delete is requested while a previous cleanup thread is
-still running, the resource cleanup is skipped and an alert dialog is
-shown to the user warning that worktrees, branches, and open PRs may
-need manual cleanup. The backend record and session are still deleted
-immediately.
+Only one delete cleanup can be in flight at a time. Both the modal
+path (`confirm_delete_from_prompt`) and the MCP path
+(`McpEvent::DeleteWorkItem`) check `delete_cleanup_rx.is_some()` BEFORE
+touching the backend. If a previous cleanup is still running, the new
+delete is refused with an alert and the backend record / session are
+left intact - avoiding the orphaned-resource hole where
+`spawn_delete_cleanup` would otherwise early-return after the backend
+had already been destroyed.
 
-### Force delete
+### Delete confirmation modal
 
-When the selected work item's worktree has uncommitted changes, Ctrl+D shows
-a confirmation prompt ("delete anyway?"). If confirmed, the worktree is
-removed with `--force` and the branch with `-D`. Auto-archive skips
-resource cleanup entirely (steps 4-6 are bypassed).
+Manual delete (Ctrl+D or Delete key) opens a `Delete Work Item`
+confirmation modal via `open_delete_prompt()`. The modal body warns
+`"Delete '<title>' (uncommitted changes will be lost)?"` and offers
+`[y]` to confirm or `[Esc]` to cancel. This wording is
+unconditional - `open_delete_prompt` does NOT shell out to `git status
+--porcelain` to pre-detect dirty worktrees, because blocking I/O on
+the UI thread is forbidden (see `docs/UI.md` "Blocking I/O
+Prohibition"). The cost is that users with clean worktrees see a
+warning about uncommitted changes, but the benefit is that the UI
+thread stays responsive and there is no dirty/clean split in the
+confirm wording.
+
+On `[y]`, `confirm_delete_from_prompt()` runs Phases 2-6 and spawns
+the background cleanup. The modal remains visible with a braille
+spinner (`"Removing worktree, branches, and open PRs..."`) and all
+keystrokes are swallowed (including paste and mouse events) so the
+PTY pane below cannot receive stray input while cleanup runs. Q and
+Ctrl+Q still trigger the force-quit path as an escape hatch if the
+background thread hangs. On completion, `poll_delete_cleanup()` closes
+the modal and shows either a success status message or a red alert
+with warnings.
 
 ### Auto-archive
 

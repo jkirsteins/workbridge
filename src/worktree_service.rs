@@ -74,10 +74,6 @@ pub trait WorktreeService: Send + Sync {
         force: bool,
     ) -> Result<(), WorktreeError>;
 
-    /// Check if a worktree has uncommitted changes (staged or unstaged).
-    /// Returns true if `git status --porcelain` produces any output.
-    fn is_worktree_dirty(&self, worktree_path: &Path) -> Result<bool, WorktreeError>;
-
     /// Get the default branch name (main, master, or configured) for a repo.
     fn default_branch(&self, repo_path: &Path) -> Result<String, WorktreeError>;
 
@@ -335,11 +331,6 @@ impl WorktreeService for GitWorktreeService {
         let flag = if force { "-D" } else { "-d" };
         Self::run_git(repo_path, &["branch", flag, branch])?;
         Ok(())
-    }
-
-    fn is_worktree_dirty(&self, worktree_path: &Path) -> Result<bool, WorktreeError> {
-        let output = Self::run_git(worktree_path, &["status", "--porcelain"])?;
-        Ok(!output.trim().is_empty())
     }
 
     fn default_branch(&self, repo_path: &Path) -> Result<String, WorktreeError> {
@@ -1162,59 +1153,6 @@ mod integration_tests {
             result.is_err(),
             "create_branch should fail with untracked files",
         );
-    }
-
-    #[test]
-    fn is_worktree_dirty_clean() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_dir = tmp.path().join("repo");
-        fs::create_dir_all(&repo_dir).unwrap();
-        setup_git_repo(&repo_dir);
-
-        let wt_dir = tmp.path().join("wt-clean");
-        run_in(
-            &repo_dir,
-            &[
-                "git",
-                "worktree",
-                "add",
-                wt_dir.to_str().unwrap(),
-                "-b",
-                "clean-branch",
-            ],
-        );
-
-        let svc = GitWorktreeService;
-        let dirty = svc.is_worktree_dirty(&wt_dir).unwrap();
-        assert!(!dirty, "freshly created worktree should not be dirty");
-    }
-
-    #[test]
-    fn is_worktree_dirty_modified() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_dir = tmp.path().join("repo");
-        fs::create_dir_all(&repo_dir).unwrap();
-        setup_git_repo(&repo_dir);
-
-        let wt_dir = tmp.path().join("wt-dirty");
-        run_in(
-            &repo_dir,
-            &[
-                "git",
-                "worktree",
-                "add",
-                wt_dir.to_str().unwrap(),
-                "-b",
-                "dirty-branch",
-            ],
-        );
-
-        // Modify a tracked file inside the worktree.
-        fs::write(wt_dir.join("README"), "modified content").unwrap();
-
-        let svc = GitWorktreeService;
-        let dirty = svc.is_worktree_dirty(&wt_dir).unwrap();
-        assert!(dirty, "worktree with modified file should be dirty");
     }
 
     #[test]

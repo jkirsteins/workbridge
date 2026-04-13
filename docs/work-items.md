@@ -350,16 +350,22 @@ warnings but do not prevent the delete.
 - In-memory state: rework reasons, review gate findings, no-plan prompt queue,
   merge/rework prompt visibility flags
 
-### 3-step confirmation flow
+### Confirmation flow
 
-1. First press: "Press again to delete this work item"
-2. Second press checks worktree status:
-   - If all worktrees are clean (or no worktrees exist): deletes immediately
-   - If any worktree has uncommitted changes: "Worktree has uncommitted changes!
-     Press again to force-delete"
-3. Third press (only if dirty): force-deletes using `git worktree remove --force`
+Ctrl+D/Delete opens a confirmation modal titled "Delete '<title>'?".
+The modal body warns that any uncommitted changes in the worktree
+will be lost. Pressing `y` (or `Y`) confirms and spawns the
+background cleanup thread; pressing `Esc` cancels and closes the
+modal without touching anything. All other keys are swallowed while
+the modal is visible so stray keystrokes cannot leak into the PTY
+session below.
 
-Any key other than the delete key cancels the confirmation flow.
+There is no "dirty detection" step: the modal unconditionally warns
+about uncommitted changes and the background cleanup always passes
+`force=true` to `remove_worktree`, so the UI thread never needs to
+shell out to `git status --porcelain`. See `docs/CLEANUP.md` for the
+authoritative description of the cleanup path and the background
+thread contract.
 
 ### Backend-specific cleanup
 
