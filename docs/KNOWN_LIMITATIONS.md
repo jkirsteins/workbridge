@@ -31,6 +31,45 @@ buffer space. No data is lost - the write completes once the child catches up.
 process to catch up. The freeze resolves on its own once the child reads
 the buffered input.
 
+## Worktree reuse via symlink-resolved path equality
+
+**What:** `App::find_reusable_worktree` (src/app.rs) decides whether an
+existing git worktree can be reused in place of `git worktree add` by
+comparing the canonicalized `.worktrees/<branch>` target against the
+canonicalized path git reports. `config::canonicalize_path` resolves
+symlinks, so if the `.worktrees/<branch>` leaf is itself a symlink that
+happens to point at another registered worktree on the same branch,
+equality holds and the reuse path is taken.
+
+**When it is a problem:** Only when `.worktrees/` or `.worktrees/<branch>`
+has been manually replaced with a symlink to another git-registered
+worktree on the matching branch. Workbridge never creates such symlinks,
+and `git worktree add` always creates real directories. The bypass
+requires a user or external script to deliberately set up the symlink.
+
+**Why it is accepted:** This is a "you did this to yourself" setup on a
+local dev tool. Normal checkout paths that happen to live under a
+symlinked parent (e.g. `/Users/foo/Projects -> /Volumes/SSD/Projects`)
+are NOT affected: both sides of the comparison resolve through the same
+symlink to the same physical location, which is the correct outcome.
+The guard only fails open when a leaf component is an intentional
+misdirection, which no realistic workflow produces.
+
+**Impact:** A work item could be bound to a worktree workbridge did
+not intend to adopt. Session spawn, MCP state, and delete-time cleanup
+would then operate on that alternate worktree. Because reused paths
+are flagged with `reused: true`, the destructive orphan-cleanup paths
+still skip `remove_worktree`, so there is no force-delete escalation.
+
+**Future fix options:**
+- Require a purely lexical (non-symlink-resolving) equality between
+  git's reported worktree path and `wt_target`, falling back to
+  canonicalization only for OS-level display quirks like macOS
+  `/tmp` vs `/private/tmp`.
+- Reject any match where a component of `wt_target` is a symlink.
+
+**Workaround:** Do not replace `.worktrees/<branch>` with a symlink.
+
 ## Single-threaded event loop
 
 **What:** All event handling (keyboard input, terminal resize, liveness checks)

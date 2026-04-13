@@ -306,6 +306,12 @@ pub struct WorktreeCreateResult {
     /// fetched or created (branch gone). False for other worktree errors
     /// (permissions, disk full, path conflict).
     pub branch_gone: bool,
+    /// True when `path` points at a pre-existing worktree that the background
+    /// thread observed via `list_worktrees` instead of creating with
+    /// `git worktree add`. Cancel/orphan cleanup paths must not run
+    /// `remove_worktree` on reused worktrees because the thread never owned
+    /// them (the worktree was already registered with git when we found it).
+    pub reused: bool,
 }
 
 /// App holds the entire application state.
@@ -1786,8 +1792,12 @@ impl App {
             let thread_done = if let Some(ref rx) = self.worktree_create_rx {
                 match rx.try_recv() {
                     Ok(result) => {
-                        // Thread completed - clean up the orphaned worktree.
-                        if let Some(ref path) = result.path
+                        // Thread completed - clean up the orphaned worktree,
+                        // but only if WE created it. A reused worktree was
+                        // already on disk before the thread ran and must
+                        // not be force-removed as part of this delete.
+                        if !result.reused
+                            && let Some(ref path) = result.path
                             && let Err(e) = self.worktree_service.remove_worktree(
                                 &result.repo_path,
                                 path,
@@ -2724,6 +2734,44 @@ impl App {
         repo_path.join(worktree_dir).join(sanitized)
     }
 
+    /// Find an existing worktree that can be safely reused in place of
+    /// calling `git worktree add`. A worktree is reusable only when all
+    /// three conditions hold:
+    ///
+    /// 1. It is registered with git for the target `branch`.
+    /// 2. It is NOT the main worktree (`is_main = false`). Reusing the
+    ///    user's primary repo checkout would spawn Claude sessions inside
+    ///    it and drop workbridge state (`.mcp.json`) there, violating
+    ///    invariant #3 in `docs/invariants.md`.
+    /// 3. Its canonicalized path equals the canonicalized `wt_target` the
+    ///    import/session-spawn flow would have created. This rules out
+    ///    adopting unrelated worktrees the user made manually or that
+    ///    another tool created at a different location.
+    ///
+    /// When no safe match is found, returns `None` and the caller should
+    /// fall through to `create_worktree`, which surfaces git's own "branch
+    /// already checked out" error for the truly conflicting cases.
+    fn find_reusable_worktree(
+        ws: &dyn WorktreeService,
+        repo_path: &std::path::Path,
+        branch: &str,
+        wt_target: &std::path::Path,
+    ) -> Option<crate::worktree_service::WorktreeInfo> {
+        let target_canonical = crate::config::canonicalize_path(wt_target).ok()?;
+        ws.list_worktrees(repo_path).ok()?.into_iter().find(|w| {
+            if w.is_main {
+                return false;
+            }
+            if w.branch.as_deref() != Some(branch) {
+                return false;
+            }
+            match crate::config::canonicalize_path(&w.path) {
+                Ok(existing_canonical) => existing_canonical == target_canonical,
+                Err(_) => false,
+            }
+        })
+    }
+
     /// Open or focus a session for the currently selected work item.
     ///
     /// If a session already exists for this work item, focuses the right panel.
@@ -2831,10 +2879,31 @@ impl App {
                                     )),
                                     open_session: true,
                                     branch_gone: true,
+                                    reused: false,
                                 });
                                 return;
                             }
-                            match ws.create_worktree(&repo_path, &branch, &wt_target) {
+                            // Reuse an existing worktree only if it lives at
+                            // the exact expected location (wt_target) and is
+                            // NOT the main worktree. Matching purely on
+                            // branch name would hijack the user's primary
+                            // checkout when it happens to be on the same
+                            // feature branch, or adopt an unrelated worktree
+                            // at some other path - both of which would then
+                            // feed into destructive orphan-cleanup paths.
+                            let reused_wt = Self::find_reusable_worktree(
+                                ws.as_ref(),
+                                &repo_path,
+                                &branch,
+                                &wt_target,
+                            );
+                            let (wt_result, reused) = match reused_wt {
+                                Some(existing_wt) => (Ok(existing_wt), true),
+                                None => {
+                                    (ws.create_worktree(&repo_path, &branch, &wt_target), false)
+                                }
+                            };
+                            match wt_result {
                                 Ok(wt_info) => {
                                     let _ = tx.send(WorktreeCreateResult {
                                         wi_id: wi_id_clone,
@@ -2843,6 +2912,7 @@ impl App {
                                         error: None,
                                         open_session: true,
                                         branch_gone: false,
+                                        reused,
                                     });
                                 }
                                 Err(e) => {
@@ -2856,6 +2926,7 @@ impl App {
                                         )),
                                         open_session: true,
                                         branch_gone: false,
+                                        reused: false,
                                     });
                                 }
                             }
@@ -3076,11 +3147,23 @@ impl App {
             self.end_activity(aid);
         }
 
+        let reused = result.reused;
         match (result.path, result.error) {
             (Some(path), _) => {
                 // Verify the work item still exists before opening a session.
                 // It may have been deleted while the background thread was running.
                 if !self.work_items.iter().any(|w| w.id == result.wi_id) {
+                    if reused {
+                        // The worktree was already on disk before the thread
+                        // ran - we do NOT own it, so we must not force-remove
+                        // it here. Surface a status message so the user can
+                        // clean up manually if needed.
+                        self.status_message = Some(
+                            "Work item deleted while creating worktree; pre-existing worktree left in place"
+                                .into(),
+                        );
+                        return;
+                    }
                     // Clean up the orphaned worktree instead of leaving it behind.
                     if let Err(e) =
                         self.worktree_service
@@ -4007,11 +4090,21 @@ impl App {
                     )),
                     open_session: false,
                     branch_gone: false,
+                    reused: false,
                 });
                 return;
             }
             let wt_target = Self::worktree_target_path(&repo_path, &branch, &wt_dir);
-            match ws.create_worktree(&repo_path, &branch, &wt_target) {
+            // Reuse an existing worktree only if it lives at the exact
+            // expected location (wt_target) and is NOT the main worktree.
+            // See `find_reusable_worktree` for rationale.
+            let reused_wt =
+                Self::find_reusable_worktree(ws.as_ref(), &repo_path, &branch, &wt_target);
+            let (wt_result, reused) = match reused_wt {
+                Some(existing_wt) => (Ok(existing_wt), true),
+                None => (ws.create_worktree(&repo_path, &branch, &wt_target), false),
+            };
+            match wt_result {
                 Ok(wt_info) => {
                     let _ = tx.send(WorktreeCreateResult {
                         wi_id: wi_id_clone,
@@ -4020,6 +4113,7 @@ impl App {
                         error: None,
                         open_session: false,
                         branch_gone: false,
+                        reused,
                     });
                 }
                 Err(e) => {
@@ -4030,6 +4124,7 @@ impl App {
                         error: Some(format!("Imported: {title} (worktree not created: {e})")),
                         open_session: false,
                         branch_gone: false,
+                        reused: false,
                     });
                 }
             }
@@ -8769,6 +8864,175 @@ mod tests {
             path,
             PathBuf::from("/repos/myrepo/.worktrees/simple-branch"),
         );
+    }
+
+    /// find_reusable_worktree must only accept worktrees that live at the
+    /// exact expected target path, are not the main worktree, and are on
+    /// the target branch. Any other match is rejected so the caller falls
+    /// through to `create_worktree` (which surfaces git's "already checked
+    /// out" error for truly conflicting cases).
+    #[test]
+    fn find_reusable_worktree_enforces_all_guards() {
+        use crate::worktree_service::{WorktreeError, WorktreeInfo};
+
+        struct ListOnlyMock {
+            entries: Vec<WorktreeInfo>,
+        }
+        impl WorktreeService for ListOnlyMock {
+            fn list_worktrees(
+                &self,
+                _repo_path: &std::path::Path,
+            ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+                Ok(self.entries.clone())
+            }
+            fn create_worktree(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+                _target_dir: &std::path::Path,
+            ) -> Result<WorktreeInfo, WorktreeError> {
+                Err(WorktreeError::GitError("not used".into()))
+            }
+            fn remove_worktree(
+                &self,
+                _repo_path: &std::path::Path,
+                _worktree_path: &std::path::Path,
+                _delete_branch: bool,
+                _force: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn delete_branch(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+                _force: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn is_worktree_dirty(
+                &self,
+                _worktree_path: &std::path::Path,
+            ) -> Result<bool, WorktreeError> {
+                Ok(false)
+            }
+            fn default_branch(
+                &self,
+                _repo_path: &std::path::Path,
+            ) -> Result<String, WorktreeError> {
+                Ok("main".into())
+            }
+            fn github_remote(
+                &self,
+                _repo_path: &std::path::Path,
+            ) -> Result<Option<(String, String)>, WorktreeError> {
+                Ok(None)
+            }
+            fn fetch_branch(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn create_branch(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+        }
+
+        // find_reusable_worktree canonicalizes both paths, so they must
+        // exist on disk. Use a temp dir with a fresh subdirectory per case.
+        let root = std::env::temp_dir().join(format!(
+            "workbridge-reusable-worktree-test-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let wt_target = repo.join(".worktrees").join("feature-x");
+        std::fs::create_dir_all(&wt_target).unwrap();
+        let other_target = repo.join(".worktrees").join("feature-x-alt");
+        std::fs::create_dir_all(&other_target).unwrap();
+
+        // Case 1: exact match at wt_target, not main, branch matches -> accept.
+        let mock = ListOnlyMock {
+            entries: vec![WorktreeInfo {
+                path: wt_target.clone(),
+                branch: Some("feature-x".into()),
+                is_main: false,
+            }],
+        };
+        let found = App::find_reusable_worktree(&mock, &repo, "feature-x", &wt_target);
+        assert!(found.is_some(), "valid reuse should be accepted");
+
+        // Case 2: is_main=true must be rejected even if path and branch match.
+        let mock = ListOnlyMock {
+            entries: vec![WorktreeInfo {
+                path: wt_target.clone(),
+                branch: Some("feature-x".into()),
+                is_main: true,
+            }],
+        };
+        assert!(
+            App::find_reusable_worktree(&mock, &repo, "feature-x", &wt_target).is_none(),
+            "main worktree must never be reused as a work-item worktree",
+        );
+
+        // Case 3: branch mismatch must be rejected.
+        let mock = ListOnlyMock {
+            entries: vec![WorktreeInfo {
+                path: wt_target.clone(),
+                branch: Some("other-branch".into()),
+                is_main: false,
+            }],
+        };
+        assert!(
+            App::find_reusable_worktree(&mock, &repo, "feature-x", &wt_target).is_none(),
+            "branch mismatch must not be reused",
+        );
+
+        // Case 4: path mismatch (worktree at a different location than the
+        // expected .worktrees/<branch>) must be rejected.
+        let mock = ListOnlyMock {
+            entries: vec![WorktreeInfo {
+                path: other_target.clone(),
+                branch: Some("feature-x".into()),
+                is_main: false,
+            }],
+        };
+        assert!(
+            App::find_reusable_worktree(&mock, &repo, "feature-x", &wt_target).is_none(),
+            "worktree at unexpected location must not be silently adopted",
+        );
+
+        // Case 5: empty list -> None (happy path for fresh creates).
+        let mock = ListOnlyMock { entries: vec![] };
+        assert!(
+            App::find_reusable_worktree(&mock, &repo, "feature-x", &wt_target).is_none(),
+            "empty list should yield None",
+        );
+
+        // Case 6: wt_target does not exist on disk -> None (canonicalization
+        // fails; the caller will fall through to create_worktree).
+        let missing_target = repo.join(".worktrees").join("never-existed");
+        let mock = ListOnlyMock {
+            entries: vec![WorktreeInfo {
+                path: wt_target.clone(),
+                branch: Some("feature-x".into()),
+                is_main: false,
+            }],
+        };
+        assert!(
+            App::find_reusable_worktree(&mock, &repo, "feature-x", &missing_target).is_none(),
+            "non-existent target path must not match anything",
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// F-2 regression: import_selected_unlinked creates the worktree under
