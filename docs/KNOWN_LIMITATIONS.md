@@ -82,5 +82,6 @@ since each tick iteration renders the UI and checks liveness for all tabs.
 Each tab has a dedicated reader thread that continuously reads PTY output and
 feeds it to the vt100 parser. The UI thread only locks parsers briefly to call
 `.screen()` for rendering. For typical Claude Code usage (1-5 tabs), this is
-not a bottleneck. The tick rate (200ms) is fast enough for responsive UI updates
-without burning CPU on idle polling.
+not a bottleneck. The render tick fires at ~120fps (8ms) so PTY output renders
+smoothly, and heavy background work (liveness checks, fetch drains) is throttled
+to roughly every 25th tick (~200ms) to keep CPU usage reasonable.
