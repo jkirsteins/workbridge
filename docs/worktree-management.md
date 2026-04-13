@@ -50,11 +50,29 @@ Only one worktree creation can be in flight at a time. If a second import
 is triggered while one is already running, the backend record is still
 created but the worktree creation is queued with a status message.
 
-If a worktree already exists for the target branch (e.g. a prior delete
-cleanup failed non-blockingly, or the branch is already checked out in
-another worktree), WorkBridge reuses that existing worktree instead of
-calling `git worktree add` again. This is detected by calling
-`list_worktrees` and matching on branch name before attempting creation.
+If a stale worktree already exists at the expected target location
+(e.g. a prior delete cleanup failed non-blockingly and left the directory
+behind), WorkBridge reuses it instead of calling `git worktree add`
+again. Reuse is deliberately narrow: the match must satisfy all three
+conditions:
+
+1. `list_worktrees` returns an entry for the target branch.
+2. The entry is NOT the main worktree (`is_main = false`).
+3. The entry's canonicalized path equals the canonicalized target path
+   under `.worktrees/<branch>`.
+
+If the branch is checked out at any other location - the user's primary
+repo checkout, a manually-created worktree, or a worktree for another
+work item - reuse is refused and `git worktree add` is allowed to fail
+with its native "already checked out" error. This prevents workbridge
+from silently hijacking unrelated checkouts (which would violate
+invariant #3 in `docs/invariants.md`).
+
+Cancel/orphan cleanup paths (`poll_worktree_creation` and the delete
+handler's phase 5) track whether a worktree was created by the
+background thread or merely reused, and skip destructive
+`remove_worktree` calls on reused paths - they never owned that
+worktree in the first place.
 
 ### Auto-create on session spawn
 
@@ -64,8 +82,10 @@ Code session. If the branch no longer exists (cannot be fetched from origin
 and cannot be created locally), a "Worktree Creation Failed" dialog is shown
 offering to delete the orphaned work item or dismiss.
 
-As with the import path, if a worktree already exists for the target
-branch, WorkBridge reuses it instead of calling `git worktree add`.
+The same reuse rules described under "Auto-create on import" apply here:
+a stale worktree at the expected target location is reused, but any
+other existing checkout of the branch is left alone and surfaces as a
+git error.
 
 ## Placement Convention
 
