@@ -1590,6 +1590,36 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     }
                 }
                 None => {
+                    // If worktree creation is in flight for this work item,
+                    // show a spinner instead of the "Press Enter to start a
+                    // session." hint - Enter is a no-op while the background
+                    // thread is running, so the hint would be misleading.
+                    let worktree_creating = app
+                        .work_items
+                        .get(*wi_idx)
+                        .map(|wi| app.worktree_create_wi.as_ref() == Some(&wi.id))
+                        .unwrap_or(false);
+
+                    if worktree_creating {
+                        let spinner_chars = [b'|', b'/', b'-', b'\\'];
+                        let frame = app.spinner_tick % spinner_chars.len();
+                        let spinner = spinner_chars[frame] as char;
+                        let text = Text::from(vec![
+                            Line::from(""),
+                            Line::from(format!("  {spinner} Creating worktree...")),
+                            Line::from(""),
+                            Line::from(Span::styled(
+                                "  Fetching branch and setting up workspace.",
+                                theme.style_text_muted(),
+                            )),
+                        ]);
+                        let paragraph = Paragraph::new(text)
+                            .block(block)
+                            .style(theme.style_text_muted());
+                        paragraph.render(area, buf);
+                        return;
+                    }
+
                     let wi = app.work_items.get(*wi_idx);
                     let errors = wi.map(|w| &w.errors);
                     let has_errors = errors.is_some_and(|e| !e.is_empty());

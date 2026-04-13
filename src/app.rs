@@ -2834,7 +2834,19 @@ impl App {
                                 });
                                 return;
                             }
-                            match ws.create_worktree(&repo_path, &branch, &wt_target) {
+                            // Reuse an existing worktree if one already
+                            // exists for this branch. `git worktree add`
+                            // would otherwise fail with "already checked
+                            // out" and surface as an alert dialog.
+                            let existing = ws.list_worktrees(&repo_path).ok().and_then(|wts| {
+                                wts.into_iter()
+                                    .find(|w| w.branch.as_deref() == Some(branch.as_str()))
+                            });
+                            let wt_result = match existing {
+                                Some(existing_wt) => Ok(existing_wt),
+                                None => ws.create_worktree(&repo_path, &branch, &wt_target),
+                            };
+                            match wt_result {
                                 Ok(wt_info) => {
                                     let _ = tx.send(WorktreeCreateResult {
                                         wi_id: wi_id_clone,
@@ -4011,7 +4023,20 @@ impl App {
                 return;
             }
             let wt_target = Self::worktree_target_path(&repo_path, &branch, &wt_dir);
-            match ws.create_worktree(&repo_path, &branch, &wt_target) {
+            // Reuse an existing worktree if one already exists for this
+            // branch (e.g. a prior delete cleanup left it behind, or the
+            // branch is already checked out elsewhere). `git worktree add`
+            // would otherwise fail with "already checked out" / "already
+            // exists" and surface as an error dialog to the user.
+            let existing = ws.list_worktrees(&repo_path).ok().and_then(|wts| {
+                wts.into_iter()
+                    .find(|w| w.branch.as_deref() == Some(branch.as_str()))
+            });
+            let wt_result = match existing {
+                Some(existing_wt) => Ok(existing_wt),
+                None => ws.create_worktree(&repo_path, &branch, &wt_target),
+            };
+            match wt_result {
                 Ok(wt_info) => {
                     let _ = tx.send(WorktreeCreateResult {
                         wi_id: wi_id_clone,

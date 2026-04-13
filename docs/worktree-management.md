@@ -50,6 +50,12 @@ Only one worktree creation can be in flight at a time. If a second import
 is triggered while one is already running, the backend record is still
 created but the worktree creation is queued with a status message.
 
+If a worktree already exists for the target branch (e.g. a prior delete
+cleanup failed non-blockingly, or the branch is already checked out in
+another worktree), WorkBridge reuses that existing worktree instead of
+calling `git worktree add` again. This is detected by calling
+`list_worktrees` and matching on branch name before attempting creation.
+
 ### Auto-create on session spawn
 
 When a session is spawned for a work item that has a branch but no worktree,
@@ -57,6 +63,9 @@ WorkBridge creates the worktree automatically before launching the Claude
 Code session. If the branch no longer exists (cannot be fetched from origin
 and cannot be created locally), a "Worktree Creation Failed" dialog is shown
 offering to delete the orphaned work item or dismiss.
+
+As with the import path, if a worktree already exists for the target
+branch, WorkBridge reuses it instead of calling `git worktree add`.
 
 ## Placement Convention
 
