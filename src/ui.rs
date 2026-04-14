@@ -1392,7 +1392,15 @@ fn format_work_item_entry<'a>(
     let is_working = app.claude_working.contains(&wi.id) || app.review_gates.contains_key(&wi.id);
     let (margin_text, margin_style): (String, ratatui_core::style::Style) = if is_working {
         let frame = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
-        (format!("{frame} "), theme.style_badge_session_working())
+        // On a highlighted row the list's bg is already Cyan, so a Cyan
+        // spinner fg is invisible. Match the selection caret/title styling
+        // (Black fg on Cyan bg, BOLD) so the spinner stays readable.
+        let style = if is_selected {
+            theme.style_tab_highlight()
+        } else {
+            theme.style_badge_session_working()
+        };
+        (format!("{frame} "), style)
     } else if has_session {
         ("\u{25CF} ".to_string(), theme.style_badge_session_idle())
     } else if is_selected {
@@ -3719,6 +3727,34 @@ mod format_entry_tests {
         lines.join("\n")
     }
 
+    /// Render a `ListItem` into a `Buffer` through the same `StatefulWidget`
+    /// path the real left-panel list uses, so tests can inspect per-cell
+    /// `fg`/`bg`. Unlike `render_list_item_to_string`, this applies the
+    /// `highlight_style` (`style_tab_highlight_bg`) that the actual list
+    /// renderer uses at `ui.rs` `style_tab_highlight_bg` call site, which is
+    /// what makes a selected row's background Cyan - exactly the context
+    /// needed to catch the Cyan-on-Cyan spinner regression.
+    fn render_list_item_to_buffer(
+        item: ratatui_widgets::list::ListItem<'_>,
+        width: usize,
+        selected: bool,
+    ) -> ratatui_core::buffer::Buffer {
+        use ratatui_core::buffer::Buffer;
+        use ratatui_core::layout::Rect;
+        use ratatui_core::widgets::StatefulWidget;
+        let height = item.height() as u16;
+        let area = Rect::new(0, 0, width as u16, height);
+        let list = ratatui_widgets::list::List::new(vec![item])
+            .highlight_style(Theme::default_theme().style_tab_highlight_bg());
+        let mut buf = Buffer::empty(area);
+        let mut state = ratatui_widgets::list::ListState::default();
+        if selected {
+            state.select(Some(0));
+        }
+        StatefulWidget::render(list, area, &mut buf, &mut state);
+        buf
+    }
+
     fn make_app_with_work_item(wi: WorkItem) -> App {
         let mut app = App::with_config(crate::config::Config::default(), Arc::new(StubBackend));
         app.work_items = vec![wi];
@@ -3862,6 +3898,92 @@ mod format_entry_tests {
                 line,
             );
         }
+    }
+
+    /// When a work item is actively working AND selected, the left-margin
+    /// spinner must render in the highlight style (Black fg on Cyan bg)
+    /// rather than its default Cyan fg. Otherwise the spinner is Cyan-on-Cyan
+    /// and invisible on the highlight bar.
+    #[test]
+    fn working_spinner_is_visible_on_highlighted_row() {
+        use ratatui_core::style::Color;
+        let wi = WorkItem {
+            id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "Working item".to_string(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/Projects/myrepo"),
+                branch: Some("feature".to_string()),
+                worktree_path: Some(PathBuf::from("/Projects/myrepo/.worktrees/feature")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            status_derived: false,
+            errors: vec![],
+        };
+        let id = wi.id.clone();
+        let mut app = make_app_with_work_item(wi);
+        app.claude_working.insert(id);
+        let theme = Theme::default_theme();
+
+        let item = format_work_item_entry(&app, 0, 40, &theme, true);
+        let buf = render_list_item_to_buffer(item, 40, true);
+        let cell = buf.cell((0, 0)).expect("cell (0,0) exists");
+        assert_eq!(
+            cell.fg, theme.tab_highlight_fg,
+            "spinner fg on highlighted row should be tab_highlight_fg, got {:?}",
+            cell.fg
+        );
+        assert_eq!(
+            cell.bg, theme.tab_highlight_bg,
+            "spinner bg on highlighted row should be tab_highlight_bg, got {:?}",
+            cell.bg
+        );
+        assert_ne!(
+            cell.fg,
+            Color::Cyan,
+            "regression: spinner on highlighted row must not be Cyan (cyan-on-cyan is invisible)"
+        );
+    }
+
+    /// On a non-highlighted row, the spinner keeps its default Cyan fg and
+    /// no forced background.
+    #[test]
+    fn working_spinner_keeps_default_style_on_unselected_row() {
+        let wi = WorkItem {
+            id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "Working item".to_string(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/Projects/myrepo"),
+                branch: Some("feature".to_string()),
+                worktree_path: Some(PathBuf::from("/Projects/myrepo/.worktrees/feature")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            status_derived: false,
+            errors: vec![],
+        };
+        let id = wi.id.clone();
+        let mut app = make_app_with_work_item(wi);
+        app.claude_working.insert(id);
+        let theme = Theme::default_theme();
+
+        let item = format_work_item_entry(&app, 0, 40, &theme, false);
+        let buf = render_list_item_to_buffer(item, 40, false);
+        let cell = buf.cell((0, 0)).expect("cell (0,0) exists");
+        assert_eq!(
+            cell.fg, theme.badge_session_working,
+            "spinner fg on unselected row should remain badge_session_working"
+        );
     }
 }
 
