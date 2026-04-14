@@ -436,6 +436,11 @@ pub fn app_event(
                 // warnings.
                 state.poll_orphan_cleanup_finished();
 
+                // Drain any fresh metrics snapshots from the background
+                // aggregator. Non-blocking; reads only the in-memory
+                // crossbeam channel.
+                state.poll_metrics_snapshot();
+
                 // Surface queued fetch errors.
                 state.drain_pending_fetch_errors();
 

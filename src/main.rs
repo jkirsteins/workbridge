@@ -2,11 +2,13 @@ mod app;
 mod assembly;
 mod config;
 mod create_dialog;
+mod dashboard_seed;
 mod event;
 mod fetcher;
 mod github_client;
 mod layout;
 mod mcp;
+mod metrics;
 mod pr_service;
 mod prompts;
 mod salsa;
@@ -36,9 +38,25 @@ fn handle_cli(args: &[String]) -> bool {
         Some("repos") => handle_repos_subcommand(args),
         Some("mcp") => handle_mcp_subcommand(args),
         Some("config") => handle_config_subcommand(),
+        Some("seed-dashboard") => handle_seed_dashboard_subcommand(args),
         _ => return false,
     }
     true
+}
+
+/// Dev tool: populate a workbridge `work-items/` directory with synthetic
+/// data so the metrics Dashboard can be visually verified end-to-end.
+/// Intended to be run against an isolated `HOME` override (see
+/// `docs/metrics.md` for the recommended tmux harness flow).
+fn handle_seed_dashboard_subcommand(args: &[String]) {
+    let Some(dir) = args.get(2) else {
+        eprintln!("Usage: workbridge seed-dashboard <work-items-dir>");
+        std::process::exit(1);
+    };
+    if let Err(e) = dashboard_seed::seed_dashboard(std::path::Path::new(dir)) {
+        eprintln!("workbridge: seed-dashboard failed: {e}");
+        std::process::exit(1);
+    }
 }
 
 fn handle_repos_subcommand(args: &[String]) {
@@ -479,6 +497,13 @@ fn main() -> Result<(), AppError> {
         Arc::clone(&worktree_service),
         Box::new(FileConfigProvider),
     );
+    // Spawn the background metrics aggregator and wire its receiver into
+    // the App so the Dashboard view has fresh data. The aggregator reads
+    // the same data dir LocalFileBackend uses; if that dir cannot be
+    // resolved we silently skip - the Dashboard renders a placeholder.
+    if let Some(data_dir) = metrics::default_data_dir() {
+        app.metrics_rx = Some(metrics::spawn_metrics_aggregator(data_dir));
+    }
     // Surface config/backend load errors in the TUI status bar so the user sees them.
     if let Some(msg) = config_error {
         app.status_message = Some(msg);

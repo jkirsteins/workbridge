@@ -284,6 +284,51 @@ impl LocalFileBackend {
         }
     }
 
+    /// Directory under `data_dir` where activity logs are moved when their
+    /// work item is deleted. Enables the metrics dashboard to read historical
+    /// flow events after the owning work item is gone.
+    fn archive_dir(&self) -> PathBuf {
+        self.data_dir.join("archive")
+    }
+
+    /// Path where a work item's activity log lives after deletion. The file
+    /// name matches the active path so the format on both sides is identical
+    /// and readers can use the same deserialization.
+    fn archived_activity_path(&self, id: &WorkItemId) -> Result<PathBuf, BackendError> {
+        let active = self.activity_path(id)?;
+        let file_name = active
+            .file_name()
+            .ok_or_else(|| {
+                BackendError::Io(format!("invalid activity path: {}", active.display()))
+            })?
+            .to_owned();
+        Ok(self.archive_dir().join(file_name))
+    }
+
+    /// Move a work item's activity log into the archive directory so its
+    /// flow history survives `delete()`. A no-op if the log does not exist.
+    fn archive_activity_log(&self, id: &WorkItemId) -> Result<(), BackendError> {
+        let active_path = self.activity_path(id)?;
+        if !active_path.exists() {
+            return Ok(());
+        }
+        let archive_dir = self.archive_dir();
+        fs::create_dir_all(&archive_dir).map_err(|e| {
+            BackendError::Io(format!(
+                "failed to create archive dir {}: {e}",
+                archive_dir.display()
+            ))
+        })?;
+        let dest = self.archived_activity_path(id)?;
+        fs::rename(&active_path, &dest).map_err(|e| {
+            BackendError::Io(format!(
+                "failed to archive {} -> {}: {e}",
+                active_path.display(),
+                dest.display()
+            ))
+        })
+    }
+
     /// Read and deserialize a work item record from disk.
     fn read_record(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
         match id {
@@ -442,6 +487,32 @@ impl WorkItemBackend for LocalFileBackend {
         atomic_write(&path, json.as_bytes())
             .map_err(|e| BackendError::Io(format!("failed to write {}: {e}", path.display())))?;
 
+        // Seed the activity log with a `created` event so the metrics
+        // aggregator can see freshly created items in `created_per_day`
+        // and (when initial status is Backlog) in the current-backlog
+        // trailing edge without waiting for the first stage_change.
+        // Without this, an item that is created and left untouched is
+        // invisible to the Dashboard until some later event appends
+        // the first log line. An append failure is non-fatal: the JSON
+        // record is authoritative and the item still works; only
+        // historical metrics lose that one entry.
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let created_entry = ActivityEntry {
+            timestamp: format!("{secs}Z"),
+            event_type: "created".to_string(),
+            payload: serde_json::json!({ "initial_status": record.status }),
+        };
+        if let Err(e) = self.append_activity(&record.id, &created_entry) {
+            eprintln!(
+                "workbridge: failed to append initial activity entry for {}: {e}; \
+                 dashboard will omit this item until another event is logged",
+                path.display()
+            );
+        }
+
         Ok(record)
     }
 
@@ -454,9 +525,24 @@ impl WorkItemBackend for LocalFileBackend {
                 fs::remove_file(path).map_err(|e| {
                     BackendError::Io(format!("failed to delete {}: {e}", path.display()))
                 })?;
-                // Also remove the activity log file if it exists.
-                if let Ok(activity_path) = self.activity_path(id) {
-                    let _ = fs::remove_file(&activity_path);
+                // Move the activity log to the archive directory so the
+                // metrics dashboard can read historical flow events after
+                // the work item is gone. If archival fails (cross-device
+                // rename, permission error, ...) we deliberately leave
+                // the log in place in the active directory rather than
+                // deleting it: the aggregator reads both the active dir
+                // and `archive/`, so an orphan log still contributes to
+                // historical metrics and nothing is silently destroyed.
+                // The user may need to clean it up by hand later, but
+                // history is preserved - which is the whole point of
+                // archival. stderr is swallowed by the alternate screen
+                // under the TUI, so this warning is best-effort for the
+                // non-TUI case only.
+                if let Err(e) = self.archive_activity_log(id) {
+                    eprintln!(
+                        "workbridge: failed to archive activity log for deleted work item: {e}; \
+                         leaving log in place so history is preserved"
+                    );
                 }
                 Ok(())
             }
@@ -758,6 +844,162 @@ mod tests {
     }
 
     #[test]
+    fn delete_archives_activity_log() {
+        let dir = temp_dir("delete-archive");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Item with activity".into(),
+                description: None,
+                status: WorkItemStatus::Implementing,
+                kind: WorkItemKind::Own,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: Some("main".into()),
+                    pr_identity: None,
+                }],
+            })
+            .unwrap();
+
+        backend
+            .append_activity(
+                &record.id,
+                &ActivityEntry {
+                    timestamp: "2026-04-14T10:00:00Z".into(),
+                    event_type: "stage_change".into(),
+                    payload: serde_json::json!({"from": "Backlog", "to": "Implementing"}),
+                },
+            )
+            .unwrap();
+        backend
+            .append_activity(
+                &record.id,
+                &ActivityEntry {
+                    timestamp: "2026-04-14T11:00:00Z".into(),
+                    event_type: "stage_change".into(),
+                    payload: serde_json::json!({"from": "Implementing", "to": "Done"}),
+                },
+            )
+            .unwrap();
+
+        let active_path = backend.activity_path(&record.id).unwrap();
+        let original_contents = fs::read_to_string(&active_path).unwrap();
+
+        backend.delete(&record.id).unwrap();
+
+        if let WorkItemId::LocalFile(ref path) = record.id {
+            assert!(!path.exists(), "work item JSON should be gone");
+        }
+        assert!(
+            !active_path.exists(),
+            "active activity log path should be empty after archival"
+        );
+
+        let archive_path = dir.join("archive").join(active_path.file_name().unwrap());
+        assert!(
+            archive_path.exists(),
+            "activity log should have been moved to {}",
+            archive_path.display()
+        );
+        let archived_contents = fs::read_to_string(&archive_path).unwrap();
+        assert_eq!(
+            archived_contents, original_contents,
+            "archived log must preserve the original bytes"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_creates_archive_dir_if_missing() {
+        let dir = temp_dir("delete-archive-dir-created");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Trigger archive dir creation".into(),
+                description: None,
+                status: WorkItemStatus::Implementing,
+                kind: WorkItemKind::Own,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: None,
+                    pr_identity: None,
+                }],
+            })
+            .unwrap();
+
+        backend
+            .append_activity(
+                &record.id,
+                &ActivityEntry {
+                    timestamp: "2026-04-14T12:00:00Z".into(),
+                    event_type: "note".into(),
+                    payload: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+
+        let archive_dir = dir.join("archive");
+        assert!(
+            !archive_dir.exists(),
+            "precondition: archive dir should not exist yet"
+        );
+
+        backend.delete(&record.id).unwrap();
+
+        assert!(
+            archive_dir.exists() && archive_dir.is_dir(),
+            "delete should create the archive directory on demand"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_without_activity_log_is_ok() {
+        // Regression: deletion must tolerate a missing activity log.
+        // `create()` normally seeds a log, so this test explicitly
+        // removes it to simulate the no-log scenario (e.g. a record
+        // imported before the seeding-on-create change, or one whose
+        // log was cleaned up out of band).
+        let dir = temp_dir("delete-no-activity");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "No activity".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                kind: WorkItemKind::Own,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: None,
+                    pr_identity: None,
+                }],
+            })
+            .unwrap();
+
+        let active_path = backend.activity_path(&record.id).unwrap();
+        fs::remove_file(&active_path).expect("remove seeded log for precondition");
+        assert!(
+            !active_path.exists(),
+            "precondition: no activity log for this item"
+        );
+
+        backend.delete(&record.id).unwrap();
+
+        let archive_dir = dir.join("archive");
+        assert!(
+            !archive_dir.exists(),
+            "archive dir should not be created when there is nothing to archive"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn import_creates_from_pr() {
         let dir = temp_dir("import");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
@@ -997,7 +1239,9 @@ mod tests {
             })
             .unwrap();
 
-        // Append two entries.
+        // Append two entries. `create()` already seeds a `created`
+        // event, so the roundtrip should yield three entries total
+        // with the created event in position 0.
         let entry1 = ActivityEntry {
             timestamp: "1000Z".into(),
             event_type: "stage_change".into(),
@@ -1013,24 +1257,34 @@ mod tests {
 
         // Read back and verify.
         let entries = backend.read_activity(&record.id).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].event_type, "stage_change");
-        assert_eq!(entries[0].timestamp, "1000Z");
-        assert_eq!(entries[1].event_type, "note");
-        assert_eq!(entries[1].timestamp, "2000Z");
-        assert_eq!(entries[1].payload["message"], "started work");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].event_type, "created");
+        assert_eq!(
+            entries[0].payload["initial_status"].as_str(),
+            Some("Implementing")
+        );
+        assert_eq!(entries[1].event_type, "stage_change");
+        assert_eq!(entries[1].timestamp, "1000Z");
+        assert_eq!(entries[2].event_type, "note");
+        assert_eq!(entries[2].timestamp, "2000Z");
+        assert_eq!(entries[2].payload["message"], "started work");
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn activity_log_empty_for_new_item() {
-        let dir = temp_dir("activity-empty");
+    fn create_seeds_activity_log_with_created_event() {
+        // `create()` seeds the activity log with a single `created`
+        // event capturing the initial status. This is what lets the
+        // metrics dashboard count freshly created items in
+        // `created_per_day` and in the current-backlog trailing edge
+        // before any subsequent stage_change happens.
+        let dir = temp_dir("activity-seeded-on-create");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
             .create(CreateWorkItem {
-                title: "No activity".into(),
+                title: "Seeded".into(),
                 description: None,
                 status: WorkItemStatus::Backlog,
                 kind: WorkItemKind::Own,
@@ -1043,7 +1297,25 @@ mod tests {
             .unwrap();
 
         let entries = backend.read_activity(&record.id).unwrap();
-        assert!(entries.is_empty(), "new item should have no activity");
+        assert_eq!(
+            entries.len(),
+            1,
+            "new item should have exactly one seeded `created` event"
+        );
+        assert_eq!(entries[0].event_type, "created");
+        assert_eq!(
+            entries[0].payload["initial_status"].as_str(),
+            Some("Backlog")
+        );
+        // Timestamp is `{secs}Z`; just verify the suffix and that the
+        // numeric portion parses as a plausible epoch second.
+        let ts = &entries[0].timestamp;
+        assert!(ts.ends_with('Z'), "timestamp should end with Z: {ts}");
+        let secs: i64 = ts.trim_end_matches('Z').parse().expect("numeric secs");
+        assert!(
+            secs > 1_600_000_000,
+            "timestamp should be a real epoch: {ts}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

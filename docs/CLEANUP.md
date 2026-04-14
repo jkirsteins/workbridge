@@ -43,8 +43,18 @@ MCP tool, or automatically via auto-archive - the following resources are
 cleaned up in order via `delete_work_item_by_id()`:
 
 1. **Backend record** - `pre_delete_cleanup()` is called (no-op for
-   LocalFileBackend; reserved for future backends), then the JSON file is
-   deleted from disk.
+   LocalFileBackend; reserved for future backends), then the work item
+   JSON file is deleted from disk. The work item's **activity log**
+   (`activity-{uuid}.jsonl`) is NOT deleted: `LocalFileBackend::delete()`
+   moves it into the `archive/` subdirectory of the data directory
+   instead, so the metrics Dashboard can still read historical flow
+   events after the owning work item is gone. If the move fails (cross-
+   device rename, permission error, etc.) the log is deliberately left
+   in place in the active directory and a stderr warning is emitted -
+   the aggregator reads both the active and archived dirs, so orphaned
+   logs still contribute to historical metrics and nothing is silently
+   destroyed. See `docs/metrics.md` for the aggregator that consumes
+   both the active and archived logs.
 2. **Sessions** - if a Claude Code PTY session is running, it receives SIGKILL
    and the session entry is removed from the sessions map. If a terminal PTY
    session is running (spawned via the Terminal tab), it also receives SIGKILL

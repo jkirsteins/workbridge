@@ -2,7 +2,7 @@
 source: src/ui.rs
 expression: "render(&app, 120, 40)"
 ---
-  List    Board                          Tab: switch view | <-/->: columns | Shift+arrow: move item | Enter: drill down
+  List    Board    Dashboard             Tab: switch view | <-/->: columns | Shift+arrow: move item | Enter: drill down
 ┌ Backlog (1) ───────────────┐┌ Planning (0) ──────────────┐┌ Implementing (2) ──────────┐┌ Review (0) ────────────────┐
 │First item                  ││                            ││  Active work               ││                            │
 │                            ││  No items                  ││> Second active             ││  No items                  │

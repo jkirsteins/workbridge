@@ -4,8 +4,8 @@ use crate::salsa::ct::event::{
 use crate::work_item::SelectionState;
 
 use crate::app::{
-    App, BOARD_COLUMNS, DisplayEntry, FocusPanel, RightPanelTab, SettingsListFocus, SettingsTab,
-    ViewMode,
+    App, BOARD_COLUMNS, DashboardWindow, DisplayEntry, FocusPanel, RightPanelTab,
+    SettingsListFocus, SettingsTab, ViewMode,
 };
 use crate::create_dialog::CreateDialogFocus;
 use crate::layout;
@@ -390,6 +390,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    // Dashboard mode has its own key handler (number keys for time window,
+    // Tab to cycle out).
+    if app.view_mode == ViewMode::Dashboard {
+        handle_key_dashboard(app, key);
+        return true;
+    }
+
     match app.focus {
         FocusPanel::Left => {
             handle_key_left(app, key);
@@ -475,7 +482,7 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
         // Enter - drill down into item's stage (two-panel view)
         (KeyModifiers::NONE, KeyCode::Enter) => {
             if app.board_selected_work_item_id().is_some() {
-                let stage = BOARD_COLUMNS[app.board_cursor.column].clone();
+                let stage = BOARD_COLUMNS[app.board_cursor.column];
                 app.board_drill_down = true;
                 app.board_drill_stage = Some(stage);
                 app.build_display_list();
@@ -535,6 +542,45 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
             sync_layout(app);
         }
         // ? - toggle settings overlay
+        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
+            app.show_settings = !app.show_settings;
+        }
+        _ => {}
+    }
+}
+
+/// Key handling for the global metrics Dashboard view. Tab cycles to the
+/// next view; number keys 1..4 select the rolling time window. All other
+/// keys are ignored (no per-item interaction in this view).
+fn handle_key_dashboard(app: &mut App, key: KeyEvent) {
+    match (key.modifiers, key.code) {
+        (KeyModifiers::NONE, KeyCode::Tab) => {
+            app.toggle_view_mode();
+        }
+        (KeyModifiers::NONE, KeyCode::Char('1')) => {
+            app.dashboard_window = DashboardWindow::Week;
+        }
+        (KeyModifiers::NONE, KeyCode::Char('2')) => {
+            app.dashboard_window = DashboardWindow::Month;
+        }
+        (KeyModifiers::NONE, KeyCode::Char('3')) => {
+            app.dashboard_window = DashboardWindow::Quarter;
+        }
+        (KeyModifiers::NONE, KeyCode::Char('4')) => {
+            app.dashboard_window = DashboardWindow::Year;
+        }
+        // Q/q/Ctrl+Q - quit with confirmation (mirrors handle_key_board).
+        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('q' | 'Q'))
+        | (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
+            if !app.has_any_session() || app.confirm_quit {
+                app.should_quit = true;
+            } else {
+                app.confirm_quit = true;
+                app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                sync_layout(app);
+            }
+        }
+        // ?/Shift+? - settings overlay toggle (parity with handle_key_board).
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
             app.show_settings = !app.show_settings;
         }

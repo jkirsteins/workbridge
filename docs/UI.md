@@ -244,13 +244,22 @@ The `ViewMode` enum controls the root overview layout:
   Terminal. See Layout and Right Panel Tabs sections below.
 - `Board`: kanban board with 4 columns organized by workflow stage.
   See Board View section below.
+- `Dashboard`: global flow-metrics view (throughput, cycle time,
+  backlog size over time, stuck items). Reads from the background
+  metrics aggregator - no per-work-item interaction. See
+  `docs/metrics.md` for the data model and bucketing rules, and the
+  Dashboard View section below for the layout. Number keys `1 2 3 4`
+  select the rolling time window (7d / 30d / 90d / 365d) while this
+  view is active.
 
-Toggle between modes with Tab. The selected work item is preserved
-across toggles. A 1-row view mode header at the top of the screen
-shows a segmented tab bar (using the ratatui `Tabs` widget) with
-`List` and `Board` labels. The active mode is highlighted. Contextual
-keybinding hints appear right-aligned in the header (e.g., board mode
-shows arrow key and Shift+arrow controls).
+Cycle between modes with Tab (FlatList -> Board -> Dashboard ->
+FlatList). The selected work item is preserved across toggles. A
+1-row view mode header at the top of the screen shows a segmented
+tab bar (using the ratatui `Tabs` widget) with `List`, `Board`, and
+`Dashboard` labels. The active mode is highlighted. Contextual
+keybinding hints appear right-aligned in the header (e.g., board
+mode shows arrow key and Shift+arrow controls; dashboard mode shows
+the window-selection number keys).
 
 ## Global Shortcuts
 
@@ -295,6 +304,26 @@ and row index independently.
 
 After a stage transition (Shift+arrow), the cursor follows the item
 into its new column.
+
+### Dashboard Mode Navigation
+
+In Dashboard view, `handle_key_dashboard()` intercepts key events
+before the left/right panel handlers. The view has no per-item
+cursor - all charts are global, so navigation is limited to
+switching the rolling time window and cycling out via Tab.
+
+- `1`: 7-day window
+- `2`: 30-day window (default on launch)
+- `3`: 90-day window
+- `4`: 365-day window
+- Tab: cycle to List view
+- Q / Ctrl+Q: quit with confirmation (same semantics as other views)
+- `?`: open settings overlay
+
+The selected window persists only for the session; it resets to 30d
+on each launch. The charts re-read `App.metrics_snapshot` on every
+render; the snapshot itself is refreshed by the background
+aggregator every ~60s (see `docs/metrics.md`).
 
 ### Within Dialogs
 
@@ -604,6 +633,50 @@ other columns use `style_board_column_unfocused()`.
 Drill-down (Enter on a board item) switches to a filtered two-panel
 layout showing only items from the selected column's stage, with the
 PTY panel on the right. Ctrl+] returns to the full board view.
+
+### Layout: Dashboard View
+
+```
+  List   Board   Dashboard    Tab: switch view | 1/2/3/4: 7d/30d/90d/365d window
++-- Dashboard (window: 30d) --------------------------------------------+
+| Throughput 11/30d   Cycle p50 5d   Cycle p90 20d   Backlog now 5 (+5)  |
++-- Done vs PRs merged  [G] done [M] merged (daily) -+-- Created per day +
+|                                                    |                  |
+|              GG    GG                              |      BB BB BB    |
+|              GG    GG MM      MM                   |      BB BB BB    |
+|              GG GG GG MM  GG  MM GG                |   BB BB BB BB    |
++- -29d ---- -19d --- -9d ------- now ---------------+- -29d ...  now --+
++-- Backlog size over time  now 5 / peak 5 ----------+-- Stuck items ---+
+|                                                    |  Review  5d0h    |
+|                                  ▁▁▁▁▁██████████   |  Review  3d0h    |
+|                              ▃▃▃▃██████████████    |  Blocked 2d0h    |
+|                          ▆▆▆▆████████████████      |                  |
++- -29d ---- -19d --- -9d ------- now ---------------+------------------+
+```
+
+The `Dashboard` label is highlighted (active). The Dashboard is a
+2x2 grid of chart panels (`Done vs PRs merged`, `Created per day`,
+`Backlog size over time`, `Stuck items`) sitting below a one-row KPI
+strip. The KPI strip shows throughput, cycle-time p50/p90, current
+backlog + delta from window start, and stuck-item count. Every
+chart panel has overlaid x-axis labels on its bottom border at 0%,
+33%, 66%, and 100% of the chart width (`-Nd` / `-Md` / `-Kd` /
+`now`), written by `draw_bottom_axis_labels` directly into the
+buffer row after the block is rendered.
+
+The Done-vs-PRs-merged chart is a grouped `BarChart` with two bars
+per bucket (green = Done, magenta = merged). Long windows bucket
+aggressively (daily for 7d/30d, weekly for 90d, monthly for 365d)
+so the bar density stays readable. The other two charts use
+`ratatui_widgets::sparkline::Sparkline` for 1/8-cell filled-area
+rendering. Long windows (90d/365d) are downsampled with
+`downsample_for_sparkline` so the inner width of the chart panel
+always receives exactly one data point per column (otherwise
+`Sparkline` would truncate the tail). The Stuck items panel is a
+plain `Paragraph` list.
+
+See `docs/metrics.md` for the data pipeline, aggregation rules, and
+per-chart semantics.
 
 ### Right Panel Tabs
 

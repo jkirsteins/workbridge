@@ -2,7 +2,7 @@
 source: src/ui.rs
 expression: "render(&app, 80, 12)"
 ---
-  List    Board                                                Tab: switch view
+  List    Board    Dashboard                                   Tab: switch view
 ┌ Work Items (7) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  ACTIVE (0) (5)       ││                                                     │
 │  branch-a5 [no wt]    ││  Item B2                                            │
