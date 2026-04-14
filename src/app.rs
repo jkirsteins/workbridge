@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::assembly;
 use crate::config::{Config, ConfigProvider, RepoEntry, RepoSource};
@@ -91,6 +91,17 @@ pub struct BoardCursor {
 /// user explains the task, replacing this placeholder.
 pub const QUICKSTART_TITLE: &str = "Quick start";
 
+/// Rejection wording shown when `execute_merge` refuses a second
+/// concurrent merge. Duplicated at the pre-check and the
+/// defense-in-depth race handler after `try_begin_user_action` - kept
+/// in one const so a future rename is a single-site edit.
+const PR_MERGE_ALREADY_IN_PROGRESS: &str = "PR merge already in progress";
+
+/// Rejection wording shown when `spawn_review_submission` refuses a
+/// second concurrent review submission. Same duplication rationale as
+/// `PR_MERGE_ALREADY_IN_PROGRESS`.
+const REVIEW_SUBMIT_ALREADY_IN_PROGRESS: &str = "Review submission already in progress";
+
 pub const BOARD_COLUMNS: &[WorkItemStatus] = &[
     WorkItemStatus::Backlog,
     WorkItemStatus::Planning,
@@ -164,6 +175,95 @@ pub struct ActivityId(u64);
 pub struct Activity {
     pub id: ActivityId,
     pub message: String,
+}
+
+/// Keys identifying every user-initiated remote I/O action that runs
+/// through `App::try_begin_user_action`. One variant per admission slot:
+/// rejecting a second concurrent entry is the whole point of routing
+/// through the helper.
+///
+/// See `docs/UI.md` "User action guard" for the admission contract and
+/// `CLAUDE.md` severity overrides for the review-time policy.
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub enum UserActionKey {
+    /// User-triggered GitHub refresh (Ctrl+R). Debounced to 500ms; the
+    /// background fetcher's structural restart path does NOT go through
+    /// this key - only the explicit user press does.
+    GithubRefresh,
+    /// Asynchronous PR creation initiated from the Review stage.
+    PrCreate,
+    /// Asynchronous PR merge (`gh pr merge`) initiated from the merge
+    /// modal.
+    PrMerge,
+    /// Asynchronous PR review submission (approve / request-changes).
+    ReviewSubmit,
+    /// Shared single slot for `spawn_session`'s auto-worktree creation
+    /// and `spawn_import_worktree`'s import flow. Per-repo concurrency
+    /// is intentionally out of scope here: both callers compete for the
+    /// same global slot. If concurrent worktree creation for different
+    /// repos is later wanted, key this on `(RepoPath, Branch)` instead.
+    WorktreeCreate,
+    /// Asynchronous unlinked-PR cleanup initiated from the cleanup
+    /// modal. Single source of truth for the "cleanup in progress" read
+    /// state that event.rs / ui.rs / salsa.rs query via
+    /// `App::is_user_action_in_flight(&UnlinkedCleanup)`.
+    UnlinkedCleanup,
+    /// Asynchronous delete-cleanup initiated from the delete modal or
+    /// the MCP delete handler.
+    DeleteCleanup,
+}
+
+/// Payload stored inside `UserActionState` for each in-flight entry.
+/// Carries the background-thread receiver and any per-action metadata
+/// (such as the `WorkItemId` the action was spawned for) directly inside
+/// the helper map, so state ownership is structural: dropping the map
+/// entry drops the receiver, and there is no way to leave behind a
+/// stray `Option<Receiver>` or orphaned `Option<ActivityId>`.
+pub enum UserActionPayload {
+    /// No receiver attached. Used by `GithubRefresh` (the fetcher has
+    /// its own channel) and as the transient state between
+    /// `try_begin_user_action` returning and the caller attaching the
+    /// payload via `attach_user_action_payload`.
+    Empty,
+    PrCreate {
+        rx: crossbeam_channel::Receiver<PrCreateResult>,
+        wi_id: WorkItemId,
+    },
+    PrMerge {
+        rx: crossbeam_channel::Receiver<PrMergeResult>,
+    },
+    ReviewSubmit {
+        rx: crossbeam_channel::Receiver<ReviewSubmitResult>,
+        wi_id: WorkItemId,
+    },
+    WorktreeCreate {
+        rx: crossbeam_channel::Receiver<WorktreeCreateResult>,
+        wi_id: WorkItemId,
+    },
+    UnlinkedCleanup {
+        rx: crossbeam_channel::Receiver<CleanupResult>,
+    },
+    DeleteCleanup {
+        rx: crossbeam_channel::Receiver<CleanupResult>,
+    },
+}
+
+/// State for one in-flight user action. Owned by the `UserActionGuard`
+/// map keyed on `UserActionKey`. The `activity_id` is the status-bar
+/// spinner started when the action was admitted; the `payload` carries
+/// the per-action receiver so there is exactly one structural drop
+/// site for both.
+pub struct UserActionState {
+    pub activity_id: ActivityId,
+    pub payload: UserActionPayload,
+}
+
+/// Single source of truth for "is this user action in flight" plus the
+/// last-attempt timestamps used for debounce. See `App::try_begin_user_action`.
+#[derive(Default)]
+pub struct UserActionGuard {
+    pub in_flight: HashMap<UserActionKey, UserActionState>,
+    pub last_attempted: HashMap<UserActionKey, Instant>,
 }
 
 /// Outcome of attempting to spawn the review gate.
@@ -522,11 +622,6 @@ pub struct App {
     /// Identity of the unlinked PR being cleaned up: (repo_path, branch, pr_number).
     /// Stored by identity rather than index so it survives reassembly.
     pub cleanup_unlinked_target: Option<(PathBuf, String, u64)>,
-    /// Receiver for the async unlinked-item cleanup thread result.
-    pub cleanup_rx: Option<crossbeam_channel::Receiver<CleanupResult>>,
-    /// True while the cleanup background thread is running.
-    /// The dialog stays open with a spinner in this state.
-    pub cleanup_in_progress: bool,
     /// PR number shown in the in-progress dialog body.
     pub cleanup_progress_pr_number: Option<u64>,
     /// Repo path of the in-progress cleanup target (for cache eviction on completion).
@@ -537,10 +632,6 @@ pub struct App {
     /// stale fetch results from re-adding the PR as unlinked. Applied and
     /// cleared when a fresh fetch arrives (drain_fetch_results returns true).
     pub cleanup_evicted_branches: Vec<(PathBuf, String)>,
-    /// Receiver for the async MCP-triggered work item delete cleanup thread.
-    pub delete_cleanup_rx: Option<crossbeam_channel::Receiver<CleanupResult>>,
-    /// Activity ID for the running delete-cleanup indicator.
-    pub delete_cleanup_activity: Option<ActivityId>,
     /// General-purpose alert dialog. When Some, a red-bordered modal is shown.
     /// Dismissed with Enter or Esc.
     pub alert_message: Option<String>,
@@ -709,38 +800,35 @@ pub struct App {
     /// activities are present.
     pub spinner_tick: usize,
 
+    // -- User action guard (single-flight admission for remote I/O) --
+    /// Owns the in-flight slot + debounce timestamps for every action
+    /// routed through `App::try_begin_user_action`. See `docs/UI.md`
+    /// "User action guard" for the contract. Replaces seven separate
+    /// `Option<Receiver>` + sibling `Option<ActivityId>` triplets.
+    pub user_actions: UserActionGuard,
+
     // -- Background fetch indicator --
-    /// Activity ID for the in-flight background GitHub fetch. Started when
-    /// a FetchStarted message arrives, ended when all in-flight fetches
-    /// complete. Shows a spinner in the status bar during GitHub API calls.
-    pub fetch_activity: Option<ActivityId>,
+    /// Activity ID for an in-flight GitHub fetch that was NOT initiated
+    /// via the `GithubRefresh` user-action guard - i.e. a structural
+    /// fetcher restart (newly managed repo, work item created, delete
+    /// cleanup completed). Started when a `FetchStarted` message arrives
+    /// and the user-action guard does not already own the spinner;
+    /// cleared when `pending_fetch_count` returns to zero. The invariant
+    /// is "exactly one fetch spinner at a time": either this field or
+    /// the `UserActionKey::GithubRefresh` entry owns it, never both.
+    pub structural_fetch_activity: Option<ActivityId>,
     /// Number of repos currently fetching. The activity spinner is shown
     /// while this is > 0 and cleared when it returns to 0.
     pub pending_fetch_count: usize,
 
-    // -- Async PR creation --
-    /// Receiver for asynchronous PR creation results.
-    pub pr_create_rx: Option<crossbeam_channel::Receiver<PrCreateResult>>,
-    /// Activity ID for the running PR creation indicator.
-    pub pr_create_activity: Option<ActivityId>,
-    /// The work item ID that the current in-flight PR creation was spawned for.
-    pub pr_create_wi: Option<WorkItemId>,
+    // -- PR creation queue (bespoke, outside the user-action guard) --
     /// Queued work item IDs waiting for PR creation when a creation is
     /// already in-flight. Drained one at a time as each creation completes.
+    /// Kept separate from `user_actions` because queueing semantics are
+    /// PR-create-specific; the guard itself only models single-flight
+    /// admission.
     pub pr_create_pending: VecDeque<WorkItemId>,
 
-    // -- Async PR merge --
-    /// Receiver for asynchronous PR merge results.
-    pub pr_merge_rx: Option<crossbeam_channel::Receiver<PrMergeResult>>,
-
-    // -- Async review submission --
-    /// Receiver for asynchronous review submission results.
-    pub review_submit_rx: Option<crossbeam_channel::Receiver<ReviewSubmitResult>>,
-    /// Work item ID of the in-flight review submission, used to cancel
-    /// the submission if the work item is deleted while in flight.
-    pub review_submit_wi: Option<WorkItemId>,
-    /// Activity ID for the running review submission indicator.
-    pub review_submit_activity: Option<ActivityId>,
     /// Work item IDs whose reviews were just submitted. These are excluded
     /// from the re-open logic in reassemble_work_items() because repo_data
     /// may still contain stale review-requested entries until the next
@@ -774,14 +862,6 @@ pub struct App {
     /// rule: this is a system-initiated startup migration and therefore
     /// owes the user a status-bar spinner (not a blocking dialog).
     pub pr_identity_backfill_activity: Option<ActivityId>,
-
-    // -- Async worktree creation --
-    /// Receiver for asynchronous worktree creation results.
-    pub worktree_create_rx: Option<crossbeam_channel::Receiver<WorktreeCreateResult>>,
-    /// Activity ID for the running worktree creation indicator.
-    pub worktree_create_activity: Option<ActivityId>,
-    /// The work item ID that the current worktree creation was spawned for.
-    pub worktree_create_wi: Option<WorkItemId>,
 
     // -- Async session-open plan read --
     /// Pending background plan reads, keyed by work item ID. Each entry
@@ -921,14 +1001,10 @@ impl App {
             cleanup_reason_input_active: false,
             cleanup_reason_input: crate::create_dialog::SimpleTextInput::new(),
             cleanup_unlinked_target: None,
-            cleanup_rx: None,
-            cleanup_in_progress: false,
             cleanup_progress_pr_number: None,
             cleanup_progress_repo_path: None,
             cleanup_progress_branch: None,
             cleanup_evicted_branches: Vec::new(),
-            delete_cleanup_rx: None,
-            delete_cleanup_activity: None,
             alert_message: None,
             branch_gone_prompt: None,
             no_plan_prompt_visible: false,
@@ -989,25 +1065,16 @@ impl App {
             activity_counter: 0,
             activities: Vec::new(),
             spinner_tick: 0,
-            fetch_activity: None,
+            user_actions: UserActionGuard::default(),
+            structural_fetch_activity: None,
             pending_fetch_count: 0,
-            pr_create_rx: None,
-            pr_create_activity: None,
-            pr_create_wi: None,
             pr_create_pending: VecDeque::new(),
-            pr_merge_rx: None,
-            review_submit_rx: None,
-            review_submit_wi: None,
-            review_submit_activity: None,
             review_reopen_suppress: std::collections::HashSet::new(),
             mergequeue_watches: Vec::new(),
             mergequeue_polls: HashMap::new(),
             mergequeue_poll_errors: HashMap::new(),
             pr_identity_backfill_rx: None,
             pr_identity_backfill_activity: None,
-            worktree_create_rx: None,
-            worktree_create_activity: None,
-            worktree_create_wi: None,
             session_open_rx: HashMap::new(),
             orphan_cleanup_finished_tx,
             orphan_cleanup_finished_rx,
@@ -1059,6 +1126,153 @@ impl App {
     /// a status message or an activity indicator is present.
     pub fn has_visible_status_bar(&self) -> bool {
         self.status_message.is_some() || !self.activities.is_empty()
+    }
+
+    // -- User action guard API --
+
+    /// Attempt to admit a user-initiated remote-I/O action. Returns
+    /// `Some(activity_id)` on success (status-bar spinner started,
+    /// helper entry inserted with `UserActionPayload::Empty`) or `None`
+    /// if another entry for `key` is already in flight OR the debounce
+    /// window from the previous attempt has not elapsed.
+    ///
+    /// `debounce` should be `Duration::ZERO` for most callers; only
+    /// key-spam-prone handlers (currently Ctrl+R) pass a nonzero value.
+    /// Tests override the debounce with a short `Duration::from_millis`
+    /// to avoid real sleeps.
+    ///
+    /// The helper deliberately does NOT emit any status message or
+    /// alert on rejection - every caller owns its rejection UX and the
+    /// wording is caller-specific. See `docs/UI.md` "User action guard"
+    /// for the contract and `CLAUDE.md` severity overrides for the
+    /// review policy that requires user-initiated remote I/O to go
+    /// through this helper.
+    pub fn try_begin_user_action(
+        &mut self,
+        key: UserActionKey,
+        debounce: Duration,
+        message: impl Into<String>,
+    ) -> Option<ActivityId> {
+        let now = Instant::now();
+        if self.user_actions.in_flight.contains_key(&key) {
+            return None;
+        }
+        if !debounce.is_zero()
+            && let Some(last) = self.user_actions.last_attempted.get(&key)
+            && now.saturating_duration_since(*last) < debounce
+        {
+            return None;
+        }
+        self.user_actions.last_attempted.insert(key.clone(), now);
+        let activity_id = self.start_activity(message);
+        self.user_actions.in_flight.insert(
+            key,
+            UserActionState {
+                activity_id,
+                payload: UserActionPayload::Empty,
+            },
+        );
+        Some(activity_id)
+    }
+
+    /// Attach a receiver/metadata payload to an already-admitted user
+    /// action. Unconditionally panics (in both debug and release) if no
+    /// entry for `key` exists - this is a programming error; every
+    /// `attach` must be preceded by a successful
+    /// `try_begin_user_action` call. Silently skipping the attach in
+    /// release builds would leave the helper map entry pinned to
+    /// `UserActionPayload::Empty` forever, which `is_user_action_in_flight`
+    /// would still report as "in flight" until something else cleared
+    /// it - exactly the latent-state bug the helper is meant to
+    /// eliminate.
+    pub fn attach_user_action_payload(&mut self, key: &UserActionKey, payload: UserActionPayload) {
+        match self.user_actions.in_flight.get_mut(key) {
+            Some(state) => state.payload = payload,
+            None => panic!(
+                "attach_user_action_payload called without a prior successful \
+                 try_begin_user_action for {key:?}: every attach must be preceded \
+                 by an admit that returned Some(_)",
+            ),
+        }
+    }
+
+    /// End a user action: remove the map entry and clear the status-bar
+    /// spinner. Idempotent - calling twice (or calling without a prior
+    /// begin) is a no-op, because early-return cancel paths (delete,
+    /// retreat) use this as a best-effort cleanup.
+    pub fn end_user_action(&mut self, key: &UserActionKey) {
+        if let Some(state) = self.user_actions.in_flight.remove(key) {
+            self.end_activity(state.activity_id);
+        }
+    }
+
+    /// Returns true while a user action for `key` is still in flight.
+    /// Pure in-memory check - no I/O, safe on the UI thread.
+    pub fn is_user_action_in_flight(&self, key: &UserActionKey) -> bool {
+        self.user_actions.in_flight.contains_key(key)
+    }
+
+    /// Borrow the payload stored under `key`, if any.
+    pub fn user_action_payload(&self, key: &UserActionKey) -> Option<&UserActionPayload> {
+        self.user_actions.in_flight.get(key).map(|s| &s.payload)
+    }
+
+    /// Return the `WorkItemId` the in-flight action is targeting, if
+    /// the payload carries one. Used by delete/retreat cancel paths.
+    pub fn user_action_work_item(&self, key: &UserActionKey) -> Option<&WorkItemId> {
+        match self.user_action_payload(key)? {
+            UserActionPayload::PrCreate { wi_id, .. }
+            | UserActionPayload::ReviewSubmit { wi_id, .. }
+            | UserActionPayload::WorktreeCreate { wi_id, .. } => Some(wi_id),
+            _ => None,
+        }
+    }
+
+    /// Reset all fetcher-derived UI state to a clean slate. Called from
+    /// the salsa structural-restart block (src/salsa.rs) when the repo
+    /// set changes and the old fetcher thread is being torn down and
+    /// replaced with a new one against a different repo list.
+    ///
+    /// The restart drops `fetch_rx`, which severs the channel any
+    /// mid-flight fetcher thread would otherwise use to deliver its
+    /// paired `RepoData` / `FetcherError` terminal messages. Without
+    /// resetting the derived state, any `FetchStarted` whose count was
+    /// already incremented on a prior tick (via `drain_fetch_results`)
+    /// would be stranded forever: `pending_fetch_count` would stay
+    /// non-zero for the rest of the process lifetime, which the Ctrl+R
+    /// hard gate in `src/event.rs` interprets as "a fetch cycle is
+    /// still running" and rejects every user-initiated refresh from
+    /// that point on. The dangling `structural_fetch_activity` id would
+    /// similarly leave a stuck spinner on the status bar.
+    ///
+    /// This helper groups the three invariants that must always move
+    /// together on a structural restart:
+    ///   1. `fetch_rx = None` - the channel the old threads write into
+    ///      is torn down.
+    ///   2. `pending_fetch_count = 0` - any counted-but-unpaired
+    ///      `FetchStarted` from the old channel is reset so the Ctrl+R
+    ///      gate does not permanently lock out the user.
+    ///   3. `structural_fetch_activity` / `UserActionKey::GithubRefresh`
+    ///      activities are ended so no stuck spinner remains.
+    ///
+    /// Keeping them in a single method makes the structural ownership
+    /// explicit: there is exactly one site that tears down fetcher
+    /// state, and every derived field is visible there.
+    pub fn reset_fetch_state(&mut self) {
+        // 1. Drop the old channel so no stale terminal messages from
+        //    the previous fetcher thread are drained into the new
+        //    accounting.
+        self.fetch_rx = None;
+        // 2. Reset the count so any previously-counted `FetchStarted`
+        //    whose paired `RepoData` / `FetcherError` will never
+        //    arrive cannot strand the Ctrl+R gate.
+        self.pending_fetch_count = 0;
+        // 3. End both possible owners of the current fetch spinner.
+        //    Both are idempotent no-ops when already clear.
+        self.end_user_action(&UserActionKey::GithubRefresh);
+        if let Some(id) = self.structural_fetch_activity.take() {
+            self.end_activity(id);
+        }
     }
 
     /// Check whether a path is inside (or equal to) one of the active
@@ -1628,38 +1842,70 @@ impl App {
     /// Returns true if any messages were received (meaning reassembly is
     /// warranted).
     pub fn drain_fetch_results(&mut self) -> bool {
-        let Some(ref rx) = self.fetch_rx else {
-            return false;
-        };
+        // First, collect all pending messages into a local Vec so the
+        // `self.fetch_rx` borrow is released before we call any
+        // `&mut self` helpers (`end_user_action`, `end_activity`, etc.).
+        // Previously this function reached directly into
+        // `self.user_actions.in_flight.remove(...)` and
+        // `self.activities.retain(...)` because the `rx` borrow blocked
+        // it from routing through `end_user_action`; that created a
+        // drift hazard if `end_user_action` ever grew side effects.
+        // Now every cleanup path here is identical to the rest of the
+        // codebase.
+        let mut messages = Vec::new();
+        let mut disconnected = false;
+        {
+            let Some(ref rx) = self.fetch_rx else {
+                return false;
+            };
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => messages.push(msg),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         let mut received_any = false;
-        loop {
-            match rx.try_recv() {
-                Ok(FetchMessage::FetchStarted) => {
+        for msg in messages {
+            match msg {
+                FetchMessage::FetchStarted => {
                     // Show a spinner while GitHub data is being fetched.
                     // Track how many repos are in-flight so the spinner
                     // persists until all repos have reported back.
+                    //
+                    // If the Ctrl+R path has already admitted a
+                    // `GithubRefresh` action, reuse its activity - do NOT
+                    // start a second one. Otherwise (structural restart
+                    // path: manage/unmanage, quickstart create, delete
+                    // cleanup, etc.) own the spinner locally via
+                    // `structural_fetch_activity` so the single-spinner
+                    // invariant holds.
                     self.pending_fetch_count += 1;
-                    if self.fetch_activity.is_none() {
-                        // Can't call self.start_activity() here because
-                        // `rx` borrows self.fetch_rx immutably.
-                        self.activity_counter += 1;
-                        let id = ActivityId(self.activity_counter);
-                        self.activities.push(Activity {
-                            id,
-                            message: "Refreshing GitHub data".into(),
-                        });
-                        self.fetch_activity = Some(id);
+                    let helper_owns_it =
+                        self.is_user_action_in_flight(&UserActionKey::GithubRefresh);
+                    if !helper_owns_it && self.structural_fetch_activity.is_none() {
+                        let id = self.start_activity("Refreshing GitHub data");
+                        self.structural_fetch_activity = Some(id);
                     }
-                    continue;
                 }
-                Ok(FetchMessage::RepoData(result)) => {
+                FetchMessage::RepoData(result) => {
                     received_any = true;
                     self.pending_fetch_count = self.pending_fetch_count.saturating_sub(1);
-                    // Can't call self.end_activity() here - rx borrow.
-                    if self.pending_fetch_count == 0
-                        && let Some(id) = self.fetch_activity.take()
-                    {
-                        self.activities.retain(|a| a.id != id);
+                    // End both possible owners of the fetch spinner:
+                    // the Ctrl+R helper entry (if it started this
+                    // cycle) and the structural fallback (if the
+                    // restart path started it). Exactly one of them
+                    // actually holds an activity at any given time.
+                    if self.pending_fetch_count == 0 {
+                        self.end_user_action(&UserActionKey::GithubRefresh);
+                        if let Some(id) = self.structural_fetch_activity.take() {
+                            self.end_activity(id);
+                        }
                     }
                     // Surface worktree errors in the status bar. One-time
                     // per repo to avoid flooding on every fetch cycle.
@@ -1709,13 +1955,13 @@ impl App {
                         self.review_reopen_suppress.clear();
                     }
                 }
-                Ok(FetchMessage::FetcherError { repo_path, error }) => {
+                FetchMessage::FetcherError { repo_path, error } => {
                     received_any = true;
                     self.pending_fetch_count = self.pending_fetch_count.saturating_sub(1);
-                    // Can't call self.end_activity() here - rx borrow.
                     if self.pending_fetch_count == 0 {
-                        if let Some(id) = self.fetch_activity.take() {
-                            self.activities.retain(|a| a.id != id);
+                        self.end_user_action(&UserActionKey::GithubRefresh);
+                        if let Some(id) = self.structural_fetch_activity.take() {
+                            self.end_activity(id);
                         }
                         // Clear re-open suppression when all repos have
                         // reported back, even if they all failed.  This
@@ -1729,19 +1975,16 @@ impl App {
                         self.pending_fetch_errors.push(msg);
                     }
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if !self.fetcher_disconnected {
-                        self.fetcher_disconnected = true;
-                        let msg = "Background fetcher stopped unexpectedly".to_string();
-                        if self.status_message.is_none() {
-                            self.status_message = Some(msg);
-                        } else {
-                            self.pending_fetch_errors.push(msg);
-                        }
-                    }
-                    break;
-                }
+            }
+        }
+
+        if disconnected && !self.fetcher_disconnected {
+            self.fetcher_disconnected = true;
+            let msg = "Background fetcher stopped unexpectedly".to_string();
+            if self.status_message.is_none() {
+                self.status_message = Some(msg);
+            } else {
+                self.pending_fetch_errors.push(msg);
             }
         }
         received_any
@@ -1957,69 +2200,60 @@ impl App {
         //    `docs/UI.md` "Blocking I/O Prohibition".
 
         // -- Phase 5: Cancel in-flight operations --
-        if self.worktree_create_wi.as_ref() == Some(wi_id) {
-            let thread_done = if let Some(ref rx) = self.worktree_create_rx {
-                match rx.try_recv() {
-                    Ok(result) => {
-                        // Thread completed - queue the orphaned worktree
-                        // for the background delete-cleanup thread, but
-                        // only if WE created it. A reused worktree was
-                        // already on disk before the thread ran and must
-                        // not be force-removed as part of this delete.
-                        // Running `git worktree remove` here would be a
-                        // P0 blocking-I/O violation - see `docs/UI.md`.
-                        // The branch name is preserved so
-                        // `spawn_delete_cleanup` can run
-                        // `git branch -D` for the stale branch ref too
-                        // (dropping it would leak the branch).
-                        if !result.reused
-                            && let Some(ref path) = result.path
-                        {
-                            orphan_worktrees.push(OrphanWorktree {
-                                repo_path: result.repo_path.clone(),
-                                worktree_path: path.clone(),
-                                branch: result.branch.clone(),
-                            });
+        if self.user_action_work_item(&UserActionKey::WorktreeCreate) == Some(wi_id) {
+            // Drain the helper payload's receiver. If the thread has
+            // finished, capture the (non-reused) worktree path so the
+            // caller can run background cleanup; if the thread is still
+            // running, leave the helper entry intact so
+            // `poll_worktree_creation` can drain it on the next tick
+            // and run its orphan-cleanup path.
+            let (thread_done, captured_orphan) = match self
+                .user_actions
+                .in_flight
+                .get(&UserActionKey::WorktreeCreate)
+            {
+                Some(state) => match &state.payload {
+                    UserActionPayload::WorktreeCreate { rx, .. } => match rx.try_recv() {
+                        Ok(result) => {
+                            let orphan = if !result.reused
+                                && let Some(ref path) = result.path
+                            {
+                                Some(OrphanWorktree {
+                                    repo_path: result.repo_path.clone(),
+                                    worktree_path: path.clone(),
+                                    branch: result.branch.clone(),
+                                })
+                            } else {
+                                None
+                            };
+                            (true, orphan)
                         }
-                        true
-                    }
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => true,
-                    Err(crossbeam_channel::TryRecvError::Empty) => {
-                        // Thread still running. Leave the receiver intact so
-                        // poll_worktree_creation can drain it on the next timer
-                        // tick and run its orphan-cleanup path.
-                        false
-                    }
-                }
-            } else {
-                true
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => (true, None),
+                        Err(crossbeam_channel::TryRecvError::Empty) => (false, None),
+                    },
+                    _ => (true, None),
+                },
+                None => (true, None),
             };
-            if thread_done {
-                self.worktree_create_rx = None;
+            if let Some(orphan) = captured_orphan {
+                orphan_worktrees.push(orphan);
             }
-            self.worktree_create_wi = None;
-            if let Some(aid) = self.worktree_create_activity.take() {
-                self.end_activity(aid);
+            if thread_done {
+                self.end_user_action(&UserActionKey::WorktreeCreate);
             }
         }
-        if self.pr_create_wi.as_ref() == Some(wi_id) {
-            self.pr_create_rx = None;
-            self.pr_create_wi = None;
-            if let Some(aid) = self.pr_create_activity.take() {
-                self.end_activity(aid);
-            }
+        if self.user_action_work_item(&UserActionKey::PrCreate) == Some(wi_id) {
+            self.end_user_action(&UserActionKey::PrCreate);
         }
         self.pr_create_pending.retain(|id| id != wi_id);
-        if self.merge_wi_id.as_ref() == Some(wi_id) && self.pr_merge_rx.is_some() {
-            self.pr_merge_rx = None;
+        if self.merge_wi_id.as_ref() == Some(wi_id)
+            && self.is_user_action_in_flight(&UserActionKey::PrMerge)
+        {
+            self.end_user_action(&UserActionKey::PrMerge);
             self.merge_in_progress = false;
         }
-        if self.review_submit_wi.as_ref() == Some(wi_id) {
-            self.review_submit_rx = None;
-            self.review_submit_wi = None;
-            if let Some(aid) = self.review_submit_activity.take() {
-                self.end_activity(aid);
-            }
+        if self.user_action_work_item(&UserActionKey::ReviewSubmit) == Some(wi_id) {
+            self.end_user_action(&UserActionKey::ReviewSubmit);
         }
         self.mergequeue_watches.retain(|w| w.wi_id != *wi_id);
         self.mergequeue_poll_errors.remove(wi_id);
@@ -2064,6 +2298,33 @@ impl App {
             return;
         };
 
+        // Admit the action through the user-action guard. In practice the
+        // cleanup modal at `src/event.rs` already prevents overlapping
+        // invocations (the key handler swallows input while the dialog
+        // is in progress), so rejection here is defense-in-depth. We
+        // still surface a status message on rejection so any future
+        // code path that bypasses the modal does not silently drop the
+        // request. The modal's "in-progress spinner" is rendered by
+        // reading `is_user_action_in_flight(&UserActionKey::UnlinkedCleanup)`
+        // via the UI layer.
+        let activity_id = match self.try_begin_user_action(
+            UserActionKey::UnlinkedCleanup,
+            Duration::ZERO,
+            "Cleaning up unlinked PR...",
+        ) {
+            Some(aid) => aid,
+            None => {
+                self.status_message = Some("Unlinked PR cleanup already in progress".into());
+                return;
+            }
+        };
+        // The cleanup modal already renders its own in-progress spinner
+        // in the dialog body; a duplicate status-bar indicator would
+        // mislead the user. Drop the visible activity but leave the
+        // helper map entry intact so `is_user_action_in_flight` still
+        // reports the true state to the modal / event / ui layers.
+        self.end_activity(activity_id);
+
         // Extract github remote before leaving the main thread.
         let github_remote = self
             .repo_data
@@ -2074,7 +2335,6 @@ impl App {
         // open. The UI renders a spinner + "Please wait." instead of key options.
         self.cleanup_reason_input_active = false;
         self.cleanup_reason_input.clear();
-        self.cleanup_in_progress = true;
         self.cleanup_progress_pr_number = Some(pr_number);
         self.cleanup_progress_repo_path = Some(repo_path.clone());
         self.cleanup_progress_branch = Some(branch.clone());
@@ -2193,7 +2453,10 @@ impl App {
             });
         });
 
-        self.cleanup_rx = Some(rx);
+        self.attach_user_action_payload(
+            &UserActionKey::UnlinkedCleanup,
+            UserActionPayload::UnlinkedCleanup { rx },
+        );
     }
 
     /// Poll the async unlinked-item cleanup thread for a result. Called on each timer tick.
@@ -2226,18 +2489,25 @@ impl App {
     }
 
     pub fn poll_unlinked_cleanup(&mut self) {
-        let rx = match self.cleanup_rx.as_ref() {
-            Some(rx) => rx,
-            None => return,
+        // Read the receiver out of the user-action guard. The borrow is
+        // scoped so we can call `&mut self` methods below.
+        let recv_result = {
+            let Some(UserActionPayload::UnlinkedCleanup { rx }) =
+                self.user_action_payload(&UserActionKey::UnlinkedCleanup)
+            else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(r) => Ok(r),
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
+            }
         };
-
-        let result = match rx.try_recv() {
+        let result = match recv_result {
             Ok(r) => r,
-            Err(crossbeam_channel::TryRecvError::Empty) => return,
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                self.cleanup_rx = None;
+            Err(()) => {
+                self.end_user_action(&UserActionKey::UnlinkedCleanup);
                 self.cleanup_prompt_visible = false;
-                self.cleanup_in_progress = false;
                 self.cleanup_progress_pr_number = None;
                 self.cleanup_progress_repo_path = None;
                 self.cleanup_progress_branch = None;
@@ -2246,9 +2516,8 @@ impl App {
             }
         };
 
-        self.cleanup_rx = None;
+        self.end_user_action(&UserActionKey::UnlinkedCleanup);
         self.cleanup_prompt_visible = false;
-        self.cleanup_in_progress = false;
 
         // Track the closed branch so stale fetch results (from in-flight
         // fetches that started before the close) don't re-add the PR.
@@ -2347,16 +2616,47 @@ impl App {
         force: bool,
         show_status_activity: bool,
     ) {
-        if self.delete_cleanup_rx.is_some() {
-            // A previous delete cleanup is still running. Alert the user
-            // so orphaned resources (worktrees, branches, open PRs) are
-            // visible rather than silently dropped.
-            self.alert_message = Some(
-                "Delete cleanup skipped: a previous cleanup is still in progress. \
-                 Worktrees, branches, and open PRs for this item may need manual cleanup."
-                    .into(),
-            );
-            return;
+        // Route single-flight admission through the user-action guard.
+        // Preserves the pre-refactor alert wording verbatim on rejection.
+        let activity_id = match self.try_begin_user_action(
+            UserActionKey::DeleteCleanup,
+            Duration::ZERO,
+            "Deleting work item resources...",
+        ) {
+            Some(aid) => aid,
+            None => {
+                // A previous delete cleanup is still running. Alert the user
+                // so orphaned resources (worktrees, branches, open PRs) are
+                // visible rather than silently dropped.
+                //
+                // Reset `delete_in_progress` here because the modal
+                // delete flow (`confirm_delete_from_prompt`) sets it to
+                // true BEFORE calling into `spawn_delete_cleanup`. If
+                // admission is rejected we must close that latent-state
+                // gap - otherwise the modal stays pinned at the
+                // in-progress spinner with no key input accepted and
+                // no exit path. The helper map is the single source of
+                // truth for "is cleanup running", but `delete_in_progress`
+                // still gates modal rendering and key input in the
+                // current code, so both flags must clear together on
+                // the rejection arm.
+                self.delete_in_progress = false;
+                self.alert_message = Some(
+                    "Delete cleanup skipped: a previous cleanup is still in progress. \
+                     Worktrees, branches, and open PRs for this item may need manual cleanup."
+                        .into(),
+                );
+                return;
+            }
+        };
+        // Modal delete flow already renders its own in-progress spinner
+        // in the dialog body - a duplicate status-bar spinner would
+        // mislead the user about what is waiting on what. Clear the
+        // visible activity but leave the helper map entry intact so
+        // single-flight admission (and `is_user_action_in_flight`
+        // reads) still work.
+        if !show_status_activity {
+            self.end_activity(activity_id);
         }
 
         let ws = Arc::clone(&self.worktree_service);
@@ -2438,11 +2738,10 @@ impl App {
             });
         });
 
-        self.delete_cleanup_rx = Some(rx);
-        if show_status_activity {
-            self.delete_cleanup_activity =
-                Some(self.start_activity("Deleting work item resources..."));
-        }
+        self.attach_user_action_payload(
+            &UserActionKey::DeleteCleanup,
+            UserActionPayload::DeleteCleanup { rx },
+        );
     }
 
     /// Background cleanup for a single orphaned worktree. Used when
@@ -2528,19 +2827,22 @@ impl App {
     /// Poll the async delete-cleanup thread for a result. Called on each
     /// timer tick from the event loop.
     pub fn poll_delete_cleanup(&mut self) {
-        let rx = match self.delete_cleanup_rx.as_ref() {
-            Some(rx) => rx,
-            None => return,
+        let recv_result = {
+            let Some(UserActionPayload::DeleteCleanup { rx }) =
+                self.user_action_payload(&UserActionKey::DeleteCleanup)
+            else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(r) => Ok(r),
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
+            }
         };
-
-        let result = match rx.try_recv() {
+        let result = match recv_result {
             Ok(r) => r,
-            Err(crossbeam_channel::TryRecvError::Empty) => return,
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                self.delete_cleanup_rx = None;
-                if let Some(aid) = self.delete_cleanup_activity.take() {
-                    self.end_activity(aid);
-                }
+            Err(()) => {
+                self.end_user_action(&UserActionKey::DeleteCleanup);
                 let sync_warnings = std::mem::take(&mut self.delete_sync_warnings);
                 if self.delete_in_progress {
                     self.delete_in_progress = false;
@@ -2559,10 +2861,7 @@ impl App {
             }
         };
 
-        self.delete_cleanup_rx = None;
-        if let Some(aid) = self.delete_cleanup_activity.take() {
-            self.end_activity(aid);
-        }
+        self.end_user_action(&UserActionKey::DeleteCleanup);
 
         // Modal-initiated delete: route through finish_delete_cleanup so
         // the dialog closes, evictions are applied, and the final message
@@ -3198,9 +3497,9 @@ impl App {
         }
 
         // If any worktree creation is already in progress, don't start another.
-        // Replacing worktree_create_rx while a thread is running would orphan
+        // Replacing the helper payload while a thread is running would orphan
         // the worktree on disk (the poll handler would never see the result).
-        if self.worktree_create_wi.is_some() {
+        if self.is_user_action_in_flight(&UserActionKey::WorktreeCreate) {
             self.status_message = Some("Worktree creation already in progress...".into());
             return;
         }
@@ -3233,6 +3532,28 @@ impl App {
                             &branch,
                             &self.config.defaults.worktree_dir,
                         );
+
+                        // Admit the user action BEFORE spawning the
+                        // background thread. If the admit ever fails
+                        // (defense-in-depth against a future async
+                        // entry point), we must NOT have already
+                        // spawned a thread that creates a worktree on
+                        // disk with no receiver attached - that would
+                        // be a durable orphan. Match the
+                        // `spawn_import_worktree` ordering exactly.
+                        if self
+                            .try_begin_user_action(
+                                UserActionKey::WorktreeCreate,
+                                Duration::ZERO,
+                                "Initializing worktree...",
+                            )
+                            .is_none()
+                        {
+                            self.status_message =
+                                Some("Worktree creation already in progress...".into());
+                            return;
+                        }
+
                         let ws = Arc::clone(&self.worktree_service);
                         let wi_id_clone = work_item_id.clone();
 
@@ -3310,13 +3631,13 @@ impl App {
                             }
                         });
 
-                        self.worktree_create_rx = Some(rx);
-                        self.worktree_create_wi = Some(work_item_id);
-                        if let Some(aid) = self.worktree_create_activity.take() {
-                            self.end_activity(aid);
-                        }
-                        self.worktree_create_activity =
-                            Some(self.start_activity("Initializing worktree..."));
+                        self.attach_user_action_payload(
+                            &UserActionKey::WorktreeCreate,
+                            UserActionPayload::WorktreeCreate {
+                                rx,
+                                wi_id: work_item_id,
+                            },
+                        );
                     }
                     None => {
                         self.status_message = Some("Set a branch name to start working".into());
@@ -3610,31 +3931,29 @@ impl App {
 
     /// Poll the async worktree creation thread for a result. Called on each timer tick.
     pub fn poll_worktree_creation(&mut self) {
-        let rx = match self.worktree_create_rx.as_ref() {
-            Some(rx) => rx,
-            None => return,
+        let recv_result = {
+            let Some(UserActionPayload::WorktreeCreate { rx, .. }) =
+                self.user_action_payload(&UserActionKey::WorktreeCreate)
+            else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(r) => Ok(r),
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
+            }
         };
-
-        let result = match rx.try_recv() {
+        let result = match recv_result {
             Ok(r) => r,
-            Err(crossbeam_channel::TryRecvError::Empty) => return,
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                self.worktree_create_rx = None;
-                self.worktree_create_wi = None;
-                if let Some(aid) = self.worktree_create_activity.take() {
-                    self.end_activity(aid);
-                }
+            Err(()) => {
+                self.end_user_action(&UserActionKey::WorktreeCreate);
                 self.status_message =
                     Some("Worktree creation: background thread exited unexpectedly".into());
                 return;
             }
         };
 
-        self.worktree_create_rx = None;
-        self.worktree_create_wi = None;
-        if let Some(aid) = self.worktree_create_activity.take() {
-            self.end_activity(aid);
-        }
+        self.end_user_action(&UserActionKey::WorktreeCreate);
 
         let reused = result.reused;
         match (result.path, result.error) {
@@ -4274,7 +4593,7 @@ impl App {
                     // (confirm_delete_from_prompt) here so both entry points have
                     // the same ordering: check availability -> delete backend ->
                     // spawn cleanup.
-                    if self.delete_cleanup_rx.is_some() {
+                    if self.is_user_action_in_flight(&UserActionKey::DeleteCleanup) {
                         self.alert_message = Some(
                             "MCP delete refused: another delete cleanup is still \
                              in progress. Wait for it to finish and try again."
@@ -4568,7 +4887,28 @@ impl App {
         branch: String,
         title: String,
     ) {
-        if self.worktree_create_wi.is_some() {
+        if self.is_user_action_in_flight(&UserActionKey::WorktreeCreate) {
+            self.status_message = Some(format!(
+                "Imported: {title} (worktree queued - another in progress)"
+            ));
+            return;
+        }
+
+        // Admit the user action BEFORE spawning the background thread
+        // so there is no window in which a freshly-spawned thread could
+        // be running while the helper is in the rejecting state. The
+        // `is_user_action_in_flight` check above already guarantees the
+        // slot is free (UI-thread serialization), so this call is
+        // effectively infallible; the `is_none()` branch is
+        // defense-in-depth against a future async entry point.
+        if self
+            .try_begin_user_action(
+                UserActionKey::WorktreeCreate,
+                Duration::ZERO,
+                format!("Importing: {title}..."),
+            )
+            .is_none()
+        {
             self.status_message = Some(format!(
                 "Imported: {title} (worktree queued - another in progress)"
             ));
@@ -4638,12 +4978,10 @@ impl App {
             }
         });
 
-        self.worktree_create_rx = Some(rx);
-        self.worktree_create_wi = Some(wi_id);
-        if let Some(aid) = self.worktree_create_activity.take() {
-            self.end_activity(aid);
-        }
-        self.worktree_create_activity = Some(self.start_activity(format!("Importing: {title}...")));
+        self.attach_user_action_payload(
+            &UserActionKey::WorktreeCreate,
+            UserActionPayload::WorktreeCreate { rx, wi_id },
+        );
         self.status_message = Some(format!("Imported: {title} (creating worktree...)"));
     }
 
@@ -4946,7 +5284,7 @@ impl App {
         // If a prior cleanup (MCP or modal) is still running, refuse to
         // start a second one. Alert the user and leave the modal closed -
         // they can retry once the other cleanup drains.
-        if self.delete_cleanup_rx.is_some() {
+        if self.is_user_action_in_flight(&UserActionKey::DeleteCleanup) {
             self.cancel_delete_prompt();
             self.alert_message = Some(
                 "Another delete cleanup is still in progress. \
@@ -5210,11 +5548,13 @@ impl App {
         self.drop_review_gate(&wi_id);
 
         // Cancel any in-flight PR merge. Merges are only spawned from Review,
-        // so when retreating from Review we drop the receiver to prevent
+        // so when retreating from Review we drop the helper entry to prevent
         // poll_pr_merge from applying a stale result. The background thread
         // will finish on its own; we just ignore its result.
-        if current_status == WorkItemStatus::Review && self.pr_merge_rx.is_some() {
-            self.pr_merge_rx = None;
+        if current_status == WorkItemStatus::Review
+            && self.is_user_action_in_flight(&UserActionKey::PrMerge)
+        {
+            self.end_user_action(&UserActionKey::PrMerge);
             self.merge_in_progress = false;
             self.confirm_merge = false;
             self.merge_wi_id = None;
@@ -5222,15 +5562,11 @@ impl App {
 
         // Cancel any in-flight or pending PR creation for the retreating item.
         // PR creation is spawned when entering Review; retreating means the user
-        // no longer wants the PR. Drop the receiver so poll_pr_creation ignores
-        // the result, and remove the item from the pending queue.
+        // no longer wants the PR. Drop the helper entry so poll_pr_creation
+        // ignores the result, and remove the item from the pending queue.
         if current_status == WorkItemStatus::Review {
-            if self.pr_create_wi.as_ref() == Some(&wi_id) {
-                self.pr_create_rx = None;
-                self.pr_create_wi = None;
-                if let Some(aid) = self.pr_create_activity.take() {
-                    self.end_activity(aid);
-                }
+            if self.user_action_work_item(&UserActionKey::PrCreate) == Some(&wi_id) {
+                self.end_user_action(&UserActionKey::PrCreate);
             }
             self.pr_create_pending.retain(|id| *id != wi_id);
         }
@@ -5421,7 +5757,7 @@ impl App {
     fn spawn_pr_creation(&mut self, wi_id: &WorkItemId) {
         // If a PR creation is already in-flight, queue this one instead of
         // silently dropping it. The queue is drained in poll_pr_creation.
-        if self.pr_create_rx.is_some() {
+        if self.is_user_action_in_flight(&UserActionKey::PrCreate) {
             if !self.pr_create_pending.contains(wi_id) {
                 self.pr_create_pending.push_back(wi_id.clone());
             }
@@ -5449,6 +5785,10 @@ impl App {
         // fetcher populates `repo_data[path].github_remote` on every cycle;
         // if no entry exists yet the first fetch hasn't completed and we
         // surface that to the user instead of blocking.
+        //
+        // This check runs BEFORE try_begin_user_action so an early return
+        // (cache miss) cannot leave an orphaned helper entry - see the
+        // "desync guard" discussion in `docs/UI.md` "User action guard".
         let (owner, repo_name) = match self
             .repo_data
             .get(&repo_path)
@@ -5465,6 +5805,28 @@ impl App {
         };
         let owner_repo = format!("{owner}/{repo_name}");
 
+        // Admit the action through the user-action guard. The early-return
+        // cache check above runs first so we never hold a helper slot
+        // across a rejected code path.
+        if self
+            .try_begin_user_action(
+                UserActionKey::PrCreate,
+                Duration::ZERO,
+                "Creating pull request...",
+            )
+            .is_none()
+        {
+            // Unreachable today because the is_user_action_in_flight
+            // check above already short-circuited the queueing path,
+            // but defense in depth: if a race ever sneaks through, push
+            // the request onto the pending queue rather than silently
+            // dropping it.
+            if !self.pr_create_pending.contains(&wi_id) {
+                self.pr_create_pending.push_back(wi_id);
+            }
+            return;
+        }
+
         // Clone the Arc'd backend and worktree service so the background
         // thread can run `read_plan` (filesystem) and `default_branch`
         // (git subprocess) off the UI thread.
@@ -5472,7 +5834,7 @@ impl App {
         let ws = Arc::clone(&self.worktree_service);
 
         let (tx, rx) = crossbeam_channel::bounded(1);
-        self.pr_create_wi = Some(wi_id.clone());
+        let helper_wi_id = wi_id.clone();
 
         std::thread::spawn(move || {
             // Blocking reads run on the background thread. `read_plan` hits
@@ -5613,29 +5975,33 @@ impl App {
             let _ = tx.send(result);
         });
 
-        self.pr_create_rx = Some(rx);
-        if let Some(aid) = self.pr_create_activity.take() {
-            self.end_activity(aid);
-        }
-        self.pr_create_activity = Some(self.start_activity("Creating pull request..."));
+        self.attach_user_action_payload(
+            &UserActionKey::PrCreate,
+            UserActionPayload::PrCreate {
+                rx,
+                wi_id: helper_wi_id,
+            },
+        );
     }
 
     /// Poll the async PR creation thread for a result. Called on each timer tick.
     pub fn poll_pr_creation(&mut self) {
-        let rx = match self.pr_create_rx.as_ref() {
-            Some(rx) => rx,
-            None => return,
+        let recv_result = {
+            let Some(UserActionPayload::PrCreate { rx, .. }) =
+                self.user_action_payload(&UserActionKey::PrCreate)
+            else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(r) => Ok(r),
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
+            }
         };
-
-        let result = match rx.try_recv() {
+        let result = match recv_result {
             Ok(r) => r,
-            Err(crossbeam_channel::TryRecvError::Empty) => return,
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                self.pr_create_rx = None;
-                self.pr_create_wi = None;
-                if let Some(aid) = self.pr_create_activity.take() {
-                    self.end_activity(aid);
-                }
+            Err(()) => {
+                self.end_user_action(&UserActionKey::PrCreate);
                 self.status_message =
                     Some("PR creation: background thread exited unexpectedly".into());
                 // Try next pending PR creation despite the failure.
@@ -5654,11 +6020,7 @@ impl App {
             }
         };
 
-        self.pr_create_rx = None;
-        self.pr_create_wi = None;
-        if let Some(aid) = self.pr_create_activity.take() {
-            self.end_activity(aid);
-        }
+        self.end_user_action(&UserActionKey::PrCreate);
 
         // Log PR creation to activity log.
         if let Some(ref url) = result.url {
@@ -5705,11 +6067,18 @@ impl App {
     /// thread to run `gh pr merge`. Results are polled by `poll_pr_merge()`
     /// on each timer tick.
     pub fn execute_merge(&mut self, wi_id: &WorkItemId, strategy: &str) {
-        // If a PR merge is already in-flight, don't spawn another.
-        // The background thread may have already merged a PR on GitHub;
-        // replacing the receiver would silently lose its result.
-        if self.pr_merge_rx.is_some() {
-            self.alert_message = Some("PR merge already in progress".into());
+        // Single-flight guard via the user-action helper. Rejecting when
+        // another merge is already in flight preserves the existing alert
+        // wording verbatim - the background thread may have already
+        // merged a PR on GitHub, so silently replacing the receiver
+        // would lose the result.
+        //
+        // We run validity checks BEFORE try_begin_user_action so an
+        // early return (missing repo / branch / github_remote cache)
+        // cannot leave an orphaned helper entry. See `docs/UI.md`
+        // "User action guard" for the desync-guard rule.
+        if self.is_user_action_in_flight(&UserActionKey::PrMerge) {
+            self.alert_message = Some(PR_MERGE_ALREADY_IN_PROGRESS.into());
             return;
         }
 
@@ -5756,6 +6125,28 @@ impl App {
             }
         };
         let owner_repo = format!("{owner}/{repo_name}");
+
+        // All validity checks have passed. Admit the action now so any
+        // rejection above cannot leave the helper with an empty slot.
+        if self
+            .try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging PR...")
+            .is_none()
+        {
+            // Raced with another in-flight merge after the
+            // `is_user_action_in_flight` check above. Mirror that
+            // check's alert wording so the user sees a single, stable
+            // rejection message regardless of which branch rejected.
+            self.alert_message = Some(PR_MERGE_ALREADY_IN_PROGRESS.into());
+            return;
+        }
+        // Hide the status-bar spinner: the merge modal already renders
+        // its own in-progress spinner, and stacking two is confusing.
+        // The helper map entry is still the single source of truth for
+        // `is_user_action_in_flight(&PrMerge)`.
+        if let Some(state) = self.user_actions.in_flight.get(&UserActionKey::PrMerge) {
+            let aid = state.activity_id;
+            self.end_activity(aid);
+        }
         let merge_flag = if strategy == "merge" {
             "--merge"
         } else {
@@ -5842,22 +6233,28 @@ impl App {
             });
         });
 
-        self.pr_merge_rx = Some(rx);
+        self.attach_user_action_payload(&UserActionKey::PrMerge, UserActionPayload::PrMerge { rx });
         self.merge_in_progress = true;
     }
 
     /// Poll the async PR merge thread for a result. Called on each timer tick.
     pub fn poll_pr_merge(&mut self) {
-        let rx = match self.pr_merge_rx.as_ref() {
-            Some(rx) => rx,
-            None => return,
+        let recv_result = {
+            let Some(UserActionPayload::PrMerge { rx }) =
+                self.user_action_payload(&UserActionKey::PrMerge)
+            else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(r) => Ok(r),
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
+            }
         };
-
-        let result = match rx.try_recv() {
+        let result = match recv_result {
             Ok(r) => r,
-            Err(crossbeam_channel::TryRecvError::Empty) => return,
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                self.pr_merge_rx = None;
+            Err(()) => {
+                self.end_user_action(&UserActionKey::PrMerge);
                 self.merge_in_progress = false;
                 self.confirm_merge = false;
                 self.merge_wi_id = None;
@@ -5866,7 +6263,7 @@ impl App {
             }
         };
 
-        self.pr_merge_rx = None;
+        self.end_user_action(&UserActionKey::PrMerge);
         self.merge_in_progress = false;
         self.confirm_merge = false;
         self.merge_wi_id = None;
@@ -5972,8 +6369,10 @@ impl App {
     /// request-changes) via `gh pr review`. Results are polled by
     /// `poll_review_submission()` on each timer tick.
     pub fn spawn_review_submission(&mut self, wi_id: &WorkItemId, action: &str, comment: &str) {
-        if self.review_submit_rx.is_some() {
-            self.status_message = Some("Review submission already in progress".into());
+        // In-flight guard via the user-action helper. Rejection message
+        // is preserved verbatim.
+        if self.is_user_action_in_flight(&UserActionKey::ReviewSubmit) {
+            self.status_message = Some(REVIEW_SUBMIT_ALREADY_IN_PROGRESS.into());
             return;
         }
 
@@ -5999,6 +6398,9 @@ impl App {
         // Read owner/repo from the cached fetcher result rather than shelling
         // out on the UI thread. The first fetch populates it; until then we
         // surface a message rather than block.
+        //
+        // Early returns above run BEFORE try_begin_user_action so a
+        // cache miss cannot leave an orphaned helper entry.
         let (owner, repo_name) = match self
             .repo_data
             .get(&repo_path)
@@ -6014,6 +6416,25 @@ impl App {
             }
         };
         let owner_repo = format!("{owner}/{repo_name}");
+
+        let verb = if action == "approve" {
+            "Submitting approval"
+        } else {
+            "Requesting changes"
+        };
+        if self
+            .try_begin_user_action(
+                UserActionKey::ReviewSubmit,
+                Duration::ZERO,
+                format!("{verb}..."),
+            )
+            .is_none()
+        {
+            // Race with another in-flight submission; preserve the
+            // pre-refactor wording.
+            self.status_message = Some(REVIEW_SUBMIT_ALREADY_IN_PROGRESS.into());
+            return;
+        }
         let action_owned = action.to_string();
         let comment_owned = comment.to_string();
         let wi_id_clone = wi_id.clone();
@@ -6059,47 +6480,41 @@ impl App {
             });
         });
 
-        self.review_submit_rx = Some(rx);
-        self.review_submit_wi = Some(wi_id.clone());
-        if let Some(aid) = self.review_submit_activity.take() {
-            self.end_activity(aid);
-        }
-        let verb = if action == "approve" {
-            "Submitting approval"
-        } else {
-            "Requesting changes"
-        };
-        self.review_submit_activity = Some(self.start_activity(format!("{verb}...")));
+        self.attach_user_action_payload(
+            &UserActionKey::ReviewSubmit,
+            UserActionPayload::ReviewSubmit {
+                rx,
+                wi_id: wi_id.clone(),
+            },
+        );
     }
 
     /// Poll the asynchronous review submission result.
     /// Called on the 200ms timer tick.
     pub fn poll_review_submission(&mut self) {
-        let rx = match self.review_submit_rx.as_ref() {
-            Some(rx) => rx,
-            None => return,
+        let recv_result = {
+            let Some(UserActionPayload::ReviewSubmit { rx, .. }) =
+                self.user_action_payload(&UserActionKey::ReviewSubmit)
+            else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(r) => Ok(r),
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
+            }
         };
-
-        let result = match rx.try_recv() {
+        let result = match recv_result {
             Ok(r) => r,
-            Err(crossbeam_channel::TryRecvError::Empty) => return,
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                self.review_submit_rx = None;
-                self.review_submit_wi = None;
-                if let Some(aid) = self.review_submit_activity.take() {
-                    self.end_activity(aid);
-                }
+            Err(()) => {
+                self.end_user_action(&UserActionKey::ReviewSubmit);
                 self.status_message =
                     Some("Review submission: background thread exited unexpectedly".into());
                 return;
             }
         };
 
-        self.review_submit_rx = None;
-        self.review_submit_wi = None;
-        if let Some(aid) = self.review_submit_activity.take() {
-            self.end_activity(aid);
-        }
+        self.end_user_action(&UserActionKey::ReviewSubmit);
 
         match result.outcome {
             ReviewSubmitOutcome::Success => {
@@ -8383,7 +8798,7 @@ mod tests {
         tx.send(FetchMessage::FetchStarted).unwrap();
 
         app.drain_fetch_results();
-        assert!(app.fetch_activity.is_some());
+        assert!(app.structural_fetch_activity.is_some());
         assert!(app.current_activity().is_some());
 
         // Sending RepoData should clear the activity.
@@ -8399,7 +8814,7 @@ mod tests {
         .unwrap();
 
         app.drain_fetch_results();
-        assert!(app.fetch_activity.is_none());
+        assert!(app.structural_fetch_activity.is_none());
     }
 
     /// FetcherError also clears the fetch activity.
@@ -8411,7 +8826,7 @@ mod tests {
 
         tx.send(FetchMessage::FetchStarted).unwrap();
         app.drain_fetch_results();
-        assert!(app.fetch_activity.is_some());
+        assert!(app.structural_fetch_activity.is_some());
 
         tx.send(FetchMessage::FetcherError {
             repo_path: PathBuf::from("/repo"),
@@ -8420,7 +8835,7 @@ mod tests {
         .unwrap();
 
         app.drain_fetch_results();
-        assert!(app.fetch_activity.is_none());
+        assert!(app.structural_fetch_activity.is_none());
     }
 
     /// Multiple FetchStarted messages should not create duplicate activities.
@@ -8448,7 +8863,7 @@ mod tests {
         tx.send(FetchMessage::FetchStarted).unwrap();
         tx.send(FetchMessage::FetchStarted).unwrap();
         app.drain_fetch_results();
-        assert!(app.fetch_activity.is_some());
+        assert!(app.structural_fetch_activity.is_some());
 
         // First repo finishes - spinner should persist.
         tx.send(FetchMessage::RepoData(RepoFetchResult {
@@ -8463,7 +8878,7 @@ mod tests {
         .unwrap();
         app.drain_fetch_results();
         assert!(
-            app.fetch_activity.is_some(),
+            app.structural_fetch_activity.is_some(),
             "spinner should persist while second repo is still fetching",
         );
 
@@ -8479,7 +8894,7 @@ mod tests {
         }))
         .unwrap();
         app.drain_fetch_results();
-        assert!(app.fetch_activity.is_none());
+        assert!(app.structural_fetch_activity.is_none());
     }
 
     // -- Round 4 regression tests --
@@ -10702,7 +11117,9 @@ mod tests {
             outcome: PrMergeOutcome::NoPr,
         })
         .unwrap();
-        app.pr_merge_rx = Some(rx);
+        app.try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging PR...")
+            .expect("helper admit should succeed");
+        app.attach_user_action_payload(&UserActionKey::PrMerge, UserActionPayload::PrMerge { rx });
         app.poll_pr_merge();
         let status = app
             .work_items
@@ -10741,7 +11158,9 @@ mod tests {
             },
         })
         .unwrap();
-        app.pr_merge_rx = Some(rx);
+        app.try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging PR...")
+            .expect("helper admit should succeed");
+        app.attach_user_action_payload(&UserActionKey::PrMerge, UserActionPayload::PrMerge { rx });
         app.poll_pr_merge();
         // After apply_stage_change, reassemble rebuilds from StubBackend (empty),
         // so we verify via the status message that the merge path was taken.
@@ -13922,11 +14341,14 @@ mod tests {
         // first `default_branch` call and cannot race the snapshot.
         let gate = ws.gate.lock().unwrap();
 
-        app.pr_create_rx = None;
+        app.end_user_action(&UserActionKey::PrCreate);
         app.spawn_pr_creation(&wi_id);
         let ws_calls_after_spawn = ws.load();
 
-        assert_eq!(app.pr_create_wi.as_ref(), Some(&wi_id));
+        assert_eq!(
+            app.user_action_work_item(&UserActionKey::PrCreate),
+            Some(&wi_id),
+        );
         assert_eq!(
             ws_calls_after_spawn, 0,
             "spawn_pr_creation must read github_remote from repo_data, not \
@@ -13936,7 +14358,7 @@ mod tests {
         // Release the gate so the background thread can drain. Dropping
         // the receiver stops any progress being observed.
         drop(gate);
-        app.pr_create_rx = None;
+        app.end_user_action(&UserActionKey::PrCreate);
     }
 
     #[test]
@@ -13953,12 +14375,12 @@ mod tests {
             WorkItemStatus::Review,
         );
 
-        app.pr_merge_rx = None;
+        app.end_user_action(&UserActionKey::PrMerge);
         app.execute_merge(&wi_id, "squash");
         let ws_calls_after_spawn = ws.load();
 
         assert!(
-            app.pr_merge_rx.is_some() || app.alert_message.is_some(),
+            app.is_user_action_in_flight(&UserActionKey::PrMerge) || app.alert_message.is_some(),
             "execute_merge must proceed past the github_remote lookup",
         );
         assert_eq!(
@@ -13966,7 +14388,7 @@ mod tests {
             "execute_merge must read github_remote from repo_data, not \
              worktree_service, on the UI thread",
         );
-        app.pr_merge_rx = None;
+        app.end_user_action(&UserActionKey::PrMerge);
     }
 
     #[test]
@@ -13983,17 +14405,20 @@ mod tests {
             WorkItemStatus::Review,
         );
 
-        app.review_submit_rx = None;
+        app.end_user_action(&UserActionKey::ReviewSubmit);
         app.spawn_review_submission(&wi_id, "approve", "");
         let ws_calls_after_spawn = ws.load();
 
-        assert_eq!(app.review_submit_wi.as_ref(), Some(&wi_id));
+        assert_eq!(
+            app.user_action_work_item(&UserActionKey::ReviewSubmit),
+            Some(&wi_id),
+        );
         assert_eq!(
             ws_calls_after_spawn, 0,
             "spawn_review_submission must read github_remote from repo_data, \
              not worktree_service, on the UI thread",
         );
-        app.review_submit_rx = None;
+        app.end_user_action(&UserActionKey::ReviewSubmit);
     }
 
     #[test]
@@ -14453,11 +14878,11 @@ mod tests {
         // delete-during-create race leaked a branch ref.
         //
         // Proof: put a completed `WorktreeCreateResult` with a known
-        // branch into `worktree_create_rx`, call
-        // `delete_work_item_by_id`, and assert the resulting
-        // `OrphanWorktree` has the branch populated. Then mirror the
-        // caller's synthesis logic and check the `DeleteCleanupInfo`
-        // carries the branch through unchanged.
+        // branch into the `UserActionKey::WorktreeCreate` helper
+        // payload, call `delete_work_item_by_id`, and assert the
+        // resulting `OrphanWorktree` has the branch populated. Then
+        // mirror the caller's synthesis logic and check the
+        // `DeleteCleanupInfo` carries the branch through unchanged.
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
             Arc::new(CountingPlanBackend::default()) as Arc<dyn WorkItemBackend>,
@@ -14502,8 +14927,19 @@ mod tests {
             reused: false,
         })
         .unwrap();
-        app.worktree_create_rx = Some(rx);
-        app.worktree_create_wi = Some(wi_id.clone());
+        app.try_begin_user_action(
+            UserActionKey::WorktreeCreate,
+            Duration::ZERO,
+            "Initializing worktree...",
+        )
+        .expect("helper admit should succeed");
+        app.attach_user_action_payload(
+            &UserActionKey::WorktreeCreate,
+            UserActionPayload::WorktreeCreate {
+                rx,
+                wi_id: wi_id.clone(),
+            },
+        );
 
         let mut warnings: Vec<String> = Vec::new();
         let mut orphan_worktrees: Vec<OrphanWorktree> = Vec::new();
@@ -15179,6 +15615,217 @@ mod tests {
             !app.activities.iter().any(|a| a.id == gate_aid),
             "Result arm of poll_review_gate must end the gate's specific \
              ActivityId via drop_review_gate",
+        );
+    }
+
+    // -- User action guard --
+
+    /// `try_begin_user_action` followed by `end_user_action` admits a
+    /// single action, starts one activity, and clears it cleanly.
+    #[test]
+    fn user_action_try_begin_then_end_roundtrip() {
+        let mut app = App::new();
+        let aid = app
+            .try_begin_user_action(UserActionKey::PrCreate, Duration::ZERO, "Creating PR...")
+            .expect("first admit must succeed");
+        assert!(app.is_user_action_in_flight(&UserActionKey::PrCreate));
+        assert!(app.activities.iter().any(|a| a.id == aid));
+        app.end_user_action(&UserActionKey::PrCreate);
+        assert!(!app.is_user_action_in_flight(&UserActionKey::PrCreate));
+        assert!(!app.activities.iter().any(|a| a.id == aid));
+    }
+
+    /// Calling `try_begin_user_action` twice without an intermediate
+    /// `end_user_action` must reject the second call.
+    #[test]
+    fn user_action_try_begin_rejects_second_concurrent_call() {
+        let mut app = App::new();
+        let first = app
+            .try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging...")
+            .expect("first admit must succeed");
+        let second =
+            app.try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging...");
+        assert!(second.is_none(), "second concurrent admit must return None");
+        // First activity is still owned by the helper.
+        assert!(app.activities.iter().any(|a| a.id == first));
+    }
+
+    /// A debounce window blocks a fresh admit even after the previous
+    /// one has been ended.
+    #[test]
+    fn user_action_debounce_window_blocks_repeat() {
+        let mut app = App::new();
+        app.try_begin_user_action(
+            UserActionKey::GithubRefresh,
+            Duration::from_millis(500),
+            "Refreshing...",
+        )
+        .expect("first admit must succeed");
+        app.end_user_action(&UserActionKey::GithubRefresh);
+        // Immediate retry within the debounce window is rejected.
+        let retry = app.try_begin_user_action(
+            UserActionKey::GithubRefresh,
+            Duration::from_millis(500),
+            "Refreshing...",
+        );
+        assert!(retry.is_none(), "debounce must reject rapid retry");
+    }
+
+    /// Once the debounce window has elapsed, a fresh admit is
+    /// accepted.
+    #[test]
+    fn user_action_debounce_elapsed_allows_retry() {
+        let mut app = App::new();
+        // Use a very short (10ms) debounce so the test does not
+        // actually have to sleep in production CI. The plan pins
+        // debounce values at the call site, so direct overrides are
+        // the supported way to test.
+        app.try_begin_user_action(
+            UserActionKey::GithubRefresh,
+            Duration::from_millis(10),
+            "Refreshing...",
+        )
+        .expect("first admit must succeed");
+        app.end_user_action(&UserActionKey::GithubRefresh);
+        std::thread::sleep(Duration::from_millis(20));
+        let retry = app.try_begin_user_action(
+            UserActionKey::GithubRefresh,
+            Duration::from_millis(10),
+            "Refreshing...",
+        );
+        assert!(retry.is_some(), "debounce should allow retry after elapse");
+    }
+
+    /// `end_user_action` is idempotent: calling it a second time is a
+    /// silent no-op (no panic, no spurious activity cleanup).
+    #[test]
+    fn user_action_end_is_idempotent() {
+        let mut app = App::new();
+        app.try_begin_user_action(UserActionKey::ReviewSubmit, Duration::ZERO, "Submitting...")
+            .expect("admit must succeed");
+        app.end_user_action(&UserActionKey::ReviewSubmit);
+        // Second end is a no-op.
+        app.end_user_action(&UserActionKey::ReviewSubmit);
+        // Third end on a key that was never admitted is also a no-op.
+        app.end_user_action(&UserActionKey::DeleteCleanup);
+    }
+
+    /// Unit test for `try_begin_user_action`: a second admit on the
+    /// same key while the first is still in flight is rejected. This
+    /// only covers the helper-level in-flight check; the full Ctrl+R
+    /// dispatch path (including the `pending_fetch_count` hard gate
+    /// and the status message wiring) is exercised by
+    /// `ctrl_r_rapid_double_press_through_handle_key_is_gated` in
+    /// `src/event.rs`.
+    #[test]
+    fn user_action_second_admit_rejected_while_in_flight() {
+        let mut app = App::new();
+        // First admit succeeds.
+        let first = app.try_begin_user_action(
+            UserActionKey::GithubRefresh,
+            Duration::from_millis(500),
+            "Refreshing GitHub data",
+        );
+        assert!(first.is_some(), "first admit must succeed");
+        // While the helper entry is still in flight, a second admit is
+        // rejected by the in-flight check.
+        let second = app.try_begin_user_action(
+            UserActionKey::GithubRefresh,
+            Duration::from_millis(500),
+            "Refreshing GitHub data",
+        );
+        assert!(second.is_none(), "second admit must be rejected");
+    }
+
+    /// `reset_fetch_state` is the single site that tears down all
+    /// fetcher-derived UI state on a structural restart (see the
+    /// salsa.rs `fetcher_repos_changed` block). It must reset three
+    /// invariants together:
+    ///   1. drop `fetch_rx`
+    ///   2. zero `pending_fetch_count`
+    ///   3. end both possible spinner owners (the `GithubRefresh`
+    ///      helper entry AND `structural_fetch_activity`)
+    ///
+    /// This test seeds the derived state as if two `FetchStarted`
+    /// messages had been counted but their paired terminal messages
+    /// were stranded on the old channel, then asserts that the reset
+    /// leaves the app in a clean slate that does NOT strand the Ctrl+R
+    /// count gate for the rest of the process lifetime.
+    #[test]
+    fn reset_fetch_state_clears_all_fetcher_derived_state() {
+        let mut app = App::new();
+
+        // Seed state as if the fetcher had started and the Ctrl+R
+        // helper entry was admitted (covers the path where a Ctrl+R
+        // was in flight when the restart happened).
+        app.try_begin_user_action(
+            UserActionKey::GithubRefresh,
+            Duration::ZERO,
+            "Refreshing GitHub data",
+        )
+        .expect("admit must succeed");
+        // Simulate two repos' `FetchStarted` counted but not yet
+        // paired with `RepoData`/`FetcherError`. These are exactly
+        // the messages that would be stranded when the old channel is
+        // dropped by the restart.
+        app.pending_fetch_count = 2;
+
+        // Sanity-check the seeded state.
+        assert!(app.is_user_action_in_flight(&UserActionKey::GithubRefresh));
+        assert_eq!(app.pending_fetch_count, 2);
+        assert!(!app.activities.is_empty());
+
+        // Simulate the salsa restart block.
+        app.reset_fetch_state();
+
+        // All three invariants must be clear.
+        assert!(
+            app.fetch_rx.is_none(),
+            "fetch_rx must be dropped by reset_fetch_state",
+        );
+        assert_eq!(
+            app.pending_fetch_count, 0,
+            "pending_fetch_count must be reset to 0 - otherwise the Ctrl+R \
+             hard gate in src/event.rs permanently locks out refresh",
+        );
+        assert!(
+            !app.is_user_action_in_flight(&UserActionKey::GithubRefresh),
+            "GithubRefresh helper entry must be cleared",
+        );
+        assert!(
+            app.structural_fetch_activity.is_none(),
+            "structural_fetch_activity must be cleared",
+        );
+        assert!(
+            app.activities.is_empty(),
+            "no stray status-bar spinners may survive the reset",
+        );
+    }
+
+    /// `reset_fetch_state` must also handle the structural-fallback
+    /// ownership path: when `FetchStarted` arrived without a prior
+    /// Ctrl+R admit (manage/unmanage, work-item create, delete
+    /// cleanup, etc.), the spinner is owned by
+    /// `structural_fetch_activity` rather than the helper entry. The
+    /// reset must end that activity too, not just the helper.
+    #[test]
+    fn reset_fetch_state_ends_structural_fetch_activity() {
+        let mut app = App::new();
+        // Simulate `drain_fetch_results` on the structural-restart
+        // path: no helper entry, but a counted FetchStarted and an
+        // owned structural activity.
+        let id = app.start_activity("Refreshing GitHub data");
+        app.structural_fetch_activity = Some(id);
+        app.pending_fetch_count = 1;
+        assert!(!app.is_user_action_in_flight(&UserActionKey::GithubRefresh));
+
+        app.reset_fetch_state();
+
+        assert_eq!(app.pending_fetch_count, 0);
+        assert!(app.structural_fetch_activity.is_none());
+        assert!(
+            app.activities.is_empty(),
+            "structural_fetch_activity id must be removed from the activity list",
         );
     }
 }

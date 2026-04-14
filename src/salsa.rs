@@ -347,7 +347,7 @@ pub fn app_event(
                 // activity or Claude session is running.
                 let modal_in_progress = state.delete_in_progress
                     || state.merge_in_progress
-                    || state.cleanup_in_progress;
+                    || state.is_user_action_in_flight(&crate::app::UserActionKey::UnlinkedCleanup);
                 if !state.activities.is_empty()
                     || !state.claude_working.is_empty()
                     || modal_in_progress
@@ -498,11 +498,31 @@ pub fn app_event(
                 if state.fetcher_repos_changed {
                     state.fetcher_repos_changed = false;
                     state.fetcher_disconnected = false;
-                    // Stop the old fetcher.
+                    // Stop the old fetcher. `handle.stop()` only flips
+                    // an atomic flag - it does NOT kill an in-flight
+                    // `gh` subprocess. Any thread mid-network-I/O will
+                    // eventually try to send on `state.fetch_rx`
+                    // (dropped below), observe `Err`, and exit without
+                    // delivering its paired terminal message.
                     if let Some(handle) = state.fetcher_handle.take() {
                         handle.stop();
                     }
-                    state.fetch_rx = None;
+                    // A structural restart supersedes any in-flight
+                    // Ctrl+R refresh AND any mid-flight fetch accounting:
+                    // the new fetcher will start fresh `FetchStarted`
+                    // cycles on a different repo set. `reset_fetch_state`
+                    // groups the three invariants that must always move
+                    // together here - drop `fetch_rx`, zero
+                    // `pending_fetch_count`, and end any owner of the
+                    // current spinner (either the `GithubRefresh` helper
+                    // entry or the `structural_fetch_activity` fallback).
+                    // Without this reset, a counted-but-unpaired
+                    // `FetchStarted` from the old channel would strand
+                    // `pending_fetch_count > 0` forever, which the
+                    // Ctrl+R hard gate in `src/event.rs` would then read
+                    // as "a fetch cycle is still running" and
+                    // permanently lock out the user.
+                    state.reset_fetch_state();
                     // Start a new fetcher with the updated repo list.
                     let new_repos: Vec<PathBuf> = state
                         .active_repo_cache

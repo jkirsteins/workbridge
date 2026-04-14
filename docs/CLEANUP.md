@@ -95,10 +95,12 @@ which handles worktree/branch/PR removal.
 
 The worktree-creation race is also handled off the UI thread: if a
 worktree-creation background thread has already completed (its result
-is queued in `worktree_create_rx`) at the moment the user confirms the
-delete, `delete_work_item_by_id()` Phase 5 drains the receiver and
-appends the orphan's `(repo_path, worktree_path, branch)` to an
-`orphan_worktrees` vector passed in by the caller. Each orphan entry
+is queued in the `UserActionPayload::WorktreeCreate` receiver stored
+under `UserActionKey::WorktreeCreate` in the user-action guard) at the
+moment the user confirms the delete, `delete_work_item_by_id()` Phase 5
+drains the receiver and appends the orphan's `(repo_path,
+worktree_path, branch)` to an `orphan_worktrees` vector passed in by
+the caller. Each orphan entry
 is then forwarded to `spawn_delete_cleanup()` as a synthesized
 `DeleteCleanupInfo` (with `branch_in_main_worktree: false` because a
 freshly-created worktree is never the main worktree), so
@@ -119,9 +121,10 @@ The Ctrl+D path invokes `confirm_delete_from_prompt()`, which calls
 cancellation) and then spawns the background cleanup thread. The MCP
 path (`McpEvent::DeleteWorkItem`) does the same ordering: delete the
 backend record and kill sessions on the main thread, then spawn the
-background cleanup. In both cases the `delete_cleanup_rx` receiver is
-polled from `poll_delete_cleanup()` on each timer tick and the result
-is surfaced via the modal (Ctrl+D) or the status-bar activity (MCP).
+background cleanup. In both cases the `UserActionPayload::DeleteCleanup`
+receiver (stored under `UserActionKey::DeleteCleanup` in the user-action
+guard) is polled from `poll_delete_cleanup()` on each timer tick and the
+result is surfaced via the modal (Ctrl+D) or the status-bar activity (MCP).
 
 Steps 4-8 are best-effort: failures produce warning messages but do not
 abort the overall delete. Only a backend delete failure (step 1) is
@@ -146,12 +149,16 @@ eviction tracking used by the unlinked PR cleanup flow.
 
 Only one delete cleanup can be in flight at a time. Both the modal
 path (`confirm_delete_from_prompt`) and the MCP path
-(`McpEvent::DeleteWorkItem`) check `delete_cleanup_rx.is_some()` BEFORE
+(`McpEvent::DeleteWorkItem`) call
+`app.is_user_action_in_flight(&UserActionKey::DeleteCleanup)` BEFORE
 touching the backend. If a previous cleanup is still running, the new
 delete is refused with an alert and the backend record / session are
 left intact - avoiding the orphaned-resource hole where
 `spawn_delete_cleanup` would otherwise early-return after the backend
-had already been destroyed.
+had already been destroyed. The single-flight guard is routed through
+the shared user-action helper (see `docs/UI.md` "User action guard")
+so the in-flight state, status-bar spinner, and receiver are all owned
+by one map entry that is dropped atomically when cleanup finishes.
 
 ### Delete confirmation modal
 

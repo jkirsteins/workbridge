@@ -22,7 +22,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     App, BOARD_COLUMNS, DisplayEntry, FocusPanel, GroupHeaderKind, RightPanelTab,
-    SettingsListFocus, SettingsTab, ViewMode, WorkItemContext,
+    SettingsListFocus, SettingsTab, UserActionKey, ViewMode, WorkItemContext,
 };
 use crate::config;
 use crate::create_dialog::{CreateDialog, CreateDialogFocus};
@@ -199,7 +199,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
             },
         );
     } else if app.cleanup_prompt_visible {
-        if app.cleanup_in_progress {
+        if app.is_user_action_in_flight(&UserActionKey::UnlinkedCleanup) {
             let pr_num = app.cleanup_progress_pr_number.unwrap_or(0);
             let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
             draw_prompt_dialog(
@@ -2222,7 +2222,10 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     let worktree_creating = app
                         .work_items
                         .get(*wi_idx)
-                        .map(|wi| app.worktree_create_wi.as_ref() == Some(&wi.id))
+                        .map(|wi| {
+                            app.user_action_work_item(&UserActionKey::WorktreeCreate)
+                                == Some(&wi.id)
+                        })
                         .unwrap_or(false);
 
                     if worktree_creating {
@@ -4024,7 +4027,7 @@ mod sticky_header_tests {
 #[cfg(test)]
 mod snapshot_tests {
     use super::draw_to_buffer;
-    use crate::app::{App, FocusPanel, StubBackend, ViewMode, is_selectable};
+    use crate::app::{App, FocusPanel, StubBackend, UserActionKey, ViewMode, is_selectable};
     use crate::theme::Theme;
     use crate::work_item::{
         BackendType, CheckStatus, PrInfo, PrState, RepoAssociation, ReviewDecision, UnlinkedPr,
@@ -4887,7 +4890,19 @@ mod snapshot_tests {
     fn cleanup_progress_dialog() {
         let mut app = App::new();
         app.cleanup_prompt_visible = true;
-        app.cleanup_in_progress = true;
+        // Simulate an in-flight unlinked cleanup by admitting the
+        // helper entry directly and then ending the visible
+        // status-bar activity. This mirrors spawn_unlinked_cleanup,
+        // which hides the status-bar spinner so only the in-dialog
+        // spinner is shown.
+        let aid = app
+            .try_begin_user_action(
+                UserActionKey::UnlinkedCleanup,
+                std::time::Duration::ZERO,
+                "Cleaning up unlinked PR...",
+            )
+            .expect("helper admit should succeed");
+        app.end_activity(aid);
         app.cleanup_progress_pr_number = Some(42);
         app.spinner_tick = 3; // deterministic spinner frame
         insta::assert_snapshot!(render(&app, 80, 24));
