@@ -152,10 +152,14 @@ Ctrl+B opens the full creation dialog (title, description, repos, branch) and
 creates a Backlog item, matching the previous Ctrl+N behavior.
 
 Repo selection for quick-start follows this priority:
-1. The managed repo root of the current working directory, if available.
-2. The only managed repo with a git directory, if exactly one exists.
-3. If multiple repos are present and CWD is not in one, the full creation
-   dialog opens for the user to select a repo.
+1. The only managed repo with a git directory, if exactly one exists.
+2. Otherwise, the full creation dialog opens with the repo list focused so
+   the user can pick one explicitly.
+
+The current working directory is deliberately not used to auto-select a
+repo: when more than one managed repo is configured there is a real choice
+to make, and the user wants to pick explicitly every time rather than have
+Ctrl+N silently latch onto whichever repo they happened to launch from.
 
 ## Global Assistant Transfer
 
