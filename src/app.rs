@@ -523,6 +523,61 @@ pub struct SessionOpenPending {
     pub activity: ActivityId,
 }
 
+/// Which form of session-identity flag workbridge is asking Claude Code
+/// to honour on a given spawn.
+///
+/// `Resume` (`--resume <uuid>`) re-attaches to a previously existing
+/// session under that UUID and is the default on every interactive
+/// stage-session spawn. When no such session exists on disk Claude exits
+/// almost immediately with "No conversation found", so workbridge's
+/// `poll_resume_probes` tick detects the failure and respawns with
+/// `Fresh` (`--session-id <uuid>`) to create a new session under the
+/// same deterministic UUID. The user never sees the retry.
+///
+/// See `docs/work-items.md` "Session identity and resumption" for the
+/// end-to-end protocol and rationale for the deterministic UUID scheme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpawnFlag {
+    Resume,
+    Fresh,
+}
+
+impl SpawnFlag {
+    /// The `claude` CLI flag corresponding to this spawn-flag variant.
+    pub fn cli_flag(self) -> &'static str {
+        match self {
+            SpawnFlag::Resume => "--resume",
+            SpawnFlag::Fresh => "--session-id",
+        }
+    }
+}
+
+/// Per-spawn state owned by `App::resume_probes` and consumed by
+/// `poll_resume_probes`.
+///
+/// A fresh probe is created whenever `finish_session_open` spawns Claude
+/// Code with `--resume <uuid>`. On the next background tick (after at
+/// least one check-interval has elapsed so a slow resume is not mistaken
+/// for a dead one) the probe inspects the matching `SessionEntry`. If
+/// the child has already died, the probe rebuilds the command with
+/// `--session-id <uuid>` and respawns once. The probe is then cleared on
+/// the tick after that - either because the fresh spawn is alive, or
+/// because it also died and the failure is surfaced like any other
+/// spawn error.
+///
+/// The probe stores the full `cmd` vector captured at spawn time so the
+/// retry path does not need to re-enter the plan-read pipeline
+/// (`begin_session_open` -> `finish_session_open`) and therefore cannot
+/// re-run any of the state-consuming helpers that built the system
+/// prompt. The MCP server created for the original spawn is reused
+/// verbatim - it is keyed by work item, not by spawn attempt.
+pub struct ResumeProbe {
+    pub cwd: PathBuf,
+    pub cmd: Vec<String>,
+    pub started_at: Instant,
+    pub attempted: SpawnFlag,
+}
+
 /// Result from the asynchronous worktree creation thread.
 pub struct WorktreeCreateResult {
     /// The work item the worktree was created for.
@@ -885,6 +940,20 @@ pub struct App {
     /// a background thread; this map is how the result flows back.
     pub session_open_rx: HashMap<WorkItemId, SessionOpenPending>,
 
+    /// Active resume probes keyed by `(WorkItemId, WorkItemStatus)` -
+    /// the same key used by `self.sessions` so each probe structurally
+    /// owns the retry state of exactly one session spawn. Populated by
+    /// `finish_session_open` after a successful `--resume <uuid>` spawn
+    /// and drained by `poll_resume_probes` on the next background tick.
+    /// The map is empty at rest: a probe only lives for the ~200ms
+    /// between spawn and the first liveness observation that tells us
+    /// whether Claude accepted the resume UUID. See
+    /// `docs/work-items.md` "Session identity and resumption" for the
+    /// full protocol and `CLAUDE.md` "Prefer structural ownership over
+    /// manual correlation" for why the probe shares its key with
+    /// `self.sessions` rather than living as sibling fields on `App`.
+    pub resume_probes: HashMap<(WorkItemId, WorkItemStatus), ResumeProbe>,
+
     /// Sender for completion messages from `spawn_orphan_worktree_cleanup`
     /// background threads. Cloned into each spawned closure. The closure
     /// always sends exactly one `OrphanCleanupFinished` when it finishes
@@ -1085,6 +1154,7 @@ impl App {
             pr_identity_backfill_rx: None,
             pr_identity_backfill_activity: None,
             session_open_rx: HashMap::new(),
+            resume_probes: HashMap::new(),
             orphan_cleanup_finished_tx,
             orphan_cleanup_finished_rx,
             global_drawer_open: false,
@@ -3805,10 +3875,19 @@ impl App {
         let session_key = (work_item_id.clone(), work_item_status);
         let has_gate_findings = self.review_gate_findings.contains_key(work_item_id);
         let system_prompt = self.stage_system_prompt(work_item_id, cwd, plan_text);
+        // Deterministic session UUID for (work_item_id, stage). Every
+        // interactive stage-session spawn starts with `--resume <uuid>`
+        // so a workbridge restart re-attaches to the previous Claude
+        // Code conversation. If the session does not yet exist on
+        // disk, `poll_resume_probes` transparently falls back to
+        // `--session-id <uuid>` on the next background tick.
+        let session_id = crate::session_id::session_id_for(work_item_id, work_item_status);
         let mut cmd = Self::build_claude_cmd(
             &work_item_status,
             system_prompt.as_deref(),
             has_gate_findings,
+            session_id,
+            SpawnFlag::Resume,
         );
 
         // Write MCP config as .mcp.json in the worktree AND pass via --mcp-config.
@@ -3872,6 +3951,26 @@ impl App {
                     selection: None,
                 };
                 self.sessions.insert(session_key.clone(), entry);
+                // Register a resume probe so the next background tick
+                // can detect a near-instant "No conversation found"
+                // exit and transparently respawn with `--session-id`.
+                // The probe is keyed by `session_key` so it is
+                // structurally tied to this session's lifetime:
+                // retreating to another stage uses a different key, and
+                // deleting the work item removes the matching session
+                // entry. Orphaned probes (whose session was removed out
+                // from under them) are cleaned up by
+                // `poll_resume_probes` via its `NoSession` branch on
+                // the next background tick.
+                self.resume_probes.insert(
+                    session_key.clone(),
+                    ResumeProbe {
+                        cwd: cwd.to_path_buf(),
+                        cmd: cmd.clone(),
+                        started_at: Instant::now(),
+                        attempted: SpawnFlag::Resume,
+                    },
+                );
                 match mcp_result {
                     Ok((server, _)) => {
                         self.mcp_servers.insert(work_item_id.clone(), server);
@@ -3891,16 +3990,241 @@ impl App {
         }
     }
 
+    /// Inspect active resume probes and respawn any sessions that died
+    /// instantly after a `--resume <unknown-uuid>` attempt.
+    ///
+    /// Runs on every background tick, BEFORE `check_liveness`, so the
+    /// respawn happens before `cleanup_session_state_for` (driven by
+    /// `check_liveness`) tears down the MCP server that the retry
+    /// needs to keep using. The retry reuses the original `cmd`
+    /// verbatim, only flipping `--resume` to `--session-id`, so it
+    /// does not re-enter the plan-read pipeline and cannot trigger
+    /// the state-consuming helpers that built the system prompt.
+    ///
+    /// The probe state machine is simple and self-terminating:
+    ///
+    /// 1. Probe is fresh (< 200 ms old) - skip, wait another tick.
+    /// 2. Probe is old AND the child is alive - resume worked, drop
+    ///    the probe so a later natural death is handled by the
+    ///    ordinary liveness path.
+    /// 3. Probe is old AND the child is dead AND the attempted flag
+    ///    is `Resume` - flip the flag to `Fresh`, respawn once,
+    ///    leave a new probe in place so the next tick observes the
+    ///    retry.
+    /// 4. Probe is old AND the child is dead AND the attempted flag
+    ///    is `Fresh` - the fresh spawn also died. This is a real
+    ///    spawn error; drop the probe, drop the session entry, clean
+    ///    up the MCP server, and surface a status message exactly as
+    ///    any other spawn failure would.
+    ///
+    /// The 200 ms floor matches the background tick cadence: a probe
+    /// created in `finish_session_open` on tick N is first observed on
+    /// tick N+1, which is a natural lower bound on how long the child
+    /// has had to exit. Waiting explicitly avoids misinterpreting a
+    /// still-loading successful resume as a dead spawn when the tick
+    /// fires unusually close to the spawn.
+    pub fn poll_resume_probes(&mut self) {
+        if self.resume_probes.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+        let min_age = Duration::from_millis(200);
+
+        // Collect the keys we will act on this tick. Cloning the keys
+        // avoids holding a borrow on `self.resume_probes` across the
+        // per-key work loop, which itself calls `&mut self` methods.
+        let ready: Vec<(WorkItemId, WorkItemStatus)> = self
+            .resume_probes
+            .iter()
+            .filter(|(_, probe)| now.duration_since(probe.started_at) >= min_age)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        for key in ready {
+            // Determine the session's state under this key. We inspect
+            // the child process directly rather than reading
+            // `entry.alive`, because `entry.alive` is only refreshed
+            // by `check_liveness` which runs AFTER this poll.
+            //
+            // `NoSession` means someone else (apply_stage_change,
+            // delete, etc.) removed the entry out from under the
+            // probe. In that case the probe is orphaned and must be
+            // dropped silently without a retry - retrying would
+            // resurrect a session for a stage / work item the user
+            // intentionally moved away from.
+            enum ProbeObservation {
+                NoSession,
+                Alive,
+                Dead,
+            }
+            let observation = match self.sessions.get_mut(&key) {
+                None => ProbeObservation::NoSession,
+                Some(entry) => match entry.session.as_mut() {
+                    Some(session) => {
+                        if session.is_alive() {
+                            ProbeObservation::Alive
+                        } else {
+                            ProbeObservation::Dead
+                        }
+                    }
+                    None => ProbeObservation::Dead,
+                },
+            };
+
+            match observation {
+                ProbeObservation::NoSession => {
+                    // The session was removed out from under the
+                    // probe by another code path. Clear the probe
+                    // without retry.
+                    self.resume_probes.remove(&key);
+                    continue;
+                }
+                ProbeObservation::Alive => {
+                    // Resume worked - drop the probe so a later
+                    // natural death is handled by the ordinary
+                    // liveness path.
+                    self.resume_probes.remove(&key);
+                    continue;
+                }
+                ProbeObservation::Dead => {
+                    // Fall through to the retry-or-error decision.
+                }
+            }
+
+            // The session is dead. Decide whether to retry or to
+            // surface the failure based on what we attempted last.
+            let attempted = self
+                .resume_probes
+                .get(&key)
+                .map(|p| p.attempted)
+                .unwrap_or(SpawnFlag::Fresh);
+
+            match attempted {
+                SpawnFlag::Resume => {
+                    // Case 3: resume of nonexistent UUID. Rebuild the
+                    // command with `--session-id` and respawn once.
+                    let (cwd, mut new_cmd) = match self.resume_probes.get(&key) {
+                        Some(probe) => (probe.cwd.clone(), probe.cmd.clone()),
+                        None => continue,
+                    };
+                    // Swap the flag in place. The position is
+                    // deterministic (set by `build_claude_cmd`) but we
+                    // search anyway so a future reshuffle of the arg
+                    // order does not silently break the fallback.
+                    let mut swapped = false;
+                    for s in new_cmd.iter_mut() {
+                        if s == SpawnFlag::Resume.cli_flag() {
+                            *s = SpawnFlag::Fresh.cli_flag().to_string();
+                            swapped = true;
+                            break;
+                        }
+                    }
+                    if !swapped {
+                        // Defensive: if we somehow cannot find the
+                        // flag in the captured command, treat this as
+                        // a real error rather than silently retrying
+                        // an identical spawn. The child is already
+                        // dead here too, so `force_kill` is preferred.
+                        self.resume_probes.remove(&key);
+                        if let Some(mut entry) = self.sessions.remove(&key)
+                            && let Some(ref mut session) = entry.session
+                        {
+                            session.force_kill();
+                        }
+                        self.cleanup_session_state_for(&key.0);
+                        self.status_message = Some(
+                            "Session resume fallback failed: --resume flag not found in captured command"
+                                .to_string(),
+                        );
+                        continue;
+                    }
+
+                    // Drop the dead session entry. Do NOT call
+                    // `cleanup_session_state_for`: the MCP server and
+                    // any other per-work-item state are reused by the
+                    // retry. The child is definitively already dead
+                    // (that is the only reason we are in this branch),
+                    // so we use `force_kill` rather than `kill` to
+                    // avoid the 50 ms SIGTERM grace-sleep that `kill`
+                    // would otherwise burn on the UI thread - see
+                    // `session::Session::kill` vs `force_kill`.
+                    if let Some(mut entry) = self.sessions.remove(&key)
+                        && let Some(ref mut session) = entry.session
+                    {
+                        session.force_kill();
+                    }
+
+                    let cmd_refs: Vec<&str> = new_cmd.iter().map(|s| s.as_str()).collect();
+                    match Session::spawn(self.pane_cols, self.pane_rows, Some(&cwd), &cmd_refs) {
+                        Ok(session) => {
+                            let parser = Arc::clone(&session.parser);
+                            self.sessions.insert(
+                                key.clone(),
+                                SessionEntry {
+                                    parser,
+                                    alive: true,
+                                    session: Some(session),
+                                    scrollback_offset: 0,
+                                    selection: None,
+                                },
+                            );
+                            if let Some(probe) = self.resume_probes.get_mut(&key) {
+                                probe.attempted = SpawnFlag::Fresh;
+                                probe.cmd = new_cmd;
+                                probe.started_at = Instant::now();
+                            }
+                        }
+                        Err(e) => {
+                            // Respawn itself failed (e.g. PTY
+                            // exhaustion). Surface and drop the probe.
+                            self.resume_probes.remove(&key);
+                            self.cleanup_session_state_for(&key.0);
+                            self.status_message = Some(format!("Error respawning session: {e}"));
+                        }
+                    }
+                }
+                SpawnFlag::Fresh => {
+                    // Case 4: even the fresh spawn died. Treat as a
+                    // real spawn failure. The child is already dead,
+                    // so `force_kill` is both correct and avoids the
+                    // 50 ms SIGTERM grace-sleep that `kill` would
+                    // burn on the UI thread.
+                    self.resume_probes.remove(&key);
+                    if let Some(mut entry) = self.sessions.remove(&key)
+                        && let Some(ref mut session) = entry.session
+                    {
+                        session.force_kill();
+                    }
+                    self.cleanup_session_state_for(&key.0);
+                    self.status_message = Some(
+                        "Session spawn failed: Claude Code exited immediately after --session-id fallback"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
     /// Build the `claude` CLI argument list.
     ///
     /// The positional prompt (for planning sessions) MUST come before
     /// `--mcp-config` so Claude Code does not mistake it for a config
     /// file path. The returned Vec does not include `--mcp-config` -
     /// callers append it after this returns.
+    ///
+    /// `session_id` is the deterministic UUID derived from the work
+    /// item and stage via `session_id::session_id_for`. `flag` selects
+    /// whether this spawn is a resume attempt (`--resume`) or a fresh
+    /// create under a known UUID (`--session-id`); see `SpawnFlag` and
+    /// `docs/work-items.md` "Session identity and resumption" for the
+    /// resume-first / fallback protocol.
     fn build_claude_cmd(
         status: &WorkItemStatus,
         system_prompt: Option<&str>,
         force_auto_start: bool,
+        session_id: uuid::Uuid,
+        flag: SpawnFlag,
     ) -> Vec<String> {
         let is_planning = *status == WorkItemStatus::Planning;
         let auto_start = force_auto_start
@@ -3911,6 +4235,17 @@ impl App {
 
         let mut cmd: Vec<String> = vec!["claude".to_string()];
         cmd.push("--dangerously-skip-permissions".to_string());
+        // Session identity: `--resume <uuid>` on every interactive
+        // stage-session spawn so a workbridge restart re-attaches to
+        // the previous Claude Code conversation for this
+        // (work_item_id, stage) pair. When no such session yet exists
+        // on disk, `poll_resume_probes` detects the near-instant exit
+        // and respawns once with `--session-id <uuid>`, which creates
+        // a fresh session under the same deterministic UUID. The
+        // scheme is intentionally pure - nothing is persisted in
+        // workbridge's data model, see `src/session_id.rs`.
+        cmd.push(flag.cli_flag().to_string());
+        cmd.push(session_id.to_string());
         cmd.push("--allowedTools".to_string());
         cmd.push(
             [
@@ -9433,6 +9768,7 @@ mod tests {
         repo: &str,
     ) -> crate::work_item::WorkItem {
         crate::work_item::WorkItem {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from(format!("/tmp/{title}.json"))),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -12273,22 +12609,30 @@ mod tests {
     #[test]
     fn build_claude_cmd_prompt_before_mcp_config() {
         // Planning session: has --dangerously-skip-permissions, --settings hook, and positional prompt.
-        let cmd =
-            App::build_claude_cmd(&WorkItemStatus::Planning, Some("system prompt here"), false);
+        let session_id = uuid::Uuid::nil();
+        let cmd = App::build_claude_cmd(
+            &WorkItemStatus::Planning,
+            Some("system prompt here"),
+            false,
+            session_id,
+            SpawnFlag::Resume,
+        );
         assert_eq!(cmd[0], "claude");
         assert_eq!(cmd[1], "--dangerously-skip-permissions");
-        assert_eq!(cmd[2], "--allowedTools");
+        assert_eq!(cmd[2], "--resume");
+        assert_eq!(cmd[3], session_id.to_string());
+        assert_eq!(cmd[4], "--allowedTools");
         assert!(
-            cmd[3].contains("mcp__workbridge__workbridge_get_context"),
+            cmd[5].contains("mcp__workbridge__workbridge_get_context"),
             "allowed tools must include workbridge MCP tools",
         );
-        assert_eq!(cmd[4], "--settings");
+        assert_eq!(cmd[6], "--settings");
         assert!(
-            cmd[5].contains("PostToolUse") && cmd[5].contains("workbridge_set_plan"),
+            cmd[7].contains("PostToolUse") && cmd[7].contains("workbridge_set_plan"),
             "planning sessions must include TodoWrite reminder hook via --settings",
         );
-        assert_eq!(cmd[6], "--system-prompt");
-        assert_eq!(cmd[7], "system prompt here");
+        assert_eq!(cmd[8], "--system-prompt");
+        assert_eq!(cmd[9], "system prompt here");
         // Positional prompt is the LAST element - callers append
         // --mcp-config after this, so it stays after the prompt.
         assert_eq!(
@@ -12305,19 +12649,359 @@ mod tests {
     /// Implementing sessions also get an auto-start prompt.
     #[test]
     fn build_claude_cmd_implementing_has_prompt() {
-        let cmd = App::build_claude_cmd(&WorkItemStatus::Implementing, Some("impl prompt"), false);
+        let session_id = uuid::Uuid::nil();
+        let cmd = App::build_claude_cmd(
+            &WorkItemStatus::Implementing,
+            Some("impl prompt"),
+            false,
+            session_id,
+            SpawnFlag::Resume,
+        );
         assert_eq!(cmd[0], "claude");
         assert_eq!(cmd[1], "--dangerously-skip-permissions");
-        assert_eq!(cmd[2], "--allowedTools");
+        assert_eq!(cmd[2], "--resume");
+        assert_eq!(cmd[3], session_id.to_string());
+        assert_eq!(cmd[4], "--allowedTools");
         assert!(
-            cmd[3].contains("mcp__workbridge__workbridge_get_context"),
+            cmd[5].contains("mcp__workbridge__workbridge_get_context"),
             "allowed tools must include workbridge MCP tools",
         );
-        assert_eq!(cmd[4], "--system-prompt");
+        assert_eq!(cmd[6], "--system-prompt");
         assert!(
             cmd.last().unwrap().contains("start working"),
             "implementing should have auto-start prompt",
         );
+    }
+
+    /// `SpawnFlag::Fresh` must emit `--session-id <uuid>` instead of
+    /// `--resume <uuid>` so the fallback path creates a new session
+    /// under the deterministic UUID when no session yet exists for it.
+    #[test]
+    fn build_claude_cmd_fresh_flag_uses_session_id() {
+        let session_id = uuid::Uuid::nil();
+        let cmd = App::build_claude_cmd(
+            &WorkItemStatus::Implementing,
+            Some("impl prompt"),
+            false,
+            session_id,
+            SpawnFlag::Fresh,
+        );
+        assert_eq!(cmd[2], "--session-id");
+        assert_eq!(cmd[3], session_id.to_string());
+        assert!(
+            !cmd.iter().any(|a| a == "--resume"),
+            "Fresh spawns must not contain --resume",
+        );
+    }
+
+    /// The deterministic session UUID must be passed through verbatim.
+    /// Different work items / stages derive different UUIDs and each
+    /// must appear in the argv unchanged.
+    #[test]
+    fn build_claude_cmd_embeds_exact_session_uuid() {
+        let a = uuid::Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
+        let b = uuid::Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222);
+        let cmd_a = App::build_claude_cmd(
+            &WorkItemStatus::Implementing,
+            None,
+            false,
+            a,
+            SpawnFlag::Resume,
+        );
+        let cmd_b = App::build_claude_cmd(
+            &WorkItemStatus::Implementing,
+            None,
+            false,
+            b,
+            SpawnFlag::Resume,
+        );
+        assert!(
+            cmd_a.iter().any(|s| s == &a.to_string()),
+            "cmd for uuid a must contain a.to_string()",
+        );
+        assert!(
+            cmd_b.iter().any(|s| s == &b.to_string()),
+            "cmd for uuid b must contain b.to_string()",
+        );
+        assert_ne!(
+            cmd_a.iter().find(|s| *s == &a.to_string()),
+            cmd_b.iter().find(|s| *s == &a.to_string()),
+            "each build must embed its own uuid, not leak another run's",
+        );
+    }
+
+    // -- Feature: resume probe state machine --
+
+    /// Build an `Instant` that is `ago_ms` milliseconds in the past, so
+    /// the probe's `started_at` satisfies the 200 ms minimum-age
+    /// threshold used by `poll_resume_probes`. `Instant` subtraction is
+    /// fallible on platforms where the clock has not been running long
+    /// enough (tests start immediately); `checked_sub` falls back to
+    /// "now" which would make the probe look too fresh. The cfg-test
+    /// helper masks that by sleeping the difference.
+    fn aged_instant(ago_ms: u64) -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_millis(ago_ms))
+            .unwrap_or_else(|| {
+                std::thread::sleep(Duration::from_millis(ago_ms));
+                Instant::now() - Duration::from_millis(ago_ms)
+            })
+    }
+
+    /// A probe whose session entry was removed out from under it
+    /// (retreat, delete, or any other explicit session-kill path) must
+    /// be dropped silently on the next tick, with no retry and no
+    /// spurious error message. Retrying would resurrect a session for
+    /// a stage the user intentionally moved away from.
+    #[test]
+    fn resume_probe_with_orphaned_session_is_cleared_silently() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/orphan-probe.json"));
+        let key = (wi_id.clone(), WorkItemStatus::Planning);
+        app.resume_probes.insert(
+            key.clone(),
+            ResumeProbe {
+                cwd: PathBuf::from("/tmp"),
+                cmd: vec!["claude".into(), "--resume".into(), "deadbeef".into()],
+                started_at: aged_instant(500),
+                attempted: SpawnFlag::Resume,
+            },
+        );
+        assert!(!app.sessions.contains_key(&key), "precondition: no session",);
+
+        app.poll_resume_probes();
+
+        assert!(
+            !app.resume_probes.contains_key(&key),
+            "orphaned probe must be dropped on the first tick",
+        );
+        assert!(
+            app.status_message.is_none(),
+            "orphaned cleanup must not surface an error, got {:?}",
+            app.status_message,
+        );
+    }
+
+    /// A probe whose session is still alive must be cleared without
+    /// respawn so the tick after that treats the session as any other
+    /// ordinary live session.
+    #[test]
+    fn resume_probe_with_alive_session_is_cleared_silently() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/alive-probe.json"));
+        let key = (wi_id.clone(), WorkItemStatus::Planning);
+        // Spawn a real child process that stays alive for the
+        // duration of the test (well past `poll_resume_probes`).
+        let session = Session::spawn(80, 24, None, &["sleep", "60"]).expect("spawn live session");
+        let parser = Arc::clone(&session.parser);
+        app.sessions.insert(
+            key.clone(),
+            SessionEntry {
+                parser,
+                alive: true,
+                session: Some(session),
+                scrollback_offset: 0,
+                selection: None,
+            },
+        );
+        app.resume_probes.insert(
+            key.clone(),
+            ResumeProbe {
+                cwd: PathBuf::from("/tmp"),
+                cmd: vec!["claude".into(), "--resume".into(), "deadbeef".into()],
+                started_at: aged_instant(500),
+                attempted: SpawnFlag::Resume,
+            },
+        );
+
+        app.poll_resume_probes();
+
+        assert!(
+            !app.resume_probes.contains_key(&key),
+            "alive session probe must be dropped on the first tick",
+        );
+        assert!(
+            app.sessions.contains_key(&key),
+            "alive session must be left in place",
+        );
+
+        // Tidy up: kill the long sleep so the test does not leak a
+        // process beyond its lifetime.
+        if let Some(mut entry) = app.sessions.remove(&key)
+            && let Some(ref mut session) = entry.session
+        {
+            session.kill();
+        }
+    }
+
+    /// A fresh probe that is younger than the 200 ms minimum age must
+    /// be left alone - `poll_resume_probes` cannot yet distinguish
+    /// "slow but successful resume" from "immediate exit after
+    /// unknown UUID", so it waits another tick before acting.
+    #[test]
+    fn resume_probe_under_min_age_is_skipped() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/fresh-probe.json"));
+        let key = (wi_id.clone(), WorkItemStatus::Planning);
+        app.resume_probes.insert(
+            key.clone(),
+            ResumeProbe {
+                cwd: PathBuf::from("/tmp"),
+                cmd: vec!["claude".into(), "--resume".into(), "deadbeef".into()],
+                started_at: Instant::now(),
+                attempted: SpawnFlag::Resume,
+            },
+        );
+
+        app.poll_resume_probes();
+
+        assert!(
+            app.resume_probes.contains_key(&key),
+            "probe younger than min age must be preserved until a later tick",
+        );
+    }
+
+    /// After the Fresh spawn has also been observed dead, the probe
+    /// drops and the status bar surfaces a spawn failure. The key
+    /// invariant is that we never loop retrying the same spawn: once
+    /// `attempted == SpawnFlag::Fresh`, there is no further retry.
+    #[test]
+    fn resume_probe_fresh_dead_surfaces_error_and_clears() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/fresh-dead-probe.json"));
+        let key = (wi_id.clone(), WorkItemStatus::Planning);
+        // Spawn a short-lived process and wait for it to exit so the
+        // probe sees a dead session.
+        let session = Session::spawn(80, 24, None, &["sleep", "0"]).expect("spawn throwaway");
+        let parser = Arc::clone(&session.parser);
+        app.sessions.insert(
+            key.clone(),
+            SessionEntry {
+                parser,
+                alive: true,
+                session: Some(session),
+                scrollback_offset: 0,
+                selection: None,
+            },
+        );
+        // Let the child exit before we poll.
+        std::thread::sleep(Duration::from_millis(250));
+
+        app.resume_probes.insert(
+            key.clone(),
+            ResumeProbe {
+                cwd: PathBuf::from("/tmp"),
+                cmd: vec!["claude".into(), "--session-id".into(), "deadbeef".into()],
+                started_at: aged_instant(500),
+                attempted: SpawnFlag::Fresh,
+            },
+        );
+
+        app.poll_resume_probes();
+
+        assert!(
+            !app.resume_probes.contains_key(&key),
+            "Fresh-dead probe must be cleared so we never loop retrying",
+        );
+        assert!(
+            !app.sessions.contains_key(&key),
+            "dead session entry must also be removed on the fresh-fail path",
+        );
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("Session spawn failed")),
+            "a real spawn failure must be surfaced to the user, got {:?}",
+            app.status_message,
+        );
+    }
+
+    /// Resume-dead path: probe observes a dead session that was
+    /// spawned with `--resume`, rebuilds the cmd with `--session-id`,
+    /// respawns once, and transitions `attempted` to `SpawnFlag::Fresh`
+    /// so the state machine cannot loop. The respawn uses a captured
+    /// cmd of `sh -c "sleep 60" --resume`; `sh` treats trailing
+    /// positional arguments as `$0`/`$1`/... (not flags), so both the
+    /// `--resume` and `--session-id` forms parse cleanly and keep the
+    /// child alive long enough for the test to observe the transition.
+    #[test]
+    fn resume_probe_resume_dead_respawns_with_fresh_flag() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/resume-retry-probe.json"));
+        let key = (wi_id.clone(), WorkItemStatus::Planning);
+
+        // Seed `sessions` with a short-lived child so the probe sees
+        // a definitively dead session on the first poll.
+        let dying = Session::spawn(80, 24, None, &["sleep", "0"]).expect("spawn throwaway");
+        let parser = Arc::clone(&dying.parser);
+        app.sessions.insert(
+            key.clone(),
+            SessionEntry {
+                parser,
+                alive: true,
+                session: Some(dying),
+                scrollback_offset: 0,
+                selection: None,
+            },
+        );
+        std::thread::sleep(Duration::from_millis(250));
+
+        app.resume_probes.insert(
+            key.clone(),
+            ResumeProbe {
+                cwd: PathBuf::from("/tmp"),
+                cmd: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "sleep 60".into(),
+                    "--resume".into(),
+                ],
+                started_at: aged_instant(500),
+                attempted: SpawnFlag::Resume,
+            },
+        );
+
+        app.poll_resume_probes();
+
+        assert!(
+            app.sessions.contains_key(&key),
+            "respawn must succeed and leave a live session entry in place",
+        );
+        let probe = app
+            .resume_probes
+            .get(&key)
+            .expect("probe must survive the successful retry spawn");
+        assert_eq!(
+            probe.attempted,
+            SpawnFlag::Fresh,
+            "probe must transition Resume -> Fresh exactly once",
+        );
+        assert!(
+            probe.cmd.iter().any(|s| s == "--session-id"),
+            "retry cmd must contain --session-id after swap",
+        );
+        assert!(
+            !probe.cmd.iter().any(|s| s == "--resume"),
+            "retry cmd must no longer contain --resume",
+        );
+        assert!(
+            app.status_message.is_none()
+                || !app
+                    .status_message
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("failed"),
+            "silent retry must not surface a user-visible error, got {:?}",
+            app.status_message,
+        );
+
+        // Tidy up: kill the long sleep so the test does not leak a
+        // process beyond its lifetime.
+        if let Some(mut entry) = app.sessions.remove(&key)
+            && let Some(ref mut session) = entry.session
+        {
+            session.kill();
+        }
     }
 
     // -- Feature: global assistant drawer teardown --
@@ -12644,8 +13328,15 @@ mod tests {
     /// Blocked and Review sessions do NOT get an auto-start prompt.
     #[test]
     fn build_claude_cmd_blocked_review_no_prompt() {
+        let session_id = uuid::Uuid::nil();
         for status in [WorkItemStatus::Blocked, WorkItemStatus::Review] {
-            let cmd = App::build_claude_cmd(&status, Some("prompt"), false);
+            let cmd = App::build_claude_cmd(
+                &status,
+                Some("prompt"),
+                false,
+                session_id,
+                SpawnFlag::Resume,
+            );
             // Last arg should be the system prompt value, not a positional prompt.
             assert_eq!(cmd.last().unwrap(), "prompt");
         }
@@ -12654,7 +13345,14 @@ mod tests {
     /// Review sessions auto-start when force_auto_start is true (gate findings present).
     #[test]
     fn build_claude_cmd_review_force_auto_start() {
-        let cmd = App::build_claude_cmd(&WorkItemStatus::Review, Some("review prompt"), true);
+        let session_id = uuid::Uuid::nil();
+        let cmd = App::build_claude_cmd(
+            &WorkItemStatus::Review,
+            Some("review prompt"),
+            true,
+            session_id,
+            SpawnFlag::Resume,
+        );
         assert!(
             cmd.last().unwrap().contains("review gate assessment"),
             "review with force_auto_start should have gate-specific prompt",

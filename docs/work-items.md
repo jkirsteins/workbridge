@@ -339,6 +339,45 @@ the session can be respawned. Dead terminal sessions are automatically
 cleaned up and respawned when the user switches to the Terminal tab again.
 Only deleting the backend record destroys the work item.
 
+### Session identity and resumption
+
+Each interactive Claude Code session spawned by workbridge is assigned a
+deterministic UUID v5 derived from the tuple `(work_item_id, stage)` and
+a workbridge-specific namespace constant defined in `src/session_id.rs`.
+The derivation is pure: nothing is persisted in the work item's backend
+record. The UUID is recomputed from first principles on every spawn, so
+the scheme survives workbridge restarts and is immune to backend format
+changes that do not touch the identifying fields.
+
+Stable `(work_item_id, stage) -> UUID` mapping means that re-entering a
+work item after quitting workbridge resumes the exact same Claude Code
+session via `claude --resume <uuid>`. The full prior conversation
+history is restored. Stage transitions deliberately change the UUID
+(because the tuple changes), so each stage keeps its own isolated
+resumable history and there is no cross-stage history bleed.
+
+The spawn protocol in `App::finish_session_open` always starts with
+`--resume <uuid>`. If no session yet exists under that UUID (fresh
+install, new work item, a stage being entered for the first time after
+the feature landed) Claude Code exits almost immediately with a
+"No conversation found" message. A background `poll_resume_probes`
+tick detects the near-instant exit and transparently respawns once
+with `--session-id <uuid>`, which creates a new session under the
+same deterministic UUID. The user never sees the retry. The probe
+state machine is self-terminating: it retries at most once, and on
+the second failure it surfaces a normal spawn-error status message.
+The probe lives in a map keyed by `(WorkItemId, WorkItemStatus)` - the
+same key `App::sessions` uses - so every probe structurally owns the
+retry state of exactly one session spawn and orphan cleanup is
+handled by the polling tick itself rather than scattered cleanup
+calls.
+
+The review gate's ephemeral `claude --print` subprocess (see
+`spawn_review_gate`) and the global assistant drawer (see
+`spawn_global_session`) intentionally do NOT use the deterministic
+session-ID scheme: they are one-shot or separate-scope sessions that
+must not share identity with the work-item stage session.
+
 ## Work Item Identity
 
 A work item is identified by its backend record ID (a file path in v1).

@@ -13,6 +13,7 @@ mod pr_service;
 mod prompts;
 mod salsa;
 mod session;
+mod session_id;
 mod theme;
 mod ui;
 mod work_item;

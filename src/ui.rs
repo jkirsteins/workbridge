@@ -3971,6 +3971,7 @@ mod format_entry_tests {
     fn working_spinner_is_visible_on_highlighted_row() {
         use ratatui_core::style::Color;
         let wi = WorkItem {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -4018,6 +4019,7 @@ mod format_entry_tests {
     #[test]
     fn working_spinner_keeps_default_style_on_unselected_row() {
         let wi = WorkItem {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
