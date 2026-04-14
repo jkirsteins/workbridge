@@ -945,6 +945,41 @@ dialog that blocks interaction until dismissed with Enter or Esc.
 5. Global assistant drawer
 6. Create dialog
 
+### Global assistant drawer session lifetime
+
+The global assistant drawer (toggled with Ctrl+G) does NOT keep its
+`claude` session alive across drawer openings. Every open spawns a
+fresh session with an empty context and scrollback; every close
+(Ctrl+G or Esc while the drawer is open) immediately tears the
+session down via `App::teardown_global_session`. Teardown:
+
+1. SIGTERMs the `claude` child (graceful grace period + SIGKILL
+   via `Session::kill`).
+2. Drops the `SessionEntry` so `Session::Drop` joins the reader
+   thread.
+3. Drops `global_mcp_server`.
+4. Deletes the temp MCP config file and clears
+   `global_mcp_config_path`.
+5. Drains `pending_global_pty_bytes` so buffered keystrokes from
+   the previous session never leak into the next one.
+
+The rule is "every Ctrl+G opening sees a blank-slate PTY," so any
+new state added to the global assistant must also be cleared in
+`teardown_global_session`.
+
+The session cwd is a dedicated workbridge-owned scratch directory
+(`$TMPDIR/workbridge-global-assistant-cwd`, created idempotently
+on each spawn). This is deliberately NOT `$HOME`: Claude Code's
+workspace trust dialog ("Do you trust the files in this folder?")
+persists acceptance per-project in `~/.claude.json`, but the home
+directory does not reliably persist that acceptance, so using
+`$HOME` as the cwd would produce the trust prompt on every single
+Ctrl+G. A stable non-home scratch path lets Claude Code's own
+trust-persistence mechanism cover it after the first acceptance,
+without workbridge ever reading or writing `~/.claude.json`
+itself (which would be a file-injection workaround - see the
+"Severity overrides" section in `CLAUDE.md`).
+
 ### Settings overlay tabs
 
 The settings overlay (opened with `?`) has three tabs, cycled with Tab:
