@@ -325,6 +325,7 @@ fn write_item(
             description: None,
             status,
             kind: WorkItemKind::Own,
+            display_id: None,
             repo_associations: vec![RepoAssociationRecord {
                 repo_path: std::path::PathBuf::from("/seed/repo"),
                 branch: Some(format!("seed/{id}")),

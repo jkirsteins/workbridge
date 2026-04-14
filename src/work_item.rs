@@ -1,5 +1,5 @@
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -127,12 +127,38 @@ impl WorkItemStatus {
     }
 }
 
+/// Final path component of a repo path, used as the human-readable repo
+/// slug in group headers (`"ACTIVE (workbridge)"`) and in backend-provided
+/// display IDs (`"#workbridge-42"`).
+///
+/// This is the single source of truth for "what do we call this repo in the
+/// UI": both the group-header rendering in `App::push_repo_groups` and the
+/// ID allocation in `LocalFileBackend::create` route through here so the
+/// two displayed forms cannot drift.
+///
+/// Deliberately NOT lowercased or sanitized - a repo named `My.Repo`
+/// yields the slug `My.Repo`, matching what the group header already
+/// shows. The `"unknown"` fallback only fires for a path that has no
+/// final component (e.g. the filesystem root).
+pub fn repo_slug_from_path(repo_path: &Path) -> String {
+    repo_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// A fully assembled work item with backend data and derived metadata.
 pub struct WorkItem {
     pub id: WorkItemId,
     pub backend_type: BackendType,
     pub kind: WorkItemKind,
     pub title: String,
+    /// Backend-provided, human-readable stable identifier for the work
+    /// item (e.g. `"workbridge-42"`). Passed through from the backend
+    /// record unchanged - the assembly layer does not derive it. `None`
+    /// for records created before the feature landed; those items
+    /// render in the list without the ID subtitle line.
+    pub display_id: Option<String>,
     pub description: Option<String>,
     pub status: WorkItemStatus,
     /// True when the assembly layer derived the status (e.g. merged PR -> Done)

@@ -36,12 +36,20 @@ Data is grouped into tiers by how it is obtained:
 ### Tier -1: Backend records (instant, always available)
 
 - Work item id, title, status
+- Backend-provided `display_id` (e.g. `workbridge-42`), optional, stable
 - Repo associations (repo path, branch name, optional PR identity)
 
 This data comes from local file reads (v1) and is always available. It
 defines what work items exist and their structure. The UI can render a
 work item list immediately from backend records alone, before any git
 or GitHub data is fetched.
+
+`display_id` is copied straight through from the `WorkItemRecord` onto
+the assembled `WorkItem` during `reassemble()`. The assembly layer does
+not derive it - the backend assigns it at `create()` time and the value
+never changes for the life of the record. Records created before the
+field existed pass through as `None`. See `docs/work-items.md` "Display
+IDs" for the format, uniqueness invariant, and counter-file details.
 
 Repo associations may include a `pr_identity` snapshot (number, title,
 url) persisted at merge time. After a PR is merged it leaves the open-PR

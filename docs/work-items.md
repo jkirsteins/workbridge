@@ -333,6 +333,81 @@ This means:
 - One branch can never have multiple worktrees on the same machine,
   because git prohibits two worktrees on the same branch.
 
+## Display IDs
+
+Every work item also carries a backend-provided `display_id: Option<String>`,
+a short, human-readable, stable identifier that can be referenced outside
+the TUI (commits, PRs, chat messages, grep). This is a separate field from
+the internal `WorkItemId` (which is a file path in v1 and thus not
+shareable or easy to type); the display ID is what users see and quote.
+
+### Local backend format
+
+The local file backend generates IDs in the form `<repo-slug>-<N>`, where:
+
+- `<repo-slug>` is the final path component of the first repo
+  association, using the exact same `repo_slug_from_path` helper that
+  drives the work item list's group headers. A repo at
+  `/Projects/workbridge` gets the slug `workbridge`, matching what the
+  group header shows (`ACTIVE (workbridge)`). The two cannot drift.
+- `<N>` is a monotonically increasing per-slug counter that starts at 1.
+
+Example IDs: `workbridge-1`, `workbridge-42`, `other-repo-3`.
+
+### No reuse on delete
+
+Numbers are never reused within a backend instance. Deleting a work item
+leaves a permanent gap in its slug's sequence: if you have
+`workbridge-1`, `workbridge-2`, `workbridge-3`, delete `workbridge-2`,
+then create a new item, the new item is `workbridge-4`, not `-2`. This
+preserves the invariant that any reference to a `#<slug>-<N>` is
+unambiguous even if the original item has been deleted since.
+
+### Counter persistence
+
+The counter is persisted in `{data_dir}/id-counters.json` as a flat JSON
+map of slug to highest-ever-N:
+
+```json
+{
+  "workbridge": 42,
+  "other-repo": 3
+}
+```
+
+The file stores the high-water mark rather than the next-to-assign, so
+the invariant is trivial to read off the file: the next ID for a slug is
+always `highest + 1`. Deleting items never touches the counter. Creating
+a new item reads the file, increments the slug's entry, writes the file
+atomically (via the same `atomic_write` helper used for record JSONs),
+and returns `format!("{slug}-{next}")`. Concurrent `create()` calls are
+serialized by a `counter_lock: Mutex<()>` field on `LocalFileBackend`.
+
+A missing or corrupt `id-counters.json` is tolerated: the backend logs
+a warning and starts with empty counters. Under normal operation the
+next save rewrites the file from scratch, so the invariant holds
+against anything short of manual file tampering.
+
+### No backfill for pre-existing records
+
+Records created before this feature landed do not carry a `display_id`.
+Their on-disk JSON is missing the field entirely; serde deserializes
+them with `display_id: None` via `#[serde(default)]`. These items
+render in the work item list without an ID subtitle line. They are
+deliberately not backfilled, because backfilling would either reuse
+numbers (breaking the no-reuse invariant) or assign new numbers that
+don't match anything a user or PR already references.
+
+### Display in the work item list
+
+Items with a `display_id` render the ID as a dimmed `#<slug>-<N>`
+subtitle line under the title, styled with the same `meta_style` as the
+branch subtitle (same muted/selected-highlight color rules). The ID
+line sits above the branch line and below any title continuation
+lines. Items without a `display_id` (legacy records) skip the line
+entirely - row heights are variable, which the list rendering already
+supports for title and branch wrap.
+
 ## Deleting Work Items
 
 Deleting a work item (Ctrl+D/Delete in the TUI) performs comprehensive cleanup

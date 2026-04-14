@@ -1573,6 +1573,24 @@ fn format_work_item_entry<'a>(
         ]));
     }
 
+    // Backend-provided display ID (e.g. `#workbridge-42`).
+    //
+    // Rendered as a dimmed subtitle line between the title and the
+    // branch line, styled with the same `meta_style` as the branch
+    // subtitle so selection highlighting flows consistently across
+    // both. Records created before this feature landed have
+    // `display_id == None` and skip this block entirely - they render
+    // exactly as before with no reserved blank line.
+    if let Some(display_id) = wi.display_id.as_deref() {
+        let id_text = format!("#{display_id}");
+        for wrapped in wrap_text(&id_text, content_width) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(wrapped, meta_style),
+            ]));
+        }
+    }
+
     if has_branch {
         // Branch + [no wt] indicator. Repo is shown in the group header.
         let branch_name = first_assoc.and_then(|a| a.branch.as_deref()).unwrap_or("");
@@ -3730,6 +3748,7 @@ mod format_entry_tests {
     #[test]
     fn pre_planning_item_no_tags() {
         let wi = WorkItem {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -3771,6 +3790,7 @@ mod format_entry_tests {
     #[test]
     fn item_with_branch_shows_metadata() {
         let wi = WorkItem {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -3802,6 +3822,7 @@ mod format_entry_tests {
     #[test]
     fn item_with_branch_no_worktree_shows_no_wt() {
         let wi = WorkItem {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -3828,10 +3849,107 @@ mod format_entry_tests {
         assert!(text.contains("[no wt]"), "should show [no wt]: {text}");
     }
 
+    /// Work items with a backend-provided `display_id` should render
+    /// a dimmed `#display_id` subtitle line between the title and the
+    /// branch line. Items without a `display_id` (legacy records) must
+    /// NOT render any such line.
+    #[test]
+    fn format_entry_renders_display_id_line() {
+        let wi = WorkItem {
+            display_id: Some("workbridge-7".to_string()),
+            id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "Ship a thing".to_string(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/Projects/workbridge"),
+                branch: Some("janiskirsteins/ship-a-thing".to_string()),
+                worktree_path: Some(PathBuf::from(
+                    "/Projects/workbridge/.worktrees/ship-a-thing",
+                )),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            status_derived: false,
+            errors: vec![],
+        };
+        let app = make_app_with_work_item(wi);
+        let theme = Theme::default_theme();
+        let item = format_work_item_entry(&app, 0, 80, &theme, false);
+        let text = render_list_item_to_string(item, 80);
+
+        // The ID line is rendered as `#workbridge-7` (octothorp +
+        // slug-N form), not the bare slug.
+        assert!(
+            text.contains("#workbridge-7"),
+            "rendered output should contain the display_id line: {text}"
+        );
+
+        // Order: title is on line 0, ID line sits above the branch
+        // line, branch is below both. Split the render into lines
+        // and verify the positions.
+        let lines: Vec<&str> = text.lines().collect();
+        let title_idx = lines
+            .iter()
+            .position(|l| l.contains("Ship a thing"))
+            .expect("title line");
+        let id_idx = lines
+            .iter()
+            .position(|l| l.contains("#workbridge-7"))
+            .expect("id line");
+        let branch_idx = lines
+            .iter()
+            .position(|l| l.contains("janiskirsteins/ship-a-thing"))
+            .expect("branch line");
+        assert!(
+            title_idx < id_idx && id_idx < branch_idx,
+            "order should be title ({title_idx}) -> id ({id_idx}) -> branch ({branch_idx}): {text}"
+        );
+    }
+
+    #[test]
+    fn format_entry_omits_id_line_when_none() {
+        let wi = WorkItem {
+            display_id: None,
+            id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "Legacy item".to_string(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/Projects/workbridge"),
+                branch: Some("main".to_string()),
+                worktree_path: Some(PathBuf::from("/Projects/workbridge")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            status_derived: false,
+            errors: vec![],
+        };
+        let app = make_app_with_work_item(wi);
+        let theme = Theme::default_theme();
+        let item = format_work_item_entry(&app, 0, 80, &theme, false);
+        let text = render_list_item_to_string(item, 80);
+
+        // Legacy items must not render any `#` line. Checking for the
+        // bare `#` character is strict enough because no other UI
+        // element in this entry uses it.
+        assert!(
+            !text.contains('#'),
+            "legacy item (display_id=None) should not render any `#` line: {text}"
+        );
+    }
+
     /// Every line in the rendered item must fit within max_width.
     #[test]
     fn all_lines_fit_within_max_width() {
         let wi = WorkItem {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -4163,6 +4281,7 @@ mod snapshot_tests {
             });
         }
         WorkItem {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from(format!("/data/{id_suffix}.json"))),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -4565,6 +4684,7 @@ mod snapshot_tests {
     #[test]
     fn work_item_with_errors_no_session() {
         let items = vec![WorkItem {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from("/data/err.json")),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
