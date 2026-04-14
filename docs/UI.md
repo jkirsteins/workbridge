@@ -868,8 +868,20 @@ worktree; otherwise only "Claude Code" is shown.
   `App::terminal_sessions` keyed by `WorkItemId`.
 
 Tab switching (while right panel is focused):
-- Tab: cycle between Claude Code and Terminal
-- Shift+Tab: forwarded to PTY as CSI Z (not intercepted)
+- Tab: cycle between Claude Code and Terminal. Still fires even when
+  the current tab's session has ended - the on-screen "Press Tab to
+  switch back to Claude Code" hint (shown on the dead-terminal
+  placeholder in `src/ui.rs`) and the symmetric dead-Claude case both
+  rely on this. Focus stays on the right panel across the flip. On
+  the Claude-Code-dead -> Terminal flip, the terminal session is
+  spawned lazily via `spawn_terminal_session()` if the work item has
+  a worktree (same path as the live-session Tab flip).
+- All other keys on a dead right-panel session redirect focus to the
+  left panel with a "returned to work items" status message (the
+  existing escape hatch). Ctrl+], Shift+Tab / BackTab, plain letters,
+  Enter, Esc all take this path.
+- Shift+Tab (on a live session): forwarded to PTY as CSI Z (not
+  intercepted).
 
 Terminal sessions are cleaned up on:
 - Work item deletion (killed in `delete_work_item_by_id`)
