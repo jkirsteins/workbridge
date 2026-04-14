@@ -196,6 +196,20 @@ pub trait WorkItemBackend: Send + Sync {
         Err(BackendError::UnsupportedId(id.clone()))
     }
 
+    /// Set or replace the branch name on the repo association matching
+    /// `repo_path`. Used by the "Set branch" recovery dialog and any
+    /// future branch-rename flow. Default impl is a no-op so in-process
+    /// test mocks do not need to implement it unless they exercise the
+    /// recovery path.
+    fn update_branch(
+        &self,
+        _id: &WorkItemId,
+        _repo_path: &Path,
+        _branch: &str,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Update the implementation plan for a work item.
     fn update_plan(&self, id: &WorkItemId, plan: &str) -> Result<(), BackendError>;
 
@@ -601,6 +615,23 @@ impl WorkItemBackend for LocalFileBackend {
         let title = title.to_string();
         self.modify_record(id, |record| {
             record.title = title;
+        })
+    }
+
+    fn update_branch(
+        &self,
+        id: &WorkItemId,
+        repo_path: &Path,
+        branch: &str,
+    ) -> Result<(), BackendError> {
+        let branch = branch.to_string();
+        let repo_path = repo_path.to_path_buf();
+        self.modify_record(id, |record| {
+            for assoc in record.repo_associations.iter_mut() {
+                if assoc.repo_path == repo_path {
+                    assoc.branch = Some(branch.clone());
+                }
+            }
         })
     }
 
@@ -1202,6 +1233,109 @@ mod tests {
             BackendError::NotFound(_) => {}
             other => panic!("expected NotFound, got: {other}"),
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_branch_persists() {
+        let dir = temp_dir("update-branch");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Needs a branch".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                kind: WorkItemKind::Own,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: None,
+                    pr_identity: None,
+                }],
+            })
+            .unwrap();
+
+        backend
+            .update_branch(&record.id, Path::new("/repo"), "feature/x")
+            .unwrap();
+
+        // Re-read from disk (via list) to confirm persistence.
+        let result = backend.list().unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(
+            result.records[0].repo_associations[0].branch.as_deref(),
+            Some("feature/x")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_branch_not_found() {
+        let dir = temp_dir("update-branch-notfound");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let result = backend.update_branch(
+            &WorkItemId::LocalFile(dir.join("nonexistent.json")),
+            Path::new("/repo"),
+            "feature/x",
+        );
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BackendError::NotFound(_) => {}
+            other => panic!("expected NotFound, got: {other}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_branch_only_touches_matching_repo() {
+        let dir = temp_dir("update-branch-scoped");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Multi-repo".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                kind: WorkItemKind::Own,
+                repo_associations: vec![
+                    RepoAssociationRecord {
+                        repo_path: PathBuf::from("/repo-a"),
+                        branch: None,
+                        pr_identity: None,
+                    },
+                    RepoAssociationRecord {
+                        repo_path: PathBuf::from("/repo-b"),
+                        branch: Some("existing/b".into()),
+                        pr_identity: None,
+                    },
+                ],
+            })
+            .unwrap();
+
+        backend
+            .update_branch(&record.id, Path::new("/repo-a"), "new/a")
+            .unwrap();
+
+        let result = backend.list().unwrap();
+        let assocs = &result.records[0].repo_associations;
+        let repo_a = assocs
+            .iter()
+            .find(|a| a.repo_path == Path::new("/repo-a"))
+            .unwrap();
+        let repo_b = assocs
+            .iter()
+            .find(|a| a.repo_path == Path::new("/repo-b"))
+            .unwrap();
+        assert_eq!(repo_a.branch.as_deref(), Some("new/a"));
+        assert_eq!(
+            repo_b.branch.as_deref(),
+            Some("existing/b"),
+            "unrelated repo association must not be mutated"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

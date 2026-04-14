@@ -594,6 +594,12 @@ pub struct App {
     /// message alongside the background thread's warnings - otherwise
     /// they would be silently dropped when `cleanup_infos` is non-empty.
     pub delete_sync_warnings: Vec<String>,
+    /// When `Some`, the "Set branch name" recovery modal is visible.
+    /// Shown when a Planning/Implementing work item has no branch on any
+    /// repo association and would otherwise be stuck (e.g. Enter pressed
+    /// on a branchless item, or advance_stage called on a branchless
+    /// Backlog item). See `docs/UI.md` "Set branch recovery dialog".
+    pub set_branch_dialog: Option<crate::create_dialog::SetBranchDialog>,
     /// True when the merge strategy prompt is visible (Review -> Done).
     pub confirm_merge: bool,
     /// The work item ID that the merge prompt applies to.
@@ -991,6 +997,7 @@ impl App {
             delete_target_title: None,
             delete_in_progress: false,
             delete_sync_warnings: Vec::new(),
+            set_branch_dialog: None,
             confirm_merge: false,
             merge_wi_id: None,
             merge_in_progress: false,
@@ -3640,7 +3647,19 @@ impl App {
                         );
                     }
                     None => {
-                        self.status_message = Some("Set a branch name to start working".into());
+                        // No repo association has a branch. Open the
+                        // recovery dialog instead of leaving the user
+                        // stuck on a dead-end status message. When the
+                        // user confirms, the dialog's
+                        // `PendingBranchAction::SpawnSession` arm
+                        // re-enters `spawn_session` with the same work
+                        // item ID, so the worktree is created and the
+                        // Claude pane opens without the user having to
+                        // press Enter a second time.
+                        self.open_set_branch_dialog(
+                            work_item_id.clone(),
+                            crate::create_dialog::PendingBranchAction::SpawnSession,
+                        );
                     }
                 }
             }
@@ -4985,63 +5004,9 @@ impl App {
         self.status_message = Some(format!("Imported: {title} (creating worktree...)"));
     }
 
-    /// Create a new work item with the current working directory as the
-    /// repo association. Validates that the CWD is inside a managed repo
-    /// before persisting.
-    ///
-    /// Note: the TUI now uses `create_work_item_with()` via the creation
-    /// dialog. This method is retained for tests and potential CLI use.
-    #[allow(dead_code)]
-    pub fn create_work_item(&mut self) {
-        let cwd = match std::env::current_dir() {
-            Ok(p) => p,
-            Err(e) => {
-                self.status_message = Some(format!("Cannot determine working directory: {e}"));
-                return;
-            }
-        };
-
-        // Validate that CWD is inside a managed repo and resolve to repo root.
-        let repo_root = match self.managed_repo_root(&cwd) {
-            Some(root) => root,
-            None => {
-                self.status_message = Some(
-                    "CWD is not inside a managed repo. Add it via 'workbridge repos add' first."
-                        .into(),
-                );
-                return;
-            }
-        };
-
-        let request = CreateWorkItem {
-            title: "New work item".to_string(),
-            description: None,
-            status: WorkItemStatus::Backlog,
-            kind: WorkItemKind::Own,
-            repo_associations: vec![RepoAssociationRecord {
-                repo_path: repo_root,
-                branch: None,
-                pr_identity: None,
-            }],
-        };
-
-        match self.backend.create(request) {
-            Ok(record) => {
-                let title = record.title.clone();
-                self.reassemble_work_items();
-                self.build_display_list();
-                self.status_message = Some(format!("Created: {title}"));
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Create error: {e}"));
-            }
-        }
-    }
-
     /// Create a new work item with explicit parameters from the creation
-    /// dialog. Unlike `create_work_item()` which uses CWD and a hardcoded
-    /// title, this accepts user-provided title, selected repos, and a
-    /// branch name (required).
+    /// dialog. Accepts user-provided title, selected repos, and a branch
+    /// name (required).
     pub fn create_work_item_with(
         &mut self,
         title: String,
@@ -5219,6 +5184,120 @@ impl App {
             0 => Err("No managed repos available. Add one in Settings (?)".to_string()),
             1 => Ok(git_repos[0].clone()),
             _ => Err("MULTIPLE_REPOS".to_string()),
+        }
+    }
+
+    /// Open the "Set branch name" recovery modal for a work item.
+    ///
+    /// The dialog is prefilled with a generated slug in the same
+    /// `{username}/{slug}-{suffix}` shape the create dialog produces
+    /// (see `create_dialog::auto_fill_branch`). The `pending` parameter
+    /// records what action should be re-driven after the branch is
+    /// persisted, so a branchless Enter or advance gesture can resume
+    /// without the user having to repeat it.
+    ///
+    /// This method only mutates `self.set_branch_dialog`; it does not
+    /// touch the backend or the work item list.
+    pub fn open_set_branch_dialog(
+        &mut self,
+        wi_id: WorkItemId,
+        pending: crate::create_dialog::PendingBranchAction,
+    ) {
+        let title = self
+            .work_items
+            .iter()
+            .find(|w| w.id == wi_id)
+            .map(|w| w.title.clone())
+            .unwrap_or_default();
+        let slug = crate::create_dialog::slugify(&title);
+        let slug = crate::create_dialog::truncate_slug(&slug, crate::create_dialog::MAX_SLUG_LEN);
+        let suffix = crate::create_dialog::random_suffix();
+        // Match `create_quickstart_work_item` and
+        // `CreateDialog::auto_fill_branch`: use $USER when available and
+        // fall back to a generic "user" literal otherwise.
+        let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+        let default = if slug.is_empty() {
+            format!("{username}/workitem-{suffix}")
+        } else {
+            format!("{username}/{slug}-{suffix}")
+        };
+        let mut input = crate::create_dialog::SimpleTextInput::new();
+        input.set_text(&default);
+        self.set_branch_dialog = Some(crate::create_dialog::SetBranchDialog {
+            wi_id,
+            input,
+            pending,
+        });
+    }
+
+    /// Dismiss the "Set branch name" modal without mutating anything.
+    /// Safe to call when the modal is not visible.
+    pub fn cancel_set_branch_dialog(&mut self) {
+        self.set_branch_dialog = None;
+    }
+
+    /// Persist the branch name typed into the "Set branch name" modal
+    /// and re-drive whichever action opened the dialog in the first
+    /// place (see `PendingBranchAction`).
+    ///
+    /// Applies the branch to every repo association that currently has
+    /// `branch.is_none()`, matching the "one branch per item" convention
+    /// of `create_work_item_with`. On failure the dialog stays open so
+    /// the user can retry or press Esc.
+    pub fn confirm_set_branch_dialog(&mut self) {
+        let Some(dlg) = self.set_branch_dialog.take() else {
+            return;
+        };
+        let branch = dlg.input.text().trim().to_string();
+        if branch.is_empty() {
+            // Restore the dialog so the user can edit the field.
+            self.status_message = Some("Branch name cannot be empty".into());
+            self.set_branch_dialog = Some(dlg);
+            return;
+        }
+
+        // Collect the list of repo associations that need a branch.
+        let targets: Vec<PathBuf> = match self.work_items.iter().find(|w| w.id == dlg.wi_id) {
+            Some(w) => w
+                .repo_associations
+                .iter()
+                .filter(|a| a.branch.is_none())
+                .map(|a| a.repo_path.clone())
+                .collect(),
+            None => {
+                self.status_message = Some("Work item not found".into());
+                return;
+            }
+        };
+
+        if targets.is_empty() {
+            // Defensive: if the user somehow opened the dialog for an
+            // item that already has a branch on every repo, treat it as
+            // a no-op but still re-drive the pending action so the
+            // gesture is not silently lost.
+            self.status_message = Some("Branch already set".into());
+        } else {
+            for repo_path in &targets {
+                if let Err(e) = self.backend.update_branch(&dlg.wi_id, repo_path, &branch) {
+                    self.status_message = Some(format!("Failed to set branch: {e}"));
+                    // Restore the dialog so the user can retry.
+                    self.set_branch_dialog = Some(dlg);
+                    return;
+                }
+            }
+            self.reassemble_work_items();
+            self.build_display_list();
+            self.fetcher_repos_changed = true;
+        }
+
+        // Re-drive the pending action that opened the dialog.
+        match dlg.pending {
+            crate::create_dialog::PendingBranchAction::SpawnSession => {
+                self.spawn_session(&dlg.wi_id);
+            }
+            crate::create_dialog::PendingBranchAction::Advance { from, to } => {
+                self.apply_stage_change(&dlg.wi_id, &from, &to, "user");
+            }
         }
     }
 
@@ -5468,10 +5547,38 @@ impl App {
             return;
         }
         let current_status = wi.status;
+        // Capture the branch invariant state before giving up our
+        // borrow of `wi` below. `has_branch` is true when at least one
+        // repo association already has a branch name; if false, the
+        // Backlog -> Planning branch below opens the recovery dialog
+        // instead of persisting a stage change that would produce a
+        // stuck "Planning with no branch" item on disk.
+        let has_branch = wi.repo_associations.iter().any(|a| a.branch.is_some());
         let Some(new_status) = current_status.next_stage() else {
             self.status_message = Some("Already at final stage".into());
             return;
         };
+
+        // Branch invariant: a work item must carry at least one branch
+        // name by the time it leaves Backlog (everything past Backlog
+        // implies "somebody is actively working on this branch"). The
+        // only natural Backlog transition is -> Planning, but we gate on
+        // the source status rather than the target so any future
+        // Backlog -> X path inherits the same enforcement without a
+        // silent gap. When the invariant fails, open the recovery dialog
+        // so the user can set a branch and resume; the dialog re-drives
+        // `apply_stage_change` on confirm (see
+        // `confirm_set_branch_dialog`).
+        if current_status == WorkItemStatus::Backlog && !has_branch {
+            self.open_set_branch_dialog(
+                wi_id.clone(),
+                crate::create_dialog::PendingBranchAction::Advance {
+                    from: current_status,
+                    to: new_status,
+                },
+            );
+            return;
+        }
 
         // Planning -> Implementing is automatic (triggered by workbridge_set_plan).
         // Block manual advance to prevent skipping the plan handoff.
@@ -8396,18 +8503,6 @@ mod tests {
     // -- F-3 regression test --
 
     #[test]
-    fn create_work_item_rejects_unmanaged_cwd() {
-        // With no managed repos, the CWD cannot be inside one.
-        let mut app = App::new();
-        app.create_work_item();
-        let msg = app.status_message.as_deref().unwrap_or("");
-        assert!(
-            msg.contains("not inside a managed repo"),
-            "expected rejection message, got: {msg}"
-        );
-    }
-
-    #[test]
     fn is_inside_managed_repo_positive() {
         let dir = std::env::temp_dir().join("workbridge-test-f3-managed");
         let _ = std::fs::remove_dir_all(&dir);
@@ -8434,7 +8529,7 @@ mod tests {
     // -- Round 3 regression tests --
 
     /// F-1: managed_repo_root returns repo root, not subdirectory path.
-    /// create_work_item should store the repo root, not CWD when CWD is
+    /// Work item creation must store the repo root, not CWD when CWD is
     /// a subdirectory of a managed repo.
     #[test]
     fn managed_repo_root_returns_root_not_subdir() {
@@ -11623,6 +11718,254 @@ mod tests {
                 .unwrap_or("")
                 .contains("workbridge_set_plan"),
         );
+    }
+
+    // -- Branch invariant + "Set branch name" recovery dialog --
+
+    /// Helper: spin up an App backed by a real LocalFileBackend in a
+    /// temp directory with one Backlog work item whose repo association
+    /// has `branch: None`. Returns (app, wi_id, temp_dir) so the caller
+    /// owns cleanup.
+    fn app_with_branchless_backlog_item(name: &str) -> (App, WorkItemId, PathBuf) {
+        use crate::work_item_backend::{CreateWorkItem, LocalFileBackend, RepoAssociationRecord};
+
+        let dir = std::env::temp_dir().join(format!("workbridge-test-branchless-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Needs a branch".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                kind: crate::work_item::WorkItemKind::Own,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/tmp/branchless-repo"),
+                    branch: None,
+                    pr_identity: None,
+                }],
+            })
+            .unwrap();
+        let wi_id = record.id.clone();
+
+        let mut app = App::with_config(Config::for_test(), Arc::new(backend));
+        app.reassemble_work_items();
+        app.build_display_list();
+        // Position selection on the newly created item.
+        app.selected_work_item = Some(wi_id.clone());
+        app.build_display_list();
+
+        (app, wi_id, dir)
+    }
+
+    /// advance_stage from a branchless Backlog item must refuse the
+    /// stage change and open the recovery dialog instead, so the user
+    /// is not silently moved into Planning with no branch set.
+    #[test]
+    fn advance_from_backlog_without_branch_opens_dialog() {
+        let (mut app, wi_id, dir) = app_with_branchless_backlog_item("advance-opens");
+
+        app.advance_stage();
+
+        assert!(
+            app.set_branch_dialog.is_some(),
+            "advance_stage should open the Set branch dialog",
+        );
+        let dlg = app.set_branch_dialog.as_ref().unwrap();
+        assert_eq!(dlg.wi_id, wi_id);
+        assert!(matches!(
+            dlg.pending,
+            crate::create_dialog::PendingBranchAction::Advance {
+                from: WorkItemStatus::Backlog,
+                to: WorkItemStatus::Planning,
+            }
+        ));
+        assert_eq!(
+            app.work_items
+                .iter()
+                .find(|w| w.id == wi_id)
+                .unwrap()
+                .status,
+            WorkItemStatus::Backlog,
+            "advance must not mutate status when the branch invariant fails",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Confirming the Set branch dialog from an advance_stage-triggered
+    /// open must persist the branch via the backend and then re-drive
+    /// the same stage change so the work item actually advances.
+    #[test]
+    fn confirm_set_branch_dialog_persists_and_advances() {
+        let (mut app, wi_id, dir) = app_with_branchless_backlog_item("confirm-advance");
+
+        // Open the dialog via the advance path.
+        app.advance_stage();
+        assert!(app.set_branch_dialog.is_some());
+
+        // Overwrite the prefilled slug with a deterministic value so
+        // the assertion below is stable across runs.
+        if let Some(dlg) = app.set_branch_dialog.as_mut() {
+            dlg.input.clear();
+            dlg.input.set_text("user/needs-a-branch-abcd");
+        }
+
+        app.confirm_set_branch_dialog();
+
+        assert!(
+            app.set_branch_dialog.is_none(),
+            "confirm should close the dialog",
+        );
+        let wi = app.work_items.iter().find(|w| w.id == wi_id).unwrap();
+        assert_eq!(
+            wi.status,
+            WorkItemStatus::Planning,
+            "confirm should re-drive the pending stage advance",
+        );
+        assert_eq!(
+            wi.repo_associations[0].branch.as_deref(),
+            Some("user/needs-a-branch-abcd"),
+            "branch must be persisted to the repo association",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Confirming the Set branch dialog from a spawn_session-triggered
+    /// open must persist the branch and re-enter spawn_session. Under
+    /// the StubWorktreeService, that path admits a WorktreeCreate user
+    /// action (the background thread never resolves because the stub
+    /// never sends on its channel, but the single-flight slot IS
+    /// occupied, which is what we assert here).
+    #[test]
+    fn confirm_set_branch_dialog_persists_and_spawns_session() {
+        use crate::work_item_backend::{CreateWorkItem, LocalFileBackend, RepoAssociationRecord};
+
+        let dir = std::env::temp_dir().join("workbridge-test-branchless-spawn");
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        // Use Planning so spawn_session proceeds past the
+        // Backlog/Done/Mergequeue early-return.
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Resume me".into(),
+                description: None,
+                status: WorkItemStatus::Planning,
+                kind: crate::work_item::WorkItemKind::Own,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/tmp/branchless-spawn-repo"),
+                    branch: None,
+                    pr_identity: None,
+                }],
+            })
+            .unwrap();
+        let wi_id = record.id.clone();
+
+        let mut app = App::with_config(Config::for_test(), Arc::new(backend));
+        app.reassemble_work_items();
+        app.selected_work_item = Some(wi_id.clone());
+        app.build_display_list();
+
+        // First Enter press: spawn_session on a branchless item must
+        // open the recovery dialog instead of the old dead-end status
+        // message.
+        app.spawn_session(&wi_id);
+        assert!(
+            app.set_branch_dialog.is_some(),
+            "spawn_session on a branchless item must open the Set branch dialog",
+        );
+        assert!(matches!(
+            app.set_branch_dialog.as_ref().unwrap().pending,
+            crate::create_dialog::PendingBranchAction::SpawnSession
+        ));
+
+        // Drop the prefilled slug and type a deterministic branch.
+        if let Some(dlg) = app.set_branch_dialog.as_mut() {
+            dlg.input.clear();
+            dlg.input.set_text("user/resume-me-abcd");
+        }
+
+        app.confirm_set_branch_dialog();
+
+        assert!(app.set_branch_dialog.is_none());
+        let wi = app.work_items.iter().find(|w| w.id == wi_id).unwrap();
+        assert_eq!(
+            wi.repo_associations[0].branch.as_deref(),
+            Some("user/resume-me-abcd"),
+            "branch must be persisted before re-driving spawn_session",
+        );
+        assert!(
+            app.is_user_action_in_flight(&UserActionKey::WorktreeCreate),
+            "re-driven spawn_session must admit a WorktreeCreate action",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Esc (cancel_set_branch_dialog) must not mutate anything: the
+    /// work item stays branchless and in Backlog, the backend record
+    /// on disk is untouched, and there is no lingering dialog state.
+    #[test]
+    fn cancel_set_branch_dialog_leaves_item_unchanged() {
+        let (mut app, wi_id, dir) = app_with_branchless_backlog_item("cancel");
+
+        app.advance_stage();
+        assert!(app.set_branch_dialog.is_some());
+
+        app.cancel_set_branch_dialog();
+
+        assert!(app.set_branch_dialog.is_none());
+        let wi = app.work_items.iter().find(|w| w.id == wi_id).unwrap();
+        assert_eq!(wi.status, WorkItemStatus::Backlog);
+        assert!(wi.repo_associations[0].branch.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// spawn_session on a branchless Planning item opens the dialog
+    /// (regression guard for the old "Set a branch name to start
+    /// working" dead-end status message at the former `None =>` arm).
+    #[test]
+    fn spawn_session_on_branchless_item_opens_dialog_instead_of_message() {
+        use crate::work_item_backend::{CreateWorkItem, LocalFileBackend, RepoAssociationRecord};
+
+        let dir = std::env::temp_dir().join("workbridge-test-branchless-spawn-msg");
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Dead-end fix".into(),
+                description: None,
+                status: WorkItemStatus::Planning,
+                kind: crate::work_item::WorkItemKind::Own,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/tmp/dead-end-repo"),
+                    branch: None,
+                    pr_identity: None,
+                }],
+            })
+            .unwrap();
+        let wi_id = record.id.clone();
+
+        let mut app = App::with_config(Config::for_test(), Arc::new(backend));
+        app.reassemble_work_items();
+        app.selected_work_item = Some(wi_id.clone());
+        app.build_display_list();
+
+        app.spawn_session(&wi_id);
+
+        assert!(
+            app.set_branch_dialog.is_some(),
+            "spawn_session must open the Set branch dialog, not surface a hint string",
+        );
+        // And it must NOT have left the old dead-end message behind.
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            !msg.contains("Set a branch name"),
+            "old dead-end status message should be gone, got: {msg}",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Session lookup requires matching stage in composite key.

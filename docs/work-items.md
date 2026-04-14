@@ -204,6 +204,22 @@ Most forward transitions are triggered by the user via TUI keybinds (advance/ret
 
 All other transitions must go through TUI keybinds.
 
+### Branch invariant at Backlog -> Planning
+
+A work item may not leave Backlog unless at least one of its repo
+associations carries a branch name. `App::advance_stage` enforces this
+at the top of the function: when the source status is Backlog and no
+association has `branch.is_some()`, the stage change is refused and the
+"Set branch name" recovery modal opens instead. Confirming the modal
+persists the branch via `WorkItemBackend::update_branch` and re-drives
+the same transition. The same modal is opened from `spawn_session`
+when the user presses Enter on a Planning/Implementing item whose
+repo associations all have `branch.is_none()`, recovering any work
+item that reached Planning or later without a branch (e.g. items
+created by a now-removed Backlog creation path that stored
+`branch: None`). See `docs/UI.md` "Set branch recovery dialog" for the
+UI contract.
+
 Claude sessions can also delete the current work item via the `workbridge_delete` MCP tool, available for all non-read-only sessions (both regular work items and review requests). The backend record is deleted and the session is killed immediately on the main thread. Resource cleanup (worktree removal, branch deletion, PR closure) runs asynchronously on a background thread to avoid blocking the UI. Force mode is always used (no interactive dirty-worktree confirmation). See docs/CLEANUP.md for the deletion phases.
 
 ### Review gate

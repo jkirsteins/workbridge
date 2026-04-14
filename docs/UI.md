@@ -425,6 +425,45 @@ app.alert_message = Some(format!("Operation failed: {e}"));
 // The alert dialog dismisses itself when the user presses Enter or Esc.
 ```
 
+### Set branch recovery dialog
+
+WorkBridge enforces a **branch invariant** at the Backlog -> Planning
+transition: a work item may not leave Backlog unless at least one of
+its `repo_associations` has a branch name. The check lives in
+`App::advance_stage()` at the top of the function and gates both
+user-driven advances and MCP-driven advances that flow through the same
+helper. When the invariant fails, `advance_stage` does NOT call
+`apply_stage_change`; it opens the "Set branch name" modal via
+`App::open_set_branch_dialog(wi_id, PendingBranchAction::Advance {
+from, to })` instead.
+
+The same modal is opened from `App::spawn_session()` when the user
+presses Enter on a Planning/Implementing work item whose repo
+associations all have `branch.is_none()`. Before this dialog existed,
+that path ended in a dead-end `"Set a branch name to start working"`
+status message with no way to recover short of editing JSON by hand.
+
+The modal reuses `PromptDialogKind::TextInput` and `SimpleTextInput`
+(see `src/ui.rs` and `src/create_dialog.rs`). State lives on
+`App::set_branch_dialog: Option<SetBranchDialog>` and carries a
+`PendingBranchAction` so the dialog knows what to re-drive after the
+branch is persisted. Behaviour:
+
+- **Open**: prefills `{$USER}/{slug}-{suffix}` from the work item's
+  title using the same slug helpers the create dialog uses.
+- **Enter**: calls `backend.update_branch(...)` on every repo
+  association that currently has `branch.is_none()`, reassembles the
+  work-item list, then re-drives the pending action (either
+  `spawn_session` or `apply_stage_change`). If the backend write
+  fails the dialog stays open with an error on the status bar so the
+  user can retry.
+- **Esc**: dismisses the dialog without touching the backend.
+
+The key intercept in `src/event.rs` sits near the top of `handle_key`,
+above the general work-item keybindings, so `d` / `q` / `Enter` are
+treated as branch-name input rather than delete / quit / advance while
+the dialog is visible.
+
 ### Activity indicator placement
 
 Background operations have exactly two valid progress-feedback idioms.
