@@ -805,44 +805,56 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
         entry.scrollback_offset = 0;
     }
 
+    // Plain Tab (no modifiers) is exempt from the dead-session early-return
+    // so it can reach the Tab-cycle handler below. This matches the on-screen
+    // hint "Press Tab to switch back to Claude Code" rendered on the dead
+    // terminal placeholder (src/ui.rs) and the docs/UI.md contract that Tab
+    // cycles between Claude Code and Terminal tabs. Shift+Tab / BackTab are
+    // NOT exempted - they keep the existing dead-session "return to work
+    // items" escape-hatch behavior.
+    let is_tab_cycle = key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT);
+
     // Check if the active session/terminal is dead before forwarding keys.
     // Flush any buffered PTY bytes before changing state.
-    match app.right_panel_tab {
-        RightPanelTab::ClaudeCode => {
-            if let Some(entry) = app.active_session_entry() {
-                if !entry.alive {
+    if !is_tab_cycle {
+        match app.right_panel_tab {
+            RightPanelTab::ClaudeCode => {
+                if let Some(entry) = app.active_session_entry() {
+                    if !entry.alive {
+                        app.flush_pty_buffers();
+                        app.focus = FocusPanel::Left;
+                        app.status_message =
+                            Some("Session has ended - returned to work items".into());
+                        sync_layout(app);
+                        return true;
+                    }
+                } else {
+                    // No session for this work item - return to left panel.
                     app.flush_pty_buffers();
                     app.focus = FocusPanel::Left;
-                    app.status_message = Some("Session has ended - returned to work items".into());
+                    app.status_message = None;
                     sync_layout(app);
                     return true;
                 }
-            } else {
-                // No session for this work item - return to left panel.
-                app.flush_pty_buffers();
-                app.focus = FocusPanel::Left;
-                app.status_message = None;
-                sync_layout(app);
-                return true;
             }
-        }
-        RightPanelTab::Terminal => {
-            if let Some(entry) = app.active_terminal_entry() {
-                if !entry.alive {
+            RightPanelTab::Terminal => {
+                if let Some(entry) = app.active_terminal_entry() {
+                    if !entry.alive {
+                        app.flush_pty_buffers();
+                        app.focus = FocusPanel::Left;
+                        app.status_message =
+                            Some("Terminal session has ended - returned to work items".into());
+                        sync_layout(app);
+                        return true;
+                    }
+                } else {
+                    // No terminal session yet - return to left panel.
                     app.flush_pty_buffers();
                     app.focus = FocusPanel::Left;
-                    app.status_message =
-                        Some("Terminal session has ended - returned to work items".into());
+                    app.status_message = None;
                     sync_layout(app);
                     return true;
                 }
-            } else {
-                // No terminal session yet - return to left panel.
-                app.flush_pty_buffers();
-                app.focus = FocusPanel::Left;
-                app.status_message = None;
-                sync_layout(app);
-                return true;
             }
         }
     }
@@ -2422,6 +2434,167 @@ mod tests {
         assert!(
             app.merge_wi_id.is_some(),
             "merge_wi_id must not clear during progress"
+        );
+    }
+
+    // -- Right-panel Tab cycling on dead sessions (regression) --
+
+    /// Regression: plain Tab on the Terminal tab when the terminal
+    /// session has ended must cycle back to Claude Code, NOT redirect
+    /// to the left panel. The on-screen hint "Press Tab to switch back
+    /// to Claude Code" (dead-terminal placeholder in `src/ui.rs`) and
+    /// the `docs/UI.md` "Right Panel Tabs" contract both rely on this.
+    #[test]
+    fn tab_on_dead_terminal_cycles_to_claude_code() {
+        use crate::work_item::{
+            BackendType, RepoAssociation, SessionEntry, WorkItem, WorkItemId, WorkItemKind,
+            WorkItemStatus,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/tab-dead-terminal.json"));
+        app.work_items.push(WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: WorkItemKind::Own,
+            title: "Tab cycle test".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/tmp/repo"),
+                branch: Some("feature/test".into()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+        app.display_list
+            .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
+        app.selected_item = Some(app.display_list.len() - 1);
+
+        // Install a dead terminal session for this work item.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        app.terminal_sessions.insert(
+            wi_id,
+            SessionEntry {
+                parser,
+                alive: false,
+                session: None,
+                scrollback_offset: 0,
+                selection: None,
+            },
+        );
+
+        app.right_panel_tab = RightPanelTab::Terminal;
+        app.focus = FocusPanel::Right;
+
+        // Plain Tab should cycle to Claude Code, NOT redirect to the left panel.
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        handle_key(&mut app, tab);
+
+        assert!(
+            matches!(app.right_panel_tab, RightPanelTab::ClaudeCode),
+            "plain Tab must flip the dead-terminal tab to Claude Code",
+        );
+        assert!(
+            matches!(app.focus, FocusPanel::Right),
+            "focus must stay on the right panel after the Tab flip",
+        );
+        let status = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            !status.contains("returned to work items"),
+            "status must not be the dead-session 'returned to work items' message, got: {status}",
+        );
+    }
+
+    /// Symmetric regression: plain Tab on the Claude Code tab when the
+    /// Claude session has ended must cycle to Terminal (when the work
+    /// item has a worktree), keeping focus on the right panel. A
+    /// pre-installed LIVE terminal session makes
+    /// `spawn_terminal_session()` return early so the test does not
+    /// fork a real shell.
+    #[test]
+    fn tab_on_dead_claude_code_cycles_to_terminal() {
+        use crate::work_item::{
+            BackendType, RepoAssociation, SessionEntry, WorkItem, WorkItemId, WorkItemKind,
+            WorkItemStatus,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/tab-dead-claude.json"));
+        let wt_path = PathBuf::from("/tmp/tab-dead-claude-worktree");
+        app.work_items.push(WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: WorkItemKind::Own,
+            title: "Tab cycle test".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/tmp/repo"),
+                branch: Some("feature/test".into()),
+                worktree_path: Some(wt_path),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+        app.display_list
+            .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
+        app.selected_item = Some(app.display_list.len() - 1);
+
+        // Install a dead Claude Code session (keyed by (wi_id, status)).
+        let dead_parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        app.sessions.insert(
+            (wi_id.clone(), WorkItemStatus::Implementing),
+            SessionEntry {
+                parser: dead_parser,
+                alive: false,
+                session: None,
+                scrollback_offset: 0,
+                selection: None,
+            },
+        );
+        // Pre-install a LIVE terminal session so the Tab-flip's call to
+        // spawn_terminal_session() sees the live entry and returns
+        // early - it does NOT fork a real shell from inside the test.
+        let live_parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        app.terminal_sessions.insert(
+            wi_id,
+            SessionEntry {
+                parser: live_parser,
+                alive: true,
+                session: None,
+                scrollback_offset: 0,
+                selection: None,
+            },
+        );
+
+        app.right_panel_tab = RightPanelTab::ClaudeCode;
+        app.focus = FocusPanel::Right;
+
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        handle_key(&mut app, tab);
+
+        assert!(
+            matches!(app.right_panel_tab, RightPanelTab::Terminal),
+            "plain Tab must flip the dead Claude Code tab to Terminal",
+        );
+        assert!(
+            matches!(app.focus, FocusPanel::Right),
+            "focus must stay on the right panel after the Tab flip",
+        );
+        let status = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            !status.contains("returned to work items"),
+            "status must not be the dead-session 'returned to work items' message, got: {status}",
         );
     }
 
