@@ -1,11 +1,14 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 use crate::work_item::{
     BackendType, ReviewRequestedPr, UnlinkedPr, WorkItemId, WorkItemKind, WorkItemStatus,
+    repo_slug_from_path,
 };
 
 /// Errors from backend operations.
@@ -66,6 +69,16 @@ pub struct WorkItemRecord {
     /// Defaults to Own for migration compatibility with existing records.
     #[serde(default)]
     pub kind: WorkItemKind,
+    /// Backend-provided, human-readable stable identifier for the work
+    /// item (e.g. `"workbridge-42"`). Distinct from `id`, which is the
+    /// internal key. LocalFileBackend generates IDs as `<repo-slug>-<N>`
+    /// at create time, with N persisted in `id-counters.json` so
+    /// numbers are never reused - deletion leaves permanent gaps. This
+    /// is a post-v1 addition: records created before this feature
+    /// landed deserialize with `display_id: None` and are not
+    /// backfilled.
+    #[serde(default)]
+    pub display_id: Option<String>,
     pub repo_associations: Vec<RepoAssociationRecord>,
     /// Implementation plan text. None means no plan has been set yet.
     /// Defaults to None for migration compatibility with existing records.
@@ -249,6 +262,12 @@ pub trait WorkItemBackend: Send + Sync {
 /// Each file is named with a UUID v4 and a `.json` extension.
 pub struct LocalFileBackend {
     data_dir: PathBuf,
+    /// Serializes read-modify-write access to `id-counters.json` so
+    /// concurrent `create()` calls (e.g. from a background thread) can
+    /// never race on the counter file and hand out duplicate or
+    /// out-of-order display IDs. Held only for the duration of a single
+    /// load/save cycle inside `allocate_id`.
+    counter_lock: Mutex<()>,
 }
 
 impl LocalFileBackend {
@@ -268,7 +287,10 @@ impl LocalFileBackend {
                 data_dir.display()
             ))
         })?;
-        Ok(Self { data_dir })
+        Ok(Self {
+            data_dir,
+            counter_lock: Mutex::new(()),
+        })
     }
 
     /// Create a LocalFileBackend with a custom directory (for tests).
@@ -277,7 +299,92 @@ impl LocalFileBackend {
         fs::create_dir_all(&dir).map_err(|e| {
             BackendError::Io(format!("failed to create dir {}: {e}", dir.display()))
         })?;
-        Ok(Self { data_dir: dir })
+        Ok(Self {
+            data_dir: dir,
+            counter_lock: Mutex::new(()),
+        })
+    }
+
+    /// Path to the persistent ID-counter file.
+    ///
+    /// The file stores a JSON object `{ "<slug>": <highest_ever_n> }`
+    /// where `highest_ever_n` is the largest `N` ever assigned for the
+    /// given repo slug. Storing the high-water mark (rather than "next")
+    /// makes the invariant trivial to read off the file: the next ID
+    /// for a slug is always `highest + 1`, and deleting items never
+    /// touches the counter, so numbers are never reused even after
+    /// deletion leaves gaps.
+    fn counter_path(&self) -> PathBuf {
+        self.data_dir.join("id-counters.json")
+    }
+
+    /// Load the persistent counter map from disk.
+    ///
+    /// Corruption tolerance: a missing file, an unreadable file, or
+    /// garbled JSON all return an empty map and log a warning to
+    /// stderr. The invariant "never reuse an ID" is best-effort against
+    /// manual file tampering; under normal operation the next
+    /// `save_counters` call rewrites the file from scratch and the
+    /// counters resume from whatever state they were in pre-corruption.
+    fn load_counters(&self) -> HashMap<String, u64> {
+        let path = self.counter_path();
+        let contents = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+            Err(e) => {
+                eprintln!(
+                    "workbridge: failed to read id-counters file {}: {e}; \
+                     starting fresh counters (existing work items keep their IDs)",
+                    path.display()
+                );
+                return HashMap::new();
+            }
+        };
+        match serde_json::from_str::<HashMap<String, u64>>(&contents) {
+            Ok(map) => map,
+            Err(e) => {
+                eprintln!(
+                    "workbridge: id-counters file {} is corrupt ({e}); \
+                     starting fresh counters (existing work items keep their IDs)",
+                    path.display()
+                );
+                HashMap::new()
+            }
+        }
+    }
+
+    /// Atomically persist the counter map back to disk.
+    fn save_counters(&self, counters: &HashMap<String, u64>) -> Result<(), BackendError> {
+        let path = self.counter_path();
+        let json = serde_json::to_string_pretty(counters)
+            .map_err(|e| BackendError::Serialize(format!("{e}")))?;
+        atomic_write(&path, json.as_bytes())
+            .map_err(|e| BackendError::Io(format!("failed to write {}: {e}", path.display())))?;
+        Ok(())
+    }
+
+    /// Allocate the next display ID for `slug`, persist the updated
+    /// counter, and return the formatted `"{slug}-{N}"` string.
+    ///
+    /// Locking: acquires `counter_lock` for the entire load/modify/save
+    /// cycle so parallel `create()` calls cannot race. The lock is
+    /// dropped as soon as the counter file is saved, before the caller
+    /// writes the work item JSON, so it does not serialize the rest of
+    /// `create()`.
+    fn allocate_id(&self, slug: &str) -> Result<String, BackendError> {
+        // Recover from a poisoned lock by taking the inner guard. A
+        // poisoned mutex just means a previous holder panicked; the
+        // counter state is still valid because we load/save on every
+        // call rather than caching across calls.
+        let _guard = self
+            .counter_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut counters = self.load_counters();
+        let next = counters.get(slug).copied().unwrap_or(0) + 1;
+        counters.insert(slug.to_string(), next);
+        self.save_counters(&counters)?;
+        Ok(format!("{slug}-{next}"))
     }
 
     /// Compute the activity log file path for a work item.
@@ -473,6 +580,13 @@ impl WorkItemBackend for LocalFileBackend {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
+            // Skip sidecar files that share the data directory but do
+            // not hold work item records. Adding a new sidecar? Extend
+            // this list rather than moving files into subdirectories,
+            // so existing deployments keep working.
+            if path.file_name().and_then(|n| n.to_str()) == Some("id-counters.json") {
+                continue;
+            }
             let contents = match fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -522,6 +636,13 @@ impl WorkItemBackend for LocalFileBackend {
             ));
         }
 
+        // Derive the display-ID slug from the first repo association,
+        // using the same rule as the work item list's group header so
+        // `#workbridge-42` and `ACTIVE (workbridge)` can never drift.
+        // Safe to index: we already returned above if the list is empty.
+        let slug = repo_slug_from_path(&request.repo_associations[0].repo_path);
+        let display_id = self.allocate_id(&slug)?;
+
         let filename = format!("{}.json", uuid::Uuid::new_v4());
         let path = self.data_dir.join(&filename);
 
@@ -531,6 +652,7 @@ impl WorkItemBackend for LocalFileBackend {
             description: request.description,
             status: request.status,
             kind: request.kind,
+            display_id: Some(display_id),
             repo_associations: request.repo_associations,
             plan: None,
             done_at: None,
@@ -1651,6 +1773,211 @@ mod tests {
             .as_ref()
             .expect("pr_identity should survive list roundtrip");
         assert_eq!(listed.number, 42);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // display_id tests
+    //
+    // Every work item created through LocalFileBackend gets a stable,
+    // human-readable `display_id` of the form `<slug>-<N>`, where the
+    // slug is the final path component of the first repo association
+    // and N is a monotonic per-slug counter persisted in
+    // `id-counters.json`. Numbers are never reused even after delete;
+    // counters survive process restart; corrupt counter files are
+    // tolerated. These tests pin those invariants.
+    // -----------------------------------------------------------------
+
+    fn make_request(repo: &str, title: &str) -> CreateWorkItem {
+        CreateWorkItem {
+            title: title.into(),
+            description: None,
+            status: WorkItemStatus::Backlog,
+            kind: WorkItemKind::Own,
+            repo_associations: vec![RepoAssociationRecord {
+                repo_path: PathBuf::from(repo),
+                branch: None,
+                pr_identity: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn create_assigns_display_id() {
+        let dir = temp_dir("display-id-first");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(make_request("/tmp/foo/workbridge", "first"))
+            .unwrap();
+
+        assert_eq!(
+            record.display_id.as_deref(),
+            Some("workbridge-1"),
+            "first item in `workbridge` repo should be workbridge-1"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn display_id_counts_per_repo() {
+        let dir = temp_dir("display-id-per-repo");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        // Three items in `foo`, interleaved with two in `bar`. The
+        // per-slug counter must be independent: `foo` advances 1->2->3
+        // while `bar` stays at 1 until its first item is created, then
+        // advances 1->2 while `foo` stays at wherever it was.
+        let f1 = backend.create(make_request("/repos/foo", "f1")).unwrap();
+        let b1 = backend.create(make_request("/repos/bar", "b1")).unwrap();
+        let f2 = backend.create(make_request("/repos/foo", "f2")).unwrap();
+        let f3 = backend.create(make_request("/repos/foo", "f3")).unwrap();
+        let b2 = backend.create(make_request("/repos/bar", "b2")).unwrap();
+
+        assert_eq!(f1.display_id.as_deref(), Some("foo-1"));
+        assert_eq!(f2.display_id.as_deref(), Some("foo-2"));
+        assert_eq!(f3.display_id.as_deref(), Some("foo-3"));
+        assert_eq!(b1.display_id.as_deref(), Some("bar-1"));
+        assert_eq!(b2.display_id.as_deref(), Some("bar-2"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn display_id_never_reuses_on_delete() {
+        let dir = temp_dir("display-id-no-reuse");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let r1 = backend.create(make_request("/repos/foo", "one")).unwrap();
+        let r2 = backend.create(make_request("/repos/foo", "two")).unwrap();
+        let r3 = backend.create(make_request("/repos/foo", "three")).unwrap();
+        assert_eq!(r1.display_id.as_deref(), Some("foo-1"));
+        assert_eq!(r2.display_id.as_deref(), Some("foo-2"));
+        assert_eq!(r3.display_id.as_deref(), Some("foo-3"));
+
+        // Delete the middle item. Its number (2) must never be reused.
+        backend.delete(&r2.id).unwrap();
+
+        let r4 = backend.create(make_request("/repos/foo", "four")).unwrap();
+        assert_eq!(
+            r4.display_id.as_deref(),
+            Some("foo-4"),
+            "deleted IDs leave permanent gaps; the counter always advances"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn counter_persists_across_backend_instances() {
+        let dir = temp_dir("display-id-persist");
+        let _ = fs::remove_dir_all(&dir);
+
+        // Instance 1: allocate foo-1.
+        {
+            let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+            let r = backend.create(make_request("/repos/foo", "one")).unwrap();
+            assert_eq!(r.display_id.as_deref(), Some("foo-1"));
+        }
+
+        // Instance 2: same dir, fresh backend. The counter file on
+        // disk is the only shared state; if it is read on startup the
+        // next ID must be foo-2, not foo-1.
+        {
+            let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+            let r = backend.create(make_request("/repos/foo", "two")).unwrap();
+            assert_eq!(
+                r.display_id.as_deref(),
+                Some("foo-2"),
+                "counter must survive backend drop/recreate via id-counters.json"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_record_without_display_id_deserializes() {
+        // Migration-compat: an on-disk JSON written before the
+        // `display_id` field existed must still load cleanly with
+        // `display_id: None`.
+        let dir = temp_dir("display-id-legacy");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let legacy_path = dir.join("legacy.json");
+        let legacy_json = r#"{
+            "id": {"LocalFile": "__SELF__"},
+            "title": "Pre-feature item",
+            "status": "Backlog",
+            "kind": "Own",
+            "repo_associations": [
+                {"repo_path": "/repos/foo", "branch": null}
+            ]
+        }"#
+        .replace("__SELF__", legacy_path.to_str().unwrap());
+        fs::write(&legacy_path, legacy_json).unwrap();
+
+        let result = backend.list().unwrap();
+        assert!(
+            result.corrupt.is_empty(),
+            "legacy record must not surface as corrupt: {:?}",
+            result.corrupt
+        );
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].display_id, None);
+        assert_eq!(result.records[0].title, "Pre-feature item");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_counter_file_does_not_panic() {
+        // A manually corrupted `id-counters.json` must be tolerated:
+        // the backend logs a warning, starts the counter from zero,
+        // and the next save rewrites a valid file from scratch.
+        let dir = temp_dir("display-id-corrupt-counter");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        fs::write(dir.join("id-counters.json"), "{bad json").unwrap();
+
+        let r = backend
+            .create(make_request("/repos/foo", "after corruption"))
+            .unwrap();
+        assert_eq!(
+            r.display_id.as_deref(),
+            Some("foo-1"),
+            "after corruption the counter starts fresh"
+        );
+
+        // The save path must have rewritten the file as valid JSON.
+        let contents = fs::read_to_string(dir.join("id-counters.json")).unwrap();
+        let parsed: HashMap<String, u64> =
+            serde_json::from_str(&contents).expect("counter file should be valid JSON after save");
+        assert_eq!(parsed.get("foo").copied(), Some(1));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn counter_file_is_not_treated_as_work_item() {
+        // The counter file lives next to work item JSONs. list()
+        // must skip it rather than reporting it as corrupt. Without
+        // the skip, every normal startup would surface a fake
+        // "corrupt JSON" entry in the UI.
+        let dir = temp_dir("display-id-counter-skip");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        backend.create(make_request("/repos/foo", "one")).unwrap();
+
+        let result = backend.list().unwrap();
+        assert!(
+            result.corrupt.is_empty(),
+            "id-counters.json should not be reported as corrupt: {:?}",
+            result.corrupt
+        );
+        assert_eq!(result.records.len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }

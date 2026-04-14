@@ -3173,7 +3173,10 @@ impl App {
             return;
         }
 
-        // Collect unique repos in order of first appearance.
+        // Collect unique repos in order of first appearance. Uses the
+        // shared `repo_slug_from_path` helper so the slug displayed in
+        // the group header can never drift from the slug baked into a
+        // work item's `display_id` (e.g. `#workbridge-42`).
         let mut repo_order: Vec<String> = Vec::new();
         let mut by_repo: std::collections::HashMap<String, Vec<usize>> =
             std::collections::HashMap::new();
@@ -3181,9 +3184,8 @@ impl App {
             let repo = work_items[i]
                 .repo_associations
                 .first()
-                .and_then(|a| a.repo_path.file_name())
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "(none)".to_string());
+                .map(|a| crate::work_item::repo_slug_from_path(&a.repo_path))
+                .unwrap_or_else(|| "unknown".to_string());
             by_repo.entry(repo.clone()).or_default().push(i);
             if !repo_order.contains(&repo) {
                 repo_order.push(repo);
@@ -8671,6 +8673,7 @@ mod tests {
                 unlinked: &crate::work_item::UnlinkedPr,
             ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 let record = crate::work_item_backend::WorkItemRecord {
+                    display_id: None,
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/fake.json")),
                     title: unlinked.pr.title.clone(),
                     description: None,
@@ -8692,6 +8695,7 @@ mod tests {
                 rr: &crate::work_item::ReviewRequestedPr,
             ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 let record = crate::work_item_backend::WorkItemRecord {
+                    display_id: None,
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/fake-rr.json")),
                     title: rr.pr.title.clone(),
                     status: WorkItemStatus::Review,
@@ -8817,6 +8821,7 @@ mod tests {
                 req: CreateWorkItem,
             ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 Ok(crate::work_item_backend::WorkItemRecord {
+                    display_id: None,
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/new.json")),
                     title: req.title.clone(),
                     description: None,
@@ -9310,6 +9315,7 @@ mod tests {
         let id_b = WorkItemId::LocalFile(PathBuf::from("/data/bbb.json"));
 
         let record_a = crate::work_item_backend::WorkItemRecord {
+            display_id: None,
             id: id_a.clone(),
             title: "Item A".into(),
             description: None,
@@ -9324,6 +9330,7 @@ mod tests {
             done_at: None,
         };
         let record_b = crate::work_item_backend::WorkItemRecord {
+            display_id: None,
             id: id_b.clone(),
             title: "Item B".into(),
             description: None,
@@ -9361,6 +9368,7 @@ mod tests {
         // mutate the backend through the trait interface.
         app.work_items = vec![
             crate::work_item::WorkItem {
+                display_id: None,
                 id: id_b.clone(),
                 backend_type: crate::work_item::BackendType::LocalFile,
                 kind: crate::work_item::WorkItemKind::Own,
@@ -9379,6 +9387,7 @@ mod tests {
                 errors: vec![],
             },
             crate::work_item::WorkItem {
+                display_id: None,
                 id: id_a.clone(),
                 backend_type: crate::work_item::BackendType::LocalFile,
                 kind: crate::work_item::WorkItemKind::Own,
@@ -9559,6 +9568,7 @@ mod tests {
         let names = ["zzz.json", "aaa.json", "mmm.json"];
         for name in &names {
             let record = crate::work_item_backend::WorkItemRecord {
+                display_id: None,
                 id: WorkItemId::LocalFile(dir.join(name)),
                 title: format!("Item {name}"),
                 description: None,
@@ -10001,6 +10011,7 @@ mod tests {
                 unlinked: &crate::work_item::UnlinkedPr,
             ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 let record = crate::work_item_backend::WorkItemRecord {
+                    display_id: None,
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported.json")),
                     title: unlinked.pr.title.clone(),
                     description: None,
@@ -10022,6 +10033,7 @@ mod tests {
                 rr: &crate::work_item::ReviewRequestedPr,
             ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 let record = crate::work_item_backend::WorkItemRecord {
+                    display_id: None,
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported-rr.json")),
                     title: rr.pr.title.clone(),
                     status: WorkItemStatus::Review,
@@ -10276,6 +10288,7 @@ mod tests {
                 unlinked: &crate::work_item::UnlinkedPr,
             ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 let record = crate::work_item_backend::WorkItemRecord {
+                    display_id: None,
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported.json")),
                     title: unlinked.pr.title.clone(),
                     description: None,
@@ -10297,6 +10310,7 @@ mod tests {
                 rr: &crate::work_item::ReviewRequestedPr,
             ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 let record = crate::work_item_backend::WorkItemRecord {
+                    display_id: None,
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported-rr.json")),
                     title: rr.pr.title.clone(),
                     status: WorkItemStatus::Review,
@@ -10741,6 +10755,7 @@ mod tests {
                 unlinked: &crate::work_item::UnlinkedPr,
             ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 let record = crate::work_item_backend::WorkItemRecord {
+                    display_id: None,
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported.json")),
                     title: unlinked.pr.title.clone(),
                     description: None,
@@ -10762,6 +10777,7 @@ mod tests {
                 rr: &crate::work_item::ReviewRequestedPr,
             ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 let record = crate::work_item_backend::WorkItemRecord {
+                    display_id: None,
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported-rr.json")),
                     title: rr.pr.title.clone(),
                     status: WorkItemStatus::Review,
@@ -10908,6 +10924,7 @@ mod tests {
                     .map(|r| r.repo_path.clone())
                     .collect();
                 let record = crate::work_item_backend::WorkItemRecord {
+                    display_id: None,
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/new.json")),
                     title: req.title.clone(),
                     description: None,
@@ -11029,6 +11046,7 @@ mod tests {
     fn make_work_item(path: &str, title: &str, status: WorkItemStatus) -> WorkItem {
         use crate::work_item::RepoAssociation;
         WorkItem {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from(format!("/data/{title}.json"))),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -11229,6 +11247,7 @@ mod tests {
         // Manually inject a work item in Review status.
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-test.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -11261,6 +11280,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-no-assoc.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -11288,6 +11308,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-no-branch.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -11322,6 +11343,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-no-remote.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -11358,6 +11380,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-no-pr.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -11396,6 +11419,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-ok.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -11439,6 +11463,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/mq-merged.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -11507,6 +11532,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/mq-err.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -11571,6 +11597,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/mq-backfill.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -11641,6 +11668,7 @@ mod tests {
         let wi_b = WorkItemId::LocalFile(PathBuf::from("/tmp/mq-b.json"));
         for (id, branch) in [(&wi_a, "feature/a"), (&wi_b, "feature/b")] {
             app.work_items.push(crate::work_item::WorkItem {
+                display_id: None,
                 id: id.clone(),
                 backend_type: BackendType::LocalFile,
                 kind: crate::work_item::WorkItemKind::Own,
@@ -11720,6 +11748,7 @@ mod tests {
         // persisted for Mergequeue (the motivating case from the user's
         // report). Reconstruction must still rebuild the watch.
         let record = crate::work_item_backend::WorkItemRecord {
+            display_id: None,
             id: wi_id.clone(),
             title: "Was polling".into(),
             description: None,
@@ -11773,6 +11802,7 @@ mod tests {
     fn reconstruct_mergequeue_watches_skips_when_repo_data_missing() {
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/mq-unfetched.json"));
         let record = crate::work_item_backend::WorkItemRecord {
+            display_id: None,
             id: wi_id.clone(),
             title: "Not yet fetched".into(),
             description: None,
@@ -11810,6 +11840,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/rework-test.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -11855,6 +11886,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/no-merge.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id,
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -11883,6 +11915,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/plan.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id,
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -12433,6 +12466,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/plan-from-branch.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -12464,6 +12498,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/plan-not-blocked.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -12510,6 +12545,7 @@ mod tests {
             (active_id, WorkItemStatus::Implementing),
         ] {
             app.work_items.push(crate::work_item::WorkItem {
+                display_id: None,
                 id,
                 backend_type: BackendType::LocalFile,
                 kind: crate::work_item::WorkItemKind::Own,
@@ -12568,6 +12604,7 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/blocked-kind.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id,
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -12790,6 +12827,7 @@ mod tests {
             vec![]
         };
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -13250,6 +13288,7 @@ mod tests {
         // Item A: gate is running for this one.
         let wi_id_a = WorkItemId::LocalFile(PathBuf::from("/tmp/gate-a.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id_a.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -13271,6 +13310,7 @@ mod tests {
         // Item B: MCP will request Review for this one.
         let wi_id_b = WorkItemId::LocalFile(PathBuf::from("/tmp/gate-b.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id_b.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -13627,6 +13667,7 @@ mod tests {
                 unlinked: &crate::work_item::UnlinkedPr,
             ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
                 let record = crate::work_item_backend::WorkItemRecord {
+                    display_id: None,
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/delete-mem-test.json")),
                     title: unlinked.pr.title.clone(),
                     description: None,
@@ -13781,6 +13822,7 @@ mod tests {
         fn one_item(id_path: &str, title: &str, repo_path: &str, branch: &str) -> Self {
             Self {
                 records: vec![crate::work_item_backend::WorkItemRecord {
+                    display_id: None,
                     id: WorkItemId::LocalFile(PathBuf::from(id_path)),
                     title: title.into(),
                     description: None,
@@ -14376,6 +14418,7 @@ mod tests {
         done_at: Option<u64>,
     ) -> crate::work_item_backend::WorkItemRecord {
         crate::work_item_backend::WorkItemRecord {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from(format!("/tmp/{name}.json"))),
             title: name.into(),
             description: None,
@@ -14773,6 +14816,7 @@ mod tests {
         status: WorkItemStatus,
     ) {
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -15187,6 +15231,7 @@ mod tests {
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/p0-backfill.json"));
         let backend = Arc::new(DoneRecordBackend {
             record: crate::work_item_backend::WorkItemRecord {
+                display_id: None,
                 id: wi_id.clone(),
                 title: "backfill-test".into(),
                 description: None,
@@ -15384,6 +15429,7 @@ mod tests {
         );
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/p0-stage-prompt.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -15434,6 +15480,7 @@ mod tests {
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/p0-session-open.json"));
         // Work item needs a status that allows sessions.
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -15525,6 +15572,7 @@ mod tests {
         let branch_name = "feature/r2f2-orphan".to_string();
 
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -15632,6 +15680,7 @@ mod tests {
         );
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/r2f3-session-open.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -15724,6 +15773,7 @@ mod tests {
         );
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-stage-cancel.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
@@ -16017,6 +16067,7 @@ mod tests {
         );
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/r2f3-cleanup.json"));
         app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,

@@ -775,6 +775,25 @@ Work items are shown as a flat list with stage badges:
 - [BL] Backlog, [PL] Planning, [IM] Implementing
 - [BK] Blocked, [RV] Review, [MQ] Mergequeue, [DN] Done
 
+Each entry is rendered as a multi-line `ListItem` by
+`format_work_item_entry` in `src/ui.rs`:
+
+1. **Title line** - stage badge, wrapped title, optional right-side PR
+   / CI / error badges.
+2. **Title continuation lines** - only emitted when the title wraps.
+3. **Display ID line** - optional. When the work item has a
+   backend-provided `display_id` (e.g. `#workbridge-42`), it is
+   rendered as a dimmed `#<slug>-<N>` subtitle between the title and
+   the branch line, styled with the same `meta_style` as the branch
+   line so selection highlighting flows consistently. Legacy records
+   without a `display_id` skip this line entirely - row heights are
+   variable, which the list rendering already supports for title and
+   branch wrap. See `docs/work-items.md` "Display IDs" for the format
+   and uniqueness rules.
+4. **Branch subtitle line** - the branch name plus optional
+   `[no wt]` marker when the worktree is missing. Also styled with
+   `meta_style`.
+
 Stage transitions: Shift+Right to advance, Shift+Left to retreat.
 
 Left panel: 25% of width (min 30 columns)

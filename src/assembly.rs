@@ -373,6 +373,11 @@ pub fn reassemble(
             backend_type: backend_type_from_id(&record.id),
             kind: record.kind.clone(),
             title,
+            // display_id is a pass-through from the backend record -
+            // the assembly layer does not derive it. `None` for
+            // pre-feature records, which the list renderer silently
+            // skips.
+            display_id: record.display_id.clone(),
             description: record.description.clone(),
             status,
             status_derived,
@@ -531,6 +536,7 @@ mod tests {
         associations: Vec<RepoAssociationRecord>,
     ) -> WorkItemRecord {
         WorkItemRecord {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from(format!("/data/{id_suffix}.json"))),
             title: title.to_string(),
             description: None,
@@ -1021,6 +1027,55 @@ mod tests {
     }
 
     #[test]
+    fn reassemble_propagates_display_id() {
+        // The assembly layer must pass `display_id` through from the
+        // backend record unchanged. It is not derived - a legacy
+        // record with `None` must produce a `WorkItem` with `None`,
+        // and a record with `Some("foo-42")` must produce a
+        // `WorkItem` with the same string.
+        let rp = repo_path("alpha");
+        let mut record = create_mock_record(
+            "wi-display",
+            "title",
+            WorkItemStatus::Backlog,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: None,
+                pr_identity: None,
+            }],
+        );
+        record.display_id = Some("alpha-42".into());
+
+        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].display_id.as_deref(),
+            Some("alpha-42"),
+            "display_id must be passed through from the record"
+        );
+
+        // Legacy record without display_id -> None on the WorkItem.
+        let legacy = create_mock_record(
+            "wi-legacy",
+            "title",
+            WorkItemStatus::Backlog,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: None,
+                pr_identity: None,
+            }],
+        );
+        assert!(legacy.display_id.is_none());
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![], vec![], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+        let (items, _, _, _) = reassemble(&[legacy], &repo_data, DEFAULT_ISSUE_PATTERN);
+        assert_eq!(items[0].display_id, None);
+    }
+
+    #[test]
     fn issue_extraction_from_branch() {
         let rp = repo_path("alpha");
         let branch = "42-fix-bug";
@@ -1373,6 +1428,7 @@ mod tests {
     fn backend_type_derived_from_id() {
         let records = vec![
             WorkItemRecord {
+                display_id: None,
                 id: WorkItemId::LocalFile(PathBuf::from("/data/wi.json")),
                 title: "Local".to_string(),
                 description: None,
@@ -1387,6 +1443,7 @@ mod tests {
                 done_at: None,
             },
             WorkItemRecord {
+                display_id: None,
                 id: WorkItemId::GithubIssue {
                     owner: "o".to_string(),
                     repo: "r".to_string(),
@@ -1405,6 +1462,7 @@ mod tests {
                 done_at: None,
             },
             WorkItemRecord {
+                display_id: None,
                 id: WorkItemId::GithubProject {
                     node_id: "node123".to_string(),
                 },
