@@ -34,8 +34,8 @@ use crate::layout;
 use crate::metrics::{MetricsSnapshot, StuckItem, secs_to_day};
 use crate::theme::Theme;
 use crate::work_item::{
-    BackendType, CheckStatus, PrState, ReviewDecision, SelectionState, WorkItemError, WorkItemKind,
-    WorkItemStatus,
+    BackendType, CheckStatus, MergeableState, PrState, ReviewDecision, SelectionState,
+    WorkItemError, WorkItemKind, WorkItemStatus,
 };
 
 /// Braille-dot spinner frames for the activity indicator.
@@ -1079,6 +1079,9 @@ fn format_board_item<'a>(
             }
             CheckStatus::None | CheckStatus::Unknown => {}
         }
+        if matches!(pr.mergeable, MergeableState::Conflicting) {
+            indicators.push(Span::styled(" !merge", theme.style_badge_merge_conflict()));
+        }
     }
     if !indicators.is_empty() {
         lines.push(Line::from(indicators));
@@ -1459,6 +1462,9 @@ fn format_work_item_entry<'a>(
                 right_parts.push((" ...".to_string(), theme.style_badge_ci_pending()));
             }
             CheckStatus::None | CheckStatus::Unknown => {}
+        }
+        if matches!(pr.mergeable, MergeableState::Conflicting) {
+            right_parts.push((" !merge".to_string(), theme.style_badge_merge_conflict()));
         }
     }
 
@@ -4091,8 +4097,8 @@ mod snapshot_tests {
     use crate::app::{App, FocusPanel, StubBackend, UserActionKey, ViewMode, is_selectable};
     use crate::theme::Theme;
     use crate::work_item::{
-        BackendType, CheckStatus, PrInfo, PrState, RepoAssociation, ReviewDecision, UnlinkedPr,
-        WorkItem, WorkItemError, WorkItemId, WorkItemStatus,
+        BackendType, CheckStatus, MergeableState, PrInfo, PrState, RepoAssociation, ReviewDecision,
+        UnlinkedPr, WorkItem, WorkItemError, WorkItemId, WorkItemStatus,
     };
     use crate::work_item_backend::{BackendError, CreateWorkItem, WorkItemBackend, WorkItemRecord};
     use ratatui_core::{backend::TestBackend, terminal::Terminal};
@@ -4238,6 +4244,7 @@ mod snapshot_tests {
             is_draft: false,
             review_decision: ReviewDecision::None,
             checks,
+            mergeable: MergeableState::Unknown,
             url: format!("https://github.com/o/r/pull/{number}"),
         }
     }
@@ -4252,6 +4259,7 @@ mod snapshot_tests {
                 is_draft,
                 review_decision: ReviewDecision::None,
                 checks: CheckStatus::None,
+                mergeable: MergeableState::Unknown,
                 url: format!("https://github.com/o/r/pull/{number}"),
             },
             branch: branch.to_string(),
@@ -4326,6 +4334,7 @@ mod snapshot_tests {
                     is_draft: false,
                     review_decision: ReviewDecision::Pending,
                     checks: CheckStatus::Passing,
+                    mergeable: MergeableState::Unknown,
                     url: "https://github.com/o/r/pull/77".into(),
                 },
                 branch: "refactor-auth".into(),
@@ -4608,6 +4617,7 @@ mod snapshot_tests {
                     is_draft: false,
                     review_decision: ReviewDecision::None,
                     checks: CheckStatus::Passing,
+                    mergeable: MergeableState::Unknown,
                     url: "https://github.com/o/r/pull/50".to_string(),
                 }),
                 1,

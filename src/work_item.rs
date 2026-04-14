@@ -198,6 +198,14 @@ pub enum CheckStatus {
     Unknown,
 }
 
+/// Whether GitHub reports the PR as mergeable against its base branch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MergeableState {
+    Unknown,
+    Mergeable,
+    Conflicting,
+}
+
 /// PR review decision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ReviewDecision {
@@ -231,6 +239,7 @@ pub struct PrInfo {
     pub is_draft: bool,
     pub review_decision: ReviewDecision,
     pub checks: CheckStatus,
+    pub mergeable: MergeableState,
     pub url: String,
 }
 

@@ -51,6 +51,10 @@ pub struct GithubPr {
     /// The login of the PR author. None if the gh CLI did not return
     /// the field (backwards compatibility with older fetch results).
     pub author: Option<String>,
+    /// Raw mergeable state from GitHub (e.g. "MERGEABLE", "CONFLICTING",
+    /// "UNKNOWN", or empty). Indicates whether the PR has a merge conflict
+    /// against its base branch.
+    pub mergeable: String,
 }
 
 /// A raw issue as returned by the GitHub API (via gh CLI).
@@ -194,7 +198,7 @@ impl GhCliClient {
 impl GithubClient for GhCliClient {
     fn list_open_prs(&self, owner: &str, repo: &str) -> Result<Vec<GithubPr>, GithubError> {
         let repo_arg = format!("{owner}/{repo}");
-        let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner,author";
+        let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner,author,mergeable";
         let stdout = self.run_gh(&[
             "pr",
             "list",
@@ -222,7 +226,7 @@ impl GithubClient for GhCliClient {
         repo: &str,
     ) -> Result<Vec<GithubPr>, GithubError> {
         let repo_arg = format!("{owner}/{repo}");
-        let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner,author";
+        let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner,author,mergeable";
         let stdout = self.run_gh(&[
             "pr",
             "list",
@@ -343,6 +347,12 @@ fn parse_pr_from_value(v: &Value) -> Result<GithubPr, GithubError> {
         .and_then(|l| l.as_str())
         .map(|s| s.to_string());
 
+    let mergeable = v
+        .get("mergeable")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+
     Ok(GithubPr {
         number,
         title,
@@ -354,6 +364,7 @@ fn parse_pr_from_value(v: &Value) -> Result<GithubPr, GithubError> {
         status_check_rollup,
         head_repo_owner,
         author,
+        mergeable,
     })
 }
 
@@ -572,6 +583,7 @@ mod tests {
                 status_check_rollup: "SUCCESS".into(),
                 head_repo_owner: None,
                 author: None,
+                mergeable: "MERGEABLE".into(),
             }],
             issues: Vec::new(),
             review_requested_prs: Vec::new(),

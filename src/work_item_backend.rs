@@ -739,7 +739,7 @@ impl WorkItemBackend for LocalFileBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
+    use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("workbridge-test-backend-{name}"));
@@ -1052,6 +1052,7 @@ mod tests {
                 is_draft: false,
                 review_decision: ReviewDecision::None,
                 checks: CheckStatus::Passing,
+                mergeable: MergeableState::Unknown,
                 url: "https://github.com/org/repo/pull/42".into(),
             },
             branch: "42-fix-widget".into(),
