@@ -1,6 +1,6 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 24)"
+expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
 ┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
@@ -13,7 +13,7 @@ expression: "render(&app, 80, 24)"
 │                   │                                      │t                  │
 │                   │ Why is rework needed?                │                   │
 │                   │                                      │                   │
-│                   │  needs more error handling           │                   │
+│                   │ needs more error handling            │                   │
 │                   │                                      │                   │
 │                   │ Enter: Submit   Esc: Cancel          │                   │
 │                   │                                      │                   │

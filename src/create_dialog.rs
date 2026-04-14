@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+use rat_widget::text_input::TextInputState;
+use rat_widget::textarea::TextAreaState;
+
 use crate::work_item::{WorkItemId, WorkItemStatus};
 
 /// Which field has keyboard focus inside the create dialog.
@@ -11,328 +14,17 @@ pub enum CreateDialogFocus {
     Branch,
 }
 
-/// A simple inline text input with cursor, insert, delete, and navigation.
-///
-/// rat-widget's TextInputState uses Rc internally (not Send-safe) and is
-/// heavier than we need. This struct covers the basics: character insert,
-/// backspace, delete, home, end, left, right.
-#[derive(Clone, Debug, Default)]
-pub struct SimpleTextInput {
-    /// The current text content.
-    pub text: String,
-    /// Byte offset of the cursor within `text`.
-    cursor: usize,
-}
-
-impl SimpleTextInput {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the text content and move the cursor to the end.
-    /// Used by tests and dialog initialization.
-    #[allow(dead_code)]
-    pub fn set_text(&mut self, s: &str) {
-        self.text = s.to_string();
-        self.cursor = self.text.len();
-    }
-
-    /// Get the current text.
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    /// Get the cursor position as a character offset (for rendering).
-    pub fn cursor_char_pos(&self) -> usize {
-        self.text[..self.cursor].chars().count()
-    }
-
-    /// Insert a character at the cursor position.
-    pub fn insert_char(&mut self, c: char) {
-        self.text.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-    }
-
-    /// Delete the character before the cursor (backspace).
-    pub fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        // Find the start of the previous character.
-        let prev = self.text[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        self.text.remove(prev);
-        self.cursor = prev;
-    }
-
-    /// Delete the character at the cursor position.
-    pub fn delete(&mut self) {
-        if self.cursor >= self.text.len() {
-            return;
-        }
-        self.text.remove(self.cursor);
-    }
-
-    /// Move cursor one character to the left.
-    pub fn move_left(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let prev = self.text[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        self.cursor = prev;
-    }
-
-    /// Move cursor one character to the right.
-    pub fn move_right(&mut self) {
-        if self.cursor >= self.text.len() {
-            return;
-        }
-        let next = self.text[self.cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(i, _)| self.cursor + i)
-            .unwrap_or(self.text.len());
-        self.cursor = next;
-    }
-
-    /// Move cursor to the start of the text.
-    pub fn home(&mut self) {
-        self.cursor = 0;
-    }
-
-    /// Move cursor to the end of the text.
-    pub fn end(&mut self) {
-        self.cursor = self.text.len();
-    }
-
-    /// Clear all text and reset cursor.
-    pub fn clear(&mut self) {
-        self.text.clear();
-        self.cursor = 0;
-    }
-}
-
-/// A simple multi-line text area with cursor movement and scrolling.
-///
-/// Stores text as a vector of lines. Supports insert, delete, newlines,
-/// and basic cursor movement (arrows, home, end, up, down).
-#[derive(Clone, Debug)]
-pub struct SimpleTextArea {
-    /// Lines of text. Always has at least one entry (possibly empty).
-    lines: Vec<String>,
-    /// Current cursor row (0-based line index).
-    cursor_row: usize,
-    /// Byte offset of the cursor within the current line.
-    cursor_col: usize,
-    /// First visible line index (for vertical scrolling).
-    pub scroll_offset: usize,
-}
-
-impl Default for SimpleTextArea {
-    fn default() -> Self {
-        Self {
-            lines: vec![String::new()],
-            cursor_row: 0,
-            cursor_col: 0,
-            scroll_offset: 0,
-        }
-    }
-}
-
-impl SimpleTextArea {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set text content and move cursor to end.
-    #[allow(dead_code)]
-    pub fn set_text(&mut self, s: &str) {
-        self.lines = s.split('\n').map(|l| l.to_string()).collect();
-        if self.lines.is_empty() {
-            self.lines.push(String::new());
-        }
-        self.cursor_row = self.lines.len() - 1;
-        self.cursor_col = self.lines[self.cursor_row].len();
-        self.scroll_offset = 0;
-    }
-
-    /// Get the full text content with newlines joining lines.
-    pub fn text(&self) -> String {
-        self.lines.join("\n")
-    }
-
-    /// Get the cursor position as (row, char_col) for rendering.
-    pub fn cursor_pos(&self) -> (usize, usize) {
-        let char_col = self.lines[self.cursor_row][..self.cursor_col]
-            .chars()
-            .count();
-        (self.cursor_row, char_col)
-    }
-
-    /// Get visible lines for rendering, given the visible height.
-    pub fn visible_lines(&self, height: usize) -> &[String] {
-        let start = self.scroll_offset;
-        let end = (start + height).min(self.lines.len());
-        &self.lines[start..end]
-    }
-
-    /// Ensure the cursor row is visible given the viewport height.
-    pub fn ensure_visible(&mut self, height: usize) {
-        if height == 0 {
-            return;
-        }
-        if self.cursor_row < self.scroll_offset {
-            self.scroll_offset = self.cursor_row;
-        } else if self.cursor_row >= self.scroll_offset + height {
-            self.scroll_offset = self.cursor_row - height + 1;
-        }
-    }
-
-    /// Insert a character at the cursor position.
-    pub fn insert_char(&mut self, c: char) {
-        self.lines[self.cursor_row].insert(self.cursor_col, c);
-        self.cursor_col += c.len_utf8();
-    }
-
-    /// Insert a newline, splitting the current line at the cursor.
-    pub fn insert_newline(&mut self) {
-        let rest = self.lines[self.cursor_row][self.cursor_col..].to_string();
-        self.lines[self.cursor_row].truncate(self.cursor_col);
-        self.cursor_row += 1;
-        self.lines.insert(self.cursor_row, rest);
-        self.cursor_col = 0;
-    }
-
-    /// Delete the character before the cursor (backspace).
-    /// At the start of a line, joins with the previous line.
-    pub fn backspace(&mut self) {
-        if self.cursor_col > 0 {
-            let prev = self.lines[self.cursor_row][..self.cursor_col]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            self.lines[self.cursor_row].remove(prev);
-            self.cursor_col = prev;
-        } else if self.cursor_row > 0 {
-            let current_line = self.lines.remove(self.cursor_row);
-            self.cursor_row -= 1;
-            self.cursor_col = self.lines[self.cursor_row].len();
-            self.lines[self.cursor_row].push_str(&current_line);
-        }
-    }
-
-    /// Delete the character at the cursor position.
-    /// At the end of a line, joins with the next line.
-    pub fn delete(&mut self) {
-        let line_len = self.lines[self.cursor_row].len();
-        if self.cursor_col < line_len {
-            self.lines[self.cursor_row].remove(self.cursor_col);
-        } else if self.cursor_row + 1 < self.lines.len() {
-            let next_line = self.lines.remove(self.cursor_row + 1);
-            self.lines[self.cursor_row].push_str(&next_line);
-        }
-    }
-
-    /// Move cursor one character to the left. Wraps to end of previous line.
-    pub fn move_left(&mut self) {
-        if self.cursor_col > 0 {
-            let prev = self.lines[self.cursor_row][..self.cursor_col]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            self.cursor_col = prev;
-        } else if self.cursor_row > 0 {
-            self.cursor_row -= 1;
-            self.cursor_col = self.lines[self.cursor_row].len();
-        }
-    }
-
-    /// Move cursor one character to the right. Wraps to start of next line.
-    pub fn move_right(&mut self) {
-        let line_len = self.lines[self.cursor_row].len();
-        if self.cursor_col < line_len {
-            let next = self.lines[self.cursor_row][self.cursor_col..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| self.cursor_col + i)
-                .unwrap_or(line_len);
-            self.cursor_col = next;
-        } else if self.cursor_row + 1 < self.lines.len() {
-            self.cursor_row += 1;
-            self.cursor_col = 0;
-        }
-    }
-
-    /// Move cursor up one line, preserving column position as best as possible.
-    pub fn move_up(&mut self) {
-        if self.cursor_row > 0 {
-            let char_col = self.lines[self.cursor_row][..self.cursor_col]
-                .chars()
-                .count();
-            self.cursor_row -= 1;
-            self.cursor_col = char_to_byte_offset(&self.lines[self.cursor_row], char_col);
-        }
-    }
-
-    /// Move cursor down one line, preserving column position as best as possible.
-    pub fn move_down(&mut self) {
-        if self.cursor_row + 1 < self.lines.len() {
-            let char_col = self.lines[self.cursor_row][..self.cursor_col]
-                .chars()
-                .count();
-            self.cursor_row += 1;
-            self.cursor_col = char_to_byte_offset(&self.lines[self.cursor_row], char_col);
-        }
-    }
-
-    /// Move cursor to the start of the current line.
-    pub fn home(&mut self) {
-        self.cursor_col = 0;
-    }
-
-    /// Move cursor to the end of the current line.
-    pub fn end(&mut self) {
-        self.cursor_col = self.lines[self.cursor_row].len();
-    }
-
-    /// Clear all text and reset cursor.
-    pub fn clear(&mut self) {
-        self.lines = vec![String::new()];
-        self.cursor_row = 0;
-        self.cursor_col = 0;
-        self.scroll_offset = 0;
-    }
-}
-
-/// Convert a character offset to a byte offset within a string, clamping
-/// to the string length if the char offset exceeds available characters.
-fn char_to_byte_offset(s: &str, char_offset: usize) -> usize {
-    s.char_indices()
-        .nth(char_offset)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
-}
-
 /// State for the work item creation modal dialog.
 #[derive(Clone, Debug)]
 pub struct CreateDialog {
     /// Whether the dialog is currently visible.
     pub visible: bool,
     /// Text input for the work item title.
-    pub title_input: SimpleTextInput,
+    pub title_input: TextInputState,
     /// Multi-line text area for the optional description.
-    pub description_input: SimpleTextArea,
+    pub description_input: TextAreaState,
     /// Text input for the optional branch name.
-    pub branch_input: SimpleTextInput,
+    pub branch_input: TextInputState,
     /// List of repos with selection state: (repo_path, selected).
     pub repo_list: Vec<(PathBuf, bool)>,
     /// Cursor position in the repo list.
@@ -354,9 +46,9 @@ impl Default for CreateDialog {
     fn default() -> Self {
         Self {
             visible: false,
-            title_input: SimpleTextInput::new(),
-            description_input: SimpleTextArea::new(),
-            branch_input: SimpleTextInput::new(),
+            title_input: TextInputState::new(),
+            description_input: TextAreaState::new(),
+            branch_input: TextInputState::new(),
             repo_list: Vec::new(),
             repo_cursor: 0,
             focus_field: CreateDialogFocus::Title,
@@ -487,8 +179,8 @@ impl CreateDialog {
     }
 
     /// Get the currently focused single-line text input mutably.
-    /// Returns None for Description (uses SimpleTextArea) and Repos.
-    pub fn focused_input_mut(&mut self) -> Option<&mut SimpleTextInput> {
+    /// Returns None for Description (uses TextAreaState) and Repos.
+    pub fn focused_input_mut(&mut self) -> Option<&mut TextInputState> {
         match self.focus_field {
             CreateDialogFocus::Title => Some(&mut self.title_input),
             CreateDialogFocus::Branch => Some(&mut self.branch_input),
@@ -510,7 +202,7 @@ impl CreateDialog {
         let suffix = random_suffix();
         let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
         self.branch_input
-            .set_text(&format!("{username}/{slug}-{suffix}"));
+            .set_text(format!("{username}/{slug}-{suffix}"));
     }
 }
 
@@ -589,13 +281,14 @@ pub enum PendingBranchAction {
 /// State for the "Set branch name" recovery modal. Shown when a work item
 /// has reached a stage where a branch is required but its repo
 /// associations all have `branch.is_none()`. The dialog reuses
-/// `SimpleTextInput` and prefills a slug generated from the item's title.
+/// `rat_widget::text_input::TextInputState` and prefills a slug generated
+/// from the item's title.
 #[derive(Clone, Debug)]
 pub struct SetBranchDialog {
     /// The work item that needs a branch.
     pub wi_id: WorkItemId,
     /// The branch-name text input, prefilled with a slug default.
-    pub input: SimpleTextInput,
+    pub input: TextInputState,
     /// What to do after the branch is persisted.
     pub pending: PendingBranchAction,
 }
@@ -603,188 +296,6 @@ pub struct SetBranchDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn simple_text_input_basic_operations() {
-        let mut input = SimpleTextInput::new();
-        assert_eq!(input.text(), "");
-        assert_eq!(input.cursor_char_pos(), 0);
-
-        input.insert_char('h');
-        input.insert_char('e');
-        input.insert_char('l');
-        input.insert_char('l');
-        input.insert_char('o');
-        assert_eq!(input.text(), "hello");
-        assert_eq!(input.cursor_char_pos(), 5);
-
-        input.backspace();
-        assert_eq!(input.text(), "hell");
-
-        input.home();
-        assert_eq!(input.cursor_char_pos(), 0);
-
-        input.delete();
-        assert_eq!(input.text(), "ell");
-
-        input.end();
-        assert_eq!(input.cursor_char_pos(), 3);
-
-        input.move_left();
-        assert_eq!(input.cursor_char_pos(), 2);
-
-        input.move_right();
-        assert_eq!(input.cursor_char_pos(), 3);
-    }
-
-    #[test]
-    fn simple_text_input_set_text() {
-        let mut input = SimpleTextInput::new();
-        input.set_text("preset value");
-        assert_eq!(input.text(), "preset value");
-        assert_eq!(input.cursor_char_pos(), 12);
-    }
-
-    #[test]
-    fn simple_text_input_boundary_cases() {
-        let mut input = SimpleTextInput::new();
-
-        // Backspace on empty does nothing.
-        input.backspace();
-        assert_eq!(input.text(), "");
-
-        // Delete on empty does nothing.
-        input.delete();
-        assert_eq!(input.text(), "");
-
-        // Move left at start does nothing.
-        input.move_left();
-        assert_eq!(input.cursor_char_pos(), 0);
-
-        // Move right at end does nothing.
-        input.move_right();
-        assert_eq!(input.cursor_char_pos(), 0);
-    }
-
-    // -- SimpleTextArea tests --
-
-    #[test]
-    fn textarea_basic_insert_and_newline() {
-        let mut ta = SimpleTextArea::new();
-        ta.insert_char('a');
-        ta.insert_char('b');
-        ta.insert_newline();
-        ta.insert_char('c');
-        assert_eq!(ta.text(), "ab\nc");
-        assert_eq!(ta.cursor_pos(), (1, 1));
-    }
-
-    #[test]
-    fn textarea_backspace_joins_lines() {
-        let mut ta = SimpleTextArea::new();
-        ta.set_text("hello\nworld");
-        // cursor at end of "world"
-        ta.home(); // start of "world"
-        ta.backspace(); // should join with previous line
-        assert_eq!(ta.text(), "helloworld");
-        assert_eq!(ta.cursor_pos(), (0, 5));
-    }
-
-    #[test]
-    fn textarea_delete_joins_lines() {
-        let mut ta = SimpleTextArea::new();
-        ta.set_text("hello\nworld");
-        // Move to end of first line
-        ta.cursor_row = 0;
-        ta.cursor_col = 5;
-        ta.delete(); // should join with next line
-        assert_eq!(ta.text(), "helloworld");
-    }
-
-    #[test]
-    fn textarea_move_up_down() {
-        let mut ta = SimpleTextArea::new();
-        ta.set_text("abc\nde\nfghij");
-        ta.cursor_row = 0;
-        ta.cursor_col = 3; // end of "abc"
-
-        ta.move_down();
-        assert_eq!(ta.cursor_row, 1);
-        // char col 3 clamps to len of "de" = 2
-        assert_eq!(ta.cursor_col, 2);
-
-        ta.move_down();
-        assert_eq!(ta.cursor_row, 2);
-        // restores to char col 2 (byte 2 in "fghij")
-        assert_eq!(ta.cursor_col, 2);
-
-        ta.move_up();
-        assert_eq!(ta.cursor_row, 1);
-    }
-
-    #[test]
-    fn textarea_move_left_wraps_to_prev_line() {
-        let mut ta = SimpleTextArea::new();
-        ta.set_text("ab\ncd");
-        ta.cursor_row = 1;
-        ta.cursor_col = 0;
-        ta.move_left(); // wrap to end of "ab"
-        assert_eq!(ta.cursor_row, 0);
-        assert_eq!(ta.cursor_col, 2);
-    }
-
-    #[test]
-    fn textarea_move_right_wraps_to_next_line() {
-        let mut ta = SimpleTextArea::new();
-        ta.set_text("ab\ncd");
-        ta.cursor_row = 0;
-        ta.cursor_col = 2; // end of "ab"
-        ta.move_right(); // wrap to start of "cd"
-        assert_eq!(ta.cursor_row, 1);
-        assert_eq!(ta.cursor_col, 0);
-    }
-
-    #[test]
-    fn textarea_clear() {
-        let mut ta = SimpleTextArea::new();
-        ta.set_text("some\ntext");
-        ta.clear();
-        assert_eq!(ta.text(), "");
-        assert_eq!(ta.cursor_pos(), (0, 0));
-    }
-
-    #[test]
-    fn textarea_visible_lines_with_scroll() {
-        let mut ta = SimpleTextArea::new();
-        ta.set_text("line0\nline1\nline2\nline3\nline4");
-        ta.scroll_offset = 2;
-        let visible = ta.visible_lines(2);
-        assert_eq!(visible.len(), 2);
-        assert_eq!(visible[0], "line2");
-        assert_eq!(visible[1], "line3");
-    }
-
-    #[test]
-    fn textarea_ensure_visible() {
-        let mut ta = SimpleTextArea::new();
-        ta.set_text("a\nb\nc\nd\ne");
-        ta.cursor_row = 4;
-        ta.ensure_visible(3);
-        assert_eq!(ta.scroll_offset, 2); // lines 2,3,4 visible
-    }
-
-    #[test]
-    fn textarea_boundary_no_panic() {
-        let mut ta = SimpleTextArea::new();
-        // Operations on empty
-        ta.backspace();
-        ta.delete();
-        ta.move_left();
-        ta.move_right();
-        ta.move_up();
-        ta.move_down();
-        assert_eq!(ta.text(), "");
-    }
 
     // -- Dialog tests --
 
@@ -861,6 +372,29 @@ mod tests {
         assert!(description.is_none());
         assert_eq!(selected_repos, vec![PathBuf::from("/repo/a")]);
         assert_eq!(branch, "feature/my-branch");
+    }
+
+    #[test]
+    fn description_long_text_roundtrips_through_validate() {
+        // A long single-line string must not be silently truncated or
+        // rejected by validate(). The TextArea state handles wrapping as a
+        // rendering concern; the underlying text is preserved.
+        let long: String = "x".repeat(250);
+        let repos = vec![PathBuf::from("/repo/a")];
+        let mut dialog = CreateDialog::new();
+        dialog.open(&repos, Some(&PathBuf::from("/repo/a")));
+        dialog.title_input.set_text("My feature");
+        dialog.branch_input.set_text("feature/my-branch");
+        dialog.description_input.set_text(&long);
+
+        let result = dialog.validate();
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        let (_, description, _, _) = result.unwrap();
+        assert_eq!(
+            description.expect("description should be Some for non-empty text"),
+            long,
+            "description must round-trip unchanged",
+        );
     }
 
     #[test]

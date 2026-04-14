@@ -1,15 +1,17 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 24)"
+expression: "render(&mut app, 80, 24)"
 ---
-  List    Board    Dashboard                                   Tab: switch view
-┌ Work Items (0)┌ Create Work Item ────────────────────────────┐───────────────┐
+  List    Board ┌ Create Work Item ────────────────────────────┐ab: switch view
+┌ Work Items (0)│                                              │───────────────┐
+│               │ Title:                                       │               │
+│  No work items│                                              │               │
 │               │                                              │               │
-│  No work items│ Title:                                       │               │
+│  Ctrl+N: quick│ Description (optional):                      │               │
+│  Ctrl+B: backl│                                              │               │
 │               │                                              │               │
-│  Ctrl+N: quick│                                              │               │
-│  Ctrl+B: backl│ Description (optional):                      │               │
-│               │  (empty)                                     │               │
+│               │                                              │               │
+│               │                                              │               │
 │               │                                              │               │
 │               │                                              │               │
 │               │                                              │               │
@@ -18,11 +20,9 @@ expression: "render(&app, 80, 24)"
 │               │  [ ] /Volumes/X10/Projects/other-repo        │               │
 │               │                                              │               │
 │               │ Branch (optional):                           │               │
-│               │  (empty)                                     │               │
+│               │                                              │               │
 │               │                                              │               │
 │               │                                              │               │
 │               │ Enter: Create | Esc: Cancel | Tab: Next fiel │               │
 │               │                                              │               │
-│               └──────────────────────────────────────────────┘               │
-│                       ││                                                     │
-└───────────────────────┘└─────────────────────────────────────────────────────┘
+└───────────────└──────────────────────────────────────────────┘───────────────┘

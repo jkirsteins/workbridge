@@ -1,3 +1,7 @@
+use rat_widget::scrolled::Scroll;
+use rat_widget::text::TextStyle;
+use rat_widget::text_input::TextInput;
+use rat_widget::textarea::{TextArea, TextWrap};
 use ratatui_core::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Margin, Position, Rect},
@@ -47,7 +51,11 @@ const SPINNER_FRAMES: &[char] = &[
 /// Buffer-based rendering entry point. Called by the rat-salsa render
 /// callback. All rendering uses Widget::render(area, buf) and
 /// StatefulWidget::render(widget, area, buf, &mut state) directly.
-pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
+///
+/// `app` is `&mut` because stateful widgets owned by `App` (currently the
+/// `rat-widget` text fields inside `CreateDialog`) need `&mut State` to
+/// render.
+pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme) {
     // Vertical split: 1-row view mode header + main area + optional context bar + optional status bar.
     let has_context = app.selected_work_item_context().is_some();
     let has_status = app.has_visible_status_bar();
@@ -174,7 +182,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
                 },
             );
         }
-    } else if let Some(dlg) = app.set_branch_dialog.as_ref() {
+    } else if let Some(dlg) = app.set_branch_dialog.as_mut() {
         draw_prompt_dialog(
             buf,
             theme,
@@ -182,7 +190,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
             PromptDialogKind::TextInput {
                 title: "Set Branch Name",
                 body: "This work item has no branch. Enter a name to continue.",
-                input: &dlg.input,
+                input: &mut dlg.input,
                 hint: "Enter: confirm   Esc: cancel",
             },
         );
@@ -194,7 +202,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
             PromptDialogKind::TextInput {
                 title: "Rework Reason",
                 body: "Why is rework needed?",
-                input: &app.rework_prompt_input,
+                input: &mut app.rework_prompt_input,
                 hint: "Enter: Submit   Esc: Cancel",
             },
         );
@@ -206,7 +214,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
             PromptDialogKind::TextInput {
                 title: "Close Reason",
                 body: "Reason to comment on the PR (optional):",
-                input: &app.cleanup_reason_input,
+                input: &mut app.cleanup_reason_input,
                 hint: "Enter: Submit   Esc: Cancel",
             },
         );
@@ -329,8 +337,10 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
     }
 
     // Create dialog overlay (rendered on top of everything).
+    // Uses `&mut app.create_dialog` because the rat-widget `TextInput` /
+    // `TextArea` stateful widgets need `&mut State` to render.
     if app.create_dialog.visible {
-        draw_create_dialog(buf, &app.create_dialog, theme, area);
+        draw_create_dialog(buf, &mut app.create_dialog, theme, area);
     }
 }
 
@@ -2560,7 +2570,7 @@ const REPOS_LIST_MAX_ROWS: u16 = 6;
 ///   - Repos section: horizontal split of Active and Excluded lists
 ///   - Defaults (2 lines)
 ///   - Hint line
-fn draw_settings_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+fn draw_settings_overlay(buf: &mut Buffer, app: &mut App, theme: &Theme, area: Rect) {
     // Dim the background so the overlay is the clear focal point.
     dim_background(buf, area);
 
@@ -2809,7 +2819,7 @@ fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area: Rec
     Paragraph::new(defaults_text).render(sections[4], buf);
 }
 
-fn draw_settings_review_gate_tab(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+fn draw_settings_review_gate_tab(buf: &mut Buffer, app: &mut App, theme: &Theme, area: Rect) {
     // Layout: heading (1) + blank (1) + label (1) + input (1) + blank (1) + description.
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -2830,9 +2840,17 @@ fn draw_settings_review_gate_tab(buf: &mut Buffer, app: &App, theme: &Theme, are
     Paragraph::new(label).render(rows[2], buf);
 
     if app.settings_review_skill_editing {
-        draw_text_input_field(buf, &app.settings_review_skill_input, theme, rows[3], true);
+        // Render with rat-widget's TextInput so the caret is drawn by the
+        // same stateful widget used by the Create Work Item dialog.
+        app.settings_review_skill_input.focus.set(true);
+        StatefulWidget::render(
+            TextInput::new().styles(create_dialog_text_style(theme)),
+            rows[3],
+            buf,
+            &mut app.settings_review_skill_input,
+        );
     } else {
-        // Show the current value; style matches draw_text_input_field unfocused.
+        // Show the current value; mirror the unfocused single-line style.
         let value = Line::from(vec![
             Span::raw(" "),
             Span::styled(
@@ -2935,15 +2953,22 @@ fn draw_settings_keybindings_tab(buf: &mut Buffer, app: &App, theme: &Theme, are
 ///   |  Enter: Create  |  Esc: Cancel  |  Tab: Next field  |
 ///   +-----------------------------------------------------+
 /// Height of the description text area (visible lines).
-pub const DESC_TEXTAREA_HEIGHT: u16 = 3;
+///
+/// Six rows gives enough vertical room to show wrapped multi-line
+/// descriptions without immediately scrolling on the first few lines of
+/// typing. When content exceeds this height the underlying
+/// `rat_widget::textarea::TextArea` scrolls vertically (a scrollbar is
+/// wired through `Scroll::new`), so long descriptions are still fully
+/// editable.
+pub const DESC_TEXTAREA_HEIGHT: u16 = 6;
 
-fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, area: Rect) {
+fn draw_create_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &Theme, area: Rect) {
     // Dim the background so the dialog is the clear focal point.
     dim_background(buf, area);
 
     // Compute dialog height based on content.
     // Rows: border(1) + blank(1) + "Title:" label(1) + input(1) + blank(1)
-    //   + "Description:" label(1) + textarea(3) + blank(1)
+    //   + "Description:" label(1) + textarea(DESC_TEXTAREA_HEIGHT) + blank(1)
     //   + "Repos:" label(1) + repo_lines(max 6) + blank(1)
     //   + "Branch:" label(1) + input(1) + blank(1)
     //   + error_line(1) + hint(1) + border(1)
@@ -3001,13 +3026,17 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, ar
     };
     Paragraph::new(Line::styled("Title:", title_label_style)).render(sections[0], buf);
 
-    // Title input
-    draw_text_input_field(
-        buf,
-        &dialog.title_input,
-        theme,
+    // Title input (rat_widget::text_input::TextInput).
+    // Sync focus flag to dialog focus state before rendering.
+    dialog
+        .title_input
+        .focus
+        .set(dialog.focus_field == CreateDialogFocus::Title);
+    StatefulWidget::render(
+        TextInput::new().styles(create_dialog_text_style(theme)),
         sections[1],
-        dialog.focus_field == CreateDialogFocus::Title,
+        buf,
+        &mut dialog.title_input,
     );
 
     // Description label
@@ -3019,13 +3048,23 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, ar
     Paragraph::new(Line::styled("Description (optional):", desc_label_style))
         .render(sections[3], buf);
 
-    // Description textarea
-    draw_text_area_field(
-        buf,
-        &dialog.description_input,
-        theme,
+    // Description textarea (rat_widget::textarea::TextArea).
+    // - `TextWrap::Word(2)` wraps long descriptions at word boundaries,
+    //   preferring breaks in the last two columns before the right margin.
+    // - `Scroll::new()` on the vertical axis wires a scrollbar and lets
+    //   the textarea scroll when content exceeds DESC_TEXTAREA_HEIGHT.
+    dialog
+        .description_input
+        .focus
+        .set(dialog.focus_field == CreateDialogFocus::Description);
+    StatefulWidget::render(
+        TextArea::new()
+            .text_wrap(TextWrap::Word(2))
+            .vscroll(Scroll::new())
+            .styles(create_dialog_text_style(theme)),
         sections[4],
-        dialog.focus_field == CreateDialogFocus::Description,
+        buf,
+        &mut dialog.description_input,
     );
 
     // Repos label
@@ -3071,13 +3110,16 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, ar
     };
     Paragraph::new(Line::styled("Branch (optional):", branch_label_style)).render(sections[9], buf);
 
-    // Branch input
-    draw_text_input_field(
-        buf,
-        &dialog.branch_input,
-        theme,
+    // Branch input (rat_widget::text_input::TextInput).
+    dialog
+        .branch_input
+        .focus
+        .set(dialog.focus_field == CreateDialogFocus::Branch);
+    StatefulWidget::render(
+        TextInput::new().styles(create_dialog_text_style(theme)),
         sections[10],
-        dialog.focus_field == CreateDialogFocus::Branch,
+        buf,
+        &mut dialog.branch_input,
     );
 
     // Error message (if any)
@@ -3093,159 +3135,40 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, ar
     Paragraph::new(hint).render(sections[13], buf);
 }
 
-/// Draw a simple text input field with a visual cursor indicator.
+/// Build the shared `TextStyle` used by the Create Work Item dialog's
+/// text fields (`TextInput` for Title / Branch, `TextArea` for
+/// Description).
 ///
-/// When focused, the text is rendered with a cursor position marker.
-/// When unfocused, just the text is shown dimmed.
-fn draw_text_input_field(
-    buf: &mut Buffer,
-    input: &crate::create_dialog::SimpleTextInput,
-    theme: &Theme,
-    area: Rect,
-    focused: bool,
-) {
-    let text = input.text();
-    let inner_width = area.width.saturating_sub(2) as usize; // 1 char padding each side
-
-    if focused {
-        let cursor_pos = input.cursor_char_pos();
-        // Build the display: text with a cursor block character.
-        let before: String = text.chars().take(cursor_pos).collect();
-        let cursor_char: String = text
-            .chars()
-            .nth(cursor_pos)
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| " ".to_string());
-        let after: String = text.chars().skip(cursor_pos + 1).collect();
-
-        // Truncate to fit. Simple approach: if text is longer than inner_width,
-        // scroll so cursor is visible.
-        let total_chars = text.chars().count().max(cursor_pos + 1);
-        let (display_before, display_cursor, display_after) = if total_chars <= inner_width {
-            (before, cursor_char, after)
-        } else {
-            // Scroll window to keep cursor visible.
-            let start = if cursor_pos >= inner_width {
-                cursor_pos - inner_width + 1
-            } else {
-                0
-            };
-            let b: String = text.chars().skip(start).take(cursor_pos - start).collect();
-            let c: String = text
-                .chars()
-                .nth(cursor_pos)
-                .map(|ch| ch.to_string())
-                .unwrap_or_else(|| " ".to_string());
-            let remaining = inner_width.saturating_sub(cursor_pos - start + 1);
-            let a: String = text.chars().skip(cursor_pos + 1).take(remaining).collect();
-            (b, c, a)
-        };
-
-        let line = Line::from(vec![
-            Span::raw(" "),
-            Span::styled(display_before, theme.style_text()),
-            Span::styled(
-                display_cursor,
-                ratatui_core::style::Style::default()
-                    .fg(theme.tab_highlight_fg)
-                    .bg(theme.tab_highlight_bg),
-            ),
-            Span::styled(display_after, theme.style_text()),
-        ]);
-        Paragraph::new(line).render(area, buf);
-    } else {
-        // Unfocused: show text dimmed.
-        let display: String = if text.is_empty() {
-            "(empty)".to_string()
-        } else {
-            text.chars().take(inner_width).collect()
-        };
-        let line = Line::from(vec![
-            Span::raw(" "),
-            Span::styled(display, theme.style_text_muted()),
-        ]);
-        Paragraph::new(line).render(area, buf);
+/// - `style` is the base text color (plain, not dimmed).
+/// - `focus` is left at the base style so focused fields don't visually
+///   change the run of text itself; the adjacent label (e.g. `Title:`)
+///   already switches to the heading color when the field has focus.
+/// - `cursor` uses the tab-highlight foreground/background so the caret
+///   block is visible against the terminal's default background. This
+///   is only honoured when the rat-text cursor type is
+///   `RenderedCursor`; see [`ensure_rendered_cursor`].
+fn create_dialog_text_style(theme: &Theme) -> TextStyle {
+    ensure_rendered_cursor();
+    let base = theme.style_text();
+    let cursor = ratatui_core::style::Style::default()
+        .fg(theme.tab_highlight_fg)
+        .bg(theme.tab_highlight_bg);
+    TextStyle {
+        style: base,
+        focus: Some(base),
+        cursor: Some(cursor),
+        ..Default::default()
     }
 }
 
-/// Draw a multi-line text area field for the description input.
-///
-/// Shows visible lines from the textarea with cursor when focused.
-/// When unfocused, shows the first few lines dimmed.
-fn draw_text_area_field(
-    buf: &mut Buffer,
-    textarea: &crate::create_dialog::SimpleTextArea,
-    theme: &Theme,
-    area: Rect,
-    focused: bool,
-) {
-    let height = area.height as usize;
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let visible = textarea.visible_lines(height);
-    let (cursor_row, cursor_char_col) = textarea.cursor_pos();
-    let scroll = textarea.scroll_offset;
-
-    for (i, row_area) in (0..height).map(|i| {
-        (
-            i,
-            Rect {
-                x: area.x,
-                y: area.y + i as u16,
-                width: area.width,
-                height: 1,
-            },
-        )
-    }) {
-        let line_idx = scroll + i;
-        let line_text = visible.get(i).map(|s| s.as_str()).unwrap_or("");
-
-        if focused && line_idx == cursor_row {
-            // Render this line with a cursor block.
-            let before: String = line_text.chars().take(cursor_char_col).collect();
-            let cursor_char: String = line_text
-                .chars()
-                .nth(cursor_char_col)
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| " ".to_string());
-            let after: String = line_text.chars().skip(cursor_char_col + 1).collect();
-
-            // Truncate to fit width (simple: no horizontal scroll for now).
-            let b: String = before.chars().take(inner_width).collect();
-            let remaining = inner_width.saturating_sub(b.chars().count() + 1);
-            let a: String = after.chars().take(remaining).collect();
-
-            let line = Line::from(vec![
-                Span::raw(" "),
-                Span::styled(b, theme.style_text()),
-                Span::styled(
-                    cursor_char,
-                    ratatui_core::style::Style::default()
-                        .fg(theme.tab_highlight_fg)
-                        .bg(theme.tab_highlight_bg),
-                ),
-                Span::styled(a, theme.style_text()),
-            ]);
-            Paragraph::new(line).render(row_area, buf);
-        } else if focused {
-            let display: String = line_text.chars().take(inner_width).collect();
-            let line = Line::from(vec![
-                Span::raw(" "),
-                Span::styled(display, theme.style_text()),
-            ]);
-            Paragraph::new(line).render(row_area, buf);
-        } else {
-            let display: String = if i == 0 && line_text.is_empty() && visible.len() <= 1 {
-                "(empty)".to_string()
-            } else {
-                line_text.chars().take(inner_width).collect()
-            };
-            let line = Line::from(vec![
-                Span::raw(" "),
-                Span::styled(display, theme.style_text_muted()),
-            ]);
-            Paragraph::new(line).render(row_area, buf);
-        }
-    }
+/// Configure rat-text to render the cursor into the ratatui `Buffer`
+/// instead of driving the terminal cursor. Called from the text-style
+/// helper so it is applied before the first dialog render - after that
+/// the atomic store is a no-op. Keeps tests deterministic (the
+/// `TestBackend` does not have a real terminal cursor).
+fn ensure_rendered_cursor() {
+    use rat_widget::text::cursor::{CursorType, set_cursor_type};
+    set_cursor_type(CursorType::RenderedCursor);
 }
 
 /// Return a centered rect with fixed width and height within the outer rect.
@@ -3287,7 +3210,7 @@ enum PromptDialogKind<'a> {
     TextInput {
         title: &'a str,
         body: &'a str,
-        input: &'a crate::create_dialog::SimpleTextInput,
+        input: &'a mut rat_widget::text_input::TextInputState,
         hint: &'a str,
     },
     /// Red-bordered alert for errors/warnings. Dismissed with Enter or Esc.
@@ -3433,7 +3356,16 @@ fn draw_prompt_dialog(buf: &mut Buffer, theme: &Theme, area: Rect, kind: PromptD
                 .style(theme.style_text())
                 .render(rows[0], buf);
             // rows[1] is blank.
-            draw_text_input_field(buf, input, theme, rows[2], true);
+            // Focused prompt input: render with rat-widget's TextInput so
+            // the caret is drawn by the same stateful widget used by the
+            // Create Work Item dialog (no custom single-line widget).
+            input.focus.set(true);
+            StatefulWidget::render(
+                TextInput::new().styles(create_dialog_text_style(theme)),
+                rows[2],
+                buf,
+                input,
+            );
             // rows[3] is blank.
             Paragraph::new(hint)
                 .style(theme.style_text_muted())
@@ -4046,7 +3978,7 @@ mod snapshot_tests {
     use std::sync::Arc;
 
     /// Helper: render the app into a TestBackend and return the buffer as a string.
-    fn render(app: &App, width: u16, height: u16) -> String {
+    fn render(app: &mut App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::default_theme();
@@ -4206,15 +4138,15 @@ mod snapshot_tests {
 
     #[test]
     fn empty_app_default_view() {
-        let app = App::new();
-        insta::assert_snapshot!(render(&app, 80, 24));
+        let mut app = App::new();
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
     fn empty_app_with_status_message() {
         let mut app = App::new();
         app.status_message = Some("Press Ctrl+N to create a work item".to_string());
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4224,8 +4156,8 @@ mod snapshot_tests {
             make_work_item("b", "Second item", WorkItemStatus::Implementing, None, 1),
             make_work_item("c", "Third item", WorkItemStatus::Backlog, None, 1),
         ];
-        let app = app_with_items(items, vec![]);
-        insta::assert_snapshot!(render(&app, 80, 24));
+        let mut app = app_with_items(items, vec![]);
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4240,7 +4172,7 @@ mod snapshot_tests {
         let mut app = app_with_items(items, vec![]);
         // Select the first selectable work item entry.
         app.selected_item = app.display_list.iter().position(is_selectable);
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4256,7 +4188,7 @@ mod snapshot_tests {
         let mut app = app_with_items(items, unlinked);
         // Select the unlinked item (index 1, since index 0 is UNLINKED header).
         app.selected_item = Some(1);
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4279,7 +4211,7 @@ mod snapshot_tests {
         app.build_display_list();
         // Select the review request item (index 1: header at 0, item at 1).
         app.selected_item = Some(1);
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4301,7 +4233,7 @@ mod snapshot_tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::default_theme();
         terminal
-            .draw(|frame| draw_to_buffer(frame.area(), frame.buffer_mut(), &app, &theme))
+            .draw(|frame| draw_to_buffer(frame.area(), frame.buffer_mut(), &mut app, &theme))
             .unwrap();
         let buf = terminal.backend().buffer().clone();
 
@@ -4347,7 +4279,7 @@ mod snapshot_tests {
         let mut app = app_with_items(items, vec![]);
         app.selected_item = app.display_list.iter().position(is_selectable);
         app.focus = FocusPanel::Right;
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4365,7 +4297,7 @@ mod snapshot_tests {
         let mut app = app_with_items(vec![wi], vec![]);
         // Select the first selectable work item entry.
         app.selected_item = app.display_list.iter().position(is_selectable);
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4379,7 +4311,7 @@ mod snapshot_tests {
         )];
         let mut app = app_with_items(items, vec![]);
         app.selected_item = app.display_list.iter().position(is_selectable);
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4396,7 +4328,7 @@ mod snapshot_tests {
         let mut app = app_with_items(vec![wi], vec![]);
         app.selected_item = app.display_list.iter().position(is_selectable);
         app.status_message = Some("Right panel focused - press Ctrl+] to return".into());
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4413,7 +4345,7 @@ mod snapshot_tests {
         app.status_message = Some("This should be hidden".into());
         app.start_activity("Creating pull request...");
         app.spinner_tick = 3; // Pick a specific frame for deterministic snapshot.
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4430,7 +4362,7 @@ mod snapshot_tests {
         app.start_activity("Running review gate...");
         app.start_activity("Creating pull request...");
         app.spinner_tick = 0;
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4458,7 +4390,7 @@ mod snapshot_tests {
         };
         let mut app = App::with_config(config, Arc::new(StubBackend));
         app.show_settings = true;
-        let output = render(&app, 80, 24);
+        let output = render(&mut app, 80, 24);
 
         let _ = std::fs::remove_dir_all(&base);
 
@@ -4499,8 +4431,8 @@ mod snapshot_tests {
                 1,
             ),
         ];
-        let app = app_with_items(items, vec![]);
-        insta::assert_snapshot!(render(&app, 80, 24));
+        let mut app = app_with_items(items, vec![]);
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4516,14 +4448,14 @@ mod snapshot_tests {
             make_unlinked_pr("fix-typo", 45, false),
             make_unlinked_pr("update-deps", 12, true),
         ];
-        let app = app_with_items(items, unlinked);
-        insta::assert_snapshot!(render(&app, 80, 24));
+        let mut app = app_with_items(items, unlinked);
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
     fn work_item_list_empty_groups() {
-        let app = app_with_items(vec![], vec![]);
-        insta::assert_snapshot!(render(&app, 80, 24));
+        let mut app = app_with_items(vec![], vec![]);
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4559,8 +4491,8 @@ mod snapshot_tests {
                 1,
             ),
         ];
-        let app = app_with_items(items, vec![]);
-        insta::assert_snapshot!(render(&app, 80, 24));
+        let mut app = app_with_items(items, vec![]);
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4596,7 +4528,7 @@ mod snapshot_tests {
         let mut app = app_with_items(items, vec![]);
         // Select the first selectable work item entry (skipping group headers).
         app.selected_item = app.display_list.iter().position(is_selectable);
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4614,7 +4546,7 @@ mod snapshot_tests {
         );
         assert!(app.create_dialog.visible);
         assert_eq!(app.create_dialog.focus_field, CreateDialogFocus::Title);
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4634,7 +4566,7 @@ mod snapshot_tests {
         // Focus on repos
         app.create_dialog.focus_field = CreateDialogFocus::Repos;
         app.create_dialog.repo_cursor = 1; // beta is selected
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4643,7 +4575,57 @@ mod snapshot_tests {
         let repos = vec![PathBuf::from("/repo/only")];
         app.create_dialog.open(&repos, None);
         app.create_dialog.error_message = Some("Title cannot be empty".to_string());
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
+    }
+
+    /// Regression test for "Creating a new workitem does not allow
+    /// multi-line description" (#2266).
+    ///
+    /// A description that is much longer than the textarea width must
+    /// wrap onto multiple visible rows instead of being clipped at the
+    /// right margin. The description is built from a distinctive set of
+    /// uppercase tokens so the test can cheaply confirm that more than
+    /// one token lands on a different row - which is only possible if
+    /// the TextArea wrapped.
+    #[test]
+    fn create_dialog_wraps_long_description() {
+        let mut app = App::new();
+        let repos = vec![PathBuf::from("/repo/only")];
+        app.create_dialog.open(&repos, None);
+        // Sixteen distinctive uppercase tokens; at a 48-column dialog
+        // width the TextArea's inner width is well under ~46 cols, so
+        // these tokens cannot all fit on one line.
+        let tokens = [
+            "ALPHA", "BETA", "GAMMA", "DELTA", "EPSILON", "ZETA", "ETA", "THETA", "IOTA", "KAPPA",
+            "LAMBDA", "MU", "NU", "XI", "OMICRON", "PI",
+        ];
+        let long_description = tokens.join(" ");
+        app.create_dialog
+            .description_input
+            .set_text(&long_description);
+
+        // A 40-row terminal gives the dialog vertical slack so the
+        // description textarea sits well inside the visible area.
+        let rendered = render(&mut app, 80, 40);
+
+        // Find rows that contain any of the unique tokens. If wrapping
+        // happened at least two distinct rows in the rendered output
+        // contain different tokens. A non-wrapping TextArea (or a
+        // horizontally-clipped Paragraph) would only ever place one
+        // row's worth of description text on screen, so no more than a
+        // single row would contain a token.
+        let mut rows_with_token = 0usize;
+        for line in rendered.lines() {
+            if tokens.iter().any(|t| line.contains(t)) {
+                rows_with_token += 1;
+            }
+        }
+        assert!(
+            rows_with_token >= 2,
+            "expected the long description to wrap onto at least 2 rows, \
+             but only {rows_with_token} rendered row(s) contained any \
+             description token.\nRendered output:\n{rendered}"
+        );
     }
 
     #[test]
@@ -4667,7 +4649,7 @@ mod snapshot_tests {
         let mut app = app_with_items(items, vec![]);
         // Select an item near the end to force scrolling.
         app.selected_item = Some(app.display_list.len().saturating_sub(2));
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4676,8 +4658,8 @@ mod snapshot_tests {
             make_work_item("a", "First item", WorkItemStatus::Backlog, None, 1),
             make_work_item("b", "Second item", WorkItemStatus::Implementing, None, 1),
         ];
-        let app = app_with_items(items, vec![]);
-        insta::assert_snapshot!(render(&app, 80, 24));
+        let mut app = app_with_items(items, vec![]);
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     // -- Board view snapshot tests --
@@ -4686,7 +4668,7 @@ mod snapshot_tests {
     fn board_view_empty() {
         let mut app = App::new();
         app.view_mode = ViewMode::Board;
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4718,7 +4700,7 @@ mod snapshot_tests {
         let mut app = app_with_items(items, vec![]);
         app.view_mode = ViewMode::Board;
         app.sync_board_cursor();
-        insta::assert_snapshot!(render(&app, 120, 40));
+        insta::assert_snapshot!(render(&mut app, 120, 40));
     }
 
     #[test]
@@ -4740,7 +4722,7 @@ mod snapshot_tests {
         app.board_cursor.column = 2;
         app.board_cursor.row = Some(1);
         app.sync_selection_from_board();
-        insta::assert_snapshot!(render(&app, 120, 40));
+        insta::assert_snapshot!(render(&mut app, 120, 40));
     }
 
     #[test]
@@ -4754,7 +4736,7 @@ mod snapshot_tests {
         app.board_cursor.column = 2; // Implementing column
         app.board_cursor.row = Some(0);
         app.sync_selection_from_board();
-        insta::assert_snapshot!(render(&app, 120, 40));
+        insta::assert_snapshot!(render(&mut app, 120, 40));
     }
 
     #[test]
@@ -4770,7 +4752,7 @@ mod snapshot_tests {
         app.view_mode = ViewMode::Board;
         app.sync_board_cursor();
         // At 80 cols: column is 20 wide, inner 16. Title must wrap, not clip.
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4786,7 +4768,7 @@ mod snapshot_tests {
         app.view_mode = ViewMode::Board;
         app.sync_board_cursor();
         app.status_message = Some("Item moved to Planning".to_string());
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4825,7 +4807,7 @@ mod snapshot_tests {
         app.view_mode = ViewMode::Board;
         app.sync_board_cursor();
         // At 120x40, each column is 30 wide (28 inner). No title should clip.
-        insta::assert_snapshot!(render(&app, 120, 40));
+        insta::assert_snapshot!(render(&mut app, 120, 40));
     }
 
     // -- Prompt dialog snapshot tests --
@@ -4835,7 +4817,7 @@ mod snapshot_tests {
         let mut app = App::new();
         app.confirm_merge = true;
         app.merge_wi_id = Some(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4845,7 +4827,7 @@ mod snapshot_tests {
         app.merge_in_progress = true;
         app.merge_wi_id = Some(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
         app.spinner_tick = 3;
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4855,7 +4837,7 @@ mod snapshot_tests {
         app.rework_prompt_wi = Some(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
         app.rework_prompt_input
             .set_text("needs more error handling");
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4864,7 +4846,7 @@ mod snapshot_tests {
         app.no_plan_prompt_visible = true;
         app.no_plan_prompt_queue
             .push_back(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4873,7 +4855,7 @@ mod snapshot_tests {
         app.cleanup_prompt_visible = true;
         app.cleanup_unlinked_target =
             Some((PathBuf::from("/tmp/repo"), "feature-branch".to_string(), 42));
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4884,7 +4866,7 @@ mod snapshot_tests {
         app.cleanup_unlinked_target =
             Some((PathBuf::from("/tmp/repo"), "feature-branch".to_string(), 42));
         app.cleanup_reason_input.set_text("closing - abandoned");
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4906,14 +4888,14 @@ mod snapshot_tests {
         app.end_activity(aid);
         app.cleanup_progress_pr_number = Some(42);
         app.spinner_tick = 3; // deterministic spinner frame
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
     fn alert_dialog() {
         let mut app = App::new();
         app.alert_message = Some("PR close failed: permission denied".to_string());
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     // -- Sticky group header tests --
@@ -4937,7 +4919,7 @@ mod snapshot_tests {
             app.selected_item = Some(pos);
         }
         // Short viewport forces the ACTIVE header off-screen -> sticky.
-        insta::assert_snapshot!(render(&app, 80, 12));
+        insta::assert_snapshot!(render(&mut app, 80, 12));
     }
 
     #[test]
@@ -4947,9 +4929,9 @@ mod snapshot_tests {
             make_work_item("a", "Item A", WorkItemStatus::Implementing, None, 1),
             make_work_item("b", "Item B", WorkItemStatus::Backlog, None, 1),
         ];
-        let app = app_with_items(items, vec![]);
+        let mut app = app_with_items(items, vec![]);
         // Offset 0, header is visible - no sticky header should appear.
-        insta::assert_snapshot!(render(&app, 80, 24));
+        insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
     #[test]
@@ -4965,7 +4947,7 @@ mod snapshot_tests {
         app.board_drill_down = true;
         app.build_display_list();
         app.selected_item = app.display_list.iter().rposition(is_selectable);
-        insta::assert_snapshot!(render(&app, 80, 12));
+        insta::assert_snapshot!(render(&mut app, 80, 12));
     }
 
     #[test]
@@ -4980,7 +4962,7 @@ mod snapshot_tests {
         let mut app = app_with_items(items, vec![]);
         app.selected_item = app.display_list.iter().position(is_selectable);
 
-        let rendered = render(&app, 100, 30);
+        let rendered = render(&mut app, 100, 30);
         assert!(
             rendered.contains("Waiting for PR to be merged"),
             "should render mergequeue hint: {rendered}"
@@ -5019,7 +5001,7 @@ mod snapshot_tests {
         app.selected_item = app.display_list.iter().position(is_selectable);
 
         // At a wide terminal the entire URL fits and must appear in full.
-        let wide = render(&app, 160, 30);
+        let wide = render(&mut app, 160, 30);
         assert!(
             wide.contains(&long_url),
             "long PR URL should appear in full at 160-col width:\n{wide}"
@@ -5033,7 +5015,7 @@ mod snapshot_tests {
         // body proves the dedicated-line layout is in use. Use 40 chars
         // as a comfortable lower bound that the labelled-row layout could
         // never have produced.
-        let narrow = render(&app, 80, 24);
+        let narrow = render(&mut app, 80, 24);
         let prefix = &long_url[..40];
         assert!(
             narrow.contains(prefix),
@@ -5062,6 +5044,6 @@ mod snapshot_tests {
             app.selected_item = Some(pos);
         }
         // Short viewport so the BACKLOGGED header scrolls off -> sticky.
-        insta::assert_snapshot!(render(&app, 80, 12));
+        insta::assert_snapshot!(render(&mut app, 80, 12));
     }
 }

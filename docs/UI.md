@@ -343,7 +343,9 @@ See `src/create_dialog.rs` as the reference implementation.
 
 1. Create a dialog struct in `src/<dialog_name>.rs` with:
    - `visible: bool`
-   - Input state fields (SimpleTextInput for text, Vec for lists)
+   - Input state fields (`rat_widget::text_input::TextInputState` for
+     single-line text, `rat_widget::textarea::TextAreaState` for
+     multi-line text, `Vec` for lists)
    - Focus tracking enum
    - `open()`, `close()`, `handle_key()` methods
 
@@ -377,7 +379,7 @@ State fields live directly on `App`:
 
 ```rust
 pub my_prompt_visible: bool,
-pub my_prompt_input: SimpleTextInput,    // if text input needed
+pub my_prompt_input: rat_widget::text_input::TextInputState, // if text input needed
 pub my_prompt_target: Option<MyTarget>,  // relevant context
 ```
 
@@ -443,8 +445,8 @@ associations all have `branch.is_none()`. Before this dialog existed,
 that path ended in a dead-end `"Set a branch name to start working"`
 status message with no way to recover short of editing JSON by hand.
 
-The modal reuses `PromptDialogKind::TextInput` and `SimpleTextInput`
-(see `src/ui.rs` and `src/create_dialog.rs`). State lives on
+The modal reuses `PromptDialogKind::TextInput` and rat-widget's
+`TextInputState` (see `src/ui.rs` and `src/create_dialog.rs`). State lives on
 `App::set_branch_dialog: Option<SetBranchDialog>` and carries a
 `PendingBranchAction` so the dialog knows what to re-drive after the
 branch is persisted. Behaviour:
@@ -1039,7 +1041,10 @@ From rat-widget (available for future dialogs):
 - Form layout helpers
 
 Currently used:
-- SimpleTextInput (custom, in create_dialog.rs) - lightweight text input
+- TextInput, TextArea (rat-widget) - Create Work Item dialog fields. The
+  Description TextArea uses `TextWrap::Word(2)` so long text wraps at word
+  boundaries, and `Scroll::new()` on the vertical axis so content that
+  exceeds `DESC_TEXTAREA_HEIGHT` scrolls with a visible scrollbar.
 - List (ratatui-widgets) - work item list, repo selection, board columns
   (rendered via StatefulWidget::render in board view)
 - Tabs (ratatui-widgets) - view mode header (List/Board segmented tab bar)

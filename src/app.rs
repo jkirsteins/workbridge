@@ -610,7 +610,7 @@ pub struct App {
     /// True when the rework reason text input is visible (Review -> Implementing).
     pub rework_prompt_visible: bool,
     /// Text input for the rework reason.
-    pub rework_prompt_input: crate::create_dialog::SimpleTextInput,
+    pub rework_prompt_input: rat_widget::text_input::TextInputState,
     /// The work item ID that the rework prompt applies to.
     pub rework_prompt_wi: Option<WorkItemId>,
     /// Rework reasons keyed by work item ID. Used by stage_system_prompt
@@ -626,7 +626,7 @@ pub struct App {
     /// from the confirmation prompt to type an optional close reason).
     pub cleanup_reason_input_active: bool,
     /// Text input for the optional close reason.
-    pub cleanup_reason_input: crate::create_dialog::SimpleTextInput,
+    pub cleanup_reason_input: rat_widget::text_input::TextInputState,
     /// Identity of the unlinked PR being cleaned up: (repo_path, branch, pr_number).
     /// Stored by identity rather than index so it survives reassembly.
     pub cleanup_unlinked_target: Option<(PathBuf, String, u64)>,
@@ -685,7 +685,7 @@ pub struct App {
     /// Scroll offset for the keybindings tab in the settings overlay.
     pub settings_keybindings_scroll: u16,
     /// Text input for editing the review skill in the Review Gate tab.
-    pub settings_review_skill_input: crate::create_dialog::SimpleTextInput,
+    pub settings_review_skill_input: rat_widget::text_input::TextInputState,
     /// Whether the review skill text input is in editing mode.
     pub settings_review_skill_editing: bool,
     /// State for the work item creation modal dialog.
@@ -1002,13 +1002,13 @@ impl App {
             merge_wi_id: None,
             merge_in_progress: false,
             rework_prompt_visible: false,
-            rework_prompt_input: crate::create_dialog::SimpleTextInput::new(),
+            rework_prompt_input: rat_widget::text_input::TextInputState::new(),
             rework_prompt_wi: None,
             rework_reasons: HashMap::new(),
             review_gate_findings: HashMap::new(),
             cleanup_prompt_visible: false,
             cleanup_reason_input_active: false,
-            cleanup_reason_input: crate::create_dialog::SimpleTextInput::new(),
+            cleanup_reason_input: rat_widget::text_input::TextInputState::new(),
             cleanup_unlinked_target: None,
             cleanup_progress_pr_number: None,
             cleanup_progress_repo_path: None,
@@ -1031,7 +1031,7 @@ impl App {
             settings_tab: SettingsTab::Repos,
             settings_list_focus: SettingsListFocus::Managed,
             settings_keybindings_scroll: 0,
-            settings_review_skill_input: crate::create_dialog::SimpleTextInput::new(),
+            settings_review_skill_input: rat_widget::text_input::TextInputState::new(),
             settings_review_skill_editing: false,
             create_dialog: CreateDialog::new(),
             backend,
@@ -5212,7 +5212,7 @@ impl App {
         } else {
             format!("{username}/{slug}-{suffix}")
         };
-        let mut input = crate::create_dialog::SimpleTextInput::new();
+        let mut input = rat_widget::text_input::TextInputState::new();
         input.set_text(&default);
         self.set_branch_dialog = Some(crate::create_dialog::SetBranchDialog {
             wi_id,
