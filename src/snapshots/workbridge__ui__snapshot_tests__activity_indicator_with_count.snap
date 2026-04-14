@@ -24,5 +24,5 @@ expression: "render(&app, 80, 24)"
 │                       ││                                                     │
 │                       ││                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
-Multi-task | [Implementing] | /repo/act-2/0
+Multi-task | [Implementing] | 0
  ⠋ Creating pull request... (+1)

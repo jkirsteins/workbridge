@@ -2498,7 +2498,7 @@ fn render_selection_overlay(buf: &mut Buffer, inner_area: Rect, selection: &Sele
     }
 }
 
-/// Draw the work-item context bar showing title, repo path, and labels.
+/// Draw the work-item context bar showing title, stage, repo name, and labels.
 fn draw_context_bar(buf: &mut Buffer, ctx: &WorkItemContext, theme: &Theme, area: Rect) {
     let labels_part = if ctx.labels.is_empty() {
         String::new()
@@ -2506,14 +2506,9 @@ fn draw_context_bar(buf: &mut Buffer, ctx: &WorkItemContext, theme: &Theme, area
         format!(" | {}", ctx.labels.join(", "))
     };
 
-    let activity_part = match ctx.last_activity {
-        Some(ref a) => format!(" | {a}"),
-        None => String::new(),
-    };
-
     let full = format!(
-        "{} | [{}] | {}{}{}",
-        ctx.title, ctx.stage, ctx.repo_path, labels_part, activity_part
+        "{} | [{}] | {}{}",
+        ctx.title, ctx.stage, ctx.repo_name, labels_part
     );
 
     // Truncate to fit width. Use char-based indexing for multi-byte safety.
@@ -4110,12 +4105,6 @@ mod snapshot_tests {
             _entry: &crate::work_item_backend::ActivityEntry,
         ) -> Result<(), BackendError> {
             Ok(())
-        }
-        fn read_activity(
-            &self,
-            _id: &WorkItemId,
-        ) -> Result<Vec<crate::work_item_backend::ActivityEntry>, BackendError> {
-            Ok(Vec::new())
         }
         fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
             Ok(())

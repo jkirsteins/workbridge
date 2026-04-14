@@ -709,7 +709,7 @@ nearest `GroupHeader` entry.
 | [IM] feature-3 |                                 |
 | [RV] fix-4     |                                 |
 +----------------+---------------------------------+
-| Context bar: title | repo | labels               |
+| Context bar: title | [stage] | repo | labels     |
 +--------------------------------------------------+
 | Status bar message                               |
 +--------------------------------------------------+
@@ -738,7 +738,7 @@ Status bar: 1 row, conditional on status_message.is_some()
 | idea-6       |              | feature-3     |              |
 |              |              |               |              |
 +--------------+--------------+---------------+--------------+
-| Context bar: title | repo | labels                         |
+| Context bar: title | [stage] | repo | labels               |
 +------------------------------------------------------------+
 | Status bar message                                         |
 +------------------------------------------------------------+
@@ -746,6 +746,11 @@ Status bar: 1 row, conditional on status_message.is_some()
 
 The `Board` label is highlighted (active). Board-mode hints show
 arrow key navigation and Shift+arrow stage transitions.
+
+The `repo` segment in the context bar is the short repo name (last
+path segment of the work item's repo root), not the full path - the
+full path is available via the right panel Terminal tab's shell
+prompt.
 
 Four columns displayed: Backlog, Planning, Implementing, Review.
 Done items are hidden from the board. Blocked items appear in the

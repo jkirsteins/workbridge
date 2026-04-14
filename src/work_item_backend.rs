@@ -188,9 +188,6 @@ pub trait WorkItemBackend: Send + Sync {
     /// Append an activity entry to a work item's activity log.
     fn append_activity(&self, id: &WorkItemId, entry: &ActivityEntry) -> Result<(), BackendError>;
 
-    /// Read all activity entries for a work item.
-    fn read_activity(&self, id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError>;
-
     /// Update the title of a work item.
     ///
     /// Default implementation returns an unsupported error. Override in
@@ -327,6 +324,50 @@ impl LocalFileBackend {
                 dest.display()
             ))
         })
+    }
+
+    /// Read all activity entries for a work item.
+    ///
+    /// Test-only helper. Production code does not read activity logs
+    /// through the backend: the metrics aggregator reads the raw
+    /// `activity-*.jsonl` files from disk (see
+    /// `metrics::aggregate_from_activity_logs`) and the MCP activity
+    /// query reads through the path returned by `activity_path_for`.
+    /// Keeping this as an inherent `#[cfg(test)]` method lets the
+    /// append/read round-trip tests exercise `append_activity` without
+    /// bloating the public backend trait with a never-called method.
+    #[cfg(test)]
+    fn read_activity(&self, id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
+        let activity_path = self.activity_path(id)?;
+        if !activity_path.exists() {
+            return Ok(Vec::new());
+        }
+        let contents = fs::read_to_string(&activity_path).map_err(|e| {
+            BackendError::Io(format!(
+                "failed to read activity log {}: {e}",
+                activity_path.display()
+            ))
+        })?;
+        let mut entries = Vec::new();
+        for line in contents.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<ActivityEntry>(line) {
+                Ok(entry) => entries.push(entry),
+                Err(e) => {
+                    // Skip corrupt lines rather than discarding the entire
+                    // log. Partial writes from a crash can leave a truncated
+                    // trailing line; the valid entries before it are still
+                    // valuable.
+                    eprintln!(
+                        "workbridge: skipping corrupt activity log line in {}: {e}",
+                        activity_path.display()
+                    );
+                }
+            }
+        }
+        Ok(entries)
     }
 
     /// Read and deserialize a work item record from disk.
@@ -620,39 +661,6 @@ impl WorkItemBackend for LocalFileBackend {
             ))
         })?;
         Ok(())
-    }
-
-    fn read_activity(&self, id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-        let activity_path = self.activity_path(id)?;
-        if !activity_path.exists() {
-            return Ok(Vec::new());
-        }
-        let contents = fs::read_to_string(&activity_path).map_err(|e| {
-            BackendError::Io(format!(
-                "failed to read activity log {}: {e}",
-                activity_path.display()
-            ))
-        })?;
-        let mut entries = Vec::new();
-        for line in contents.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<ActivityEntry>(line) {
-                Ok(entry) => entries.push(entry),
-                Err(e) => {
-                    // Skip corrupt lines rather than discarding the entire
-                    // log. Partial writes from a crash can leave a truncated
-                    // trailing line; the valid entries before it are still
-                    // valuable.
-                    eprintln!(
-                        "workbridge: skipping corrupt activity log line in {}: {e}",
-                        activity_path.display()
-                    );
-                }
-            }
-        }
-        Ok(entries)
     }
 
     fn update_plan(&self, id: &WorkItemId, plan: &str) -> Result<(), BackendError> {

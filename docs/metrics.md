@@ -18,8 +18,12 @@ getting stuck?", "is my backlog growing or shrinking?".
 All metrics derive from the **per-work-item activity log** that
 `LocalFileBackend` already appends to on every stage transition, PR
 event, and review action (see `src/work_item_backend.rs` -
-`ActivityEntry`, `append_activity`, `read_activity`). The aggregator
-reads two locations:
+`ActivityEntry`, `append_activity`). The aggregator reads the raw
+`activity-*.jsonl` files directly from disk via
+`metrics::aggregate_from_activity_logs`; the backend trait
+deliberately exposes only the writer (`append_activity`) so the
+aggregator and the per-item UI each own their read path. The
+aggregator reads two locations:
 
 - `{data_dir}/activity-{uuid}.jsonl` - active work items.
 - `{data_dir}/archive/activity-{uuid}.jsonl` - work items that have

@@ -134,12 +134,14 @@ pub struct WorkItemContext {
     pub title: String,
     /// The workflow stage name (e.g., "Backlog", "Implementing").
     pub stage: String,
-    /// The repository path on disk (from RepoAssociation.repo_path).
-    pub repo_path: String,
+    /// Short repo name derived from the last path segment of
+    /// `RepoAssociation.repo_path` (e.g., `workbridge`). Used for the
+    /// context bar so the full path does not crowd the row; the
+    /// authoritative cwd is always visible in the right panel
+    /// Terminal tab via the live shell prompt.
+    pub repo_name: String,
     /// Issue labels (from IssueInfo.labels). Empty if no issue linked.
     pub labels: Vec<String>,
-    /// Last activity entry description (for status bar display).
-    pub last_activity: Option<String>,
 }
 
 /// Visual style variant for group headers.
@@ -1331,10 +1333,15 @@ impl App {
         match self.display_list.get(idx)? {
             DisplayEntry::WorkItemEntry(wi_idx) => {
                 let wi = self.work_items.get(*wi_idx)?;
-                let repo_path = wi
+                let repo_name = wi
                     .repo_associations
                     .first()
-                    .map(|a| a.repo_path.display().to_string())
+                    .map(|a| {
+                        a.repo_path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| a.repo_path.display().to_string())
+                    })
                     .unwrap_or_default();
                 let labels = wi
                     .repo_associations
@@ -1342,18 +1349,11 @@ impl App {
                     .find_map(|a| a.issue.as_ref())
                     .map(|issue| issue.labels.clone())
                     .unwrap_or_default();
-                let last_activity = match self.backend.read_activity(&wi.id) {
-                    Ok(entries) => entries
-                        .last()
-                        .map(|e| format!("{}: {}", e.event_type, e.timestamp)),
-                    Err(_) => Some("Error reading activity log".to_string()),
-                };
                 Some(WorkItemContext {
                     title: wi.title.clone(),
                     stage: format!("{:?}", wi.status),
-                    repo_path,
+                    repo_name,
                     labels,
-                    last_activity,
                 })
             }
             _ => None,
@@ -8315,10 +8315,6 @@ impl WorkItemBackend for StubBackend {
         Ok(())
     }
 
-    fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-        Ok(Vec::new())
-    }
-
     fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
         Ok(())
     }
@@ -8572,9 +8568,6 @@ mod tests {
             ) -> Result<(), BackendError> {
                 Ok(())
             }
-            fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-                Ok(Vec::new())
-            }
             fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
                 Ok(())
             }
@@ -8714,9 +8707,6 @@ mod tests {
                 _entry: &ActivityEntry,
             ) -> Result<(), BackendError> {
                 Ok(())
-            }
-            fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-                Ok(Vec::new())
             }
             fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
                 Ok(())
@@ -9146,9 +9136,6 @@ mod tests {
                 _entry: &ActivityEntry,
             ) -> Result<(), BackendError> {
                 Ok(())
-            }
-            fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-                Ok(Vec::new())
             }
             fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
                 Ok(())
@@ -9778,9 +9765,6 @@ mod tests {
             ) -> Result<(), BackendError> {
                 Ok(())
             }
-            fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-                Ok(Vec::new())
-            }
             fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
                 Ok(())
             }
@@ -10054,9 +10038,6 @@ mod tests {
                 _entry: &ActivityEntry,
             ) -> Result<(), BackendError> {
                 Ok(())
-            }
-            fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-                Ok(Vec::new())
             }
             fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
                 Ok(())
@@ -10522,9 +10503,6 @@ mod tests {
             ) -> Result<(), BackendError> {
                 Ok(())
             }
-            fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-                Ok(Vec::new())
-            }
             fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
                 Ok(())
             }
@@ -10686,9 +10664,6 @@ mod tests {
                 _entry: &ActivityEntry,
             ) -> Result<(), BackendError> {
                 Ok(())
-            }
-            fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-                Ok(Vec::new())
             }
             fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
                 Ok(())
@@ -13011,9 +12986,6 @@ mod tests {
             ) -> Result<(), BackendError> {
                 Ok(())
             }
-            fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-                Ok(Vec::new())
-            }
             fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
                 Ok(())
             }
@@ -13202,9 +13174,6 @@ mod tests {
             _entry: &ActivityEntry,
         ) -> Result<(), BackendError> {
             Ok(())
-        }
-        fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-            Ok(Vec::new())
         }
         fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
             Ok(())
@@ -13705,9 +13674,6 @@ mod tests {
             _entry: &ActivityEntry,
         ) -> Result<(), BackendError> {
             Ok(())
-        }
-        fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-            Ok(Vec::new())
         }
         fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
             Ok(())
@@ -14223,9 +14189,6 @@ mod tests {
         ) -> Result<(), BackendError> {
             Ok(())
         }
-        fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-            Ok(Vec::new())
-        }
         fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
             Ok(())
         }
@@ -14517,9 +14480,6 @@ mod tests {
         ) -> Result<(), BackendError> {
             Ok(())
         }
-        fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-            Ok(Vec::new())
-        }
         fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
             Ok(())
         }
@@ -14706,9 +14666,6 @@ mod tests {
             _entry: &ActivityEntry,
         ) -> Result<(), BackendError> {
             Ok(())
-        }
-        fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
-            Ok(Vec::new())
         }
         fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
             Ok(())

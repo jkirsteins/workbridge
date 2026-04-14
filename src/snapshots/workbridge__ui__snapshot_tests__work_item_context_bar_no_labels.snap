@@ -25,4 +25,4 @@ expression: "render(&app, 80, 24)"
 │                       ││                                                     │
 │                       ││                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
-Add authentication | [Backlog] | /repo/ctx-2/0
+Add authentication | [Backlog] | 0

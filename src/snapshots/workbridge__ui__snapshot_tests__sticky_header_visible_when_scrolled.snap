@@ -13,4 +13,4 @@ expression: "render(&app, 80, 12)"
 │  branch-b2 [no wt]    ││  Branch      branch-b2                              │
 │                       ││  Worktree    (none)                                 │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
-Item B2 | [Backlog] | /repo/b2/0
+Item B2 | [Backlog] | 0
