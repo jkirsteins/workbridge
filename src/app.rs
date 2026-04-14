@@ -3190,6 +3190,15 @@ impl App {
             }
         }
 
+        // Sort each repo's items in workflow order so PL items precede
+        // IM, IM precedes RV, etc. Stable sort preserves the existing
+        // backend path order within a stage as the tiebreaker. This is
+        // a no-op for the BLOCKED / BACKLOGGED / DONE callers because
+        // every item in those buckets shares a single status.
+        for items in by_repo.values_mut() {
+            items.sort_by_key(|&i| work_items[i].status.active_group_rank());
+        }
+
         for repo in &repo_order {
             let items = &by_repo[repo];
             list.push(DisplayEntry::GroupHeader {
@@ -9350,6 +9359,136 @@ mod tests {
         assert_ne!(
             old_index, new_index,
             "display index should change when items reorder",
+        );
+    }
+
+    /// Helper for ACTIVE-group sort tests: build a minimal WorkItem for
+    /// a given repo path and status. Title is purely informational for
+    /// assertion messages.
+    fn active_sort_test_item(
+        title: &str,
+        status: WorkItemStatus,
+        repo: &str,
+    ) -> crate::work_item::WorkItem {
+        crate::work_item::WorkItem {
+            id: WorkItemId::LocalFile(PathBuf::from(format!("/tmp/{title}.json"))),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: title.to_string(),
+            description: None,
+            status,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from(repo),
+                branch: None,
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        }
+    }
+
+    /// Inside a single `ACTIVE (<repo>)` sub-group, items must be sorted
+    /// by workflow stage (PL -> IM -> RV -> MQ) regardless of the
+    /// backend's insertion order. Within a single stage, the relative
+    /// order from backend path order is preserved (stable sort).
+    #[test]
+    fn build_display_list_sorts_active_group_by_stage() {
+        let mut app = App::new();
+        // Insert in a deliberately non-workflow order. Two PL items,
+        // two IM items, one RV, one MQ - all in the same repo.
+        app.work_items = vec![
+            active_sort_test_item("a", WorkItemStatus::Implementing, "/repo"),
+            active_sort_test_item("b", WorkItemStatus::Planning, "/repo"),
+            active_sort_test_item("c", WorkItemStatus::Review, "/repo"),
+            active_sort_test_item("d", WorkItemStatus::Planning, "/repo"),
+            active_sort_test_item("e", WorkItemStatus::Implementing, "/repo"),
+            active_sort_test_item("f", WorkItemStatus::Mergequeue, "/repo"),
+        ];
+        app.build_display_list();
+
+        // Find the single ACTIVE (repo) group header and collect the
+        // work-item indices that follow it until the next header.
+        let mut header_idx = None;
+        let mut header_count = None;
+        for (i, entry) in app.display_list.iter().enumerate() {
+            if let DisplayEntry::GroupHeader { label, count, .. } = entry
+                && label.starts_with("ACTIVE ")
+            {
+                header_idx = Some(i);
+                header_count = Some(*count);
+                break;
+            }
+        }
+        let header_idx = header_idx.expect("expected an ACTIVE group header");
+        assert_eq!(
+            header_count,
+            Some(6),
+            "ACTIVE group header count should match item count",
+        );
+
+        // Gather ordered titles from the entries that follow the header.
+        let mut ordered_titles: Vec<&str> = Vec::new();
+        for entry in app.display_list.iter().skip(header_idx + 1) {
+            match entry {
+                DisplayEntry::WorkItemEntry(wi_idx) => {
+                    ordered_titles.push(app.work_items[*wi_idx].title.as_str());
+                }
+                DisplayEntry::GroupHeader { .. } => break,
+                _ => break,
+            }
+        }
+
+        // Expected: PL items first (b, d in original order), then IM
+        // (a, e), then RV (c), then MQ (f).
+        assert_eq!(
+            ordered_titles,
+            vec!["b", "d", "a", "e", "c", "f"],
+            "ACTIVE group items should sort PL -> IM -> RV -> MQ \
+             with backend order preserved within each stage",
+        );
+    }
+
+    /// Single-stage ACTIVE buckets must preserve the original backend
+    /// order as the stable-sort tiebreaker. This guards against a future
+    /// refactor that swaps in an unstable sort.
+    #[test]
+    fn push_repo_groups_preserves_single_stage_ordering() {
+        let mut app = App::new();
+        app.work_items = vec![
+            active_sort_test_item("x", WorkItemStatus::Implementing, "/repo"),
+            active_sort_test_item("y", WorkItemStatus::Implementing, "/repo"),
+            active_sort_test_item("z", WorkItemStatus::Implementing, "/repo"),
+        ];
+        app.build_display_list();
+
+        let header_idx = app
+            .display_list
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    DisplayEntry::GroupHeader { label, .. } if label.starts_with("ACTIVE ")
+                )
+            })
+            .expect("expected an ACTIVE group header");
+
+        let mut ordered_titles: Vec<&str> = Vec::new();
+        for entry in app.display_list.iter().skip(header_idx + 1) {
+            match entry {
+                DisplayEntry::WorkItemEntry(wi_idx) => {
+                    ordered_titles.push(app.work_items[*wi_idx].title.as_str());
+                }
+                DisplayEntry::GroupHeader { .. } => break,
+                _ => break,
+            }
+        }
+        assert_eq!(
+            ordered_titles,
+            vec!["x", "y", "z"],
+            "single-stage ACTIVE bucket must preserve original order",
         );
     }
 
