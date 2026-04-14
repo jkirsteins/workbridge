@@ -174,6 +174,18 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &App, theme: &Theme) {
                 },
             );
         }
+    } else if let Some(dlg) = app.set_branch_dialog.as_ref() {
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::TextInput {
+                title: "Set Branch Name",
+                body: "This work item has no branch. Enter a name to continue.",
+                input: &dlg.input,
+                hint: "Enter: confirm   Esc: cancel",
+            },
+        );
     } else if app.rework_prompt_visible {
         draw_prompt_dialog(
             buf,

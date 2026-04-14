@@ -61,6 +61,19 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    // "Set branch name" recovery modal. Must come before any handler
+    // that might interpret `d`, `q`, Enter, or arrow keys so the user
+    // cannot accidentally delete, quit, or advance a work item while
+    // trying to type a branch name. The dialog is mutually exclusive
+    // with every other prompt below (it is only opened from
+    // `spawn_session` / `advance_stage`, both of which refuse to run
+    // while a conflicting modal is up), so we do not need to worry
+    // about it stacking on top of another dialog.
+    if app.set_branch_dialog.is_some() {
+        handle_set_branch_dialog(app, key);
+        return true;
+    }
+
     // When the rework reason prompt is visible, route keys to it.
     if app.rework_prompt_visible {
         handle_rework_prompt(app, key);
@@ -1305,6 +1318,67 @@ fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
         }
         (_, KeyCode::End) => {
             app.rework_prompt_input.end();
+        }
+        _ => {}
+    }
+    if app.has_visible_status_bar() != had_status {
+        sync_layout(app);
+    }
+}
+
+/// Handle key events for the "Set branch name" recovery modal.
+///
+/// Enter confirms (persists the branch via `update_branch` and re-drives
+/// whichever gesture opened the dialog - spawn_session or advance_stage).
+/// Esc dismisses without touching the backend. Character input keys and
+/// basic cursor navigation are forwarded to the `SimpleTextInput`.
+fn handle_set_branch_dialog(app: &mut App, key: KeyEvent) {
+    let had_status = app.has_visible_status_bar();
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Esc) => {
+            app.cancel_set_branch_dialog();
+        }
+        (_, KeyCode::Enter) => {
+            app.confirm_set_branch_dialog();
+        }
+        // Route text input keys to the dialog's SimpleTextInput. The
+        // dialog intercept above must remain higher priority than any
+        // Ctrl+D / `d` / `q` handler so the user can type those
+        // characters as part of a branch name.
+        (_, KeyCode::Char(c)) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(dlg) = app.set_branch_dialog.as_mut() {
+                dlg.input.insert_char(c);
+            }
+        }
+        (_, KeyCode::Backspace) => {
+            if let Some(dlg) = app.set_branch_dialog.as_mut() {
+                dlg.input.backspace();
+            }
+        }
+        (_, KeyCode::Delete) => {
+            if let Some(dlg) = app.set_branch_dialog.as_mut() {
+                dlg.input.delete();
+            }
+        }
+        (_, KeyCode::Left) => {
+            if let Some(dlg) = app.set_branch_dialog.as_mut() {
+                dlg.input.move_left();
+            }
+        }
+        (_, KeyCode::Right) => {
+            if let Some(dlg) = app.set_branch_dialog.as_mut() {
+                dlg.input.move_right();
+            }
+        }
+        (_, KeyCode::Home) => {
+            if let Some(dlg) = app.set_branch_dialog.as_mut() {
+                dlg.input.home();
+            }
+        }
+        (_, KeyCode::End) => {
+            if let Some(dlg) = app.set_branch_dialog.as_mut() {
+                dlg.input.end();
+            }
         }
         _ => {}
     }
