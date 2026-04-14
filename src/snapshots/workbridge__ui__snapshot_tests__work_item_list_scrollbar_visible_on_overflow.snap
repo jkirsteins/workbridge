@@ -12,17 +12,17 @@ expression: "render(&app, 80, 24)"
 │  [BL] Work item       ││  Repo        /repo/item-10/0                        │
 │  number 1             ││  Branch      branch-item-10                         │
 │  branch-item-1 [no wt]││  Worktree    (none)                                 │
-│  [BL] Work item       █│  PR          (none)                                 │
-│  number 4             █│  Issue       (none)                                 │
-│  branch-item-4 [no wt]█│  Errors      (none)                                 │
-│  [BL] Work item       █│                                                     │
+│  [BL] Work item       ││  PR          (none)                                 │
+│  number 4             ││  Issue       (none)                                 │
+│  branch-item-4 [no wt]││  Errors      (none)                                 │
+│  [BL] Work item       ││                                                     │
 │  number 7             █│  Press Shift+Right to move to Planning.             │
 │  branch-item-7 [no wt]█│                                                     │
-│> [BL] Work item       ││                                                     │
-│  number 10            ││                                                     │
-│  branch-item-10 [no   ││                                                     │
-│      wt]              ││                                                     │
-│                       ││                                                     │
+│> [BL] Work item       █│                                                     │
+│  number 10            █│                                                     │
+│  branch-item-10 [no   █│                                                     │
+│      wt]              █│                                                     │
+│                       █│                                                     │
 │                       ││                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
 Work item number 10 | [Backlog] | /repo/item-10/0

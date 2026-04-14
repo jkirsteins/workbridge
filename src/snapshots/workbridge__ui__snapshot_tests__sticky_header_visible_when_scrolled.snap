@@ -7,10 +7,10 @@ expression: "render(&app, 80, 12)"
 │  ACTIVE (0) (5)       ││                                                     │
 │  branch-a5 [no wt]    ││  Item B2                                            │
 │  BACKLOGGED (0) (2)   ││                                                     │
-│  [BL] Item B1         █│  Status      Backlog                                │
+│  [BL] Item B1         ││  Status      Backlog                                │
 │  branch-b1 [no wt]    █│  Backend     Local file                             │
 │> [BL] Item B2         █│  Repo        /repo/b2/0                             │
-│  branch-b2 [no wt]    ││  Branch      branch-b2                              │
-│                       ││  Worktree    (none)                                 │
+│  branch-b2 [no wt]    █│  Branch      branch-b2                              │
+│                       █│  Worktree    (none)                                 │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
 Item B2 | [Backlog] | /repo/b2/0
