@@ -197,21 +197,36 @@ pub struct RepoAssociation {
     pub worktree_path: Option<PathBuf>,
     pub pr: Option<PrInfo>,
     pub issue: Option<IssueInfo>,
-    /// Read by assembly tests; will be shown in detail views.
-    #[allow(dead_code)]
+    /// Derived local git state for this worktree. Read by the work
+    /// item list renderer (`format_work_item_entry`) to decide whether
+    /// to show the `!cl` unclean-worktree chip, and by tests. Will
+    /// also feed future detail views (e.g., "3 ahead, 1 behind, dirty").
     pub git_state: Option<GitState>,
 }
 
-/// Local git state for a worktree.
-/// Populated by assembly; fields read in tests. Will be shown in work
-/// item detail views (e.g., "3 ahead, 1 behind, dirty").
+/// Local git state for a worktree. Fields are cache-projections of the
+/// background-fetcher `WorktreeInfo` values - reading them from the UI
+/// thread is always a pure in-memory op and never shells out.
+///
+/// - `dirty`: union of uncommitted tracked-file changes AND untracked
+///   files present in the worktree. The `!cl` chip treats both the
+///   same way; callers that need to distinguish them (e.g. the
+///   merge-guard alert wording) go through `App::worktree_cleanliness`
+///   which reads the raw `WorktreeInfo` fields directly.
+/// - `ahead`: commits on the local branch that are not yet on its
+///   upstream - i.e. unpushed work.
+/// - `behind`: commits on the upstream that the local branch does not
+///   have. Shown as a soft warning but does not block merges.
+///
+/// A `detached` flag was intentionally omitted: `assembly::reassemble`
+/// only populates `GitState` when a worktree matched by branch name,
+/// so detached-HEAD worktrees never produce a `GitState`, and there
+/// is nowhere the field could be meaningfully true.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct GitState {
     pub dirty: bool,
     pub ahead: u32,
     pub behind: u32,
-    pub detached: bool,
 }
 
 /// Aggregate CI check status for a PR.

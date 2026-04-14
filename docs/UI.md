@@ -129,8 +129,12 @@ read from the cache**. Concretely:
   in flight), surface that to the user via `alert_message` / a status
   bar message rather than blocking.
 - Worktree / branch metadata - read from
-  `self.repo_data[repo_path].worktrees` (which now carries
-  `has_commits_ahead` so `branch_has_commits` is a pure cache lookup).
+  `self.repo_data[repo_path].worktrees` (which carries
+  `has_commits_ahead` so `branch_has_commits` is a pure cache lookup,
+  plus `dirty` / `untracked` / `unpushed` / `behind_remote` so
+  `App::worktree_cleanliness` can classify a worktree's local state
+  without shelling out - used by the `!cl` chip renderer and the
+  Review -> Done merge guard).
 - Backend file reads (`read_plan`, `list`) - clone the `Arc<dyn
   WorkItemBackend>` into the background closure and run the read there.
 - `default_branch`, `github_remote`, `git diff` - clone the

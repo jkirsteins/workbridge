@@ -1487,6 +1487,25 @@ fn format_work_item_entry<'a>(
         }
     }
 
+    // Unclean-worktree chip. Rendered whenever ANY repo association has
+    // a derived `GitState` that reports uncommitted changes, unpushed
+    // commits, or a behind-remote delta. `git_state.dirty` is the union
+    // of modified-tracked-files and untracked-files (see `GitState`
+    // doc comment); the merge guard in `App::advance_stage` /
+    // `App::execute_merge` distinguishes them via
+    // `App::worktree_cleanliness`, which reads the raw `WorktreeInfo`
+    // fields. Both paths are pure cache reads and cannot shell out,
+    // honouring the "no blocking I/O on the UI thread" invariant.
+    let is_unclean = wi.repo_associations.iter().any(|a| {
+        a.git_state
+            .as_ref()
+            .map(|gs| gs.dirty || gs.ahead > 0 || gs.behind > 0)
+            .unwrap_or(false)
+    });
+    if is_unclean {
+        right_parts.push((" !cl".to_string(), theme.style_badge_worktree_unclean()));
+    }
+
     // Multi-repo indicator.
     let repo_count = wi.repo_associations.len();
     if repo_count > 1 {
