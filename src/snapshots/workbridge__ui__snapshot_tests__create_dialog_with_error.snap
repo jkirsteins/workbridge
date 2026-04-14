@@ -1,16 +1,17 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 24)"
+expression: "render(&mut app, 80, 24)"
 ---
-  List    Board    Dashboard                                   Tab: switch view
-┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
-│               ┌ Create Work Item ────────────────────────────┐               │
-│  No work items│                                              │               │
+  List    Board ┌ Create Work Item ────────────────────────────┐ab: switch view
+┌ Work Items (0)│                                              │───────────────┐
 │               │ Title:                                       │               │
-│  Ctrl+N: quick│                                              │               │
+│  No work items│                                              │               │
+│               │                                              │               │
+│  Ctrl+N: quick│ Description (optional):                      │               │
 │  Ctrl+B: backl│                                              │               │
-│               │ Description (optional):                      │               │
-│               │  (empty)                                     │               │
+│               │                                              │               │
+│               │                                              │               │
+│               │                                              │               │
 │               │                                              │               │
 │               │                                              │               │
 │               │                                              │               │
@@ -18,11 +19,10 @@ expression: "render(&app, 80, 24)"
 │               │  [x] /repo/only                              │               │
 │               │                                              │               │
 │               │ Branch (optional):                           │               │
-│               │  (empty)                                     │               │
+│               │                                              │               │
 │               │                                              │               │
 │               │ Title cannot be empty                        │               │
 │               │ Enter: Create | Esc: Cancel | Tab: Next fiel │               │
 │               │                                              │               │
 │               └──────────────────────────────────────────────┘               │
-│                       ││                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘

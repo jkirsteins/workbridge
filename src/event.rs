@@ -281,37 +281,37 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 if app.settings_tab == SettingsTab::ReviewGate
                     && app.settings_review_skill_editing =>
             {
-                app.settings_review_skill_input.backspace();
+                app.settings_review_skill_input.delete_prev_char();
             }
             (_, KeyCode::Delete)
                 if app.settings_tab == SettingsTab::ReviewGate
                     && app.settings_review_skill_editing =>
             {
-                app.settings_review_skill_input.delete();
+                app.settings_review_skill_input.delete_next_char();
             }
             (_, KeyCode::Left)
                 if app.settings_tab == SettingsTab::ReviewGate
                     && app.settings_review_skill_editing =>
             {
-                app.settings_review_skill_input.move_left();
+                app.settings_review_skill_input.move_left(false);
             }
             (_, KeyCode::Right)
                 if app.settings_tab == SettingsTab::ReviewGate
                     && app.settings_review_skill_editing =>
             {
-                app.settings_review_skill_input.move_right();
+                app.settings_review_skill_input.move_right(false);
             }
             (_, KeyCode::Home)
                 if app.settings_tab == SettingsTab::ReviewGate
                     && app.settings_review_skill_editing =>
             {
-                app.settings_review_skill_input.home();
+                app.settings_review_skill_input.move_to_line_start(false);
             }
             (_, KeyCode::End)
                 if app.settings_tab == SettingsTab::ReviewGate
                     && app.settings_review_skill_editing =>
             {
-                app.settings_review_skill_input.end();
+                app.settings_review_skill_input.move_to_line_end(false);
             }
             (_, KeyCode::Up) => match app.settings_tab {
                 SettingsTab::Repos => match app.settings_list_focus {
@@ -1297,27 +1297,27 @@ fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
                 "user_rework",
             );
         }
-        // Route text input keys to the SimpleTextInput.
+        // Route text input keys to the rat-widget TextInputState.
         (_, KeyCode::Char(c)) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.rework_prompt_input.insert_char(c);
         }
         (_, KeyCode::Backspace) => {
-            app.rework_prompt_input.backspace();
+            app.rework_prompt_input.delete_prev_char();
         }
         (_, KeyCode::Delete) => {
-            app.rework_prompt_input.delete();
+            app.rework_prompt_input.delete_next_char();
         }
         (_, KeyCode::Left) => {
-            app.rework_prompt_input.move_left();
+            app.rework_prompt_input.move_left(false);
         }
         (_, KeyCode::Right) => {
-            app.rework_prompt_input.move_right();
+            app.rework_prompt_input.move_right(false);
         }
         (_, KeyCode::Home) => {
-            app.rework_prompt_input.home();
+            app.rework_prompt_input.move_to_line_start(false);
         }
         (_, KeyCode::End) => {
-            app.rework_prompt_input.end();
+            app.rework_prompt_input.move_to_line_end(false);
         }
         _ => {}
     }
@@ -1331,7 +1331,8 @@ fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
 /// Enter confirms (persists the branch via `update_branch` and re-drives
 /// whichever gesture opened the dialog - spawn_session or advance_stage).
 /// Esc dismisses without touching the backend. Character input keys and
-/// basic cursor navigation are forwarded to the `SimpleTextInput`.
+/// basic cursor navigation are forwarded to the rat-widget
+/// `TextInputState`.
 fn handle_set_branch_dialog(app: &mut App, key: KeyEvent) {
     let had_status = app.has_visible_status_bar();
     match (key.modifiers, key.code) {
@@ -1341,7 +1342,7 @@ fn handle_set_branch_dialog(app: &mut App, key: KeyEvent) {
         (_, KeyCode::Enter) => {
             app.confirm_set_branch_dialog();
         }
-        // Route text input keys to the dialog's SimpleTextInput. The
+        // Route text input keys to the dialog's TextInputState. The
         // dialog intercept above must remain higher priority than any
         // Ctrl+D / `d` / `q` handler so the user can type those
         // characters as part of a branch name.
@@ -1352,32 +1353,32 @@ fn handle_set_branch_dialog(app: &mut App, key: KeyEvent) {
         }
         (_, KeyCode::Backspace) => {
             if let Some(dlg) = app.set_branch_dialog.as_mut() {
-                dlg.input.backspace();
+                dlg.input.delete_prev_char();
             }
         }
         (_, KeyCode::Delete) => {
             if let Some(dlg) = app.set_branch_dialog.as_mut() {
-                dlg.input.delete();
+                dlg.input.delete_next_char();
             }
         }
         (_, KeyCode::Left) => {
             if let Some(dlg) = app.set_branch_dialog.as_mut() {
-                dlg.input.move_left();
+                dlg.input.move_left(false);
             }
         }
         (_, KeyCode::Right) => {
             if let Some(dlg) = app.set_branch_dialog.as_mut() {
-                dlg.input.move_right();
+                dlg.input.move_right(false);
             }
         }
         (_, KeyCode::Home) => {
             if let Some(dlg) = app.set_branch_dialog.as_mut() {
-                dlg.input.home();
+                dlg.input.move_to_line_start(false);
             }
         }
         (_, KeyCode::End) => {
             if let Some(dlg) = app.set_branch_dialog.as_mut() {
-                dlg.input.end();
+                dlg.input.move_to_line_end(false);
             }
         }
         _ => {}
@@ -1447,22 +1448,22 @@ fn handle_cleanup_reason_input(app: &mut App, key: KeyEvent) {
             app.cleanup_reason_input.insert_char(c);
         }
         (_, KeyCode::Backspace) => {
-            app.cleanup_reason_input.backspace();
+            app.cleanup_reason_input.delete_prev_char();
         }
         (_, KeyCode::Delete) => {
-            app.cleanup_reason_input.delete();
+            app.cleanup_reason_input.delete_next_char();
         }
         (_, KeyCode::Left) => {
-            app.cleanup_reason_input.move_left();
+            app.cleanup_reason_input.move_left(false);
         }
         (_, KeyCode::Right) => {
-            app.cleanup_reason_input.move_right();
+            app.cleanup_reason_input.move_right(false);
         }
         (_, KeyCode::Home) => {
-            app.cleanup_reason_input.home();
+            app.cleanup_reason_input.move_to_line_start(false);
         }
         (_, KeyCode::End) => {
-            app.cleanup_reason_input.end();
+            app.cleanup_reason_input.move_to_line_end(false);
         }
         _ => {}
     }
@@ -1560,10 +1561,11 @@ fn handle_create_dialog(app: &mut App, key: KeyEvent) {
                 app.create_dialog.focus_field,
                 CreateDialogFocus::Description
             ) {
+                // rat-widget's TextAreaState manages its own viewport, so
+                // no explicit ensure_visible/scroll call is required - the
+                // next render will adjust the scroll offset so the cursor
+                // stays visible.
                 app.create_dialog.description_input.insert_newline();
-                app.create_dialog
-                    .description_input
-                    .ensure_visible(crate::ui::DESC_TEXTAREA_HEIGHT as usize);
                 return;
             }
             if app.create_dialog.quickstart_mode {
@@ -1643,7 +1645,13 @@ fn handle_create_dialog(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Forward a key event to the currently focused text input in the create dialog.
+/// Forward a key event to the currently focused text input in the create
+/// dialog.
+///
+/// This drives `rat_widget::text_input::TextInputState` methods directly
+/// rather than going through `rat_widget::text_input::handle_events` -
+/// doing so avoids the crossterm 0.28 / 0.29 version skew documented at
+/// `src/salsa.rs:22-26`.
 fn handle_text_input_key(app: &mut App, key: KeyEvent) {
     let is_branch = matches!(app.create_dialog.focus_field, CreateDialogFocus::Branch);
 
@@ -1661,22 +1669,22 @@ fn handle_text_input_key(app: &mut App, key: KeyEvent) {
             input.insert_char(c);
         }
         (_, KeyCode::Backspace) => {
-            input.backspace();
+            input.delete_prev_char();
         }
         (_, KeyCode::Delete) => {
-            input.delete();
+            input.delete_next_char();
         }
         (_, KeyCode::Left) => {
-            input.move_left();
+            input.move_left(false);
         }
         (_, KeyCode::Right) => {
-            input.move_right();
+            input.move_right(false);
         }
         (_, KeyCode::Home) => {
-            input.home();
+            input.move_to_line_start(false);
         }
         (_, KeyCode::End) => {
-            input.end();
+            input.move_to_line_end(false);
         }
         _ => {}
     }
@@ -1688,7 +1696,10 @@ fn handle_text_input_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Forward a key event to the description textarea in the create dialog.
+/// Forward a key event to the description textarea in the create
+/// dialog. Drives `rat_widget::textarea::TextAreaState` methods
+/// directly - viewport/scroll is managed by the textarea itself on the
+/// next render, so there is no explicit `ensure_visible` call.
 fn handle_textarea_key(app: &mut App, key: KeyEvent) {
     let ta = &mut app.create_dialog.description_input;
     match (key.modifiers, key.code) {
@@ -1696,33 +1707,31 @@ fn handle_textarea_key(app: &mut App, key: KeyEvent) {
             ta.insert_char(c);
         }
         (_, KeyCode::Backspace) => {
-            ta.backspace();
+            ta.delete_prev_char();
         }
         (_, KeyCode::Delete) => {
-            ta.delete();
+            ta.delete_next_char();
         }
         (_, KeyCode::Left) => {
-            ta.move_left();
+            ta.move_left(1, false);
         }
         (_, KeyCode::Right) => {
-            ta.move_right();
+            ta.move_right(1, false);
         }
         (_, KeyCode::Up) => {
-            ta.move_up();
+            ta.move_up(1, false);
         }
         (_, KeyCode::Down) => {
-            ta.move_down();
+            ta.move_down(1, false);
         }
         (_, KeyCode::Home) => {
-            ta.home();
+            ta.move_to_line_start(false);
         }
         (_, KeyCode::End) => {
-            ta.end();
+            ta.move_to_line_end(false);
         }
         _ => {}
     }
-    // Keep cursor visible within the 3-line viewport.
-    ta.ensure_visible(crate::ui::DESC_TEXTAREA_HEIGHT as usize);
 }
 
 // -- Mouse scroll handling ---------------------------------------------------
