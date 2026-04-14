@@ -36,6 +36,14 @@ pub struct WorktreeInfo {
     pub branch: Option<String>,
     /// True if this is the main worktree (the repo's primary checkout).
     pub is_main: bool,
+    /// Cached answer to "does this worktree's branch have commits ahead of
+    /// the repo's default branch?" - populated by `list_worktrees` during
+    /// the background fetch cycle so UI-thread code can read the result
+    /// synchronously without shelling out to `git log`. `None` means the
+    /// check was not attempted (detached HEAD, the main worktree, or the
+    /// check failed); the UI thread must treat `None` as "unknown - safe
+    /// default" rather than retrying the shell-out.
+    pub has_commits_ahead: Option<bool>,
 }
 
 /// Trait for worktree operations. Implementations include
@@ -174,6 +182,7 @@ impl GitWorktreeService {
                         path,
                         branch: current_branch.take(),
                         is_main: is_first,
+                        has_commits_ahead: None,
                     });
                     is_first = false;
                 }
@@ -201,6 +210,7 @@ impl GitWorktreeService {
                 path,
                 branch: current_branch.take(),
                 is_main: is_first,
+                has_commits_ahead: None,
             });
         }
 
@@ -249,6 +259,41 @@ impl WorktreeService for GitWorktreeService {
             }
         });
 
+        // Populate `has_commits_ahead` for each non-main worktree so UI-thread
+        // code (`App::branch_has_commits`) can consult the cached answer
+        // instead of shelling out to `git log`. Runs one `git log` per
+        // worktree on the background fetcher thread; on error we leave the
+        // field as `None` and let callers fall back to their safe default.
+        // The main worktree is skipped because the review-gate / retroactive-
+        // analysis flows only care about side-branch worktrees.
+        for wt in worktrees.iter_mut() {
+            if wt.is_main {
+                continue;
+            }
+            // Skip detached-HEAD worktrees: they have no branch-ish HEAD so
+            // `<default>..HEAD` would be meaningless for the review-gate /
+            // retroactive-analysis callers.
+            if wt.branch.is_none() {
+                continue;
+            }
+            // Run from inside the worktree so HEAD resolves to that worktree's
+            // branch tip even when multiple worktrees are checked out.
+            let range = format!("{default}..HEAD");
+            let out = git_command()
+                .args(["log", &range, "--oneline"])
+                .current_dir(&wt.path)
+                .output();
+            wt.has_commits_ahead = match out {
+                Ok(o) if o.status.success() => {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    Some(!stdout.trim().is_empty())
+                }
+                // Leave as None on any failure - the main thread will treat
+                // that as "unknown" and apply its safe fallback.
+                _ => None,
+            };
+        }
+
         Ok(worktrees)
     }
 
@@ -284,6 +329,16 @@ impl WorktreeService for GitWorktreeService {
             path: target_dir.to_path_buf(),
             branch: Some(branch.to_string()),
             is_main: false,
+            // `has_commits_ahead: None` means "not yet resolved" - the
+            // background fetcher will compute the real answer on its
+            // next cycle. Returning `Some(false)` eagerly would be
+            // silently wrong for the `branch_exists` path, where an
+            // existing branch being attached to a new worktree may
+            // already be ahead of the default branch. `None` is the
+            // safe default: the cache-reading helpers
+            // (`branch_has_commits`) treat it the same as `Some(false)`
+            // and defer the decision to the fetcher.
+            has_commits_ahead: None,
         })
     }
 

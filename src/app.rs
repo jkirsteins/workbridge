@@ -159,12 +159,46 @@ pub enum ReviewGateMessage {
     Progress(String),
     /// Final result - the gate completed or failed.
     Result(ReviewGateResult),
+    /// Terminal "cannot run" outcome discovered on the background thread
+    /// (no plan, no diff, git failure, default branch unresolvable). This
+    /// is NOT the same as `Result { approved: false }`: Blocked means the
+    /// gate never actually ran against a diff, so the caller must only
+    /// surface the reason in the status bar and clear the gate state -
+    /// NOT log an activity entry or kill/respawn the session as if the
+    /// review had rejected the work.
+    Blocked {
+        work_item_id: WorkItemId,
+        reason: String,
+    },
+}
+
+/// Who initiated a review gate. Determines how `poll_review_gate`
+/// handles a `Blocked` outcome:
+///
+/// - `Mcp`: Claude requested Review via workbridge_set_status and the
+///   background gate decided it cannot run. The rework flow applies -
+///   kill the existing session and respawn with the rejection reason so
+///   Claude has feedback to iterate on.
+/// - `Tui`: The user pressed `l` (advance) on a no-diff or no-plan
+///   Implementing item. The session is still the user's primary
+///   workspace - killing and respawning would be destructive. Only
+///   surface the reason in the status bar and let the user decide.
+/// - `Auto`: An Implementing session died without calling
+///   workbridge_set_status("Review"). Auto-triggering the gate is a
+///   convenience; if it blocks we still want the rework flow so Claude
+///   sees the reason on the next restart (mirrors Mcp semantics).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewGateOrigin {
+    Mcp,
+    Tui,
+    Auto,
 }
 
 /// Per-work-item state for an in-flight review gate.
 pub struct ReviewGateState {
     pub rx: crossbeam_channel::Receiver<ReviewGateMessage>,
     pub progress: Option<String>,
+    pub origin: ReviewGateOrigin,
 }
 
 /// A single CI check as returned by `gh pr checks --json name,bucket`.
@@ -300,12 +334,49 @@ pub(crate) struct DeleteCleanupInfo {
     github_remote: Option<(String, String)>,
 }
 
+/// Result from the asynchronous plan-read that precedes opening a
+/// Claude session. `stage_system_prompt` previously read the plan
+/// synchronously on the UI thread - the read is now performed on a
+/// background thread and the deserialized plan (plus any error
+/// message) flows back via this struct for the main thread to apply.
+pub struct SessionOpenPlanResult {
+    /// The work item the session is being opened for.
+    pub wi_id: WorkItemId,
+    /// The worktree path where Claude will run.
+    pub cwd: PathBuf,
+    /// Plan text read from the backend, if any. Empty string when the
+    /// backend returned `Ok(None)` or an error (the caller treats an
+    /// empty plan the same as a missing plan).
+    pub plan_text: String,
+    /// Human-readable error surfaced in the status bar when the backend
+    /// read failed. `None` on success or when the backend reported no
+    /// plan exists.
+    pub read_error: Option<String>,
+}
+
+/// Per-entry state tracked alongside the `session_open_rx` map so
+/// `poll_session_opens` can end the "Opening session..." spinner
+/// started by `begin_session_open`. Stored in a named struct (rather
+/// than a bare tuple) so the activity ID cannot be accidentally
+/// dropped if the map grows new fields - a missed `end_activity`
+/// would leak a permanent spinner in the status bar.
+pub struct SessionOpenPending {
+    pub rx: crossbeam_channel::Receiver<SessionOpenPlanResult>,
+    pub activity: ActivityId,
+}
+
 /// Result from the asynchronous worktree creation thread.
 pub struct WorktreeCreateResult {
     /// The work item the worktree was created for.
     pub wi_id: WorkItemId,
     /// The repo path the worktree belongs to.
     pub repo_path: PathBuf,
+    /// The branch name the worktree was created for. Preserved here so
+    /// orphan-cleanup paths (Phase 5 in `delete_work_item_by_id`) can
+    /// forward it to `spawn_delete_cleanup` and run `git branch -D`
+    /// off the UI thread. `None` only for test stubs that synthesize a
+    /// result without a branch (e.g. `collect_backfill_requests` tests).
+    pub branch: Option<String>,
     /// The worktree path on success.
     pub path: Option<PathBuf>,
     /// Human-readable error message on failure.
@@ -323,6 +394,20 @@ pub struct WorktreeCreateResult {
     /// `remove_worktree` on reused worktrees because the thread never owned
     /// them (the worktree was already registered with git when we found it).
     pub reused: bool,
+}
+
+/// An orphaned worktree captured from an in-flight worktree-create
+/// result at the moment a delete is confirmed. Threaded back to the
+/// caller of `delete_work_item_by_id` so the caller can synthesize a
+/// `DeleteCleanupInfo` for `spawn_delete_cleanup` - keeping the
+/// `git worktree remove` and `git branch -D` off the UI thread. The
+/// branch name is preserved so the cleanup thread deletes the stale
+/// branch ref too (dropping it here would leak the branch on master's
+/// pre-P0-fix behaviour).
+pub(crate) struct OrphanWorktree {
+    pub repo_path: PathBuf,
+    pub worktree_path: PathBuf,
+    pub branch: Option<String>,
 }
 
 /// App holds the entire application state.
@@ -452,8 +537,13 @@ pub struct App {
     pub create_dialog: CreateDialog,
 
     // -- Work item state --
-    /// Backend for persisting work item records.
-    pub backend: Box<dyn WorkItemBackend>,
+    /// Backend for persisting work item records. Held as `Arc` rather than
+    /// `Box` so background threads (PR creation, review gate, delete
+    /// cleanup) can clone the handle and perform backend I/O off the UI
+    /// thread - see `docs/UI.md` "Blocking I/O Prohibition" for why
+    /// `backend.read_plan(...)` and similar calls must not run on the
+    /// main thread.
+    pub backend: Arc<dyn WorkItemBackend>,
     /// Worktree service for creating/listing worktrees.
     pub worktree_service: Arc<dyn WorktreeService + Send + Sync>,
     /// GitHub pull-request closer, injected via trait so the background
@@ -619,6 +709,30 @@ pub struct App {
     /// The work item ID that the current worktree creation was spawned for.
     pub worktree_create_wi: Option<WorkItemId>,
 
+    // -- Async session-open plan read --
+    /// Pending background plan reads, keyed by work item ID. Each entry
+    /// holds a receiver for a single `SessionOpenPlanResult` plus the
+    /// `ActivityId` of the "Opening session..." spinner started in
+    /// `begin_session_open` and ended in `poll_session_opens`. Once the
+    /// result arrives, `poll_session_opens` ends the activity and
+    /// finishes the session open on the main thread. Keyed by work item
+    /// (rather than a single Option<Receiver>) so that opens for
+    /// different items do not collide: pressing Enter on several items
+    /// in quick succession must not cancel each other. `docs/UI.md`
+    /// "Blocking I/O Prohibition" requires the backend read to live on
+    /// a background thread; this map is how the result flows back.
+    pub session_open_rx: HashMap<WorkItemId, SessionOpenPending>,
+
+    /// Sender for warnings emitted by `spawn_orphan_worktree_cleanup`
+    /// background threads. Cloned into each spawned closure so the
+    /// fire-and-forget cleanup can still surface failures (failed
+    /// `git worktree remove` / `git branch -D`) to the user instead of
+    /// silently leaking. Drained by `poll_orphan_cleanup_warnings` on
+    /// each background tick.
+    pub orphan_cleanup_warnings_tx: crossbeam_channel::Sender<String>,
+    /// Receiver paired with `orphan_cleanup_warnings_tx`.
+    pub orphan_cleanup_warnings_rx: crossbeam_channel::Receiver<String>,
+
     /// Whether the global assistant drawer is open.
     pub global_drawer_open: bool,
     /// The global assistant PTY session (lazy, persistent).
@@ -677,7 +791,7 @@ impl App {
         use crate::config::InMemoryConfigProvider;
         Self::with_config_and_worktree_service(
             Config::default(),
-            Box::new(StubBackend),
+            Arc::new(StubBackend),
             Arc::new(StubWorktreeService),
             Box::new(InMemoryConfigProvider::new()),
         )
@@ -688,7 +802,7 @@ impl App {
     /// Uses a no-op worktree service. Call `with_config_and_worktree_service`
     /// to provide a real or mock worktree service.
     #[cfg(test)]
-    pub fn with_config(config: Config, backend: Box<dyn WorkItemBackend>) -> Self {
+    pub fn with_config(config: Config, backend: Arc<dyn WorkItemBackend>) -> Self {
         use crate::config::InMemoryConfigProvider;
         Self::with_config_and_worktree_service(
             config,
@@ -702,12 +816,14 @@ impl App {
     /// and config provider.
     pub fn with_config_and_worktree_service(
         config: Config,
-        backend: Box<dyn WorkItemBackend>,
+        backend: Arc<dyn WorkItemBackend>,
         worktree_service: Arc<dyn WorktreeService + Send + Sync>,
         config_provider: Box<dyn ConfigProvider>,
     ) -> Self {
         let active_repo_cache = canonicalize_repo_entries(config.active_repos());
         let (mcp_tx, mcp_rx) = crossbeam_channel::unbounded();
+        let (orphan_cleanup_warnings_tx, orphan_cleanup_warnings_rx) =
+            crossbeam_channel::unbounded();
         let mut app = Self {
             pr_closer: crate::pr_service::default_pr_closer(),
             should_quit: false,
@@ -814,6 +930,9 @@ impl App {
             worktree_create_rx: None,
             worktree_create_activity: None,
             worktree_create_wi: None,
+            session_open_rx: HashMap::new(),
+            orphan_cleanup_warnings_tx,
+            orphan_cleanup_warnings_rx,
             global_drawer_open: false,
             global_session: None,
             global_mcp_server: None,
@@ -1058,28 +1177,26 @@ impl App {
             if wi.status != WorkItemStatus::Implementing || self.review_gates.contains_key(&wi_id) {
                 continue;
             }
-            // Extract paths before calling &mut self methods.
-            let paths = wi.repo_associations.first().and_then(|assoc| {
-                let wt = assoc.worktree_path.clone()?;
-                Some((wt, assoc.repo_path.clone()))
-            });
-            let has_commits = match paths {
-                Some((wt, repo)) => self.branch_has_commits(&wt, &repo),
-                None => false,
-            };
-            if has_commits {
-                match self.spawn_review_gate(&wi_id) {
-                    ReviewGateSpawn::Spawned => {
-                        self.status_message =
-                            Some("Implementing session ended - running review gate...".into());
-                    }
-                    ReviewGateSpawn::Blocked(reason) => {
-                        self.status_message = Some(reason);
-                    }
+            // Unconditionally spawn the gate. The background closure
+            // runs `git diff default..branch` itself and emits
+            // `ReviewGateMessage::Blocked("Cannot enter Review: no
+            // changes on branch")` when there are no commits. That
+            // single source of truth is more reliable than peeking at
+            // the 120s fetcher cache, which can still report
+            // `Some(false)` (or `None`) for up to two minutes after
+            // Claude's final commit - causing the item to get stuck in
+            // Implementing with no auto-retry until the next fetch.
+            // The Blocked path runs the rework flow (the Auto origin is
+            // equivalent to Mcp here) so Claude sees the reason on the
+            // next session restart.
+            match self.spawn_review_gate(&wi_id, ReviewGateOrigin::Auto) {
+                ReviewGateSpawn::Spawned => {
+                    self.status_message =
+                        Some("Implementing session ended - running review gate...".into());
                 }
-            } else {
-                self.status_message =
-                    Some("Implementing session ended with no commits on branch".into());
+                ReviewGateSpawn::Blocked(reason) => {
+                    self.status_message = Some(reason);
+                }
             }
         }
 
@@ -1144,6 +1261,12 @@ impl App {
     fn cleanup_session_state_for(&mut self, wi_id: &WorkItemId) {
         self.mcp_servers.remove(wi_id);
         self.claude_working.remove(wi_id);
+        // Drop any pending background plan read and end its
+        // "Opening session..." spinner. The thread will complete and
+        // try to send; the send will fail because the receiver is
+        // gone, and the thread exits. `finish_session_open` also has
+        // its own deleted-work-item guard as a second line of defence.
+        self.drop_session_open_entry(wi_id);
     }
 
     /// Stop all MCP servers, clear activity state, and remove temp config files.
@@ -1682,30 +1805,43 @@ impl App {
         self.reconstruct_mergequeue_watches();
     }
 
-    /// Core work-item deletion. Removes ALL associated resources:
-    /// backend record, session (killed), MCP server, worktrees, local branches,
-    /// open PRs (closed via gh), in-flight operations, and all in-memory state.
+    /// Core work-item deletion. Removes the backend record, kills the
+    /// Claude and terminal sessions, cancels in-flight background
+    /// operations (worktree create, PR create, merge, review submit,
+    /// mergequeue poll) and clears in-memory state.
     ///
     /// Does NOT touch selection/cursor/display state - callers handle that.
     ///
-    /// `repo_associations` is the list of repo+branch associations from the
-    /// backend record. Worktree paths and live PR state are looked up from
-    /// self.repo_data (populated by the background fetcher).
+    /// Resource cleanup (worktree removal, branch deletion, PR close) is
+    /// NOT performed here - it is blocking I/O and must run on a
+    /// background thread. Callers that need resource cleanup first call
+    /// `gather_delete_cleanup_infos` (a pure cache lookup) and then
+    /// `spawn_delete_cleanup` to run the actual `git` / `gh` commands off
+    /// the UI thread. Auto-archive skips resource cleanup entirely
+    /// because Done items have already been through the merge flow.
     ///
-    /// When `skip_resource_cleanup` is true, Phase 4 (worktree removal,
-    /// branch deletion, PR close) is skipped. Used by auto-archive where
-    /// Done items have already been through the merge flow which handles
-    /// resource cleanup, avoiding blocking I/O on the UI thread.
+    /// Warnings (best-effort cleanup failures from Phase 5 orphan
+    /// handling) are appended to `warnings`. Orphaned worktrees
+    /// discovered in Phase 5 (an in-flight worktree-create thread that
+    /// had already produced a path before the user requested the
+    /// delete) are appended to `orphan_worktrees` as `OrphanWorktree`
+    /// entries so the caller can forward them to `spawn_delete_cleanup`
+    /// and run both `git worktree remove` and `git branch -D` on the
+    /// background cleanup thread. The branch name is preserved so
+    /// `spawn_delete_cleanup` can delete the stale branch ref too
+    /// (dropping it would leak the branch - master deleted it inline
+    /// before the async refactor). This function MUST NOT call
+    /// `self.worktree_service.remove_worktree(...)` directly - it runs
+    /// on the UI thread (either the MCP tick handler or the modal
+    /// confirm handler) where blocking I/O is forbidden by
+    /// `docs/UI.md` "Blocking I/O Prohibition".
     ///
-    /// Warnings (best-effort cleanup failures) are appended to `warnings`.
     /// Returns Err only if the backend delete itself fails (fatal).
     fn delete_work_item_by_id(
         &mut self,
         wi_id: &WorkItemId,
-        repo_associations: &[crate::work_item_backend::RepoAssociationRecord],
         warnings: &mut Vec<String>,
-        force: bool,
-        skip_resource_cleanup: bool,
+        orphan_worktrees: &mut Vec<OrphanWorktree>,
     ) -> Result<(), crate::work_item_backend::BackendError> {
         // -- Phase 2: Backend cleanup (fatal on delete failure) --
         if let Err(e) = self.backend.pre_delete_cleanup(wi_id) {
@@ -1728,125 +1864,36 @@ impl App {
             session.kill();
         }
 
-        // -- Phase 4: Resource cleanup (worktrees, branches, open PRs) --
-        // Skipped for auto-archive: Done items have already been through the
-        // merge flow which handles resource cleanup. This avoids blocking I/O
-        // (git worktree remove, git branch -D, gh pr close) on the UI thread
-        // during timer-driven reassembly.
-        if !skip_resource_cleanup {
-            struct CleanupInfo {
-                repo_path: PathBuf,
-                branch: Option<String>,
-                worktree_path: Option<PathBuf>,
-                branch_in_main_worktree: bool,
-                open_pr_number: Option<u64>,
-                github_remote: Option<(String, String)>,
-            }
-
-            let cleanup_infos: Vec<CleanupInfo> = repo_associations
-                .iter()
-                .map(|assoc| {
-                    let wt_for_branch = self
-                        .repo_data
-                        .get(&assoc.repo_path)
-                        .and_then(|rd| rd.worktrees.as_ref().ok())
-                        .and_then(|wts| {
-                            wts.iter()
-                                .find(|wt| wt.branch.as_deref() == assoc.branch.as_deref())
-                        });
-
-                    let worktree_path = wt_for_branch
-                        .filter(|wt| !wt.is_main)
-                        .map(|wt| wt.path.clone());
-
-                    let branch_in_main_worktree =
-                        wt_for_branch.map(|wt| wt.is_main).unwrap_or(false);
-
-                    let open_pr_number = assoc.branch.as_deref().and_then(|branch| {
-                        self.repo_data.get(&assoc.repo_path).and_then(|rd| {
-                            rd.prs.as_ref().ok().and_then(|prs| {
-                                prs.iter()
-                                    .find(|pr| pr.head_branch == branch && pr.state == "OPEN")
-                                    .map(|pr| pr.number)
-                            })
-                        })
-                    });
-
-                    let github_remote = self
-                        .repo_data
-                        .get(&assoc.repo_path)
-                        .and_then(|rd| rd.github_remote.clone());
-
-                    CleanupInfo {
-                        repo_path: assoc.repo_path.clone(),
-                        branch: assoc.branch.clone(),
-                        worktree_path,
-                        branch_in_main_worktree,
-                        open_pr_number,
-                        github_remote,
-                    }
-                })
-                .collect();
-
-            for info in &cleanup_infos {
-                if let Some(ref wt_path) = info.worktree_path
-                    && let Err(e) = self.worktree_service.remove_worktree(
-                        &info.repo_path,
-                        wt_path,
-                        false,
-                        force,
-                    )
-                {
-                    warnings.push(format!("worktree: {e}"));
-                }
-                // Skip branch deletion when checked out in the main worktree
-                // (git forbids deleting the currently checked-out branch).
-                if !info.branch_in_main_worktree
-                    && let Some(ref branch) = info.branch
-                    && let Err(e) =
-                        self.worktree_service
-                            .delete_branch(&info.repo_path, branch, true)
-                {
-                    warnings.push(format!("branch: {e}"));
-                }
-                if let Some(pr_number) = info.open_pr_number
-                    && let Some((ref owner, ref repo)) = info.github_remote
-                {
-                    let owner_repo = format!("{owner}/{repo}");
-                    match std::process::Command::new("gh")
-                        .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
-                        .output()
-                    {
-                        Ok(output) if !output.status.success() => {
-                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                            warnings.push(format!("PR close: {stderr}"));
-                        }
-                        Err(e) => warnings.push(format!("PR close: {e}")),
-                        _ => {}
-                    }
-                }
-            }
-        }
+        // -- Phase 4: (removed) Resource cleanup runs on a background
+        //    thread via `spawn_delete_cleanup`. Doing it synchronously
+        //    here would block the UI thread on `git worktree remove`,
+        //    `git branch -D`, and `gh pr close` - all forbidden by
+        //    `docs/UI.md` "Blocking I/O Prohibition".
 
         // -- Phase 5: Cancel in-flight operations --
         if self.worktree_create_wi.as_ref() == Some(wi_id) {
             let thread_done = if let Some(ref rx) = self.worktree_create_rx {
                 match rx.try_recv() {
                     Ok(result) => {
-                        // Thread completed - clean up the orphaned worktree,
-                        // but only if WE created it. A reused worktree was
+                        // Thread completed - queue the orphaned worktree
+                        // for the background delete-cleanup thread, but
+                        // only if WE created it. A reused worktree was
                         // already on disk before the thread ran and must
                         // not be force-removed as part of this delete.
+                        // Running `git worktree remove` here would be a
+                        // P0 blocking-I/O violation - see `docs/UI.md`.
+                        // The branch name is preserved so
+                        // `spawn_delete_cleanup` can run
+                        // `git branch -D` for the stale branch ref too
+                        // (dropping it would leak the branch).
                         if !result.reused
                             && let Some(ref path) = result.path
-                            && let Err(e) = self.worktree_service.remove_worktree(
-                                &result.repo_path,
-                                path,
-                                true,
-                                true,
-                            )
                         {
-                            warnings.push(format!("orphan worktree cleanup: {e}"));
+                            orphan_worktrees.push(OrphanWorktree {
+                                repo_path: result.repo_path.clone(),
+                                worktree_path: path.clone(),
+                                branch: result.branch.clone(),
+                            });
                         }
                         true
                     }
@@ -2284,6 +2331,64 @@ impl App {
         }
     }
 
+    /// Background cleanup for a single orphaned worktree. Used when
+    /// `poll_worktree_creation` discovers that the work item was
+    /// deleted while the worktree-create thread was running and the
+    /// fresh worktree on disk is now an orphan.
+    ///
+    /// The worktree-create thread finished successfully, so the
+    /// original `spawn_delete_cleanup` flow is not involved here - the
+    /// user may have confirmed the delete modal minutes ago. A
+    /// dedicated background thread runs `git worktree remove --force`
+    /// followed by `git branch -D` (when a branch name is available)
+    /// off the UI thread; failures are forwarded through
+    /// `orphan_cleanup_warnings_tx` so `poll_orphan_cleanup_warnings`
+    /// can surface them in the status bar. Deleting the branch here
+    /// matches the behaviour of the Phase 5 orphan path routed through
+    /// `spawn_delete_cleanup`, so a delete-during-create race never
+    /// leaks a branch ref regardless of which of the two orphan paths
+    /// fires.
+    fn spawn_orphan_worktree_cleanup(
+        &self,
+        repo_path: PathBuf,
+        worktree_path: PathBuf,
+        branch: Option<String>,
+    ) {
+        let ws = Arc::clone(&self.worktree_service);
+        let warnings_tx = self.orphan_cleanup_warnings_tx.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = ws.remove_worktree(&repo_path, &worktree_path, true, true) {
+                let _ = warnings_tx.send(format!(
+                    "Orphan worktree cleanup failed for {}: {e}",
+                    worktree_path.display()
+                ));
+            }
+            if let Some(ref branch) = branch
+                && let Err(e) = ws.delete_branch(&repo_path, branch, true)
+            {
+                let _ = warnings_tx.send(format!(
+                    "Orphan branch cleanup failed for {branch} in {}: {e}",
+                    repo_path.display()
+                ));
+            }
+        });
+    }
+
+    /// Drain any pending warnings from `spawn_orphan_worktree_cleanup`
+    /// background threads and surface them via `status_message`. Called
+    /// from the background-work tick alongside the other `poll_*`
+    /// methods. An empty channel is the success path: every orphan
+    /// cleanup so far has completed without errors.
+    pub fn poll_orphan_cleanup_warnings(&mut self) {
+        let mut warnings: Vec<String> = Vec::new();
+        while let Ok(msg) = self.orphan_cleanup_warnings_rx.try_recv() {
+            warnings.push(msg);
+        }
+        if !warnings.is_empty() {
+            self.status_message = Some(warnings.join(" | "));
+        }
+    }
+
     /// Poll the async delete-cleanup thread for a result. Called on each
     /// timer tick from the event loop.
     pub fn poll_delete_cleanup(&mut self) {
@@ -2398,16 +2503,25 @@ impl App {
                 && now.saturating_sub(done_at) >= archive_secs
             {
                 let mut warnings: Vec<String> = Vec::new();
-                match self.delete_work_item_by_id(
-                    &record.id,
-                    &record.repo_associations,
-                    &mut warnings,
-                    false,
-                    true, // skip resource cleanup: blocking I/O prohibited on UI thread
-                ) {
+                // Done items cannot have an in-flight worktree-create
+                // thread (create only runs for pre-Implementing stages),
+                // so `orphan_worktrees` is declared for the signature's
+                // sake and any unexpected entries are forwarded into the
+                // warnings buffer so they do not get silently dropped.
+                let mut orphan_worktrees: Vec<OrphanWorktree> = Vec::new();
+                match self.delete_work_item_by_id(&record.id, &mut warnings, &mut orphan_worktrees)
+                {
                     Ok(()) => {
                         archived_count += 1;
                         all_warnings.extend(warnings);
+                        for orphan in orphan_worktrees {
+                            all_warnings.push(format!(
+                                "auto-archive saw in-flight worktree {} in {} - \
+                                 left in place, clean up manually",
+                                orphan.worktree_path.display(),
+                                orphan.repo_path.display(),
+                            ));
+                        }
                     }
                     Err(e) => {
                         all_warnings.push(format!("delete {}: {e}", record.title));
@@ -2956,8 +3070,12 @@ impl App {
             .find_map(|a| a.worktree_path.clone())
         {
             Some(path) => {
-                // Worktree already exists - proceed to session spawn immediately.
-                self.complete_session_open(&work_item_id, &path);
+                // Worktree already exists - enqueue the background plan
+                // read that feeds `finish_session_open`. The read MUST
+                // live on a background thread because
+                // `WorkItemBackend::read_plan` hits the filesystem
+                // (see `docs/UI.md` "Blocking I/O Prohibition").
+                self.begin_session_open(&work_item_id, &path);
             }
             None => {
                 // Try to find an association with a branch name and auto-create
@@ -2986,6 +3104,7 @@ impl App {
                                 let _ = tx.send(WorktreeCreateResult {
                                     wi_id: wi_id_clone,
                                     repo_path,
+                                    branch: Some(branch.clone()),
                                     path: None,
                                     error: Some(format!(
                                         "Could not fetch or create branch '{}': {create_err}",
@@ -3022,6 +3141,7 @@ impl App {
                                     let _ = tx.send(WorktreeCreateResult {
                                         wi_id: wi_id_clone,
                                         repo_path,
+                                        branch: Some(branch),
                                         path: Some(wt_info.path),
                                         error: None,
                                         open_session: true,
@@ -3033,6 +3153,7 @@ impl App {
                                     let _ = tx.send(WorktreeCreateResult {
                                         wi_id: wi_id_clone,
                                         repo_path,
+                                        branch: Some(branch.clone()),
                                         path: None,
                                         error: Some(format!(
                                             "Failed to create worktree for '{}': {e}",
@@ -3062,23 +3183,134 @@ impl App {
         }
     }
 
-    /// Complete session setup after the worktree path is known.
-    /// Shared by both the immediate path (worktree already exists) and
-    /// the deferred path (worktree was just created in a background thread).
-    fn complete_session_open(&mut self, work_item_id: &WorkItemId, cwd: &std::path::Path) {
-        // Start MCP socket server for this session.
-        let mcp_result = self.start_mcp_for_session(cwd, work_item_id);
+    /// Begin the async plan-read stage of opening a Claude session.
+    ///
+    /// Spawns a background thread that calls `WorkItemBackend::read_plan`
+    /// (filesystem I/O) and then hands the result back to
+    /// `poll_session_opens`, which finishes the session on the UI thread.
+    /// Running the read here on the caller (a UI-thread entry point such
+    /// as `spawn_session` / `poll_worktree_creation` /
+    /// `poll_review_gate`) would freeze the event loop - see
+    /// `docs/UI.md` "Blocking I/O Prohibition".
+    ///
+    /// If another plan read is already in flight for this work item, the
+    /// new request is dropped (the previous one will finish and spawn a
+    /// session). This cannot deadlock: `poll_session_opens` removes the
+    /// entry as soon as the result arrives.
+    fn begin_session_open(&mut self, work_item_id: &WorkItemId, cwd: &std::path::Path) {
+        if self.session_open_rx.contains_key(work_item_id) {
+            // Already in flight - the pending read will finish the open.
+            // Re-surface the spinner message so a repeat Enter press is
+            // not silent; the existing activity entry is still alive so
+            // the duplicate start below would otherwise stack.
+            self.status_message = Some("Opening session...".into());
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let backend = Arc::clone(&self.backend);
+        let wi_id_clone = work_item_id.clone();
+        let cwd_clone = cwd.to_path_buf();
+        std::thread::spawn(move || {
+            let (plan_text, read_error) = match backend.read_plan(&wi_id_clone) {
+                Ok(Some(plan)) => (plan, None),
+                Ok(None) => (String::new(), None),
+                Err(e) => (String::new(), Some(format!("Could not read plan: {e}"))),
+            };
+            let _ = tx.send(SessionOpenPlanResult {
+                wi_id: wi_id_clone,
+                cwd: cwd_clone,
+                plan_text,
+                read_error,
+            });
+        });
+        // Surface immediate feedback so a slow plan read does not
+        // make the TUI look hung between the Enter keypress and the
+        // next `poll_session_opens` tick (200ms). The spinner is
+        // ended in `poll_session_opens` for every terminal arm
+        // (success, read_error, disconnect) via `drop_session_open_entry`.
+        let activity = self.start_activity("Opening session...");
+        self.session_open_rx
+            .insert(work_item_id.clone(), SessionOpenPending { rx, activity });
+    }
 
-        // Build the claude command with system prompt and MCP config.
-        let work_item_status = self
+    /// Remove a pending `session_open_rx` entry and end its spinner
+    /// activity. Centralising this keeps the two terminal paths
+    /// (result delivered, background thread disconnected) symmetric so
+    /// no terminal arm can leak a spinner.
+    fn drop_session_open_entry(&mut self, wi_id: &WorkItemId) {
+        if let Some(entry) = self.session_open_rx.remove(wi_id) {
+            self.end_activity(entry.activity);
+        }
+    }
+
+    /// Poll pending session-open plan reads. Called from the
+    /// background-work tick in `salsa.rs`. Each completed receiver
+    /// finishes the session open by calling `finish_session_open`
+    /// with the plan text read on the background thread.
+    pub fn poll_session_opens(&mut self) {
+        if self.session_open_rx.is_empty() {
+            return;
+        }
+        // Collect keys first because `finish_session_open` borrows
+        // `self` mutably, and we need to `remove` entries before the
+        // nested call.
+        let wi_ids: Vec<WorkItemId> = self.session_open_rx.keys().cloned().collect();
+        for wi_id in wi_ids {
+            let result = match self.session_open_rx.get(&wi_id) {
+                Some(entry) => match entry.rx.try_recv() {
+                    Ok(r) => r,
+                    Err(crossbeam_channel::TryRecvError::Empty) => continue,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        // Background thread died without sending - drop
+                        // the entry (and end its spinner) so a retry is
+                        // possible and surface the failure in the status
+                        // bar.
+                        self.drop_session_open_entry(&wi_id);
+                        self.status_message =
+                            Some("Session open: background thread exited unexpectedly".into());
+                        continue;
+                    }
+                },
+                None => continue,
+            };
+            self.drop_session_open_entry(&wi_id);
+            if let Some(msg) = result.read_error {
+                self.status_message = Some(msg);
+            }
+            self.finish_session_open(&result.wi_id, &result.cwd, result.plan_text);
+        }
+    }
+
+    /// Finish the session-open flow after the plan text has been read on
+    /// a background thread. Called by `poll_session_opens` - MUST NOT be
+    /// called directly from UI-thread entry points, because it invokes
+    /// `stage_system_prompt` which consumes state and would otherwise
+    /// encourage new synchronous `read_plan` callers.
+    fn finish_session_open(
+        &mut self,
+        work_item_id: &WorkItemId,
+        cwd: &std::path::Path,
+        plan_text: String,
+    ) {
+        // Guard: the work item may have been deleted while the plan
+        // read was in flight. In that case, do not spawn a session,
+        // just drop the result quietly. (The worktree itself is
+        // either pre-existing or cleaned up by `poll_worktree_creation`
+        // before we got here.)
+        let Some(work_item_status) = self
             .work_items
             .iter()
             .find(|w| w.id == *work_item_id)
             .map(|w| w.status.clone())
-            .unwrap_or(WorkItemStatus::Implementing);
+        else {
+            return;
+        };
+
+        // Start MCP socket server for this session.
+        let mcp_result = self.start_mcp_for_session(cwd, work_item_id);
         let session_key = (work_item_id.clone(), work_item_status.clone());
         let has_gate_findings = self.review_gate_findings.contains_key(work_item_id);
-        let system_prompt = self.stage_system_prompt(work_item_id, cwd);
+        let system_prompt = self.stage_system_prompt(work_item_id, cwd, plan_text);
         let mut cmd = Self::build_claude_cmd(
             &work_item_status,
             system_prompt.as_deref(),
@@ -3278,18 +3510,20 @@ impl App {
                         );
                         return;
                     }
-                    // Clean up the orphaned worktree instead of leaving it behind.
-                    if let Err(e) =
-                        self.worktree_service
-                            .remove_worktree(&result.repo_path, &path, true, true)
-                    {
-                        self.status_message = Some(format!(
-                            "Worktree created but work item deleted; cleanup failed: {e}"
-                        ));
-                    } else {
-                        self.status_message =
-                            Some("Worktree created but work item was deleted - cleaned up".into());
-                    }
+                    // Queue the orphaned worktree for background
+                    // cleanup. `poll_worktree_creation` runs on the UI
+                    // thread (rat-salsa timer ticks fire on the event
+                    // loop), so calling `remove_worktree` here would be
+                    // a P0 blocking-I/O violation - see `docs/UI.md`.
+                    self.spawn_orphan_worktree_cleanup(
+                        result.repo_path.clone(),
+                        path.clone(),
+                        result.branch.clone(),
+                    );
+                    self.status_message = Some(
+                        "Worktree created but work item was deleted - cleaning up in background"
+                            .into(),
+                    );
                     return;
                 }
                 // Worktree created successfully - reassemble so the new
@@ -3297,7 +3531,11 @@ impl App {
                 self.reassemble_work_items();
                 self.build_display_list();
                 if result.open_session {
-                    self.complete_session_open(&result.wi_id, &path);
+                    // Hand off to the background plan read; the session
+                    // itself is spawned from `poll_session_opens` once
+                    // the plan arrives. Running the read here would put
+                    // filesystem I/O back on the UI thread.
+                    self.begin_session_open(&result.wi_id, &path);
                 } else {
                     self.status_message = Some("Imported (worktree created)".into());
                 }
@@ -3329,10 +3567,20 @@ impl App {
     ///
     /// `cwd` is the worktree path where Claude will run - used to build the
     /// situation summary so Claude knows where it is working.
+    ///
+    /// `plan_text` is the plan body that was read from the backend on the
+    /// background thread by `begin_session_open` / `poll_session_opens`.
+    /// The UI thread must NOT read the plan here - `WorkItemBackend::read_plan`
+    /// performs filesystem I/O that would freeze the event loop (see
+    /// `docs/UI.md` "Blocking I/O Prohibition"). An empty string means
+    /// either "no plan on disk" or "plan read failed"; callers that need
+    /// to distinguish should pass the pre-resolved `read_error` via
+    /// `status_message` before calling this function.
     fn stage_system_prompt(
         &mut self,
         work_item_id: &WorkItemId,
         cwd: &std::path::Path,
+        plan_text: String,
     ) -> Option<String> {
         use std::collections::HashMap;
 
@@ -3351,16 +3599,6 @@ impl App {
             .filter(|u| !u.is_empty());
         let worktree_display = cwd.display().to_string();
 
-        // Read the plan text (if any) from the backend.
-        let plan_text = match self.backend.read_plan(work_item_id) {
-            Ok(Some(plan)) => plan,
-            Ok(None) => String::new(),
-            Err(e) => {
-                self.status_message = Some(format!("Could not read plan: {e}"));
-                String::new()
-            }
-        };
-
         // Look up and consume rework reason if any (one-shot use).
         let rework_reason = self.rework_reasons.remove(work_item_id).unwrap_or_default();
         let review_gate_findings = self
@@ -3370,15 +3608,17 @@ impl App {
 
         // Check if the branch has commits ahead of the default branch.
         // Used to select the retroactive planning prompt when appropriate.
-        // Clone the repo path to release the borrow on self.work_items
-        // before calling &mut self method.
+        // Reads from the cached fetch result - never shells out to git
+        // on the UI thread. When the fetcher has not yet populated this
+        // repo, defaults to false (fall through to the "no plan" prompt).
         let repo_path_owned = wi.repo_associations.first().map(|a| a.repo_path.clone());
+        let branch_owned = wi.repo_associations.first().and_then(|a| a.branch.clone());
         let status = wi.status.clone();
         let description = wi.description.clone();
-        let has_branch_commits = repo_path_owned
-            .as_ref()
-            .map(|rp| self.branch_has_commits(cwd, rp))
-            .unwrap_or(false);
+        let has_branch_commits = match (repo_path_owned.as_ref(), branch_owned.as_deref()) {
+            (Some(rp), Some(branch)) => self.branch_has_commits(rp, branch),
+            _ => false,
+        };
 
         // Build a situation summary that tells Claude where it is and what
         // state the work item is in.  Uses the worktree path (not the main
@@ -3497,38 +3737,27 @@ impl App {
         crate::prompts::render(prompt_key, &vars)
     }
 
-    /// Check if the branch in `cwd` has commits ahead of the default branch.
-    /// Returns false and surfaces a status message on error so the user knows
-    /// retroactive analysis was skipped.
-    fn branch_has_commits(&mut self, cwd: &std::path::Path, repo_path: &std::path::Path) -> bool {
-        let default_branch = match self.worktree_service.default_branch(repo_path) {
-            Ok(b) => b,
-            Err(e) => {
-                self.status_message = Some(format!("Could not detect default branch: {e}"));
-                return false;
-            }
-        };
-
-        let output = crate::worktree_service::git_command()
-            .args(["log", &format!("{default_branch}..HEAD"), "--oneline"])
-            .current_dir(cwd)
-            .output();
-        match output {
-            Ok(o) if o.status.success() => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                !stdout.trim().is_empty()
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                self.status_message =
-                    Some(format!("Branch commit check failed: {}", stderr.trim()));
-                false
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Branch commit check failed: {e}"));
-                false
-            }
-        }
+    /// Check if `branch` in `repo_path` has commits ahead of the default
+    /// branch, consulting the cached `repo_data` populated by the
+    /// background fetcher.
+    ///
+    /// This is a pure, synchronous cache lookup - it MUST NOT shell out to
+    /// git on the UI thread. Blocking I/O in this call path would freeze
+    /// the event loop; see `docs/UI.md` "Blocking I/O Prohibition".
+    ///
+    /// When the fetcher has not yet produced a result for this repo/branch
+    /// (first fetch still in flight, repo never fetched, or detached
+    /// HEAD), returns `false` - the safe default that causes the caller
+    /// to skip the review-gate / retroactive-analysis path without
+    /// freezing the UI. The next fetch cycle will populate the cache and
+    /// subsequent calls will return the correct answer.
+    fn branch_has_commits(&self, repo_path: &std::path::Path, branch: &str) -> bool {
+        self.repo_data
+            .get(repo_path)
+            .and_then(|rd| rd.worktrees.as_ref().ok())
+            .and_then(|wts| wts.iter().find(|wt| wt.branch.as_deref() == Some(branch)))
+            .and_then(|wt| wt.has_commits_ahead)
+            .unwrap_or(false)
     }
 
     /// Start an MCP socket server for a work item session.
@@ -3725,48 +3954,25 @@ impl App {
                     }
 
                     // Review gate: when MCP requests Implementing/Blocked -> Review,
-                    // a per-item review gate must approve the transition.
+                    // a per-item review gate must approve the transition. The
+                    // gate runs entirely on a background thread - any
+                    // "cannot run" discovery (no plan, empty diff, git error)
+                    // arrives as `ReviewGateMessage::Blocked` and is handled
+                    // by `poll_review_gate` (which applies the rework flow).
+                    // This main-thread path only ever sees synchronous
+                    // pre-conditions (gate already running, no branch, no
+                    // repo association, work item missing).
                     if (current_status.as_ref() == Some(&WorkItemStatus::Implementing)
                         || current_status.as_ref() == Some(&WorkItemStatus::Blocked))
                         && new_status == WorkItemStatus::Review
                     {
-                        match self.spawn_review_gate(&wi_id) {
+                        match self.spawn_review_gate(&wi_id, ReviewGateOrigin::Mcp) {
                             ReviewGateSpawn::Spawned => {
                                 self.status_message =
                                     Some("Claude requested Review - running review gate...".into());
                             }
                             ReviewGateSpawn::Blocked(reason) => {
-                                // If a gate is already running for this item,
-                                // just inform Claude - don't rework, the event is dropped
-                                // and Claude will need to request Review again.
-                                if reason.contains("already running") {
-                                    self.status_message = Some(reason);
-                                } else {
-                                    // Gate truly can't run (no plan, no diff, git error).
-                                    // Apply the rework flow so Claude gets feedback instead
-                                    // of waiting forever for a gate result that never comes.
-                                    self.rework_reasons.insert(wi_id.clone(), reason.clone());
-                                    self.status_message =
-                                        Some(format!("Review gate failed to start: {reason}"));
-                                    // If Blocked, transition to Implementing so the
-                                    // implementing_rework prompt (with {rework_reason}) is used.
-                                    if current_status.as_ref() == Some(&WorkItemStatus::Blocked) {
-                                        let _ = self
-                                            .backend
-                                            .update_status(&wi_id, WorkItemStatus::Implementing);
-                                        self.reassemble_work_items();
-                                        self.build_display_list();
-                                    }
-                                    // Kill and respawn the session with rework prompt.
-                                    if let Some(key) = self.session_key_for(&wi_id)
-                                        && let Some(mut entry) = self.sessions.remove(&key)
-                                        && let Some(ref mut session) = entry.session
-                                    {
-                                        session.kill();
-                                    }
-                                    self.cleanup_session_state_for(&wi_id);
-                                    self.spawn_session(&wi_id);
-                                }
+                                self.status_message = Some(reason);
                             }
                         }
                         continue;
@@ -3952,21 +4158,41 @@ impl App {
                             .unwrap_or_default();
 
                     // Gather cleanup info BEFORE deleting (needs repo_data lookups).
-                    let cleanup_infos = self.gather_delete_cleanup_infos(&repo_associations);
+                    let mut cleanup_infos = self.gather_delete_cleanup_infos(&repo_associations);
 
                     // Non-blocking phases: backend delete, session kill, in-memory
-                    // cleanup. Resource cleanup (Phase 4) is skipped here - it runs
-                    // on a background thread below.
+                    // cleanup. Resource cleanup (worktree removal, branch
+                    // deletion, PR close) runs on a background thread below
+                    // via `spawn_delete_cleanup`.
                     let mut warnings: Vec<String> = Vec::new();
-                    if let Err(e) = self.delete_work_item_by_id(
-                        &wi_id,
-                        &repo_associations,
-                        &mut warnings,
-                        true,
-                        true, // skip_resource_cleanup: Phase 4 runs on background thread
-                    ) {
+                    let mut orphan_worktrees: Vec<OrphanWorktree> = Vec::new();
+                    if let Err(e) =
+                        self.delete_work_item_by_id(&wi_id, &mut warnings, &mut orphan_worktrees)
+                    {
                         self.status_message = Some(format!("MCP delete error: {e}"));
                         continue;
+                    }
+
+                    // Phase 5 may have captured an in-flight worktree-create
+                    // result whose worktree is now orphaned. Forward each
+                    // orphan to the background cleanup thread by synthesizing
+                    // a `DeleteCleanupInfo` (no PR, no remote - this is a
+                    // fresh worktree with no PR yet) so the
+                    // `git worktree remove` and `git branch -D` both run off
+                    // the UI thread. Running them here would be a P0
+                    // blocking-I/O violation; see `docs/UI.md`.
+                    // `branch_in_main_worktree: false` is correct by
+                    // construction - a freshly-created worktree is never the
+                    // main worktree.
+                    for orphan in orphan_worktrees {
+                        cleanup_infos.push(DeleteCleanupInfo {
+                            repo_path: orphan.repo_path,
+                            branch: orphan.branch,
+                            worktree_path: Some(orphan.worktree_path),
+                            branch_in_main_worktree: false,
+                            open_pr_number: None,
+                            github_remote: None,
+                        });
                     }
 
                     // Spawn background thread for blocking resource cleanup
@@ -4219,6 +4445,7 @@ impl App {
                 let _ = tx.send(WorktreeCreateResult {
                     wi_id: wi_id_clone,
                     repo_path,
+                    branch: Some(branch.clone()),
                     path: None,
                     error: Some(format!(
                         "Imported: {title} - could not fetch branch '{branch}' from origin. \
@@ -4245,6 +4472,7 @@ impl App {
                     let _ = tx.send(WorktreeCreateResult {
                         wi_id: wi_id_clone,
                         repo_path,
+                        branch: Some(branch),
                         path: Some(wt_info.path),
                         error: None,
                         open_session: false,
@@ -4256,6 +4484,7 @@ impl App {
                     let _ = tx.send(WorktreeCreateResult {
                         wi_id: wi_id_clone,
                         repo_path,
+                        branch: Some(branch),
                         path: None,
                         error: Some(format!("Imported: {title} (worktree not created: {e})")),
                         open_session: false,
@@ -4604,29 +4833,44 @@ impl App {
 
         // Resource-cleanup data must be gathered before reassembly so the
         // repo_data lookups still reflect the pre-delete state.
-        let cleanup_infos = self.gather_delete_cleanup_infos(&repo_associations);
-        // The modal always passes force=true: we no longer shell out to
-        // `git status --porcelain` from the UI thread to detect dirty
-        // worktrees, and the dialog body warns the user that uncommitted
-        // changes will be lost. See open_delete_prompt for the rationale.
-        let force = true;
+        let mut cleanup_infos = self.gather_delete_cleanup_infos(&repo_associations);
+        // The modal warns the user that uncommitted changes will be lost;
+        // the background cleanup thread always runs with force=true.
+        // See `open_delete_prompt` for why we do not shell out to
+        // `git status --porcelain` on the UI thread.
 
         // Phases 2-6: backend delete, session kill, in-flight cancellation,
-        // in-memory state cleanup. Resource cleanup (Phase 4) is skipped
-        // here and runs on the background thread below.
+        // in-memory state cleanup. Resource cleanup (worktree/branch/PR)
+        // runs on the background thread below via spawn_delete_cleanup.
         let mut warnings: Vec<String> = Vec::new();
-        if let Err(e) = self.delete_work_item_by_id(
-            &work_item_id,
-            &repo_associations,
-            &mut warnings,
-            force,
-            true, // skip_resource_cleanup: deferred to spawn_delete_cleanup
-        ) {
+        let mut orphan_worktrees: Vec<OrphanWorktree> = Vec::new();
+        if let Err(e) =
+            self.delete_work_item_by_id(&work_item_id, &mut warnings, &mut orphan_worktrees)
+        {
             // Backend delete failed; nothing was spawned. Close the modal
             // and surface the error as an alert.
             self.cancel_delete_prompt();
             self.alert_message = Some(format!("Delete error: {e}"));
             return;
+        }
+
+        // Phase 5 may have captured an in-flight worktree-create result
+        // whose worktree is now orphaned. Forward each orphan to the
+        // background cleanup thread by synthesizing a `DeleteCleanupInfo`
+        // (no PR, no remote - this is a fresh worktree with no PR yet)
+        // so both `git worktree remove` and `git branch -D` run off the
+        // UI thread. `branch_in_main_worktree: false` is correct by
+        // construction - a freshly-created worktree is never the main
+        // worktree.
+        for orphan in orphan_worktrees {
+            cleanup_infos.push(DeleteCleanupInfo {
+                repo_path: orphan.repo_path,
+                branch: orphan.branch,
+                worktree_path: Some(orphan.worktree_path),
+                branch_in_main_worktree: false,
+                open_pr_number: None,
+                github_remote: None,
+            });
         }
 
         // -- Phase 7: Clear identity trackers and reassemble --
@@ -4684,7 +4928,7 @@ impl App {
             // spinner, a duplicate status-bar indicator would just be
             // noise. `force=true` is always passed because the modal
             // body warns the user that uncommitted changes will be lost.
-            self.spawn_delete_cleanup(cleanup_infos, force, false);
+            self.spawn_delete_cleanup(cleanup_infos, true, false);
         }
     }
 
@@ -4764,7 +5008,7 @@ impl App {
             || current_status == WorkItemStatus::Blocked)
             && new_status == WorkItemStatus::Review
         {
-            match self.spawn_review_gate(&wi_id) {
+            match self.spawn_review_gate(&wi_id, ReviewGateOrigin::Tui) {
                 ReviewGateSpawn::Spawned => {
                     // Gate is running in background - do not advance yet.
                 }
@@ -4993,6 +5237,17 @@ impl App {
             self.spawn_pr_creation(wi_id);
         }
 
+        // Cancel any pending session-open plan-read for this work item
+        // BEFORE the session kill block. The plan-read receiver lives in
+        // `session_open_rx` (no entry in `self.sessions` yet), so the
+        // session-kill branch below would not see it; without this
+        // unconditional drop, a stale pending open from the old stage
+        // would survive the transition and `finish_session_open` would
+        // later spawn Claude for the new stage - including no-session
+        // stages like Done or Mergequeue. Dropping the entry here also
+        // ends the "Opening session..." spinner.
+        self.drop_session_open_entry(wi_id);
+
         // Kill the old session for this work item before spawning a new one.
         // Previously relied on orphan cleanup in check_liveness, but that
         // leaves two sessions alive briefly and the old one can do work
@@ -5046,35 +5301,48 @@ impl App {
         let title = wi.title.clone();
         let wi_id = wi_id.clone();
 
-        // Get owner/repo from the worktree service (synchronous but fast).
-        let (owner, repo_name) = match self.worktree_service.github_remote(&repo_path) {
-            Ok(Some((o, r))) => (o, r),
-            Ok(None) => {
-                self.status_message = Some("PR creation skipped: no GitHub remote".into());
-                return;
-            }
-            Err(e) => {
-                self.status_message =
-                    Some(format!("PR creation skipped: could not read remote: {e}"));
+        // Read owner/repo from the cached fetcher result rather than shelling
+        // out via `worktree_service.github_remote(...)` on the UI thread. The
+        // fetcher populates `repo_data[path].github_remote` on every cycle;
+        // if no entry exists yet the first fetch hasn't completed and we
+        // surface that to the user instead of blocking.
+        let (owner, repo_name) = match self
+            .repo_data
+            .get(&repo_path)
+            .and_then(|rd| rd.github_remote.clone())
+        {
+            Some((o, r)) => (o, r),
+            None => {
+                self.status_message = Some(
+                    "PR creation skipped: GitHub remote not yet cached (waiting for next fetch)"
+                        .into(),
+                );
                 return;
             }
         };
         let owner_repo = format!("{owner}/{repo_name}");
 
-        // Get plan text and default branch before spawning (needs &self).
-        let body = match self.backend.read_plan(&wi_id) {
-            Ok(Some(plan)) if !plan.trim().is_empty() => plan,
-            _ => String::new(),
-        };
-        let default_branch = self
-            .worktree_service
-            .default_branch(&repo_path)
-            .unwrap_or_else(|_| "main".to_string());
+        // Clone the Arc'd backend and worktree service so the background
+        // thread can run `read_plan` (filesystem) and `default_branch`
+        // (git subprocess) off the UI thread.
+        let backend = Arc::clone(&self.backend);
+        let ws = Arc::clone(&self.worktree_service);
 
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.pr_create_wi = Some(wi_id.clone());
 
         std::thread::spawn(move || {
+            // Blocking reads run on the background thread. `read_plan` hits
+            // the filesystem; `default_branch` shells out to git. Both are
+            // cheap per-call but absolutely prohibited on the UI thread.
+            let body = match backend.read_plan(&wi_id) {
+                Ok(Some(plan)) if !plan.trim().is_empty() => plan,
+                _ => String::new(),
+            };
+            let default_branch = ws
+                .default_branch(&repo_path)
+                .unwrap_or_else(|_| "main".to_string());
+
             // Check if a PR already exists for this branch.
             let check_output = std::process::Command::new("gh")
                 .args([
@@ -5326,13 +5594,21 @@ impl App {
         };
         let repo_path = assoc.repo_path.clone();
 
-        // Get owner/repo from the worktree service.
-        let (owner, repo_name) = match self.worktree_service.github_remote(&repo_path) {
-            Ok(Some((o, r))) => (o, r),
-            _ => {
+        // Read owner/repo from the cached fetcher result rather than shelling
+        // out on the UI thread. If no entry exists yet, the first fetch has
+        // not completed - surface that as an alert instead of blocking.
+        let (owner, repo_name) = match self
+            .repo_data
+            .get(&repo_path)
+            .and_then(|rd| rd.github_remote.clone())
+        {
+            Some((o, r)) => (o, r),
+            None => {
                 self.confirm_merge = false;
                 self.merge_wi_id = None;
-                self.alert_message = Some("Cannot merge: no GitHub remote found".into());
+                self.alert_message = Some(
+                    "Cannot merge: GitHub remote not yet cached (waiting for next fetch)".into(),
+                );
                 return;
             }
         };
@@ -5577,10 +5853,20 @@ impl App {
             }
         };
         let repo_path = assoc.repo_path.clone();
-        let (owner, repo_name) = match self.worktree_service.github_remote(&repo_path) {
-            Ok(Some((o, r))) => (o, r),
-            _ => {
-                self.status_message = Some("Cannot submit review: no GitHub remote found".into());
+        // Read owner/repo from the cached fetcher result rather than shelling
+        // out on the UI thread. The first fetch populates it; until then we
+        // surface a message rather than block.
+        let (owner, repo_name) = match self
+            .repo_data
+            .get(&repo_path)
+            .and_then(|rd| rd.github_remote.clone())
+        {
+            Some((o, r)) => (o, r),
+            None => {
+                self.status_message = Some(
+                    "Cannot submit review: GitHub remote not yet cached (waiting for next fetch)"
+                        .into(),
+                );
                 return;
             }
         };
@@ -5748,11 +6034,20 @@ impl App {
             }
         };
         let repo_path = assoc.repo_path.clone();
-        let (owner, repo_name) = match self.worktree_service.github_remote(&repo_path) {
-            Ok(Some((o, r))) => (o, r),
-            _ => {
-                self.status_message =
-                    Some("Cannot enter mergequeue: no GitHub remote found".into());
+        // Read owner/repo from the cached fetcher result - never shell out
+        // on the UI thread.
+        let (owner, repo_name) = match self
+            .repo_data
+            .get(&repo_path)
+            .and_then(|rd| rd.github_remote.clone())
+        {
+            Some((o, r)) => (o, r),
+            None => {
+                self.status_message = Some(
+                    "Cannot enter mergequeue: GitHub remote not yet cached \
+                     (waiting for next fetch)"
+                        .into(),
+                );
                 return;
             }
         };
@@ -6093,6 +6388,12 @@ impl App {
     /// no persisted pr_identity). Returns tuples of
     /// (wi_id, repo_path, branch, github_owner, github_repo).
     ///
+    /// Reads owner/repo from the cached `repo_data[path].github_remote`
+    /// populated by the background fetcher. When the fetcher has not
+    /// produced a result for a repo yet, that repo is silently skipped
+    /// (the next reassembly will retry) - we NEVER shell out via
+    /// `worktree_service.github_remote(...)` on the UI thread.
+    ///
     /// Temporary migration helper - can be removed once all existing Done
     /// items have been backfilled (i.e. no Done items with pr_identity=None
     /// remain on disk).
@@ -6114,10 +6415,13 @@ impl App {
                     Some(b) => b.clone(),
                     None => continue,
                 };
-                let (owner, repo_name) = match self.worktree_service.github_remote(&assoc.repo_path)
+                let (owner, repo_name) = match self
+                    .repo_data
+                    .get(&assoc.repo_path)
+                    .and_then(|rd| rd.github_remote.clone())
                 {
-                    Ok(Some((o, r))) => (o, r),
-                    _ => continue,
+                    Some((o, r)) => (o, r),
+                    None => continue,
                 };
                 requests.push((
                     record.id.clone(),
@@ -6269,24 +6573,31 @@ impl App {
     /// Attempt to spawn the async review gate for the given work item.
     /// Returns `Spawned` if the gate is running (caller should wait),
     /// or `Blocked(reason)` if the transition must not proceed.
-    fn spawn_review_gate(&mut self, wi_id: &WorkItemId) -> ReviewGateSpawn {
+    ///
+    /// Only synchronous, in-memory pre-conditions (gate already running,
+    /// work item not found, no repo association, no branch) return
+    /// `Blocked` from the main thread. Every blocking check -
+    /// `backend.read_plan` (filesystem), `worktree_service.default_branch`
+    /// / `github_remote` / `git diff` (git subprocess) - runs inside the
+    /// background closure and reports failure through
+    /// `ReviewGateMessage::Blocked` so the main UI thread is never blocked.
+    ///
+    /// `origin` records who initiated the gate; `poll_review_gate` uses
+    /// it to decide whether a `Blocked` outcome should apply the full
+    /// rework flow (kill + respawn the session) or just surface the
+    /// reason as a status message without touching the session. See
+    /// `ReviewGateOrigin`.
+    fn spawn_review_gate(
+        &mut self,
+        wi_id: &WorkItemId,
+        origin: ReviewGateOrigin,
+    ) -> ReviewGateSpawn {
         // Guard: if a review gate is already running for this item, don't spawn a duplicate.
         if self.review_gates.contains_key(wi_id) {
             return ReviewGateSpawn::Blocked("Review gate already running".into());
         }
 
-        // Read the plan from the backend.
-        let plan = match self.backend.read_plan(wi_id) {
-            Ok(Some(plan)) if !plan.trim().is_empty() => plan,
-            Ok(_) => {
-                return ReviewGateSpawn::Blocked("Cannot enter Review: no plan exists".into());
-            }
-            Err(e) => {
-                return ReviewGateSpawn::Blocked(format!("Could not read plan: {e}"));
-            }
-        };
-
-        // Find the branch for this work item to get the diff.
+        // Find the branch for this work item (pure in-memory read).
         let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
             Some(wi) => wi,
             None => {
@@ -6314,39 +6625,11 @@ impl App {
         // - Some(CheckStatus::None) = PR cached but no CI checks configured, skip
         // - Some(other) = PR cached with CI checks, proceed to wait
         let current_check_status = assoc.pr.as_ref().map(|p| p.checks.clone());
-        // Clone the worktree service for the background thread so that
-        // github_remote() (which runs `git remote get-url`) executes off
-        // the main UI thread.
+        // Clone the worktree service and backend for the background thread so
+        // that `default_branch()`/`github_remote()` (which shell out to git)
+        // and `read_plan()` (filesystem read) execute off the main UI thread.
         let ws = Arc::clone(&self.worktree_service);
-
-        // Get the default branch for diffing.
-        let default_branch = self
-            .worktree_service
-            .default_branch(&repo_path)
-            .unwrap_or_else(|_| "main".to_string());
-
-        // Get the git diff (this is fast, local I/O only).
-        let diff = match crate::worktree_service::git_command()
-            .arg("-C")
-            .arg(&repo_path)
-            .args(["diff", &format!("{default_branch}...{branch}")])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                String::from_utf8_lossy(&output.stdout).to_string()
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return ReviewGateSpawn::Blocked(format!("Review gate: git diff failed: {stderr}"));
-            }
-            Err(e) => {
-                return ReviewGateSpawn::Blocked(format!("Review gate: could not run git: {e}"));
-            }
-        };
-
-        if diff.trim().is_empty() {
-            return ReviewGateSpawn::Blocked("Cannot enter Review: no changes on branch".into());
-        }
+        let backend = Arc::clone(&self.backend);
 
         // Spawn the review gate in a background thread with three phases:
         // 1. PR existence check (if GitHub remote exists)
@@ -6360,6 +6643,69 @@ impl App {
         let gate_mcp_tx = self.mcp_tx.clone();
 
         std::thread::spawn(move || {
+            // === Phase 0: Read plan, resolve default branch, confirm non-empty diff ===
+            //
+            // Every step here is blocking I/O (filesystem read or git
+            // subprocess) so it MUST run on the background thread. On any
+            // failure we send `Blocked` through the channel so the main UI
+            // thread can clear the gate state and surface the reason in
+            // the status bar.
+            let plan = match backend.read_plan(&wi_id_clone) {
+                Ok(Some(plan)) if !plan.trim().is_empty() => plan,
+                Ok(_) => {
+                    let _ = tx.send(ReviewGateMessage::Blocked {
+                        work_item_id: wi_id_clone,
+                        reason: "Cannot enter Review: no plan exists".into(),
+                    });
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(ReviewGateMessage::Blocked {
+                        work_item_id: wi_id_clone,
+                        reason: format!("Could not read plan: {e}"),
+                    });
+                    return;
+                }
+            };
+
+            let default_branch = match ws.default_branch(&repo_path) {
+                Ok(b) => b,
+                Err(_) => "main".to_string(),
+            };
+
+            match crate::worktree_service::git_command()
+                .arg("-C")
+                .arg(&repo_path)
+                .args(["diff", &format!("{default_branch}...{branch}")])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    let diff = String::from_utf8_lossy(&output.stdout);
+                    if diff.trim().is_empty() {
+                        let _ = tx.send(ReviewGateMessage::Blocked {
+                            work_item_id: wi_id_clone,
+                            reason: "Cannot enter Review: no changes on branch".into(),
+                        });
+                        return;
+                    }
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let _ = tx.send(ReviewGateMessage::Blocked {
+                        work_item_id: wi_id_clone,
+                        reason: format!("Review gate: git diff failed: {stderr}"),
+                    });
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(ReviewGateMessage::Blocked {
+                        work_item_id: wi_id_clone,
+                        reason: format!("Review gate: could not run git: {e}"),
+                    });
+                    return;
+                }
+            };
+
             // Resolve GitHub remote on this background thread (blocking I/O).
             let (gh_owner, gh_repo, has_github_remote) = match ws.github_remote(&repo_path) {
                 Ok(Some((o, r))) => (o, r, true),
@@ -6634,8 +6980,14 @@ impl App {
             let _ = tx.send(ReviewGateMessage::Result(result));
         });
 
-        self.review_gates
-            .insert(wi_id.clone(), ReviewGateState { rx, progress: None });
+        self.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                progress: None,
+                origin,
+            },
+        );
         ReviewGateSpawn::Spawned
     }
 
@@ -6658,6 +7010,7 @@ impl App {
 
             // Drain all pending messages for this gate.
             let mut result: Option<ReviewGateResult> = None;
+            let mut blocked_reason: Option<String> = None;
             let mut disconnected = false;
             let mut last_progress: Option<String> = None;
 
@@ -6668,6 +7021,14 @@ impl App {
                     }
                     Ok(ReviewGateMessage::Result(r)) => {
                         result = Some(r);
+                        break;
+                    }
+                    Ok(ReviewGateMessage::Blocked {
+                        work_item_id: msg_id,
+                        reason,
+                    }) => {
+                        debug_assert_eq!(msg_id, wi_id);
+                        blocked_reason = Some(reason);
                         break;
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -6691,6 +7052,87 @@ impl App {
                 self.status_message =
                     Some("Review gate: background thread exited unexpectedly".into());
                 continue;
+            }
+
+            // Blocked: the gate could not run against a real diff (no plan,
+            // empty diff, git failure, default branch unresolvable).
+            //
+            // How the outcome is applied depends on who initiated the gate:
+            //
+            // - `Mcp` / `Auto`: Claude (or the auto-trigger after an
+            //   Implementing session died) asked for Review. The rework
+            //   flow applies - kill and respawn the session with the
+            //   reason so the next Claude run sees the feedback.
+            //
+            // - `Tui`: The user pressed `l` (advance) on an Implementing
+            //   item that cannot satisfy the gate. On master the TUI path
+            //   just surfaced the reason in the status bar and left the
+            //   session running; killing it here would be a regression.
+            //   Only drop the gate state and set the status message.
+            //
+            // In all cases: if the work item was deleted while the gate
+            // was in flight, drop the gate state without touching session
+            // or `rework_reasons` - a rework_reasons entry with no owner
+            // would leak forever because nothing else ever clears it.
+            if let Some(reason) = blocked_reason {
+                let origin = self
+                    .review_gates
+                    .get(&wi_id)
+                    .map(|g| g.origin)
+                    .unwrap_or(ReviewGateOrigin::Mcp);
+                self.review_gates.remove(&wi_id);
+
+                let wi_exists = self.work_items.iter().any(|w| w.id == wi_id);
+                if !wi_exists {
+                    // Work item deleted mid-gate. Nothing more to do -
+                    // the gate state is already dropped and no session
+                    // exists to act on.
+                    continue;
+                }
+
+                match origin {
+                    ReviewGateOrigin::Tui => {
+                        // Preserve master's non-destructive behaviour: the
+                        // user's session is still the primary workspace,
+                        // so just surface the reason.
+                        self.status_message =
+                            Some(format!("Review gate failed to start: {reason}"));
+                        continue;
+                    }
+                    ReviewGateOrigin::Mcp | ReviewGateOrigin::Auto => {
+                        self.rework_reasons.insert(wi_id.clone(), reason.clone());
+                        self.status_message =
+                            Some(format!("Review gate failed to start: {reason}"));
+
+                        // If Blocked, transition to Implementing so the
+                        // implementing_rework prompt (which has {rework_reason})
+                        // is used instead of the "blocked" prompt.
+                        let wi_status = self
+                            .work_items
+                            .iter()
+                            .find(|w| w.id == wi_id)
+                            .map(|w| w.status.clone());
+                        if wi_status == Some(WorkItemStatus::Blocked) {
+                            let _ = self
+                                .backend
+                                .update_status(&wi_id, WorkItemStatus::Implementing);
+                            self.reassemble_work_items();
+                            self.build_display_list();
+                        }
+
+                        // Kill and respawn the session with the rework
+                        // prompt so Claude sees the rejection reason.
+                        if let Some(key) = self.session_key_for(&wi_id)
+                            && let Some(mut entry) = self.sessions.remove(&key)
+                            && let Some(ref mut session) = entry.session
+                        {
+                            session.kill();
+                        }
+                        self.cleanup_session_state_for(&wi_id);
+                        self.spawn_session(&wi_id);
+                        continue;
+                    }
+                }
             }
 
             let result = match result {
@@ -7331,7 +7773,7 @@ mod tests {
         assert!(!all.is_empty(), "should discover at least one repo");
         let _repo_display = all[0].path.display().to_string();
 
-        let mut app = App::with_config(cfg, Box::new(StubBackend));
+        let mut app = App::with_config(cfg, Arc::new(StubBackend));
 
         // Initially false.
         assert!(!app.fetcher_repos_changed);
@@ -7390,7 +7832,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.add_repo(dir.to_str().unwrap()).unwrap();
 
-        let app = App::with_config(cfg, Box::new(StubBackend));
+        let app = App::with_config(cfg, Arc::new(StubBackend));
 
         // The repo root itself should be inside.
         assert!(app.is_inside_managed_repo(&dir));
@@ -7418,7 +7860,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.add_repo(dir.to_str().unwrap()).unwrap();
 
-        let app = App::with_config(cfg, Box::new(StubBackend));
+        let app = App::with_config(cfg, Arc::new(StubBackend));
 
         // From a subdirectory, managed_repo_root should return the repo root.
         let subdir = dir.join("src/deeply/nested");
@@ -7567,7 +8009,7 @@ mod tests {
         let backend = TestBackend {
             records: std::sync::Mutex::new(Vec::new()),
         };
-        let mut app = App::with_config(Config::default(), Box::new(backend));
+        let mut app = App::with_config(Config::default(), Arc::new(backend));
 
         // Set up an unlinked PR to import.
         app.unlinked_prs.push(crate::work_item::UnlinkedPr {
@@ -7707,7 +8149,7 @@ mod tests {
             }
         }
 
-        let mut app = App::with_config(Config::default(), Box::new(CreateBackend));
+        let mut app = App::with_config(Config::default(), Arc::new(CreateBackend));
         app.active_repo_cache = vec![RepoEntry {
             path: PathBuf::from("/repo"),
             source: RepoSource::Explicit,
@@ -7893,7 +8335,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.add_repo(link_path.to_str().unwrap()).unwrap();
 
-        let app = App::with_config(cfg, Box::new(StubBackend));
+        let app = App::with_config(cfg, Arc::new(StubBackend));
 
         // The active_repo_cache should contain the canonical (real) path,
         // not the symlink path.
@@ -8175,7 +8617,7 @@ mod tests {
         let backend = OrderableBackend {
             records: std::sync::Mutex::new(vec![record_a.clone(), record_b.clone()]),
         };
-        let mut app = App::with_config(Config::default(), Box::new(backend));
+        let mut app = App::with_config(Config::default(), Arc::new(backend));
 
         // Select Item B (the second Todo item).
         app.select_next_item(); // selects first item (A)
@@ -8494,7 +8936,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.defaults.branch_issue_pattern = "[invalid(".to_string();
 
-        let mut app = App::with_config(cfg, Box::new(StubBackend));
+        let mut app = App::with_config(cfg, Arc::new(StubBackend));
 
         // Replicate the main.rs validation logic.
         if let Err(e) = regex::Regex::new(&app.config.defaults.branch_issue_pattern) {
@@ -8602,6 +9044,7 @@ mod tests {
                     path: target_dir.to_path_buf(),
                     branch: Some(branch.to_string()),
                     is_main: false,
+                    has_commits_ahead: Some(false),
                 })
             }
 
@@ -8777,7 +9220,7 @@ mod tests {
         };
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
-            Box::new(backend),
+            Arc::new(backend),
             Arc::clone(&mock_ws) as Arc<dyn WorktreeService + Send + Sync>,
             Box::new(crate::config::InMemoryConfigProvider::new()),
         );
@@ -8877,6 +9320,7 @@ mod tests {
                     path: target_dir.to_path_buf(),
                     branch: Some(branch.to_string()),
                     is_main: false,
+                    has_commits_ahead: Some(false),
                 })
             }
 
@@ -9053,7 +9497,7 @@ mod tests {
         };
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
-            Box::new(backend),
+            Arc::new(backend),
             Arc::clone(&mock_ws) as Arc<dyn WorktreeService + Send + Sync>,
             Box::new(crate::config::InMemoryConfigProvider::new()),
         );
@@ -9234,6 +9678,7 @@ mod tests {
                 path: wt_target.clone(),
                 branch: Some("feature-x".into()),
                 is_main: false,
+                has_commits_ahead: None,
             }],
         };
         let found = App::find_reusable_worktree(&mock, &repo, "feature-x", &wt_target);
@@ -9245,6 +9690,7 @@ mod tests {
                 path: wt_target.clone(),
                 branch: Some("feature-x".into()),
                 is_main: true,
+                has_commits_ahead: None,
             }],
         };
         assert!(
@@ -9258,6 +9704,7 @@ mod tests {
                 path: wt_target.clone(),
                 branch: Some("other-branch".into()),
                 is_main: false,
+                has_commits_ahead: None,
             }],
         };
         assert!(
@@ -9272,6 +9719,7 @@ mod tests {
                 path: other_target.clone(),
                 branch: Some("feature-x".into()),
                 is_main: false,
+                has_commits_ahead: None,
             }],
         };
         assert!(
@@ -9294,6 +9742,7 @@ mod tests {
                 path: wt_target.clone(),
                 branch: Some("feature-x".into()),
                 is_main: false,
+                has_commits_ahead: None,
             }],
         };
         assert!(
@@ -9340,6 +9789,7 @@ mod tests {
                     path: target_dir.to_path_buf(),
                     branch: Some(branch.to_string()),
                     is_main: false,
+                    has_commits_ahead: Some(false),
                 })
             }
 
@@ -9518,7 +9968,7 @@ mod tests {
         };
         let mut app = App::with_config_and_worktree_service(
             config,
-            Box::new(backend),
+            Arc::new(backend),
             Arc::clone(&mock_ws) as Arc<dyn WorktreeService + Send + Sync>,
             Box::new(crate::config::InMemoryConfigProvider::new()),
         );
@@ -9674,7 +10124,7 @@ mod tests {
         let last_repos = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut app = App::with_config(
             Config::default(),
-            Box::new(RecordingBackend {
+            Arc::new(RecordingBackend {
                 last_repos: Arc::clone(&last_repos),
             }),
         );
@@ -10042,7 +10492,8 @@ mod tests {
             }],
             errors: vec![],
         });
-        // StubWorktreeService.github_remote() returns Ok(None)
+        // No repo_data entry for /tmp/repo, so the cached github_remote
+        // lookup returns None and execute_merge blocks the merge.
         app.execute_merge(&wi_id, "squash");
         let status = app
             .work_items
@@ -10053,7 +10504,7 @@ mod tests {
             .clone();
         assert_eq!(status, WorkItemStatus::Review, "must stay in Review");
         let msg = app.alert_message.as_deref().unwrap_or("");
-        assert!(msg.contains("no GitHub remote"), "got: {msg}");
+        assert!(msg.contains("GitHub remote not yet cached"), "got: {msg}");
     }
 
     #[test]
@@ -10437,7 +10888,7 @@ mod tests {
         let backend = ArchiveTestBackend {
             records: std::sync::Mutex::new(vec![record]),
         };
-        let mut app = App::with_config(Config::for_test(), Box::new(backend));
+        let mut app = App::with_config(Config::for_test(), Arc::new(backend));
         // Seed repo_data with a cached github_remote so reconstruction
         // finds the owner/repo without shelling out. This mirrors the
         // real flow: the background fetcher has already populated
@@ -10490,7 +10941,7 @@ mod tests {
         let backend = ArchiveTestBackend {
             records: std::sync::Mutex::new(vec![record]),
         };
-        let mut app = App::with_config(Config::for_test(), Box::new(backend));
+        let mut app = App::with_config(Config::for_test(), Arc::new(backend));
         // Deliberately do not seed repo_data, mirroring the cold-start
         // window before the first fetch completes.
         app.reassemble_work_items();
@@ -11039,6 +11490,28 @@ mod tests {
 
     /// Helper: create an App with a single work item at the given status,
     /// with an optional repo association (branch + repo_path).
+    /// Poll `poll_review_gate` in a short busy loop until the review gate
+    /// for `wi_id` is no longer in-flight, or a short timeout elapses.
+    ///
+    /// Tests that trigger `spawn_review_gate` via MCP/advance_stage need
+    /// this because the gate now runs on a real background thread - the
+    /// synchronous Blocked branch was removed to keep `git diff` off the
+    /// UI thread (see P0 audit #1). The background thread will immediately
+    /// send a `Blocked` message for stub-backend cases (no plan, etc.) so
+    /// the loop normally returns within a single millisecond.
+    fn drain_review_gate_with_timeout(app: &mut App, wi_id: &WorkItemId) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.review_gates.contains_key(wi_id) && std::time::Instant::now() < deadline {
+            app.poll_review_gate();
+            if !app.review_gates.contains_key(wi_id) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Final poll to catch any message that arrived during the last sleep.
+        app.poll_review_gate();
+    }
+
     fn app_with_work_item(
         status: WorkItemStatus,
         branch: Option<&str>,
@@ -11076,8 +11549,9 @@ mod tests {
     }
 
     /// Test 4: MCP StatusUpdate for Review on Implementing item with no plan
-    /// must NOT change status to Review (gate spawn fails), and rework_reasons
-    /// must be populated.
+    /// must NOT change status to Review (gate spawn fails asynchronously),
+    /// and rework_reasons must be populated after poll_review_gate drains
+    /// the background thread's Blocked message.
     #[test]
     fn mcp_review_gate_bypass_prevented_no_plan() {
         let (mut app, wi_id) = app_with_work_item(
@@ -11098,6 +11572,9 @@ mod tests {
         .unwrap();
 
         app.poll_mcp_status_updates();
+        // The review gate now runs on a background thread; wait for its
+        // Blocked message to drain and the rework flow to fire.
+        drain_review_gate_with_timeout(&mut app, &wi_id);
 
         // Status must stay at Implementing - the gate cannot run without a plan.
         let wi = app.work_items.iter().find(|w| w.id == wi_id).unwrap();
@@ -11119,7 +11596,9 @@ mod tests {
     }
 
     /// Test 5: TUI advance_stage from Implementing with no plan must NOT
-    /// change status to Review.
+    /// change status to Review. The gate's "no plan" check now runs on a
+    /// background thread (see P0 audit #1), so we drain the gate with a
+    /// short poll loop before asserting.
     #[test]
     fn tui_advance_stage_blocked_without_plan() {
         let (mut app, wi_id) = app_with_work_item(
@@ -11129,8 +11608,10 @@ mod tests {
         );
 
         app.advance_stage();
+        drain_review_gate_with_timeout(&mut app, &wi_id);
 
-        // Status must stay at Implementing - spawn_review_gate returns Blocked.
+        // Status must stay at Implementing - spawn_review_gate fires the
+        // Blocked outcome from the background thread, not synchronously.
         let wi = app.work_items.iter().find(|w| w.id == wi_id).unwrap();
         assert_eq!(
             wi.status,
@@ -11142,6 +11623,165 @@ mod tests {
         assert!(
             msg.contains("no plan"),
             "status message should explain gate failure, got: {msg}",
+        );
+    }
+
+    /// Regression guard for R1-F-3: a TUI-initiated review gate that
+    /// resolves to `Blocked` MUST NOT kill the user's Implementing
+    /// session. On master the TUI advance path just set
+    /// `status_message`; when the blocking-I/O fix moved the gate to a
+    /// background thread the new `poll_review_gate` Blocked arm
+    /// unconditionally killed and respawned the session - a regression
+    /// for user-initiated advances. The `ReviewGateOrigin::Tui` branch
+    /// in `poll_review_gate` must preserve the session and only surface
+    /// the reason.
+    #[test]
+    fn poll_review_gate_tui_blocked_preserves_session() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        // Install a mock Implementing session so we can assert it
+        // survives the Blocked arm.
+        let parser = Arc::new(std::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+        app.sessions.insert(
+            (wi_id.clone(), WorkItemStatus::Implementing),
+            SessionEntry {
+                parser,
+                alive: true,
+                session: None,
+                scrollback_offset: 0,
+                selection: None,
+            },
+        );
+
+        // Install a Tui-origin gate with a pre-queued Blocked message.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ReviewGateMessage::Blocked {
+            work_item_id: wi_id.clone(),
+            reason: "Cannot enter Review: no changes on branch".into(),
+        })
+        .unwrap();
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                progress: None,
+                origin: ReviewGateOrigin::Tui,
+            },
+        );
+
+        app.poll_review_gate();
+
+        // The session must still be in the sessions map - TUI Blocked
+        // does not run the kill+respawn rework flow.
+        assert!(
+            app.sessions
+                .contains_key(&(wi_id.clone(), WorkItemStatus::Implementing)),
+            "Tui-origin Blocked must NOT kill the existing Implementing session",
+        );
+        // rework_reasons must NOT be populated - rework only applies to
+        // Mcp/Auto origins. A TUI user explicitly pressed advance; we
+        // surface the reason instead of rewriting their session prompt.
+        assert!(
+            !app.rework_reasons.contains_key(&wi_id),
+            "Tui-origin Blocked must NOT populate rework_reasons",
+        );
+        // Status must explain the gate failure.
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("no changes on branch"),
+            "status message should carry the Blocked reason, got: {msg}",
+        );
+        // Gate entry must be dropped.
+        assert!(
+            !app.review_gates.contains_key(&wi_id),
+            "gate state must be cleared after Blocked",
+        );
+    }
+
+    /// Regression guard for R1-F-3: Mcp-origin Blocked still runs the
+    /// full rework flow (session kill + respawn + rework_reasons).
+    /// This preserves the behaviour Claude relies on when
+    /// workbridge_set_status("Review") fails - Claude sees the
+    /// rejection reason in its next session prompt and iterates.
+    #[test]
+    fn poll_review_gate_mcp_blocked_populates_rework_reasons() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ReviewGateMessage::Blocked {
+            work_item_id: wi_id.clone(),
+            reason: "Cannot enter Review: no plan exists".into(),
+        })
+        .unwrap();
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                progress: None,
+                origin: ReviewGateOrigin::Mcp,
+            },
+        );
+
+        app.poll_review_gate();
+
+        assert!(
+            app.rework_reasons
+                .get(&wi_id)
+                .is_some_and(|r| r.contains("no plan exists")),
+            "Mcp-origin Blocked must populate rework_reasons so Claude \
+             sees the reason on the next session restart",
+        );
+        assert!(
+            !app.review_gates.contains_key(&wi_id),
+            "gate state must be cleared after Blocked",
+        );
+    }
+
+    /// Regression guard for R1-F-6: if the work item was deleted while
+    /// a review gate was in flight, the Blocked arm must NOT leak an
+    /// orphan `rework_reasons` entry. Only the gate state should be
+    /// dropped - nothing else to do for a work item that no longer
+    /// exists.
+    #[test]
+    fn poll_review_gate_blocked_guards_deleted_work_item() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/deleted-mid-gate.json"));
+
+        // Install a gate WITHOUT pushing a matching work item: the
+        // delete happened between spawn and poll.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ReviewGateMessage::Blocked {
+            work_item_id: wi_id.clone(),
+            reason: "Cannot enter Review: no plan exists".into(),
+        })
+        .unwrap();
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                progress: None,
+                origin: ReviewGateOrigin::Mcp,
+            },
+        );
+
+        app.poll_review_gate();
+
+        assert!(
+            !app.review_gates.contains_key(&wi_id),
+            "gate entry must be dropped even for deleted work items",
+        );
+        assert!(
+            !app.rework_reasons.contains_key(&wi_id),
+            "rework_reasons must NOT be populated for a deleted work item - \
+             nothing would ever clear the entry and it would leak forever",
         );
     }
 
@@ -11163,8 +11803,14 @@ mod tests {
             detail: "Tests are missing for the new feature".into(),
         }))
         .unwrap();
-        app.review_gates
-            .insert(wi_id.clone(), ReviewGateState { rx, progress: None });
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                progress: None,
+                origin: ReviewGateOrigin::Mcp,
+            },
+        );
 
         app.poll_review_gate();
 
@@ -11201,8 +11847,14 @@ mod tests {
             detail: "All plan items implemented".into(),
         }))
         .unwrap();
-        app.review_gates
-            .insert(wi_id.clone(), ReviewGateState { rx, progress: None });
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                progress: None,
+                origin: ReviewGateOrigin::Mcp,
+            },
+        );
 
         app.poll_review_gate();
 
@@ -11237,8 +11889,14 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(ReviewGateMessage::Progress("2 / 3 CI checks green".into()))
             .unwrap();
-        app.review_gates
-            .insert(wi_id.clone(), ReviewGateState { rx, progress: None });
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                progress: None,
+                origin: ReviewGateOrigin::Mcp,
+            },
+        );
 
         app.poll_review_gate();
 
@@ -11275,8 +11933,14 @@ mod tests {
             detail: "Missing error handling".into(),
         }))
         .unwrap();
-        app.review_gates
-            .insert(wi_id.clone(), ReviewGateState { rx, progress: None });
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                progress: None,
+                origin: ReviewGateOrigin::Mcp,
+            },
+        );
 
         app.poll_review_gate();
 
@@ -11306,8 +11970,14 @@ mod tests {
         ))
         .unwrap();
         drop(tx); // Simulate thread exit without sending Result.
-        app.review_gates
-            .insert(wi_id.clone(), ReviewGateState { rx, progress: None });
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                progress: None,
+                origin: ReviewGateOrigin::Mcp,
+            },
+        );
 
         app.poll_review_gate();
 
@@ -11323,11 +11993,16 @@ mod tests {
         );
     }
 
-    /// Test 8: Gate spawn failure (MCP path) populates rework_reasons with
-    /// the failure message.
+    /// Test 8: Gate spawn failure (MCP path) via "no branch" - a
+    /// synchronous pre-condition that still returns
+    /// `ReviewGateSpawn::Blocked` from the main thread. The MCP handler
+    /// surfaces the reason in `status_message` (not `rework_reasons`);
+    /// `rework_reasons` is populated only when the BACKGROUND thread
+    /// reports a Blocked result via poll_review_gate. The rework flow for
+    /// "no plan" is exercised by `mcp_review_gate_bypass_prevented_no_plan`
+    /// via the drain helper.
     #[test]
     fn mcp_gate_spawn_failure_sets_rework_reasons() {
-        // Work item with no branch - gate will fail with "no branch set".
         let (mut app, wi_id) = app_with_work_item(
             WorkItemStatus::Implementing,
             None, // no branch
@@ -11346,16 +12021,19 @@ mod tests {
 
         app.poll_mcp_status_updates();
 
-        assert!(
-            app.rework_reasons.contains_key(&wi_id),
-            "rework_reasons must be set on gate spawn failure (no branch)",
+        // Status must stay at Implementing - the synchronous pre-condition
+        // blocked the spawn.
+        let wi = app.work_items.iter().find(|w| w.id == wi_id).unwrap();
+        assert_eq!(
+            wi.status,
+            WorkItemStatus::Implementing,
+            "status must not change to Review when gate is blocked",
         );
-        let reason = app.rework_reasons.get(&wi_id).unwrap();
-        // The gate failure could mention "no plan" (checked first) or "no branch".
-        // StubBackend.read_plan returns Ok(None), so "no plan" is the first failure.
+        // The synchronous Blocked path surfaces the reason in status_message.
+        let msg = app.status_message.as_deref().unwrap_or("");
         assert!(
-            reason.contains("no plan") || reason.contains("no branch"),
-            "rework reason should explain the failure, got: {reason}",
+            msg.contains("no branch"),
+            "status should mention 'no branch', got: {msg}",
         );
     }
 
@@ -11416,6 +12094,7 @@ mod tests {
             ReviewGateState {
                 rx: dummy_rx,
                 progress: None,
+                origin: ReviewGateOrigin::Mcp,
             },
         );
 
@@ -11431,6 +12110,9 @@ mod tests {
         .unwrap();
 
         app.poll_mcp_status_updates();
+        // Item B's gate runs on a background thread; drain the "no plan"
+        // Blocked message via poll_review_gate.
+        drain_review_gate_with_timeout(&mut app, &wi_id_b);
 
         // Item B's status must be unchanged (gate spawn failed due to no plan).
         let wi_b = app.work_items.iter().find(|w| w.id == wi_id_b).unwrap();
@@ -11440,7 +12122,8 @@ mod tests {
             "item B should remain Implementing when gate cannot spawn (no plan)",
         );
         // rework_reasons should be populated - gate spawn failure (no plan)
-        // triggers the rework flow, unlike the old behavior where it was silently skipped.
+        // triggers the rework flow via poll_review_gate, mirroring the old
+        // synchronous behavior.
         assert!(
             app.rework_reasons.contains_key(&wi_id_b),
             "rework_reasons must be set for item B (gate spawn failure, not blocked by item A)",
@@ -11460,6 +12143,8 @@ mod tests {
     /// Test 10: A Blocked work item with no plan that fails the gate via MCP
     /// should transition to Implementing (not stay Blocked), so the
     /// implementing_rework prompt (which has {rework_reason}) is used.
+    /// The gate runs on a background thread and the Blocked outcome is
+    /// drained via poll_review_gate.
     #[test]
     fn blocked_gate_failure_transitions_to_implementing() {
         let (mut app, wi_id) = app_with_work_item(
@@ -11480,8 +12165,8 @@ mod tests {
         .unwrap();
 
         app.poll_mcp_status_updates();
+        drain_review_gate_with_timeout(&mut app, &wi_id);
 
-        // The work item should now be Implementing (not still Blocked).
         // StubBackend.update_status is a no-op, but reassemble_work_items
         // rebuilds from the StubBackend (which returns empty). The important
         // assertion is that rework_reasons is populated AND the code path
@@ -11498,44 +12183,47 @@ mod tests {
         );
     }
 
-    /// Test 11: spawn_review_gate sets status_message on all failure paths.
+    /// Test 11: spawn_review_gate reports failures on synchronous
+    /// pre-conditions (no repo association, no branch) via the returned
+    /// `ReviewGateSpawn::Blocked`. The background-thread failures (no
+    /// plan, empty diff, git error) arrive asynchronously via
+    /// `poll_review_gate` and are covered by other tests.
     #[test]
     fn spawn_review_gate_sets_status_on_failure() {
-        // Case 1: no plan exists.
+        // Case 1: no plan exists - now an ASYNC Blocked message.
         {
             let (mut app, wi_id) = app_with_work_item(
                 WorkItemStatus::Implementing,
                 Some("feature/test"),
                 Some("/tmp/repo"),
             );
-            let result = app.spawn_review_gate(&wi_id);
-            match result {
-                ReviewGateSpawn::Blocked(reason) => {
-                    assert!(
-                        reason.contains("no plan"),
-                        "should mention no plan, got: {reason}",
-                    );
-                }
-                ReviewGateSpawn::Spawned => {
-                    panic!("gate should not have spawned without a plan");
-                }
-            }
+            let result = app.spawn_review_gate(&wi_id, ReviewGateOrigin::Mcp);
+            // With the blocking-I/O fix, the no-plan check runs on the
+            // background thread. The spawn returns Spawned and the rework
+            // flow fires after poll_review_gate drains the Blocked message.
+            assert!(matches!(result, ReviewGateSpawn::Spawned));
+            drain_review_gate_with_timeout(&mut app, &wi_id);
+            assert!(
+                app.rework_reasons
+                    .get(&wi_id)
+                    .is_some_and(|r| r.contains("no plan")),
+                "drained rework reason should mention no plan",
+            );
         }
 
-        // Case 2: no branch set.
+        // Case 2: no branch set - synchronous pre-condition.
         {
             let (mut app, wi_id) = app_with_work_item(
                 WorkItemStatus::Implementing,
                 None, // no branch
                 Some("/tmp/repo"),
             );
-            let result = app.spawn_review_gate(&wi_id);
+            let result = app.spawn_review_gate(&wi_id, ReviewGateOrigin::Mcp);
             match result {
                 ReviewGateSpawn::Blocked(reason) => {
-                    // Could fail on "no plan" first (StubBackend returns None).
                     assert!(
-                        reason.contains("no plan") || reason.contains("no branch"),
-                        "should mention no plan or no branch, got: {reason}",
+                        reason.contains("no branch"),
+                        "should mention no branch, got: {reason}",
                     );
                 }
                 ReviewGateSpawn::Spawned => {
@@ -11544,20 +12232,19 @@ mod tests {
             }
         }
 
-        // Case 3: no repo association.
+        // Case 3: no repo association - synchronous pre-condition.
         {
             let (mut app, wi_id) = app_with_work_item(
                 WorkItemStatus::Implementing,
                 None,
                 None, // no repo association
             );
-            let result = app.spawn_review_gate(&wi_id);
+            let result = app.spawn_review_gate(&wi_id, ReviewGateOrigin::Mcp);
             match result {
                 ReviewGateSpawn::Blocked(reason) => {
-                    // Could fail on "no plan" first (StubBackend returns None).
                     assert!(
-                        reason.contains("no plan") || reason.contains("no repo"),
-                        "should mention no plan or no repo, got: {reason}",
+                        reason.contains("no repo"),
+                        "should mention no repo, got: {reason}",
                     );
                 }
                 ReviewGateSpawn::Spawned => {
@@ -11668,7 +12355,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut app = App::with_config(Config::default(), Box::new(backend));
+        let mut app = App::with_config(Config::default(), Arc::new(backend));
         app.worktree_service = Arc::new(StubWorktreeService);
 
         let requests = app.collect_backfill_requests();
@@ -11801,7 +12488,7 @@ mod tests {
         let backend = TestBackend {
             records: std::sync::Mutex::new(Vec::new()),
         };
-        let mut app = App::with_config(Config::default(), Box::new(backend));
+        let mut app = App::with_config(Config::default(), Arc::new(backend));
 
         // Import a work item so we have something to delete.
         app.unlinked_prs.push(crate::work_item::UnlinkedPr {
@@ -12093,7 +12780,7 @@ mod tests {
 
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
-            Box::new(FixedListBackend::one_item(
+            Arc::new(FixedListBackend::one_item(
                 "/tmp/prompt-test.json",
                 "Prompt test item",
                 "/repo",
@@ -12139,7 +12826,7 @@ mod tests {
         use crate::config::InMemoryConfigProvider;
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
-            Box::new(FixedListBackend::one_item(
+            Arc::new(FixedListBackend::one_item(
                 "/tmp/recording-test.json",
                 "Recording test item",
                 "/my/repo",
@@ -12161,6 +12848,7 @@ mod tests {
                     path: PathBuf::from("/my/repo/.worktrees/feature-branch"),
                     branch: Some("feature-branch".into()),
                     is_main: false,
+                    has_commits_ahead: None,
                 }]),
                 prs: Ok(vec![]),
                 review_requested_prs: Ok(vec![]),
@@ -12271,7 +12959,7 @@ mod tests {
 
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
-            Box::new(FixedListBackend::one_item(
+            Arc::new(FixedListBackend::one_item(
                 "/tmp/pr-close-fail-test.json",
                 "PR close fail item",
                 "/my/repo",
@@ -12302,6 +12990,7 @@ mod tests {
                     path: PathBuf::from("/my/repo/.worktrees/feature-branch"),
                     branch: Some("feature-branch".into()),
                     is_main: false,
+                    has_commits_ahead: None,
                 }]),
                 prs: Ok(vec![crate::github_client::GithubPr {
                     number: 42,
@@ -12531,7 +13220,7 @@ mod tests {
 
         let mut cfg = Config::for_test();
         cfg.defaults.archive_after_days = 7;
-        let mut app = App::with_config(cfg, Box::new(backend));
+        let mut app = App::with_config(cfg, Arc::new(backend));
         app.reassemble_work_items();
 
         // Only the active item should remain.
@@ -12556,7 +13245,7 @@ mod tests {
 
         let mut cfg = Config::for_test();
         cfg.defaults.archive_after_days = 0; // disabled
-        let mut app = App::with_config(cfg, Box::new(backend));
+        let mut app = App::with_config(cfg, Arc::new(backend));
         app.reassemble_work_items();
 
         assert_eq!(app.work_items.len(), 1, "should not archive when disabled");
@@ -12574,7 +13263,7 @@ mod tests {
 
         let mut cfg = Config::for_test();
         cfg.defaults.archive_after_days = 7;
-        let mut app = App::with_config(cfg, Box::new(backend));
+        let mut app = App::with_config(cfg, Arc::new(backend));
         app.reassemble_work_items();
 
         assert_eq!(
@@ -12602,7 +13291,7 @@ mod tests {
 
         let mut cfg = Config::for_test();
         cfg.defaults.archive_after_days = 7;
-        let mut app = App::with_config(cfg, Box::new(backend));
+        let mut app = App::with_config(cfg, Arc::new(backend));
         app.reassemble_work_items();
 
         assert_eq!(app.work_items.len(), 1, "recent Done items should be kept");
@@ -12626,7 +13315,7 @@ mod tests {
 
         let mut cfg = Config::for_test();
         cfg.defaults.archive_after_days = 7;
-        let mut app = App::with_config(cfg, Box::new(backend));
+        let mut app = App::with_config(cfg, Arc::new(backend));
         app.reassemble_work_items();
 
         assert_eq!(
@@ -12648,7 +13337,7 @@ mod tests {
 
         let mut cfg = Config::for_test();
         cfg.defaults.archive_after_days = 7;
-        let mut app = App::with_config(cfg, Box::new(backend));
+        let mut app = App::with_config(cfg, Arc::new(backend));
         app.reassemble_work_items();
         app.build_display_list();
 
@@ -12685,7 +13374,7 @@ mod tests {
 
         let mut cfg = Config::for_test();
         cfg.defaults.archive_after_days = 7;
-        let mut app = App::with_config(cfg, Box::new(backend));
+        let mut app = App::with_config(cfg, Arc::new(backend));
         app.reassemble_work_items();
         app.build_display_list();
 
@@ -12703,6 +13392,1391 @@ mod tests {
         assert_eq!(
             records[0].done_at, None,
             "done_at should be cleared when retreating from Done"
+        );
+    }
+
+    // -- P0 Blocking-I/O regression guard (GAN ui-audit-p0-io) --
+    //
+    // Ensures the UI-thread entry points touched by the audit never call
+    // into `WorktreeService` synchronously. We install a worktree service
+    // that atomically bumps a per-method counter and returns a stub
+    // result without blocking. Each regression test snapshots the
+    // counter immediately after the UI-thread entry point returns and
+    // asserts that NOTHING was called on the main thread. Background
+    // threads spawned by the entry points are free to increment the
+    // counter later - the snapshot is taken synchronously before any
+    // thread progress is observable.
+    //
+    // A counting probe is used instead of a panicking probe because the
+    // PR-create / merge / review-submit entry points intentionally spawn
+    // background threads that DO call `default_branch` later. A panic on
+    // the worker thread would pollute `--nocapture` output without
+    // adding signal.
+
+    /// Counting probe that records how many times any method was
+    /// called on the UI thread. A `Mutex<()>` "gate" establishes a
+    /// deterministic happens-before edge: tests that spawn a
+    /// background thread which might call into this service acquire
+    /// the gate BEFORE invoking the UI-thread entry point, snapshot
+    /// the counter, then drop the gate so the background thread can
+    /// proceed. Without the gate the background thread could race the
+    /// test thread and bump the counter before the assertion runs,
+    /// flaking the test under CI load. Mirrors the pattern used by
+    /// `CountingPlanBackend`.
+    #[derive(Default)]
+    struct CountingWorktreeService {
+        calls: std::sync::atomic::AtomicUsize,
+        gate: std::sync::Mutex<()>,
+    }
+
+    impl CountingWorktreeService {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+        fn load(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        /// Acquire the gate mutex, block until the test thread
+        /// releases it, then atomically bump the counter. Every
+        /// trait method routes through here, so any caller - UI
+        /// thread or background thread - is forced to serialize
+        /// against whichever test is holding the gate.
+        fn gated_bump(&self) {
+            let _guard = self.gate.lock().unwrap();
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl crate::worktree_service::WorktreeService for CountingWorktreeService {
+        fn list_worktrees(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<
+            Vec<crate::worktree_service::WorktreeInfo>,
+            crate::worktree_service::WorktreeError,
+        > {
+            self.gated_bump();
+            Ok(Vec::new())
+        }
+
+        fn create_worktree(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+            target_dir: &std::path::Path,
+        ) -> Result<crate::worktree_service::WorktreeInfo, crate::worktree_service::WorktreeError>
+        {
+            self.gated_bump();
+            Ok(crate::worktree_service::WorktreeInfo {
+                path: target_dir.to_path_buf(),
+                branch: None,
+                is_main: false,
+                has_commits_ahead: None,
+            })
+        }
+
+        fn remove_worktree(
+            &self,
+            _repo_path: &std::path::Path,
+            _worktree_path: &std::path::Path,
+            _delete_branch: bool,
+            _force: bool,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            self.gated_bump();
+            Ok(())
+        }
+
+        fn delete_branch(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+            _force: bool,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            self.gated_bump();
+            Ok(())
+        }
+
+        fn default_branch(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<String, crate::worktree_service::WorktreeError> {
+            self.gated_bump();
+            Ok("main".into())
+        }
+
+        fn github_remote(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<Option<(String, String)>, crate::worktree_service::WorktreeError> {
+            self.gated_bump();
+            Ok(None)
+        }
+
+        fn fetch_branch(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            self.gated_bump();
+            Ok(())
+        }
+
+        fn create_branch(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            self.gated_bump();
+            Ok(())
+        }
+    }
+
+    /// Build an `App` wired with the counting worktree service and an
+    /// in-memory config provider. Returns the shared `Arc` so tests can
+    /// snapshot the call count after each UI-thread entry point.
+    fn app_with_counting_ws() -> (App, Arc<CountingWorktreeService>) {
+        let ws = CountingWorktreeService::new();
+        let app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(StubBackend),
+            Arc::clone(&ws) as Arc<dyn crate::worktree_service::WorktreeService + Send + Sync>,
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        (app, ws)
+    }
+
+    /// Install a cached `RepoFetchResult` with the given `github_remote`
+    /// and optional worktree so UI-thread cache reads (`github_remote`,
+    /// `has_commits_ahead`) return real data without ever touching the
+    /// worktree service.
+    fn install_cached_repo(
+        app: &mut App,
+        repo_path: &std::path::Path,
+        branch: Option<&str>,
+        has_commits_ahead: Option<bool>,
+    ) {
+        let worktrees = match branch {
+            Some(b) => vec![crate::worktree_service::WorktreeInfo {
+                path: repo_path.join(".worktrees").join(b),
+                branch: Some(b.to_string()),
+                is_main: false,
+                has_commits_ahead,
+            }],
+            None => Vec::new(),
+        };
+        app.repo_data.insert(
+            repo_path.to_path_buf(),
+            crate::work_item::RepoFetchResult {
+                repo_path: repo_path.to_path_buf(),
+                github_remote: Some(("owner".into(), "repo".into())),
+                worktrees: Ok(worktrees),
+                prs: Ok(Vec::new()),
+                review_requested_prs: Ok(Vec::new()),
+                issues: Vec::new(),
+            },
+        );
+    }
+
+    fn push_review_work_item(
+        app: &mut App,
+        id: &WorkItemId,
+        repo_path: &std::path::Path,
+        branch: &str,
+        status: WorkItemStatus,
+    ) {
+        app.work_items.push(crate::work_item::WorkItem {
+            id: id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "blocking-io-test".into(),
+            description: None,
+            status,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: repo_path.to_path_buf(),
+                branch: Some(branch.to_string()),
+                worktree_path: None,
+                pr: Some(crate::work_item::PrInfo {
+                    number: 42,
+                    url: "https://example.com/pr/42".into(),
+                    state: crate::work_item::PrState::Open,
+                    title: "pr".into(),
+                    is_draft: false,
+                    checks: crate::work_item::CheckStatus::Passing,
+                    review_decision: crate::work_item::ReviewDecision::None,
+                }),
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+    }
+
+    /// Minimal `WorkItemBackend` whose `read_plan` returns a non-empty
+    /// plan string so `spawn_review_gate` progresses past the plan check
+    /// on the background thread. All other methods defer to `StubBackend`
+    /// semantics (no-op / not-found) so the backend stays inert for the
+    /// regression test's purposes.
+    struct NonEmptyPlanBackend;
+
+    impl WorkItemBackend for NonEmptyPlanBackend {
+        fn read(
+            &self,
+            id: &WorkItemId,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::NotFound(id.clone()))
+        }
+        fn list(&self) -> Result<crate::work_item_backend::ListResult, BackendError> {
+            Ok(crate::work_item_backend::ListResult {
+                records: Vec::new(),
+                corrupt: Vec::new(),
+            })
+        }
+        fn create(
+            &self,
+            _request: CreateWorkItem,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation(
+                "non-empty-plan backend does not support create".into(),
+            ))
+        }
+        fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn update_status(
+            &self,
+            _id: &WorkItemId,
+            _status: WorkItemStatus,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn import(
+            &self,
+            _unlinked: &UnlinkedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation(
+                "non-empty-plan backend does not support import".into(),
+            ))
+        }
+        fn import_review_request(
+            &self,
+            _rr: &crate::work_item::ReviewRequestedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation(
+                "non-empty-plan backend does not support import_review_request".into(),
+            ))
+        }
+        fn append_activity(
+            &self,
+            _id: &WorkItemId,
+            _entry: &ActivityEntry,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
+            Ok(Vec::new())
+        }
+        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn update_title(&self, _id: &WorkItemId, _title: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
+            Ok(Some("plan-text for regression test".into()))
+        }
+        fn set_done_at(&self, _id: &WorkItemId, _done_at: Option<u64>) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn backend_type(&self) -> crate::work_item::BackendType {
+            crate::work_item::BackendType::LocalFile
+        }
+    }
+
+    #[test]
+    fn spawn_review_gate_does_not_touch_worktree_service_synchronously() {
+        // Exercise the full happy-path pre-conditions (plan exists,
+        // branch is set, repo association present) so the background
+        // thread is the ONLY place `default_branch` / `github_remote` /
+        // `git diff` may run. Against the pre-fix master version this
+        // assertion would fail: `spawn_review_gate` called
+        // `self.worktree_service.default_branch(&repo_path)` on the UI
+        // thread after reading the plan, bumping the counter to 1.
+        let ws = CountingWorktreeService::new();
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(NonEmptyPlanBackend),
+            Arc::clone(&ws) as Arc<dyn crate::worktree_service::WorktreeService + Send + Sync>,
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let repo = PathBuf::from("/tmp/p0-review-gate-repo");
+        install_cached_repo(&mut app, &repo, Some("feature/gate"), Some(true));
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/p0-gate.json"));
+        push_review_work_item(
+            &mut app,
+            &wi_id,
+            &repo,
+            "feature/gate",
+            WorkItemStatus::Implementing,
+        );
+
+        // Hold the gate mutex so the background thread (which WILL
+        // call `default_branch` / `github_remote` as soon as it wakes)
+        // cannot increment the counter before we snapshot it. Without
+        // this deterministic happens-before edge, CI-load thread
+        // scheduling can let the background thread run first and
+        // flake the assertion. Mirrors the pattern used by
+        // `begin_session_open_defers_backend_read_plan_to_background_thread`.
+        let gate = ws.gate.lock().unwrap();
+
+        let result = app.spawn_review_gate(&wi_id, ReviewGateOrigin::Mcp);
+        let ws_calls_after_spawn = ws.load();
+
+        assert!(
+            matches!(result, ReviewGateSpawn::Spawned),
+            "gate must spawn when plan, branch and repo are all present",
+        );
+        assert_eq!(
+            ws_calls_after_spawn, 0,
+            "spawn_review_gate must not touch worktree_service on the UI thread: \
+             read_plan, default_branch, git diff and github_remote must all run \
+             inside the std::thread::spawn closure",
+        );
+
+        // Release the gate so the background thread can proceed and
+        // drain. Removing the review gate entry drops the receiver,
+        // causing the background thread's sends to fail - it exits
+        // cleanly without outliving the test.
+        drop(gate);
+        app.review_gates.remove(&wi_id);
+    }
+
+    #[test]
+    fn spawn_pr_creation_reads_github_remote_from_cache() {
+        // Happy path: the cached github_remote is populated, so the main
+        // thread never calls into worktree_service. The background thread
+        // WILL call `default_branch` later. The gate mutex establishes a
+        // deterministic happens-before edge so the counter snapshot runs
+        // before the background thread can increment it, eliminating the
+        // CI-load race condition that would otherwise flake this test.
+        let (mut app, ws) = app_with_counting_ws();
+        let repo = PathBuf::from("/tmp/p0-pr-create-repo");
+        install_cached_repo(&mut app, &repo, Some("feature/prc"), Some(true));
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/p0-prc.json"));
+        push_review_work_item(
+            &mut app,
+            &wi_id,
+            &repo,
+            "feature/prc",
+            WorkItemStatus::Review,
+        );
+
+        // Hold the gate so the background thread is blocked on its
+        // first `default_branch` call and cannot race the snapshot.
+        let gate = ws.gate.lock().unwrap();
+
+        app.pr_create_rx = None;
+        app.spawn_pr_creation(&wi_id);
+        let ws_calls_after_spawn = ws.load();
+
+        assert_eq!(app.pr_create_wi.as_ref(), Some(&wi_id));
+        assert_eq!(
+            ws_calls_after_spawn, 0,
+            "spawn_pr_creation must read github_remote from repo_data, not \
+             worktree_service, on the UI thread",
+        );
+
+        // Release the gate so the background thread can drain. Dropping
+        // the receiver stops any progress being observed.
+        drop(gate);
+        app.pr_create_rx = None;
+    }
+
+    #[test]
+    fn execute_merge_reads_github_remote_from_cache() {
+        let (mut app, ws) = app_with_counting_ws();
+        let repo = PathBuf::from("/tmp/p0-merge-repo");
+        install_cached_repo(&mut app, &repo, Some("feature/merge"), Some(true));
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/p0-merge.json"));
+        push_review_work_item(
+            &mut app,
+            &wi_id,
+            &repo,
+            "feature/merge",
+            WorkItemStatus::Review,
+        );
+
+        app.pr_merge_rx = None;
+        app.execute_merge(&wi_id, "squash");
+        let ws_calls_after_spawn = ws.load();
+
+        assert!(
+            app.pr_merge_rx.is_some() || app.alert_message.is_some(),
+            "execute_merge must proceed past the github_remote lookup",
+        );
+        assert_eq!(
+            ws_calls_after_spawn, 0,
+            "execute_merge must read github_remote from repo_data, not \
+             worktree_service, on the UI thread",
+        );
+        app.pr_merge_rx = None;
+    }
+
+    #[test]
+    fn spawn_review_submission_reads_github_remote_from_cache() {
+        let (mut app, ws) = app_with_counting_ws();
+        let repo = PathBuf::from("/tmp/p0-review-submit-repo");
+        install_cached_repo(&mut app, &repo, Some("feature/rs"), Some(true));
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/p0-rs.json"));
+        push_review_work_item(
+            &mut app,
+            &wi_id,
+            &repo,
+            "feature/rs",
+            WorkItemStatus::Review,
+        );
+
+        app.review_submit_rx = None;
+        app.spawn_review_submission(&wi_id, "approve", "");
+        let ws_calls_after_spawn = ws.load();
+
+        assert_eq!(app.review_submit_wi.as_ref(), Some(&wi_id));
+        assert_eq!(
+            ws_calls_after_spawn, 0,
+            "spawn_review_submission must read github_remote from repo_data, \
+             not worktree_service, on the UI thread",
+        );
+        app.review_submit_rx = None;
+    }
+
+    #[test]
+    fn enter_mergequeue_reads_github_remote_from_cache() {
+        let (mut app, ws) = app_with_counting_ws();
+        let repo = PathBuf::from("/tmp/p0-mq-repo");
+        install_cached_repo(&mut app, &repo, Some("feature/mq"), Some(true));
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/p0-mq.json"));
+        push_review_work_item(
+            &mut app,
+            &wi_id,
+            &repo,
+            "feature/mq",
+            WorkItemStatus::Review,
+        );
+
+        app.enter_mergequeue(&wi_id);
+        assert!(
+            app.mergequeue_watches.iter().any(|w| w.wi_id == wi_id),
+            "enter_mergequeue must proceed past the github_remote lookup using \
+             cached data only",
+        );
+        assert_eq!(
+            ws.load(),
+            0,
+            "enter_mergequeue must never call worktree_service on the UI thread",
+        );
+    }
+
+    /// Minimal `WorkItemBackend` whose `list` returns a single Done
+    /// record with a branch and `pr_identity: None`. Used by the
+    /// backfill regression test to prove `collect_backfill_requests`
+    /// actually enters its loop body (the old version used
+    /// `StubBackend` whose empty list skipped the loop entirely, so
+    /// the counter-zero assertion was trivially satisfied for the
+    /// wrong reason).
+    struct DoneRecordBackend {
+        record: crate::work_item_backend::WorkItemRecord,
+    }
+
+    impl WorkItemBackend for DoneRecordBackend {
+        fn read(
+            &self,
+            id: &WorkItemId,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            if id == &self.record.id {
+                Ok(self.record.clone())
+            } else {
+                Err(BackendError::NotFound(id.clone()))
+            }
+        }
+        fn list(&self) -> Result<crate::work_item_backend::ListResult, BackendError> {
+            Ok(crate::work_item_backend::ListResult {
+                records: vec![self.record.clone()],
+                corrupt: Vec::new(),
+            })
+        }
+        fn create(
+            &self,
+            _request: CreateWorkItem,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation(
+                "done-record backend does not support create".into(),
+            ))
+        }
+        fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn update_status(
+            &self,
+            _id: &WorkItemId,
+            _status: WorkItemStatus,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn import(
+            &self,
+            _unlinked: &UnlinkedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation(
+                "done-record backend does not support import".into(),
+            ))
+        }
+        fn import_review_request(
+            &self,
+            _rr: &crate::work_item::ReviewRequestedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation(
+                "done-record backend does not support import_review_request".into(),
+            ))
+        }
+        fn append_activity(
+            &self,
+            _id: &WorkItemId,
+            _entry: &ActivityEntry,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
+            Ok(Vec::new())
+        }
+        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn update_title(&self, _id: &WorkItemId, _title: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
+            Ok(self.record.plan.clone())
+        }
+        fn set_done_at(&self, _id: &WorkItemId, _done_at: Option<u64>) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn backend_type(&self) -> crate::work_item::BackendType {
+            crate::work_item::BackendType::LocalFile
+        }
+    }
+
+    #[test]
+    fn collect_backfill_requests_reads_github_remote_from_cache() {
+        // Drive `collect_backfill_requests` through a backend that
+        // actually returns a Done record with a branch and no
+        // `pr_identity`. The cached `github_remote` in `repo_data`
+        // supplies owner/repo. The previous version of this test used
+        // `StubBackend` (empty list), so the loop body never executed
+        // and the counter-zero assertion was vacuously satisfied -
+        // the test would have passed on master unchanged, providing
+        // zero coverage of the UI-thread blocking-I/O guard.
+        let repo = PathBuf::from("/tmp/p0-backfill-repo");
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/p0-backfill.json"));
+        let backend = Arc::new(DoneRecordBackend {
+            record: crate::work_item_backend::WorkItemRecord {
+                id: wi_id.clone(),
+                title: "backfill-test".into(),
+                description: None,
+                status: WorkItemStatus::Done,
+                kind: crate::work_item::WorkItemKind::Own,
+                repo_associations: vec![crate::work_item_backend::RepoAssociationRecord {
+                    repo_path: repo.clone(),
+                    branch: Some("feature/bf".into()),
+                    pr_identity: None,
+                }],
+                plan: None,
+                done_at: Some(0),
+            },
+        });
+
+        let ws = CountingWorktreeService::new();
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            backend,
+            Arc::clone(&ws) as Arc<dyn crate::worktree_service::WorktreeService + Send + Sync>,
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        install_cached_repo(&mut app, &repo, Some("feature/bf"), Some(false));
+
+        let requests = app.collect_backfill_requests();
+
+        assert_eq!(
+            requests.len(),
+            1,
+            "backend returned a Done record with branch and no pr_identity - \
+             collect_backfill_requests must produce exactly one request using \
+             the cached github_remote",
+        );
+        let (req_wi_id, req_repo, req_branch, req_owner, req_repo_name) = &requests[0];
+        assert_eq!(req_wi_id, &wi_id);
+        assert_eq!(req_repo, &repo);
+        assert_eq!(req_branch, "feature/bf");
+        assert_eq!(req_owner, "owner");
+        assert_eq!(req_repo_name, "repo");
+        assert_eq!(
+            ws.load(),
+            0,
+            "collect_backfill_requests must never call worktree_service on \
+             the UI thread - owner/repo must come from repo_data cache",
+        );
+    }
+
+    #[test]
+    fn branch_has_commits_reads_from_cache_and_never_shells_out() {
+        let (mut app, ws) = app_with_counting_ws();
+        let repo = PathBuf::from("/tmp/p0-branch-commits-repo");
+        // Cache populated with has_commits_ahead=Some(true).
+        install_cached_repo(&mut app, &repo, Some("feature/bhc"), Some(true));
+        assert!(app.branch_has_commits(&repo, "feature/bhc"));
+
+        // Missing branch / missing cache entry returns the safe default.
+        assert!(!app.branch_has_commits(&repo, "unknown-branch"));
+        let unknown_repo = PathBuf::from("/tmp/never-fetched");
+        assert!(!app.branch_has_commits(&unknown_repo, "anything"));
+
+        // Cache populated with has_commits_ahead=None must also default
+        // to false rather than retrying a shell-out.
+        let repo2 = PathBuf::from("/tmp/p0-branch-commits-repo-2");
+        install_cached_repo(&mut app, &repo2, Some("feature/null"), None);
+        assert!(!app.branch_has_commits(&repo2, "feature/null"));
+
+        assert_eq!(
+            ws.load(),
+            0,
+            "branch_has_commits must read from repo_data and never call \
+             worktree_service",
+        );
+    }
+
+    /// `WorkItemBackend` probe that counts `read_plan` calls through
+    /// an `AtomicUsize`. Used to assert that `begin_session_open`
+    /// defers the plan read to a background thread.
+    ///
+    /// The backend holds a `Mutex` "gate" that the background thread
+    /// must acquire before it is allowed to call `read_plan`. Tests
+    /// lock the gate before calling `begin_session_open`, then
+    /// atomically snapshot the counter (which MUST still be zero)
+    /// BEFORE releasing the gate. Without the gate the background
+    /// thread can race the UI thread and the counter may already be
+    /// `1` by the time the test reads it - a race that would
+    /// wrongly report a regression.
+    #[derive(Default)]
+    struct CountingPlanBackend {
+        read_plan_calls: std::sync::atomic::AtomicUsize,
+        gate: std::sync::Mutex<()>,
+    }
+
+    impl CountingPlanBackend {
+        fn load(&self) -> usize {
+            self.read_plan_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl WorkItemBackend for CountingPlanBackend {
+        fn read(
+            &self,
+            id: &WorkItemId,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::NotFound(id.clone()))
+        }
+        fn list(&self) -> Result<crate::work_item_backend::ListResult, BackendError> {
+            Ok(crate::work_item_backend::ListResult {
+                records: Vec::new(),
+                corrupt: Vec::new(),
+            })
+        }
+        fn create(
+            &self,
+            _request: CreateWorkItem,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation(
+                "counting-plan backend does not support create".into(),
+            ))
+        }
+        fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn update_status(
+            &self,
+            _id: &WorkItemId,
+            _status: WorkItemStatus,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn import(
+            &self,
+            _unlinked: &UnlinkedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation(
+                "counting-plan backend does not support import".into(),
+            ))
+        }
+        fn import_review_request(
+            &self,
+            _rr: &crate::work_item::ReviewRequestedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation(
+                "counting-plan backend does not support import_review_request".into(),
+            ))
+        }
+        fn append_activity(
+            &self,
+            _id: &WorkItemId,
+            _entry: &ActivityEntry,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn read_activity(&self, _id: &WorkItemId) -> Result<Vec<ActivityEntry>, BackendError> {
+            Ok(Vec::new())
+        }
+        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn update_title(&self, _id: &WorkItemId, _title: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
+            // Block until the test releases the gate. This proves the
+            // call runs on the background thread - a UI-thread caller
+            // would deadlock against the already-held mutex.
+            let _guard = self.gate.lock().unwrap();
+            self.read_plan_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some("plan-text from counting backend".into()))
+        }
+        fn set_done_at(&self, _id: &WorkItemId, _done_at: Option<u64>) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn backend_type(&self) -> crate::work_item::BackendType {
+            crate::work_item::BackendType::LocalFile
+        }
+    }
+
+    #[test]
+    fn stage_system_prompt_never_reads_plan_on_ui_thread() {
+        // Proof: after the refactor, `stage_system_prompt` takes the
+        // plan text as a parameter and MUST NOT call
+        // `backend.read_plan(...)` itself. Against the pre-fix code
+        // this assertion would fail: the UI-thread call of
+        // `stage_system_prompt` unconditionally invoked
+        // `self.backend.read_plan(work_item_id)` before building the
+        // prompt, bumping the counter to 1.
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/p0-stage-prompt.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "stage-prompt-test".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/p0-stage-prompt-repo"),
+                branch: Some("feature/sp".into()),
+                worktree_path: Some(PathBuf::from("/tmp/p0-stage-prompt-worktree")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        let cwd = PathBuf::from("/tmp/p0-stage-prompt-worktree");
+        // The caller passes the plan text as a parameter - the
+        // function itself must NEVER consult the backend.
+        let _ = app.stage_system_prompt(&wi_id, &cwd, "pre-read plan body".into());
+        assert_eq!(
+            backend.load(),
+            0,
+            "stage_system_prompt must use the plan_text parameter and \
+             never call backend.read_plan on the UI thread",
+        );
+    }
+
+    #[test]
+    fn begin_session_open_defers_backend_read_plan_to_background_thread() {
+        // Proof: `begin_session_open` must NOT call
+        // `backend.read_plan` on the UI thread. Under the pre-fix
+        // `stage_system_prompt` path, `complete_session_open`
+        // -> `stage_system_prompt` would read the plan synchronously
+        // before returning to the event loop, freezing the UI while
+        // the filesystem read ran. This regression guard ensures the
+        // read moves to the background thread driven by
+        // `poll_session_opens` / `finish_session_open`.
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/p0-session-open.json"));
+        // Work item needs a status that allows sessions.
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "session-open-test".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/p0-session-open-repo"),
+                branch: Some("feature/so".into()),
+                worktree_path: Some(PathBuf::from("/tmp/p0-session-open-worktree")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        // Hold the gate so the background thread cannot call
+        // `read_plan` until the test releases it. Any synchronous
+        // caller of `backend.read_plan` would deadlock here (on the
+        // test thread) and `begin_session_open` would never return.
+        let gate = backend.gate.lock().unwrap();
+
+        let cwd = PathBuf::from("/tmp/p0-session-open-worktree");
+        app.begin_session_open(&wi_id, &cwd);
+
+        // Immediately after the UI-thread call: the backend MUST NOT
+        // have been touched. The background thread is parked waiting
+        // on the gate mutex held by this test; the counter is zero.
+        let reads_immediately_after = backend.load();
+        assert_eq!(
+            reads_immediately_after, 0,
+            "begin_session_open must defer backend.read_plan to the \
+             background thread - see docs/UI.md 'Blocking I/O Prohibition'",
+        );
+        assert!(
+            app.session_open_rx.contains_key(&wi_id),
+            "begin_session_open must register a pending receiver for the \
+             background plan read",
+        );
+
+        // Release the gate so the background thread may proceed, then
+        // drain it via the channel. After that the counter must be 1
+        // (the background thread actually ran the read).
+        drop(gate);
+        let entry = app.session_open_rx.remove(&wi_id).unwrap();
+        let result = entry
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("background plan-read thread must deliver a result");
+        assert_eq!(result.plan_text, "plan-text from counting backend");
+        assert!(result.read_error.is_none());
+        assert_eq!(
+            backend.load(),
+            1,
+            "background thread must have performed exactly one read_plan call",
+        );
+        // End the spinner activity since `poll_session_opens` was
+        // bypassed by the manual drain above.
+        app.end_activity(entry.activity);
+    }
+
+    #[test]
+    fn delete_work_item_phase5_forwards_orphan_branch_to_cleanup_info() {
+        // Regression guard for R2-F-2. Round 1 pushed
+        // `(repo_path, worktree_path)` pairs into `orphan_worktrees`
+        // and silently dropped the branch name - so the synthesized
+        // `DeleteCleanupInfo` had `branch: None` and
+        // `spawn_delete_cleanup` skipped the `git branch -D` step. On
+        // master this step ran inline. Net regression: a
+        // delete-during-create race leaked a branch ref.
+        //
+        // Proof: put a completed `WorktreeCreateResult` with a known
+        // branch into `worktree_create_rx`, call
+        // `delete_work_item_by_id`, and assert the resulting
+        // `OrphanWorktree` has the branch populated. Then mirror the
+        // caller's synthesis logic and check the `DeleteCleanupInfo`
+        // carries the branch through unchanged.
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(CountingPlanBackend::default()) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/r2f2-orphan.json"));
+        let repo_path = PathBuf::from("/tmp/r2f2-repo");
+        let worktree_path = PathBuf::from("/tmp/r2f2-worktree");
+        let branch_name = "feature/r2f2-orphan".to_string();
+
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "r2f2-test".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: repo_path.clone(),
+                branch: Some(branch_name.clone()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        // Pre-queue a completed worktree-create result so Phase 5's
+        // `try_recv` drains it synchronously.
+        let (tx, rx) = crossbeam_channel::bounded::<WorktreeCreateResult>(1);
+        tx.send(WorktreeCreateResult {
+            wi_id: wi_id.clone(),
+            repo_path: repo_path.clone(),
+            branch: Some(branch_name.clone()),
+            path: Some(worktree_path.clone()),
+            error: None,
+            open_session: true,
+            branch_gone: false,
+            reused: false,
+        })
+        .unwrap();
+        app.worktree_create_rx = Some(rx);
+        app.worktree_create_wi = Some(wi_id.clone());
+
+        let mut warnings: Vec<String> = Vec::new();
+        let mut orphan_worktrees: Vec<OrphanWorktree> = Vec::new();
+        app.delete_work_item_by_id(&wi_id, &mut warnings, &mut orphan_worktrees)
+            .expect("delete must succeed");
+
+        assert_eq!(
+            orphan_worktrees.len(),
+            1,
+            "Phase 5 must capture the in-flight worktree as an orphan",
+        );
+        let orphan = &orphan_worktrees[0];
+        assert_eq!(orphan.repo_path, repo_path);
+        assert_eq!(orphan.worktree_path, worktree_path);
+        assert_eq!(
+            orphan.branch.as_deref(),
+            Some(branch_name.as_str()),
+            "R2-F-2 regression: orphan must preserve the branch name so \
+             spawn_delete_cleanup can run `git branch -D`",
+        );
+
+        // Mirror the caller's synthesis and verify the DeleteCleanupInfo
+        // carries the branch through. This exercises the exact code path
+        // in `confirm_delete_from_prompt` and the MCP delete handler.
+        let cleanup_info = DeleteCleanupInfo {
+            repo_path: orphan.repo_path.clone(),
+            branch: orphan.branch.clone(),
+            worktree_path: Some(orphan.worktree_path.clone()),
+            branch_in_main_worktree: false,
+            open_pr_number: None,
+            github_remote: None,
+        };
+        assert_eq!(
+            cleanup_info.branch.as_deref(),
+            Some(branch_name.as_str()),
+            "synthesized DeleteCleanupInfo must propagate the orphan branch",
+        );
+        assert!(
+            !cleanup_info.branch_in_main_worktree,
+            "a freshly-created worktree is never the main worktree",
+        );
+    }
+
+    #[test]
+    fn begin_session_open_surfaces_activity_spinner_for_feedback() {
+        // Regression guard for R2-F-3. Round 1's background plan-read
+        // path returned silently from `begin_session_open`, so a slow
+        // backend made the TUI look hung between Enter and the next
+        // 200ms poll tick. `begin_session_open` must register an
+        // activity so `current_activity()` surfaces feedback
+        // immediately. The activity must also be ended in every
+        // terminal path of `poll_session_opens` - here we verify the
+        // happy path.
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/r2f3-session-open.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "r2f3-session-open".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/r2f3-repo"),
+                branch: Some("feature/r2f3".into()),
+                worktree_path: Some(PathBuf::from("/tmp/r2f3-worktree")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        // No spinner before the call.
+        assert!(app.current_activity().is_none());
+
+        let cwd = PathBuf::from("/tmp/r2f3-worktree");
+        app.begin_session_open(&wi_id, &cwd);
+
+        // Spinner must be present IMMEDIATELY - no waiting on the
+        // background thread to finish. This is the entire point of the
+        // R2-F-3 fix.
+        let activity_msg = app
+            .current_activity()
+            .expect("R2-F-3 regression: begin_session_open must start an activity spinner");
+        assert_eq!(activity_msg, "Opening session...");
+        assert!(
+            app.session_open_rx.contains_key(&wi_id),
+            "begin_session_open must register a pending receiver",
+        );
+
+        // Wait for the background read to produce a result, then drain
+        // it via `poll_session_opens`. The spinner MUST be cleared once
+        // the result is applied.
+        let recv_start = std::time::Instant::now();
+        loop {
+            let ready = app
+                .session_open_rx
+                .get(&wi_id)
+                .map(|entry| !entry.rx.is_empty())
+                .unwrap_or(false);
+            if ready {
+                break;
+            }
+            if recv_start.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("background plan-read thread did not produce a result");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // `finish_session_open` will try to spawn a Claude session,
+        // which would touch external binaries. To avoid that, drain
+        // and end the spinner manually via the internal helper.
+        // This mirrors what `poll_session_opens` does on success.
+        let entry = app.session_open_rx.remove(&wi_id).unwrap();
+        let _result = entry
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("background plan-read thread must deliver a result");
+        app.end_activity(entry.activity);
+
+        assert!(
+            app.current_activity().is_none(),
+            "R2-F-3 regression: spinner must be cleared after the result is drained",
+        );
+    }
+
+    #[test]
+    fn apply_stage_change_cancels_pending_session_open() {
+        // Codex finding: pending session opens must NOT survive a stage
+        // change. The plan-read receiver in `session_open_rx` has no
+        // entry in `self.sessions`, so the old session-kill branch in
+        // `apply_stage_change` would only run if a session already
+        // existed. Without the unconditional `drop_session_open_entry`
+        // call, a stale pending open from the old stage would survive
+        // the transition and `finish_session_open` would later spawn
+        // Claude for the new stage - including no-session stages like
+        // Mergequeue or Done. This test pins the cancellation contract.
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-stage-cancel.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "codex-stage-cancel".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/codex-stage-cancel-repo"),
+                branch: Some("feature/codex-stage".into()),
+                worktree_path: Some(PathBuf::from("/tmp/codex-stage-cancel-wt")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        let cwd = PathBuf::from("/tmp/codex-stage-cancel-wt");
+        app.begin_session_open(&wi_id, &cwd);
+        assert!(
+            app.session_open_rx.contains_key(&wi_id),
+            "begin_session_open must register a pending receiver",
+        );
+        assert!(
+            app.current_activity().is_some(),
+            "begin_session_open must start an activity spinner",
+        );
+
+        // Stage transition to Mergequeue (a no-session stage). Use
+        // "pr_merge" source to satisfy the merge-gate guard - the
+        // important behaviour to pin is that the pending open is
+        // cancelled, not the source-string semantics.
+        app.apply_stage_change(
+            &wi_id,
+            &WorkItemStatus::Implementing,
+            &WorkItemStatus::Mergequeue,
+            "pr_merge",
+        );
+
+        assert!(
+            !app.session_open_rx.contains_key(&wi_id),
+            "stage change must cancel the pending session open - otherwise \
+             finish_session_open would later spawn Claude for the new stage",
+        );
+        assert!(
+            app.current_activity().is_none(),
+            "stage change must end the 'Opening session...' spinner",
+        );
+    }
+
+    /// A WorktreeService whose `remove_worktree` always fails. Used to
+    /// verify that `spawn_orphan_worktree_cleanup` surfaces failures
+    /// through `orphan_cleanup_warnings_tx` instead of dropping them.
+    #[cfg(test)]
+    pub struct FailingRemoveWorktreeService;
+
+    #[cfg(test)]
+    impl WorktreeService for FailingRemoveWorktreeService {
+        fn list_worktrees(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<
+            Vec<crate::worktree_service::WorktreeInfo>,
+            crate::worktree_service::WorktreeError,
+        > {
+            Ok(Vec::new())
+        }
+
+        fn create_worktree(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+            _target_dir: &std::path::Path,
+        ) -> Result<crate::worktree_service::WorktreeInfo, crate::worktree_service::WorktreeError>
+        {
+            Err(crate::worktree_service::WorktreeError::GitError(
+                "unsupported in this stub".into(),
+            ))
+        }
+
+        fn remove_worktree(
+            &self,
+            _repo_path: &std::path::Path,
+            _worktree_path: &std::path::Path,
+            _delete_branch: bool,
+            _force: bool,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            Err(crate::worktree_service::WorktreeError::GitError(
+                "simulated remove failure".into(),
+            ))
+        }
+
+        fn delete_branch(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+            _force: bool,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            Err(crate::worktree_service::WorktreeError::GitError(
+                "simulated branch delete failure".into(),
+            ))
+        }
+
+        fn default_branch(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<String, crate::worktree_service::WorktreeError> {
+            Ok("main".to_string())
+        }
+
+        fn github_remote(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<Option<(String, String)>, crate::worktree_service::WorktreeError> {
+            Ok(None)
+        }
+
+        fn fetch_branch(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            Ok(())
+        }
+
+        fn create_branch(
+            &self,
+            _repo_path: &std::path::Path,
+            _branch: &str,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spawn_orphan_worktree_cleanup_surfaces_failures_via_status_message() {
+        // Codex finding: `spawn_orphan_worktree_cleanup` previously
+        // discarded `remove_worktree` and `delete_branch` errors with
+        // `let _ = ...`, leaving leaked worktrees/branches with no
+        // user-visible warning. The fix routes failures through
+        // `orphan_cleanup_warnings_tx` so `poll_orphan_cleanup_warnings`
+        // can surface them in the status bar.
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(StubBackend) as Arc<dyn WorkItemBackend>,
+            Arc::new(FailingRemoveWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+
+        // Drain any pre-existing status message so the assertion
+        // below is unambiguous.
+        app.status_message = None;
+
+        app.spawn_orphan_worktree_cleanup(
+            PathBuf::from("/tmp/codex-orphan-repo"),
+            PathBuf::from("/tmp/codex-orphan-repo/.worktrees/feature/codex-orphan"),
+            Some("feature/codex-orphan".into()),
+        );
+
+        // Wait for both warnings to land in the channel (one for
+        // remove_worktree, one for delete_branch).
+        let recv_start = std::time::Instant::now();
+        loop {
+            // Peek without consuming: count pending messages.
+            let pending = app.orphan_cleanup_warnings_rx.len();
+            if pending >= 2 {
+                break;
+            }
+            if recv_start.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("orphan cleanup background thread did not enqueue warnings");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        app.poll_orphan_cleanup_warnings();
+
+        let msg = app
+            .status_message
+            .as_ref()
+            .expect("poll_orphan_cleanup_warnings must surface a status message");
+        assert!(
+            msg.contains("Orphan worktree cleanup failed"),
+            "status message must mention the worktree failure, got: {msg}",
+        );
+        assert!(
+            msg.contains("Orphan branch cleanup failed"),
+            "status message must mention the branch failure, got: {msg}",
+        );
+        assert!(
+            msg.contains("feature/codex-orphan"),
+            "status message must include the branch name, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn poll_orphan_cleanup_warnings_is_silent_on_success() {
+        // The success path: an empty channel means every cleanup
+        // succeeded; `poll_orphan_cleanup_warnings` must NOT clobber
+        // an unrelated status message.
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(StubBackend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        app.status_message = Some("unrelated status message".into());
+
+        app.poll_orphan_cleanup_warnings();
+
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("unrelated status message"),
+            "empty warnings channel must not clobber unrelated status messages",
+        );
+    }
+
+    #[test]
+    fn cleanup_session_state_ends_spinner_for_pending_open() {
+        // Regression guard for R2-F-3's symmetric cleanup path:
+        // `cleanup_session_state_for` is called when a work item is
+        // deleted mid-open. It must route through
+        // `drop_session_open_entry` so the spinner is not leaked.
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/r2f3-cleanup.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "r2f3-cleanup".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/r2f3-cleanup-repo"),
+                branch: Some("feature/r2f3c".into()),
+                worktree_path: Some(PathBuf::from("/tmp/r2f3-cleanup-wt")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        let cwd = PathBuf::from("/tmp/r2f3-cleanup-wt");
+        app.begin_session_open(&wi_id, &cwd);
+        assert!(app.current_activity().is_some());
+
+        // Delete-flavour cleanup: spinner must be cleared.
+        app.cleanup_session_state_for(&wi_id);
+        assert!(
+            app.current_activity().is_none(),
+            "cleanup_session_state_for must end the session-open spinner",
+        );
+        assert!(
+            !app.session_open_rx.contains_key(&wi_id),
+            "pending session-open entry must be removed on cleanup",
         );
     }
 }

@@ -366,6 +366,7 @@ mod tests {
                 path: PathBuf::from("/tmp/wt-feature"),
                 branch: Some("42-fix-bug".to_string()),
                 is_main: false,
+                has_commits_ahead: None,
             }],
             github_remote: Some(("owner".to_string(), "repo".to_string())),
         });
@@ -458,6 +459,7 @@ mod tests {
                 path: PathBuf::from("/tmp/wt-local"),
                 branch: Some("local-branch".to_string()),
                 is_main: false,
+                has_commits_ahead: None,
             }],
             github_remote: None,
         });

@@ -168,16 +168,19 @@ doing so would be blocking I/O on the UI thread. The
 `WorktreeService` trait no longer exposes a dirty-check method at
 all, making this violation structurally impossible.
 
-There is one remaining edge case where the delete flow still runs a
-synchronous `remove_worktree` on the UI thread: if a worktree-creation
-background thread has already completed (its result is sitting
-in `worktree_create_rx`) at the moment the user confirms the delete,
-`delete_work_item_by_id()` Phase 5 drains the receiver and
-force-removes the orphan worktree inline. This is rare (the window is
-a single tick between `poll_worktree_creation` firings) and the
-refactor to push this into the background cleanup thread is deferred
-to a follow-up change because it cross-cuts the Phase 5 cancellation
-logic for pr_create, merge, and review_submit.
+The worktree-creation race is handled entirely off the UI thread. If
+a worktree-creation background thread has already completed (its
+result is sitting in `worktree_create_rx`) at the moment the user
+confirms the delete, `delete_work_item_by_id()` Phase 5 drains the
+receiver and appends the orphan's `(repo_path, worktree_path, branch)`
+to an `orphan_worktrees` vector passed in by the caller. Each caller
+(MCP delete and `confirm_delete_from_prompt`) then forwards every
+orphan entry to `spawn_delete_cleanup()` as a synthesized
+`DeleteCleanupInfo`, so `git worktree remove --force` and the follow-up
+`git branch -D` run on the same background thread used for normal
+delete cleanup. No synchronous `git worktree remove` or
+`git branch -D` runs on the UI thread. See `docs/CLEANUP.md` for
+the full async flow.
 
 Both entry points guard against concurrent cleanup: if a previous
 `spawn_delete_cleanup()` is still running (either path) when a new

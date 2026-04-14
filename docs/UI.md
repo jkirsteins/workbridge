@@ -92,7 +92,11 @@ selection is always available since the PTY is not receiving events.
 The event loop runs on a single thread. Any blocking I/O (network
 requests, git commands, file system operations that may be slow) will
 freeze the UI until the operation completes. All I/O that could take
-more than a few milliseconds must run on a background thread.
+more than a few milliseconds must run on a background thread. This
+prohibition is transitive: a trait method like
+`WorktreeService::github_remote(...)` or `WorkItemBackend::read_plan(...)`
+that shells out to `git` / `gh` or hits the filesystem counts as
+blocking I/O and must not be called from the UI thread either.
 
 Pattern for background I/O:
 
@@ -106,6 +110,77 @@ Pattern for background I/O:
 
 See `spawn_import_worktree()` and `poll_worktree_creation()` in
 `src/app.rs` as reference implementations.
+
+#### Prefer cached values over trait shell-outs
+
+Many spawn helpers previously ran "fast" pre-flight checks synchronously
+on the UI thread - `worktree_service.github_remote(...)` to look up the
+`(owner, repo)` pair, `worktree_service.default_branch(...)` to find the
+base for a diff, `backend.read_plan(...)` to read a plan file. Each
+call is sub-millisecond in isolation but re-introduces the forbidden
+blocking-I/O dependency on the main loop.
+
+The rule is: **if the background fetcher has already cached the value,
+read from the cache**. Concretely:
+
+- `(owner, repo)` - read from
+  `self.repo_data[repo_path].github_remote` (populated by
+  `src/fetcher.rs::fetcher_loop`). If the cache is empty (first fetch
+  in flight), surface that to the user via `alert_message` / a status
+  bar message rather than blocking.
+- Worktree / branch metadata - read from
+  `self.repo_data[repo_path].worktrees` (which now carries
+  `has_commits_ahead` so `branch_has_commits` is a pure cache lookup).
+- Backend file reads (`read_plan`, `list`) - clone the `Arc<dyn
+  WorkItemBackend>` into the background closure and run the read there.
+- `default_branch`, `github_remote`, `git diff` - clone the
+  `Arc<dyn WorktreeService>` into the background closure and run the
+  shell-out there. NEVER on the UI thread.
+
+Examples of the cache-first pattern:
+- `spawn_pr_creation`, `execute_merge`, `enter_mergequeue`,
+  `spawn_review_submission`, `collect_backfill_requests`,
+  `reconstruct_mergequeue_watches` all read github_remote from
+  `repo_data`.
+- `spawn_review_gate` performs every blocking step
+  (`backend.read_plan`, `default_branch`, `git diff`, `github_remote`)
+  inside its `std::thread::spawn` closure and reports any "cannot run"
+  discovery via `ReviewGateMessage::Blocked` so `poll_review_gate`
+  applies the rework flow without freezing the UI.
+- Review gates carry a `ReviewGateOrigin` tag so `poll_review_gate`
+  can dispatch Blocked outcomes correctly. `Mcp` and `Auto` origins
+  (Claude requested Review via the MCP status update, or the
+  auto-trigger after an Implementing session died) run the full
+  rework flow: populate `rework_reasons`, kill the session, respawn
+  it with the implementing_rework prompt so Claude sees the reason.
+  `Tui` origin (the user pressed `l` on an Implementing item) only
+  surfaces the reason in the status bar and leaves the session
+  running - killing the user's primary workspace would be a
+  destructive regression from the master behaviour. In all origins,
+  if the work item was deleted while the gate was in flight, only
+  the gate state is dropped; `rework_reasons` is not populated,
+  preventing an orphan entry that nothing would ever clear.
+- The auto-trigger from a dying Implementing session
+  (`reassemble_work_items` -> `check_liveness` retroactive branch)
+  does NOT gate on `branch_has_commits`. The background gate's
+  `git diff default..branch` is the source of truth: if the branch
+  has no changes it arrives as `ReviewGateMessage::Blocked("Cannot
+  enter Review: no changes on branch")`, which `poll_review_gate`
+  surfaces via the Auto-origin rework flow. Gating the spawn on a
+  stale fetcher cache would let items get stuck in Implementing for
+  up to two minutes after Claude's final commit (the fetch
+  interval), with no auto-retry.
+- `spawn_session` routes through `begin_session_open` +
+  `poll_session_opens` instead of calling `stage_system_prompt`
+  directly. `begin_session_open` spawns a background thread that runs
+  `backend.read_plan(...)` and sends a `SessionOpenPlanResult` through
+  a per-work-item receiver; `poll_session_opens` drains completed
+  receivers and invokes `finish_session_open`, which builds the claude
+  command and spawns the PTY on the UI thread. `stage_system_prompt`
+  now takes the pre-read plan text as a parameter and MUST NOT call
+  `backend.read_plan(...)` itself. The receiver map is keyed by
+  `WorkItemId` so parallel session opens for different items cannot
+  collide.
 
 #### Streaming progress variant
 

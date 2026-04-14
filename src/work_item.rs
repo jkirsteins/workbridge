@@ -310,8 +310,15 @@ pub struct SessionEntry {
 /// to the main thread for assembly.
 pub struct RepoFetchResult {
     pub repo_path: PathBuf,
-    /// Read by fetcher tests; retained for stale-data indicators.
-    #[allow(dead_code)]
+    /// `(owner, repo)` pair parsed from the `origin` remote URL. Populated
+    /// by the background fetcher so UI-thread code that needs the remote
+    /// (`spawn_pr_creation`, `execute_merge`, `enter_mergequeue`,
+    /// `spawn_review_submission`, `collect_backfill_requests`,
+    /// `reconstruct_mergequeue_watches`) can read from the cache instead of
+    /// calling `WorktreeService::github_remote` (which shells out to
+    /// `git remote get-url`). Also used by fetcher tests to assert the
+    /// populated value. `None` means the repo has no GitHub remote (or
+    /// the fetcher has not finished its first cycle yet).
     pub github_remote: Option<(String, String)>,
     pub worktrees: Result<Vec<WorktreeInfo>, WorktreeError>,
     pub prs: Result<Vec<GithubPr>, GithubError>,
