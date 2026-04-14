@@ -728,21 +728,50 @@ viewport, a "sticky" copy of that header is rendered at the top of the
 list's inner area. This ensures the user always knows which group the
 currently visible items belong to.
 
-The sticky header is rendered as a `Paragraph` widget overlay after the
-`List` widget has already rendered, overwriting the first row of the
-inner area. It uses a DarkGray background (`style_sticky_header()` /
-`style_sticky_header_blocked()`) to visually separate it from the
-highlighted item below, which uses a Cyan background.
+The sticky header uses a dedicated reserved row, not an overlay. In
+`draw_work_item_list` the left-panel `Block` is rendered into `area`
+first, then the inner area is split: if the frame is predicted to need
+a sticky header, the first row of the inner area is reserved as a
+sticky slot (1 row) and the `List` widget is rendered into a
+`body_area` that starts one row below. The sticky row itself is drawn
+as a `Paragraph` into the reserved slot. This guarantees that the
+topmost visible work item (including the selected item) is never
+painted over by the sticky header, fixing the overlap bug where the
+selected item's first wrapped line was clobbered.
+
+The "will a sticky fire this frame?" decision is made before rendering
+by `predict_list_offset()`, a faithful mirror of
+`ratatui_widgets::list::List::get_items_bounds` for the default
+`scroll_padding = 0` case. The predictor runs twice when necessary:
+first with the full `inner.height` to see if the sticky would fire,
+then (if yes) with `inner.height - 1` so that ratatui's internal
+scroll math already accounts for the slot we are about to reserve. The
+predictor is covered by parallel-render tests in
+`mod sticky_header_tests` that compare its output to a real `List`
+rendered into a `TestBackend`, so any future drift with ratatui is
+caught immediately.
+
+The sticky row uses a DarkGray background
+(`style_sticky_header()` / `style_sticky_header_blocked()`) to visually
+separate it from the highlighted item below, which uses a Cyan
+background.
 
 Behavior:
-- Only active in flat list mode (not board drill-down, which has no
-  group headers)
+- Only active in flat list mode. Board drill-down never reserves the
+  slot because the drill-down display list has no group headers.
 - Shows the most recent `GroupHeader` that precedes the current scroll
   offset
 - Disappears automatically when the original header scrolls back into
   view (i.e., the user scrolls up past it)
-- Does not affect scrollbar position or item selection
-- Overlays the first visible row - does not insert an extra row
+- Does not affect item selection. The scrollbar track follows the
+  `body_area` height (not the full inner) so the thumb represents the
+  list body, not the slot.
+- Reserves a dedicated 1-row slot when a sticky is predicted to fire.
+  In the rare edge case where selection jumps between frames and the
+  post-render offset disagrees with the prediction, we accept a
+  one-frame visual glitch (blank slot or briefly missing sticky) and
+  the next frame reserves correctly. `debug_assert!` fires in debug
+  builds so the mismatch is caught in development.
 
 The header lookup is performed by `find_current_group_header()` in
 `ui.rs`, which walks backwards from the scroll offset to find the
