@@ -125,6 +125,25 @@ impl WorkItemStatus {
             Self::Done => "[DN]",
         }
     }
+
+    /// Workflow-order rank for sorting within a display group.
+    ///
+    /// Lower values sort first: Planning (0) -> Implementing (1) ->
+    /// Review (2) -> Mergequeue (3). Other stages return a high value
+    /// so they never displace PL/IM/RV/MQ inside the ACTIVE bucket.
+    /// Ties are broken by the caller's existing order (stable sort).
+    pub fn active_group_rank(&self) -> u8 {
+        match self {
+            Self::Planning => 0,
+            Self::Implementing => 1,
+            Self::Review => 2,
+            Self::Mergequeue => 3,
+            // Blocked, Backlog, Done don't appear in the ACTIVE bucket
+            // but we give them a deterministic high rank for defensive
+            // robustness if the caller ever mixes buckets.
+            _ => u8::MAX,
+        }
+    }
 }
 
 /// A fully assembled work item with backend data and derived metadata.
