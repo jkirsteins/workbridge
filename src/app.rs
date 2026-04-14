@@ -5192,22 +5192,13 @@ impl App {
     /// Determine the repo to use for a quick-start work item.
     ///
     /// Strategy:
-    /// 1. CWD resolved to a managed repo root - use it.
-    /// 2. Exactly one managed repo with a git directory - use it.
-    /// 3. Multiple repos and CWD doesn't resolve - return "MULTIPLE_REPOS".
-    /// 4. No repos at all - return an error message.
+    /// 1. Exactly one managed repo with a git directory - use it.
+    /// 2. Multiple repos - return "MULTIPLE_REPOS" so the caller opens the
+    ///    creation dialog with the repo picker focused. CWD is deliberately
+    ///    not consulted: when there is a real choice to make, the user should
+    ///    pick explicitly every time.
+    /// 3. No repos at all - return an error message.
     fn resolve_quickstart_repo(&self) -> Result<PathBuf, String> {
-        if let Some(repo) = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| self.managed_repo_root(&cwd))
-            && self
-                .active_repo_cache
-                .iter()
-                .any(|r| r.path == repo && r.git_dir_present)
-        {
-            return Ok(repo);
-        }
-
         let git_repos: Vec<&PathBuf> = self
             .active_repo_cache
             .iter()
