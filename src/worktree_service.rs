@@ -459,17 +459,11 @@ impl WorktreeService for GitWorktreeService {
             .default_branch(repo_path)
             .unwrap_or_else(|_| "HEAD".to_string());
 
-        // Refuse to branch when the repo has uncommitted changes (staged
-        // or unstaged) or untracked files.  A dirty working tree means the
-        // base branch does not match its committed state, so any branch
-        // created from it would start from an ambiguous point.
-        let status_output = Self::run_git(repo_path, &["status", "--porcelain"])?;
-        if !status_output.trim().is_empty() {
-            return Err(WorktreeError::GitError(format!(
-                "cannot create branch '{branch}': repo has uncommitted changes"
-            )));
-        }
-
+        // `git branch` is a pure ref operation: it writes a single file
+        // under `.git/refs/heads/<name>` pointing at the commit `base`
+        // resolves to. It never reads the working tree, so the main repo's
+        // dirty state is irrelevant here. See commit 9b25497 for the
+        // historical false-positive check that used to live here.
         Self::run_git(repo_path, &["branch", branch, &base])?;
         Ok(())
     }
@@ -1157,57 +1151,6 @@ mod integration_tests {
             &["rev-parse", "--verify", "refs/heads/existing-branch"],
         );
         assert!(check.is_ok(), "branch should still exist");
-    }
-
-    #[test]
-    fn create_branch_rejects_dirty_repo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_dir = tmp.path().join("repo");
-        fs::create_dir_all(&repo_dir).unwrap();
-        setup_git_repo(&repo_dir);
-
-        // Leave an unstaged modification in the working tree.
-        fs::write(repo_dir.join("README"), "dirty").unwrap();
-
-        let svc = GitWorktreeService;
-        let result = svc.create_branch(&repo_dir, "my-feature");
-        assert!(
-            result.is_err(),
-            "create_branch should fail when repo is dirty",
-        );
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("uncommitted changes"),
-            "error should mention uncommitted changes, got: {err_msg}",
-        );
-
-        // Branch should not have been created.
-        let check = GitWorktreeService::run_git(
-            &repo_dir,
-            &["rev-parse", "--verify", "refs/heads/my-feature"],
-        );
-        assert!(
-            check.is_err(),
-            "branch should not exist after dirty-state rejection",
-        );
-    }
-
-    #[test]
-    fn create_branch_rejects_untracked_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_dir = tmp.path().join("repo");
-        fs::create_dir_all(&repo_dir).unwrap();
-        setup_git_repo(&repo_dir);
-
-        // Add an untracked file.
-        fs::write(repo_dir.join("stray.txt"), "stray").unwrap();
-
-        let svc = GitWorktreeService;
-        let result = svc.create_branch(&repo_dir, "my-feature");
-        assert!(
-            result.is_err(),
-            "create_branch should fail with untracked files",
-        );
     }
 
     #[test]
