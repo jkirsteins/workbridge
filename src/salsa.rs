@@ -199,8 +199,16 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
     // Backfill PR identity for Done items that were merged before
     // persistence was added. One-time startup migration - can be removed
     // once no Done items with pr_identity=None remain on disk.
+    //
+    // System-initiated startup work (no dialog is open), so per
+    // `docs/UI.md` "Activity indicator placement" the user is owed a
+    // status-bar spinner. The activity ID lives directly on `App` (the
+    // backfill is a singleton) and `drain_pr_identity_backfill` ends it
+    // on the Disconnected branch.
     let backfill_requests = state.collect_backfill_requests();
     if !backfill_requests.is_empty() {
+        state.pr_identity_backfill_activity =
+            Some(state.start_activity("Backfilling merged PR identities..."));
         let gc = Arc::clone(&ctx.github_client);
         let (tx, rx) = crossbeam_channel::unbounded();
         std::thread::spawn(move || {
@@ -422,9 +430,11 @@ pub fn app_event(
                 // Poll async MCP-triggered delete cleanup result.
                 state.poll_delete_cleanup();
 
-                // Drain any warnings from fire-and-forget orphan
-                // worktree cleanups (delete-during-create races).
-                state.poll_orphan_cleanup_warnings();
+                // Drain completion messages from fire-and-forget orphan
+                // worktree cleanups (delete-during-create races): ends
+                // each spawn's status-bar activity and surfaces any
+                // warnings.
+                state.poll_orphan_cleanup_finished();
 
                 // Surface queued fetch errors.
                 state.drain_pending_fetch_errors();

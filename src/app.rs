@@ -199,6 +199,15 @@ pub struct ReviewGateState {
     pub rx: crossbeam_channel::Receiver<ReviewGateMessage>,
     pub progress: Option<String>,
     pub origin: ReviewGateOrigin,
+    /// Status-bar activity ID for the "Running review gate..." spinner
+    /// started in `spawn_review_gate`. The review gate is a
+    /// system-initiated long-running operation (no blocking dialog is
+    /// open) so per `docs/UI.md` "Activity indicator placement" it owes
+    /// the user a status-bar spinner. Ownership lives inside
+    /// `ReviewGateState` so that every drop site (delete, retreat, all
+    /// terminal arms of `poll_review_gate`, shutdown) can route through
+    /// `drop_review_gate` and end the activity in one place.
+    pub activity: ActivityId,
 }
 
 /// A single CI check as returned by `gh pr checks --json name,bucket`.
@@ -311,6 +320,20 @@ pub struct PrIdentityBackfillResult {
     pub wi_id: WorkItemId,
     pub repo_path: PathBuf,
     pub identity: PrIdentityRecord,
+}
+
+/// One completion message per `spawn_orphan_worktree_cleanup` thread.
+/// Always sent exactly once when the background closure finishes -
+/// success or failure. Carries the `ActivityId` so the main thread can
+/// end the matching status-bar spinner, and any warnings so they can
+/// be surfaced via `status_message`. Per `docs/UI.md` "Activity
+/// indicator placement", the orphan cleanup is system-initiated
+/// fire-and-forget background work and therefore owes the user a
+/// status-bar spinner; the per-spawn `ActivityId` is the structural
+/// owner of that spinner.
+pub struct OrphanCleanupFinished {
+    pub activity: ActivityId,
+    pub warnings: Vec<String>,
 }
 
 /// Result from the asynchronous unlinked-item cleanup thread.
@@ -700,6 +723,13 @@ pub struct App {
     /// Receiver for background PR identity backfill results (one-time startup).
     pub pr_identity_backfill_rx:
         Option<crossbeam_channel::Receiver<Result<PrIdentityBackfillResult, String>>>,
+    /// Status-bar activity ID for the PR identity backfill spawned in
+    /// `app_init` (see `salsa.rs`). Kept on `App` so
+    /// `drain_pr_identity_backfill` can end it when the background thread
+    /// finishes. Following the `docs/UI.md` "Activity indicator placement"
+    /// rule: this is a system-initiated startup migration and therefore
+    /// owes the user a status-bar spinner (not a blocking dialog).
+    pub pr_identity_backfill_activity: Option<ActivityId>,
 
     // -- Async worktree creation --
     /// Receiver for asynchronous worktree creation results.
@@ -723,15 +753,15 @@ pub struct App {
     /// a background thread; this map is how the result flows back.
     pub session_open_rx: HashMap<WorkItemId, SessionOpenPending>,
 
-    /// Sender for warnings emitted by `spawn_orphan_worktree_cleanup`
-    /// background threads. Cloned into each spawned closure so the
-    /// fire-and-forget cleanup can still surface failures (failed
-    /// `git worktree remove` / `git branch -D`) to the user instead of
-    /// silently leaking. Drained by `poll_orphan_cleanup_warnings` on
-    /// each background tick.
-    pub orphan_cleanup_warnings_tx: crossbeam_channel::Sender<String>,
-    /// Receiver paired with `orphan_cleanup_warnings_tx`.
-    pub orphan_cleanup_warnings_rx: crossbeam_channel::Receiver<String>,
+    /// Sender for completion messages from `spawn_orphan_worktree_cleanup`
+    /// background threads. Cloned into each spawned closure. The closure
+    /// always sends exactly one `OrphanCleanupFinished` when it finishes
+    /// (success or failure), so `poll_orphan_cleanup_finished` can both
+    /// surface any warnings AND end the matching status-bar activity.
+    /// Drained by `poll_orphan_cleanup_finished` on each background tick.
+    pub orphan_cleanup_finished_tx: crossbeam_channel::Sender<OrphanCleanupFinished>,
+    /// Receiver paired with `orphan_cleanup_finished_tx`.
+    pub orphan_cleanup_finished_rx: crossbeam_channel::Receiver<OrphanCleanupFinished>,
 
     /// Whether the global assistant drawer is open.
     pub global_drawer_open: bool,
@@ -822,7 +852,7 @@ impl App {
     ) -> Self {
         let active_repo_cache = canonicalize_repo_entries(config.active_repos());
         let (mcp_tx, mcp_rx) = crossbeam_channel::unbounded();
-        let (orphan_cleanup_warnings_tx, orphan_cleanup_warnings_rx) =
+        let (orphan_cleanup_finished_tx, orphan_cleanup_finished_rx) =
             crossbeam_channel::unbounded();
         let mut app = Self {
             pr_closer: crate::pr_service::default_pr_closer(),
@@ -927,12 +957,13 @@ impl App {
             mergequeue_polls: HashMap::new(),
             mergequeue_poll_errors: HashMap::new(),
             pr_identity_backfill_rx: None,
+            pr_identity_backfill_activity: None,
             worktree_create_rx: None,
             worktree_create_activity: None,
             worktree_create_wi: None,
             session_open_rx: HashMap::new(),
-            orphan_cleanup_warnings_tx,
-            orphan_cleanup_warnings_rx,
+            orphan_cleanup_finished_tx,
+            orphan_cleanup_finished_rx,
             global_drawer_open: false,
             global_session: None,
             global_mcp_server: None,
@@ -1359,8 +1390,16 @@ impl App {
             }
             entry.alive = false;
         }
-        // Cancel all in-flight review gates.
-        self.review_gates.clear();
+        // Cancel all in-flight review gates. Route through
+        // `drop_review_gate` for each entry so the matching status-bar
+        // activity is ended; otherwise force-quit would leak the
+        // spinner state on the way out (cosmetic in the moments before
+        // exit, but the helper exists precisely so no remove site can
+        // skip activity teardown).
+        let gate_keys: Vec<WorkItemId> = self.review_gates.keys().cloned().collect();
+        for key in gate_keys {
+            self.drop_review_gate(&key);
+        }
         if let Some(ref mut entry) = self.global_session {
             if let Some(ref mut session) = entry.session {
                 session.force_kill();
@@ -1957,7 +1996,7 @@ impl App {
             self.merge_wi_id = None;
             self.confirm_merge = false;
         }
-        self.review_gates.remove(wi_id);
+        self.drop_review_gate(wi_id);
         if self
             .branch_gone_prompt
             .as_ref()
@@ -2341,24 +2380,35 @@ impl App {
     /// user may have confirmed the delete modal minutes ago. A
     /// dedicated background thread runs `git worktree remove --force`
     /// followed by `git branch -D` (when a branch name is available)
-    /// off the UI thread; failures are forwarded through
-    /// `orphan_cleanup_warnings_tx` so `poll_orphan_cleanup_warnings`
-    /// can surface them in the status bar. Deleting the branch here
-    /// matches the behaviour of the Phase 5 orphan path routed through
-    /// `spawn_delete_cleanup`, so a delete-during-create race never
-    /// leaks a branch ref regardless of which of the two orphan paths
-    /// fires.
+    /// off the UI thread.
+    ///
+    /// Per `docs/UI.md` "Activity indicator placement", this is
+    /// system-initiated background work and therefore owes the user a
+    /// status-bar spinner. We start an activity here, hand the
+    /// `ActivityId` to the closure, and the closure sends exactly one
+    /// `OrphanCleanupFinished` message on completion (success or
+    /// failure) carrying the activity ID and any warnings.
+    /// `poll_orphan_cleanup_finished` ends the activity and surfaces
+    /// the warnings. Deleting the branch here matches the behaviour of
+    /// the Phase 5 orphan path routed through `spawn_delete_cleanup`,
+    /// so a delete-during-create race never leaks a branch ref
+    /// regardless of which of the two orphan paths fires.
     fn spawn_orphan_worktree_cleanup(
-        &self,
+        &mut self,
         repo_path: PathBuf,
         worktree_path: PathBuf,
         branch: Option<String>,
     ) {
+        let activity = self.start_activity(format!(
+            "Cleaning up orphan worktree {}",
+            worktree_path.display()
+        ));
         let ws = Arc::clone(&self.worktree_service);
-        let warnings_tx = self.orphan_cleanup_warnings_tx.clone();
+        let finished_tx = self.orphan_cleanup_finished_tx.clone();
         std::thread::spawn(move || {
+            let mut warnings: Vec<String> = Vec::new();
             if let Err(e) = ws.remove_worktree(&repo_path, &worktree_path, true, true) {
-                let _ = warnings_tx.send(format!(
+                warnings.push(format!(
                     "Orphan worktree cleanup failed for {}: {e}",
                     worktree_path.display()
                 ));
@@ -2366,23 +2416,34 @@ impl App {
             if let Some(ref branch) = branch
                 && let Err(e) = ws.delete_branch(&repo_path, branch, true)
             {
-                let _ = warnings_tx.send(format!(
+                warnings.push(format!(
                     "Orphan branch cleanup failed for {branch} in {}: {e}",
                     repo_path.display()
                 ));
             }
+            // Always send exactly one completion message so the main
+            // thread can end the matching status-bar activity even on
+            // the success path. If the receiver has been dropped
+            // (`App` torn down mid-cleanup) we silently discard - the
+            // activity disappears with the App.
+            let _ = finished_tx.send(OrphanCleanupFinished { activity, warnings });
         });
     }
 
-    /// Drain any pending warnings from `spawn_orphan_worktree_cleanup`
-    /// background threads and surface them via `status_message`. Called
+    /// Drain pending completion messages from
+    /// `spawn_orphan_worktree_cleanup` background threads. For each
+    /// message, end the matching status-bar activity and accumulate any
+    /// warnings. If any warnings arrived, surface them as a single
+    /// `status_message` so the user notices failed cleanups instead of
+    /// silently leaking worktrees / branches. An empty channel is the
+    /// idle path - no spinner is touched and no message is set. Called
     /// from the background-work tick alongside the other `poll_*`
-    /// methods. An empty channel is the success path: every orphan
-    /// cleanup so far has completed without errors.
-    pub fn poll_orphan_cleanup_warnings(&mut self) {
+    /// methods.
+    pub fn poll_orphan_cleanup_finished(&mut self) {
         let mut warnings: Vec<String> = Vec::new();
-        while let Ok(msg) = self.orphan_cleanup_warnings_rx.try_recv() {
-            warnings.push(msg);
+        while let Ok(msg) = self.orphan_cleanup_finished_rx.try_recv() {
+            self.end_activity(msg.activity);
+            warnings.extend(msg.warnings);
         }
         if !warnings.is_empty() {
             self.status_message = Some(warnings.join(" | "));
@@ -5064,7 +5125,7 @@ impl App {
 
         // If the retreating item has a pending review gate, cancel it.
         // The gate result would be stale since the user intentionally moved away.
-        self.review_gates.remove(&wi_id);
+        self.drop_review_gate(&wi_id);
 
         // Cancel any in-flight PR merge. Merges are only spawned from Review,
         // so when retreating from Review we drop the receiver to prevent
@@ -6474,6 +6535,9 @@ impl App {
         }
         if disconnected {
             self.pr_identity_backfill_rx = None;
+            if let Some(aid) = self.pr_identity_backfill_activity.take() {
+                self.end_activity(aid);
+            }
         }
         changed
     }
@@ -6598,33 +6662,49 @@ impl App {
         }
 
         // Find the branch for this work item (pure in-memory read).
-        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
-            Some(wi) => wi,
-            None => {
-                return ReviewGateSpawn::Blocked("Work item not found".into());
-            }
+        // Clone everything off `wi`/`assoc` into owned values up-front so
+        // the immutable borrow of `self.work_items` ends before the
+        // mutable `start_activity` call below.
+        let (title, branch, repo_path, current_pr_number, current_check_status) = {
+            let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
+                Some(wi) => wi,
+                None => {
+                    return ReviewGateSpawn::Blocked("Work item not found".into());
+                }
+            };
+            let assoc = match wi.repo_associations.first() {
+                Some(a) => a,
+                None => {
+                    return ReviewGateSpawn::Blocked(
+                        "Cannot enter Review: no repo association".into(),
+                    );
+                }
+            };
+            let branch = match assoc.branch.as_ref() {
+                Some(b) => b.clone(),
+                None => {
+                    return ReviewGateSpawn::Blocked("Cannot enter Review: no branch set".into());
+                }
+            };
+            // Two-level Option semantics:
+            // - None = no cached PR data, must query fresh
+            // - Some(CheckStatus::None) = PR cached but no CI checks configured, skip
+            // - Some(other) = PR cached with CI checks, proceed to wait
+            (
+                wi.title.clone(),
+                branch,
+                assoc.repo_path.clone(),
+                assoc.pr.as_ref().map(|p| p.number),
+                assoc.pr.as_ref().map(|p| p.checks.clone()),
+            )
         };
-        let assoc = match wi.repo_associations.first() {
-            Some(a) => a,
-            None => {
-                return ReviewGateSpawn::Blocked("Cannot enter Review: no repo association".into());
-            }
-        };
-        let branch = match assoc.branch.as_ref() {
-            Some(b) => b.clone(),
-            None => {
-                return ReviewGateSpawn::Blocked("Cannot enter Review: no branch set".into());
-            }
-        };
-        let repo_path = assoc.repo_path.clone();
 
-        // Gather cached PR info for the background thread.
-        let current_pr_number = assoc.pr.as_ref().map(|p| p.number);
-        // Two-level Option semantics:
-        // - None = no cached PR data, must query fresh
-        // - Some(CheckStatus::None) = PR cached but no CI checks configured, skip
-        // - Some(other) = PR cached with CI checks, proceed to wait
-        let current_check_status = assoc.pr.as_ref().map(|p| p.checks.clone());
+        // Status-bar activity for the review gate. Per `docs/UI.md`
+        // "Activity indicator placement", review gates are
+        // system-initiated background work and must own a status-bar
+        // spinner. The ID lives on `ReviewGateState` so every drop site
+        // ends it via `drop_review_gate`.
+        let activity = self.start_activity(format!("Running review gate for '{title}'"));
         // Clone the worktree service and backend for the background thread so
         // that `default_branch()`/`github_remote()` (which shell out to git)
         // and `read_plan()` (filesystem read) execute off the main UI thread.
@@ -6986,9 +7066,22 @@ impl App {
                 rx,
                 progress: None,
                 origin,
+                activity,
             },
         );
         ReviewGateSpawn::Spawned
+    }
+
+    /// Drop a review gate and end its status-bar activity. Every site
+    /// that removes a `review_gates` entry MUST go through this helper:
+    /// the activity ID lives inside `ReviewGateState` per
+    /// structural-ownership, so dropping the gate without ending the
+    /// activity would leak a spinner. See `docs/UI.md` "Activity
+    /// indicator placement".
+    fn drop_review_gate(&mut self, wi_id: &WorkItemId) {
+        if let Some(state) = self.review_gates.remove(wi_id) {
+            self.end_activity(state.activity);
+        }
     }
 
     /// Poll all async review gates for results. Called on each timer tick.
@@ -7048,7 +7141,7 @@ impl App {
 
             if disconnected {
                 // Thread exited without sending a Result - treat as gate error.
-                self.review_gates.remove(&wi_id);
+                self.drop_review_gate(&wi_id);
                 self.status_message =
                     Some("Review gate: background thread exited unexpectedly".into());
                 continue;
@@ -7080,7 +7173,7 @@ impl App {
                     .get(&wi_id)
                     .map(|g| g.origin)
                     .unwrap_or(ReviewGateOrigin::Mcp);
-                self.review_gates.remove(&wi_id);
+                self.drop_review_gate(&wi_id);
 
                 let wi_exists = self.work_items.iter().any(|w| w.id == wi_id);
                 if !wi_exists {
@@ -7142,7 +7235,7 @@ impl App {
 
             // Gate completed - remove from map.
             debug_assert_eq!(result.work_item_id, wi_id);
-            self.review_gates.remove(&wi_id);
+            self.drop_review_gate(&wi_id);
 
             // Verify the work item is still eligible for the gate result.
             // Both Implementing and Blocked are valid pre-gate states (Blocked->Review
@@ -11512,6 +11605,29 @@ mod tests {
         app.poll_review_gate();
     }
 
+    /// Test helper: insert a manually-constructed `ReviewGateState`
+    /// after starting a status-bar activity for it. Mirrors the
+    /// behaviour of `spawn_review_gate` so the production
+    /// `drop_review_gate` invariant (always end the activity on every
+    /// drop site) is exercised by the tests.
+    fn insert_test_review_gate(
+        app: &mut App,
+        wi_id: WorkItemId,
+        rx: crossbeam_channel::Receiver<ReviewGateMessage>,
+        origin: ReviewGateOrigin,
+    ) {
+        let activity = app.start_activity("test review gate");
+        app.review_gates.insert(
+            wi_id,
+            ReviewGateState {
+                rx,
+                progress: None,
+                origin,
+                activity,
+            },
+        );
+    }
+
     fn app_with_work_item(
         status: WorkItemStatus,
         branch: Option<&str>,
@@ -11664,14 +11780,7 @@ mod tests {
             reason: "Cannot enter Review: no changes on branch".into(),
         })
         .unwrap();
-        app.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                progress: None,
-                origin: ReviewGateOrigin::Tui,
-            },
-        );
+        insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Tui);
 
         app.poll_review_gate();
 
@@ -11721,14 +11830,7 @@ mod tests {
             reason: "Cannot enter Review: no plan exists".into(),
         })
         .unwrap();
-        app.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                progress: None,
-                origin: ReviewGateOrigin::Mcp,
-            },
-        );
+        insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Mcp);
 
         app.poll_review_gate();
 
@@ -11763,14 +11865,7 @@ mod tests {
             reason: "Cannot enter Review: no plan exists".into(),
         })
         .unwrap();
-        app.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                progress: None,
-                origin: ReviewGateOrigin::Mcp,
-            },
-        );
+        insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Mcp);
 
         app.poll_review_gate();
 
@@ -11803,14 +11898,7 @@ mod tests {
             detail: "Tests are missing for the new feature".into(),
         }))
         .unwrap();
-        app.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                progress: None,
-                origin: ReviewGateOrigin::Mcp,
-            },
-        );
+        insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Mcp);
 
         app.poll_review_gate();
 
@@ -11847,14 +11935,7 @@ mod tests {
             detail: "All plan items implemented".into(),
         }))
         .unwrap();
-        app.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                progress: None,
-                origin: ReviewGateOrigin::Mcp,
-            },
-        );
+        insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Mcp);
 
         app.poll_review_gate();
 
@@ -11889,14 +11970,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(ReviewGateMessage::Progress("2 / 3 CI checks green".into()))
             .unwrap();
-        app.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                progress: None,
-                origin: ReviewGateOrigin::Mcp,
-            },
-        );
+        insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Mcp);
 
         app.poll_review_gate();
 
@@ -11933,14 +12007,7 @@ mod tests {
             detail: "Missing error handling".into(),
         }))
         .unwrap();
-        app.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                progress: None,
-                origin: ReviewGateOrigin::Mcp,
-            },
-        );
+        insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Mcp);
 
         app.poll_review_gate();
 
@@ -11970,14 +12037,7 @@ mod tests {
         ))
         .unwrap();
         drop(tx); // Simulate thread exit without sending Result.
-        app.review_gates.insert(
-            wi_id.clone(),
-            ReviewGateState {
-                rx,
-                progress: None,
-                origin: ReviewGateOrigin::Mcp,
-            },
-        );
+        insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Mcp);
 
         app.poll_review_gate();
 
@@ -12089,14 +12149,7 @@ mod tests {
 
         // Simulate gate running for item A.
         let (_dummy_tx, dummy_rx) = crossbeam_channel::unbounded();
-        app.review_gates.insert(
-            wi_id_a.clone(),
-            ReviewGateState {
-                rx: dummy_rx,
-                progress: None,
-                origin: ReviewGateOrigin::Mcp,
-            },
-        );
+        insert_test_review_gate(&mut app, wi_id_a.clone(), dummy_rx, ReviewGateOrigin::Mcp);
 
         // Send MCP StatusUpdate for item B.
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -13746,12 +13799,25 @@ mod tests {
              inside the std::thread::spawn closure",
         );
 
+        // Spawning the gate must register a status-bar activity per
+        // `docs/UI.md` "Activity indicator placement" - assert it is
+        // visible BEFORE we drop the gate so the spinner is observable
+        // in the live system, not just after teardown.
+        assert!(
+            app.current_activity().is_some(),
+            "spawn_review_gate must register a status-bar activity",
+        );
+
         // Release the gate so the background thread can proceed and
-        // drain. Removing the review gate entry drops the receiver,
-        // causing the background thread's sends to fail - it exits
-        // cleanly without outliving the test.
+        // drain. Routing through `drop_review_gate` ensures the
+        // associated activity is also ended - the same teardown path
+        // every drop site uses.
         drop(gate);
-        app.review_gates.remove(&wi_id);
+        app.drop_review_gate(&wi_id);
+        assert!(
+            app.current_activity().is_none(),
+            "drop_review_gate must end the review gate activity",
+        );
     }
 
     #[test]
@@ -14567,7 +14633,8 @@ mod tests {
 
     /// A WorktreeService whose `remove_worktree` always fails. Used to
     /// verify that `spawn_orphan_worktree_cleanup` surfaces failures
-    /// through `orphan_cleanup_warnings_tx` instead of dropping them.
+    /// through the per-spawn `OrphanCleanupFinished` completion message
+    /// instead of dropping them.
     #[cfg(test)]
     pub struct FailingRemoveWorktreeService;
 
@@ -14654,9 +14721,10 @@ mod tests {
         // Codex finding: `spawn_orphan_worktree_cleanup` previously
         // discarded `remove_worktree` and `delete_branch` errors with
         // `let _ = ...`, leaving leaked worktrees/branches with no
-        // user-visible warning. The fix routes failures through
-        // `orphan_cleanup_warnings_tx` so `poll_orphan_cleanup_warnings`
-        // can surface them in the status bar.
+        // user-visible warning. The fix routes failures through the
+        // per-spawn `OrphanCleanupFinished` completion message so
+        // `poll_orphan_cleanup_finished` can surface them in the status
+        // bar AND end the matching status-bar activity.
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
             Arc::new(StubBackend) as Arc<dyn WorkItemBackend>,
@@ -14674,27 +14742,31 @@ mod tests {
             Some("feature/codex-orphan".into()),
         );
 
-        // Wait for both warnings to land in the channel (one for
-        // remove_worktree, one for delete_branch).
+        // Spawning must register a status-bar activity per
+        // `docs/UI.md` "Activity indicator placement".
+        assert!(
+            app.current_activity().is_some(),
+            "spawn_orphan_worktree_cleanup must register a status-bar activity",
+        );
+
+        // Wait for the single completion message to land in the channel.
         let recv_start = std::time::Instant::now();
         loop {
-            // Peek without consuming: count pending messages.
-            let pending = app.orphan_cleanup_warnings_rx.len();
-            if pending >= 2 {
+            if !app.orphan_cleanup_finished_rx.is_empty() {
                 break;
             }
             if recv_start.elapsed() > std::time::Duration::from_secs(2) {
-                panic!("orphan cleanup background thread did not enqueue warnings");
+                panic!("orphan cleanup background thread did not enqueue completion message");
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        app.poll_orphan_cleanup_warnings();
+        app.poll_orphan_cleanup_finished();
 
         let msg = app
             .status_message
             .as_ref()
-            .expect("poll_orphan_cleanup_warnings must surface a status message");
+            .expect("poll_orphan_cleanup_finished must surface a status message");
         assert!(
             msg.contains("Orphan worktree cleanup failed"),
             "status message must mention the worktree failure, got: {msg}",
@@ -14707,13 +14779,17 @@ mod tests {
             msg.contains("feature/codex-orphan"),
             "status message must include the branch name, got: {msg}",
         );
+        assert!(
+            app.current_activity().is_none(),
+            "poll_orphan_cleanup_finished must end the spawned activity even on failure",
+        );
     }
 
     #[test]
-    fn poll_orphan_cleanup_warnings_is_silent_on_success() {
-        // The success path: an empty channel means every cleanup
-        // succeeded; `poll_orphan_cleanup_warnings` must NOT clobber
-        // an unrelated status message.
+    fn poll_orphan_cleanup_finished_is_silent_on_idle_channel() {
+        // The idle path: an empty channel means no cleanup has finished;
+        // `poll_orphan_cleanup_finished` must NOT clobber an unrelated
+        // status message and must NOT touch any activity.
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
             Arc::new(StubBackend) as Arc<dyn WorkItemBackend>,
@@ -14722,12 +14798,63 @@ mod tests {
         );
         app.status_message = Some("unrelated status message".into());
 
-        app.poll_orphan_cleanup_warnings();
+        app.poll_orphan_cleanup_finished();
 
         assert_eq!(
             app.status_message.as_deref(),
             Some("unrelated status message"),
-            "empty warnings channel must not clobber unrelated status messages",
+            "empty completion channel must not clobber unrelated status messages",
+        );
+    }
+
+    #[test]
+    fn spawn_orphan_worktree_cleanup_ends_activity_on_success() {
+        // Success path: the cleanup closure runs against `StubWorktreeService`
+        // (whose `remove_worktree` / `delete_branch` succeed), sends an
+        // `OrphanCleanupFinished` with no warnings, and the poll
+        // function must end the registered status-bar activity without
+        // touching `status_message`.
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(StubBackend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        app.status_message = None;
+
+        app.spawn_orphan_worktree_cleanup(
+            PathBuf::from("/tmp/orphan-success-repo"),
+            PathBuf::from("/tmp/orphan-success-repo/.worktrees/feature/orphan-success"),
+            Some("feature/orphan-success".into()),
+        );
+
+        assert!(
+            app.current_activity().is_some(),
+            "spawn_orphan_worktree_cleanup must register a status-bar activity",
+        );
+
+        // Wait for the single completion message to arrive.
+        let recv_start = std::time::Instant::now();
+        loop {
+            if !app.orphan_cleanup_finished_rx.is_empty() {
+                break;
+            }
+            if recv_start.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("orphan cleanup background thread did not enqueue completion message");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        app.poll_orphan_cleanup_finished();
+
+        assert!(
+            app.current_activity().is_none(),
+            "poll_orphan_cleanup_finished must end the spawned activity on success",
+        );
+        assert!(
+            app.status_message.is_none(),
+            "successful orphan cleanup must not set status_message, got {:?}",
+            app.status_message,
         );
     }
 
@@ -14777,6 +14904,203 @@ mod tests {
         assert!(
             !app.session_open_rx.contains_key(&wi_id),
             "pending session-open entry must be removed on cleanup",
+        );
+    }
+
+    /// Gap 1 regression: `drain_pr_identity_backfill` must end the
+    /// status-bar activity AND clear the receiver on the Disconnected
+    /// branch. The activity is started in `salsa.rs::app_init` when the
+    /// backfill request set is non-empty; the only terminal state for
+    /// that one-shot stream is sender-dropped (background thread done),
+    /// so `drain_pr_identity_backfill` is the sole place the activity
+    /// can be ended without leaking a spinner.
+    #[test]
+    fn drain_pr_identity_backfill_ends_activity_on_disconnect() {
+        let mut app = App::new();
+
+        // Manually wire a disconnected channel + a registered activity:
+        // create the channel, drop the tx half so the next try_recv
+        // returns Disconnected, store the rx on App and start the
+        // matching status-bar activity.
+        let (tx, rx) =
+            crossbeam_channel::unbounded::<Result<crate::app::PrIdentityBackfillResult, String>>();
+        drop(tx);
+        app.pr_identity_backfill_rx = Some(rx);
+        let aid = app.start_activity("Backfilling merged PR identities...");
+        app.pr_identity_backfill_activity = Some(aid);
+
+        let changed = app.drain_pr_identity_backfill();
+
+        assert!(
+            !changed,
+            "no Ok messages were sent so changed must be false",
+        );
+        assert!(
+            app.pr_identity_backfill_rx.is_none(),
+            "Disconnected branch must drop the receiver",
+        );
+        assert!(
+            app.pr_identity_backfill_activity.is_none(),
+            "Disconnected branch must take the ActivityId",
+        );
+        assert!(
+            app.current_activity().is_none(),
+            "drain_pr_identity_backfill must end the status-bar activity \
+             on Disconnected so the spinner does not leak",
+        );
+    }
+
+    /// Gap 3 regression: the disconnected arm of `poll_review_gate`
+    /// must end the review gate's status-bar activity. Routing through
+    /// `drop_review_gate` is the structural guarantee.
+    #[test]
+    fn poll_review_gate_disconnect_ends_status_bar_activity() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        // Drop the tx half so the next try_recv yields Disconnected.
+        let (tx, rx) = crossbeam_channel::unbounded::<ReviewGateMessage>();
+        drop(tx);
+        insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Mcp);
+
+        assert!(
+            app.current_activity().is_some(),
+            "test gate must register an activity to begin with",
+        );
+
+        app.poll_review_gate();
+
+        assert!(
+            !app.review_gates.contains_key(&wi_id),
+            "Disconnected gate must be dropped",
+        );
+        assert!(
+            app.current_activity().is_none(),
+            "Disconnected arm of poll_review_gate must end the gate activity",
+        );
+    }
+
+    /// Gap 3 regression: the Blocked arm of `poll_review_gate` must
+    /// end the review gate's status-bar activity. Use a Tui origin so
+    /// the test does not need a live session map - the Tui branch only
+    /// surfaces the reason and drops the gate, which is exactly what
+    /// the test wants to observe.
+    #[test]
+    fn poll_review_gate_blocked_ends_status_bar_activity() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ReviewGateMessage::Blocked {
+            work_item_id: wi_id.clone(),
+            reason: "Cannot enter Review: no plan exists".into(),
+        })
+        .unwrap();
+        insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Tui);
+
+        assert!(app.current_activity().is_some());
+
+        app.poll_review_gate();
+
+        assert!(
+            !app.review_gates.contains_key(&wi_id),
+            "Blocked gate must be dropped",
+        );
+        assert!(
+            app.current_activity().is_none(),
+            "Blocked arm of poll_review_gate must end the gate activity",
+        );
+    }
+
+    /// Gap 3 regression: the Result arm of `poll_review_gate` must
+    /// end the review gate's status-bar activity, both for the approve
+    /// path and the reject path.
+    ///
+    /// The reject path additionally kills and respawns the session,
+    /// which starts its own "Opening session..." activity - so we
+    /// cannot assert that `current_activity()` is None after polling.
+    /// Instead, we capture the gate's ActivityId before polling and
+    /// verify that exact ID is no longer in `app.activities`.
+    #[test]
+    fn poll_review_gate_result_ends_status_bar_activity_reject() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ReviewGateMessage::Result(ReviewGateResult {
+            work_item_id: wi_id.clone(),
+            approved: false,
+            detail: "missing tests".into(),
+        }))
+        .unwrap();
+        insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Mcp);
+
+        let gate_aid = app
+            .review_gates
+            .get(&wi_id)
+            .map(|g| g.activity)
+            .expect("inserted gate must expose its ActivityId");
+
+        app.poll_review_gate();
+
+        assert!(
+            !app.review_gates.contains_key(&wi_id),
+            "Result gate must be dropped",
+        );
+        assert!(
+            !app.activities.iter().any(|a| a.id == gate_aid),
+            "Result arm of poll_review_gate must end the gate's specific \
+             ActivityId via drop_review_gate",
+        );
+    }
+
+    /// Gap 3 regression: same property on the approve path. The
+    /// approve path advances the work item to Review and spawns a
+    /// session for the new stage, so other activities may exist
+    /// afterwards - we assert only that the gate's specific ID is
+    /// gone.
+    #[test]
+    fn poll_review_gate_result_ends_status_bar_activity_approve() {
+        let (mut app, wi_id) = app_with_work_item(
+            WorkItemStatus::Implementing,
+            Some("feature/test"),
+            Some("/tmp/repo"),
+        );
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ReviewGateMessage::Result(ReviewGateResult {
+            work_item_id: wi_id.clone(),
+            approved: true,
+            detail: "looks good".into(),
+        }))
+        .unwrap();
+        insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Mcp);
+
+        let gate_aid = app
+            .review_gates
+            .get(&wi_id)
+            .map(|g| g.activity)
+            .expect("inserted gate must expose its ActivityId");
+
+        app.poll_review_gate();
+
+        assert!(
+            !app.review_gates.contains_key(&wi_id),
+            "Result gate must be dropped",
+        );
+        assert!(
+            !app.activities.iter().any(|a| a.id == gate_aid),
+            "Result arm of poll_review_gate must end the gate's specific \
+             ActivityId via drop_review_gate",
         );
     }
 }

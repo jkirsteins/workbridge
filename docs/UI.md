@@ -398,20 +398,56 @@ app.alert_message = Some(format!("Operation failed: {e}"));
 
 ### Activity indicator placement
 
-Activity indicators follow a strict ownership rule based on who
-initiated the action:
+Background operations have exactly two valid progress-feedback idioms.
+Every long-running background op owes the user one of these - never
+neither, never both.
 
-**User-initiated actions from a dialog** must show progress inline in
-that dialog. The dialog stays open with a spinner until the operation
-completes. The user triggered the action and is watching the dialog -
-progress and errors must appear where they are looking. Never close the
-dialog and move feedback to the status bar; that disconnects the result
-from the action.
+1. **Blocking dialog with inline spinner** - for operations initiated
+   from an already-open dialog. The dialog stays open with a spinner
+   until the operation completes. The user triggered the action and
+   is watching the dialog - progress and errors must appear where they
+   are looking. Never close the dialog and move feedback to the status
+   bar; that disconnects the result from the action. Examples: the
+   delete modal, the merge strategy modal, the unlinked-PR cleanup
+   modal.
+2. **Status-bar activity** - for operations initiated outside any
+   dialog: system-initiated startup work, automatic transitions, and
+   user presses that don't open a dialog. Use `start_activity(...)`
+   and end the returned `ActivityId` on every terminal path of the
+   operation's poll function. The `ActivityId` must always be
+   reachable from a stable owner so every drop site can route through
+   one helper and end the spinner in exactly one place. Three valid
+   forms of structural ownership:
+   - **Per-owner state struct** for long-lived operations keyed by
+     a work item or session (e.g. `ReviewGateState.activity`,
+     `SessionOpenPending.activity`, `MergequeuePollState.activity`).
+   - **Closure-captured + completion message** for fire-and-forget
+     spawns with no persistent state (e.g. the `activity` field on
+     `OrphanCleanupFinished`, which the worker thread captures and
+     echoes back in its one-shot completion message).
+   - **Singleton `App` field** for one-shot app-wide migrations
+     where exactly one is ever in flight (e.g.
+     `App.pr_identity_backfill_activity` for the startup PR identity
+     backfill).
+   Examples: the background fetcher, PR creation, mergequeue polling,
+   review submission, session-open plan read, the review gate, the
+   one-time PR identity backfill migration, the orphan worktree
+   cleanup.
 
-**System-initiated actions** (triggered by Claude, periodic background
-fetches, or automatic transitions) belong in the status bar. The user
-did not explicitly trigger these, so a non-blocking global indicator is
-appropriate.
+The "Session Activity Indicators" described later in this document
+(the left-panel list badges that reflect whether a session is alive
+and whether Claude has signalled active work via MCP) are a
+**complementary** per-item view, NOT a substitute for one of the two
+primary idioms. Every background operation still owes a dialog
+spinner OR a status-bar activity regardless of whether an item badge
+also exists.
+
+The structural-ownership rule applies without exception across all
+three forms above: the `ActivityId` must always be reachable from the
+owning state struct, completion message, or singleton `App` field -
+never a free-floating `Option<ActivityId>` sitting next to an
+`Option<Receiver>` that requires manual correlation to find its
+matching drop site.
 
 Pattern for user-initiated dialog operations:
 
