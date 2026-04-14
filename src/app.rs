@@ -40,6 +40,39 @@ pub enum RightPanelTab {
 pub enum ViewMode {
     FlatList,
     Board,
+    Dashboard,
+}
+
+/// Rolling window selection for the metrics Dashboard view. Each value maps
+/// to a key in the header: 1=Week, 2=Month, 3=Quarter, 4=Year.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DashboardWindow {
+    Week,
+    Month,
+    Quarter,
+    Year,
+}
+
+impl DashboardWindow {
+    /// Number of days the window covers (inclusive of today).
+    pub fn days(self) -> i64 {
+        match self {
+            Self::Week => 7,
+            Self::Month => 30,
+            Self::Quarter => 90,
+            Self::Year => 365,
+        }
+    }
+
+    /// Short label shown in the header strip.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Week => "7d",
+            Self::Month => "30d",
+            Self::Quarter => "90d",
+            Self::Year => "365d",
+        }
+    }
 }
 
 /// Cursor state for the board view.
@@ -613,6 +646,17 @@ pub struct App {
     pub board_drill_down: bool,
     /// The stage being drilled into (for filtering the left panel).
     pub board_drill_stage: Option<WorkItemStatus>,
+    /// Rolling time window currently selected in the Dashboard view.
+    /// Not persisted to disk; resets to Month on each launch.
+    pub dashboard_window: DashboardWindow,
+    /// Latest metrics snapshot produced by the background aggregator. None
+    /// on startup until the first aggregation completes. The Dashboard
+    /// renders a "computing..." placeholder while None.
+    pub metrics_snapshot: Option<crate::metrics::MetricsSnapshot>,
+    /// Receiver for fresh `MetricsSnapshot` values from the background
+    /// metrics aggregator thread. Polled (non-blocking `try_recv`) from
+    /// the UI timer tick. See `docs/UI.md` "Blocking I/O Prohibition".
+    pub metrics_rx: Option<crossbeam_channel::Receiver<crate::metrics::MetricsSnapshot>>,
     /// Set when manage/unmanage changes active repos. The main loop checks
     /// this flag and restarts the background fetcher with the updated repo
     /// list so newly managed repos get fetched and removed repos stop.
@@ -926,6 +970,9 @@ impl App {
                 row: None,
             },
             board_drill_down: false,
+            dashboard_window: DashboardWindow::Month,
+            metrics_snapshot: None,
+            metrics_rx: None,
             board_drill_stage: None,
             fetcher_repos_changed: false,
             selected_work_item: None,
@@ -2150,6 +2197,34 @@ impl App {
     }
 
     /// Poll the async unlinked-item cleanup thread for a result. Called on each timer tick.
+    /// Drain the metrics channel, keeping only the latest snapshot. Called
+    /// from the salsa timer tick. Non-blocking; never touches disk. The
+    /// background thread produces a fresh snapshot every ~60s, so multiple
+    /// pending values are rare but the drain-to-latest pattern keeps the
+    /// dashboard truthful even if the consumer briefly lags.
+    pub fn poll_metrics_snapshot(&mut self) {
+        let Some(rx) = self.metrics_rx.as_ref() else {
+            return;
+        };
+        let mut latest: Option<crate::metrics::MetricsSnapshot> = None;
+        loop {
+            match rx.try_recv() {
+                Ok(snap) => latest = Some(snap),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // The aggregator thread has exited - drop the receiver
+                    // so we stop polling. The dashboard will keep showing
+                    // the last snapshot we received.
+                    self.metrics_rx = None;
+                    break;
+                }
+            }
+        }
+        if let Some(snap) = latest {
+            self.metrics_snapshot = Some(snap);
+        }
+    }
+
     pub fn poll_unlinked_cleanup(&mut self) {
         let rx = match self.cleanup_rx.as_ref() {
             Some(rx) => rx,
@@ -2982,7 +3057,9 @@ impl App {
         self.selected_work_item = self.board_selected_work_item_id();
     }
 
-    /// Toggle between flat list and board view, syncing cursor state.
+    /// Cycle view mode: FlatList -> Board -> Dashboard -> FlatList. Also
+    /// syncs cursor state when leaving Board mode so the FlatList cursor
+    /// stays on the selected work item.
     pub fn toggle_view_mode(&mut self) {
         match self.view_mode {
             ViewMode::FlatList => {
@@ -2990,10 +3067,15 @@ impl App {
                 self.sync_board_cursor();
             }
             ViewMode::Board => {
-                self.view_mode = ViewMode::FlatList;
+                self.view_mode = ViewMode::Dashboard;
                 self.board_drill_down = false;
                 self.board_drill_stage = None;
-                // Sync flat list selection from board cursor.
+            }
+            ViewMode::Dashboard => {
+                self.view_mode = ViewMode::FlatList;
+                // Sync flat list selection from whichever work item is
+                // currently selected, so the cursor lands on it when we
+                // land back in the list view.
                 if let Some(ref target_id) = self.selected_work_item {
                     for (i, entry) in self.display_list.iter().enumerate() {
                         if let DisplayEntry::WorkItemEntry(wi_idx) = entry
@@ -3362,14 +3444,14 @@ impl App {
             .work_items
             .iter()
             .find(|w| w.id == *work_item_id)
-            .map(|w| w.status.clone())
+            .map(|w| w.status)
         else {
             return;
         };
 
         // Start MCP socket server for this session.
         let mcp_result = self.start_mcp_for_session(cwd, work_item_id);
-        let session_key = (work_item_id.clone(), work_item_status.clone());
+        let session_key = (work_item_id.clone(), work_item_status);
         let has_gate_findings = self.review_gate_findings.contains_key(work_item_id);
         let system_prompt = self.stage_system_prompt(work_item_id, cwd, plan_text);
         let mut cmd = Self::build_claude_cmd(
@@ -3674,7 +3756,7 @@ impl App {
         // repo, defaults to false (fall through to the "no plan" prompt).
         let repo_path_owned = wi.repo_associations.first().map(|a| a.repo_path.clone());
         let branch_owned = wi.repo_associations.first().and_then(|a| a.branch.clone());
-        let status = wi.status.clone();
+        let status = wi.status;
         let description = wi.description.clone();
         let has_branch_commits = match (repo_path_owned.as_ref(), branch_owned.as_deref()) {
             (Some(rp), Some(branch)) => self.branch_has_commits(rp, branch),
@@ -3966,7 +4048,7 @@ impl App {
                         continue;
                     }
 
-                    let current_status = wi_ref.map(|w| w.status.clone());
+                    let current_status = wi_ref.map(|w| w.status);
 
                     // Restrict MCP to valid forward transitions only.
                     // Allowed: Implementing -> Review (via gate), Implementing -> Blocked,
@@ -4001,7 +4083,7 @@ impl App {
                         && reason.contains("No implementation plan")
                     {
                         // Apply the block first so the item is in Blocked state.
-                        let current = current_status.clone().unwrap();
+                        let current = current_status.unwrap();
                         self.apply_stage_change(&wi_id, &current, &new_status, "mcp");
 
                         // Enqueue for the no-plan prompt (skip duplicates).
@@ -5047,7 +5129,7 @@ impl App {
             self.status_message = Some("Use approve/request-changes in the Claude session".into());
             return;
         }
-        let current_status = wi.status.clone();
+        let current_status = wi.status;
         let Some(new_status) = current_status.next_stage() else {
             self.status_message = Some("Already at final stage".into());
             return;
@@ -5117,7 +5199,7 @@ impl App {
             self.status_message = Some("Review request items cannot be retreated".into());
             return;
         }
-        let current_status = wi.status.clone();
+        let current_status = wi.status;
         let Some(new_status) = current_status.prev_stage() else {
             self.status_message = Some("Already at first stage".into());
             return;
@@ -5252,7 +5334,7 @@ impl App {
             self.status_message = Some(format!("Activity log error: {e}"));
         }
 
-        if let Err(e) = self.backend.update_status(wi_id, new_status.clone()) {
+        if let Err(e) = self.backend.update_status(wi_id, *new_status) {
             self.status_message = Some(format!("Stage update error: {e}"));
             return;
         }
@@ -5796,7 +5878,7 @@ impl App {
             .work_items
             .iter()
             .find(|w| w.id == result.wi_id)
-            .map(|w| w.status.clone());
+            .map(|w| w.status);
 
         match result.outcome {
             PrMergeOutcome::NoPr => {
@@ -6173,7 +6255,7 @@ impl App {
                 .work_items
                 .iter()
                 .find(|w| w.id == result.wi_id)
-                .map(|w| w.status.clone());
+                .map(|w| w.status);
 
             if actual_status.as_ref() != Some(&WorkItemStatus::Mergequeue) {
                 // Item moved away - remove watch and discard.
@@ -7204,7 +7286,7 @@ impl App {
                             .work_items
                             .iter()
                             .find(|w| w.id == wi_id)
-                            .map(|w| w.status.clone());
+                            .map(|w| w.status);
                         if wi_status == Some(WorkItemStatus::Blocked) {
                             let _ = self
                                 .backend
@@ -7278,7 +7360,7 @@ impl App {
                     .work_items
                     .iter()
                     .find(|w| w.id == wi_id)
-                    .map(|w| w.status.clone())
+                    .map(|w| w.status)
                     .unwrap_or(WorkItemStatus::Implementing);
 
                 self.apply_stage_change(
@@ -7315,7 +7397,7 @@ impl App {
                         .work_items
                         .iter()
                         .find(|w| w.id == wi_id)
-                        .map(|w| w.status.clone());
+                        .map(|w| w.status);
                     if wi_status == Some(WorkItemStatus::Blocked) {
                         let _ = self
                             .backend
@@ -8182,7 +8264,7 @@ mod tests {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/new.json")),
                     title: req.title.clone(),
                     description: None,
-                    status: req.status.clone(),
+                    status: req.status,
                     kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: req.repo_associations,
                     plan: None,
@@ -10153,7 +10235,7 @@ mod tests {
                     id: WorkItemId::LocalFile(PathBuf::from("/tmp/new.json")),
                     title: req.title.clone(),
                     description: None,
-                    status: req.status.clone(),
+                    status: req.status,
                     kind: crate::work_item::WorkItemKind::Own,
                     repo_associations: req.repo_associations,
                     plan: None,
@@ -10521,8 +10603,7 @@ mod tests {
             .iter()
             .find(|w| w.id == wi_id)
             .unwrap()
-            .status
-            .clone();
+            .status;
         assert_eq!(status, WorkItemStatus::Review, "must stay in Review");
         let msg = app.alert_message.as_deref().unwrap_or("");
         assert!(msg.contains("no repo association"), "got: {msg}");
@@ -10556,8 +10637,7 @@ mod tests {
             .iter()
             .find(|w| w.id == wi_id)
             .unwrap()
-            .status
-            .clone();
+            .status;
         assert_eq!(status, WorkItemStatus::Review, "must stay in Review");
         let msg = app.alert_message.as_deref().unwrap_or("");
         assert!(msg.contains("no branch"), "got: {msg}");
@@ -10593,8 +10673,7 @@ mod tests {
             .iter()
             .find(|w| w.id == wi_id)
             .unwrap()
-            .status
-            .clone();
+            .status;
         assert_eq!(status, WorkItemStatus::Review, "must stay in Review");
         let msg = app.alert_message.as_deref().unwrap_or("");
         assert!(msg.contains("GitHub remote not yet cached"), "got: {msg}");
@@ -10630,8 +10709,7 @@ mod tests {
             .iter()
             .find(|w| w.id == wi_id)
             .unwrap()
-            .status
-            .clone();
+            .status;
         assert_eq!(status, WorkItemStatus::Review, "must stay in Review");
         let msg = app.alert_message.as_deref().unwrap_or("");
         assert!(msg.contains("no PR found"), "got: {msg}");

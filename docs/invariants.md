@@ -68,7 +68,8 @@ items exist. Everything else is derived.
 The only persistent state is:
 
 - The list of registered repositories (config file)
-- Backend records (one per work item, stored in platform data directory)
+- Backend records, including their per-item activity logs and archived
+  activity logs for deleted items (stored in platform data directory)
 - Optional per-worktree override files (rare, for edge cases)
 
 If it can be derived from git or GitHub, it must not be stored. Backend

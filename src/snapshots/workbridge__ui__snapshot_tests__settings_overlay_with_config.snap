@@ -2,7 +2,7 @@
 source: src/ui.rs
 expression: output
 ---
-  List    Board                                                Tab: switch view
+  List    Board    Dashboard                                   Tab: switch view
 ┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │           ┌ Settings (press ? or Esc to close) ──────────────────┐           │
 │  No work i│                                                      │           │

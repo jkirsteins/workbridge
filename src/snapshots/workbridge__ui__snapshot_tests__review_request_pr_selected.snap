@@ -2,7 +2,7 @@
 source: src/ui.rs
 expression: "render(&app, 80, 24)"
 ---
-  List    Board                                                Tab: switch view
+  List    Board    Dashboard                                   Tab: switch view
 ┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  REVIEW REQUESTS (1)  ││                                                     │
 │> R Refactor au.. PR#77││  Refactor auth middleware                           │

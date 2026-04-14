@@ -354,7 +354,7 @@ pub fn reassemble(
         let (status, status_derived) = if has_merged_pr {
             (WorkItemStatus::Done, true)
         } else {
-            (record.status.clone(), false)
+            (record.status, false)
         };
 
         work_items.push(WorkItem {

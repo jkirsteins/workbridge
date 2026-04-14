@@ -342,7 +342,6 @@ warnings but do not prevent the delete.
 ### Resources cleaned up
 
 - Backend record (the JSON file)
-- Activity log (the .jsonl file)
 - Worktree directory on disk
 - Local git branch (force-deleted with `-D`)
 - Open PR on GitHub (closed via `gh pr close`)
@@ -351,6 +350,17 @@ warnings but do not prevent the delete.
 - MCP socket server and .mcp.json config file
 - In-memory state: rework reasons, review gate findings, no-plan prompt queue,
   merge/rework prompt visibility flags
+
+### Resources preserved
+
+- **Activity log (the .jsonl file)**: moved to
+  `<data_dir>/work-items/archive/activity-<id>.jsonl` instead of being
+  deleted. The metrics Dashboard reads both the active directory and
+  the archive subdirectory, so historical flow events (created, stage
+  changes, pr_merged, done) from deleted items still contribute to
+  throughput, cycle time, backlog reconstruction, and the
+  Created/Backlog sparklines. See `docs/metrics.md` for the aggregator
+  behavior and `docs/CLEANUP.md` for the authoritative delete flow.
 
 ### Confirmation flow
 
