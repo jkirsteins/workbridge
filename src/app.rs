@@ -407,6 +407,73 @@ pub struct ReviewSubmitResult {
     pub outcome: ReviewSubmitOutcome,
 }
 
+/// Classification of a worktree's local state relative to its upstream,
+/// returned by `App::worktree_cleanliness`.
+///
+/// The variants are ordered by merge-guard priority: the helper returns
+/// the first matching one, so `Dirty` wins over `Untracked` which wins
+/// over `Unpushed` which wins over `BehindOnly` which wins over `Clean`.
+///
+/// `BehindOnly` is a soft-warning state: the worktree is behind its
+/// upstream but has nothing of its own to lose, so pushing would be
+/// the wrong fix and the branch is about to be deleted on merge
+/// anyway. Every other non-Clean variant blocks the Review -> Done
+/// merge transition because advancing without addressing it would
+/// either merge a PR that does not include the user's local work or
+/// destroy that work when `gh pr merge --delete-branch` deletes the
+/// local branch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorktreeCleanliness {
+    /// No uncommitted changes, no untracked files, and either
+    /// up-to-date with upstream or no upstream configured at all.
+    Clean,
+    /// Tracked files are modified / staged / renamed / deleted but
+    /// not committed.
+    Dirty,
+    /// No tracked-file changes, but one or more untracked files are
+    /// present in the worktree.
+    Untracked,
+    /// N commits exist locally that are not on the upstream. The
+    /// user must push before merging or their work will not be in
+    /// the merged PR.
+    Unpushed(u32),
+    /// N commits exist on the upstream that are not local. Shown
+    /// as a soft warning because merging is still safe.
+    BehindOnly(u32),
+}
+
+impl WorktreeCleanliness {
+    /// Returns `true` if this state must block the Review -> Done
+    /// merge transition. `Clean` and `BehindOnly` are the only
+    /// non-blocking variants; see the enum doc comment for the
+    /// reasoning behind `BehindOnly`'s soft-warning treatment.
+    pub fn is_merge_blocking(&self) -> bool {
+        match self {
+            WorktreeCleanliness::Clean | WorktreeCleanliness::BehindOnly(_) => false,
+            WorktreeCleanliness::Dirty
+            | WorktreeCleanliness::Untracked
+            | WorktreeCleanliness::Unpushed(_) => true,
+        }
+    }
+
+    /// User-facing error text for a blocking state, or `None` when
+    /// the state does not block. The wording is intentionally
+    /// prescriptive ("Commit & push before merging.") so the alert
+    /// doubles as the remediation step.
+    pub fn merge_block_message(&self) -> Option<&'static str> {
+        match self {
+            WorktreeCleanliness::Dirty => {
+                Some("Uncommitted changes. Commit & push before merging.")
+            }
+            WorktreeCleanliness::Untracked => {
+                Some("Untracked files. Commit/ignore & push before merging.")
+            }
+            WorktreeCleanliness::Unpushed(_) => Some("Unpushed commits. Push before merging."),
+            WorktreeCleanliness::Clean | WorktreeCleanliness::BehindOnly(_) => None,
+        }
+    }
+}
+
 /// Information needed to poll a Mergequeue item's PR state.
 ///
 /// `pr_number` is the unambiguous identity of the PR the user opted into
@@ -4252,6 +4319,58 @@ impl App {
             .unwrap_or(false)
     }
 
+    /// Classify a worktree's local state for the unclean-worktree
+    /// indicator and the Review -> Done merge guard. Pure cache lookup
+    /// from `self.repo_data[repo_path].worktrees` - must NOT shell out
+    /// on the UI thread. See `docs/UI.md` "Blocking I/O Prohibition".
+    ///
+    /// Priority order when multiple conditions are present:
+    ///   Dirty > Untracked > Unpushed > BehindOnly > Clean
+    ///
+    /// Dirty is highest because a user with both uncommitted changes
+    /// and untracked files almost always means "I haven't committed
+    /// yet" - the tracked-change wording is the more actionable
+    /// message. BehindOnly is lowest because it is the only variant
+    /// that does not block merging.
+    ///
+    /// Missing cache (first fetch in flight, repo never fetched, no
+    /// matching worktree, missing branch) collapses to `Clean`: the
+    /// safe default that allows the merge flow to proceed. Once the
+    /// fetcher populates real state, subsequent calls return the
+    /// correct classification.
+    pub fn worktree_cleanliness(
+        &self,
+        repo_path: &std::path::Path,
+        branch: &str,
+    ) -> WorktreeCleanliness {
+        let Some(wt) = self
+            .repo_data
+            .get(repo_path)
+            .and_then(|rd| rd.worktrees.as_ref().ok())
+            .and_then(|wts| wts.iter().find(|wt| wt.branch.as_deref() == Some(branch)))
+        else {
+            return WorktreeCleanliness::Clean;
+        };
+
+        if wt.dirty.unwrap_or(false) {
+            return WorktreeCleanliness::Dirty;
+        }
+        if wt.untracked.unwrap_or(false) {
+            return WorktreeCleanliness::Untracked;
+        }
+        if let Some(ahead) = wt.unpushed
+            && ahead > 0
+        {
+            return WorktreeCleanliness::Unpushed(ahead);
+        }
+        if let Some(behind) = wt.behind_remote
+            && behind > 0
+        {
+            return WorktreeCleanliness::BehindOnly(behind);
+        }
+        WorktreeCleanliness::Clean
+    }
+
     /// Start an MCP socket server for a work item session.
     /// MCP config is passed to Claude via --mcp-config CLI flag, not written
     /// to disk. Returns (server, unused_path) on success, or an error message
@@ -5612,6 +5731,41 @@ impl App {
         // Merge prompt: when transitioning from Review to Done,
         // show the merge strategy prompt instead of advancing directly.
         if current_status == WorkItemStatus::Review && new_status == WorkItemStatus::Done {
+            // Unclean-worktree merge guard. Refuse to open the merge
+            // modal when the primary repo association has uncommitted
+            // changes, untracked files, or unpushed commits - merging
+            // in any of those states would either land a PR that does
+            // not include the user's local work or (with
+            // `--delete-branch`) destroy that work entirely. The
+            // guard mirrors the "unclean" chip rendered by
+            // `format_work_item_entry`; they must stay in sync.
+            // `BehindOnly` and `Clean` fall through to the normal
+            // confirm_merge path.
+            //
+            // `worktree_cleanliness` is a pure cache read - see its
+            // doc comment for the blocking-I/O invariant. The guard
+            // only applies to the PRIMARY repo association (first
+            // entry) to match `execute_merge`'s own primary-assoc
+            // model; multi-repo work items merge one PR at a time
+            // and the same helper gets re-invoked per repo.
+            if let Some(assoc) = wi.repo_associations.first()
+                && let Some(branch) = assoc.branch.as_deref()
+            {
+                let cleanliness = self.worktree_cleanliness(&assoc.repo_path, branch);
+                if cleanliness.is_merge_blocking() {
+                    // Every blocking variant also has a non-None
+                    // `merge_block_message`; the fallback string is
+                    // defensive in case a future variant is added
+                    // without wiring up its message.
+                    self.alert_message = Some(
+                        cleanliness
+                            .merge_block_message()
+                            .unwrap_or("Worktree is not ready to merge.")
+                            .to_string(),
+                    );
+                    return;
+                }
+            }
             self.confirm_merge = true;
             self.merge_wi_id = Some(wi_id);
             return;
@@ -6214,6 +6368,27 @@ impl App {
             }
         };
         let repo_path = assoc.repo_path.clone();
+
+        // Guard mirrored from advance_stage: defence-in-depth so any
+        // future caller that bypasses `advance_stage` (e.g. a new
+        // keybinding that jumps straight to `execute_merge`) cannot
+        // accidentally land a PR while the worktree still has
+        // uncommitted work, untracked files, or unpushed commits.
+        // Pure cache read, same blocking-I/O guarantees as
+        // `advance_stage`. DO NOT DRY this into `advance_stage`:
+        // future readers should see the guard at both commit points.
+        let cleanliness = self.worktree_cleanliness(&repo_path, &branch);
+        if cleanliness.is_merge_blocking() {
+            self.confirm_merge = false;
+            self.merge_wi_id = None;
+            self.alert_message = Some(
+                cleanliness
+                    .merge_block_message()
+                    .unwrap_or("Worktree is not ready to merge.")
+                    .to_string(),
+            );
+            return;
+        }
 
         // Read owner/repo from the cached fetcher result rather than shelling
         // out on the UI thread. If no entry exists yet, the first fetch has
@@ -9913,6 +10088,7 @@ mod tests {
                     branch: Some(branch.to_string()),
                     is_main: false,
                     has_commits_ahead: Some(false),
+                    ..WorktreeInfo::default()
                 })
             }
 
@@ -10189,6 +10365,7 @@ mod tests {
                     branch: Some(branch.to_string()),
                     is_main: false,
                     has_commits_ahead: Some(false),
+                    ..WorktreeInfo::default()
                 })
             }
 
@@ -10546,7 +10723,7 @@ mod tests {
                 path: wt_target.clone(),
                 branch: Some("feature-x".into()),
                 is_main: false,
-                has_commits_ahead: None,
+                ..WorktreeInfo::default()
             }],
         };
         let found = App::find_reusable_worktree(&mock, &repo, "feature-x", &wt_target);
@@ -10558,7 +10735,7 @@ mod tests {
                 path: wt_target.clone(),
                 branch: Some("feature-x".into()),
                 is_main: true,
-                has_commits_ahead: None,
+                ..WorktreeInfo::default()
             }],
         };
         assert!(
@@ -10572,7 +10749,7 @@ mod tests {
                 path: wt_target.clone(),
                 branch: Some("other-branch".into()),
                 is_main: false,
-                has_commits_ahead: None,
+                ..WorktreeInfo::default()
             }],
         };
         assert!(
@@ -10587,7 +10764,7 @@ mod tests {
                 path: other_target.clone(),
                 branch: Some("feature-x".into()),
                 is_main: false,
-                has_commits_ahead: None,
+                ..WorktreeInfo::default()
             }],
         };
         assert!(
@@ -10610,7 +10787,7 @@ mod tests {
                 path: wt_target.clone(),
                 branch: Some("feature-x".into()),
                 is_main: false,
-                has_commits_ahead: None,
+                ..WorktreeInfo::default()
             }],
         };
         assert!(
@@ -10658,6 +10835,7 @@ mod tests {
                     branch: Some(branch.to_string()),
                     is_main: false,
                     has_commits_ahead: Some(false),
+                    ..WorktreeInfo::default()
                 })
             }
 
@@ -11272,6 +11450,387 @@ mod tests {
             "merge_wi_id should be set to the work item",
         );
         // The merge prompt is now a dialog overlay; it no longer sets status_message.
+    }
+
+    // -- Feature: unclean worktree indicator + merge guard --
+
+    /// Install a `RepoFetchResult` that carries a worktree with the
+    /// given cleanliness fields. Used by the merge-guard tests to
+    /// drive `App::worktree_cleanliness` through each variant.
+    fn install_cached_repo_with_cleanliness(
+        app: &mut App,
+        repo_path: &std::path::Path,
+        branch: &str,
+        dirty: Option<bool>,
+        untracked: Option<bool>,
+        unpushed: Option<u32>,
+        behind_remote: Option<u32>,
+    ) {
+        let wt = crate::worktree_service::WorktreeInfo {
+            path: repo_path.join(".worktrees").join(branch),
+            branch: Some(branch.to_string()),
+            is_main: false,
+            dirty,
+            untracked,
+            unpushed,
+            behind_remote,
+            ..crate::worktree_service::WorktreeInfo::default()
+        };
+        app.repo_data.insert(
+            repo_path.to_path_buf(),
+            crate::work_item::RepoFetchResult {
+                repo_path: repo_path.to_path_buf(),
+                github_remote: Some(("owner".into(), "repo".into())),
+                worktrees: Ok(vec![wt]),
+                prs: Ok(Vec::new()),
+                review_requested_prs: Ok(Vec::new()),
+                issues: Vec::new(),
+            },
+        );
+    }
+
+    /// Push a Review-stage work item with a single repo association
+    /// on the given branch, and select it in the display list. Mirrors
+    /// the shape `advance_stage` expects to see.
+    fn push_selected_review_item(
+        app: &mut App,
+        wi_id: &WorkItemId,
+        repo_path: &std::path::Path,
+        branch: &str,
+    ) {
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "cleanliness-test".into(),
+            display_id: None,
+            description: None,
+            status: WorkItemStatus::Review,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: repo_path.to_path_buf(),
+                branch: Some(branch.to_string()),
+                worktree_path: Some(repo_path.join(".worktrees").join(branch)),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+        app.display_list
+            .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
+        app.selected_item = Some(app.display_list.len() - 1);
+    }
+
+    /// Priority ordering contract of `App::worktree_cleanliness`:
+    ///   Dirty > Untracked > Unpushed > BehindOnly > Clean
+    #[test]
+    fn worktree_cleanliness_priority_order() {
+        let mut app = App::new();
+        let repo = PathBuf::from("/tmp/cleanliness-priority");
+
+        // Dirty wins over everything else.
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            "b",
+            Some(true),
+            Some(true),
+            Some(5),
+            Some(5),
+        );
+        assert_eq!(
+            app.worktree_cleanliness(&repo, "b"),
+            WorktreeCleanliness::Dirty,
+        );
+
+        // Untracked wins over Unpushed + BehindOnly.
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            "b",
+            Some(false),
+            Some(true),
+            Some(3),
+            Some(3),
+        );
+        assert_eq!(
+            app.worktree_cleanliness(&repo, "b"),
+            WorktreeCleanliness::Untracked,
+        );
+
+        // Unpushed wins over BehindOnly.
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            "b",
+            Some(false),
+            Some(false),
+            Some(2),
+            Some(4),
+        );
+        assert_eq!(
+            app.worktree_cleanliness(&repo, "b"),
+            WorktreeCleanliness::Unpushed(2),
+        );
+
+        // BehindOnly when only behind.
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            "b",
+            Some(false),
+            Some(false),
+            Some(0),
+            Some(7),
+        );
+        assert_eq!(
+            app.worktree_cleanliness(&repo, "b"),
+            WorktreeCleanliness::BehindOnly(7),
+        );
+
+        // All zero / clean.
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            "b",
+            Some(false),
+            Some(false),
+            Some(0),
+            Some(0),
+        );
+        assert_eq!(
+            app.worktree_cleanliness(&repo, "b"),
+            WorktreeCleanliness::Clean,
+        );
+
+        // Missing cache entry => Clean (safe default).
+        let never_fetched = PathBuf::from("/tmp/never-fetched-cleanliness");
+        assert_eq!(
+            app.worktree_cleanliness(&never_fetched, "whatever"),
+            WorktreeCleanliness::Clean,
+        );
+
+        // All-None fields (fetcher check not yet run) => Clean.
+        install_cached_repo_with_cleanliness(&mut app, &repo, "b", None, None, None, None);
+        assert_eq!(
+            app.worktree_cleanliness(&repo, "b"),
+            WorktreeCleanliness::Clean,
+        );
+    }
+
+    /// `is_merge_blocking` blocks everything except Clean and BehindOnly.
+    #[test]
+    fn worktree_cleanliness_merge_blocking_matches_message() {
+        for (state, blocking) in [
+            (WorktreeCleanliness::Clean, false),
+            (WorktreeCleanliness::Dirty, true),
+            (WorktreeCleanliness::Untracked, true),
+            (WorktreeCleanliness::Unpushed(1), true),
+            (WorktreeCleanliness::BehindOnly(1), false),
+        ] {
+            assert_eq!(state.is_merge_blocking(), blocking, "{state:?}");
+            assert_eq!(
+                state.merge_block_message().is_some(),
+                blocking,
+                "{state:?} message presence must match is_merge_blocking",
+            );
+        }
+        // Spot-check the specific wording so copy edits are caught.
+        assert!(
+            WorktreeCleanliness::Dirty
+                .merge_block_message()
+                .unwrap()
+                .contains("Uncommitted changes"),
+        );
+        assert!(
+            WorktreeCleanliness::Untracked
+                .merge_block_message()
+                .unwrap()
+                .contains("Untracked files"),
+        );
+        assert!(
+            WorktreeCleanliness::Unpushed(3)
+                .merge_block_message()
+                .unwrap()
+                .contains("Unpushed commits"),
+        );
+    }
+
+    /// Review -> Done on a Dirty worktree must block the merge modal
+    /// with a dirty-specific alert, and the work item stays in Review.
+    #[test]
+    fn advance_stage_review_to_done_blocked_when_dirty() {
+        let mut app = App::new();
+        let repo = PathBuf::from("/tmp/merge-guard-dirty");
+        let branch = "feature/dirty";
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            branch,
+            Some(true),
+            Some(false),
+            Some(0),
+            Some(0),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-guard-dirty.json"));
+        push_selected_review_item(&mut app, &wi_id, &repo, branch);
+
+        app.advance_stage();
+
+        assert!(
+            !app.confirm_merge,
+            "merge modal must NOT open when worktree is dirty",
+        );
+        assert_eq!(
+            app.work_items
+                .iter()
+                .find(|w| w.id == wi_id)
+                .unwrap()
+                .status,
+            WorkItemStatus::Review,
+            "item must stay in Review on blocked advance",
+        );
+        let msg = app.alert_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("Uncommitted changes"),
+            "alert should tell user to commit & push, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn advance_stage_review_to_done_blocked_when_untracked() {
+        let mut app = App::new();
+        let repo = PathBuf::from("/tmp/merge-guard-untracked");
+        let branch = "feature/untracked";
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            branch,
+            Some(false),
+            Some(true),
+            Some(0),
+            Some(0),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-guard-untracked.json"));
+        push_selected_review_item(&mut app, &wi_id, &repo, branch);
+
+        app.advance_stage();
+
+        assert!(!app.confirm_merge);
+        let msg = app.alert_message.as_deref().unwrap_or("");
+        assert!(msg.contains("Untracked files"), "got: {msg}");
+    }
+
+    #[test]
+    fn advance_stage_review_to_done_blocked_when_unpushed() {
+        let mut app = App::new();
+        let repo = PathBuf::from("/tmp/merge-guard-unpushed");
+        let branch = "feature/unpushed";
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            branch,
+            Some(false),
+            Some(false),
+            Some(3),
+            Some(0),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-guard-unpushed.json"));
+        push_selected_review_item(&mut app, &wi_id, &repo, branch);
+
+        app.advance_stage();
+
+        assert!(!app.confirm_merge);
+        let msg = app.alert_message.as_deref().unwrap_or("");
+        assert!(msg.contains("Unpushed commits"), "got: {msg}");
+    }
+
+    /// BehindOnly is a soft warning and must NOT block the merge.
+    #[test]
+    fn advance_stage_review_to_done_allows_behind_only() {
+        let mut app = App::new();
+        let repo = PathBuf::from("/tmp/merge-guard-behind-only");
+        let branch = "feature/behind";
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            branch,
+            Some(false),
+            Some(false),
+            Some(0),
+            Some(5),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-guard-behind.json"));
+        push_selected_review_item(&mut app, &wi_id, &repo, branch);
+
+        app.advance_stage();
+
+        assert!(
+            app.confirm_merge,
+            "BehindOnly must fall through to the merge modal",
+        );
+        assert!(
+            app.alert_message.is_none(),
+            "no alert should fire for BehindOnly, got: {:?}",
+            app.alert_message,
+        );
+    }
+
+    /// Fully clean worktree advances normally.
+    #[test]
+    fn advance_stage_review_to_done_allows_clean() {
+        let mut app = App::new();
+        let repo = PathBuf::from("/tmp/merge-guard-clean");
+        let branch = "feature/clean";
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            branch,
+            Some(false),
+            Some(false),
+            Some(0),
+            Some(0),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/merge-guard-clean.json"));
+        push_selected_review_item(&mut app, &wi_id, &repo, branch);
+
+        app.advance_stage();
+
+        assert!(app.confirm_merge, "clean worktree must open merge modal");
+        assert!(app.alert_message.is_none());
+    }
+
+    /// Defence-in-depth: calling `execute_merge` directly on a dirty
+    /// worktree must also bail out with the same alert wording.
+    #[test]
+    fn execute_merge_blocked_when_worktree_dirty() {
+        let mut app = App::new();
+        let repo = PathBuf::from("/tmp/exec-merge-dirty");
+        let branch = "feature/exec-dirty";
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            branch,
+            Some(true),
+            Some(false),
+            Some(0),
+            Some(0),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/exec-merge-dirty.json"));
+        push_selected_review_item(&mut app, &wi_id, &repo, branch);
+
+        app.execute_merge(&wi_id, "squash");
+
+        assert!(!app.confirm_merge);
+        let msg = app.alert_message.as_deref().unwrap_or("");
+        assert!(msg.contains("Uncommitted changes"), "got: {msg}");
+        // Must NOT have admitted a PrMerge user action - otherwise the
+        // caller leaks the single-flight slot.
+        assert!(
+            !app.is_user_action_in_flight(&UserActionKey::PrMerge),
+            "execute_merge must not reserve the PrMerge slot on a blocked advance",
+        );
     }
 
     // -- Regression: execute_merge must not advance to Done without a real merge --
@@ -14081,7 +14640,7 @@ mod tests {
                     path: PathBuf::from("/my/repo/.worktrees/feature-branch"),
                     branch: Some("feature-branch".into()),
                     is_main: false,
-                    has_commits_ahead: None,
+                    ..crate::worktree_service::WorktreeInfo::default()
                 }]),
                 prs: Ok(vec![]),
                 review_requested_prs: Ok(vec![]),
@@ -14223,7 +14782,7 @@ mod tests {
                     path: PathBuf::from("/my/repo/.worktrees/feature-branch"),
                     branch: Some("feature-branch".into()),
                     is_main: false,
-                    has_commits_ahead: None,
+                    ..crate::worktree_service::WorktreeInfo::default()
                 }]),
                 prs: Ok(vec![crate::github_client::GithubPr {
                     number: 42,
@@ -14703,7 +15262,7 @@ mod tests {
                 path: target_dir.to_path_buf(),
                 branch: None,
                 is_main: false,
-                has_commits_ahead: None,
+                ..crate::worktree_service::WorktreeInfo::default()
             })
         }
 
@@ -14793,6 +15352,7 @@ mod tests {
                 branch: Some(b.to_string()),
                 is_main: false,
                 has_commits_ahead,
+                ..crate::worktree_service::WorktreeInfo::default()
             }],
             None => Vec::new(),
         };

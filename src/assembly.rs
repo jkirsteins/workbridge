@@ -235,11 +235,25 @@ pub fn reassemble(
                 && let Some(wt) = find_worktree_by_branch(worktrees, branch)
             {
                 worktree_path = Some(wt.path.clone());
+                // Cleanliness fields on `WorktreeInfo` are populated by
+                // the background fetcher (see `list_worktrees` in
+                // `src/worktree_service.rs`). Reading them here is a
+                // pure in-memory projection and respects the "no
+                // blocking I/O on the UI thread" invariant. `None`
+                // means "check not attempted or failed" and collapses
+                // to the safe default of clean/zero so an unknown
+                // state never flags a worktree as dirty/unpushed.
+                //
+                // `dirty` on `GitState` is the union of uncommitted
+                // tracked changes and untracked files because both
+                // block merging identically - callers that want to
+                // distinguish them look at the cleanliness enum in
+                // `App::worktree_cleanliness`, which reads the raw
+                // fields directly.
                 git_state = Some(GitState {
-                    dirty: false,
-                    ahead: 0,
-                    behind: 0,
-                    detached: false,
+                    dirty: wt.dirty.unwrap_or(false) || wt.untracked.unwrap_or(false),
+                    ahead: wt.unpushed.unwrap_or(0),
+                    behind: wt.behind_remote.unwrap_or(0),
                 });
             }
 
@@ -608,6 +622,10 @@ mod tests {
             branch: branch.map(|s| s.to_string()),
             is_main: false,
             has_commits_ahead: None,
+            dirty: None,
+            untracked: None,
+            unpushed: None,
+            behind_remote: None,
         }
     }
 
@@ -1024,6 +1042,132 @@ mod tests {
         let (items, unlinked, _, _) = reassemble(&[], &repo_data, DEFAULT_ISSUE_PATTERN);
         assert!(items.is_empty());
         assert!(unlinked.is_empty());
+    }
+
+    /// Cache-projected cleanliness fields on `WorktreeInfo`
+    /// (`dirty` / `untracked` / `unpushed` / `behind_remote`) must
+    /// flow into the derived `GitState`. `dirty` on `GitState` is the
+    /// union of tracked-dirty and untracked so the UI chip renders
+    /// for either - the merge guard separates them via
+    /// `App::worktree_cleanliness`, which reads the raw fields.
+    #[test]
+    fn git_state_flows_from_worktree_info_fields() {
+        let rp = repo_path("alpha");
+        let branch = "feature-dirty";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Work",
+            WorkItemStatus::Review,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+                pr_identity: None,
+            }],
+        );
+
+        let wt = WorktreeInfo {
+            path: PathBuf::from("/worktrees/feature-dirty"),
+            branch: Some(branch.to_string()),
+            is_main: false,
+            dirty: Some(true),
+            untracked: Some(false),
+            unpushed: Some(2),
+            behind_remote: Some(1),
+            ..WorktreeInfo::default()
+        };
+        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        assert_eq!(items.len(), 1);
+        let gs = items[0].repo_associations[0]
+            .git_state
+            .as_ref()
+            .expect("git_state must be populated when a worktree matches");
+        assert!(gs.dirty, "dirty=true must flow through");
+        assert_eq!(gs.ahead, 2, "unpushed must flow into GitState.ahead");
+        assert_eq!(gs.behind, 1, "behind_remote must flow into GitState.behind");
+    }
+
+    /// Tracked-dirty=false + untracked=true must still set
+    /// `GitState.dirty=true` because the chip treats both the same.
+    #[test]
+    fn git_state_dirty_is_union_of_tracked_and_untracked() {
+        let rp = repo_path("alpha");
+        let branch = "feature-untracked";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Work",
+            WorkItemStatus::Review,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+                pr_identity: None,
+            }],
+        );
+
+        let wt = WorktreeInfo {
+            path: PathBuf::from("/worktrees/feature-untracked"),
+            branch: Some(branch.to_string()),
+            is_main: false,
+            dirty: Some(false),
+            untracked: Some(true),
+            unpushed: Some(0),
+            behind_remote: Some(0),
+            ..WorktreeInfo::default()
+        };
+        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        let gs = items[0].repo_associations[0]
+            .git_state
+            .as_ref()
+            .expect("git_state must be populated");
+        assert!(
+            gs.dirty,
+            "untracked-only must still set GitState.dirty so the chip renders",
+        );
+        assert_eq!(gs.ahead, 0);
+        assert_eq!(gs.behind, 0);
+    }
+
+    /// `None` cleanliness fields (fetcher check failed / skipped) must
+    /// collapse to the safe default: clean/zero counts.
+    #[test]
+    fn git_state_none_cleanliness_fields_default_to_clean() {
+        let rp = repo_path("alpha");
+        let branch = "feature-unknown";
+
+        let record = create_mock_record(
+            "wi-1",
+            "Work",
+            WorkItemStatus::Review,
+            vec![RepoAssociationRecord {
+                repo_path: rp.clone(),
+                branch: Some(branch.to_string()),
+                pr_identity: None,
+            }],
+        );
+
+        // All cleanliness fields = None.
+        let wt = create_mock_worktree("/worktrees/feature-unknown", Some(branch));
+        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
+        let repo_data = HashMap::from([(rp_key, fetch)]);
+
+        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+
+        let gs = items[0].repo_associations[0]
+            .git_state
+            .as_ref()
+            .expect("git_state must be populated when worktree matches");
+        assert!(!gs.dirty, "None dirty must default to clean");
+        assert_eq!(gs.ahead, 0, "None unpushed must default to 0");
+        assert_eq!(gs.behind, 0, "None behind_remote must default to 0");
     }
 
     #[test]

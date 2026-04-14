@@ -89,6 +89,11 @@ pub struct Theme {
     pub badge_ci_pending: Color,
     /// Merge-conflict badge color (PR has conflicts with its base branch).
     pub badge_merge_conflict: Color,
+    /// Unclean-worktree `!cl` badge color. Distinct from `badge_ci_fail`
+    /// (red) so a row that is both CI-failing and locally unclean can
+    /// render both chips without them visually merging. Yellow/orange
+    /// to read as a warning without screaming "error".
+    pub badge_worktree_unclean: Color,
     /// Unlinked item "?" marker color.
     pub unlinked_marker: Color,
     /// Review request "R" marker color (pre-import).
@@ -169,6 +174,13 @@ impl Theme {
             badge_ci_fail: Color::Red,
             badge_ci_pending: Color::Yellow,
             badge_merge_conflict: Color::Red,
+            // LightYellow reads as a warning without colliding with the
+            // other chip colors in the row: `fail` is Red, merge-conflict
+            // `MC` is Red, pending `...` is Yellow, so LightYellow is the
+            // only amber tone left that stays distinct from all of them.
+            // A row that is both CI-failing and locally unclean renders
+            // `fail !cl` with clearly separate foregrounds.
+            badge_worktree_unclean: Color::LightYellow,
             unlinked_marker: Color::Yellow,
             review_request_marker: Color::Magenta,
             badge_review_request_kind: Color::Magenta,
@@ -336,6 +348,10 @@ impl Theme {
 
     pub fn style_badge_merge_conflict(&self) -> Style {
         Style::default().fg(self.badge_merge_conflict)
+    }
+
+    pub fn style_badge_worktree_unclean(&self) -> Style {
+        Style::default().fg(self.badge_worktree_unclean)
     }
 
     pub fn style_badge_session_idle(&self) -> Style {
