@@ -1108,6 +1108,100 @@ fn find_current_group_header(display_list: &[DisplayEntry], offset: usize) -> Op
     None
 }
 
+/// Predict the `ListState::offset()` that ratatui's `List` widget will choose
+/// when rendered with the given per-item row heights, previous offset,
+/// selection, and available body height.
+///
+/// This mirrors `ratatui_widgets::list::List::get_items_bounds` for the
+/// default `scroll_padding = 0` case, and also mirrors the `ListState::select`
+/// side effect that resets `offset` to 0 when the selection is cleared
+/// (see `ratatui_widgets::list::state::ListState::select`). The production
+/// call site in `draw_work_item_list` runs
+/// `ListState::default().with_offset(predicted).select(selected)` in that
+/// order, so when `selected` is `None` ratatui will render from offset 0
+/// regardless of `prev_offset`, and this predictor matches that behavior.
+///
+/// It exists so the sticky-header overlay can reserve a dedicated row at
+/// the top of the list's inner area **before** the `List` widget renders,
+/// guaranteeing that the selected (and topmost visible) item is never
+/// painted over by the sticky row.
+///
+/// The predictor is kept faithful by the parallel-render tests in
+/// `mod sticky_header_tests` which compare its output against a real `List`
+/// rendered into a `TestBackend`.
+fn predict_list_offset(
+    item_heights: &[usize],
+    prev_offset: usize,
+    selected: Option<usize>,
+    max_height: usize,
+) -> usize {
+    if item_heights.is_empty() {
+        return 0;
+    }
+
+    let last_valid_index = item_heights.len() - 1;
+    // Mirror `ListState::select(None)`'s side effect: clearing the
+    // selection also resets the offset to 0. This matches what ratatui
+    // will actually render when the production call site invokes
+    // `state.select(None)` after `with_offset`.
+    let effective_prev_offset = match selected {
+        Some(_) => prev_offset.min(last_valid_index),
+        None => 0,
+    };
+    if max_height == 0 {
+        return effective_prev_offset;
+    }
+    let mut first_visible_index = effective_prev_offset;
+    let mut last_visible_index = first_visible_index;
+    let mut height_from_offset: usize = 0;
+
+    // Walk forward from the current offset, summing heights until the next
+    // item would overflow the viewport. After this loop `last_visible_index`
+    // is the exclusive end of the visible range (i.e. one past the last
+    // fully-visible item).
+    for h in item_heights.iter().skip(first_visible_index) {
+        if height_from_offset + h > max_height {
+            break;
+        }
+        height_from_offset += h;
+        last_visible_index += 1;
+    }
+
+    // With `scroll_padding = 0` the index we must keep on screen is just the
+    // selected item (falling back to the offset when nothing is selected).
+    let index_to_display = match selected {
+        Some(s) => s.min(last_valid_index),
+        None => first_visible_index,
+    };
+
+    // If the selected item is past the current viewport, scroll down: add
+    // items to the tail and drop items from the head until the selected
+    // index is visible.
+    while index_to_display >= last_visible_index {
+        height_from_offset = height_from_offset.saturating_add(item_heights[last_visible_index]);
+        last_visible_index += 1;
+        while height_from_offset > max_height && first_visible_index < last_visible_index {
+            height_from_offset =
+                height_from_offset.saturating_sub(item_heights[first_visible_index]);
+            first_visible_index += 1;
+        }
+    }
+
+    // If the selected item is before the current viewport, scroll up: add
+    // items to the head and drop items from the tail.
+    while index_to_display < first_visible_index {
+        first_visible_index -= 1;
+        height_from_offset = height_from_offset.saturating_add(item_heights[first_visible_index]);
+        while height_from_offset > max_height && last_visible_index > first_visible_index + 1 {
+            last_visible_index -= 1;
+            height_from_offset =
+                height_from_offset.saturating_sub(item_heights[last_visible_index]);
+        }
+    }
+
+    first_visible_index
+}
+
 fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // When the settings overlay is open, dim background panels so the
     // overlay is the clear focal point.
@@ -1207,65 +1301,128 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     let item_heights: Vec<usize> = items.iter().map(ListItem::height).collect();
     let total_rows: usize = item_heights.iter().sum();
 
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(theme.style_tab_highlight_bg());
+    // Draw the block (borders + title) directly into `area` so we can
+    // split the inner area ourselves and hand only a sub-rect to the
+    // `List` widget. This lets us reserve a dedicated 1-row slot at the
+    // top of the inner area for the sticky group header, guaranteeing
+    // the selected work item is never painted over by the sticky row.
+    Widget::render(block, area, buf);
+    let inner = area.inner(Margin::new(1, 1));
 
-    let mut state = ListState::default().with_offset(app.list_scroll_offset.get());
-    state.select(app.selected_item);
+    // Decide whether to reserve a sticky-header slot this frame. In
+    // board drill-down mode there are no group headers at all, so we
+    // never reserve. Otherwise we call `predict_list_offset` twice to
+    // converge on a stable decision: first with the full inner height
+    // to see if a sticky would fire, then (if yes) with `inner.height - 1`
+    // so ratatui's `List` math already accounts for the slot we're about
+    // to reserve.
+    let prev_offset = app.list_scroll_offset.get();
+    let selected = app.selected_item;
+    let drill_down = app.board_drill_stage.is_some();
 
-    StatefulWidget::render(list, area, buf, &mut state);
+    let (predicted_offset, body_area, sticky_slot) = if drill_down || inner.height < 2 {
+        let predicted =
+            predict_list_offset(&item_heights, prev_offset, selected, inner.height as usize);
+        (predicted, inner, None)
+    } else {
+        let offset_without_slot =
+            predict_list_offset(&item_heights, prev_offset, selected, inner.height as usize);
+        let sticky_would_fire = find_current_group_header(&app.display_list, offset_without_slot)
+            .is_some_and(|h| h < offset_without_slot);
+
+        if sticky_would_fire {
+            let body_height = inner.height - 1;
+            let offset_with_slot =
+                predict_list_offset(&item_heights, prev_offset, selected, body_height as usize);
+            let slot = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            };
+            let body = Rect {
+                x: inner.x,
+                y: inner.y + 1,
+                width: inner.width,
+                height: body_height,
+            };
+            (offset_with_slot, body, Some(slot))
+        } else {
+            (offset_without_slot, inner, None)
+        }
+    };
+
+    let list = List::new(items).highlight_style(theme.style_tab_highlight_bg());
+
+    let mut state = ListState::default().with_offset(predicted_offset);
+    state.select(selected);
+
+    StatefulWidget::render(list, body_area, buf, &mut state);
 
     // Persist the (possibly adjusted) offset for the next frame.
     app.list_scroll_offset.set(state.offset());
 
-    // --- Sticky group header overlay ---
-    // When a group header has scrolled above the viewport, render it pinned
-    // at the top of the list's inner area so the user always knows which
-    // group the visible items belong to.
-    if app.board_drill_stage.is_none() {
-        let offset = state.offset();
-        if let Some(header_idx) = find_current_group_header(&app.display_list, offset) {
-            // Only show sticky header when the original is NOT visible
-            // (i.e., it has scrolled above the viewport).
-            if header_idx < offset
-                && let DisplayEntry::GroupHeader {
+    // --- Sticky group header ---
+    // Paint the reserved slot (if any) using the post-render offset to
+    // cover any residual drift between the prediction and ratatui's
+    // actual scroll math. Because the slot was reserved structurally
+    // via `Layout`, the `List` body never overlaps it.
+    if !drill_down {
+        let actual_offset = state.offset();
+        let header_needed = find_current_group_header(&app.display_list, actual_offset)
+            .filter(|&h| h < actual_offset);
+
+        match (sticky_slot, header_needed) {
+            (Some(slot), Some(header_idx)) => {
+                if let DisplayEntry::GroupHeader {
                     ref label,
                     count,
                     ref kind,
                 } = app.display_list[header_idx]
-            {
-                let text = format!("{label} ({count})");
-                let style = match kind {
-                    GroupHeaderKind::Blocked => theme.style_sticky_header_blocked(),
-                    GroupHeaderKind::Normal => theme.style_sticky_header(),
-                };
-                // The block has Borders::ALL, so the inner area has 1-cell
-                // margin on each side.
-                let inner = area.inner(Margin::new(1, 1));
-                let sticky_area = Rect {
-                    x: inner.x,
-                    y: inner.y,
-                    width: inner.width,
-                    height: 1,
-                };
-                // Fill the entire row with the sticky background so it
-                // visually separates from the highlighted item below.
-                let bg_style = Style::default().bg(theme.sticky_header_bg);
-                let line = Line::from(vec![
-                    Span::styled("  ", bg_style),
-                    Span::styled(text, style),
-                ]);
-                Paragraph::new(line)
-                    .style(bg_style)
-                    .render(sticky_area, buf);
+                {
+                    let text = format!("{label} ({count})");
+                    let style = match kind {
+                        GroupHeaderKind::Blocked => theme.style_sticky_header_blocked(),
+                        GroupHeaderKind::Normal => theme.style_sticky_header(),
+                    };
+                    // Fill the entire row with the sticky background so it
+                    // visually separates from the highlighted item below.
+                    let bg_style = Style::default().bg(theme.sticky_header_bg);
+                    let line = Line::from(vec![
+                        Span::styled("  ", bg_style),
+                        Span::styled(text, style),
+                    ]);
+                    Paragraph::new(line).style(bg_style).render(slot, buf);
+                }
             }
+            (Some(_), None) => {
+                // Predicted a sticky but the actual offset doesn't need
+                // one. Slot stays blank - a 1-row waste, no visual harm.
+                debug_assert!(
+                    false,
+                    "sticky slot reserved but actual offset {actual_offset} does not need one"
+                );
+            }
+            (None, Some(_)) => {
+                // Predicted no slot but actual offset now needs one. This
+                // is a 1-frame glitch (selection jump edge case); the next
+                // frame will reserve correctly. We deliberately do NOT
+                // fall back to overlay-painting here, because that would
+                // reintroduce the overlap bug we just fixed.
+                debug_assert!(
+                    false,
+                    "sticky header needed at offset {actual_offset} but no slot was reserved"
+                );
+            }
+            (None, None) => {}
         }
     }
 
-    // Scrollbar - only when content overflows the viewport.
-    let inner_height = area.height.saturating_sub(2) as usize;
-    if total_rows > inner_height || state.offset() > 0 {
+    // Scrollbar - only when content overflows the list body. We use
+    // `body_area.height` (not `inner.height`) so the scrollbar track
+    // matches whichever area the `List` was rendered into.
+    let body_height = body_area.height as usize;
+    if total_rows > body_height || state.offset() > 0 {
         // Convert the item-based offset to a row-based offset so the
         // scrollbar thumb position matches the actual viewport scroll.
         let row_offset: usize = item_heights.iter().take(state.offset()).sum();
@@ -1283,15 +1440,22 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         // scroll positions is `max_row_offset + 1`, so we size
         // `content_length` accordingly and clamp `row_offset` to guard
         // against variable-height edge cases where the list may reserve
-        // blank rows below the last item.
-        let max_row_offset = total_rows.saturating_sub(inner_height);
+        // blank rows below the last item. `body_height` (not the block's
+        // full inner height) is the correct viewport size because the
+        // sticky slot reservation shrinks the area the `List` renders into.
+        let max_row_offset = total_rows.saturating_sub(body_height);
         let content_length = max_row_offset + 1;
         let position = row_offset.min(max_row_offset);
         let mut scrollbar_state = ScrollbarState::new(content_length)
-            .viewport_content_length(inner_height)
+            .viewport_content_length(body_height)
             .position(position);
 
-        let scrollbar_area = area.inner(Margin::new(0, 1));
+        let scrollbar_area = Rect {
+            x: area.x,
+            y: body_area.y,
+            width: area.width,
+            height: body_area.height,
+        };
         StatefulWidget::render(scrollbar, scrollbar_area, buf, &mut scrollbar_state);
     }
 }
@@ -4257,14 +4421,197 @@ mod sticky_header_tests {
         // Scrolled to item in GROUP C (index 6).
         assert_eq!(find_current_group_header(&list, 6), Some(5));
     }
+
+    // -- predict_list_offset tests --
+    //
+    // The predictor must match `ratatui_widgets::list::List::get_items_bounds`
+    // for the default `scroll_padding = 0` case. The parallel-render helper
+    // below builds a real `List` widget from the same item heights and
+    // renders it into a `TestBackend`, then compares `state.offset()`
+    // against the predictor's output. This catches any drift between our
+    // simulation and ratatui's actual math (e.g. if a future ratatui
+    // version changes the algorithm).
+
+    use super::predict_list_offset;
+    use ratatui_core::{
+        backend::TestBackend,
+        layout::Rect,
+        terminal::Terminal,
+        text::{Line, Text},
+        widgets::StatefulWidget,
+    };
+    use ratatui_widgets::list::{List, ListItem, ListState};
+
+    /// Build a `Vec<ListItem>` where item `i` has `item_heights[i]` rows.
+    /// Each row is a short, unique placeholder line so ratatui sees the
+    /// heights we specified via `ListItem::height()`.
+    fn items_with_heights(item_heights: &[usize]) -> Vec<ListItem<'static>> {
+        item_heights
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| {
+                let lines: Vec<Line<'static>> =
+                    (0..h).map(|r| Line::from(format!("i{i}r{r}"))).collect();
+                ListItem::new(Text::from(lines))
+            })
+            .collect()
+    }
+
+    /// Render a real `List` through a `TestBackend` with the given heights,
+    /// prev offset, selection, and viewport height, and return the offset
+    /// that ratatui chose. This is the ground truth the predictor must
+    /// match.
+    fn ratatui_offset(
+        item_heights: &[usize],
+        prev_offset: usize,
+        selected: Option<usize>,
+        max_height: u16,
+    ) -> usize {
+        // Width is arbitrary; item_heights is authoritative.
+        let backend = TestBackend::new(20, max_height.max(1));
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = ListState::default().with_offset(prev_offset);
+        state.select(selected);
+        let items = items_with_heights(item_heights);
+        terminal
+            .draw(|frame| {
+                let list = List::new(items);
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: max_height,
+                };
+                StatefulWidget::render(list, area, frame.buffer_mut(), &mut state);
+            })
+            .unwrap();
+        state.offset()
+    }
+
+    /// Assert the predictor matches ratatui's actual offset for a given case.
+    fn assert_predictor_matches(
+        item_heights: &[usize],
+        prev_offset: usize,
+        selected: Option<usize>,
+        max_height: u16,
+        case: &str,
+    ) {
+        let actual = ratatui_offset(item_heights, prev_offset, selected, max_height);
+        let predicted =
+            predict_list_offset(item_heights, prev_offset, selected, max_height as usize);
+        assert_eq!(
+            predicted, actual,
+            "predictor disagreed with ratatui for case `{case}`: \
+             heights={item_heights:?} prev_offset={prev_offset} \
+             selected={selected:?} max_height={max_height}"
+        );
+    }
+
+    #[test]
+    fn predict_empty_list() {
+        assert_eq!(predict_list_offset(&[], 0, None, 10), 0);
+        assert_eq!(predict_list_offset(&[], 0, Some(5), 10), 0);
+        assert_eq!(predict_list_offset(&[], 7, Some(0), 10), 0);
+    }
+
+    #[test]
+    fn predict_zero_max_height() {
+        // Degenerate: zero rows available. The predictor returns the
+        // clamped prev_offset without touching ratatui (which would
+        // panic). This is a defensive path; production callers never
+        // pass max_height=0 because the inner area is always >= 1 row
+        // when this function is called.
+        assert_eq!(predict_list_offset(&[1, 2, 3], 1, Some(2), 0), 1);
+    }
+
+    #[test]
+    fn predict_no_scroll_needed() {
+        // Everything fits, selected item is first.
+        let heights = vec![1, 2, 2, 2];
+        assert_predictor_matches(&heights, 0, Some(0), 10, "no scroll, select first");
+    }
+
+    #[test]
+    fn predict_selection_below_viewport_scrolls_down() {
+        // Items don't fit; the selected index is past the tail, so the
+        // list must scroll down.
+        let heights = vec![1, 2, 2, 2, 1, 2, 2, 2, 2, 2];
+        assert_predictor_matches(&heights, 0, Some(9), 8, "scroll down to last");
+    }
+
+    #[test]
+    fn predict_selection_above_viewport_scrolls_up() {
+        // prev_offset is deep into the list but the selection is above
+        // it - must scroll back up.
+        let heights = vec![2, 2, 2, 2, 2, 2];
+        assert_predictor_matches(&heights, 4, Some(0), 6, "scroll up to first");
+    }
+
+    #[test]
+    fn predict_variable_heights_mixed() {
+        // Headers (1 row) interleaved with work items (2 rows) - the
+        // bug case from the user's screenshot.
+        let heights = vec![1, 2, 2, 2, 1, 2, 2, 2, 2, 2];
+        assert_predictor_matches(&heights, 0, Some(9), 7, "sticky-bug layout");
+        assert_predictor_matches(&heights, 0, Some(8), 8, "sticky-bug layout deeper");
+    }
+
+    #[test]
+    fn predict_selection_is_first_item_of_second_group() {
+        // Display list with two 1-row headers at indices 0 and 4, and
+        // 2-row items elsewhere. Select the first item under the second
+        // header - exactly the scenario from the regression test.
+        let heights = vec![1, 2, 2, 2, 1, 2, 2];
+        assert_predictor_matches(&heights, 0, Some(5), 8, "first item of second group, fits");
+        // Same list with a shorter viewport.
+        assert_predictor_matches(
+            &heights,
+            0,
+            Some(5),
+            5,
+            "first item of second group, short viewport",
+        );
+    }
+
+    #[test]
+    fn predict_last_index_from_offset_zero() {
+        let heights = vec![3, 3, 3, 3, 3];
+        assert_predictor_matches(&heights, 0, Some(4), 6, "last item, tight");
+    }
+
+    #[test]
+    fn predict_selection_none_resets_offset_like_ratatui() {
+        // ratatui's `ListState::select(None)` also resets the offset to 0.
+        // The production call path renders with select() after with_offset,
+        // so when no item is selected the effective offset is 0 regardless
+        // of what prev_offset we pass in. The predictor must match.
+        let heights = vec![1, 1, 1, 1, 1, 1, 1, 1];
+        assert_predictor_matches(&heights, 3, None, 4, "no selection, reset to 0");
+        let predicted = predict_list_offset(&heights, 3, None, 4);
+        assert_eq!(predicted, 0);
+    }
+
+    #[test]
+    fn predict_single_item_fits() {
+        let heights = vec![1];
+        assert_predictor_matches(&heights, 0, Some(0), 3, "single item");
+    }
+
+    #[test]
+    fn predict_offset_past_end_is_clamped() {
+        // prev_offset exceeds the list length. ratatui clamps to
+        // items.len()-1 before doing any work; the predictor must match.
+        let heights = vec![1, 1, 1];
+        assert_predictor_matches(&heights, 99, Some(0), 3, "offset past end");
+    }
 }
 
 #[cfg(test)]
 mod snapshot_tests {
     use super::draw_to_buffer;
     use crate::app::{
-        App, FocusPanel, ReviewGateOrigin, ReviewGateState, StubBackend, UserActionKey, ViewMode,
-        is_selectable,
+        App, DisplayEntry, FocusPanel, ReviewGateOrigin, ReviewGateState, StubBackend,
+        UserActionKey, ViewMode, is_selectable,
     };
     use crate::theme::Theme;
     use crate::work_item::{
@@ -5429,5 +5776,68 @@ mod snapshot_tests {
         }
         // Short viewport so the BACKLOGGED header scrolls off -> sticky.
         insta::assert_snapshot!(render(&mut app, 80, 12));
+    }
+
+    /// Regression: the sticky group header must NEVER paint over the first
+    /// wrapped line of the topmost visible (and in particular the selected)
+    /// work item. Before the structural-slot fix the sticky `Paragraph`
+    /// overlay overwrote the first row of the list body, hiding the title
+    /// of the selected item when it was the topmost visible entry and its
+    /// group header had scrolled above the viewport.
+    ///
+    /// This test uses a text-based assertion (not a snapshot) so small
+    /// unrelated layout changes do not require re-blessing the expectation.
+    /// It picks a title with a unique wrap-friendly substring and asserts
+    /// that:
+    ///   1. the sticky header is still displayed (the fix did not disable it),
+    ///   2. the selected item's first line is still present in the rendered
+    ///      output (the fix did not merely hide the sticky).
+    #[test]
+    fn sticky_header_does_not_overlap_selected_item() {
+        // Two groups. The first BACKLOGGED item gets a distinctive title
+        // chosen to mirror the user's screenshot - when it is selected and
+        // the ACTIVE group has scrolled above the viewport, the buggy
+        // overlay would paint "BACKLOGGED (repo)" over "show cwd in...".
+        let items = vec![
+            make_work_item("a1", "Active one", WorkItemStatus::Implementing, None, 1),
+            make_work_item("a2", "Active two", WorkItemStatus::Implementing, None, 1),
+            make_work_item("a3", "Active three", WorkItemStatus::Implementing, None, 1),
+            make_work_item("a4", "Active four", WorkItemStatus::Implementing, None, 1),
+            make_work_item(
+                "b1",
+                "show cwd in status bar for workitems",
+                WorkItemStatus::Backlog,
+                None,
+                1,
+            ),
+            make_work_item("b2", "Backlog other", WorkItemStatus::Backlog, None, 1),
+        ];
+        let mut app = app_with_items(items, vec![]);
+        // Select the first BACKLOGGED item specifically. With a short
+        // viewport this forces the list to scroll so that the BACKLOGGED
+        // group header sits at the top of the body and the ACTIVE group
+        // header is above the viewport - the exact scenario where the old
+        // overlay clobbered the selected item's first wrapped line.
+        let target = app
+            .display_list
+            .iter()
+            .position(|e| matches!(e, DisplayEntry::WorkItemEntry(idx) if *idx == 4))
+            .expect("target BACKLOGGED item must be in display list");
+        app.selected_item = Some(target);
+
+        let rendered = render(&mut app, 40, 12);
+
+        // The sticky (or real) BACKLOGGED header must still be shown.
+        assert!(
+            rendered.contains("BACKLOGGED"),
+            "BACKLOGGED header must still render after the fix:\n{rendered}"
+        );
+        // The distinctive first-line substring of the selected item must
+        // be present in the output. Before the fix it was painted over.
+        assert!(
+            rendered.contains("show cwd"),
+            "selected item's first wrapped line must be visible, \
+             not overlapped by the sticky header:\n{rendered}"
+        );
     }
 }
