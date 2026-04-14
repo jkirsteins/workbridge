@@ -13,4 +13,4 @@ expression: "render(&app, 80, 12)"
 │> [BL] Backlog 5       ││  Branch      branch-b5                              │
 │  branch-b5 [no wt]    ││  Worktree    (none)                                 │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
-Backlog 5 | [Backlog] | /repo/b5/0
+Backlog 5 | [Backlog] | 0

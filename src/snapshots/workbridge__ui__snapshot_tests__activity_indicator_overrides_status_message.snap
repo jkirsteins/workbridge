@@ -24,5 +24,5 @@ expression: "render(&app, 80, 24)"
 │                       ││                                                     │
 │                       ││                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
-Build feature | [Implementing] | /repo/act-1/0
+Build feature | [Implementing] | 0
  ⠸ Creating pull request...

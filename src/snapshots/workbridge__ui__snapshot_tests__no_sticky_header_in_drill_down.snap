@@ -13,4 +13,4 @@ expression: "render(&app, 80, 12)"
 │                       ││  Branch      branch-c                               │
 │                       ││  Worktree    (none)                                 │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
-Item C | [Implementing] | /repo/c/0
+Item C | [Implementing] | 0
