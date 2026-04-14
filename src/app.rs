@@ -7861,23 +7861,56 @@ impl App {
     // -- Global assistant --------------------------------------------------
 
     /// Toggle the global assistant drawer open/closed.
-    /// On first open, spawns the global session lazily.
+    ///
+    /// Every open spawns a fresh `claude` session with an empty context.
+    /// Every close immediately tears the session down (kills the child,
+    /// drops the MCP server, removes the temp MCP config file, and drops
+    /// any buffered keystrokes) so no state leaks into the next opening.
     pub fn toggle_global_drawer(&mut self) {
         if self.global_drawer_open {
-            // Close drawer, restore previous focus.
+            // Close drawer, restore previous focus, and tear down the
+            // session so the next open starts from a blank slate.
             self.global_drawer_open = false;
             self.focus = self.pre_drawer_focus;
+            self.teardown_global_session();
         } else {
-            // Open drawer.
+            // Open drawer. Defensively tear down any lingering session
+            // state first (covers the edge case where a previous session
+            // survived for any reason - e.g. a crash path that skipped
+            // the normal close branch), then spawn a fresh session every
+            // time so the user always sees an empty PTY with no prior
+            // conversation or scrollback.
+            self.teardown_global_session();
             self.pre_drawer_focus = self.focus;
             self.global_drawer_open = true;
-
-            // Spawn on first use (or respawn if dead).
-            let needs_spawn = self.global_session.as_ref().is_none_or(|s| !s.alive);
-            if needs_spawn {
-                self.spawn_global_session();
-            }
+            self.spawn_global_session();
         }
+    }
+
+    /// Tear down the global assistant session and all its associated
+    /// resources. Safe to call when no session exists.
+    ///
+    /// Steps:
+    /// 1. SIGTERM + 50 ms grace + SIGKILL the `claude` child process via
+    ///    `Session::kill` so no zombie survives.
+    /// 2. Drop the `SessionEntry`; `Session::Drop` joins the reader thread.
+    /// 3. Drop the MCP server (same as `cleanup_all_mcp`).
+    /// 4. Remove the temp MCP config file and clear its path.
+    /// 5. Drop any keystrokes queued for the old session's PTY so they
+    ///    don't leak into the next session on reopen.
+    fn teardown_global_session(&mut self) {
+        if let Some(ref mut entry) = self.global_session
+            && let Some(ref mut session) = entry.session
+        {
+            session.kill();
+        }
+        self.global_session = None;
+        self.global_mcp_server = None;
+        if let Some(ref path) = self.global_mcp_config_path {
+            let _ = std::fs::remove_file(path);
+        }
+        self.global_mcp_config_path = None;
+        self.pending_global_pty_bytes.clear();
     }
 
     /// Spawn the global assistant Claude Code session.
@@ -7968,16 +8001,35 @@ impl App {
         cmd.push("--mcp-config".to_string());
         cmd.push(config_path.to_string_lossy().to_string());
 
-        // Use home directory as cwd (neutral, not biased toward any repo).
-        let home = directories::UserDirs::new()
-            .map(|u| u.home_dir().to_path_buf())
-            .unwrap_or_else(std::env::temp_dir);
+        // Use a dedicated workbridge-owned scratch directory as cwd.
+        //
+        // We deliberately avoid `$HOME` here: Claude Code's workspace trust
+        // dialog ("Do you trust the files in this folder?") persists its
+        // acceptance per-project in `~/.claude.json`, but the home directory
+        // does not reliably persist that acceptance, so using `$HOME` as the
+        // cwd produces the trust prompt on every single Ctrl+G. Every
+        // non-home project path Claude Code sees DOES persist trust
+        // correctly, so a stable workbridge-owned scratch directory sidesteps
+        // the problem entirely without workbridge ever reading or writing
+        // `~/.claude.json`. On macOS `$TMPDIR` is per-user and stable across
+        // reboots, so the scratch path string is stable across workbridge
+        // runs, which means Claude Code's normal trust persistence carries
+        // over from one run to the next. The `create_dir_all` call is
+        // idempotent and also handles the case where the OS tmp cleaner has
+        // wiped the directory since the last spawn.
+        let scratch = std::env::temp_dir().join("workbridge-global-assistant-cwd");
+        if let Err(e) = std::fs::create_dir_all(&scratch) {
+            self.status_message = Some(format!("Global assistant scratch dir error: {e}"));
+            self.global_drawer_open = false;
+            self.focus = self.pre_drawer_focus;
+            return;
+        }
 
         let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
         match Session::spawn(
             self.global_pane_cols,
             self.global_pane_rows,
-            Some(&home),
+            Some(&scratch),
             &cmd_refs,
         ) {
             Ok(session) => {
@@ -11777,6 +11829,144 @@ mod tests {
         assert!(
             cmd.last().unwrap().contains("start working"),
             "implementing should have auto-start prompt",
+        );
+    }
+
+    // -- Feature: global assistant drawer teardown --
+
+    /// `teardown_global_session` must clear every piece of global-assistant
+    /// state: the `SessionEntry`, the MCP server slot, the temp MCP config
+    /// file (and its path), and any buffered PTY keystrokes. This is what
+    /// guarantees the next Ctrl+G opening starts from a blank slate.
+    #[test]
+    fn teardown_global_session_clears_all_state() {
+        let mut app = App::new();
+
+        // Pre-populate a fake SessionEntry with no real PTY child. The
+        // `session: None` avoids needing to spawn a real subprocess; the
+        // teardown helper skips the `session.kill()` branch when the
+        // inner session is None and still runs the rest of the cleanup.
+        let parser = Arc::new(std::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+        app.global_session = Some(SessionEntry {
+            parser,
+            alive: true,
+            session: None,
+            scrollback_offset: 0,
+            selection: None,
+        });
+
+        // Pre-populate a real temp file as the MCP config path so we can
+        // verify teardown actually deletes the file from disk.
+        let temp_path = std::env::temp_dir().join(format!(
+            "workbridge-teardown-test-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
+        assert!(temp_path.exists(), "precondition: temp file exists");
+        app.global_mcp_config_path = Some(temp_path.clone());
+
+        // Pre-populate buffered PTY keystrokes that must NOT leak into a
+        // freshly-spawned replacement session.
+        app.pending_global_pty_bytes
+            .extend_from_slice(b"stale-keys");
+
+        app.teardown_global_session();
+
+        assert!(
+            app.global_session.is_none(),
+            "global_session must be cleared",
+        );
+        assert!(
+            app.global_mcp_server.is_none(),
+            "global_mcp_server must be cleared",
+        );
+        assert!(
+            app.global_mcp_config_path.is_none(),
+            "global_mcp_config_path must be cleared",
+        );
+        assert!(
+            app.pending_global_pty_bytes.is_empty(),
+            "pending_global_pty_bytes must be drained so stale keystrokes \
+             don't leak into the next session",
+        );
+        assert!(
+            !temp_path.exists(),
+            "teardown must delete the temp MCP config file from disk",
+        );
+    }
+
+    /// Calling `teardown_global_session` with no state set must be a no-op
+    /// and must not panic. The helper runs on every close and every open,
+    /// so it has to tolerate being called when nothing has been spawned
+    /// yet (e.g. the very first open of an app run, or the defensive call
+    /// in the open branch when no previous session exists).
+    #[test]
+    fn teardown_global_session_is_idempotent_on_empty_state() {
+        let mut app = App::new();
+        assert!(app.global_session.is_none());
+        assert!(app.global_mcp_config_path.is_none());
+        assert!(app.pending_global_pty_bytes.is_empty());
+
+        app.teardown_global_session();
+
+        assert!(app.global_session.is_none());
+        assert!(app.global_mcp_server.is_none());
+        assert!(app.global_mcp_config_path.is_none());
+        assert!(app.pending_global_pty_bytes.is_empty());
+    }
+
+    /// The close branch of `toggle_global_drawer` must run the teardown so
+    /// the next open starts from a blank slate. Exercising the close
+    /// branch directly (rather than round-tripping through the open
+    /// branch) avoids spawning a real `claude` subprocess in tests.
+    #[test]
+    fn toggle_global_drawer_close_tears_down_session() {
+        let mut app = App::new();
+
+        // Simulate a drawer that is already open with live state.
+        app.global_drawer_open = true;
+        app.pre_drawer_focus = app.focus;
+
+        let parser = Arc::new(std::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+        app.global_session = Some(SessionEntry {
+            parser,
+            alive: true,
+            session: None,
+            scrollback_offset: 0,
+            selection: None,
+        });
+
+        let temp_path = std::env::temp_dir().join(format!(
+            "workbridge-toggle-close-test-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
+        app.global_mcp_config_path = Some(temp_path.clone());
+        app.pending_global_pty_bytes.extend_from_slice(b"leftover");
+
+        // Close branch: no spawn involved, so this is safe in any test env.
+        app.toggle_global_drawer();
+
+        assert!(!app.global_drawer_open, "drawer must be closed");
+        assert!(
+            app.global_session.is_none(),
+            "close must clear global_session",
+        );
+        assert!(
+            app.global_mcp_server.is_none(),
+            "close must clear global_mcp_server",
+        );
+        assert!(
+            app.global_mcp_config_path.is_none(),
+            "close must clear global_mcp_config_path",
+        );
+        assert!(
+            app.pending_global_pty_bytes.is_empty(),
+            "close must drain pending_global_pty_bytes",
+        );
+        assert!(
+            !temp_path.exists(),
+            "close must delete the temp MCP config file",
         );
     }
 
