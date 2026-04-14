@@ -1277,7 +1277,19 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
             .thumb_style(theme.style_scrollbar_thumb())
             .track_style(theme.style_scrollbar_track());
 
-        let mut scrollbar_state = ScrollbarState::new(total_rows).position(row_offset);
+        // Ratatui's `Scrollbar::part_lengths` requires
+        // `position == content_length - 1` for the thumb's lower edge to
+        // reach the bottom of the track. The number of distinct row-granular
+        // scroll positions is `max_row_offset + 1`, so we size
+        // `content_length` accordingly and clamp `row_offset` to guard
+        // against variable-height edge cases where the list may reserve
+        // blank rows below the last item.
+        let max_row_offset = total_rows.saturating_sub(inner_height);
+        let content_length = max_row_offset + 1;
+        let position = row_offset.min(max_row_offset);
+        let mut scrollbar_state = ScrollbarState::new(content_length)
+            .viewport_content_length(inner_height)
+            .position(position);
 
         let scrollbar_area = area.inner(Margin::new(0, 1));
         StatefulWidget::render(scrollbar, scrollbar_area, buf, &mut scrollbar_state);
