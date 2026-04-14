@@ -170,10 +170,12 @@ all, making this violation structurally impossible.
 
 The worktree-creation race is handled entirely off the UI thread. If
 a worktree-creation background thread has already completed (its
-result is sitting in `worktree_create_rx`) at the moment the user
-confirms the delete, `delete_work_item_by_id()` Phase 5 drains the
-receiver and appends the orphan's `(repo_path, worktree_path, branch)`
-to an `orphan_worktrees` vector passed in by the caller. Each caller
+result is sitting in the `UserActionPayload::WorktreeCreate` receiver
+stored under `UserActionKey::WorktreeCreate` in the user-action guard)
+at the moment the user confirms the delete, `delete_work_item_by_id()`
+Phase 5 drains the receiver and appends the orphan's `(repo_path,
+worktree_path, branch)` to an `orphan_worktrees` vector passed in by
+the caller. Each caller
 (MCP delete and `confirm_delete_from_prompt`) then forwards every
 orphan entry to `spawn_delete_cleanup()` as a synthesized
 `DeleteCleanupInfo`, so `git worktree remove --force` and the follow-up

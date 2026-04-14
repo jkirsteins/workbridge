@@ -5,7 +5,7 @@ use crate::work_item::SelectionState;
 
 use crate::app::{
     App, BOARD_COLUMNS, DashboardWindow, DisplayEntry, FocusPanel, RightPanelTab,
-    SettingsListFocus, SettingsTab, ViewMode,
+    SettingsListFocus, SettingsTab, UserActionKey, ViewMode,
 };
 use crate::create_dialog::CreateDialogFocus;
 use crate::layout;
@@ -80,7 +80,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // Handle Q/Ctrl+Q directly here so the user can force-quit if a subprocess
     // hangs, rather than falling through to cleanup_prompt_visible which would
     // swallow the key in its catch-all arm.
-    if app.cleanup_in_progress {
+    if app.is_user_action_in_flight(&UserActionKey::UnlinkedCleanup) {
         if matches!(
             (key.modifiers, key.code),
             (
@@ -379,8 +379,44 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // Ctrl+R - force refresh GitHub data (global, works in any view).
+    //
+    // Gated through the user-action helper with a 500ms debounce so
+    // rapid key spam does not dog-pile the fetcher / `gh` subprocess
+    // pool. The structural fetcher-restart sites elsewhere in the
+    // codebase continue to set `fetcher_repos_changed` directly - they
+    // represent "repo set changed", not "user wants fresh data", and
+    // must not be debounced.
     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('r') {
-        app.fetcher_repos_changed = true;
+        // Hard gate: any fetch cycle currently in flight (structural or
+        // Ctrl+R-initiated) must drain before a new Ctrl+R is admitted.
+        // `fetcher::stop` only flips an atomic flag - it does NOT kill
+        // the in-flight `gh` subprocess, so a naive "restart on every
+        // press" still accumulates concurrent TLS handshakes under key
+        // spam. Gating on `pending_fetch_count` (the count of repos
+        // whose `FetchStarted` has been observed but whose `RepoData` /
+        // `FetcherError` has not) guarantees we never admit a second
+        // refresh while the previous cycle's subprocesses are still
+        // talking to github.com. The 500ms debounce below still applies
+        // as a secondary guard against pre-FetchStarted spam windows.
+        if app.pending_fetch_count > 0 {
+            app.status_message = Some("Refresh already in progress".into());
+            return true;
+        }
+        if app
+            .try_begin_user_action(
+                UserActionKey::GithubRefresh,
+                std::time::Duration::from_millis(500),
+                "Refreshing GitHub data",
+            )
+            .is_some()
+        {
+            app.fetcher_repos_changed = true;
+        } else if app.is_user_action_in_flight(&UserActionKey::GithubRefresh) {
+            // Only distinguish the "already in flight" case; the
+            // debounce rejection is intentionally silent so normal
+            // key-spam protection does not pollute the status bar.
+            app.status_message = Some("Refresh already in progress".into());
+        }
         return true;
     }
 
@@ -1133,7 +1169,7 @@ fn any_modal_visible(app: &App) -> bool {
         || app.branch_gone_prompt.is_some()
         || app.confirm_merge
         || app.cleanup_prompt_visible
-        || app.cleanup_in_progress
+        || app.is_user_action_in_flight(&UserActionKey::UnlinkedCleanup)
         || app.merge_in_progress
         || app.delete_prompt_visible
         || app.delete_in_progress
@@ -2521,7 +2557,12 @@ mod tests {
     fn cleanup_in_progress_swallows_keys() {
         let mut app = App::new();
         app.cleanup_prompt_visible = true;
-        app.cleanup_in_progress = true;
+        app.try_begin_user_action(
+            UserActionKey::UnlinkedCleanup,
+            std::time::Duration::ZERO,
+            "Cleaning up unlinked PR...",
+        )
+        .expect("helper admit should succeed");
 
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         handle_key(&mut app, esc);
@@ -2531,8 +2572,8 @@ mod tests {
             "dialog should stay open during progress"
         );
         assert!(
-            app.cleanup_in_progress,
-            "in-progress flag must not clear on Esc"
+            app.is_user_action_in_flight(&UserActionKey::UnlinkedCleanup),
+            "in-progress guard must not clear on Esc"
         );
     }
 
@@ -2600,6 +2641,99 @@ mod tests {
         assert!(
             app.delete_in_progress,
             "in-progress flag must not clear on stray keys"
+        );
+    }
+
+    /// Ctrl+R first press drives through `handle_key` and flips
+    /// `fetcher_repos_changed = true`. This is the happy-path baseline
+    /// the two gating tests below depend on (they both assume the
+    /// first press is admitted through the real dispatch path).
+    #[test]
+    fn ctrl_r_first_press_flips_fetcher_repos_changed() {
+        let mut app = App::new();
+        assert!(!app.fetcher_repos_changed);
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let changed = handle_key(&mut app, ctrl_r);
+        assert!(changed, "Ctrl+R must report state changed");
+        assert!(
+            app.fetcher_repos_changed,
+            "Ctrl+R must set fetcher_repos_changed",
+        );
+        assert!(
+            app.is_user_action_in_flight(&UserActionKey::GithubRefresh),
+            "Ctrl+R must have admitted the GithubRefresh helper entry",
+        );
+    }
+
+    /// Ctrl+R second press within the debounce window: `handle_key`
+    /// returns `true` but `fetcher_repos_changed` must NOT be flipped a
+    /// second time, because the helper entry from the first press is
+    /// still in flight. This drives through the real `handle_key`
+    /// dispatch so the debounce/in-flight pre-checks are actually
+    /// exercised (unlike the unit tests that invoke the helper
+    /// directly).
+    #[test]
+    fn ctrl_r_rapid_double_press_through_handle_key_is_gated() {
+        let mut app = App::new();
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+
+        // First press admits.
+        handle_key(&mut app, ctrl_r);
+        assert!(app.fetcher_repos_changed);
+
+        // Simulate the salsa tick consuming the flag (the scheduler
+        // reads and resets it once per tick when the restart block
+        // runs). We do NOT reset the helper entry - a tight double-
+        // press happens BEFORE `drain_fetch_results` has observed any
+        // `FetchStarted`, so `pending_fetch_count` is still 0 and the
+        // only protection is the helper's in-flight check.
+        app.fetcher_repos_changed = false;
+
+        // Second press within the debounce window: the helper's
+        // in-flight check rejects, so `fetcher_repos_changed` stays
+        // false and a status message is set.
+        let changed = handle_key(&mut app, ctrl_r);
+        assert!(changed, "handler still returns true on reject path");
+        assert!(
+            !app.fetcher_repos_changed,
+            "second Ctrl+R must not re-flip fetcher_repos_changed",
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Refresh already in progress"),
+            "in-flight rejection must surface the user-visible message",
+        );
+    }
+
+    /// Ctrl+R while `pending_fetch_count > 0`: the hard gate in
+    /// `handle_key` rejects the press regardless of helper state. This
+    /// test exercises the exact pre-check added by R1-F-1 - seeding
+    /// `pending_fetch_count = 1` without touching the helper entry so
+    /// only the count gate can cause the rejection.
+    #[test]
+    fn ctrl_r_rejected_while_pending_fetch_count_nonzero() {
+        let mut app = App::new();
+        // Seed as if a prior tick's `drain_fetch_results` had counted
+        // one `FetchStarted`. No helper entry is inserted, so the
+        // in-flight check alone would admit this press.
+        app.pending_fetch_count = 1;
+        assert!(!app.is_user_action_in_flight(&UserActionKey::GithubRefresh));
+
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let changed = handle_key(&mut app, ctrl_r);
+        assert!(changed, "handler returns true even on reject path");
+        assert!(
+            !app.fetcher_repos_changed,
+            "count gate must block the fetcher restart",
+        );
+        assert!(
+            !app.is_user_action_in_flight(&UserActionKey::GithubRefresh),
+            "count gate must reject BEFORE the helper is admitted",
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Refresh already in progress"),
+            "count-gate rejection must surface the user-visible message",
         );
     }
 }

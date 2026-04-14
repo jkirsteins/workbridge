@@ -499,9 +499,137 @@ Pattern for user-initiated dialog operations:
 
 Reference implementations:
 - Cleanup dialog: `spawn_unlinked_cleanup()`, `poll_unlinked_cleanup()`,
-  `cleanup_in_progress` guard in event.rs
+  `is_user_action_in_flight(&UserActionKey::UnlinkedCleanup)` read by
+  event.rs / ui.rs / salsa.rs (see "User action guard" below).
 - Merge dialog: `execute_merge()`, `poll_pr_merge()`,
-  `merge_in_progress` guard in event.rs
+  `merge_in_progress` guard in event.rs.
+
+### User action guard
+
+Every user-initiated remote-I/O spawn on `App` (PR create / merge /
+review, worktree create, unlinked-PR cleanup, delete cleanup, Ctrl+R
+refresh) is admitted through a single helper:
+
+```rust
+if let Some(activity_id) = app.try_begin_user_action(
+    UserActionKey::PrCreate,
+    Duration::ZERO,         // or Duration::from_millis(500) for Ctrl+R
+    "Creating pull request...",
+) {
+    // Spawn the background thread here.
+    app.attach_user_action_payload(
+        &UserActionKey::PrCreate,
+        UserActionPayload::PrCreate { rx, wi_id },
+    );
+}
+```
+
+The helper owns a single `HashMap<UserActionKey, UserActionState>`
+backing three methods:
+
+- `try_begin_user_action(key, debounce, message)` - returns
+  `Some(ActivityId)` if the key is free AND the debounce window has
+  elapsed since the last attempt. Starts a status-bar activity and
+  inserts the map entry. Returns `None` otherwise. **Does NOT emit any
+  status message or alert on rejection** - every caller owns its
+  rejection UX and the wording is caller-specific.
+- `attach_user_action_payload(&key, payload)` - attaches the
+  background-thread receiver (and any metadata like `wi_id`) to the
+  entry so the same drop site ends both the activity and the channel.
+- `end_user_action(&key)` - removes the entry and ends the activity.
+  Idempotent, so cancel / retreat / delete paths can call it blindly.
+- `is_user_action_in_flight(&key)` - pure in-memory boolean used by
+  UI / event / salsa code to gate behaviour on the guard state. Safe
+  on the UI thread because it never touches I/O.
+
+Key semantics:
+
+- **One slot per `UserActionKey` variant** (`PrCreate`, `PrMerge`,
+  `ReviewSubmit`, `WorktreeCreate`, `UnlinkedCleanup`, `DeleteCleanup`,
+  `GithubRefresh`). Single-flight per-action is the point. Per-item
+  concurrency (e.g. parallel worktree creation for different repos) is
+  intentionally out of scope; if it is ever wanted, key the variant on
+  `(RepoPath, Branch)` instead of a bare discriminant.
+- **Debounce is caller-specified.** Only Ctrl+R currently passes a
+  nonzero value (500 ms); every other caller passes `Duration::ZERO`
+  so only in-flight state gates admission.
+- **Desync guard:** every `spawn_*` must run ALL validity checks
+  (missing repo, missing branch, missing `github_remote` cache) BEFORE
+  `try_begin_user_action`, so an early return cannot leave an
+  orphaned helper entry. If the helper accepts, the only remaining
+  failure modes are the background-thread disconnect (handled in the
+  matching `poll_*`) and the explicit retreat / delete cancel paths
+  (which call `end_user_action` idempotently).
+- **Structural fetcher restarts do not go through the helper.** The
+  `fetcher_repos_changed` flag is set by ~11 structural sites in
+  `src/app.rs` when the managed-repo set changes; `salsa.rs` honours
+  the flag by stopping the old fetcher and starting a new one. Only
+  the explicit Ctrl+R press goes through `UserActionKey::GithubRefresh`
+  - everything else is "repo set changed", not "user wants fresh
+  data", and must not be debounced.
+- **At most one fetch spinner.** `drain_fetch_results` checks
+  `is_user_action_in_flight(&GithubRefresh)` on `FetchStarted`; if
+  true the helper entry's activity is reused, otherwise a local
+  `structural_fetch_activity: Option<ActivityId>` field owns the
+  spinner for that cycle. When `pending_fetch_count` returns to zero
+  both owners are cleared.
+- **The `GithubRefresh` helper entry is intentionally short-lived.**
+  The Ctrl+R event handler admits the helper entry, sets
+  `fetcher_repos_changed = true`, and returns. On the next salsa tick
+  the restart block calls `end_user_action(&GithubRefresh)` BEFORE
+  stopping the old fetcher (`src/salsa.rs`), so the helper entry
+  exists only for the few milliseconds between the keypress and the
+  restart. The practical consequence is that spam protection between
+  two rapid Ctrl+R presses comes from the 500 ms **debounce**
+  (`last_attempted` timestamp), not from the in-flight check -
+  `is_user_action_in_flight(&GithubRefresh)` is almost always false
+  by the time a second press arrives. The visible spinner for the
+  resulting fetch cycle is owned by `structural_fetch_activity` in
+  `drain_fetch_results`, not by the (already-dropped) helper entry.
+  This is by design: it keeps the single-spinner invariant intact and
+  makes the structural restart path the one true source of the
+  fetch-spinner activity regardless of whether the refresh was
+  user-initiated or triggered by a repo-set change.
+- **Handoff at structural restart.** The restart block in
+  `src/salsa.rs` calls `end_user_action(&GithubRefresh)` BEFORE
+  stopping the old fetcher so a structural restart mid-Ctrl+R never
+  leaves the helper with a stale entry pointing at a dead fetcher.
+- **Modal-owned spinners hide the status-bar activity.** Both the
+  unlinked cleanup modal and the delete cleanup modal already render
+  their own in-progress spinners; to avoid a stacked duplicate, those
+  spawn functions admit the helper entry and then immediately
+  `end_activity(activity_id)` on the returned ID. The map entry stays
+  alive so `is_user_action_in_flight` keeps reporting the true state;
+  only the visible spinner is suppressed.
+- **Caller-local rejection messages.** When `try_begin_user_action`
+  returns `None`, the caller re-adds its existing alert / status
+  string verbatim. `execute_merge` keeps `"PR merge already in
+  progress"` as an `alert_message`; `spawn_delete_cleanup` keeps its
+  long delete-cleanup alert; the others keep their existing
+  `status_message` strings.
+
+Receivers, activity IDs, and per-action metadata all live inside the
+map entry's `UserActionPayload`, never as free-standing `Option` fields
+on `App`. That is the structural-ownership rule from `CLAUDE.md`
+applied to single-flight admission: dropping the map entry drops the
+receiver, the activity, and any `WorkItemId` in lockstep, and there is
+no way to forget an `if owner_matches` check at a cancel site.
+
+Reference implementations:
+
+- `spawn_pr_creation` / `poll_pr_creation` - bespoke
+  `pr_create_pending` queue sits outside the helper (queueing
+  semantics are PR-create-specific; the helper only admits the next
+  in-flight entry).
+- `execute_merge` / `poll_pr_merge`.
+- `spawn_review_submission` / `poll_review_submission`.
+- `spawn_session` + `spawn_import_worktree` - shared
+  `UserActionKey::WorktreeCreate` slot; two callers compete for one
+  global admission slot by design.
+- `spawn_unlinked_cleanup` / `poll_unlinked_cleanup`.
+- `spawn_delete_cleanup` / `poll_delete_cleanup`.
+- `drain_fetch_results` / `src/event.rs` Ctrl+R handler /
+  `src/salsa.rs` restart block.
 
 ## Rendering
 
