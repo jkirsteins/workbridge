@@ -794,6 +794,19 @@ Each entry is rendered as a multi-line `ListItem` by
    `[no wt]` marker when the worktree is missing. Also styled with
    `meta_style`.
 
+While a work item is running its async review gate (PR existence -> CI
+wait -> adversarial review, see docs/work-items.md "Review gate"), a
+yellow+bold `[RG]` badge is inserted immediately to the right of the
+stage badge (e.g. `[IM][RG] feature-3` or `[BK][RG] fix-5`). The badge
+appears the instant the id enters `app.review_gates` and disappears the
+instant it is removed via `drop_review_gate` (gate approved, rejected,
+or retreated). It never appears on Done items because the gate cannot
+run on a Done item. `[RG]` coexists with the `[RR]` review-request kind
+badge as `[RR][IM][RG]`. The presence-only `[RG]` badge is what makes
+"Claude actively coding" distinguishable from "gate running in the
+background" in the list, because both share the same cyan braille
+spinner in the left margin.
+
 Stage transitions: Shift+Right to advance, Shift+Left to retreat.
 
 Left panel: 25% of width (min 30 columns)
