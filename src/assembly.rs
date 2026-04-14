@@ -5,7 +5,7 @@ use regex::Regex;
 
 use crate::github_client::{GithubIssue, GithubPr};
 use crate::work_item::{
-    CheckStatus, GitState, IssueInfo, IssueState, PrInfo, PrState, RepoAssociation,
+    CheckStatus, GitState, IssueInfo, IssueState, MergeableState, PrInfo, PrState, RepoAssociation,
     RepoFetchResult, ReviewDecision, ReviewRequestedPr, UnlinkedPr, WorkItem, WorkItemError,
     WorkItemId, WorkItemKind, WorkItemStatus,
 };
@@ -21,6 +21,7 @@ fn convert_pr(pr: &GithubPr) -> PrInfo {
         is_draft: pr.is_draft,
         review_decision: convert_review_decision(&pr.review_decision),
         checks: convert_check_status(&pr.status_check_rollup),
+        mergeable: convert_mergeable_state(&pr.mergeable),
         url: pr.url.clone(),
     }
 }
@@ -52,6 +53,15 @@ fn convert_check_status(raw: &str) -> CheckStatus {
         "FAILURE" => CheckStatus::Failing,
         "" => CheckStatus::None,
         _ => CheckStatus::Unknown,
+    }
+}
+
+/// Convert a raw mergeable string from GitHub into a MergeableState enum.
+fn convert_mergeable_state(raw: &str) -> MergeableState {
+    match raw {
+        "MERGEABLE" => MergeableState::Mergeable,
+        "CONFLICTING" => MergeableState::Conflicting,
+        _ => MergeableState::Unknown,
     }
 }
 
@@ -277,6 +287,7 @@ pub fn reassemble(
                     is_draft: false,
                     review_decision: ReviewDecision::None,
                     checks: CheckStatus::None,
+                    mergeable: MergeableState::Unknown,
                     url: identity.url.clone(),
                 };
                 if best_pr_title.is_none() {
@@ -498,8 +509,8 @@ mod tests {
     use super::*;
     use crate::github_client::{GithubError, GithubIssue, GithubPr};
     use crate::work_item::{
-        BackendType, CheckStatus, IssueState, PrState, ReviewDecision, WorkItemId, WorkItemKind,
-        WorkItemStatus,
+        BackendType, CheckStatus, IssueState, MergeableState, PrState, ReviewDecision, WorkItemId,
+        WorkItemKind, WorkItemStatus,
     };
     use crate::work_item_backend::{RepoAssociationRecord, WorkItemRecord};
     use crate::worktree_service::WorktreeInfo;
@@ -549,6 +560,7 @@ mod tests {
             status_check_rollup: checks.to_string(),
             head_repo_owner: None,
             author: Some("testuser".to_string()),
+            mergeable: String::new(),
         }
     }
 
@@ -571,6 +583,7 @@ mod tests {
             status_check_rollup: checks.to_string(),
             head_repo_owner: owner.map(|s| s.to_string()),
             author: Some("testuser".to_string()),
+            mergeable: String::new(),
         }
     }
 
@@ -1185,6 +1198,20 @@ mod tests {
         assert_eq!(convert_check_status("FAILURE"), CheckStatus::Failing);
         assert_eq!(convert_check_status(""), CheckStatus::None);
         assert_eq!(convert_check_status("SOMETHING"), CheckStatus::Unknown);
+    }
+
+    #[test]
+    fn convert_mergeable_state_variants() {
+        assert_eq!(
+            convert_mergeable_state("MERGEABLE"),
+            MergeableState::Mergeable
+        );
+        assert_eq!(
+            convert_mergeable_state("CONFLICTING"),
+            MergeableState::Conflicting
+        );
+        assert_eq!(convert_mergeable_state("UNKNOWN"), MergeableState::Unknown);
+        assert_eq!(convert_mergeable_state(""), MergeableState::Unknown);
     }
 
     #[test]

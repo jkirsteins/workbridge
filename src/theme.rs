@@ -87,6 +87,8 @@ pub struct Theme {
     pub badge_ci_fail: Color,
     /// CI pending badge color.
     pub badge_ci_pending: Color,
+    /// Merge-conflict badge color (PR has conflicts with its base branch).
+    pub badge_merge_conflict: Color,
     /// Unlinked item "?" marker color.
     pub unlinked_marker: Color,
     /// Review request "R" marker color (pre-import).
@@ -166,6 +168,7 @@ impl Theme {
             badge_ci_pass: Color::Green,
             badge_ci_fail: Color::Red,
             badge_ci_pending: Color::Yellow,
+            badge_merge_conflict: Color::Red,
             unlinked_marker: Color::Yellow,
             review_request_marker: Color::Magenta,
             badge_review_request_kind: Color::Magenta,
@@ -329,6 +332,10 @@ impl Theme {
 
     pub fn style_badge_ci_pending(&self) -> Style {
         Style::default().fg(self.badge_ci_pending)
+    }
+
+    pub fn style_badge_merge_conflict(&self) -> Style {
+        Style::default().fg(self.badge_merge_conflict)
     }
 
     pub fn style_badge_session_idle(&self) -> Style {

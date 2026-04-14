@@ -8474,7 +8474,7 @@ mod tests {
     /// be restarted to pick up new/removed extra branches.
     #[test]
     fn import_and_delete_set_fetcher_repos_changed() {
-        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
+        use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
         use crate::work_item_backend::ListResult;
 
         /// Test backend that supports import and delete.
@@ -8611,6 +8611,7 @@ mod tests {
                 is_draft: false,
                 review_decision: ReviewDecision::None,
                 checks: CheckStatus::None,
+                mergeable: MergeableState::Unknown,
                 url: "https://github.com/o/r/pull/1".into(),
             },
             branch: "1-test".into(),
@@ -9434,7 +9435,7 @@ mod tests {
     /// reassembly, selection must stay on the correct repo's PR.
     #[test]
     fn unlinked_selection_disambiguates_by_repo_path() {
-        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
+        use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
 
         let mut app = App::new();
 
@@ -9452,6 +9453,7 @@ mod tests {
                 is_draft: false,
                 review_decision: ReviewDecision::None,
                 checks: CheckStatus::None,
+                mergeable: MergeableState::Unknown,
                 url: "https://github.com/o/alpha/pull/1".into(),
             },
             branch: branch.into(),
@@ -9465,6 +9467,7 @@ mod tests {
                 is_draft: false,
                 review_decision: ReviewDecision::None,
                 checks: CheckStatus::None,
+                mergeable: MergeableState::Unknown,
                 url: "https://github.com/o/beta/pull/2".into(),
             },
             branch: branch.into(),
@@ -9602,7 +9605,7 @@ mod tests {
     /// branch, making the work item immediately sessionable.
     #[test]
     fn import_creates_worktree_for_branch() {
-        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
+        use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
         use crate::work_item_backend::ListResult;
         use crate::worktree_service::{WorktreeError, WorktreeInfo};
 
@@ -9825,6 +9828,7 @@ mod tests {
                 is_draft: false,
                 review_decision: ReviewDecision::None,
                 checks: CheckStatus::None,
+                mergeable: MergeableState::Unknown,
                 url: "https://github.com/o/r/pull/42".into(),
             },
             branch: "fix-bug".into(),
@@ -9877,7 +9881,7 @@ mod tests {
     /// exists, but the user is told to check out manually.
     #[test]
     fn import_skips_worktree_when_fetch_fails() {
-        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
+        use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
         use crate::work_item_backend::ListResult;
         use crate::worktree_service::{WorktreeError, WorktreeInfo};
 
@@ -10102,6 +10106,7 @@ mod tests {
                 is_draft: false,
                 review_decision: ReviewDecision::None,
                 checks: CheckStatus::None,
+                mergeable: MergeableState::Unknown,
                 url: "https://github.com/o/r/pull/99".into(),
             },
             branch: "fork-branch".into(),
@@ -10347,7 +10352,7 @@ mod tests {
     /// repo_path/worktree_dir/branch, not repo_path.parent()/<repo>-wt-<branch>.
     #[test]
     fn import_creates_worktree_under_config_worktree_dir() {
-        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
+        use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
         use crate::work_item_backend::ListResult;
         use crate::worktree_service::{WorktreeError, WorktreeInfo};
 
@@ -10573,6 +10578,7 @@ mod tests {
                 is_draft: false,
                 review_decision: ReviewDecision::None,
                 checks: CheckStatus::None,
+                mergeable: MergeableState::Unknown,
                 url: "https://github.com/o/r/pull/42".into(),
             },
             branch: "feature/login-page".into(),
@@ -10872,7 +10878,7 @@ mod tests {
 
     #[test]
     fn display_list_unlinked_with_grouped_items() {
-        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
+        use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
         let mut app = App::new();
         app.unlinked_prs = vec![UnlinkedPr {
             repo_path: PathBuf::from("/repo"),
@@ -10884,6 +10890,7 @@ mod tests {
                 is_draft: false,
                 review_decision: ReviewDecision::None,
                 checks: CheckStatus::None,
+                mergeable: MergeableState::Unknown,
                 url: String::new(),
             },
         }];
@@ -12929,7 +12936,7 @@ mod tests {
     /// associated visibility flags.
     #[test]
     fn delete_cleans_up_memory_state() {
-        use crate::work_item::{CheckStatus, PrInfo, PrState, ReviewDecision};
+        use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
         use crate::work_item_backend::ListResult;
 
         struct TestBackend {
@@ -13050,6 +13057,7 @@ mod tests {
                 is_draft: false,
                 review_decision: ReviewDecision::None,
                 checks: CheckStatus::None,
+                mergeable: MergeableState::Unknown,
                 url: "https://github.com/o/r/pull/1".into(),
             },
             branch: "1-test".into(),
@@ -13553,6 +13561,7 @@ mod tests {
                     status_check_rollup: String::new(),
                     head_repo_owner: None,
                     author: None,
+                    mergeable: String::new(),
                 }]),
                 review_requested_prs: Ok(vec![]),
                 issues: vec![],
@@ -14153,6 +14162,7 @@ mod tests {
                     title: "pr".into(),
                     is_draft: false,
                     checks: crate::work_item::CheckStatus::Passing,
+                    mergeable: crate::work_item::MergeableState::Unknown,
                     review_decision: crate::work_item::ReviewDecision::None,
                 }),
                 issue: None,

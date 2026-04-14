@@ -16,7 +16,7 @@ backend record exists (work item id, title, status, repo associations)
     -> match worktree by branch name
       -> worktree_path, git state (dirty, ahead/behind)
     -> GitHub API: list PRs with head=branch
-      -> PR number, title, state, checks, reviewers
+      -> PR number, title, state, checks, reviewers, mergeable state
     -> regex extracts issue number from branch name
       -> GitHub API: get issue #N
         -> title, labels, state
@@ -80,7 +80,7 @@ is down or the remote is unreachable.
 ### Tier 2: GitHub API (async, rate-limited)
 
 - Pull requests for the branch
-- PR status, checks, reviewers
+- PR status, checks, reviewers, mergeable state (conflict detection)
 - Issue details, labels, assignees
 - Issue state (open/closed)
 

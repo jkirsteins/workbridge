@@ -383,6 +383,7 @@ mod tests {
                 status_check_rollup: String::new(),
                 head_repo_owner: None,
                 author: None,
+                mergeable: String::new(),
             }],
             issues: vec![GithubIssue {
                 number: 42,
