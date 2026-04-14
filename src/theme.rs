@@ -362,6 +362,17 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    /// Style for the `[RG]` badge rendered next to a work item's state
+    /// badge while the async review gate is running (PR existence -> CI
+    /// wait -> adversarial review). Yellow + bold, reusing the `[RV]`
+    /// target colour so the visual hint "this item is gating its way
+    /// towards Review" is obvious at a glance.
+    pub fn style_badge_review_gate(&self) -> Style {
+        Style::default()
+            .fg(self.badge_review)
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn style_done_item(&self) -> Style {
         Style::default()
             .fg(self.done_item)

@@ -255,6 +255,18 @@ If the gate approves, the work item advances to Review. If it rejects (at any
 phase), the rejection reason is fed back to the implementing Claude session as
 rework feedback.
 
+While the gate is running, the work item stays in Implementing (or Blocked) on
+the model, but the work-item list row surfaces the substate as a yellow+bold
+`[RG]` badge inserted immediately to the right of the stage badge (e.g.
+`[IM][RG]` or `[BK][RG]`, and `[RR][IM][RG]` for review-request kind). The
+badge is derived from `app.review_gates.contains_key(&wi.id)`, appears the
+instant the gate spawns, and disappears the instant `drop_review_gate` removes
+the entry on approve / reject / retreat / delete. This lets users tell at a
+glance that a row is sitting at the gate without opening the right panel,
+since the cyan braille spinner in the left margin is shared with "Claude
+actively coding" and on its own is ambiguous. See docs/UI.md "Layout: Flat
+List Mode" for the full list row anatomy.
+
 The skill (slash command) used in phase 3 is configurable via
 `defaults.review_skill` in `config.toml` (default: `/claude-adversarial-review`).
 It can also be edited from the Settings overlay's "Review Gate" tab (press `?`

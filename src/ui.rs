@@ -1414,7 +1414,14 @@ fn format_work_item_entry<'a>(
 
     // -- Left margin: activity indicator or selection caret --
     let has_session = app.session_key_for(&wi.id).is_some();
-    let is_working = app.claude_working.contains(&wi.id) || app.review_gates.contains_key(&wi.id);
+    // Review gate is a transient substate where the item is still
+    // `Implementing`/`Blocked` on the model but is running the async
+    // PR/CI/adversarial-review checks on a background thread. We surface
+    // it both in the spinner (same cyan braille as Claude working) and
+    // as an explicit `[RG]` badge alongside the state badge below, so
+    // the user can tell at a glance without opening the right panel.
+    let at_review_gate = app.review_gates.contains_key(&wi.id);
+    let is_working = app.claude_working.contains(&wi.id) || at_review_gate;
     let (margin_text, margin_style): (String, ratatui_core::style::Style) = if is_working {
         let frame = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
         // On a highlighted row the list's bg is already Cyan, so a Cyan
@@ -1474,11 +1481,19 @@ fn format_work_item_entry<'a>(
         right_parts.push((format!(" [{repo_count} repos]"), theme.style_text_muted()));
     }
 
-    // Stage badge + optional [RR] kind indicator + title. Done items omit the
-    // badge since the DONE group header already communicates their status.
+    // Stage badge + optional [RR] kind indicator + optional [RG]
+    // review-gate substate + title. Done items omit the badge since the
+    // DONE group header already communicates their status; the review
+    // gate is a transient substate and never applies to Done items, so
+    // `gate_tag` is empty on that branch by construction.
     let badge = wi.status.badge_text();
     let kind_tag = if wi.kind == WorkItemKind::ReviewRequest {
         "[RR]"
+    } else {
+        ""
+    };
+    let gate_tag = if at_review_gate && wi.status != WorkItemStatus::Done {
+        "[RG]"
     } else {
         ""
     };
@@ -1489,9 +1504,9 @@ fn format_work_item_entry<'a>(
             format!("{kind_tag} ")
         }
     } else if kind_tag.is_empty() {
-        format!("{badge} ")
+        format!("{badge}{gate_tag} ")
     } else {
-        format!("{kind_tag}{badge} ")
+        format!("{kind_tag}{badge}{gate_tag} ")
     };
     // Minimum number of display columns reserved for the title so it never
     // vanishes when badges consume all available width.
@@ -1575,6 +1590,27 @@ fn format_work_item_entry<'a>(
         line1_spans.insert(
             1,
             Span::styled("[RR]".to_string(), theme.style_badge_review_request_kind()),
+        );
+    }
+    // Insert [RG] badge immediately after the state badge for items
+    // currently at a review gate. Mirrors the [RR] pattern above. Never
+    // applies to Done items (they have no state badge and can't hold a
+    // review gate), so `gate_tag` is empty there by construction.
+    //
+    // Insertion index depends on whether `[RR]` was already inserted:
+    //   - Base non-Done layout: [margin, state_badge, " ", title, pad]
+    //     -> state badge at 1, [RG] goes at 2.
+    //   - With [RR] inserted at 1: [margin, [RR], state_badge, " ", ...]
+    //     -> state badge at 2, [RG] goes at 3.
+    if !gate_tag.is_empty() {
+        let insert_idx = if wi.kind == WorkItemKind::ReviewRequest {
+            3
+        } else {
+            2
+        };
+        line1_spans.insert(
+            insert_idx,
+            Span::styled("[RG]".to_string(), theme.style_badge_review_gate()),
         );
     }
     for (text, style) in &right_parts[..visible_badge_count] {
@@ -3975,6 +4011,7 @@ mod format_entry_tests {
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
             title: "Working item".to_string(),
+            display_id: None,
             description: None,
             status: WorkItemStatus::Implementing,
             repo_associations: vec![RepoAssociation {
@@ -4022,6 +4059,7 @@ mod format_entry_tests {
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
             title: "Working item".to_string(),
+            display_id: None,
             description: None,
             status: WorkItemStatus::Implementing,
             repo_associations: vec![RepoAssociation {
@@ -4212,7 +4250,10 @@ mod sticky_header_tests {
 #[cfg(test)]
 mod snapshot_tests {
     use super::draw_to_buffer;
-    use crate::app::{App, FocusPanel, StubBackend, UserActionKey, ViewMode, is_selectable};
+    use crate::app::{
+        App, FocusPanel, ReviewGateOrigin, ReviewGateState, StubBackend, UserActionKey, ViewMode,
+        is_selectable,
+    };
     use crate::theme::Theme;
     use crate::work_item::{
         BackendType, CheckStatus, MergeableState, PrInfo, PrState, RepoAssociation, ReviewDecision,
@@ -4743,6 +4784,85 @@ mod snapshot_tests {
             ),
         ];
         let mut app = app_with_items(items, vec![]);
+        insta::assert_snapshot!(render(&mut app, 80, 24));
+    }
+
+    /// Test helper: mark the given work item id as currently at a
+    /// review gate by inserting a minimal `ReviewGateState` into
+    /// `app.review_gates`. Starts a status-bar activity so the
+    /// production `drop_review_gate` invariant (every drop site ends
+    /// the activity) stays exercisable.
+    ///
+    /// The receiver is a dead-end `unbounded()` channel: we never poll
+    /// the gate in this test, so no messages ever need to flow.
+    fn mark_at_review_gate(app: &mut App, wi_id: &WorkItemId) {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let activity = app.start_activity("test review gate");
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                progress: None,
+                origin: ReviewGateOrigin::Tui,
+                activity,
+            },
+        );
+    }
+
+    #[test]
+    fn work_item_list_review_gate() {
+        // Baseline: plain `[IM]` item (no gate) to confirm adjacent rows
+        // are unaffected.
+        let plain = make_work_item(
+            "plain-im",
+            "Plain implementing item",
+            WorkItemStatus::Implementing,
+            None,
+            1,
+        );
+        // `[IM]` item sitting at a review gate -> `[IM][RG]`.
+        let gated_im = make_work_item(
+            "gated-im",
+            "Implementing at review gate",
+            WorkItemStatus::Implementing,
+            None,
+            1,
+        );
+        // `[BK]` item sitting at a review gate -> `[BK][RG]`. The gate
+        // can still be active when a work item retreats from
+        // Implementing to Blocked (see `docs/work-items.md`).
+        let gated_bk = make_work_item(
+            "gated-bk",
+            "Blocked at review gate",
+            WorkItemStatus::Blocked,
+            None,
+            1,
+        );
+        // Review-request kind at a gate -> `[RR][IM][RG]`, confirming
+        // the [RG] badge composes correctly with the [RR] kind badge.
+        let mut gated_rr = make_work_item(
+            "gated-rr",
+            "Review request at gate",
+            WorkItemStatus::Implementing,
+            None,
+            1,
+        );
+        gated_rr.kind = crate::work_item::WorkItemKind::ReviewRequest;
+
+        let gated_im_id = gated_im.id.clone();
+        let gated_bk_id = gated_bk.id.clone();
+        let gated_rr_id = gated_rr.id.clone();
+
+        let items = vec![plain, gated_im, gated_bk, gated_rr];
+        let mut app = app_with_items(items, vec![]);
+        mark_at_review_gate(&mut app, &gated_im_id);
+        mark_at_review_gate(&mut app, &gated_bk_id);
+        mark_at_review_gate(&mut app, &gated_rr_id);
+        // Rebuild the display list after mutating review-gate state in
+        // case grouping/ordering depends on it. (It doesn't today, but
+        // keeping this call defensive matches how `app_with_items`
+        // primes the list.)
+        app.build_display_list();
         insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 

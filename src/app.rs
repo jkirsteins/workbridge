@@ -9437,6 +9437,7 @@ mod tests {
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
             title: title.to_string(),
+            display_id: None,
             description: None,
             status,
             status_derived: false,
