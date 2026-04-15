@@ -161,13 +161,25 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
     if app.confirm_merge {
         if app.merge_in_progress {
             let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+            // While the live working-tree precheck is in flight we
+            // show a "Checking working tree..." body so the user knows
+            // the merge has not yet started shelling out to GitHub. As
+            // soon as `poll_merge_precheck` clears
+            // `merge_precheck_rx`, the next render switches to the
+            // "Merging pull request..." body without re-laying out
+            // the dialog (same `KeyChoice` shape, same spinner).
+            let body = if app.merge_precheck_rx.is_some() {
+                format!("{spinner} Checking working tree... Please wait.")
+            } else {
+                format!("{spinner} Merging pull request... Please wait.")
+            };
             draw_prompt_dialog(
                 buf,
                 theme,
                 area,
                 PromptDialogKind::KeyChoice {
                     title: "Merge Strategy",
-                    body: &format!("{spinner} Merging pull request... Please wait."),
+                    body: &body,
                     options: &[],
                 },
             );
@@ -3008,6 +3020,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 Line::from(""),
                 Line::from("  Ctrl+N    - Quick start session"),
                 Line::from("  Ctrl+B    - New backlog ticket"),
+                Line::from("  Ctrl+R    - Refresh GitHub data"),
                 Line::from("  Up/Down   - Navigate items"),
                 Line::from("  Enter     - Open session / Import"),
                 Line::from("  o         - Open PR in browser"),
@@ -3519,6 +3532,7 @@ fn draw_settings_keybindings_tab(buf: &mut Buffer, app: &App, theme: &Theme, are
         binding("Ctrl+N", "Quick-start session"),
         binding("Ctrl+B", "New backlog ticket"),
         binding("Ctrl+G", "Global assistant"),
+        binding("Ctrl+R", "Refresh GitHub data"),
         binding("Ctrl+\\", "Cycle Claude Code <-> Terminal tab"),
         binding("?", "Settings / keybindings (this overlay)"),
         binding("Q / Ctrl+Q", "Quit"),

@@ -208,8 +208,23 @@ read from the cache**. Concretely:
   `has_commits_ahead` so `branch_has_commits` is a pure cache lookup,
   plus `dirty` / `untracked` / `unpushed` / `behind_remote` so
   `App::worktree_cleanliness` can classify a worktree's local state
-  without shelling out - used by the `!cl` chip renderer and the
-  Review -> Done merge guard).
+  without shelling out). The `!cl` chip renderer reads this cache
+  directly. The Review -> Done **merge guard**, however, runs a live
+  `WorktreeService::list_worktrees` precheck on a background thread
+  (`App::spawn_merge_precheck` / `App::poll_merge_precheck`) before
+  letting the actual `gh pr merge` thread fire - the cache stays
+  authoritative for the chip but is no longer trusted for the
+  irrevocable merge decision, because long sessions can leave the
+  cached `dirty: true` value stale long after the user has committed
+  and pushed. Both the cached and live paths classify the
+  `WorktreeInfo` through the same
+  `WorktreeCleanliness::from_worktree_info` associated function so
+  they cannot drift on the priority ordering or wording. The merge
+  guard reserves its `UserActionKey::PrMerge` slot in
+  `execute_merge` BEFORE spawning the precheck and only releases it
+  on the Blocked / disconnected branches of `poll_merge_precheck`,
+  so the precheck and the actual merge share one single-flight slot
+  across both phases.
 - Backend file reads (`read_plan`, `list`) - clone the `Arc<dyn
   WorkItemBackend>` into the background closure and run the read there.
 - `default_branch`, `github_remote`, `git diff` - clone the
@@ -737,7 +752,24 @@ Key semantics:
   spawn functions admit the helper entry and then immediately
   `end_activity(activity_id)` on the returned ID. The map entry stays
   alive so `is_user_action_in_flight` keeps reporting the true state;
-  only the visible spinner is suppressed.
+  only the visible spinner is suppressed. `execute_merge` follows the
+  same rule: the merge confirmation modal renders its own
+  "Checking working tree..." / "Merging pull request..." spinner from
+  the moment the user pressed merge, so the status-bar activity is
+  ended via `end_activity` immediately after `try_begin_user_action`
+  returns.
+- **Two-phase admission (PrMerge).** `execute_merge` admits the
+  `UserActionKey::PrMerge` slot BEFORE the live working-tree precheck
+  spawns, and the helper entry is held across both the precheck phase
+  (`spawn_merge_precheck` / `poll_merge_precheck`) AND the actual
+  `gh pr merge` phase (`perform_merge_after_precheck` /
+  `poll_pr_merge`). Only the Blocked / disconnected branches of
+  `poll_merge_precheck` and the terminal arms of `poll_pr_merge`
+  release the slot. `perform_merge_after_precheck` does NOT re-admit
+  the key; it only attaches the merge payload to the already-reserved
+  slot. This keeps the helper's single-flight invariant intact across
+  the precheck-to-merge handoff while still letting the precheck
+  thread run on a background thread without blocking the UI.
 - **Caller-local rejection messages.** When `try_begin_user_action`
   returns `None`, the caller re-adds its existing alert / status
   string verbatim. `execute_merge` keeps `"PR merge already in

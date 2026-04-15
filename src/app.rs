@@ -460,6 +460,43 @@ pub struct PrMergeResult {
     pub outcome: PrMergeOutcome,
 }
 
+/// Result of the live working-tree precheck that runs between the user
+/// pressing "merge" and the actual `gh pr merge` thread spawning. The
+/// shape mirrors `ReviewGateMessage::Result` / `Blocked`: either Ready
+/// (the precheck cleared and the caller should hand off to the merge
+/// thread with the recorded strategy) or Blocked (the live worktree
+/// state is dirty / untracked / unpushed / unreachable and the user
+/// must address it before retrying).
+///
+/// The Ready variant carries every piece of state the merge thread
+/// needs (`branch`, `repo_path`, `owner_repo`) so
+/// `perform_merge_after_precheck` does not have to re-resolve them
+/// against `self.work_items` / `self.repo_data`. This is the
+/// "structural ownership over manual correlation" pattern from
+/// `CLAUDE.md`: the message itself is the source of truth for the
+/// in-flight precheck's payload, the helper map's
+/// `UserActionKey::PrMerge` slot is the source of truth for "is one in
+/// flight", and `App::merge_precheck_rx` is the single channel that
+/// owns the receiver - no sibling correlation fields.
+pub enum MergePreCheckMessage {
+    Ready {
+        wi_id: WorkItemId,
+        strategy: String,
+        branch: String,
+        repo_path: PathBuf,
+        owner_repo: String,
+    },
+    /// The live precheck blocked the merge. The `wi_id` is implicit
+    /// in the helper map's `UserActionKey::PrMerge` slot - which is
+    /// the source of truth for the in-flight precheck - so it does
+    /// not ride in this variant. `reason` is the user-facing alert
+    /// text, identical to the wording the cached path used (it comes
+    /// from `WorktreeCleanliness::merge_block_message` for
+    /// dirty/untracked/unpushed and a custom string for the
+    /// "branch-not-found" / "list_worktrees failed" cases).
+    Blocked { reason: String },
+}
+
 /// Outcome of an asynchronous PR review submission.
 pub enum ReviewSubmitOutcome {
     /// Review posted successfully on GitHub.
@@ -511,6 +548,41 @@ pub enum WorktreeCleanliness {
 }
 
 impl WorktreeCleanliness {
+    /// Classify a single `WorktreeInfo` (e.g. from the cached fetcher
+    /// result OR a fresh `WorktreeService::list_worktrees` call) using
+    /// the canonical Dirty > Untracked > Unpushed > BehindOnly > Clean
+    /// priority order. This is the single source of truth for the
+    /// classification - both the cached path
+    /// (`App::worktree_cleanliness`) and the live precheck path
+    /// (`App::spawn_merge_precheck`) call into here so they cannot
+    /// drift on the priority ordering or the `unwrap_or(false)`
+    /// defaults.
+    ///
+    /// Field semantics mirror the docs on `WorktreeInfo`: `None` for
+    /// any of `dirty`, `untracked`, `unpushed`, `behind_remote` means
+    /// "the underlying check was not attempted or failed" and is
+    /// treated as the safe default (`false` / `0`) so the worktree is
+    /// not falsely flagged when the cache is incomplete.
+    pub fn from_worktree_info(wt: &crate::worktree_service::WorktreeInfo) -> Self {
+        if wt.dirty.unwrap_or(false) {
+            return WorktreeCleanliness::Dirty;
+        }
+        if wt.untracked.unwrap_or(false) {
+            return WorktreeCleanliness::Untracked;
+        }
+        if let Some(ahead) = wt.unpushed
+            && ahead > 0
+        {
+            return WorktreeCleanliness::Unpushed(ahead);
+        }
+        if let Some(behind) = wt.behind_remote
+            && behind > 0
+        {
+            return WorktreeCleanliness::BehindOnly(behind);
+        }
+        WorktreeCleanliness::Clean
+    }
+
     /// Returns `true` if this state must block the Review -> Done
     /// merge transition. `Clean` and `BehindOnly` are the only
     /// non-blocking variants; see the enum doc comment for the
@@ -753,7 +825,23 @@ pub struct App {
     pub merge_wi_id: Option<WorkItemId>,
     /// True while the merge background thread is running.
     /// The dialog stays open with a spinner in this state.
+    ///
+    /// Set the moment `execute_merge` admits the `UserActionKey::PrMerge`
+    /// slot, so the modal renders the "Checking working tree..."
+    /// spinner during the precheck phase as well as the actual
+    /// `gh pr merge` phase. Cleared in `poll_pr_merge` /
+    /// `poll_merge_precheck` on every terminal arm.
     pub merge_in_progress: bool,
+    /// In-flight live working-tree precheck spawned from
+    /// `execute_merge` before the actual `gh pr merge` thread fires.
+    /// Drained on the ~200ms background tick by `poll_merge_precheck`,
+    /// which either hands off to `perform_merge_after_precheck` (Ready)
+    /// or surfaces the live blocker as an alert (Blocked). Single
+    /// channel by design: the `wi_id` rides inside the message payload
+    /// and the `UserActionKey::PrMerge` helper slot is the source of
+    /// truth for "is one in flight" - see `docs/UI.md` "User action
+    /// guard" and the structural-ownership rule in `CLAUDE.md`.
+    pub merge_precheck_rx: Option<crossbeam_channel::Receiver<MergePreCheckMessage>>,
     /// True when the rework reason text input is visible (Review -> Implementing).
     pub rework_prompt_visible: bool,
     /// Text input for the rework reason.
@@ -1586,6 +1674,7 @@ impl App {
             confirm_merge: false,
             merge_wi_id: None,
             merge_in_progress: false,
+            merge_precheck_rx: None,
             rework_prompt_visible: false,
             rework_prompt_input: rat_widget::text_input::TextInputState::new(),
             rework_prompt_wi: None,
@@ -4963,23 +5052,9 @@ impl App {
             return WorktreeCleanliness::Clean;
         };
 
-        if wt.dirty.unwrap_or(false) {
-            return WorktreeCleanliness::Dirty;
-        }
-        if wt.untracked.unwrap_or(false) {
-            return WorktreeCleanliness::Untracked;
-        }
-        if let Some(ahead) = wt.unpushed
-            && ahead > 0
-        {
-            return WorktreeCleanliness::Unpushed(ahead);
-        }
-        if let Some(behind) = wt.behind_remote
-            && behind > 0
-        {
-            return WorktreeCleanliness::BehindOnly(behind);
-        }
-        WorktreeCleanliness::Clean
+        // Delegate to the canonical classifier so the cached path and
+        // the live precheck path (`spawn_merge_precheck`) cannot drift.
+        WorktreeCleanliness::from_worktree_info(wt)
     }
 
     /// Start an MCP socket server for a work item session.
@@ -7002,20 +7077,35 @@ impl App {
     /// Review. The background thread also checks for an open PR and
     /// blocks if none exists (see `poll_pr_merge` / `NoPr` outcome).
     ///
-    /// Gathers the needed data synchronously, then spawns a background
-    /// thread to run `gh pr merge`. Results are polled by `poll_pr_merge()`
-    /// on each timer tick.
+    /// Two-phase flow:
+    ///
+    /// 1. Pre-flight validity checks (in-memory only): `wi`, branch,
+    ///    repo_path, GitHub remote cache. Failures alert and return
+    ///    BEFORE admitting the helper slot so an early return cannot
+    ///    leave an orphaned `UserActionKey::PrMerge` entry. See
+    ///    `docs/UI.md` "User action guard" for the desync-guard rule.
+    /// 2. Admit the helper slot, hide the status-bar spinner, set the
+    ///    in-progress modal flag, and spawn a background working-tree
+    ///    precheck via `spawn_merge_precheck`. The
+    ///    `poll_merge_precheck` background-tick poller drains the
+    ///    receiver and either hands off to
+    ///    `perform_merge_after_precheck` (Ready) or surfaces the live
+    ///    blocker as an alert (Blocked).
+    ///
+    /// The cleanliness check used to live here as a synchronous cache
+    /// read against `repo_data`. That cached path stayed stale across
+    /// long-running sessions: a user who fixed a dirty worktree
+    /// minutes ago could still see the "Uncommitted changes" alert
+    /// when trying to merge. The precheck phase replaces that read
+    /// with a live `WorktreeService::list_worktrees` call on a
+    /// background thread, so the merge guard always reflects the
+    /// current state of the worktree.
     pub fn execute_merge(&mut self, wi_id: &WorkItemId, strategy: &str) {
         // Single-flight guard via the user-action helper. Rejecting when
         // another merge is already in flight preserves the existing alert
         // wording verbatim - the background thread may have already
         // merged a PR on GitHub, so silently replacing the receiver
         // would lose the result.
-        //
-        // We run validity checks BEFORE try_begin_user_action so an
-        // early return (missing repo / branch / github_remote cache)
-        // cannot leave an orphaned helper entry. See `docs/UI.md`
-        // "User action guard" for the desync-guard rule.
         if self.is_user_action_in_flight(&UserActionKey::PrMerge) {
             self.alert_message = Some(PR_MERGE_ALREADY_IN_PROGRESS.into());
             return;
@@ -7045,27 +7135,6 @@ impl App {
         };
         let repo_path = assoc.repo_path.clone();
 
-        // Guard mirrored from advance_stage: defence-in-depth so any
-        // future caller that bypasses `advance_stage` (e.g. a new
-        // keybinding that jumps straight to `execute_merge`) cannot
-        // accidentally land a PR while the worktree still has
-        // uncommitted work, untracked files, or unpushed commits.
-        // Pure cache read, same blocking-I/O guarantees as
-        // `advance_stage`. DO NOT DRY this into `advance_stage`:
-        // future readers should see the guard at both commit points.
-        let cleanliness = self.worktree_cleanliness(&repo_path, &branch);
-        if cleanliness.is_merge_blocking() {
-            self.confirm_merge = false;
-            self.merge_wi_id = None;
-            self.alert_message = Some(
-                cleanliness
-                    .merge_block_message()
-                    .unwrap_or("Worktree is not ready to merge.")
-                    .to_string(),
-            );
-            return;
-        }
-
         // Read owner/repo from the cached fetcher result rather than shelling
         // out on the UI thread. If no entry exists yet, the first fetch has
         // not completed - surface that as an alert instead of blocking.
@@ -7086,8 +7155,13 @@ impl App {
         };
         let owner_repo = format!("{owner}/{repo_name}");
 
-        // All validity checks have passed. Admit the action now so any
-        // rejection above cannot leave the helper with an empty slot.
+        // All in-memory validity checks have passed. Admit the action
+        // now so any rejection above cannot leave the helper with an
+        // empty slot. The slot is reserved across BOTH the precheck
+        // phase and the actual merge phase - `poll_merge_precheck`
+        // either hands off to `perform_merge_after_precheck` (which
+        // attaches the merge payload without re-admitting) or releases
+        // the slot via `end_user_action`.
         if self
             .try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging PR...")
             .is_none()
@@ -7100,22 +7174,190 @@ impl App {
             return;
         }
         // Hide the status-bar spinner: the merge modal already renders
-        // its own in-progress spinner, and stacking two is confusing.
-        // The helper map entry is still the single source of truth for
-        // `is_user_action_in_flight(&PrMerge)`.
+        // its own in-progress spinner (and now also the
+        // "Checking working tree..." precheck spinner), and stacking
+        // two is confusing. The helper map entry is still the single
+        // source of truth for `is_user_action_in_flight(&PrMerge)`.
         if let Some(state) = self.user_actions.in_flight.get(&UserActionKey::PrMerge) {
             let aid = state.activity_id;
             self.end_activity(aid);
         }
+
+        // Modal renders the spinner from the moment the user pressed
+        // "merge" - the precheck phase shows "Checking working tree..."
+        // and the merge phase shows "Merging pull request...". The
+        // renderer in `src/ui.rs` keys off `merge_precheck_rx.is_some()`
+        // to pick the right body.
+        self.merge_in_progress = true;
+
+        self.spawn_merge_precheck(
+            wi_id.clone(),
+            strategy.to_string(),
+            repo_path,
+            branch,
+            owner_repo,
+        );
+    }
+
+    /// Spawn the live working-tree precheck for an in-flight merge.
+    ///
+    /// Runs `WorktreeService::list_worktrees` on a background thread
+    /// and translates the result into a `MergePreCheckMessage`:
+    /// `Ready` if the live worktree state passes
+    /// `WorktreeCleanliness::is_merge_blocking`, otherwise `Blocked`
+    /// with the same user-facing text the cached path used. The
+    /// receiver is stashed on `self.merge_precheck_rx` and drained on
+    /// the next ~200ms background tick by `poll_merge_precheck`.
+    ///
+    /// Blocking-I/O note: every call inside the spawned closure
+    /// (`list_worktrees`) is allowed to block - that is the entire
+    /// reason it lives off the main thread. The UI thread sees only
+    /// the receiver and the `MergePreCheckMessage`. See `docs/UI.md`
+    /// "Blocking I/O Prohibition".
+    fn spawn_merge_precheck(
+        &mut self,
+        wi_id: WorkItemId,
+        strategy: String,
+        repo_path: PathBuf,
+        branch: String,
+        owner_repo: String,
+    ) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ws = Arc::clone(&self.worktree_service);
+        let wi_id_for_thread = wi_id;
+        let strategy_for_thread = strategy;
+        let repo_path_for_thread = repo_path;
+        let branch_for_thread = branch;
+        let owner_repo_for_thread = owner_repo;
+
+        std::thread::spawn(move || {
+            // Live source-of-truth check via the injectable
+            // WorktreeService. Reusing list_worktrees keeps the test
+            // harness identical to the fetcher path - any mock that
+            // returns a clean `WorktreeInfo` for the fetcher will
+            // return clean here too.
+            let result = ws.list_worktrees(&repo_path_for_thread);
+            let msg = match result {
+                Ok(worktrees) => {
+                    let wt = worktrees
+                        .into_iter()
+                        .find(|w| w.branch.as_deref() == Some(&branch_for_thread));
+                    match wt {
+                        Some(w) => {
+                            // Same classification as the cached path -
+                            // see `WorktreeCleanliness::from_worktree_info`.
+                            let cleanliness = WorktreeCleanliness::from_worktree_info(&w);
+                            if let Some(reason) = cleanliness.merge_block_message() {
+                                MergePreCheckMessage::Blocked {
+                                    reason: reason.to_string(),
+                                }
+                            } else {
+                                MergePreCheckMessage::Ready {
+                                    wi_id: wi_id_for_thread,
+                                    strategy: strategy_for_thread,
+                                    branch: branch_for_thread,
+                                    repo_path: repo_path_for_thread,
+                                    owner_repo: owner_repo_for_thread,
+                                }
+                            }
+                        }
+                        None => MergePreCheckMessage::Blocked {
+                            reason: "Cannot merge: branch not found in worktree list".into(),
+                        },
+                    }
+                }
+                Err(e) => MergePreCheckMessage::Blocked {
+                    reason: format!("Cannot merge: working-tree check failed: {e}"),
+                },
+            };
+            let _ = tx.send(msg);
+        });
+
+        self.merge_precheck_rx = Some(rx);
+    }
+
+    /// Drain the live merge precheck receiver on the background tick.
+    ///
+    /// Wired into `poll_review_gate`'s sibling slot in `salsa.rs` so
+    /// it runs at the same ~200ms cadence as every other background
+    /// poller. Does nothing if no precheck is in flight; otherwise
+    /// either hands the verified merge off to
+    /// `perform_merge_after_precheck` (Ready) or releases the helper
+    /// slot and surfaces the live blocker as an alert (Blocked /
+    /// disconnected).
+    pub fn poll_merge_precheck(&mut self) {
+        let Some(rx) = self.merge_precheck_rx.as_ref() else {
+            return;
+        };
+        let msg = match rx.try_recv() {
+            Ok(m) => m,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                // Background thread died without sending. Release the
+                // helper slot, clear the modal state, and surface a
+                // generic error so the user can retry.
+                self.merge_precheck_rx = None;
+                self.confirm_merge = false;
+                self.merge_wi_id = None;
+                self.merge_in_progress = false;
+                self.end_user_action(&UserActionKey::PrMerge);
+                self.alert_message = Some("Merge precheck thread terminated unexpectedly".into());
+                return;
+            }
+        };
+        self.merge_precheck_rx = None;
+
+        match msg {
+            MergePreCheckMessage::Ready {
+                wi_id,
+                strategy,
+                branch,
+                repo_path,
+                owner_repo,
+            } => {
+                self.perform_merge_after_precheck(wi_id, strategy, branch, repo_path, owner_repo);
+            }
+            MergePreCheckMessage::Blocked { reason } => {
+                // The live worktree state blocks the merge. Release
+                // the helper slot, clear the modal, and surface the
+                // user-facing reason. The wording for the
+                // dirty/untracked/unpushed cases is identical to the
+                // old cached path because both call
+                // `WorktreeCleanliness::merge_block_message`.
+                self.confirm_merge = false;
+                self.merge_wi_id = None;
+                self.merge_in_progress = false;
+                self.end_user_action(&UserActionKey::PrMerge);
+                self.alert_message = Some(reason);
+            }
+        }
+    }
+
+    /// Spawn the actual `gh pr merge` background thread after the live
+    /// precheck has cleared. Called from `poll_merge_precheck` on
+    /// `MergePreCheckMessage::Ready` - the helper slot was already
+    /// admitted in `execute_merge`, so this method does NOT re-admit
+    /// the action key; it only attaches the merge payload to the
+    /// already-reserved slot.
+    fn perform_merge_after_precheck(
+        &mut self,
+        wi_id: WorkItemId,
+        strategy: String,
+        branch: String,
+        repo_path: PathBuf,
+        owner_repo: String,
+    ) {
         let merge_flag = if strategy == "merge" {
             "--merge"
         } else {
             "--squash"
         };
-        let strategy_owned = strategy.to_string();
-        let wi_id_clone = wi_id.clone();
+        let strategy_owned = strategy;
+        let wi_id_clone = wi_id;
         let merge_flag_owned = merge_flag.to_string();
-        let repo_path_clone = repo_path.clone();
+        let repo_path_clone = repo_path;
+        let branch_for_thread = branch;
+        let owner_repo_for_thread = owner_repo;
 
         let (tx, rx) = crossbeam_channel::bounded(1);
 
@@ -7126,11 +7368,11 @@ impl App {
                     "pr",
                     "list",
                     "--head",
-                    &branch,
+                    &branch_for_thread,
                     "--json",
                     "number,title,url",
                     "--repo",
-                    &owner_repo,
+                    &owner_repo_for_thread,
                 ])
                 .output()
             {
@@ -7157,11 +7399,11 @@ impl App {
                     .args([
                         "pr",
                         "merge",
-                        &branch,
+                        &branch_for_thread,
                         &merge_flag_owned,
                         "--delete-branch",
                         "--repo",
-                        &owner_repo,
+                        &owner_repo_for_thread,
                     ])
                     .output()
                 {
@@ -7187,14 +7429,16 @@ impl App {
 
             let _ = tx.send(PrMergeResult {
                 wi_id: wi_id_clone,
-                branch,
+                branch: branch_for_thread,
                 repo_path: repo_path_clone,
                 outcome,
             });
         });
 
         self.attach_user_action_payload(&UserActionKey::PrMerge, UserActionPayload::PrMerge { rx });
-        self.merge_in_progress = true;
+        // `merge_in_progress` was already set by `execute_merge` so the
+        // modal spinner has been rendering throughout the precheck phase.
+        // No need to set it again here.
     }
 
     /// Poll the async PR merge thread for a result. Called on each timer tick.
@@ -12385,13 +12629,35 @@ mod tests {
         assert!(app.alert_message.is_none());
     }
 
-    /// Defence-in-depth: calling `execute_merge` directly on a dirty
-    /// worktree must also bail out with the same alert wording.
+    /// Regression: a stale `dirty: true` entry in the fetcher cache must
+    /// no longer immediately block `execute_merge`. The merge guard now
+    /// runs as a live `WorktreeService::list_worktrees` precheck on a
+    /// background thread; the cached `repo_data` value is consulted only
+    /// for the unclean-worktree chip in the list view, not for the
+    /// merge decision. Verifies:
+    ///
+    /// 1. No alert is surfaced from the synchronous portion of
+    ///    `execute_merge` even though the cache says the worktree is
+    ///    dirty.
+    /// 2. The `UserActionKey::PrMerge` slot has been admitted (the
+    ///    helper reserves the slot across BOTH the precheck phase and
+    ///    the actual merge phase).
+    /// 3. `merge_in_progress` is set so the modal renders the
+    ///    "Checking working tree..." spinner from the moment the user
+    ///    pressed merge.
+    /// 4. `merge_precheck_rx` is populated, i.e. a background precheck
+    ///    is in flight.
+    /// 5. The merge confirm modal stays open (it transitions to the
+    ///    spinner state, not to the dismissed state).
     #[test]
-    fn execute_merge_blocked_when_worktree_dirty() {
+    fn execute_merge_with_stale_dirty_cache_admits_precheck_slot() {
         let mut app = App::new();
-        let repo = PathBuf::from("/tmp/exec-merge-dirty");
-        let branch = "feature/exec-dirty";
+        let repo = PathBuf::from("/tmp/exec-merge-stale-dirty");
+        let branch = "feature/exec-stale-dirty";
+        // Pre-populate the fetcher cache with a STALE dirty WorktreeInfo.
+        // Pre-fix this would have caused execute_merge to immediately
+        // surface the "Uncommitted changes" alert and refuse to admit
+        // the user-action slot.
         install_cached_repo_with_cleanliness(
             &mut app,
             &repo,
@@ -12401,19 +12667,370 @@ mod tests {
             Some(0),
             Some(0),
         );
-        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/exec-merge-dirty.json"));
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/exec-merge-stale-dirty.json"));
         push_selected_review_item(&mut app, &wi_id, &repo, branch);
+        // Open the merge modal so we can verify it stays open across the
+        // precheck transition.
+        app.confirm_merge = true;
+        app.merge_wi_id = Some(wi_id.clone());
 
         app.execute_merge(&wi_id, "squash");
 
-        assert!(!app.confirm_merge);
-        let msg = app.alert_message.as_deref().unwrap_or("");
-        assert!(msg.contains("Uncommitted changes"), "got: {msg}");
-        // Must NOT have admitted a PrMerge user action - otherwise the
-        // caller leaks the single-flight slot.
+        assert!(
+            app.alert_message.is_none(),
+            "stale-dirty cache must NOT surface an immediate alert; got: {:?}",
+            app.alert_message,
+        );
+        assert!(
+            app.is_user_action_in_flight(&UserActionKey::PrMerge),
+            "execute_merge must admit the PrMerge slot for the precheck phase",
+        );
+        assert!(
+            app.merge_in_progress,
+            "merge_in_progress must be set so the modal spinner renders during precheck",
+        );
+        assert!(
+            app.merge_precheck_rx.is_some(),
+            "spawn_merge_precheck must populate merge_precheck_rx",
+        );
+        assert!(
+            app.confirm_merge,
+            "merge confirm modal must stay open across the precheck transition",
+        );
+    }
+
+    /// `poll_merge_precheck` on a `Ready` message must hand off to
+    /// `perform_merge_after_precheck` without re-admitting the slot
+    /// and without surfacing any alert. The receiver is consumed so
+    /// subsequent ticks are no-ops.
+    #[test]
+    fn poll_merge_precheck_ready_hands_off_without_alert() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/precheck-ready.json"));
+
+        // Pre-admit the slot and set merge_in_progress, mirroring what
+        // execute_merge does immediately before spawn_merge_precheck.
+        app.try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging PR...")
+            .expect("helper admit should succeed in test setup");
+        app.merge_in_progress = true;
+        app.confirm_merge = true;
+        app.merge_wi_id = Some(wi_id.clone());
+
+        // Inject a Ready message via a synthetic channel - skips the
+        // background thread entirely so the test is deterministic and
+        // independent of any real `gh` binary.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(MergePreCheckMessage::Ready {
+            wi_id: wi_id.clone(),
+            strategy: "squash".into(),
+            branch: "feature/precheck-ready".into(),
+            repo_path: PathBuf::from("/tmp/precheck-ready-repo"),
+            owner_repo: "owner/repo".into(),
+        })
+        .unwrap();
+        app.merge_precheck_rx = Some(rx);
+
+        app.poll_merge_precheck();
+
+        assert!(
+            app.merge_precheck_rx.is_none(),
+            "poll_merge_precheck must consume the receiver on Ready",
+        );
+        assert!(
+            app.is_user_action_in_flight(&UserActionKey::PrMerge),
+            "Ready hand-off must keep the PrMerge slot reserved for the merge thread",
+        );
+        assert!(
+            app.merge_in_progress,
+            "merge_in_progress must stay true while the merge thread runs",
+        );
+        assert!(
+            app.confirm_merge,
+            "merge confirm modal must stay open while the merge thread runs",
+        );
+        assert!(
+            app.alert_message.is_none(),
+            "Ready hand-off must not surface an alert; got: {:?}",
+            app.alert_message,
+        );
+    }
+
+    /// `poll_merge_precheck` on a `Blocked` message must release the
+    /// slot, clear the modal state, and surface the reason as an alert.
+    #[test]
+    fn poll_merge_precheck_blocked_releases_slot_and_alerts() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/precheck-blocked.json"));
+
+        app.try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging PR...")
+            .expect("helper admit should succeed in test setup");
+        app.merge_in_progress = true;
+        app.confirm_merge = true;
+        app.merge_wi_id = Some(wi_id.clone());
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(MergePreCheckMessage::Blocked {
+            reason: "Uncommitted changes. Commit & push before merging.".into(),
+        })
+        .unwrap();
+        app.merge_precheck_rx = Some(rx);
+
+        app.poll_merge_precheck();
+
+        assert!(app.merge_precheck_rx.is_none());
         assert!(
             !app.is_user_action_in_flight(&UserActionKey::PrMerge),
-            "execute_merge must not reserve the PrMerge slot on a blocked advance",
+            "Blocked outcome must release the PrMerge slot",
+        );
+        assert!(!app.merge_in_progress);
+        assert!(!app.confirm_merge);
+        assert!(app.merge_wi_id.is_none());
+        let msg = app.alert_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("Uncommitted changes"),
+            "alert must surface the precheck reason; got: {msg}",
+        );
+    }
+
+    /// End-to-end: a stale `dirty: true` cache + a clean live
+    /// `WorktreeService::list_worktrees` response must let the merge
+    /// proceed past the precheck. Drives the actual background thread
+    /// via a polling loop with a short timeout.
+    #[test]
+    fn execute_merge_through_live_precheck_clears_stale_dirty() {
+        use crate::config::InMemoryConfigProvider;
+        use crate::worktree_service::{WorktreeError, WorktreeInfo};
+
+        struct CleanLiveMock {
+            branch: String,
+            repo: PathBuf,
+        }
+        impl WorktreeService for CleanLiveMock {
+            fn list_worktrees(
+                &self,
+                repo_path: &std::path::Path,
+            ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+                assert_eq!(repo_path, self.repo);
+                Ok(vec![WorktreeInfo {
+                    path: self.repo.join(".worktrees").join(&self.branch),
+                    branch: Some(self.branch.clone()),
+                    is_main: false,
+                    has_commits_ahead: Some(true),
+                    dirty: Some(false),
+                    untracked: Some(false),
+                    unpushed: Some(0),
+                    behind_remote: Some(0),
+                }])
+            }
+            fn create_worktree(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+                _target_dir: &std::path::Path,
+            ) -> Result<WorktreeInfo, WorktreeError> {
+                Err(WorktreeError::GitError("not used".into()))
+            }
+            fn remove_worktree(
+                &self,
+                _: &std::path::Path,
+                _: &std::path::Path,
+                _: bool,
+                _: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn delete_branch(
+                &self,
+                _: &std::path::Path,
+                _: &str,
+                _: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn default_branch(&self, _: &std::path::Path) -> Result<String, WorktreeError> {
+                Ok("main".to_string())
+            }
+            fn github_remote(
+                &self,
+                _: &std::path::Path,
+            ) -> Result<Option<(String, String)>, WorktreeError> {
+                Ok(None)
+            }
+            fn fetch_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn create_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+        }
+
+        let repo = PathBuf::from("/tmp/exec-merge-live-clean");
+        let branch = "feature/live-clean".to_string();
+
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(StubBackend),
+            Arc::new(CleanLiveMock {
+                branch: branch.clone(),
+                repo: repo.clone(),
+            }),
+            Box::new(InMemoryConfigProvider::new()),
+        );
+
+        // Stale-dirty cache (the bug condition). The cache also carries
+        // the github_remote so the synchronous validity check passes.
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            &branch,
+            Some(true),
+            Some(false),
+            Some(0),
+            Some(0),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/exec-merge-live-clean.json"));
+        push_selected_review_item(&mut app, &wi_id, &repo, &branch);
+        app.confirm_merge = true;
+        app.merge_wi_id = Some(wi_id.clone());
+
+        app.execute_merge(&wi_id, "squash");
+
+        assert!(app.merge_precheck_rx.is_some());
+        assert!(app.is_user_action_in_flight(&UserActionKey::PrMerge));
+        assert!(app.merge_in_progress);
+
+        // Drive the background thread via a polling loop. Bounded by a
+        // 2s timeout so a regression cannot wedge CI forever.
+        let start = std::time::Instant::now();
+        while app.merge_precheck_rx.is_some() && start.elapsed() < Duration::from_secs(2) {
+            app.poll_merge_precheck();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            app.merge_precheck_rx.is_none(),
+            "precheck must drain within 2s",
+        );
+        assert!(
+            app.is_user_action_in_flight(&UserActionKey::PrMerge),
+            "the merge slot must stay reserved across the precheck->merge handoff",
+        );
+        assert!(app.merge_in_progress);
+        assert!(
+            app.alert_message.is_none(),
+            "live-clean precheck must not surface an alert; got: {:?}",
+            app.alert_message,
+        );
+        assert!(
+            app.confirm_merge,
+            "merge modal must stay open through the handoff to the merge thread",
+        );
+    }
+
+    /// End-to-end: when `WorktreeService::list_worktrees` returns an
+    /// error, the precheck blocks the merge with a "working-tree check
+    /// failed" alert and releases the helper slot.
+    #[test]
+    fn execute_merge_through_live_precheck_surfaces_error() {
+        use crate::config::InMemoryConfigProvider;
+        use crate::worktree_service::{WorktreeError, WorktreeInfo};
+
+        struct FailingMock;
+        impl WorktreeService for FailingMock {
+            fn list_worktrees(
+                &self,
+                _repo_path: &std::path::Path,
+            ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+                Err(WorktreeError::GitError("simulated git failure".into()))
+            }
+            fn create_worktree(
+                &self,
+                _repo_path: &std::path::Path,
+                _branch: &str,
+                _target_dir: &std::path::Path,
+            ) -> Result<WorktreeInfo, WorktreeError> {
+                Err(WorktreeError::GitError("not used".into()))
+            }
+            fn remove_worktree(
+                &self,
+                _: &std::path::Path,
+                _: &std::path::Path,
+                _: bool,
+                _: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn delete_branch(
+                &self,
+                _: &std::path::Path,
+                _: &str,
+                _: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn default_branch(&self, _: &std::path::Path) -> Result<String, WorktreeError> {
+                Ok("main".to_string())
+            }
+            fn github_remote(
+                &self,
+                _: &std::path::Path,
+            ) -> Result<Option<(String, String)>, WorktreeError> {
+                Ok(None)
+            }
+            fn fetch_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn create_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+        }
+
+        let repo = PathBuf::from("/tmp/exec-merge-live-error");
+        let branch = "feature/live-error".to_string();
+
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(StubBackend),
+            Arc::new(FailingMock),
+            Box::new(InMemoryConfigProvider::new()),
+        );
+
+        // Cache has clean state, so the cached path would say "go". The
+        // live precheck is the only thing that catches the error.
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            &branch,
+            Some(false),
+            Some(false),
+            Some(0),
+            Some(0),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/exec-merge-live-error.json"));
+        push_selected_review_item(&mut app, &wi_id, &repo, &branch);
+        app.confirm_merge = true;
+        app.merge_wi_id = Some(wi_id.clone());
+
+        app.execute_merge(&wi_id, "squash");
+        assert!(app.merge_precheck_rx.is_some());
+
+        let start = std::time::Instant::now();
+        while app.merge_precheck_rx.is_some() && start.elapsed() < Duration::from_secs(2) {
+            app.poll_merge_precheck();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(app.merge_precheck_rx.is_none());
+        assert!(
+            !app.is_user_action_in_flight(&UserActionKey::PrMerge),
+            "an errored precheck must release the PrMerge slot",
+        );
+        assert!(!app.merge_in_progress);
+        assert!(!app.confirm_merge);
+        let msg = app.alert_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("working-tree check failed"),
+            "alert must contain the precheck error wording; got: {msg}",
         );
     }
 
