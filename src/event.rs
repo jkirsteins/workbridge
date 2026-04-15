@@ -1999,6 +1999,26 @@ fn handle_mouse_with_terminal_size(
         }
     }
 
+    // A `SelectUp` that did not hit any registered target ends the
+    // click-to-copy gesture from the registry's point of view: the
+    // user released outside every interactive label, so any pending
+    // click armed by an earlier `SelectDown` is abandoned. Without
+    // this clear, a stale `pending_chrome_click` could linger and
+    // later fire a false copy on an unrelated `SelectUp` that
+    // happens to hit a same-kind label (for example on terminals
+    // that coalesce intervening `Drag` events, or over SSH sessions
+    // that drop them, or in X10/Default mouse modes that only
+    // report `Down`/`Up`). The drag-cancel clear above catches the
+    // well-behaved case; this catches the lossy case. It is safe
+    // on all paths because (a) the priority check above already
+    // `take()`s `pending_chrome_click` on a matching up and returns
+    // before reaching here, and (b) the `MouseTarget::None` fallback
+    // below also `take()`s it, so clearing here cannot destroy any
+    // state that another branch still needs.
+    if matches!(action, MouseAction::SelectUp) {
+        app.pending_chrome_click = None;
+    }
+
     let target = match terminal_size {
         Some(size) => mouse_target_with_size(app, mouse.column, mouse.row, size),
         None => MouseTarget::None,
@@ -3421,6 +3441,92 @@ mod tests {
             app.toasts[0].text.contains("workbridge"),
             "toast text must mention the copied value, got {:?}",
             app.toasts[0].text,
+        );
+    }
+
+    /// Stale-pending regression: when a `SelectDown` lands on a
+    /// registered label and the matching `SelectUp` arrives somewhere
+    /// else (no intervening `Drag`, as happens on terminals that
+    /// coalesce drags or over lossy SSH sessions), the pending
+    /// click-to-copy state must NOT survive the unmatched up. If it
+    /// did, a later unrelated `SelectUp` on a same-kind label could
+    /// fire a false copy without a fresh matching `SelectDown`.
+    ///
+    /// This test drives the exact failure: down on label A, up at
+    /// an unregistered right-panel coordinate, and asserts the
+    /// pending state is cleared. It then synthesizes a later up on
+    /// label A (simulating the attacker sequence) and asserts no
+    /// toast is pushed, since there was no fresh down on A.
+    #[test]
+    fn unmatched_select_up_clears_stale_pending_chrome_click() {
+        use crate::click_targets::ClickKind;
+        use ratatui_core::layout::Rect;
+
+        let mut app = App::new();
+        {
+            let mut reg = app.click_registry.borrow_mut();
+            reg.push(
+                Rect {
+                    x: 40,
+                    y: 10,
+                    width: 30,
+                    height: 1,
+                },
+                "feat/my-branch".to_string(),
+                ClickKind::Branch,
+            );
+        }
+
+        // Sanity: both coordinates are inside the right-panel area
+        // with the test terminal size, so the classifier's RightPanel
+        // arm is the one we're testing against.
+        assert!(matches!(
+            mouse_target_with_size(&app, 50, 10, (TEST_COLS, TEST_ROWS)),
+            MouseTarget::RightPanel { .. }
+        ));
+        assert!(matches!(
+            mouse_target_with_size(&app, 100, 10, (TEST_COLS, TEST_ROWS)),
+            MouseTarget::RightPanel { .. }
+        ));
+
+        // Down on label A at (50, 10) - inside the registered rect.
+        let down_on_label = mouse(MouseEventKind::Down(MouseButton::Left), 50, 10);
+        handle_mouse_with_terminal_size(&mut app, down_on_label, TEST_SIZE);
+        assert!(
+            app.pending_chrome_click.is_some(),
+            "priority check must arm pending on down over a registered label",
+        );
+
+        // Up at (100, 10) - still inside the right panel but
+        // OUTSIDE the registered rect. No intervening Drag event:
+        // this is the "lossy terminal" case. The stale-pending
+        // clear must drop the pending state here.
+        let up_off_label = mouse(MouseEventKind::Up(MouseButton::Left), 100, 10);
+        handle_mouse_with_terminal_size(&mut app, up_off_label, TEST_SIZE);
+        assert!(
+            app.pending_chrome_click.is_none(),
+            "unmatched SelectUp must clear stale pending_chrome_click, \
+             otherwise a later unrelated SelectUp on a same-kind label \
+             could fire a false copy",
+        );
+        assert!(
+            app.toasts.is_empty(),
+            "unmatched up must not push a toast, got {:?}",
+            app.toasts.iter().map(|t| &t.text).collect::<Vec<_>>(),
+        );
+
+        // Now simulate the attacker sequence: another `SelectUp` on
+        // label A with no fresh matching `SelectDown`. This reaches
+        // the priority path (registry hit) and routes to the chrome
+        // click fallback. The fallback reads `pending` - which must
+        // be None thanks to the clear above - and therefore must NOT
+        // fire a copy. Before the fix this is where the false copy
+        // would happen.
+        let up_on_label_again = mouse(MouseEventKind::Up(MouseButton::Left), 50, 10);
+        handle_mouse_with_terminal_size(&mut app, up_on_label_again, TEST_SIZE);
+        assert!(
+            app.toasts.is_empty(),
+            "up on label without a fresh matching down must not fire a copy",
         );
     }
 }

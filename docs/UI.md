@@ -109,8 +109,16 @@ Each is rendered with `theme.style_interactive()` - the new
 affordance. The underline is the persistent visual signal that says
 "clickable". A left-click on any of these fields copies the full
 untruncated value via `clipboard::copy` and pushes a top-right toast
-(`Copied: <short-value>`) that auto-dismisses after ~2 seconds.
-Multiple toasts stack vertically with the newest on top.
+that auto-dismisses after ~2 seconds. Multiple toasts stack
+vertically with the newest on top.
+
+The toast text reflects the actual clipboard result, not the intent:
+on success it reads `Copied: <short-value>`, on failure (both OSC 52
+and `arboard` returned an error) it reads `Copy failed: <short-value>`.
+Lying about the clipboard state is the worst UX failure mode for this
+feature - a user who believes the copy succeeded will paste stale
+content and only notice long after. `fire_chrome_copy` in `src/app.rs`
+branches on the bool returned by `clipboard::copy`.
 
 Implementation:
 
@@ -139,7 +147,12 @@ Implementation:
   a matching `Up(Left)`. The drag-cancel check runs unconditionally
   at the top of `handle_mouse` so a drag over a PTY pane still
   invalidates an in-flight click-to-copy gesture that started on a
-  chrome label.
+  chrome label. A `SelectUp` that does NOT hit any registered target
+  also unconditionally clears `pending_chrome_click`: this guards
+  against terminals that coalesce or drop `Drag` events (some X10
+  mouse modes, SSH sessions with packet loss), where a stale pending
+  click could otherwise linger and fire a false copy on a later
+  unrelated `SelectUp` over a same-kind label.
 - Values that read as `"(none)"` are NOT registered and render in
   the muted style - the underline would be misleading if there is
   nothing to copy.
