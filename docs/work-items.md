@@ -232,10 +232,16 @@ Repo selection for quick-start follows this priority:
 2. Otherwise, a compact "Quick start - select repo" dialog opens. It
    contains only the repo list (no Title, Description, or Branch fields):
    focus lands directly on the list, Up/Down moves the cursor, Space
-   toggles selection, Enter creates the quick-start item with the same
+   picks the cursor row as the selected repo (single-select - any
+   previously checked row is cleared so at most one `[x]` is ever
+   visible), Enter creates the quick-start item with the same
    placeholder title and auto-generated branch as the single-repo path,
    and Esc cancels. The agent renames the title later via
    `workbridge_set_title`, exactly as in the single-repo flow.
+
+   Single-select is enforced because the quick-start submission path
+   only ever spawns a session for a single repo; allowing multi-check
+   would silently discard every choice except the first.
 
 The current working directory is deliberately not used to auto-select a
 repo: when more than one managed repo is configured there is a real choice

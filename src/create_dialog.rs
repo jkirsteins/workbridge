@@ -144,7 +144,27 @@ impl CreateDialog {
     }
 
     /// Toggle selection of the repo at the current cursor position.
+    ///
+    /// In quick-start mode this enforces single-select: any other selected
+    /// row is cleared first, so at most one repo is ever marked `[x]`. The
+    /// quickstart submission path in `event.rs` only consumes
+    /// `selected[0]` and would silently discard any additional checked
+    /// rows, so the dialog must never let the user check more than one
+    /// repo at a time. In normal (Ctrl+B) mode this stays a plain toggle
+    /// because the full create dialog supports multi-repo work items.
     pub fn toggle_repo(&mut self) {
+        if self.quickstart_mode {
+            let Some(was_selected) = self.repo_list.get(self.repo_cursor).map(|(_, s)| *s) else {
+                return;
+            };
+            for (_, sel) in self.repo_list.iter_mut() {
+                *sel = false;
+            }
+            if let Some(entry) = self.repo_list.get_mut(self.repo_cursor) {
+                entry.1 = !was_selected;
+            }
+            return;
+        }
         if let Some(entry) = self.repo_list.get_mut(self.repo_cursor) {
             entry.1 = !entry.1;
         }
@@ -687,5 +707,73 @@ mod tests {
 
         dialog.focus_prev();
         assert_eq!(dialog.focus_field, CreateDialogFocus::Repos);
+    }
+
+    #[test]
+    fn toggle_repo_is_single_select_in_quickstart_mode() {
+        // Quick-start mode must enforce single-select: the event handler
+        // only consumes `selected[0]` and would silently drop any extra
+        // checked rows. The dialog must never show two `[x]` markers at
+        // once, otherwise the user is misled into thinking both repos
+        // will be acted on.
+        let repos = vec![
+            PathBuf::from("/repo/a"),
+            PathBuf::from("/repo/b"),
+            PathBuf::from("/repo/c"),
+        ];
+        let mut dialog = CreateDialog::new();
+        dialog.open_quickstart(&repos);
+
+        // Select /repo/a.
+        dialog.toggle_repo();
+        assert!(dialog.repo_list[0].1);
+        assert!(!dialog.repo_list[1].1);
+        assert!(!dialog.repo_list[2].1);
+
+        // Move to /repo/b and select it: /repo/a must be cleared.
+        dialog.repo_down();
+        dialog.toggle_repo();
+        assert!(!dialog.repo_list[0].1);
+        assert!(dialog.repo_list[1].1);
+        assert!(!dialog.repo_list[2].1);
+        assert_eq!(
+            dialog.repo_list.iter().filter(|(_, sel)| *sel).count(),
+            1,
+            "exactly one repo must be selected at any time in quickstart mode"
+        );
+
+        // Move to /repo/c and select it: /repo/b must be cleared.
+        dialog.repo_down();
+        dialog.toggle_repo();
+        assert!(!dialog.repo_list[0].1);
+        assert!(!dialog.repo_list[1].1);
+        assert!(dialog.repo_list[2].1);
+
+        // Toggling the current row off should leave nothing selected,
+        // matching plain checkbox semantics so the user can back out.
+        dialog.toggle_repo();
+        assert!(
+            dialog.repo_list.iter().all(|(_, sel)| !*sel),
+            "toggling the selected row off should clear all selections"
+        );
+    }
+
+    #[test]
+    fn toggle_repo_remains_multi_select_in_normal_mode() {
+        // Regression guard: the Ctrl+B path must still allow multiple
+        // repos to be checked, since the full create dialog supports
+        // multi-repo work items via `validate()`.
+        let repos = vec![PathBuf::from("/repo/a"), PathBuf::from("/repo/b")];
+        let mut dialog = CreateDialog::new();
+        dialog.open(&repos, None);
+
+        dialog.toggle_repo();
+        dialog.repo_down();
+        dialog.toggle_repo();
+
+        assert!(
+            dialog.repo_list[0].1 && dialog.repo_list[1].1,
+            "normal-mode toggle_repo must allow multiple repos to be checked"
+        );
     }
 }
