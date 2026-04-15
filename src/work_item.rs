@@ -432,18 +432,6 @@ pub struct SessionEntry {
     pub scrollback_offset: usize,
     /// Active mouse text selection, if any.
     pub selection: Option<SelectionState>,
-    /// Path to the temp `--mcp-config` file workbridge wrote for
-    /// this session under `std::env::temp_dir()`. `None` for test
-    /// stubs and for sessions spawned without an MCP config.
-    /// Tracked here so every teardown path (normal death, stage
-    /// change, stale spawn result, work-item delete, cleanup-all)
-    /// can unlink the file when the session is dropped, so the
-    /// secret-bearing config does not linger in `/tmp` after
-    /// Claude exits. Codex adversarial review flagged the prior
-    /// leak as a secrets-on-disk risk even though the file is
-    /// mode 0600 - an accumulation of stale MCP configs is
-    /// unnecessary disk retention of credentials.
-    pub mcp_config_path: Option<PathBuf>,
 }
 
 /// Data fetched per repo by a background thread. Sent through a channel

@@ -671,26 +671,13 @@ pub struct SessionSpawnResult {
     pub outcome: Result<SessionSpawnOk, String>,
 }
 
-/// Success payload of a [`SessionSpawnResult`]. Carries both the
-/// live PTY session and the MCP socket server, both of which are
-/// owned by background-thread-borrowed resources that the UI thread
-/// has to accept ownership of before the spawn completes.
-///
-/// `warning` used to forward non-fatal MCP config file-write
-/// failures from the background worker back to the UI thread. It
-/// is currently always `None` because workbridge now has exactly
-/// ONE MCP config delivery path (the temp `--mcp-config` file),
-/// and a write failure there is fatal - the spawn is aborted
-/// before reaching `Session::spawn` and the outcome is an `Err`
-/// instead. The field is kept so a future warning surface can be
-/// added without touching call sites.
+/// Success payload of a [`SessionSpawnResult`]. Carries the live
+/// PTY session and its paired MCP socket server, both of which are
+/// background-thread-borrowed resources that the UI thread has to
+/// accept ownership of before the spawn completes.
 pub struct SessionSpawnOk {
     pub session: crate::session::Session,
     pub mcp_server: McpSocketServer,
-    pub warning: Option<String>,
-    /// Temp `--mcp-config` file path so every teardown path can
-    /// unlink the secret-bearing config file.
-    pub mcp_config_path: Option<PathBuf>,
 }
 
 /// Per-entry state for the `session_spawn_rx` map, mirroring
@@ -781,47 +768,6 @@ impl SpawnFlag {
             SpawnFlag::Resume => "--resume",
             SpawnFlag::Fresh => "--session-id",
         }
-    }
-}
-
-/// Write `contents` to `path` with owner-only permissions
-/// (`0600` on Unix). Used by `begin_session_spawn`'s background
-/// worker to persist the per-session MCP config file under
-/// `std::env::temp_dir()`.
-///
-/// The MCP config embeds each repo's configured MCP server
-/// `env` values (see `crate::mcp::build_mcp_config`), which can
-/// contain API tokens and other secrets. Writing the file with
-/// the default umask would leave it world-readable on many
-/// installations, exposing those secrets to any other local
-/// user or process that can list `/tmp`. This helper routes
-/// through `std::fs::OpenOptions::mode(0o600)` on Unix so the
-/// file is readable only by its owner; Codex adversarial
-/// review flagged the earlier `std::fs::write` as a leak
-/// vector.
-///
-/// On non-Unix platforms the mode flag is silently dropped and
-/// the helper falls back to a plain `std::fs::write` - there
-/// is no portable file-permission API, and workbridge's
-/// supported platforms are macOS and Linux where the mode is
-/// always enforced.
-fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(contents)?;
-        f.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)
     }
 }
 
@@ -1233,9 +1179,6 @@ pub struct App {
     pub global_pane_cols: u16,
     /// PTY rows for the global assistant drawer.
     pub global_pane_rows: u16,
-    /// Path to the temp MCP config file for the global assistant.
-    /// Tracked so it can be cleaned up on shutdown or respawn.
-    pub global_mcp_config_path: Option<PathBuf>,
     /// True when repo/work-item data has changed since the last
     /// `refresh_global_mcp_context` call. Set by `drain_fetch_results`
     /// returning true; cleared after the refresh runs.
@@ -1420,7 +1363,6 @@ impl App {
             pre_drawer_focus: FocusPanel::Left,
             global_pane_cols: 80,
             global_pane_rows: 24,
-            global_mcp_config_path: None,
             global_mcp_context_dirty: false,
             pending_active_pty_bytes: Vec::new(),
             pending_global_pty_bytes: Vec::new(),
@@ -1853,9 +1795,8 @@ impl App {
         for key in orphans {
             if let Some(entry) = self.sessions.remove(&key) {
                 let mcp_server = self.mcp_servers.remove(&key.0);
-                let mcp_config_path = entry.mcp_config_path;
                 if let Some(session) = entry.session {
-                    Self::teardown_live_session_async(session, mcp_server, mcp_config_path);
+                    Self::teardown_live_session_async(session, mcp_server);
                 } else if let Some(mcp) = mcp_server {
                     Self::teardown_mcp_server_async(mcp);
                 }
@@ -1912,7 +1853,7 @@ impl App {
             if let Some(entry) = self.terminal_sessions.remove(&wi_id)
                 && let Some(session) = entry.session
             {
-                Self::teardown_live_session_async(session, None, None);
+                Self::teardown_live_session_async(session, None);
             }
         }
     }
@@ -1955,32 +1896,18 @@ impl App {
         self.drop_session_spawn_entry(wi_id);
     }
 
-    /// Stop all MCP servers, clear activity state, and remove temp config files.
-    /// Called on app exit.
+    /// Stop all MCP servers and clear activity state. Called on app exit.
     ///
-    /// Takes the MCP servers and the global config path out of
-    /// `App` synchronously (pure in-memory map operations), then
-    /// hands them to a detached background thread that runs
-    /// `McpSocketServer::Drop` (`stop()` + `remove_file` on the
-    /// socket path) and `std::fs::remove_file` on the global
-    /// temp config. Codex adversarial review flagged the earlier
-    /// synchronous clear as a `docs/UI.md` "Blocking I/O
-    /// Prohibition" P0: `cleanup_all_mcp` is called on the exit
-    /// path from `salsa.rs`, and the per-server unlink happens
-    /// while the UI is still painting the last frame. Moving
-    /// the drops off-thread is the same pattern as the
-    /// per-session teardown path. On exit the background thread
-    /// may still be running when `main` returns, which is fine -
-    /// the OS cleans up any unfinished temp-file / socket
-    /// unlinks on process exit.
+    /// Regression guard: `McpSocketServer::Drop` runs `stop()` +
+    /// `remove_file` on the socket path. Drain the maps
+    /// synchronously and drop the values on a background thread
+    /// so the UI's last frame is not held up by socket unlinks.
     pub fn cleanup_all_mcp(&mut self) {
         self.claude_working.clear();
         let session_servers: Vec<McpSocketServer> =
             self.mcp_servers.drain().map(|(_, v)| v).collect();
         let global_server = self.global_mcp_server.take();
-        let global_config_path = self.global_mcp_config_path.take();
-
-        if session_servers.is_empty() && global_server.is_none() && global_config_path.is_none() {
+        if session_servers.is_empty() && global_server.is_none() {
             return;
         }
         std::thread::spawn(move || {
@@ -1988,9 +1915,6 @@ impl App {
                 drop(server);
             }
             drop(global_server);
-            if let Some(path) = global_config_path {
-                let _ = std::fs::remove_file(path);
-            }
         });
     }
 
@@ -2192,7 +2116,6 @@ impl App {
                         session: Some(session),
                         scrollback_offset: 0,
                         selection: None,
-                        mcp_config_path: None,
                     },
                 );
             }
@@ -2611,31 +2534,20 @@ impl App {
 
         // -- Phase 3: Kill session and clean up MCP --
         //
-        // `cleanup_session_state_for` routes any pending opens /
-        // spawns + the MCP server through the async teardown
-        // helpers; the session itself is handled here. Both the
-        // Claude session and the terminal session are handed to
-        // `teardown_live_session_async` so `Session::kill`'s
-        // SIGTERM + 50ms grace + SIGKILL + `child.wait` runs on
-        // a background thread, not on the UI-thread delete path.
-        // Codex adversarial review flagged the inline kills here
-        // as a `docs/UI.md` "Blocking I/O Prohibition" violation
-        // analogous to the `apply_stage_change` case.
+        // Regression guard: every live session must go through
+        // `teardown_live_session_async` so Session::kill's
+        // SIGTERM grace sleep runs off the UI delete path.
         self.cleanup_session_state_for(wi_id);
         if let Some(key) = self.session_key_for(wi_id)
             && let Some(entry) = self.sessions.remove(&key)
+            && let Some(session) = entry.session
         {
-            let mcp_config_path = entry.mcp_config_path;
-            if let Some(session) = entry.session {
-                Self::teardown_live_session_async(session, None, mcp_config_path);
-            }
+            Self::teardown_live_session_async(session, None);
         }
-        // Kill associated terminal session.
-        if let Some(entry) = self.terminal_sessions.remove(wi_id) {
-            let mcp_config_path = entry.mcp_config_path;
-            if let Some(session) = entry.session {
-                Self::teardown_live_session_async(session, None, mcp_config_path);
-            }
+        if let Some(entry) = self.terminal_sessions.remove(wi_id)
+            && let Some(session) = entry.session
+        {
+            Self::teardown_live_session_async(session, None);
         }
 
         // -- Phase 4: (removed) Resource cleanup runs on a background
@@ -4690,98 +4602,25 @@ impl App {
                 return;
             }
 
-            // Build the MCP config JSON (depends on the socket path
-            // we just got).
+            // Build the MCP config JSON and append it to the
+            // claude argv as an inline `--mcp-config <json>`
+            // string. Claude Code accepts inline JSON literals
+            // (per `--help`: "Load MCP servers from JSON files
+            // or strings"), so we never write the config to
+            // disk - the secrets-bearing JSON only ever lives
+            // in this process's argv and Claude's argv.
             let mcp_config =
                 crate::mcp::build_mcp_config(&exe, &server.socket_path, &repo_mcp_servers);
-
-            // Write the temp `--mcp-config` file. This is the
-            // ONLY MCP config delivery path workbridge controls;
-            // we deliberately do NOT write `.mcp.json` into the
-            // user's worktree root because we cannot tell
-            // workbridge-owned files from user-owned files
-            // there. A pre-existing `.mcp.json` belonging to the
-            // user or the repo would be silently overwritten on
-            // success and silently deleted on the rollback /
-            // spawn-error paths, which is unrecoverable data
-            // loss. It also violates the CLAUDE.md rule against
-            // mutating third-party tool control files outside of
-            // workbridge-owned directories.
-            //
-            // Claude Code supports `--mcp-config <path>` as a
-            // first-class CLI flag, so routing the config
-            // through an exclusively workbridge-owned path in
-            // `std::env::temp_dir()` is sufficient to reach the
-            // socket server. If this single write fails, the
-            // spawn is aborted: the Claude session would be
-            // structurally unable to reach the workbridge MCP
-            // server, and tools like `workbridge_set_plan` /
-            // `workbridge_set_status` would silently break the
-            // workflow.
-            let config_path = std::env::temp_dir().join(format!(
-                "workbridge-mcp-config-{}.json",
-                uuid::Uuid::new_v4()
-            ));
             let mut final_cmd = cmd;
-            // Write with mode 0600 so the file is readable only
-            // by the owning user. The MCP config embeds each
-            // repo's configured MCP server `env` values (see
-            // `crate::mcp::build_mcp_config`), which can contain
-            // API tokens and other secrets. Writing to a shared
-            // temp directory with the default umask (often
-            // world-readable) exposes those secrets to any
-            // other local user or process that can list `/tmp`.
-            // Codex adversarial review flagged the earlier
-            // `std::fs::write` as a leak vector. On non-Unix
-            // platforms we fall back to the plain write - there
-            // is no portable permission API - but workbridge's
-            // supported platforms are macOS and Linux, where
-            // the explicit mode is enforced.
-            if let Err(e) = write_private_file(&config_path, mcp_config.as_bytes()) {
-                let _ = tx.send(SessionSpawnResult {
-                    wi_id: wi_id_for_thread,
-                    stage,
-                    outcome: Err(format!(
-                        "Session spawn aborted: could not write \
-                         MCP config to {}: {e}. Claude would \
-                         have no way to reach the workbridge MCP \
-                         server, so the session is unusable.",
-                        config_path.display(),
-                    )),
-                });
-                return;
-            }
-            // The write succeeded - everything from here on out
-            // has a real config file at `config_path` to clean
-            // up on failure / cancellation. The `.mcp.json` in
-            // the worktree root is NOT touched on any path: we
-            // deliberately never write it, so there is nothing
-            // to clean up and no risk of overwriting a user- or
-            // repo-owned `.mcp.json`.
             final_cmd.push("--mcp-config".to_string());
-            final_cmd.push(config_path.to_string_lossy().to_string());
+            final_cmd.push(mcp_config);
 
-            // Cancel check 3: after the temp config write,
-            // before the PTY fork. If cancellation fired during
-            // the write (or between check 2 and now), remove
-            // the temp config file so /tmp does not accumulate
-            // orphaned workbridge-mcp-config-*.json files for
-            // every cancelled spawn. The file is exclusively
-            // workbridge-owned (we just wrote it to a
-            // UUID-tagged path under `std::env::temp_dir()`),
-            // so deleting it is safe.
+            // Cancel check 3: last point before the PTY fork.
             if cancel_for_thread.load(std::sync::atomic::Ordering::Acquire) {
-                send_cancelled(&tx, wi_id_for_thread, stage, &[config_path.as_path()]);
+                send_cancelled(&tx, wi_id_for_thread, stage, &[]);
                 return;
             }
 
-            // Fork the Claude PTY. This is the blocking call
-            // that previously ran on the UI thread; moving it
-            // here removes the last bit of session-open I/O
-            // from the tick path. On failure, remove the temp
-            // config file so /tmp does not accumulate orphans;
-            // the file is exclusively workbridge-owned, so
-            // deleting it is safe.
             let cmd_refs: Vec<&str> = final_cmd.iter().map(|s| s.as_str()).collect();
             let outcome = match crate::session::Session::spawn(
                 pane_cols,
@@ -4792,13 +4631,8 @@ impl App {
                 Ok(session) => Ok(SessionSpawnOk {
                     session,
                     mcp_server: server,
-                    warning: None,
-                    mcp_config_path: Some(config_path),
                 }),
-                Err(e) => {
-                    let _ = std::fs::remove_file(&config_path);
-                    Err(format!("Error spawning session: {e}"))
-                }
+                Err(e) => Err(format!("Error spawning session: {e}")),
             };
 
             let _ = tx.send(SessionSpawnResult {
@@ -4845,22 +4679,16 @@ impl App {
     fn teardown_session_async(
         session: crate::session::Session,
         mcp_server: Option<McpSocketServer>,
-        mcp_config_path: Option<PathBuf>,
     ) {
-        // Regression guard: every Drop here is blocking -
-        // Session::Drop runs force_kill + reader-thread join,
-        // McpSocketServer::Drop does stop + remove_file, and
-        // the temp config unlink is another syscall. Any caller
-        // that drops these on the UI thread (including via a
-        // `HashMap::insert` that replaces a live entry) blocks
-        // the tick path. See `docs/UI.md` "Blocking I/O
-        // Prohibition".
+        // Regression guard: Session::Drop and McpSocketServer::Drop
+        // are blocking (force_kill + reader-thread join + socket
+        // unlink). Any caller that drops these on the UI thread
+        // (including via a `HashMap::insert` that replaces a live
+        // entry) blocks the tick path. See `docs/UI.md` "Blocking
+        // I/O Prohibition".
         std::thread::spawn(move || {
             drop(session);
             drop(mcp_server);
-            if let Some(path) = mcp_config_path {
-                let _ = std::fs::remove_file(path);
-            }
         });
     }
 
@@ -4880,15 +4708,11 @@ impl App {
     fn teardown_live_session_async(
         mut session: crate::session::Session,
         mcp_server: Option<McpSocketServer>,
-        mcp_config_path: Option<PathBuf>,
     ) {
         std::thread::spawn(move || {
             session.kill();
             drop(session);
             drop(mcp_server);
-            if let Some(path) = mcp_config_path {
-                let _ = std::fs::remove_file(path);
-            }
         });
     }
 
@@ -4959,7 +4783,7 @@ impl App {
             if let Ok(result) = entry.rx.try_recv()
                 && let Ok(ok) = result.outcome
             {
-                Self::teardown_session_async(ok.session, Some(ok.mcp_server), ok.mcp_config_path);
+                Self::teardown_session_async(ok.session, Some(ok.mcp_server));
             }
         }
     }
@@ -5009,24 +4833,10 @@ impl App {
                 .map(|w| w.status == result.stage)
                 .unwrap_or(false);
             if !still_current {
-                // Hand the live Session + McpSocketServer to the
-                // async teardown helper so their blocking `Drop`
-                // impls run on a background thread. Letting them
-                // drop inline here would call Session::Drop ->
-                // force_kill + reader-thread join on the UI tick
-                // path (Codex adversarial review P0), which
-                // synchronously SIGTERMs/SIGKILLs a Claude
-                // process, sleeps the SIGTERM grace window, and
-                // blocks on `child.wait` + `handle.join()`.
-                // `SessionSpawnResult::Err` has no Session to
-                // tear down and just falls out of scope - no hop
-                // needed.
+                // Regression guard: never drop a live Session on
+                // the UI tick path - Session::Drop blocks.
                 if let Ok(ok) = result.outcome {
-                    Self::teardown_session_async(
-                        ok.session,
-                        Some(ok.mcp_server),
-                        ok.mcp_config_path,
-                    );
+                    Self::teardown_session_async(ok.session, Some(ok.mcp_server));
                 }
                 continue;
             }
@@ -5035,8 +4845,6 @@ impl App {
                 Ok(SessionSpawnOk {
                     session,
                     mcp_server,
-                    warning,
-                    mcp_config_path,
                 }) => {
                     // Regression guard: `HashMap::insert` below
                     // would drop any stale value on the UI
@@ -5045,20 +4853,10 @@ impl App {
                     let session_key = (result.wi_id.clone(), result.stage);
                     let old_entry = self.sessions.remove(&session_key);
                     let old_mcp = self.mcp_servers.remove(&result.wi_id);
-                    if let Some(old_entry) = old_entry {
-                        let old_config = old_entry.mcp_config_path;
-                        if let Some(old_session) = old_entry.session {
-                            Self::teardown_session_async(old_session, old_mcp, old_config);
-                        } else {
-                            if let Some(old_mcp) = old_mcp {
-                                Self::teardown_mcp_server_async(old_mcp);
-                            }
-                            if let Some(path) = old_config {
-                                std::thread::spawn(move || {
-                                    let _ = std::fs::remove_file(path);
-                                });
-                            }
-                        }
+                    if let Some(old_entry) = old_entry
+                        && let Some(old_session) = old_entry.session
+                    {
+                        Self::teardown_session_async(old_session, old_mcp);
                     } else if let Some(old_mcp) = old_mcp {
                         Self::teardown_mcp_server_async(old_mcp);
                     }
@@ -5069,21 +4867,12 @@ impl App {
                         session: Some(session),
                         scrollback_offset: 0,
                         selection: None,
-                        mcp_config_path,
                     };
                     self.sessions.insert(session_key, entry);
                     self.mcp_servers.insert(result.wi_id, mcp_server);
                     self.focus = FocusPanel::Right;
-                    // `warning` is a hook for future non-fatal
-                    // degradations. Today the temp `--mcp-config`
-                    // write is the only MCP delivery path, so a
-                    // failure there aborts the spawn before
-                    // reaching this branch - `warning` is always
-                    // `None` on the success arm and the default
-                    // "right panel focused" message always wins.
-                    self.status_message = Some(warning.unwrap_or_else(|| {
-                        "Right panel focused - press Ctrl+] to return".to_string()
-                    }));
+                    self.status_message =
+                        Some("Right panel focused - press Ctrl+] to return".to_string());
                 }
                 Err(msg) => {
                     self.status_message = Some(msg);
@@ -7110,9 +6899,8 @@ impl App {
             && let Some(entry) = self.sessions.remove(&old_key)
         {
             let mcp_server = self.mcp_servers.remove(wi_id);
-            let mcp_config_path = entry.mcp_config_path;
             if let Some(session) = entry.session {
-                Self::teardown_live_session_async(session, mcp_server, mcp_config_path);
+                Self::teardown_live_session_async(session, mcp_server);
             } else if let Some(mcp) = mcp_server {
                 Self::teardown_mcp_server_async(mcp);
             }
@@ -8869,7 +8657,9 @@ impl App {
                 }
             };
 
-            // Build MCP config file for --mcp-config.
+            // Build the MCP config JSON and pass it inline via
+            // `--mcp-config <json>`. Claude Code accepts inline
+            // strings, so the gate never writes its config to disk.
             let exe_path = match std::env::current_exe() {
                 Ok(p) => p,
                 Err(e) => {
@@ -8883,17 +8673,6 @@ impl App {
                 }
             };
             let mcp_config = crate::mcp::build_mcp_config(&exe_path, &gate_socket, &[]);
-            let config_path = std::env::temp_dir()
-                .join(format!("workbridge-rg-mcp-{}.json", uuid::Uuid::new_v4()));
-            if let Err(e) = std::fs::write(&config_path, &mcp_config) {
-                drop(gate_server);
-                let _ = tx.send(ReviewGateMessage::Result(ReviewGateResult {
-                    work_item_id: wi_id_clone,
-                    approved: false,
-                    detail: format!("review gate: could not write MCP config: {e}"),
-                }));
-                return;
-            }
 
             let json_schema = r#"{"type":"object","properties":{"approved":{"type":"boolean"},"detail":{"type":"string"}},"required":["approved","detail"]}"#;
 
@@ -8909,7 +8688,7 @@ impl App {
                     "--json-schema",
                     json_schema,
                     "--mcp-config",
-                    &config_path.to_string_lossy(),
+                    &mcp_config,
                 ])
                 .output()
             {
@@ -8950,10 +8729,7 @@ impl App {
                 },
             };
 
-            // Clean up temporary MCP server and config file.
             drop(gate_server);
-            let _ = std::fs::remove_file(&config_path);
-
             let _ = tx.send(ReviewGateMessage::Result(result));
         });
 
@@ -9117,13 +8893,8 @@ impl App {
                             && let Some(entry) = self.sessions.remove(&key)
                         {
                             let mcp_server = self.mcp_servers.remove(&wi_id);
-                            let mcp_config_path = entry.mcp_config_path;
                             if let Some(session) = entry.session {
-                                Self::teardown_live_session_async(
-                                    session,
-                                    mcp_server,
-                                    mcp_config_path,
-                                );
+                                Self::teardown_live_session_async(session, mcp_server);
                             } else if let Some(mcp) = mcp_server {
                                 Self::teardown_mcp_server_async(mcp);
                             }
@@ -9243,9 +9014,8 @@ impl App {
                     && let Some(entry) = self.sessions.remove(&key)
                 {
                     let mcp_server = self.mcp_servers.remove(&wi_id);
-                    let mcp_config_path = entry.mcp_config_path;
                     if let Some(session) = entry.session {
-                        Self::teardown_live_session_async(session, mcp_server, mcp_config_path);
+                        Self::teardown_live_session_async(session, mcp_server);
                     } else if let Some(mcp) = mcp_server {
                         Self::teardown_mcp_server_async(mcp);
                     }
@@ -9307,59 +9077,28 @@ impl App {
         }
     }
 
-    /// Tear down the global assistant session and all its associated
-    /// resources. Safe to call when no session exists.
+    /// Tear down the global assistant session. Safe to call when no
+    /// session exists.
     ///
-    /// Steps:
-    /// 1. Take the `SessionEntry`, MCP server, and temp config path
-    ///    OUT of the App state synchronously (pure in-memory map
-    ///    writes - no I/O).
-    /// 2. Hand the live session + MCP server + temp config path to
-    ///    a background thread that runs `Session::kill`
-    ///    (SIGTERM + grace + SIGKILL + wait), then drops the
-    ///    session (closes the master fd, joins the reader thread),
-    ///    then drops the MCP server (`stop()` + `remove_file` on
-    ///    the socket), then unlinks the temp MCP config file.
-    /// 3. Drop any keystrokes queued for the old session's PTY so
-    ///    they don't leak into the next session on reopen.
-    ///
-    /// This routing is required by `docs/UI.md` "Blocking I/O
-    /// Prohibition": `toggle_global_drawer` calls this function on
-    /// the UI tick path (both when closing the drawer and
-    /// defensively before opening a new one), and every blocking
-    /// operation in the old sequential implementation - the
-    /// SIGTERM grace sleep, the `child.wait` reap, the reader
-    /// thread join, the MCP socket unlink, the temp config
-    /// unlink - was running inline. Codex adversarial review
-    /// flagged the same pattern in `apply_stage_change` /
-    /// `check_liveness` / `poll_review_gate`; this fix extends it
-    /// to the global assistant drawer.
+    /// Regression guard: `Session::kill` and `McpSocketServer::Drop`
+    /// are blocking. Take the resources out synchronously and drop
+    /// them on a background thread so the UI tick path does no
+    /// process or filesystem I/O.
     fn teardown_global_session(&mut self) {
         let session = self
             .global_session
             .take()
             .and_then(|mut entry| entry.session.take());
         let mcp_server = self.global_mcp_server.take();
-        let config_path = self.global_mcp_config_path.take();
         self.pending_global_pty_bytes.clear();
 
-        if session.is_some() || mcp_server.is_some() || config_path.is_some() {
+        if session.is_some() || mcp_server.is_some() {
             std::thread::spawn(move || {
-                // Graceful kill first if we have a session.
                 if let Some(mut session) = session {
                     session.kill();
                     drop(session);
                 }
-                // Then drop the MCP server (runs stop() +
-                // remove_file(socket_path)).
                 drop(mcp_server);
-                // Finally unlink the temp MCP config file. A
-                // failure here is benign - it's a temp file, and
-                // /tmp cleanup will catch it on reboot if
-                // nothing else does.
-                if let Some(path) = config_path {
-                    let _ = std::fs::remove_file(path);
-                }
             });
         }
     }
@@ -9425,9 +9164,11 @@ impl App {
             cmd.push(prompt.clone());
         }
 
-        // Write MCP config to a temp file and pass via --mcp-config.
-        // Use a deterministic PID-based path so respawns overwrite the
-        // previous file instead of leaking a new one each time.
+        // Build the MCP config JSON and pass it inline via
+        // `--mcp-config <json>`. Claude Code accepts inline JSON
+        // strings (per `--help`: "Load MCP servers from JSON
+        // files or strings"), so we never write the config to
+        // disk.
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
@@ -9440,17 +9181,8 @@ impl App {
             }
         };
         let mcp_config = crate::mcp::build_mcp_config(&exe, &mcp_server.socket_path, &[]);
-        let config_path =
-            std::env::temp_dir().join(format!("workbridge-global-mcp-{}.json", std::process::id()));
-        if let Err(e) = std::fs::write(&config_path, &mcp_config) {
-            self.status_message = Some(format!("Global assistant MCP config error: {e}"));
-            self.global_drawer_open = false;
-            self.focus = self.pre_drawer_focus;
-            return;
-        }
-        self.global_mcp_config_path = Some(config_path.clone());
         cmd.push("--mcp-config".to_string());
-        cmd.push(config_path.to_string_lossy().to_string());
+        cmd.push(mcp_config);
 
         // Use a dedicated workbridge-owned scratch directory as cwd.
         //
@@ -9491,9 +9223,6 @@ impl App {
                     session: Some(session),
                     scrollback_offset: 0,
                     selection: None,
-                    // Global assistant temp config is tracked on
-                    // `self.global_mcp_config_path`, not here.
-                    mcp_config_path: None,
                 });
                 self.global_mcp_server = Some(mcp_server);
             }
@@ -14069,7 +13798,6 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
-                mcp_config_path: None,
             },
         );
 
@@ -14347,30 +14075,13 @@ mod tests {
             session: None,
             scrollback_offset: 0,
             selection: None,
-            mcp_config_path: None,
         });
 
-        // Pre-populate a real temp file as the MCP config path so we can
-        // verify teardown actually deletes the file from disk.
-        let temp_path = std::env::temp_dir().join(format!(
-            "workbridge-teardown-test-{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
-        assert!(temp_path.exists(), "precondition: temp file exists");
-        app.global_mcp_config_path = Some(temp_path.clone());
-
-        // Pre-populate buffered PTY keystrokes that must NOT leak into a
-        // freshly-spawned replacement session.
         app.pending_global_pty_bytes
             .extend_from_slice(b"stale-keys");
 
         app.teardown_global_session();
 
-        // In-memory state must be cleared synchronously on the
-        // UI thread. Only the blocking I/O (session kill, MCP
-        // socket unlink, temp config unlink) is deferred to a
-        // background thread.
         assert!(
             app.global_session.is_none(),
             "global_session must be cleared",
@@ -14380,27 +14091,9 @@ mod tests {
             "global_mcp_server must be cleared",
         );
         assert!(
-            app.global_mcp_config_path.is_none(),
-            "global_mcp_config_path must be cleared",
-        );
-        assert!(
             app.pending_global_pty_bytes.is_empty(),
             "pending_global_pty_bytes must be drained so stale keystrokes \
              don't leak into the next session",
-        );
-        // File deletion runs on a background thread per the
-        // Codex adversarial-review fix for
-        // `docs/UI.md` "Blocking I/O Prohibition" - poll for it
-        // with a short timeout. If the file is still present
-        // after ~500ms something is wrong.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        while temp_path.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(
-            !temp_path.exists(),
-            "teardown must (asynchronously) delete the temp MCP config \
-             file from disk",
         );
     }
 
@@ -14413,14 +14106,12 @@ mod tests {
     fn teardown_global_session_is_idempotent_on_empty_state() {
         let mut app = App::new();
         assert!(app.global_session.is_none());
-        assert!(app.global_mcp_config_path.is_none());
         assert!(app.pending_global_pty_bytes.is_empty());
 
         app.teardown_global_session();
 
         assert!(app.global_session.is_none());
         assert!(app.global_mcp_server.is_none());
-        assert!(app.global_mcp_config_path.is_none());
         assert!(app.pending_global_pty_bytes.is_empty());
     }
 
@@ -14432,7 +14123,6 @@ mod tests {
     fn toggle_global_drawer_close_tears_down_session() {
         let mut app = App::new();
 
-        // Simulate a drawer that is already open with live state.
         app.global_drawer_open = true;
         app.pre_drawer_focus = app.focus;
 
@@ -14443,18 +14133,9 @@ mod tests {
             session: None,
             scrollback_offset: 0,
             selection: None,
-            mcp_config_path: None,
         });
-
-        let temp_path = std::env::temp_dir().join(format!(
-            "workbridge-toggle-close-test-{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
-        app.global_mcp_config_path = Some(temp_path.clone());
         app.pending_global_pty_bytes.extend_from_slice(b"leftover");
 
-        // Close branch: no spawn involved, so this is safe in any test env.
         app.toggle_global_drawer();
 
         assert!(!app.global_drawer_open, "drawer must be closed");
@@ -14467,24 +14148,8 @@ mod tests {
             "close must clear global_mcp_server",
         );
         assert!(
-            app.global_mcp_config_path.is_none(),
-            "close must clear global_mcp_config_path",
-        );
-        assert!(
             app.pending_global_pty_bytes.is_empty(),
             "close must drain pending_global_pty_bytes",
-        );
-        // File deletion runs on a background thread per the
-        // Codex adversarial-review fix for
-        // `docs/UI.md` "Blocking I/O Prohibition". Poll with a
-        // short timeout.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        while temp_path.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(
-            !temp_path.exists(),
-            "close must (asynchronously) delete the temp MCP config file",
         );
     }
 
@@ -15004,7 +14669,6 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
-                mcp_config_path: None,
             },
         );
 
@@ -18192,8 +17856,6 @@ mod tests {
             outcome: Ok(SessionSpawnOk {
                 session,
                 mcp_server,
-                warning: None,
-                mcp_config_path: None,
             }),
         })
         .expect("test channel send must succeed");
@@ -18243,33 +17905,6 @@ mod tests {
              - inline drop would take at least the SIGTERM grace \
              window (50ms). Elapsed: {elapsed:?}",
         );
-    }
-
-    /// Codex adversarial-review finding: the per-session MCP
-    /// config file is written to the shared temp directory and
-    /// embeds each repo's configured MCP server `env` values,
-    /// which can contain API tokens. The file MUST be written
-    /// with owner-only (0600) permissions so other local users
-    /// or processes cannot read the secrets out of /tmp. This
-    /// test writes a file via `write_private_file` and asserts
-    /// the resulting mode has exactly the owner-read + owner-
-    /// write bits set, with every "other" permission bit clear.
-    #[test]
-    #[cfg(unix)]
-    fn write_private_file_sets_owner_only_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().expect("create temp dir");
-        let path = tmp.path().join("secret.json");
-        write_private_file(&path, br#"{"secret": "redacted"}"#).expect("write must succeed");
-        let meta = std::fs::metadata(&path).expect("stat must succeed");
-        let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "write_private_file must create the file with mode 0600, got {mode:o}",
-        );
-        // Sanity: the content is actually there.
-        let content = std::fs::read_to_string(&path).expect("read must succeed");
-        assert_eq!(content, r#"{"secret": "redacted"}"#);
     }
 
     /// Codex adversarial-review finding: `apply_stage_change`
@@ -18331,7 +17966,6 @@ mod tests {
             session: Some(session),
             scrollback_offset: 0,
             selection: None,
-            mcp_config_path: None,
         };
         app.sessions
             .insert((wi_id.clone(), WorkItemStatus::Implementing), entry);

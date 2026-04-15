@@ -210,43 +210,35 @@ Examples of the cache-first pattern:
   worker does ALL the remaining I/O: resolves
   `std::env::current_exe()` (readlink syscall), starts the
   `McpSocketServer` (`remove_file` + `UnixListener::bind`), builds
-  the MCP config JSON, writes a temp `--mcp-config` file under
-  `std::env::temp_dir()`, forks the Claude PTY via
+  the MCP config JSON, appends it inline to the claude argv as
+  `--mcp-config <json-string>`, forks the Claude PTY via
   `Session::spawn`, and sends a `SessionSpawnResult` back via a
   per-work-item receiver stored in `session_spawn_rx`.
   `poll_session_spawns` drains the result on the next background
   tick, re-validates that the work item still exists and the
-  captured stage still matches the current one (mirror of the
-  `finish_session_open` guards for the `reassemble_work_items`
-  derived-Done race), and inserts the live session / MCP server
-  into `self.sessions` / `self.mcp_servers`. If the work item or
-  stage has drifted in the meantime, the `Session` inside
-  `SessionSpawnOk` is routed through `teardown_session_async` so
-  its blocking `Drop` tears down on a background thread; the
-  session never becomes observable in the map.
-- **Workbridge does NOT write `.mcp.json` into the worktree
-  root.** Earlier iterations wrote both a worktree `.mcp.json`
-  and a temp `--mcp-config` file as defense-in-depth, but the
-  worktree file is indistinguishable from a user- or repo-owned
-  `.mcp.json` - a rollback on cancellation or spawn failure
-  would silently delete it, and a successful write on top of a
-  pre-existing user file would overwrite user state. Codex
-  adversarial review flagged that as unrecoverable data loss
-  and a violation of the CLAUDE.md rule against mutating
-  third-party tool control files outside workbridge-owned
-  directories. The temp `--mcp-config` path lives under
-  `std::env::temp_dir()` with a UUID-tagged filename, so it is
-  unambiguously workbridge-owned and can be cleaned up on every
-  failure path. Claude Code accepts `--mcp-config` as a
-  first-class CLI flag, so a single delivery path is sufficient
-  to reach the MCP server. A write failure on the temp path is
-  therefore fatal and aborts the spawn; there is no backup path
-  to fall through to.
+  captured stage still matches the current one, and inserts the
+  live session / MCP server into `self.sessions` / `self.mcp_servers`.
+  If the work item or stage has drifted in the meantime, the
+  `Session` is routed through `teardown_session_async` so its
+  blocking `Drop` tears down on a background thread.
+- **Workbridge does not write any MCP config files to disk.**
+  Claude Code accepts inline JSON literals for `--mcp-config`
+  (per `claude --help`: "Load MCP servers from JSON files or
+  strings"), so the per-session config JSON only ever lives in
+  workbridge's argv and Claude's argv. Earlier iterations wrote
+  `.mcp.json` to the worktree root and/or a temp config file
+  under `/tmp`, both of which had real downsides (overwriting
+  user-owned `.mcp.json`, accumulating secret-bearing temp
+  files, requiring rollback on every failure path). The inline
+  delivery satisfies harness-contract C4 ("per-session MCP
+  injection with stdio transport") without any of those
+  failure modes.
 - `finish_session_open` and `poll_session_spawns` together contain
   ZERO filesystem I/O on the UI thread: no `session_exists_on_disk`
-  call (moved to stage 1), no `std::fs::write` calls (moved to
-  stage 2), no `Session::spawn` PTY fork (moved to stage 2), and
-  no `McpSocketServer::start` socket bind (also moved to stage 2).
+  call (moved to stage 1), no `std::fs::write` calls (none exist
+  anywhere in the spawn path - the config goes inline), no
+  `Session::spawn` PTY fork (moved to stage 2), and no
+  `McpSocketServer::start` socket bind (also moved to stage 2).
   Any future edit that reintroduces a synchronous `read_plan`,
   `fs::write`, `fs::read`, `Session::spawn`, or
   `McpSocketServer::start` call into those functions is a P0
