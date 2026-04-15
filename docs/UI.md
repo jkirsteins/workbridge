@@ -877,24 +877,32 @@ nearest `GroupHeader` entry.
 
 ```
   List   Board                          Tab: switch view
-+-- Work Items --+-- Claude Code | Terminal -------+
-|                |                                 |
-| UNLINKED (N)   |  [PTY output or placeholder]    |
-| ? pr-branch    |                                 |
-|                |                                 |
-| [BL] idea-1    |                                 |
-| [PL] plan-2    |                                 |
-| [IM] feature-3 |                                 |
-| [RV] fix-4     |                                 |
-+----------------+---------------------------------+
-| Context bar: title | [stage] | repo | labels     |
-+--------------------------------------------------+
-| Status bar message                               |
-+--------------------------------------------------+
++-- Work Items ------------+-- Claude Code | Terminal -------+
+|                          |                                 |
+| UNLINKED (N)             |  [PTY output or placeholder]    |
+| ? a-very-long-pr-branch- |                                 |
+|     name-that-wraps      |                                 |
+|   repo-dir               |                                 |
+|                          |                                 |
+| [BL] idea-1              |                                 |
+| [PL] plan-2              |                                 |
+| [IM] feature-3           |                                 |
+| [RV] fix-4               |                                 |
++--------------------------+---------------------------------+
+| Context bar: title | [stage] | repo | labels               |
++------------------------------------------------------------+
+| Status bar message                                         |
++------------------------------------------------------------+
 ```
 
 The `List` label is highlighted (active). The header uses the ratatui
 `Tabs` widget with `style_view_mode_tab_active()` for the selected tab.
+
+Unlinked work items render as a wrapped branch title (with the `PR#N`
+badge right-aligned on the first line) followed by an indented
+repo-directory meta line. Long branches wrap across as many lines as
+needed - never truncated - matching the wrap-not-truncate convention
+used for board items.
 
 Work items are shown as a flat list with stage badges:
 - [BL] Backlog, [PL] Planning, [IM] Implementing

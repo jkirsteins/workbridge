@@ -6,14 +6,14 @@ expression: "render(&app, 80, 24)"
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  UNLINKED (2)         ││                                                     │
 │> ? fix-typo      PR#45││  Unlinked PR #45                                    │
-│  ? updat.. PR#12 draft││                                                     │
-│  ACTIVE (0) (1)       ││  PR          #45 https://github.com/o/r/pull/45     │
-│  [IM] Active  PR#30 ok││  Repo        /repo/unlinked                         │
-│  feature              ││  Branch      fix-typo                               │
-│  branch-prog-1 [no wt]││  State       Open                                   │
-│                       ││  Draft       No                                     │
-│                       ││  Review      (none)                                 │
-│                       ││  Checks      (none)                                 │
+│  unlinked             ││                                                     │
+│  ? update- PR#12 draft││  PR          #45 https://github.com/o/r/pull/45     │
+│    deps               ││  Repo        /repo/unlinked                         │
+│  unlinked             ││  Branch      fix-typo                               │
+│  ACTIVE (0) (1)       ││  State       Open                                   │
+│  [IM] Active  PR#30 ok││  Draft       No                                     │
+│  feature              ││  Review      (none)                                 │
+│  branch-prog-1 [no wt]││  Checks      (none)                                 │
 │                       ││                                                     │
 │                       ││  Press Enter to import this PR as a work item.  Ctrl│
 │                       ││                                                     │

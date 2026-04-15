@@ -1627,6 +1627,13 @@ fn format_review_request_item<'a>(
 }
 
 /// Format an unlinked PR entry for the left panel list.
+///
+/// Returns a multi-line `ListItem`:
+///   Line 1: "? branch-start"   (shares line with right-aligned PR#N [draft] badge)
+///   Line 2+: continuation lines of the wrapped branch name (4-space indent)
+///   Final line: repo directory name (2-space indent, muted)
+///
+/// Mirrors the wrap-not-truncate convention used by `format_work_item_entry`.
 fn format_unlinked_item<'a>(
     app: &App,
     idx: usize,
@@ -1648,41 +1655,86 @@ fn format_unlinked_item<'a>(
     }
     let right = format!("{pr_badge}{draft_suffix}");
 
-    // Title: branch name for unlinked items.
-    let title = &unlinked.branch;
-
-    // Layout: "{margin}? title    PR#N [draft]"
-    // Reserve space: 2 for "? " prefix, right.len() for badge, 1 for gap.
+    // Layout: "{margin}? branch    PR#N [draft]"
+    //         "       continuation-of-branch"
+    //         "  repo-dir"
+    //
+    // First line shares content_width with the "? " prefix, the right-aligned
+    // badge, and a 1-col gap. Continuation lines are indented under the branch
+    // title (4 spaces: 2 for margin + 2 for "? " prefix). The meta (repo dir)
+    // line is indented by 2 spaces to align with the branch title, matching
+    // the convention in `format_work_item_entry`.
     let prefix = "? ";
-    let available = content_width
-        .saturating_sub(prefix.width())
-        .saturating_sub(right.width())
-        .saturating_sub(1);
-    let truncated_title = truncate_str(title, available);
+    let first_width = content_width
+        .saturating_sub(prefix.width() + right.width() + 1)
+        .max(1);
+    let rest_width = content_width.saturating_sub(4).max(1);
+
+    let branch_lines = wrap_two_widths(&unlinked.branch, first_width, rest_width);
+    let first_branch = branch_lines.first().cloned().unwrap_or_default();
 
     let padding =
-        content_width.saturating_sub(prefix.width() + truncated_title.width() + right.width());
+        content_width.saturating_sub(prefix.width() + first_branch.width() + right.width());
     let pad_str: String = " ".repeat(padding);
 
-    let (margin_style, marker_style, title_style, badge_style) = if is_selected {
+    // Styling: when selected, the `List` widget applies highlight_bg; we set fg
+    // per-span so the highlight fg colors render correctly. Meta stays DarkGray
+    // on selection (matching `format_work_item_entry`).
+    let (margin_style, marker_style, title_style, badge_style, meta_style) = if is_selected {
         let hl = theme.style_tab_highlight();
-        (hl, hl, hl, hl)
+        (
+            hl,
+            hl,
+            hl,
+            hl,
+            ratatui_core::style::Style::default().fg(ratatui_core::style::Color::DarkGray),
+        )
     } else {
         (
             ratatui_core::style::Style::default(),
             theme.style_unlinked_marker(),
             theme.style_text(),
             theme.style_badge_pr(),
+            theme.style_text_muted(),
         )
     };
 
-    ListItem::new(Line::from(vec![
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Line 1: margin + "? " + first branch chunk + pad + right-aligned badge.
+    lines.push(Line::from(vec![
         Span::styled(margin, margin_style),
         Span::styled(prefix.to_string(), marker_style),
-        Span::styled(truncated_title, title_style),
+        Span::styled(first_branch, title_style),
         Span::raw(pad_str),
         Span::styled(right, badge_style),
-    ]))
+    ]));
+
+    // Branch continuation lines: 4-space indent so they align under the title.
+    for cont in branch_lines.iter().skip(1) {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(cont.clone(), title_style),
+        ]));
+    }
+
+    // Meta line: repo directory name, 2-space indent, muted. Wrap defensively
+    // in case of a very narrow pane or a pathologically long directory name.
+    let repo_name: String = unlinked
+        .repo_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "<unknown repo>".to_string());
+    let meta_budget = content_width.saturating_sub(2).max(1);
+    for wrapped in wrap_text(&repo_name, meta_budget) {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(wrapped, meta_style),
+        ]));
+    }
+
+    ListItem::new(lines)
 }
 
 /// Format a work item entry for the left panel list.
@@ -5319,6 +5371,114 @@ mod snapshot_tests {
             }
         }
         assert!(found_badge, "PR#45 badge not found on the selected row");
+    }
+
+    #[test]
+    fn unlinked_pr_long_branch_wraps() {
+        // Branch long enough to force at least 2 wrap lines at the default
+        // test-layout width (terminal 80 -> left-panel inner 23 cols,
+        // content_width 21, first-branch budget 14 cols for PR#1 badge).
+        let long_branch = "feature/very-long-branch-that-must-wrap";
+        let items = vec![make_work_item(
+            "prog-1",
+            "Anchor",
+            WorkItemStatus::Implementing,
+            None,
+            1,
+        )];
+        let unlinked = vec![make_unlinked_pr(long_branch, 1, false)];
+        let mut app = app_with_items(items, unlinked);
+
+        // Structural check via the public ListItem API: the formatted item
+        // should span at least three rows (>=1 branch-wrap line + >=1
+        // continuation line + 1 repo-dir meta line).
+        let theme = Theme::default_theme();
+        let max_width = 23_usize; // matches the left-panel inner width at term=80
+        let item = super::format_unlinked_item(&app, 0, max_width, &theme, false);
+        assert!(
+            item.height() >= 3,
+            "expected long-branch unlinked item to render as >=3 lines, got {}",
+            item.height()
+        );
+
+        // End-to-end render check: the full branch must be reconstructible
+        // from the wrapped left-panel rows (no truncation), and a meta row
+        // with the repo directory name must follow the branch rows.
+        let output = render(&mut app, 80, 24);
+        let left_lines: Vec<String> = output
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .skip(1) // skip the left border
+                    .take(max_width) // take the left panel inner width
+                    .collect::<String>()
+            })
+            .collect();
+
+        // No left-panel row may exceed the content width.
+        for row in &left_lines {
+            assert!(
+                row.chars().count() <= max_width,
+                "left panel row exceeded inner width {max_width}: {row:?}"
+            );
+        }
+
+        // Find the row that begins the unlinked item. The row format is
+        // "<margin>? <branch-start>..." where margin is "> " if selected or
+        // "  " otherwise. We match the "? " marker with either margin.
+        let item_row = left_lines
+            .iter()
+            .position(|l| {
+                let mut chars = l.chars();
+                // 2 margin chars (either "> " or "  "), then "? ".
+                chars.next();
+                chars.next();
+                chars.next() == Some('?') && chars.next() == Some(' ')
+            })
+            .expect("expected to find a '? ' unlinked item marker in the left panel rows");
+
+        // First branch chunk sits between the "  ? " prefix and the right-
+        // aligned "PR#" badge on the same row.
+        let first_row = &left_lines[item_row];
+        let first_content = first_row.get(4..).unwrap_or("");
+        let first_chunk = match first_content.rfind("PR#") {
+            Some(idx) => first_content[..idx].trim_end().to_string(),
+            None => first_content.trim_end().to_string(),
+        };
+        let mut branch_chunks = vec![first_chunk];
+
+        // Continuation rows use a 4-space indent.
+        let mut i = item_row + 1;
+        while i < left_lines.len() && left_lines[i].starts_with("    ") {
+            branch_chunks.push(left_lines[i].trim().to_string());
+            i += 1;
+        }
+        assert!(
+            branch_chunks.len() >= 2,
+            "expected branch to wrap across >=2 lines, got {}: {branch_chunks:?}",
+            branch_chunks.len()
+        );
+
+        // Next row is the repo-dir meta line, indented by 2 spaces.
+        assert!(
+            i < left_lines.len(),
+            "expected a repo-dir meta row after the branch wrap lines"
+        );
+        let meta_row = &left_lines[i];
+        assert_eq!(
+            meta_row.trim(),
+            "unlinked",
+            "expected meta row to contain the repo directory name 'unlinked', got {meta_row:?}"
+        );
+
+        // Concatenating the branch chunks (wrap strips intermediate whitespace
+        // at break points) should reconstruct the original branch string
+        // exactly - no characters dropped or truncated.
+        let reconstructed: String = branch_chunks.join("");
+        assert_eq!(
+            reconstructed, long_branch,
+            "wrapped branch chunks should reconstruct the original branch text"
+        );
     }
 
     #[test]
