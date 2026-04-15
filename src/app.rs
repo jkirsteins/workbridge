@@ -621,6 +621,9 @@ pub struct SessionSpawnOk {
     pub session: crate::session::Session,
     pub mcp_server: McpSocketServer,
     pub warning: Option<String>,
+    /// Temp `--mcp-config` file path so every teardown path can
+    /// unlink the secret-bearing config file.
+    pub mcp_config_path: Option<PathBuf>,
 }
 
 /// Per-entry state for the `session_spawn_rx` map, mirroring
@@ -1774,8 +1777,9 @@ impl App {
         for key in orphans {
             if let Some(entry) = self.sessions.remove(&key) {
                 let mcp_server = self.mcp_servers.remove(&key.0);
+                let mcp_config_path = entry.mcp_config_path;
                 if let Some(session) = entry.session {
-                    Self::teardown_live_session_async(session, mcp_server);
+                    Self::teardown_live_session_async(session, mcp_server, mcp_config_path);
                 } else if let Some(mcp) = mcp_server {
                     Self::teardown_mcp_server_async(mcp);
                 }
@@ -1832,7 +1836,7 @@ impl App {
             if let Some(entry) = self.terminal_sessions.remove(&wi_id)
                 && let Some(session) = entry.session
             {
-                Self::teardown_live_session_async(session, None);
+                Self::teardown_live_session_async(session, None, None);
             }
         }
     }
@@ -2112,6 +2116,7 @@ impl App {
                         session: Some(session),
                         scrollback_offset: 0,
                         selection: None,
+                        mcp_config_path: None,
                     },
                 );
             }
@@ -2534,15 +2539,18 @@ impl App {
         self.cleanup_session_state_for(wi_id);
         if let Some(key) = self.session_key_for(wi_id)
             && let Some(entry) = self.sessions.remove(&key)
-            && let Some(session) = entry.session
         {
-            Self::teardown_live_session_async(session, None);
+            let mcp_config_path = entry.mcp_config_path;
+            if let Some(session) = entry.session {
+                Self::teardown_live_session_async(session, None, mcp_config_path);
+            }
         }
         // Kill associated terminal session.
-        if let Some(entry) = self.terminal_sessions.remove(wi_id)
-            && let Some(session) = entry.session
-        {
-            Self::teardown_live_session_async(session, None);
+        if let Some(entry) = self.terminal_sessions.remove(wi_id) {
+            let mcp_config_path = entry.mcp_config_path;
+            if let Some(session) = entry.session {
+                Self::teardown_live_session_async(session, None, mcp_config_path);
+            }
         }
 
         // -- Phase 4: (removed) Resource cleanup runs on a background
@@ -4683,6 +4691,7 @@ impl App {
                     session,
                     mcp_server: server,
                     warning: None,
+                    mcp_config_path: Some(config_path),
                 }),
                 Err(e) => {
                     let _ = std::fs::remove_file(&config_path);
@@ -4731,58 +4740,53 @@ impl App {
     /// ms, including the SIGTERM grace window - and there are
     /// never more than a handful of pending teardowns at once in
     /// practice (one per interrupted stage change).
-    fn teardown_session_async(session: crate::session::Session, mcp_server: McpSocketServer) {
+    fn teardown_session_async(
+        session: crate::session::Session,
+        mcp_server: Option<McpSocketServer>,
+        mcp_config_path: Option<PathBuf>,
+    ) {
+        // Regression guard: every Drop here is blocking -
+        // Session::Drop runs force_kill + reader-thread join,
+        // McpSocketServer::Drop does stop + remove_file, and
+        // the temp config unlink is another syscall. Any caller
+        // that drops these on the UI thread (including via a
+        // `HashMap::insert` that replaces a live entry) blocks
+        // the tick path. See `docs/UI.md` "Blocking I/O
+        // Prohibition".
         std::thread::spawn(move || {
-            // Dropping here on this thread (not the UI thread)
-            // runs Session::Drop and McpSocketServer::Drop off
-            // the tick path. Both implementations are tested in
-            // their owning modules; we just move them into this
-            // closure so they fall out of scope on the right
-            // thread.
             drop(session);
             drop(mcp_server);
+            if let Some(path) = mcp_config_path {
+                let _ = std::fs::remove_file(path);
+            }
         });
     }
 
-    /// Gracefully kill a live `Session` (and optionally its paired
-    /// `McpSocketServer`) on a background thread.
+    /// Gracefully tear down a live `Session` on a background
+    /// thread. Unlike `teardown_session_async`, this calls
+    /// `Session::kill` first (SIGTERM + grace + SIGKILL + reap)
+    /// before dropping - the grace-window sleep is blocking and
+    /// must not run on the UI tick path.
     ///
-    /// Differs from [`teardown_session_async`] in one important
-    /// way: it calls `Session::kill` on the background thread
-    /// BEFORE dropping, which sends SIGTERM, waits the
-    /// `SIGTERM_GRACE_MS` window (currently 50ms), escalates to
-    /// SIGKILL if needed, and reaps the child. The grace window
-    /// is a blocking sleep that Codex adversarial review flagged
-    /// as a P0 `docs/UI.md` "Blocking I/O Prohibition" violation
-    /// when it ran inline on the UI thread (via
-    /// `apply_stage_change` or `check_liveness` calling
-    /// `session.kill()` directly on a HashMap entry). Routing
-    /// through this helper preserves the graceful-shutdown
-    /// semantics while keeping the UI thread free.
-    ///
-    /// `mcp_server` is optional because not every call site has
-    /// a paired server to hand off in the same move. Callers
-    /// that DO have one must pass it here so the MCP socket is
-    /// torn down on the same background thread as the session,
-    /// avoiding a second UI-thread hop into
-    /// `teardown_mcp_server_async`.
+    /// Regression guard: callers MUST NOT drop `Session`,
+    /// `McpSocketServer`, or the temp `--mcp-config` file on the
+    /// UI thread directly - every map removal that yields a
+    /// live session has to flow through this helper (or
+    /// `teardown_session_async` for already-dead sessions) so
+    /// the blocking Drops run off-thread. `docs/UI.md` "Blocking
+    /// I/O Prohibition" is the absolute rule.
     fn teardown_live_session_async(
         mut session: crate::session::Session,
         mcp_server: Option<McpSocketServer>,
+        mcp_config_path: Option<PathBuf>,
     ) {
         std::thread::spawn(move || {
-            // Graceful SIGTERM + grace + SIGKILL + reap. The
-            // child.wait() inside `Session::kill` is blocking,
-            // which is fine on this background thread.
             session.kill();
-            // `Session::Drop` also force-kills any remaining
-            // child and joins the reader thread, so once kill()
-            // has run the drop is effectively cleanup-only.
             drop(session);
-            // Drop the paired MCP server (stop() + remove_file)
-            // on the same thread so the socket cleanup and the
-            // session teardown happen together.
             drop(mcp_server);
+            if let Some(path) = mcp_config_path {
+                let _ = std::fs::remove_file(path);
+            }
         });
     }
 
@@ -4853,7 +4857,7 @@ impl App {
             if let Ok(result) = entry.rx.try_recv()
                 && let Ok(ok) = result.outcome
             {
-                Self::teardown_session_async(ok.session, ok.mcp_server);
+                Self::teardown_session_async(ok.session, Some(ok.mcp_server), ok.mcp_config_path);
             }
         }
     }
@@ -4916,7 +4920,11 @@ impl App {
                 // tear down and just falls out of scope - no hop
                 // needed.
                 if let Ok(ok) = result.outcome {
-                    Self::teardown_session_async(ok.session, ok.mcp_server);
+                    Self::teardown_session_async(
+                        ok.session,
+                        Some(ok.mcp_server),
+                        ok.mcp_config_path,
+                    );
                 }
                 continue;
             }
@@ -4926,56 +4934,30 @@ impl App {
                     session,
                     mcp_server,
                     warning,
+                    mcp_config_path,
                 }) => {
-                    // Codex adversarial review: a plain
-                    // `HashMap::insert` here can REPLACE a
-                    // pre-existing MCP server (and, defensively,
-                    // a pre-existing dead Session) for the same
-                    // work item, dropping the replaced value on
-                    // the UI thread. `open_session_for_selected`
-                    // removes only the dead `self.sessions`
-                    // entry when reopening a dead session and
-                    // leaves the old `self.mcp_servers` entry in
-                    // place; that old server would then be
-                    // dropped inline by the `mcp_servers.insert`
-                    // below, which calls
-                    // `McpSocketServer::Drop -> stop() +
-                    // std::fs::remove_file`. Route any
-                    // pre-existing entry through the async
-                    // teardown helper before the new insert so
-                    // the blocking `Drop` runs on a background
-                    // thread.
+                    // Regression guard: `HashMap::insert` below
+                    // would drop any stale value on the UI
+                    // thread. Route pre-existing resources
+                    // through the async teardown helpers first.
                     let session_key = (result.wi_id.clone(), result.stage);
-                    if let Some(old_entry) = self.sessions.remove(&session_key) {
+                    let old_entry = self.sessions.remove(&session_key);
+                    let old_mcp = self.mcp_servers.remove(&result.wi_id);
+                    if let Some(old_entry) = old_entry {
+                        let old_config = old_entry.mcp_config_path;
                         if let Some(old_session) = old_entry.session {
-                            // The paired McpSocketServer for
-                            // this (wi, stage) may or may not
-                            // still be in `self.mcp_servers`;
-                            // remove it if present so the two
-                            // old resources tear down together.
-                            if let Some(old_mcp) = self.mcp_servers.remove(&result.wi_id) {
-                                Self::teardown_session_async(old_session, old_mcp);
-                            } else {
-                                // No matching old MCP server -
-                                // tear down the session by
-                                // itself by pairing it with a
-                                // drop of the new server's
-                                // placeholder is impossible, so
-                                // spawn a dedicated thread just
-                                // for the session via a one-off
-                                // closure.
+                            Self::teardown_session_async(old_session, old_mcp, old_config);
+                        } else {
+                            if let Some(old_mcp) = old_mcp {
+                                Self::teardown_mcp_server_async(old_mcp);
+                            }
+                            if let Some(path) = old_config {
                                 std::thread::spawn(move || {
-                                    drop(old_session);
+                                    let _ = std::fs::remove_file(path);
                                 });
                             }
-                        } else if let Some(old_mcp) = self.mcp_servers.remove(&result.wi_id) {
-                            Self::teardown_mcp_server_async(old_mcp);
                         }
-                    } else if let Some(old_mcp) = self.mcp_servers.remove(&result.wi_id) {
-                        // No stale `self.sessions` entry, but
-                        // there IS a stale MCP server (the
-                        // dead-session reopen path). Route it
-                        // through the MCP-only teardown helper.
+                    } else if let Some(old_mcp) = old_mcp {
                         Self::teardown_mcp_server_async(old_mcp);
                     }
                     let parser = Arc::clone(&session.parser);
@@ -4985,6 +4967,7 @@ impl App {
                         session: Some(session),
                         scrollback_offset: 0,
                         selection: None,
+                        mcp_config_path,
                     };
                     self.sessions.insert(session_key, entry);
                     self.mcp_servers.insert(result.wi_id, mcp_server);
@@ -6929,27 +6912,18 @@ impl App {
         // status bar until the background PTY fork completes.
         self.drop_session_spawn_entry(wi_id);
 
-        // Kill the old session for this work item before spawning a new one.
-        // Previously relied on orphan cleanup in check_liveness, but that
-        // leaves two sessions alive briefly and the old one can do work
-        // (push, commit, etc.) in the gap.
-        //
-        // The kill has to run on a background thread: `Session::kill`
-        // does SIGTERM + 50ms grace sleep + SIGKILL + child.wait, all
-        // blocking, and `apply_stage_change` runs on the UI tick path.
-        // Route the live session + its paired MCP server to
-        // `teardown_live_session_async`; pull the MCP server out of
-        // the map first so the helper tears down BOTH on the same
-        // background thread and the subsequent
-        // `cleanup_session_state_for` call no longer finds it.
-        // Codex adversarial review flagged the inline `session.kill()`
-        // as a `docs/UI.md` "Blocking I/O Prohibition" P0.
+        // Regression guard: the old session + its paired MCP
+        // server must be torn down via `teardown_live_session_async`
+        // so `Session::kill`'s SIGTERM grace sleep runs off the
+        // UI tick path. Do not re-introduce an inline
+        // `session.kill()` here.
         if let Some(old_key) = self.session_key_for(wi_id)
             && let Some(entry) = self.sessions.remove(&old_key)
         {
             let mcp_server = self.mcp_servers.remove(wi_id);
+            let mcp_config_path = entry.mcp_config_path;
             if let Some(session) = entry.session {
-                Self::teardown_live_session_async(session, mcp_server);
+                Self::teardown_live_session_async(session, mcp_server, mcp_config_path);
             } else if let Some(mcp) = mcp_server {
                 Self::teardown_mcp_server_async(mcp);
             }
@@ -8926,20 +8900,20 @@ impl App {
                             self.build_display_list();
                         }
 
-                        // Kill and respawn the session with the rework
-                        // prompt so Claude sees the rejection reason.
-                        // Route through `teardown_live_session_async`
-                        // so SIGTERM + grace + SIGKILL + wait runs on
-                        // a background thread - `poll_review_gate`
-                        // runs on the UI tick path and the inline
-                        // `session.kill()` was a Codex adversarial-
-                        // review P0 under the blocking-I/O rule.
+                        // Regression guard: teardown must go through
+                        // the async helpers so SIGTERM grace + wait
+                        // runs off the UI tick path.
                         if let Some(key) = self.session_key_for(&wi_id)
                             && let Some(entry) = self.sessions.remove(&key)
                         {
                             let mcp_server = self.mcp_servers.remove(&wi_id);
+                            let mcp_config_path = entry.mcp_config_path;
                             if let Some(session) = entry.session {
-                                Self::teardown_live_session_async(session, mcp_server);
+                                Self::teardown_live_session_async(
+                                    session,
+                                    mcp_server,
+                                    mcp_config_path,
+                                );
                             } else if let Some(mcp) = mcp_server {
                                 Self::teardown_mcp_server_async(mcp);
                             }
@@ -9059,8 +9033,9 @@ impl App {
                     && let Some(entry) = self.sessions.remove(&key)
                 {
                     let mcp_server = self.mcp_servers.remove(&wi_id);
+                    let mcp_config_path = entry.mcp_config_path;
                     if let Some(session) = entry.session {
-                        Self::teardown_live_session_async(session, mcp_server);
+                        Self::teardown_live_session_async(session, mcp_server, mcp_config_path);
                     } else if let Some(mcp) = mcp_server {
                         Self::teardown_mcp_server_async(mcp);
                     }
@@ -9306,6 +9281,9 @@ impl App {
                     session: Some(session),
                     scrollback_offset: 0,
                     selection: None,
+                    // Global assistant temp config is tracked on
+                    // `self.global_mcp_config_path`, not here.
+                    mcp_config_path: None,
                 });
                 self.global_mcp_server = Some(mcp_server);
             }
@@ -13396,6 +13374,7 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
+                mcp_config_path: None,
             },
         );
 
@@ -13673,6 +13652,7 @@ mod tests {
             session: None,
             scrollback_offset: 0,
             selection: None,
+            mcp_config_path: None,
         });
 
         // Pre-populate a real temp file as the MCP config path so we can
@@ -13768,6 +13748,7 @@ mod tests {
             session: None,
             scrollback_offset: 0,
             selection: None,
+            mcp_config_path: None,
         });
 
         let temp_path = std::env::temp_dir().join(format!(
@@ -14328,6 +14309,7 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
+                mcp_config_path: None,
             },
         );
 
@@ -17510,6 +17492,7 @@ mod tests {
                 session,
                 mcp_server,
                 warning: None,
+                mcp_config_path: None,
             }),
         })
         .expect("test channel send must succeed");
@@ -17647,6 +17630,7 @@ mod tests {
             session: Some(session),
             scrollback_offset: 0,
             selection: None,
+            mcp_config_path: None,
         };
         app.sessions
             .insert((wi_id.clone(), WorkItemStatus::Implementing), entry);

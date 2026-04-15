@@ -2571,6 +2571,7 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
+                mcp_config_path: None,
             },
         );
 
@@ -2647,6 +2648,7 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
+                mcp_config_path: None,
             },
         );
         // Pre-install a LIVE terminal session so the Tab-flip's call to
@@ -2661,6 +2663,7 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
+                mcp_config_path: None,
             },
         );
 
