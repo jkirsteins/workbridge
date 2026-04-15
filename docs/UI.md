@@ -586,7 +586,7 @@ neither, never both.
    forms of structural ownership:
    - **Per-owner state struct** for long-lived operations keyed by
      a work item or session (e.g. `ReviewGateState.activity`,
-     `SessionOpenPending.activity`, `MergequeuePollState.activity`).
+     `SessionOpenPending.activity`, `PrMergePollState.activity`).
    - **Closure-captured + completion message** for fire-and-forget
      spawns with no persistent state (e.g. the `activity` field on
      `OrphanCleanupFinished`, which the worker thread captures and

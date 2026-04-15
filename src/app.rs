@@ -542,24 +542,33 @@ impl WorktreeCleanliness {
     }
 }
 
-/// Information needed to poll a Mergequeue item's PR state.
+/// Information needed to poll the PR state of a work item waiting on a
+/// merge. Used by two parallel pollers:
 ///
-/// `pr_number` is the unambiguous identity of the PR the user opted into
-/// when they pressed `[p] Poll`. When it is `Some`, the poll thread
-/// targets `gh pr view <number>`, which always returns the exact PR even
-/// if the branch has since had another PR opened on it. `enter_mergequeue`
-/// pins it from `assoc.pr.number` immediately, so the live-entry path is
-/// never vulnerable to branch-resolution drift.
+/// - `poll_mergequeue` watches `Mergequeue`-stage items for the PR the
+///   user explicitly opted into via `[p] Poll`.
+/// - `poll_review_request_merges` watches `ReviewRequest`-kind items in
+///   `Review` whose PR was merged externally - the only code path that
+///   can observe such a merge, since the `--author @me` fetch filters
+///   the PR out and `review-requested:@me` is `--state open`.
 ///
-/// `pr_number` is `None` only on a watch that was rebuilt from a backend
-/// record after an app restart, since the in-memory `assoc.pr` may have
-/// been gone by then. In that case the poll thread falls back to
-/// `gh pr view <branch>`; the result drain writes the resolved number
-/// back into the watch so subsequent polls are unambiguous.
+/// `pr_number` is the unambiguous identity of the PR. When it is `Some`,
+/// the poll thread targets `gh pr view <number>`, which always returns
+/// the exact PR even if the branch has since had another PR opened on
+/// it. Mergequeue entry pins it from `assoc.pr.number` immediately, so
+/// the live-entry path is never vulnerable to branch-resolution drift.
+///
+/// `pr_number` is `None` on a watch that was rebuilt from a backend
+/// record after an app restart (since the in-memory `assoc.pr` may have
+/// been gone by then) and on ReviewRequest watches where the
+/// author-filtered fetch never populated `assoc.pr` in the first place.
+/// In those cases the poll thread falls back to `gh pr view <branch>`;
+/// the result drain writes the resolved number back into the watch so
+/// subsequent polls are unambiguous.
 ///
 /// `last_polled` enforces a per-item cooldown so each watch is checked on
 /// its own 30s schedule. Polls run concurrently across watches.
-pub struct MergequeueWatch {
+pub struct PrMergeWatch {
     pub wi_id: WorkItemId,
     pub pr_number: Option<u64>,
     pub owner_repo: String,
@@ -568,16 +577,19 @@ pub struct MergequeueWatch {
     pub last_polled: Option<std::time::Instant>,
 }
 
-/// In-flight poll for a single Mergequeue work item. The map key is the
+/// In-flight poll for a single PR merge watch. The map key is the
 /// `WorkItemId`, so retreat / delete can drop exactly the entry that
-/// belongs to the affected item without touching anything else.
-pub struct MergequeuePollState {
-    pub rx: crossbeam_channel::Receiver<MergequeuePollResult>,
+/// belongs to the affected item without touching anything else
+/// (structural ownership, per CLAUDE.md).
+pub struct PrMergePollState {
+    pub rx: crossbeam_channel::Receiver<PrMergePollResult>,
     pub activity: ActivityId,
 }
 
-/// Result from the background Mergequeue PR state poll.
-pub struct MergequeuePollResult {
+/// Result from a background `gh pr view` merge-state poll. Shared by
+/// both the Mergequeue and the ReviewRequest merge pollers - the JSON
+/// shape and all fields are identical.
+pub struct PrMergePollResult {
     pub wi_id: WorkItemId,
     pub pr_state: String,
     pub branch: String,
@@ -988,17 +1000,36 @@ pub struct App {
     /// Active mergequeue watches - items waiting for their PR to be merged.
     /// Each watch carries its own cooldown timestamp so polls run
     /// concurrently rather than serially round-robin.
-    pub mergequeue_watches: Vec<MergequeueWatch>,
+    pub mergequeue_watches: Vec<PrMergeWatch>,
     /// In-flight polls keyed by work item ID. At most one entry per
     /// watched item; the entry owns the receiver and the activity ID so
     /// retreat / delete can drop it cleanly without touching unrelated
     /// items.
-    pub mergequeue_polls: HashMap<WorkItemId, MergequeuePollState>,
+    pub mergequeue_polls: HashMap<WorkItemId, PrMergePollState>,
     /// Last poll error per watched work item. Cleared when the next poll
     /// succeeds or when the item retreats from Mergequeue. Shown in the
     /// detail pane so users notice `gh pr view` failures instead of
     /// losing them to a transient `status_message`.
     pub mergequeue_poll_errors: HashMap<WorkItemId, String>,
+
+    // -- ReviewRequest merge polling --
+    /// Active watches for ReviewRequest work items in Review, waiting for
+    /// their PR to be merged externally. Same shape as
+    /// `mergequeue_watches`: each entry owns its own cooldown timestamp so
+    /// polls run concurrently rather than serially round-robin, and
+    /// reassembly rebuilds them idempotently so app restarts never lose a
+    /// watch.
+    pub review_request_merge_watches: Vec<PrMergeWatch>,
+    /// In-flight ReviewRequest polls keyed by work item ID. At most one
+    /// entry per watched item; the entry owns the receiver and the
+    /// activity ID so retreat / delete can drop it cleanly without
+    /// touching unrelated items (structural ownership, per CLAUDE.md).
+    pub review_request_merge_polls: HashMap<WorkItemId, PrMergePollState>,
+    /// Last poll error per watched ReviewRequest work item. Cleared when
+    /// the next poll succeeds or when the item leaves Review. Surfaced in
+    /// the detail pane so `gh pr view` failures persist across ticks
+    /// instead of vanishing with the transient `status_message`.
+    pub review_request_merge_poll_errors: HashMap<WorkItemId, String>,
 
     // -- PR identity backfill --
     /// Receiver for background PR identity backfill results (one-time startup).
@@ -1088,6 +1119,404 @@ pub struct App {
     /// Transient top-right toast notifications. Newest is at the end of
     /// the vector. Pruned each tick by `prune_toasts`.
     pub toasts: Vec<Toast>,
+}
+
+/// Spawn a background thread that runs
+/// `gh pr view <target> --repo <owner/repo> --json state,number,title,url`
+/// and sends exactly one `PrMergePollResult` through the returned
+/// receiver. Shared by `poll_mergequeue` and `poll_review_request_merges`
+/// so the `gh` invocation and JSON parsing live in a single place.
+///
+/// `target` is the pinned PR number when known (unambiguous), otherwise
+/// the branch name. The branch fallback is used on watches reconstructed
+/// from a backend record after an app restart, and on all ReviewRequest
+/// watches where the `--author @me` fetch never populated `assoc.pr`.
+/// The poll's caller backfills the resolved number into the watch on
+/// the first successful result so subsequent polls target the exact PR.
+///
+/// Every outcome (success, non-zero exit, spawn failure, JSON parse
+/// failure) is delivered as a single send on `tx`. Errors are encoded
+/// as `pr_state: "ERROR: ..."` so the caller can handle them uniformly.
+fn spawn_gh_pr_view_poll(
+    wi_id: WorkItemId,
+    pr_number: Option<u64>,
+    owner_repo: String,
+    branch: String,
+    repo_path: PathBuf,
+) -> crossbeam_channel::Receiver<PrMergePollResult> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let target = pr_number
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| branch.clone());
+        let outcome = match std::process::Command::new("gh")
+            .args([
+                "pr",
+                "view",
+                &target,
+                "--repo",
+                &owner_repo,
+                "--json",
+                "state,number,title,url",
+            ])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let parsed: serde_json::Value = match serde_json::from_str(stdout.trim()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = tx.send(PrMergePollResult {
+                            wi_id,
+                            pr_state: format!("ERROR: JSON parse failed: {e}"),
+                            branch,
+                            repo_path,
+                            pr_identity: None,
+                        });
+                        return;
+                    }
+                };
+                let state = parsed
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("UNKNOWN")
+                    .to_string();
+                let pr_identity =
+                    parsed
+                        .get("number")
+                        .and_then(|n| n.as_u64())
+                        .and_then(|number| {
+                            let title = parsed.get("title")?.as_str()?.to_string();
+                            let url = parsed.get("url")?.as_str()?.to_string();
+                            Some(PrIdentityRecord { number, title, url })
+                        });
+                PrMergePollResult {
+                    wi_id,
+                    pr_state: state,
+                    branch,
+                    repo_path,
+                    pr_identity,
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                PrMergePollResult {
+                    wi_id,
+                    pr_state: format!("ERROR: {}", stderr.trim()),
+                    branch,
+                    repo_path,
+                    pr_identity: None,
+                }
+            }
+            Err(e) => PrMergePollResult {
+                wi_id,
+                pr_state: format!("ERROR: {e}"),
+                branch,
+                repo_path,
+                pr_identity: None,
+            },
+        };
+        let _ = tx.send(outcome);
+    });
+    rx
+}
+
+/// Generate a `poll_*` method that drives one PR-merge poller instance.
+///
+/// `poll_mergequeue` and `poll_review_request_merges` differ only in
+/// which `App` fields they touch (watches / in-flight polls / errors),
+/// which stage they treat as "eligible", and a few static data bits
+/// (strategy tag, status messages, whether the merged branch runs
+/// `cleanup_worktree_for_item`). Everything else - the Phase 1 drain
+/// loop, the still-eligible guard, the `pr_number` backfill, the merge-
+/// gate dispatch, the Phase 2 cooldown, the subprocess spawn - is
+/// identical. Expressing both via a macro keeps the two methods on one
+/// source of truth so they cannot drift as the `gh` path, the merge-
+/// gate, or the JSON schema evolve.
+///
+/// See `spawn_gh_pr_view_poll` for the subprocess body itself.
+macro_rules! impl_pr_merge_poll_method {
+    (
+        $(#[$meta:meta])*
+        fn $method_name:ident,
+        watches = $watches_field:ident,
+        polls = $polls_field:ident,
+        errors = $errors_field:ident,
+        source_stage = $source_stage:expr,
+        kind_filter = $kind_filter:expr,
+        strategy_tag = $strategy_tag:expr,
+        merged_message = $merged_message:expr,
+        closed_message = $closed_message:expr,
+        poll_error_prefix = $poll_error_prefix:expr,
+        poll_label_prefix = $poll_label_prefix:expr,
+        cleanup_worktree_on_merge = $cleanup_worktree:expr,
+    ) => {
+        $(#[$meta])*
+        pub fn $method_name(&mut self) {
+            // -- Phase 1: drain any in-flight results --
+            // Collect into locals before acting so we don't borrow `self`
+            // twice when calling into `apply_stage_change`, `end_activity`,
+            // etc.
+            let mut ready: Vec<PrMergePollResult> = Vec::new();
+            let mut to_remove: Vec<WorkItemId> = Vec::new();
+            for (wi_id, state) in &self.$polls_field {
+                match state.rx.try_recv() {
+                    Ok(r) => {
+                        ready.push(r);
+                        to_remove.push(wi_id.clone());
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {}
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        to_remove.push(wi_id.clone());
+                    }
+                }
+            }
+            for wi_id in &to_remove {
+                if let Some(state) = self.$polls_field.remove(wi_id) {
+                    self.end_activity(state.activity);
+                }
+            }
+
+            for result in ready {
+                // Actual-status guard: re-check the item is still
+                // eligible. The user may have retreated / deleted it
+                // between the spawn and the drain.
+                let kind_filter: Option<WorkItemKind> = $kind_filter;
+                let still_eligible = self.work_items.iter().any(|w| {
+                    w.id == result.wi_id
+                        && w.status == $source_stage
+                        && kind_filter
+                            .as_ref()
+                            .is_none_or(|k| w.kind == *k)
+                });
+                if !still_eligible {
+                    // Item moved away - drop the watch / error entries
+                    // so nothing lingers. Structural ownership via the
+                    // maps.
+                    self.$watches_field.retain(|w| w.wi_id != result.wi_id);
+                    self.$errors_field.remove(&result.wi_id);
+                    continue;
+                }
+
+                // Backfill pr_number on the watch the first time a
+                // branch-based poll resolves to a concrete PR. This
+                // pins subsequent polls to the exact PR so a
+                // closed-then-reopened-on-same-branch race cannot
+                // redirect the watch to a different PR.
+                if let Some(identity) = &result.pr_identity
+                    && let Some(watch) = self
+                        .$watches_field
+                        .iter_mut()
+                        .find(|w| w.wi_id == result.wi_id)
+                    && watch.pr_number.is_none()
+                {
+                    watch.pr_number = Some(identity.number);
+                }
+
+                match result.pr_state.as_str() {
+                    "MERGED" => {
+                        // Persist PR identity BEFORE the stage change
+                        // so the subsequent `reassemble_work_items`
+                        // (fired from inside `apply_stage_change`)
+                        // finds the snapshot and can synthesize a
+                        // `PrInfo { state: Merged }` via the assembly
+                        // fallback. That in turn makes
+                        // `status_derived = true` and gives the item a
+                        // stable merged-PR link in the UI even after
+                        // the next fetch cycle clears any transient
+                        // data.
+                        if let Some(identity) = &result.pr_identity
+                            && let Err(e) = self.backend.save_pr_identity(
+                                &result.wi_id,
+                                &result.repo_path,
+                                identity,
+                            )
+                        {
+                            self.status_message =
+                                Some(format!("PR identity save error: {e}"));
+                        }
+
+                        let log_entry = ActivityEntry {
+                            timestamp: now_iso8601(),
+                            event_type: "pr_merged".to_string(),
+                            payload: serde_json::json!({
+                                "strategy": $strategy_tag,
+                                "branch": result.branch,
+                            }),
+                        };
+                        if let Err(e) =
+                            self.backend.append_activity(&result.wi_id, &log_entry)
+                        {
+                            self.status_message =
+                                Some(format!("Activity log error: {e}"));
+                        }
+
+                        if $cleanup_worktree {
+                            self.cleanup_worktree_for_item(&result.wi_id);
+                        }
+
+                        self.$watches_field.retain(|w| w.wi_id != result.wi_id);
+                        self.$errors_field.remove(&result.wi_id);
+
+                        self.apply_stage_change(
+                            &result.wi_id,
+                            &$source_stage,
+                            &WorkItemStatus::Done,
+                            "pr_merge",
+                        );
+                        self.status_message = Some($merged_message.into());
+                    }
+                    "CLOSED" => {
+                        // A closed PR is NOT a merge - it must not
+                        // bypass the merge-gate invariant. Leave the
+                        // watch in place so we keep observing (in case
+                        // somebody reopens the same PR) and surface a
+                        // distinct warning.
+                        self.$errors_field.remove(&result.wi_id);
+                        self.status_message = Some($closed_message.into());
+                    }
+                    s if s.starts_with("ERROR:") => {
+                        let msg = format!(
+                            "{} for {}: {}",
+                            $poll_error_prefix, result.branch, result.pr_state
+                        );
+                        self.$errors_field
+                            .insert(result.wi_id.clone(), msg.clone());
+                        self.status_message = Some(msg);
+                        // Item stays in its source stage - will retry
+                        // on next poll cycle.
+                    }
+                    _ => {
+                        // Still open - no action, will poll again next
+                        // cycle.
+                        self.$errors_field.remove(&result.wi_id);
+                    }
+                }
+            }
+
+            // -- Phase 2: spawn polls for any watch whose per-item
+            // cooldown has elapsed and which has no in-flight poll. --
+            let cooldown = std::time::Duration::from_secs(30);
+            let now = std::time::Instant::now();
+            let mut to_spawn: Vec<(WorkItemId, Option<u64>, String, String, PathBuf)> =
+                Vec::new();
+            for watch in &self.$watches_field {
+                if self.$polls_field.contains_key(&watch.wi_id) {
+                    continue;
+                }
+                if let Some(last) = watch.last_polled
+                    && now.duration_since(last) < cooldown
+                {
+                    continue;
+                }
+                to_spawn.push((
+                    watch.wi_id.clone(),
+                    watch.pr_number,
+                    watch.owner_repo.clone(),
+                    watch.branch.clone(),
+                    watch.repo_path.clone(),
+                ));
+            }
+
+            for (wi_id, pr_number, owner_repo, branch, repo_path) in to_spawn {
+                let rx = spawn_gh_pr_view_poll(
+                    wi_id.clone(),
+                    pr_number,
+                    owner_repo,
+                    branch.clone(),
+                    repo_path,
+                );
+                let activity =
+                    self.start_activity(format!("{} ({branch})", $poll_label_prefix));
+                self.$polls_field
+                    .insert(wi_id.clone(), PrMergePollState { rx, activity });
+                if let Some(w) = self
+                    .$watches_field
+                    .iter_mut()
+                    .find(|w| w.wi_id == wi_id)
+                {
+                    w.last_polled = Some(now);
+                }
+            }
+        }
+    };
+}
+
+/// Generate a `reconstruct_*_watches` method that rebuilds one PR-merge
+/// poller's watch list from the current `work_items` snapshot.
+///
+/// Both pollers share the same reconstruction shape: idempotently add a
+/// watch for each eligible item that doesn't already have one. This is
+/// strictly additive - stale watches / in-flight polls / errors for
+/// items that are no longer eligible are cleaned up lazily by the
+/// corresponding poll method's Phase 1 drain (via its still-eligible
+/// guard), not here. That matches the historical `poll_mergequeue` flow
+/// and avoids a subtle interaction with `reassemble_work_items`: after
+/// a transient backend-read failure `work_items` can briefly be empty
+/// even though the real state hasn't changed, and a proactive prune
+/// here would then evict live watches that should have survived the
+/// read.
+macro_rules! impl_pr_merge_reconstruct_method {
+    (
+        $(#[$meta:meta])*
+        fn $method_name:ident,
+        watches = $watches_field:ident,
+        source_stage = $source_stage:expr,
+        kind_filter = $kind_filter:expr,
+    ) => {
+        $(#[$meta])*
+        pub fn $method_name(&mut self) {
+            let kind_filter: Option<WorkItemKind> = $kind_filter;
+
+            for wi in &self.work_items {
+                if wi.status != $source_stage {
+                    continue;
+                }
+                if let Some(k) = kind_filter.as_ref()
+                    && wi.kind != *k
+                {
+                    continue;
+                }
+                if self.$watches_field.iter().any(|w| w.wi_id == wi.id) {
+                    continue;
+                }
+                let Some(assoc) = wi.repo_associations.first() else {
+                    continue;
+                };
+                let Some(ref branch) = assoc.branch else {
+                    continue;
+                };
+                // Read the GitHub remote from the cached fetcher
+                // result so we never shell out to `git remote get-url`
+                // on the UI thread. When the fetcher has not yet
+                // populated this repo, skip - the next reassembly
+                // (triggered on fetch completion) will retry.
+                let Some((owner, repo_name)) = self
+                    .repo_data
+                    .get(&assoc.repo_path)
+                    .and_then(|rd| rd.github_remote.clone())
+                else {
+                    continue;
+                };
+                // If the fetcher has already populated assoc.pr, pin
+                // the number immediately. Otherwise the watch starts
+                // with pr_number = None and the first poll falls back
+                // to `gh pr view <branch>`. For ReviewRequest items
+                // the fetcher almost never populates this (the
+                // `--author @me` filter drops their author-side PRs),
+                // so the branch fallback is the normal path there.
+                let pr_number = assoc.pr.as_ref().map(|pr| pr.number);
+                self.$watches_field.push(PrMergeWatch {
+                    wi_id: wi.id.clone(),
+                    pr_number,
+                    owner_repo: format!("{owner}/{repo_name}"),
+                    branch: branch.clone(),
+                    repo_path: assoc.repo_path.clone(),
+                    last_polled: None,
+                });
+            }
+        }
+    };
 }
 
 impl App {
@@ -1239,6 +1668,9 @@ impl App {
             mergequeue_watches: Vec::new(),
             mergequeue_polls: HashMap::new(),
             mergequeue_poll_errors: HashMap::new(),
+            review_request_merge_watches: Vec::new(),
+            review_request_merge_polls: HashMap::new(),
+            review_request_merge_poll_errors: HashMap::new(),
             pr_identity_backfill_rx: None,
             pr_identity_backfill_activity: None,
             session_open_rx: HashMap::new(),
@@ -2360,6 +2792,15 @@ impl App {
         // Reconstruct mergequeue watches for items that are in Mergequeue
         // but don't have a watch (e.g., after app restart).
         self.reconstruct_mergequeue_watches();
+
+        // Reconstruct ReviewRequest merge watches for any ReviewRequest
+        // item in Review (also prunes watches whose owning item no
+        // longer qualifies, e.g. after an auto-transition to Done or a
+        // delete). The `--author @me` and `review-requested:@me` fetch
+        // paths cannot observe a merged review-request PR, so this
+        // background poll is the ONLY code path that can detect the
+        // merge and advance the item to Done.
+        self.reconstruct_review_request_merge_watches();
     }
 
     /// Core work-item deletion. Removes the backend record, kills the
@@ -7130,7 +7571,7 @@ impl App {
         };
         let owner_repo = format!("{owner}/{repo_name}");
 
-        self.mergequeue_watches.push(MergequeueWatch {
+        self.mergequeue_watches.push(PrMergeWatch {
             wi_id: wi_id.clone(),
             // Pin the exact PR number from assoc.pr so subsequent polls
             // target it unambiguously even if the branch later has a
@@ -7151,315 +7592,124 @@ impl App {
         self.status_message = Some("Entered mergequeue - polling PR until merged".into());
     }
 
-    /// Poll the PR state for items in the Mergequeue. Called on each timer
-    /// tick. Spawns at most one background thread at a time, with a 30-second
-    /// cooldown between polls.
-    pub fn poll_mergequeue(&mut self) {
-        // -- Phase 1: drain any in-flight results --
-        // Iterate the in-flight map and collect entries that have either
-        // produced a result or whose sender disconnected. We can't process
-        // results inline because that would borrow self twice, so we
-        // gather into local Vecs and then act on them after the borrow
-        // ends.
-        let mut ready: Vec<MergequeuePollResult> = Vec::new();
-        let mut to_remove: Vec<WorkItemId> = Vec::new();
-        for (wi_id, state) in &self.mergequeue_polls {
-            match state.rx.try_recv() {
-                Ok(r) => {
-                    ready.push(r);
-                    to_remove.push(wi_id.clone());
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => {}
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    to_remove.push(wi_id.clone());
-                }
-            }
-        }
-        for wi_id in &to_remove {
-            if let Some(state) = self.mergequeue_polls.remove(wi_id) {
-                self.end_activity(state.activity);
-            }
-        }
+    impl_pr_merge_poll_method!(
+        /// Poll the PR state for items in the Mergequeue. Called on
+        /// each timer tick. Spawns at most one background thread per
+        /// watched item at a time, with a 30-second cooldown between
+        /// polls.
+        ///
+        /// Generated from `impl_pr_merge_poll_method!` so it shares
+        /// its Phase 1 drain, still-eligible guard, `pr_number`
+        /// backfill, merge-gate dispatch, and Phase 2 cooldown /
+        /// subprocess spawn logic with `poll_review_request_merges`.
+        /// The per-stage deltas are passed as macro arguments.
+        fn poll_mergequeue,
+        watches = mergequeue_watches,
+        polls = mergequeue_polls,
+        errors = mergequeue_poll_errors,
+        source_stage = WorkItemStatus::Mergequeue,
+        kind_filter = None,
+        strategy_tag = "external",
+        merged_message = "PR merged externally - moved to [DN]",
+        closed_message = "PR was closed without merging - retreat to Review or re-open the PR",
+        poll_error_prefix = "Mergequeue poll error",
+        poll_label_prefix = "Polling PR for merge",
+        // Mergequeue path owns a worktree the user is actively
+        // working in; clean it up on a successful merge so it does
+        // not linger.
+        cleanup_worktree_on_merge = true,
+    );
 
-        for result in ready {
-            // Check that the item is still in Mergequeue. The user may
-            // have retreated or deleted the item between the poll spawn
-            // and the result drain.
-            let actual_status = self
-                .work_items
-                .iter()
-                .find(|w| w.id == result.wi_id)
-                .map(|w| w.status);
+    impl_pr_merge_poll_method!(
+        /// Poll the PR state for `ReviewRequest` work items in Review
+        /// so that an external merge of the PR can auto-transition
+        /// the item to Done.
+        ///
+        /// This is the only code path that can observe a merged
+        /// review-request PR: the author-filtered `gh pr list
+        /// --author @me` fetch cannot see it (wrong author), the
+        /// `review-requested:@me` search is `--state open` (wrong
+        /// state), the `pr_identity` fallback is `Done`-only (wrong
+        /// status), and the startup merged-PR backfill is also
+        /// author-filtered. Without this poll the item stays stuck
+        /// in `[RR][RV]` forever.
+        ///
+        /// Generated from `impl_pr_merge_poll_method!` so it shares
+        /// its Phase 1 drain, still-eligible guard, `pr_number`
+        /// backfill, merge-gate dispatch, and Phase 2 cooldown /
+        /// subprocess spawn logic with `poll_mergequeue`. The
+        /// per-stage deltas are passed as macro arguments. The
+        /// distinct `strategy` tag (`external_review_merge`) lets
+        /// metrics tell reviewer-side merges apart from author-side
+        /// Mergequeue merges.
+        ///
+        /// This path must NOT call `cleanup_worktree_for_item`:
+        /// `worktree_service.remove_worktree` is a blocking I/O
+        /// operation and would freeze the UI from the timer tick
+        /// (see `docs/UI.md` "Blocking I/O Prohibition"). The
+        /// worktree is left on disk and cleaned up later by
+        /// auto-archive (default 7 days) or immediately by the user
+        /// with Ctrl+D.
+        fn poll_review_request_merges,
+        watches = review_request_merge_watches,
+        polls = review_request_merge_polls,
+        errors = review_request_merge_poll_errors,
+        source_stage = WorkItemStatus::Review,
+        kind_filter = Some(WorkItemKind::ReviewRequest),
+        strategy_tag = "external_review_merge",
+        merged_message = "Review request PR merged externally - moved to [DN]",
+        closed_message = "Review request PR was closed without merging - Ctrl+D to clean up",
+        poll_error_prefix = "Review request poll error",
+        poll_label_prefix = "Polling review-request PR for merge",
+        cleanup_worktree_on_merge = false,
+    );
 
-            if actual_status.as_ref() != Some(&WorkItemStatus::Mergequeue) {
-                // Item moved away - remove watch and discard.
-                self.mergequeue_watches.retain(|w| w.wi_id != result.wi_id);
-                self.mergequeue_poll_errors.remove(&result.wi_id);
-                continue;
-            }
+    impl_pr_merge_reconstruct_method!(
+        /// Reconstruct mergequeue watches from the current
+        /// `work_items` snapshot. Called after every reassembly so
+        /// that any item in `Mergequeue` gets exactly one watch and
+        /// app restarts never lose state.
+        ///
+        /// This is an add-only pass: stale watches / in-flight polls
+        /// / errors for items that are no longer in `Mergequeue` are
+        /// cleaned up lazily by `poll_mergequeue`'s Phase 1 drain
+        /// (its still-eligible guard) on the next poll cycle. See
+        /// `impl_pr_merge_reconstruct_method!` for the reasoning.
+        ///
+        /// Generated from `impl_pr_merge_reconstruct_method!` so it
+        /// shares its idempotent-add logic with
+        /// `reconstruct_review_request_merge_watches`.
+        fn reconstruct_mergequeue_watches,
+        watches = mergequeue_watches,
+        source_stage = WorkItemStatus::Mergequeue,
+        kind_filter = None,
+    );
 
-            // Backfill pr_number on the watch the first time a branch-
-            // based poll resolves to a concrete PR. This pins subsequent
-            // polls to the exact PR so a closed-then-reopened-on-same-
-            // branch race cannot redirect the watch to a different PR.
-            if let Some(identity) = &result.pr_identity
-                && let Some(watch) = self
-                    .mergequeue_watches
-                    .iter_mut()
-                    .find(|w| w.wi_id == result.wi_id)
-                && watch.pr_number.is_none()
-            {
-                watch.pr_number = Some(identity.number);
-            }
-
-            match result.pr_state.as_str() {
-                "MERGED" => {
-                    if let Some(identity) = &result.pr_identity
-                        && let Err(e) = self.backend.save_pr_identity(
-                            &result.wi_id,
-                            &result.repo_path,
-                            identity,
-                        )
-                    {
-                        self.status_message = Some(format!("PR identity save error: {e}"));
-                    }
-
-                    let log_entry = ActivityEntry {
-                        timestamp: now_iso8601(),
-                        event_type: "pr_merged".to_string(),
-                        payload: serde_json::json!({
-                            "strategy": "external",
-                            "branch": result.branch
-                        }),
-                    };
-                    if let Err(e) = self.backend.append_activity(&result.wi_id, &log_entry) {
-                        self.status_message = Some(format!("Activity log error: {e}"));
-                    }
-
-                    self.cleanup_worktree_for_item(&result.wi_id);
-
-                    self.mergequeue_watches.retain(|w| w.wi_id != result.wi_id);
-                    self.mergequeue_poll_errors.remove(&result.wi_id);
-
-                    self.apply_stage_change(
-                        &result.wi_id,
-                        &WorkItemStatus::Mergequeue,
-                        &WorkItemStatus::Done,
-                        "pr_merge",
-                    );
-                    self.status_message = Some("PR merged externally - moved to [DN]".into());
-                }
-                "CLOSED" => {
-                    self.mergequeue_poll_errors.remove(&result.wi_id);
-                    self.status_message = Some(
-                        "PR was closed without merging - retreat to Review or re-open the PR"
-                            .into(),
-                    );
-                }
-                s if s.starts_with("ERROR:") => {
-                    let msg = format!(
-                        "Mergequeue poll error for {}: {}",
-                        result.branch, result.pr_state
-                    );
-                    self.mergequeue_poll_errors
-                        .insert(result.wi_id.clone(), msg.clone());
-                    self.status_message = Some(msg);
-                    // Item stays in Mergequeue - will retry on next poll cycle.
-                }
-                _ => {
-                    // Still open - no action, will poll again next cycle.
-                    self.mergequeue_poll_errors.remove(&result.wi_id);
-                }
-            }
-        }
-
-        // -- Phase 2: spawn polls for any watch whose per-item cooldown
-        // has elapsed and which has no in-flight poll. --
-        let cooldown = std::time::Duration::from_secs(30);
-        let now = std::time::Instant::now();
-
-        // Collect work to spawn. We can't spawn while iterating
-        // self.mergequeue_watches because the spawn updates the watch.
-        let mut to_spawn: Vec<(WorkItemId, Option<u64>, String, String, PathBuf)> = Vec::new();
-        for watch in &self.mergequeue_watches {
-            if self.mergequeue_polls.contains_key(&watch.wi_id) {
-                continue;
-            }
-            if let Some(last) = watch.last_polled
-                && now.duration_since(last) < cooldown
-            {
-                continue;
-            }
-            to_spawn.push((
-                watch.wi_id.clone(),
-                watch.pr_number,
-                watch.owner_repo.clone(),
-                watch.branch.clone(),
-                watch.repo_path.clone(),
-            ));
-        }
-
-        for (wi_id, pr_number, owner_repo, branch, repo_path) in to_spawn {
-            let (tx, rx) = crossbeam_channel::bounded(1);
-            let thread_wi_id = wi_id.clone();
-            let thread_branch = branch.clone();
-            let thread_owner_repo = owner_repo.clone();
-            let thread_repo_path = repo_path.clone();
-            std::thread::spawn(move || {
-                // Prefer the pinned PR number (unambiguous) over the branch
-                // name. The branch fallback is only used on watches that
-                // were rebuilt from a backend record after an app restart
-                // and have not yet been polled successfully - after the
-                // first successful result we write the number back into
-                // the watch so subsequent polls target it directly.
-                let target = pr_number
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| thread_branch.clone());
-                let outcome = match std::process::Command::new("gh")
-                    .args([
-                        "pr",
-                        "view",
-                        &target,
-                        "--repo",
-                        &thread_owner_repo,
-                        "--json",
-                        "state,number,title,url",
-                    ])
-                    .output()
-                {
-                    Ok(output) if output.status.success() => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let parsed: serde_json::Value = match serde_json::from_str(stdout.trim()) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                let _ = tx.send(MergequeuePollResult {
-                                    wi_id: thread_wi_id,
-                                    pr_state: format!("ERROR: JSON parse failed: {e}"),
-                                    branch: thread_branch,
-                                    repo_path: thread_repo_path,
-                                    pr_identity: None,
-                                });
-                                return;
-                            }
-                        };
-                        let state = parsed
-                            .get("state")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("UNKNOWN")
-                            .to_string();
-                        let pr_identity =
-                            parsed
-                                .get("number")
-                                .and_then(|n| n.as_u64())
-                                .and_then(|number| {
-                                    let title = parsed.get("title")?.as_str()?.to_string();
-                                    let url = parsed.get("url")?.as_str()?.to_string();
-                                    Some(PrIdentityRecord { number, title, url })
-                                });
-                        MergequeuePollResult {
-                            wi_id: thread_wi_id,
-                            pr_state: state,
-                            branch: thread_branch,
-                            repo_path: thread_repo_path,
-                            pr_identity,
-                        }
-                    }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        MergequeuePollResult {
-                            wi_id: thread_wi_id,
-                            pr_state: format!("ERROR: {}", stderr.trim()),
-                            branch: thread_branch,
-                            repo_path: thread_repo_path,
-                            pr_identity: None,
-                        }
-                    }
-                    Err(e) => MergequeuePollResult {
-                        wi_id: thread_wi_id,
-                        pr_state: format!("ERROR: {e}"),
-                        branch: thread_branch,
-                        repo_path: thread_repo_path,
-                        pr_identity: None,
-                    },
-                };
-                let _ = tx.send(outcome);
-            });
-
-            let activity = self.start_activity(format!("Polling PR for merge ({branch})"));
-            self.mergequeue_polls
-                .insert(wi_id.clone(), MergequeuePollState { rx, activity });
-            if let Some(w) = self
-                .mergequeue_watches
-                .iter_mut()
-                .find(|w| w.wi_id == wi_id)
-            {
-                w.last_polled = Some(now);
-            }
-        }
-    }
-
-    /// Reconstruct mergequeue watches from backend records after reassembly.
-    /// Called after initial assembly and after each reassembly to ensure
-    /// watches exist for all Mergequeue items (handles app restart).
-    ///
-    /// Only the branch and the resolved `owner/repo` are required - the
-    /// polling thread can call `gh pr view <branch> --repo <owner/repo>`
-    /// as a fallback when `pr_number` is not known, so reconstruction
-    /// works even when the PR was merged while the app was closed and
-    /// is no longer returned by the open-PR fetch. Once a poll succeeds,
-    /// `pr_number` is backfilled on the watch so subsequent polls target
-    /// the exact PR unambiguously.
-    ///
-    /// The `owner/repo` identity is read from the cached
-    /// `repo_data[path].github_remote` that the background fetcher
-    /// already populates, *never* by shelling out via
-    /// `worktree_service.github_remote` on the UI thread. If the fetcher
-    /// has not yet produced a result for this repo, the watch is
-    /// skipped this cycle and rebuilt on the next reassembly once the
-    /// fetch completes.
-    pub fn reconstruct_mergequeue_watches(&mut self) {
-        for wi in &self.work_items {
-            if wi.status != WorkItemStatus::Mergequeue {
-                continue;
-            }
-            // Skip if already watched.
-            if self.mergequeue_watches.iter().any(|w| w.wi_id == wi.id) {
-                continue;
-            }
-            let Some(assoc) = wi.repo_associations.first() else {
-                continue;
-            };
-            let Some(ref branch) = assoc.branch else {
-                continue;
-            };
-            // Read the GitHub remote from the cached fetcher result so
-            // we never shell out to `git remote get-url` on the UI
-            // thread. When the fetcher has not yet populated this repo,
-            // skip - the next reassembly (triggered on fetch completion)
-            // will retry.
-            let Some((owner, repo_name)) = self
-                .repo_data
-                .get(&assoc.repo_path)
-                .and_then(|rd| rd.github_remote.clone())
-            else {
-                continue;
-            };
-            // If the background fetch has already populated assoc.pr, pin
-            // the number immediately. Otherwise the watch starts with
-            // pr_number = None and the first poll will fall back to
-            // `gh pr view <branch>`, then fill the number in from the
-            // result so subsequent polls are unambiguous.
-            let pr_number = assoc.pr.as_ref().map(|pr| pr.number);
-            self.mergequeue_watches.push(MergequeueWatch {
-                wi_id: wi.id.clone(),
-                pr_number,
-                owner_repo: format!("{owner}/{repo_name}"),
-                branch: branch.clone(),
-                repo_path: assoc.repo_path.clone(),
-                last_polled: None,
-            });
-        }
-    }
+    impl_pr_merge_reconstruct_method!(
+        /// Reconstruct ReviewRequest merge watches from the current
+        /// `work_items` snapshot. Called after every reassembly so
+        /// that any `ReviewRequest`-kind item in `Review` gets
+        /// exactly one watch and app restarts never lose state.
+        ///
+        /// This is an add-only pass: stale watches / in-flight polls
+        /// / errors for items that are no longer eligible are cleaned
+        /// up lazily by `poll_review_request_merges`'s Phase 1 drain
+        /// (its still-eligible guard) on the next poll cycle.
+        ///
+        /// ReviewRequest items almost never carry a live `assoc.pr`
+        /// because the `--author @me` fetch filters their
+        /// author-side PRs out, so reconstructions here will
+        /// generally start with `pr_number = None` and rely on the
+        /// first poll's branch-based fallback to resolve the number.
+        ///
+        /// Generated from `impl_pr_merge_reconstruct_method!` so it
+        /// shares its idempotent-add logic with
+        /// `reconstruct_mergequeue_watches`.
+        fn reconstruct_review_request_merge_watches,
+        watches = review_request_merge_watches,
+        source_stage = WorkItemStatus::Review,
+        kind_filter = Some(WorkItemKind::ReviewRequest),
+    );
 
     /// Collect Done items that need PR identity backfill (have a branch but
     /// no persisted pr_identity). Returns tuples of
@@ -12368,7 +12618,7 @@ mod tests {
             repo_associations: vec![],
             errors: vec![],
         });
-        app.mergequeue_watches.push(MergequeueWatch {
+        app.mergequeue_watches.push(PrMergeWatch {
             wi_id: wi_id.clone(),
             pr_number: Some(77),
             owner_repo: "owner/repo".into(),
@@ -12382,7 +12632,7 @@ mod tests {
             .insert(wi_id.clone(), "previous failure".into());
 
         let (tx, rx) = crossbeam_channel::bounded(1);
-        tx.send(MergequeuePollResult {
+        tx.send(PrMergePollResult {
             wi_id: wi_id.clone(),
             pr_state: "MERGED".into(),
             branch: "feature/x".into(),
@@ -12396,7 +12646,7 @@ mod tests {
         .unwrap();
         let activity = app.start_activity("test poll");
         app.mergequeue_polls
-            .insert(wi_id.clone(), MergequeuePollState { rx, activity });
+            .insert(wi_id.clone(), PrMergePollState { rx, activity });
 
         app.poll_mergequeue();
 
@@ -12437,7 +12687,7 @@ mod tests {
             repo_associations: vec![],
             errors: vec![],
         });
-        app.mergequeue_watches.push(MergequeueWatch {
+        app.mergequeue_watches.push(PrMergeWatch {
             wi_id: wi_id.clone(),
             pr_number: Some(88),
             owner_repo: "owner/repo".into(),
@@ -12447,7 +12697,7 @@ mod tests {
         });
 
         let (tx, rx) = crossbeam_channel::bounded(1);
-        tx.send(MergequeuePollResult {
+        tx.send(PrMergePollResult {
             wi_id: wi_id.clone(),
             pr_state: "ERROR: gh auth failed".into(),
             branch: "feature/y".into(),
@@ -12457,7 +12707,7 @@ mod tests {
         .unwrap();
         let activity = app.start_activity("test poll");
         app.mergequeue_polls
-            .insert(wi_id.clone(), MergequeuePollState { rx, activity });
+            .insert(wi_id.clone(), PrMergePollState { rx, activity });
 
         app.poll_mergequeue();
 
@@ -12505,7 +12755,7 @@ mod tests {
         // Watch starts with pr_number = None, as if reconstructed from a
         // backend record after an app restart where the open-PR fetch had
         // not yet populated assoc.pr.
-        app.mergequeue_watches.push(MergequeueWatch {
+        app.mergequeue_watches.push(PrMergeWatch {
             wi_id: wi_id.clone(),
             pr_number: None,
             owner_repo: "owner/repo".into(),
@@ -12518,7 +12768,7 @@ mod tests {
         // The key point is that the result carries a pr_identity with
         // number = 321, which the drain path must pin onto the watch.
         let (tx, rx) = crossbeam_channel::bounded(1);
-        tx.send(MergequeuePollResult {
+        tx.send(PrMergePollResult {
             wi_id: wi_id.clone(),
             pr_state: "OPEN".into(),
             branch: "feature/backfill".into(),
@@ -12532,7 +12782,7 @@ mod tests {
         .unwrap();
         let activity = app.start_activity("test poll");
         app.mergequeue_polls
-            .insert(wi_id.clone(), MergequeuePollState { rx, activity });
+            .insert(wi_id.clone(), PrMergePollState { rx, activity });
 
         app.poll_mergequeue();
 
@@ -12573,7 +12823,7 @@ mod tests {
                 repo_associations: vec![],
                 errors: vec![],
             });
-            app.mergequeue_watches.push(MergequeueWatch {
+            app.mergequeue_watches.push(PrMergeWatch {
                 wi_id: id.clone(),
                 pr_number: Some(1000),
                 owner_repo: "owner/repo".into(),
@@ -12595,7 +12845,7 @@ mod tests {
         let activity_a = app.start_activity("polling A");
         app.mergequeue_polls.insert(
             wi_a.clone(),
-            MergequeuePollState {
+            PrMergePollState {
                 rx: rx_a,
                 activity: activity_a,
             },
@@ -17748,5 +17998,747 @@ mod tests {
         app.selected_item = Some(0);
         app.open_selected_pr_in_browser();
         assert_eq!(app.status_message.as_deref(), Some("No PR to open"));
+    }
+
+    // -- Feature: ReviewRequest merge auto-close polling --
+    //
+    // These tests mirror `poll_mergequeue_*` and
+    // `reconstruct_mergequeue_watches_*`. They feed poll results into
+    // `review_request_merge_polls` directly via a locally-owned
+    // `crossbeam_channel` so nothing ever shells out to real `gh` on
+    // the test thread. See `docs/UI.md` "Blocking I/O Prohibition".
+
+    /// Test backend that records every `save_pr_identity` and
+    /// `append_activity` call, and applies status / pr_identity
+    /// mutations to its in-memory records so a subsequent
+    /// `assembly::reassemble` can observe them. Used to verify the
+    /// merge-gate path end-to-end without touching the filesystem.
+    #[derive(Default)]
+    struct RrTestBackend {
+        records: std::sync::Mutex<Vec<crate::work_item_backend::WorkItemRecord>>,
+        saved_identities: std::sync::Mutex<Vec<(WorkItemId, PathBuf, PrIdentityRecord)>>,
+        appended_activities: std::sync::Mutex<Vec<(WorkItemId, ActivityEntry)>>,
+    }
+
+    impl WorkItemBackend for RrTestBackend {
+        fn list(&self) -> Result<crate::work_item_backend::ListResult, BackendError> {
+            Ok(crate::work_item_backend::ListResult {
+                records: self.records.lock().unwrap().clone(),
+                corrupt: Vec::new(),
+            })
+        }
+        fn read(
+            &self,
+            id: &WorkItemId,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            self.records
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.id == *id)
+                .cloned()
+                .ok_or_else(|| BackendError::NotFound(id.clone()))
+        }
+        fn create(
+            &self,
+            _req: CreateWorkItem,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation("not used".into()))
+        }
+        fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
+            let mut records = self.records.lock().unwrap();
+            if let Some(pos) = records.iter().position(|r| r.id == *id) {
+                records.remove(pos);
+                Ok(())
+            } else {
+                Err(BackendError::NotFound(id.clone()))
+            }
+        }
+        fn update_status(
+            &self,
+            id: &WorkItemId,
+            status: WorkItemStatus,
+        ) -> Result<(), BackendError> {
+            let mut records = self.records.lock().unwrap();
+            if let Some(record) = records.iter_mut().find(|r| r.id == *id) {
+                record.status = status;
+                Ok(())
+            } else {
+                Err(BackendError::NotFound(id.clone()))
+            }
+        }
+        fn import(
+            &self,
+            _unlinked: &crate::work_item::UnlinkedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation("not used".into()))
+        }
+        fn import_review_request(
+            &self,
+            _rr: &crate::work_item::ReviewRequestedPr,
+        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
+            Err(BackendError::Validation("not supported in test".into()))
+        }
+        fn append_activity(
+            &self,
+            id: &WorkItemId,
+            entry: &ActivityEntry,
+        ) -> Result<(), BackendError> {
+            self.appended_activities
+                .lock()
+                .unwrap()
+                .push((id.clone(), entry.clone()));
+            Ok(())
+        }
+        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
+            Ok(None)
+        }
+        fn set_done_at(&self, id: &WorkItemId, done_at: Option<u64>) -> Result<(), BackendError> {
+            let mut records = self.records.lock().unwrap();
+            if let Some(record) = records.iter_mut().find(|r| r.id == *id) {
+                record.done_at = done_at;
+                Ok(())
+            } else {
+                Err(BackendError::NotFound(id.clone()))
+            }
+        }
+        fn save_pr_identity(
+            &self,
+            id: &WorkItemId,
+            repo_path: &std::path::Path,
+            pr_identity: &PrIdentityRecord,
+        ) -> Result<(), BackendError> {
+            self.saved_identities.lock().unwrap().push((
+                id.clone(),
+                repo_path.to_path_buf(),
+                pr_identity.clone(),
+            ));
+            // Also mutate the in-memory record so the next
+            // `assembly::reassemble` can see the persisted identity
+            // and fire the `PrInfo` fallback.
+            let mut records = self.records.lock().unwrap();
+            if let Some(record) = records.iter_mut().find(|r| r.id == *id)
+                && let Some(assoc) = record
+                    .repo_associations
+                    .iter_mut()
+                    .find(|a| a.repo_path == repo_path)
+            {
+                assoc.pr_identity = Some(pr_identity.clone());
+            }
+            Ok(())
+        }
+        fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn backend_type(&self) -> crate::work_item::BackendType {
+            crate::work_item::BackendType::LocalFile
+        }
+    }
+
+    fn make_rr_record(
+        name: &str,
+        kind: crate::work_item::WorkItemKind,
+        status: WorkItemStatus,
+        repo_path: &std::path::Path,
+        branch: Option<&str>,
+    ) -> crate::work_item_backend::WorkItemRecord {
+        crate::work_item_backend::WorkItemRecord {
+            id: WorkItemId::LocalFile(PathBuf::from(format!("/tmp/{name}.json"))),
+            title: name.into(),
+            description: None,
+            status,
+            kind,
+            display_id: None,
+            repo_associations: vec![RepoAssociationRecord {
+                repo_path: repo_path.to_path_buf(),
+                branch: branch.map(String::from),
+                pr_identity: None,
+            }],
+            plan: None,
+            done_at: None,
+        }
+    }
+
+    fn seed_rr_app(
+        records: Vec<crate::work_item_backend::WorkItemRecord>,
+        repo_path: &std::path::Path,
+        seed_remote: bool,
+    ) -> (App, Arc<RrTestBackend>) {
+        let backend = Arc::new(RrTestBackend {
+            records: std::sync::Mutex::new(records),
+            ..Default::default()
+        });
+        let mut app = App::with_config(Config::for_test(), backend.clone());
+        if seed_remote {
+            app.repo_data.insert(
+                repo_path.to_path_buf(),
+                crate::work_item::RepoFetchResult {
+                    repo_path: repo_path.to_path_buf(),
+                    github_remote: Some(("owner".into(), "repo".into())),
+                    worktrees: Ok(Vec::new()),
+                    prs: Ok(Vec::new()),
+                    review_requested_prs: Ok(Vec::new()),
+                    issues: Vec::new(),
+                    current_user_login: None,
+                },
+            );
+        }
+        app.reassemble_work_items();
+        // Pin the per-watch cooldown so Phase 2 of
+        // `poll_review_request_merges` never spawns a real `gh pr
+        // view` subprocess during a unit test. Individual tests that
+        // exercise Phase 2 can override this back to None.
+        let now = std::time::Instant::now();
+        for w in &mut app.review_request_merge_watches {
+            w.last_polled = Some(now);
+        }
+        (app, backend)
+    }
+
+    #[test]
+    fn reconstruct_review_request_merge_watches_registers_review_request_in_review() {
+        let repo_path = PathBuf::from("/tmp/rr-review");
+        let rec = make_rr_record(
+            "rr1",
+            crate::work_item::WorkItemKind::ReviewRequest,
+            WorkItemStatus::Review,
+            &repo_path,
+            Some("feature/rr1"),
+        );
+        let rec_id = rec.id.clone();
+        let (app, _backend) = seed_rr_app(vec![rec], &repo_path, true);
+        let matches: Vec<_> = app
+            .review_request_merge_watches
+            .iter()
+            .filter(|w| w.wi_id == rec_id)
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].owner_repo, "owner/repo");
+        assert_eq!(matches[0].branch, "feature/rr1");
+        assert_eq!(matches[0].pr_number, None);
+    }
+
+    #[test]
+    fn reconstruct_review_request_merge_watches_is_idempotent() {
+        let repo_path = PathBuf::from("/tmp/rr-idempotent");
+        let rec = make_rr_record(
+            "rr2",
+            crate::work_item::WorkItemKind::ReviewRequest,
+            WorkItemStatus::Review,
+            &repo_path,
+            Some("feature/rr2"),
+        );
+        let (mut app, _backend) = seed_rr_app(vec![rec], &repo_path, true);
+        let before = app.review_request_merge_watches.len();
+        app.reconstruct_review_request_merge_watches();
+        app.reconstruct_review_request_merge_watches();
+        assert_eq!(
+            app.review_request_merge_watches.len(),
+            before,
+            "re-running reconstruction must not add duplicate watches"
+        );
+    }
+
+    #[test]
+    fn reconstruct_review_request_merge_watches_skips_when_github_remote_missing() {
+        let repo_path = PathBuf::from("/tmp/rr-no-remote");
+        let rec = make_rr_record(
+            "rr3",
+            crate::work_item::WorkItemKind::ReviewRequest,
+            WorkItemStatus::Review,
+            &repo_path,
+            Some("feature/rr3"),
+        );
+        let rec_id = rec.id.clone();
+        // seed_remote = false: repo_data is not populated, mirroring
+        // the cold-start window before the first fetch completes. The
+        // watch must be skipped this cycle and rebuilt on the next
+        // reassembly.
+        let (app, _backend) = seed_rr_app(vec![rec], &repo_path, false);
+        assert!(
+            app.review_request_merge_watches
+                .iter()
+                .all(|w| w.wi_id != rec_id),
+            "watch must be skipped when github_remote is missing"
+        );
+    }
+
+    #[test]
+    fn reconstruct_review_request_merge_watches_skips_own_items() {
+        let repo_path = PathBuf::from("/tmp/rr-own");
+        let rec = make_rr_record(
+            "rr4",
+            crate::work_item::WorkItemKind::Own,
+            WorkItemStatus::Review,
+            &repo_path,
+            Some("feature/rr4"),
+        );
+        let rec_id = rec.id.clone();
+        let (app, _backend) = seed_rr_app(vec![rec], &repo_path, true);
+        assert!(
+            app.review_request_merge_watches
+                .iter()
+                .all(|w| w.wi_id != rec_id),
+            "Own-kind items must not be watched (the author-filtered PR path is the source of truth for them)",
+        );
+    }
+
+    #[test]
+    fn reconstruct_review_request_merge_watches_skips_done_items() {
+        let repo_path = PathBuf::from("/tmp/rr-done");
+        let rec = make_rr_record(
+            "rr5",
+            crate::work_item::WorkItemKind::ReviewRequest,
+            WorkItemStatus::Done,
+            &repo_path,
+            Some("feature/rr5"),
+        );
+        let rec_id = rec.id.clone();
+        let (app, _backend) = seed_rr_app(vec![rec], &repo_path, true);
+        assert!(
+            app.review_request_merge_watches
+                .iter()
+                .all(|w| w.wi_id != rec_id),
+            "ReviewRequest items already in Done must not be re-watched"
+        );
+    }
+
+    /// Feeds a MERGED result. Asserts the merge-gate path ran
+    /// (activity log carries source=="pr_merge"), pr_identity was
+    /// saved, the watch is cleared, the backend status is Done, and
+    /// the status message is the expected string.
+    #[test]
+    fn poll_review_request_merges_merged_advances_to_done_and_clears_watch() {
+        let repo_path = PathBuf::from("/tmp/rr-merged");
+        let rec = make_rr_record(
+            "rr6",
+            crate::work_item::WorkItemKind::ReviewRequest,
+            WorkItemStatus::Review,
+            &repo_path,
+            Some("feature/rr6"),
+        );
+        let rec_id = rec.id.clone();
+        let (mut app, backend) = seed_rr_app(vec![rec], &repo_path, true);
+
+        // Seed a stale error so we can also confirm it is cleared.
+        app.review_request_merge_poll_errors
+            .insert(rec_id.clone(), "stale".into());
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(PrMergePollResult {
+            wi_id: rec_id.clone(),
+            pr_state: "MERGED".into(),
+            branch: "feature/rr6".into(),
+            repo_path: repo_path.clone(),
+            pr_identity: Some(PrIdentityRecord {
+                number: 42,
+                title: "Merged externally".into(),
+                url: "https://github.com/owner/repo/pull/42".into(),
+            }),
+        })
+        .unwrap();
+        let activity = app.start_activity("test poll");
+        app.review_request_merge_polls
+            .insert(rec_id.clone(), PrMergePollState { rx, activity });
+
+        app.poll_review_request_merges();
+
+        assert!(
+            app.review_request_merge_watches
+                .iter()
+                .all(|w| w.wi_id != rec_id),
+            "watch should be removed after MERGED detection"
+        );
+        assert!(
+            !app.review_request_merge_polls.contains_key(&rec_id),
+            "in-flight poll entry should be removed after MERGED detection"
+        );
+        assert!(
+            !app.review_request_merge_poll_errors.contains_key(&rec_id),
+            "stale poll error should be cleared on success"
+        );
+
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("Review request PR merged externally") && msg.contains("[DN]"),
+            "status message should reflect external review-request merge, got: {msg}"
+        );
+
+        // The backend record is now Done.
+        let listed = backend.list().unwrap().records;
+        let persisted = listed
+            .iter()
+            .find(|r| r.id == rec_id)
+            .expect("record must still exist");
+        assert_eq!(persisted.status, WorkItemStatus::Done);
+
+        // save_pr_identity was called with number=42.
+        let saved = backend.saved_identities.lock().unwrap();
+        assert!(
+            saved
+                .iter()
+                .any(|(id, _, pr)| *id == rec_id && pr.number == 42),
+            "pr_identity must be persisted"
+        );
+
+        // The stage_change activity entry carries source=="pr_merge"
+        // (the merge-gate invariant).
+        let activities = backend.appended_activities.lock().unwrap();
+        let stage_change = activities
+            .iter()
+            .find(|(id, e)| *id == rec_id && e.event_type == "stage_change")
+            .expect("stage_change activity must be appended");
+        assert_eq!(
+            stage_change
+                .1
+                .payload
+                .get("source")
+                .and_then(|v| v.as_str()),
+            Some("pr_merge"),
+            "source must be pr_merge (the merge-gate invariant)"
+        );
+        // The pr_merged activity entry carries strategy ==
+        // "external_review_merge" (distinct from Mergequeue's
+        // "external") so metrics can differentiate.
+        let merged = activities
+            .iter()
+            .find(|(id, e)| *id == rec_id && e.event_type == "pr_merged")
+            .expect("pr_merged activity must be appended");
+        assert_eq!(
+            merged.1.payload.get("strategy").and_then(|v| v.as_str()),
+            Some("external_review_merge"),
+            "strategy must differentiate reviewer-side merges"
+        );
+    }
+
+    /// After a merged poll, reassembling with the same backend should
+    /// now see the persisted `pr_identity` and derive a
+    /// `PrInfo { state: Merged }` via the existing fallback, with
+    /// `status_derived = true`.
+    #[test]
+    fn poll_review_request_merges_merged_persists_pr_identity_for_fallback() {
+        let repo_path = PathBuf::from("/tmp/rr-fallback");
+        let rec = make_rr_record(
+            "rr7",
+            crate::work_item::WorkItemKind::ReviewRequest,
+            WorkItemStatus::Review,
+            &repo_path,
+            Some("feature/rr7"),
+        );
+        let rec_id = rec.id.clone();
+        let (mut app, backend) = seed_rr_app(vec![rec], &repo_path, true);
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(PrMergePollResult {
+            wi_id: rec_id.clone(),
+            pr_state: "MERGED".into(),
+            branch: "feature/rr7".into(),
+            repo_path: repo_path.clone(),
+            pr_identity: Some(PrIdentityRecord {
+                number: 101,
+                title: "Fallback check".into(),
+                url: "https://github.com/owner/repo/pull/101".into(),
+            }),
+        })
+        .unwrap();
+        let activity = app.start_activity("test poll");
+        app.review_request_merge_polls
+            .insert(rec_id.clone(), PrMergePollState { rx, activity });
+
+        app.poll_review_request_merges();
+
+        // Reassemble from the backend directly and confirm the
+        // assembly fallback produces a Merged PrInfo and
+        // status_derived = true.
+        let list = backend.list().unwrap();
+        let (items, _u, _rr, _reopen) = crate::assembly::reassemble(
+            &list.records,
+            &app.repo_data,
+            &Config::for_test().defaults.branch_issue_pattern,
+        );
+        let wi = items
+            .iter()
+            .find(|w| w.id == rec_id)
+            .expect("work item should survive reassembly");
+        assert_eq!(wi.status, WorkItemStatus::Done);
+        assert!(
+            wi.status_derived,
+            "status_derived must be true so manual transitions are blocked"
+        );
+        let first_assoc = wi
+            .repo_associations
+            .first()
+            .expect("repo association should exist");
+        let pr = first_assoc
+            .pr
+            .as_ref()
+            .expect("assembly fallback should synthesize a PrInfo from pr_identity");
+        assert_eq!(pr.state, crate::work_item::PrState::Merged);
+        assert_eq!(pr.number, 101);
+    }
+
+    /// Feeds a CLOSED result. The item must NOT transition to Done
+    /// (that would bypass the merge-gate invariant), the watch stays,
+    /// and a distinct warning is surfaced.
+    #[test]
+    fn poll_review_request_merges_closed_does_not_transition() {
+        let repo_path = PathBuf::from("/tmp/rr-closed");
+        let rec = make_rr_record(
+            "rr8",
+            crate::work_item::WorkItemKind::ReviewRequest,
+            WorkItemStatus::Review,
+            &repo_path,
+            Some("feature/rr8"),
+        );
+        let rec_id = rec.id.clone();
+        let (mut app, backend) = seed_rr_app(vec![rec], &repo_path, true);
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(PrMergePollResult {
+            wi_id: rec_id.clone(),
+            pr_state: "CLOSED".into(),
+            branch: "feature/rr8".into(),
+            repo_path: repo_path.clone(),
+            pr_identity: None,
+        })
+        .unwrap();
+        let activity = app.start_activity("test poll");
+        app.review_request_merge_polls
+            .insert(rec_id.clone(), PrMergePollState { rx, activity });
+
+        app.poll_review_request_merges();
+
+        // The backend record must remain in Review.
+        let listed = backend.list().unwrap().records;
+        let persisted = listed
+            .iter()
+            .find(|r| r.id == rec_id)
+            .expect("record must still exist");
+        assert_eq!(persisted.status, WorkItemStatus::Review);
+
+        // The watch stays - the next cycle will retry in case the PR
+        // is reopened.
+        assert!(
+            app.review_request_merge_watches
+                .iter()
+                .any(|w| w.wi_id == rec_id),
+            "watch must remain after CLOSED so retry is possible"
+        );
+
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("closed without merging") && msg.contains("Ctrl+D"),
+            "should warn about closed-without-merge, got: {msg}"
+        );
+    }
+
+    /// Feeds an ERROR result. Error is stored in
+    /// `review_request_merge_poll_errors`, the watch stays, and the
+    /// next cycle retries.
+    #[test]
+    fn poll_review_request_merges_error_persists_on_work_item() {
+        let repo_path = PathBuf::from("/tmp/rr-err");
+        let rec = make_rr_record(
+            "rr9",
+            crate::work_item::WorkItemKind::ReviewRequest,
+            WorkItemStatus::Review,
+            &repo_path,
+            Some("feature/rr9"),
+        );
+        let rec_id = rec.id.clone();
+        let (mut app, _backend) = seed_rr_app(vec![rec], &repo_path, true);
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(PrMergePollResult {
+            wi_id: rec_id.clone(),
+            pr_state: "ERROR: gh auth failed".into(),
+            branch: "feature/rr9".into(),
+            repo_path: repo_path.clone(),
+            pr_identity: None,
+        })
+        .unwrap();
+        let activity = app.start_activity("test poll");
+        app.review_request_merge_polls
+            .insert(rec_id.clone(), PrMergePollState { rx, activity });
+
+        app.poll_review_request_merges();
+
+        assert!(
+            app.review_request_merge_watches
+                .iter()
+                .any(|w| w.wi_id == rec_id),
+            "watch should remain on ERROR so next cycle retries"
+        );
+        assert!(
+            !app.review_request_merge_polls.contains_key(&rec_id),
+            "in-flight poll entry should be drained after ERROR"
+        );
+        let stored = app
+            .review_request_merge_poll_errors
+            .get(&rec_id)
+            .expect("error should be stored");
+        assert!(
+            stored.contains("gh auth failed"),
+            "stored error should contain gh stderr, got: {stored}"
+        );
+    }
+
+    /// Item was deleted between the spawn and the drain. The MERGED
+    /// result must be discarded and no spurious transition happens.
+    /// Same safety pattern as `poll_mergequeue`.
+    #[test]
+    fn poll_review_request_merges_discards_result_when_item_moved_away() {
+        let mut app = App::new();
+        let rec_id = WorkItemId::LocalFile(PathBuf::from("/tmp/rr-ghost.json"));
+        // Deliberately do NOT push the item into `work_items` -
+        // simulates "item was deleted since the poll was spawned."
+        app.review_request_merge_watches.push(PrMergeWatch {
+            wi_id: rec_id.clone(),
+            pr_number: Some(99),
+            owner_repo: "owner/repo".into(),
+            branch: "feature/ghost".into(),
+            repo_path: PathBuf::from("/tmp/ghost-repo"),
+            last_polled: Some(std::time::Instant::now()),
+        });
+        app.review_request_merge_poll_errors
+            .insert(rec_id.clone(), "stale".into());
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(PrMergePollResult {
+            wi_id: rec_id.clone(),
+            pr_state: "MERGED".into(),
+            branch: "feature/ghost".into(),
+            repo_path: PathBuf::from("/tmp/ghost-repo"),
+            pr_identity: None,
+        })
+        .unwrap();
+        let activity = app.start_activity("test poll");
+        app.review_request_merge_polls
+            .insert(rec_id.clone(), PrMergePollState { rx, activity });
+
+        app.poll_review_request_merges();
+
+        assert!(
+            app.review_request_merge_watches
+                .iter()
+                .all(|w| w.wi_id != rec_id),
+            "watch for a vanished item should be cleaned up"
+        );
+        assert!(
+            !app.review_request_merge_poll_errors.contains_key(&rec_id),
+            "stale error for a vanished item should be cleared"
+        );
+        let msg = app.status_message.as_deref().unwrap_or("");
+        assert!(
+            !msg.contains("Review request PR merged externally"),
+            "no spurious transition message should be set, got: {msg}"
+        );
+    }
+
+    /// Structural test: `poll_review_request_merges` drains
+    /// pre-populated receivers without shelling out on the UI thread.
+    /// With no watches in the map, nothing can spawn new subprocess
+    /// work either. If this test hangs, the function is doing blocking
+    /// I/O on the main thread.
+    #[test]
+    fn poll_review_request_merges_does_not_shell_out_on_ui_thread() {
+        let mut app = App::new();
+        let rec_id = WorkItemId::LocalFile(PathBuf::from("/tmp/rr-noshell.json"));
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(PrMergePollResult {
+            wi_id: rec_id.clone(),
+            pr_state: "OPEN".into(),
+            branch: "feature/noshell".into(),
+            repo_path: PathBuf::from("/tmp/noshell-repo"),
+            pr_identity: None,
+        })
+        .unwrap();
+        let activity = app.start_activity("test poll");
+        app.review_request_merge_polls
+            .insert(rec_id.clone(), PrMergePollState { rx, activity });
+
+        assert_eq!(app.review_request_merge_polls.len(), 1);
+
+        // Runs synchronously on this thread. No watches are present
+        // so Phase 2 cannot spawn anything new.
+        app.poll_review_request_merges();
+
+        assert_eq!(
+            app.review_request_merge_polls.len(),
+            0,
+            "ready entry must be drained"
+        );
+        assert!(
+            app.review_request_merge_watches.is_empty(),
+            "no watches should have been created by the poll path"
+        );
+    }
+
+    /// End-to-end: a ReviewRequest item is selected in the left list;
+    /// after the poll auto-closes it to Done, the existing
+    /// `WorkItemId`-keyed selection restoration in `build_display_list`
+    /// must follow it to the DONE group.
+    #[test]
+    fn reviewrequest_in_review_stays_selected_after_auto_close_to_done() {
+        let repo_path = PathBuf::from("/tmp/rr-sel");
+        let rec = make_rr_record(
+            "rr10",
+            crate::work_item::WorkItemKind::ReviewRequest,
+            WorkItemStatus::Review,
+            &repo_path,
+            Some("feature/rr10"),
+        );
+        let rec_id = rec.id.clone();
+        let (mut app, _backend) = seed_rr_app(vec![rec], &repo_path, true);
+
+        app.selected_work_item = Some(rec_id.clone());
+        app.build_display_list();
+        assert!(
+            app.selected_item.is_some(),
+            "selection should be restored for the ReviewRequest item before the poll"
+        );
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(PrMergePollResult {
+            wi_id: rec_id.clone(),
+            pr_state: "MERGED".into(),
+            branch: "feature/rr10".into(),
+            repo_path: repo_path.clone(),
+            pr_identity: Some(PrIdentityRecord {
+                number: 7,
+                title: "Follow selection".into(),
+                url: "https://github.com/owner/repo/pull/7".into(),
+            }),
+        })
+        .unwrap();
+        let activity = app.start_activity("test poll");
+        app.review_request_merge_polls
+            .insert(rec_id.clone(), PrMergePollState { rx, activity });
+
+        app.poll_review_request_merges();
+
+        assert_eq!(
+            app.selected_work_item.as_ref(),
+            Some(&rec_id),
+            "selection must stick to the work item across the auto-close"
+        );
+        let sel = app
+            .selected_item
+            .expect("selected_item should be set after reassembly");
+        let entry = app
+            .display_list
+            .get(sel)
+            .expect("selected index must be valid");
+        match entry {
+            DisplayEntry::WorkItemEntry(idx) => {
+                let wi = &app.work_items[*idx];
+                assert_eq!(wi.id, rec_id);
+                assert_eq!(wi.status, WorkItemStatus::Done);
+            }
+            other => panic!("selected entry should be the work item, got {other:?}"),
+        }
     }
 }

@@ -2891,8 +2891,19 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                         let paragraph = Paragraph::new(text).block(block);
                         paragraph.render(area, buf);
                     } else {
+                        // A work item can hit at most one of these
+                        // maps at a time (Mergequeue status vs. a
+                        // ReviewRequest in Review), so a simple
+                        // fallback covers both without a second
+                        // parameter on `draw_work_item_detail`. The
+                        // rendered line is "Last poll error: ..." in
+                        // both cases.
                         let poll_error = wi
-                            .and_then(|w| app.mergequeue_poll_errors.get(&w.id))
+                            .and_then(|w| {
+                                app.mergequeue_poll_errors
+                                    .get(&w.id)
+                                    .or_else(|| app.review_request_merge_poll_errors.get(&w.id))
+                            })
                             .map(String::as_str);
                         draw_work_item_detail(buf, app, wi, theme, block, area, poll_error);
                     }

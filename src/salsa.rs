@@ -418,6 +418,13 @@ pub fn app_event(
                 // Poll mergequeue items for externally merged PRs.
                 state.poll_mergequeue();
 
+                // Poll ReviewRequest items in Review for externally
+                // merged PRs. Same 30s cadence as `poll_mergequeue`;
+                // this is the only path that can observe a merged
+                // review-request PR (see `App::poll_review_request_merges`
+                // for the RCA).
+                state.poll_review_request_merges();
+
                 // Poll async worktree creation result.
                 state.poll_worktree_creation();
 
