@@ -313,7 +313,7 @@ the current Codex CLI surface).
 **Claude (reference)**: Interactive mode is produced by
 `App::spawn_session` -> `Session::spawn` in `src/session.rs:57`,
 which forks a `claude` process attached to a PTY slave fd. Headless
-mode is produced by the review gate at `src/app.rs:7784`, which runs
+mode is produced by the review gate at `src/app.rs:7954`, which runs
 `claude --print --output-format json --json-schema ...` via
 `std::process::Command::output()`.
 
@@ -330,8 +330,8 @@ violation.
 **Claude (reference)**: `Session::spawn` at `src/session.rs:57`
 honours the `cwd` argument via `std::process::Command::current_dir`.
 `App::finish_session_open` passes the worktree path for work-item
-spawns at `src/app.rs:3931`. `spawn_global_session` at
-`src/app.rs:8313` passes a stable workbridge-owned scratch directory
+spawns at `src/app.rs:4101`. `spawn_global_session` at
+`src/app.rs:8483` passes a stable workbridge-owned scratch directory
 (`$TMPDIR/workbridge-global-assistant-cwd`, created idempotently by
 `std::fs::create_dir_all` just before the spawn). The scratch path
 is used instead of `$HOME` because Claude Code's workspace trust
@@ -351,10 +351,10 @@ works. No clause violation.
 
 ### C3 - Permissions
 
-**Claude (reference)**: `build_claude_cmd` at `src/app.rs:3967` and
-`spawn_global_session` at `src/app.rs:8233` both push
+**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4137` and
+`spawn_global_session` at `src/app.rs:8404` both push
 `--dangerously-skip-permissions` into argv unconditionally. The
-review gate at `src/app.rs:7784` does not need it because
+review gate at `src/app.rs:7954` does not need it because
 `claude --print` is non-interactive and never prompts.
 
 **Codex (secondary, not implemented)**: **supported**. Codex has
@@ -364,7 +364,7 @@ clause violation.
 
 ### C4 - MCP injection
 
-**Claude (reference)**: `build_mcp_config` in `src/mcp.rs:1378`
+**Claude (reference)**: `build_mcp_config` in `src/mcp.rs:1382`
 produces the JSON blob, and `McpSocketServer::start` at
 `src/mcp.rs:80` starts the accept loop. All three spawn sites
 deliver the MCP config exclusively via `--mcp-config <tempfile>`
@@ -389,14 +389,14 @@ stdio transport) is still achievable.
 
 ### C5 - Tool allowlist by spawn type
 
-**Claude (reference)**: `build_claude_cmd` at `src/app.rs:3981`
+**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4151`
 passes `--allowedTools` with a comma-separated list of the 15
 workbridge MCP tools for work-item profiles.
-`spawn_global_session` at `src/app.rs:8235` uses the same list.
+`spawn_global_session` at `src/app.rs:8405` uses the same list.
 The review gate does not pass `--allowedTools`; it relies entirely
 on the MCP server exposing only the 4 read-only tools (see
 `src/mcp.rs` `tools/list` handling and the
-`read_only_mode_exposes_only_read_tools` test at `src/mcp.rs:1506`).
+`read_only_mode_exposes_only_read_tools` test at `src/mcp.rs:1510`).
 
 **Codex (secondary, not implemented)**: **workaround**. Codex does
 not expose a fine-grained MCP tool allowlist at the CLI level; its
@@ -411,15 +411,15 @@ defence in depth.
 
 ### C6 - System prompt injection per stage
 
-**Claude (reference)**: `stage_system_prompt` at `src/app.rs:4138`
+**Claude (reference)**: `stage_system_prompt` at `src/app.rs:4308`
 builds the prompt by rendering a per-stage template
 (`planning` / `planning_retroactive` / `planning_quickstart` /
 `implementing_with_plan` / `implementing_rework` /
 `implementing_no_plan` / `blocked` / `review` /
 `review_with_findings`) from `src/prompts.rs`. The result is passed
 via `--system-prompt <string>` in `build_claude_cmd` at
-`src/app.rs:4010`. The review gate renders the `review_gate`
-template and passes it with the same flag at `src/app.rs:7789`.
+`src/app.rs:4180`. The review gate renders the `review_gate`
+template and passes it with the same flag at `src/app.rs:7959`.
 
 **Codex (secondary, not implemented)**: **workaround**. Codex does
 not have a dedicated `--system-prompt` flag. The harness-neutral
@@ -431,13 +431,13 @@ injection at spawn time) is still met.
 
 ### C7 - Auto-start prompt
 
-**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4023`
+**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4186`
 appends a literal positional prompt ("Explain who you are and start
 working." for Planning/Implementing, a review-gate-findings
 presentation prompt for Review) when `auto_start` is true. It is
 placed **before** `--mcp-config` because Claude Code otherwise
 treats it as an additional config file path (see the code comment
-at `src/app.rs:4014`).
+at `src/app.rs:4183`).
 
 **Codex (secondary, not implemented)**: **supported**. Codex accepts
 an initial prompt as a positional argument in interactive mode and
@@ -446,7 +446,7 @@ as the `-p` / stdin payload in `codex exec`. No clause violation.
 ### C8 - Stage reminders
 
 **Claude (reference)**: Planning sessions get a second-layer
-reminder via `--settings`, passed at `src/app.rs:4003` with a JSON
+reminder via `--settings`, passed at `src/app.rs:4173` with a JSON
 blob that installs a `PostToolUse` hook on `TodoWrite`. The hook
 greps the tool payload for `workbridge_set_plan`; if missing, it
 writes a reminder to stderr so Claude sees it on the next turn.
@@ -466,10 +466,10 @@ the first turn.
 
 **Claude (reference)**: Interactive capture lives in
 `src/session.rs` - the reader thread in `Session::spawn`
-(`src/session.rs:159`) loops on `libc::read` against a dup'd master
+(`src/session.rs:164`) loops on `libc::read` against a dup'd master
 fd and calls `vt100::Parser::process` on every chunk. The UI thread
 locks the parser and renders its screen (`App::render_*` paths).
-Headless capture lives at `src/app.rs:7798` - the review gate
+Headless capture lives at `src/app.rs:7968` - the review gate
 consumes stdout via `Command::output()` and parses the top-level
 JSON envelope, reaching into `envelope["structured_output"]` for the
 fields.
@@ -492,7 +492,7 @@ at `src/session.rs:304` is the SIGKILL-immediately path used in
 force-kills and joins the reader thread; slave-PTY close on child
 exit gives the reader its EOF. The global-assistant teardown adds
 one extra layer on top of `Session::kill`:
-`App::teardown_global_session` at `src/app.rs:8185` kills the
+`App::teardown_global_session` at `src/app.rs:8355` kills the
 child, drops the `SessionEntry` (which joins the reader via
 `Drop`), drops the MCP server, removes the temp MCP config file,
 and drains any buffered keystrokes - symmetric with the work-item
@@ -508,13 +508,13 @@ behaviour), the existing `Session` struct handles it unchanged.
 ### C11 - Read-only sessions
 
 **Claude (reference)**: The review gate passes `read_only: true` to
-`McpSocketServer::start` at `src/app.rs:7743`. The server at
+`McpSocketServer::start` at `src/app.rs:7906`. The server at
 `src/mcp.rs:80` stores the flag into `SessionMcpConfig` and threads
 it through `handle_message`, which filters `tools/list` (see
 `src/mcp.rs` around line 439) and rejects mutating `tools/call`
 (line 608). The unit tests
 `read_only_mode_exposes_only_read_tools` and
-`read_only_mode_rejects_mutating_tool_calls` in `src/mcp.rs:1506`
+`read_only_mode_rejects_mutating_tool_calls` in `src/mcp.rs:1510`
 pin the contract.
 
 **Codex (secondary, not implemented)**: **supported**. Read-only
@@ -525,15 +525,15 @@ harness-agnostic. A Codex adapter just sets the same flag.
 
 **Claude (reference)**: Sessions are stored in `App::sessions` keyed
 by `(WorkItemId, WorkItemStatus)` and inserted at
-`src/app.rs:3941`. Stage transitions orphan old entries, which are
+`src/app.rs:4111`. Stage transitions orphan old entries, which are
 killed by the periodic liveness sweep. The poll handler in
-`poll_review_gate` at `src/app.rs:8003` explicitly kills the
+`poll_review_gate` at `src/app.rs:8041` explicitly kills the
 current session and respawns when a gate rejects or errors. The
 global assistant drawer uses a simpler identity rule: exactly one
 live session at a time, torn down on every drawer close and
 re-spawned fresh on every drawer open via
 `App::toggle_global_drawer` calling `teardown_global_session`
-(`src/app.rs:8185`) and `spawn_global_session` (`src/app.rs:8201`);
+(`src/app.rs:8355`) and `spawn_global_session` (`src/app.rs:8371`);
 see also `docs/UI.md` "Global assistant drawer session lifetime".
 
 **Codex (secondary, not implemented)**: **supported**. Identity is
@@ -595,7 +595,7 @@ claude
 ```
 
 Source: `std::process::Command::new("claude")` at
-`src/app.rs:7784`. Cwd: inherited (unspecified). The review gate
+`src/app.rs:7954`. Cwd: inherited (unspecified). The review gate
 does NOT pass `--dangerously-skip-permissions` because
 `--print` is non-interactive and never prompts. The review gate
 does NOT pass `--allowedTools`; it relies on the read-only MCP
@@ -618,11 +618,11 @@ server to hide mutating tools.
 }
 ```
 
-Source: `build_mcp_config` at `src/mcp.rs:1378`. For work-item
+Source: `build_mcp_config` at `src/mcp.rs:1382`. For work-item
 sessions, `extra_servers` (user-configured per-repo entries) are
 inserted first; the workbridge server is appended last so it wins
 on name collision. The socket path is produced by
-`socket_path_for_session` at `src/mcp.rs:1424`.
+`socket_path_for_session` at `src/mcp.rs:1428`.
 
 ### RP4 - Planning `--settings` hook payload
 
@@ -645,7 +645,7 @@ on name collision. The socket path is produced by
 ```
 
 Source: inline JSON literal in `build_claude_cmd` at
-`src/app.rs:4005`. Passed as the argument to `--settings` on
+`src/app.rs:4175`. Passed as the argument to `--settings` on
 Planning spawns only. The harness fires the command after every
 `TodoWrite` tool call; the command greps stdin (the tool payload)
 for `workbridge_set_plan` and, if missing, emits a stderr
@@ -666,7 +666,7 @@ The review gate parses the top-level JSON document emitted by
 }
 ```
 
-Source: `src/app.rs:7803` ("The structured output is in the
+Source: `src/app.rs:7973` ("The structured output is in the
 `structured_output` field."). The harness MUST produce an envelope
 whose structured body conforms to the `--json-schema` payload in
 RP2; workbridge uses `.as_bool()` and `.as_str()` with safe
@@ -832,17 +832,17 @@ update the Implementation Map section above.
 
 | File          | Line  | Mode        | Scope      | Cwd                                       |
 |---------------|-------|-------------|------------|-------------------------------------------|
-| `src/app.rs`  | 3931  | Interactive | WorkItem   | Work-item worktree                        |
-| `src/app.rs`  | 7784  | Headless    | ReviewGate | inherited                                 |
-| `src/app.rs`  | 8313  | Interactive | Global     | `$TMPDIR/workbridge-global-assistant-cwd` |
+| `src/app.rs`  | 4101  | Interactive | WorkItem   | Work-item worktree                        |
+| `src/app.rs`  | 7954  | Headless    | ReviewGate | inherited                                 |
+| `src/app.rs`  | 8483  | Interactive | Global     | `$TMPDIR/workbridge-global-assistant-cwd` |
 
 All three sites go through `src/session.rs:57` (`Session::spawn`) for
 the interactive path or `std::process::Command::output()` directly
 for the headless path; argv is built in `App::build_claude_cmd` at
-`src/app.rs:3967` for the work-item path, inlined at
-`src/app.rs:7784` for the review gate, and inlined at
-`src/app.rs:8233` for the global assistant. Global assistant
-teardown lives at `src/app.rs:8185`
+`src/app.rs:4137` for the work-item path, inlined at
+`src/app.rs:7954` for the review gate, and inlined at
+`src/app.rs:8404` for the global assistant. Global assistant
+teardown lives at `src/app.rs:8355`
 (`App::teardown_global_session`); see C10 and C12 for why each
 drawer open spawns a fresh session and each close fully tears it
 down.
@@ -883,6 +883,17 @@ harness adapter is introduced, add a dated bullet here.
   dirtied on session spawn. Updated C4 and RP1 source references
   to the new work-item spawn layout (`--mcp-config` append now
   lives inside `finish_session_open` at `src/app.rs:4089`,
-  `build_claude_cmd` is at `src/app.rs:4137`). Known Spawn Sites
-  table is unchanged by this PR - the spawn sites themselves did
-  not move, only the adjacent file write was deleted.
+  `build_claude_cmd` is at `src/app.rs:4137`). Also refreshed
+  every remaining `src/app.rs`, `src/session.rs`, and `src/mcp.rs`
+  line citation in the Implementation Map, Reference Payloads, and
+  Known Spawn Sites table to match the current tree in one sweep:
+  work-item `Session::spawn` 3931 -> 4101, review-gate
+  `Command::new` 7784 -> 7954, global `Session::spawn` 8313 ->
+  8483, `build_claude_cmd` 3967 -> 4137, `stage_system_prompt`
+  4138 -> 4308, `poll_review_gate` 8003 -> 8041,
+  `teardown_global_session` 8185 -> 8355, `spawn_global_session`
+  8201 -> 8371, plus every argv-push / comment / test anchor in
+  C3/C5/C6/C7/C8/C9/C11 and RP2-RP5. The table and Implementation
+  Map are now byte-accurate against the current tree so the
+  "table and Implementation Map must stay in sync with the code"
+  rule holds in full.
