@@ -59,8 +59,8 @@ cleaned up in order via `delete_work_item_by_id()`:
    and the session entry is removed from the sessions map. If a terminal PTY
    session is running (spawned via the Terminal tab), it also receives SIGKILL
    and is removed from the terminal sessions map.
-3. **MCP server** - the MCP socket server and `.mcp.json` config file are
-   removed via `cleanup_session_state_for()`.
+3. **MCP server** - the MCP socket server is removed via
+   `cleanup_session_state_for()`.
 4. **Open PR** - if a GitHub PR is open for this branch, it is closed
    FIRST via `gh pr close`. Merged or already-closed PRs are skipped
    (state != "OPEN"). If the close fails (auth error, network error,

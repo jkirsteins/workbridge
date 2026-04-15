@@ -494,7 +494,7 @@ warnings but do not prevent the delete.
 - Open PR on GitHub (closed via `gh pr close`)
 - Active Claude Code session (killed)
 - Active terminal session (killed)
-- MCP socket server and .mcp.json config file
+- MCP socket server
 - In-memory state: rework reasons, review gate findings, no-plan prompt queue,
   merge/rework prompt visibility flags
 
