@@ -1837,11 +1837,12 @@ fn format_work_item_entry<'a>(
     // a derived `GitState` that reports uncommitted changes, unpushed
     // commits, or a behind-remote delta. `git_state.dirty` is the union
     // of modified-tracked-files and untracked-files (see `GitState`
-    // doc comment); the merge guard in `App::advance_stage` /
-    // `App::execute_merge` distinguishes them via
-    // `App::worktree_cleanliness`, which reads the raw `WorktreeInfo`
-    // fields. Both paths are pure cache reads and cannot shell out,
-    // honouring the "no blocking I/O on the UI thread" invariant.
+    // doc comment); the merge guard lives in `App::execute_merge` as a
+    // background `WorktreeService::list_worktrees` precheck and
+    // distinguishes the variants via
+    // `WorktreeCleanliness::from_worktree_info`. The chip render here
+    // is a pure cache read and cannot shell out, honouring the "no
+    // blocking I/O on the UI thread" invariant.
     let is_unclean = wi.repo_associations.iter().any(|a| {
         a.git_state
             .as_ref()

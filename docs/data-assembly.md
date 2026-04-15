@@ -85,15 +85,23 @@ cached `WorktreeInfo` fields:
   - `GitState.dirty = wt.dirty || wt.untracked` - the union, because the
     `!cl` list chip treats both the same way. Callers that need to
     distinguish them (e.g. the merge-guard alert wording) go through
-    `App::worktree_cleanliness`, which reads the raw `WorktreeInfo`
-    fields directly and returns a `WorktreeCleanliness` enum.
+    `WorktreeCleanliness::from_worktree_info`, which reads the raw
+    `WorktreeInfo` fields directly and returns a `WorktreeCleanliness`
+    enum. The merge guard runs that classifier against a fresh
+    `WorktreeService::list_worktrees` call inside
+    `App::spawn_merge_precheck` (background thread), not against the
+    cached `repo_data` projection - see `docs/UI.md` "merge guard"
+    for the rationale.
   - `GitState.ahead = wt.unpushed.unwrap_or(0)`
   - `GitState.behind = wt.behind_remote.unwrap_or(0)`
 
 Reading these values on the UI thread is always a pure in-memory
-projection - no `git` subprocess is spawned from
-`format_work_item_entry`, `advance_stage`, or `execute_merge`. See
-`docs/UI.md` "Blocking I/O Prohibition" for the underlying rule.
+projection - no `git` subprocess is spawned on the UI thread from
+`format_work_item_entry`, `advance_stage`, or `execute_merge`.
+`execute_merge` does spawn a background working-tree precheck, but
+the spawn itself is non-blocking and the actual `git` work happens
+on a separate thread. See `docs/UI.md` "Blocking I/O Prohibition"
+for the underlying rule.
 
 ### Tier 1: Git remote (fast, usually available)
 

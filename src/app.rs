@@ -513,11 +513,12 @@ pub struct ReviewSubmitResult {
 }
 
 /// Classification of a worktree's local state relative to its upstream,
-/// returned by `App::worktree_cleanliness`.
+/// returned by `WorktreeCleanliness::from_worktree_info`.
 ///
-/// The variants are ordered by merge-guard priority: the helper returns
-/// the first matching one, so `Dirty` wins over `Untracked` which wins
-/// over `Unpushed` which wins over `BehindOnly` which wins over `Clean`.
+/// The variants are ordered by merge-guard priority: the classifier
+/// returns the first matching one, so `Dirty` wins over `Untracked`
+/// which wins over `Unpushed` which wins over `BehindOnly` which wins
+/// over `Clean`.
 ///
 /// `BehindOnly` is a soft-warning state: the worktree is behind its
 /// upstream but has nothing of its own to lose, so pushing would be
@@ -548,15 +549,16 @@ pub enum WorktreeCleanliness {
 }
 
 impl WorktreeCleanliness {
-    /// Classify a single `WorktreeInfo` (e.g. from the cached fetcher
-    /// result OR a fresh `WorktreeService::list_worktrees` call) using
-    /// the canonical Dirty > Untracked > Unpushed > BehindOnly > Clean
-    /// priority order. This is the single source of truth for the
-    /// classification - both the cached path
-    /// (`App::worktree_cleanliness`) and the live precheck path
-    /// (`App::spawn_merge_precheck`) call into here so they cannot
-    /// drift on the priority ordering or the `unwrap_or(false)`
-    /// defaults.
+    /// Classify a single `WorktreeInfo` (typically from a fresh
+    /// `WorktreeService::list_worktrees` call inside the live merge
+    /// precheck) using the canonical Dirty > Untracked > Unpushed >
+    /// BehindOnly > Clean priority order. This is the single source
+    /// of truth for the classification, called from
+    /// `App::spawn_merge_precheck` to decide whether the live
+    /// worktree state blocks a Review -> Done merge. The cached
+    /// `repo_data.worktrees` is no longer consulted for that
+    /// decision - see `execute_merge` and the doc on
+    /// `MergePreCheckMessage` for the rationale.
     ///
     /// Field semantics mirror the docs on `WorktreeInfo`: `None` for
     /// any of `dirty`, `untracked`, `unpushed`, `behind_remote` means
@@ -583,23 +585,14 @@ impl WorktreeCleanliness {
         WorktreeCleanliness::Clean
     }
 
-    /// Returns `true` if this state must block the Review -> Done
-    /// merge transition. `Clean` and `BehindOnly` are the only
-    /// non-blocking variants; see the enum doc comment for the
-    /// reasoning behind `BehindOnly`'s soft-warning treatment.
-    pub fn is_merge_blocking(&self) -> bool {
-        match self {
-            WorktreeCleanliness::Clean | WorktreeCleanliness::BehindOnly(_) => false,
-            WorktreeCleanliness::Dirty
-            | WorktreeCleanliness::Untracked
-            | WorktreeCleanliness::Unpushed(_) => true,
-        }
-    }
-
     /// User-facing error text for a blocking state, or `None` when
     /// the state does not block. The wording is intentionally
     /// prescriptive ("Commit & push before merging.") so the alert
-    /// doubles as the remediation step.
+    /// doubles as the remediation step. Callers use the `Some` /
+    /// `None` discriminant as the merge-block signal: there is no
+    /// separate `is_merge_blocking` predicate because that would
+    /// make it possible (via copy-paste drift) for the predicate
+    /// and the message to disagree on which variants block.
     pub fn merge_block_message(&self) -> Option<&'static str> {
         match self {
             WorktreeCleanliness::Dirty => {
@@ -3009,6 +3002,11 @@ impl App {
         {
             self.end_user_action(&UserActionKey::PrMerge);
             self.merge_in_progress = false;
+            // Drop any in-flight precheck receiver - same reason as
+            // `retreat_stage`: a late `Ready` would crash
+            // `perform_merge_after_precheck` against a slot the
+            // delete just released. See the longer comment there.
+            self.merge_precheck_rx = None;
         }
         if self.user_action_work_item(&UserActionKey::ReviewSubmit) == Some(wi_id) {
             self.end_user_action(&UserActionKey::ReviewSubmit);
@@ -5019,44 +5017,6 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// Classify a worktree's local state for the unclean-worktree
-    /// indicator and the Review -> Done merge guard. Pure cache lookup
-    /// from `self.repo_data[repo_path].worktrees` - must NOT shell out
-    /// on the UI thread. See `docs/UI.md` "Blocking I/O Prohibition".
-    ///
-    /// Priority order when multiple conditions are present:
-    ///   Dirty > Untracked > Unpushed > BehindOnly > Clean
-    ///
-    /// Dirty is highest because a user with both uncommitted changes
-    /// and untracked files almost always means "I haven't committed
-    /// yet" - the tracked-change wording is the more actionable
-    /// message. BehindOnly is lowest because it is the only variant
-    /// that does not block merging.
-    ///
-    /// Missing cache (first fetch in flight, repo never fetched, no
-    /// matching worktree, missing branch) collapses to `Clean`: the
-    /// safe default that allows the merge flow to proceed. Once the
-    /// fetcher populates real state, subsequent calls return the
-    /// correct classification.
-    pub fn worktree_cleanliness(
-        &self,
-        repo_path: &std::path::Path,
-        branch: &str,
-    ) -> WorktreeCleanliness {
-        let Some(wt) = self
-            .repo_data
-            .get(repo_path)
-            .and_then(|rd| rd.worktrees.as_ref().ok())
-            .and_then(|wts| wts.iter().find(|wt| wt.branch.as_deref() == Some(branch)))
-        else {
-            return WorktreeCleanliness::Clean;
-        };
-
-        // Delegate to the canonical classifier so the cached path and
-        // the live precheck path (`spawn_merge_precheck`) cannot drift.
-        WorktreeCleanliness::from_worktree_info(wt)
-    }
-
     /// Start an MCP socket server for a work item session.
     /// MCP config is passed to Claude via --mcp-config CLI flag, not written
     /// to disk. Returns (server, unused_path) on success, or an error message
@@ -6481,42 +6441,24 @@ impl App {
 
         // Merge prompt: when transitioning from Review to Done,
         // show the merge strategy prompt instead of advancing directly.
+        //
+        // The unclean-worktree merge guard used to live here as a
+        // synchronous read against the cached `repo_data` worktree
+        // info. That cached path stayed stale across long sessions
+        // and would refuse to open the modal even after the user had
+        // committed and pushed minutes ago. The authoritative merge
+        // guard now lives in `execute_merge` as a background
+        // `WorktreeService::list_worktrees` precheck (see
+        // `spawn_merge_precheck` / `poll_merge_precheck`); having a
+        // second cached guard here would short-circuit the live check
+        // and re-introduce exactly the stale-cache failure mode the
+        // precheck was added to fix. So this branch unconditionally
+        // opens the strategy picker - the live precheck classifies
+        // the worktree before the actual `gh pr merge` thread fires
+        // and surfaces the same dirty/untracked/unpushed wording as
+        // an alert if it blocks. `BehindOnly` and `Clean` continue to
+        // proceed to the merge as before.
         if current_status == WorkItemStatus::Review && new_status == WorkItemStatus::Done {
-            // Unclean-worktree merge guard. Refuse to open the merge
-            // modal when the primary repo association has uncommitted
-            // changes, untracked files, or unpushed commits - merging
-            // in any of those states would either land a PR that does
-            // not include the user's local work or (with
-            // `--delete-branch`) destroy that work entirely. The
-            // guard mirrors the "unclean" chip rendered by
-            // `format_work_item_entry`; they must stay in sync.
-            // `BehindOnly` and `Clean` fall through to the normal
-            // confirm_merge path.
-            //
-            // `worktree_cleanliness` is a pure cache read - see its
-            // doc comment for the blocking-I/O invariant. The guard
-            // only applies to the PRIMARY repo association (first
-            // entry) to match `execute_merge`'s own primary-assoc
-            // model; multi-repo work items merge one PR at a time
-            // and the same helper gets re-invoked per repo.
-            if let Some(assoc) = wi.repo_associations.first()
-                && let Some(branch) = assoc.branch.as_deref()
-            {
-                let cleanliness = self.worktree_cleanliness(&assoc.repo_path, branch);
-                if cleanliness.is_merge_blocking() {
-                    // Every blocking variant also has a non-None
-                    // `merge_block_message`; the fallback string is
-                    // defensive in case a future variant is added
-                    // without wiring up its message.
-                    self.alert_message = Some(
-                        cleanliness
-                            .merge_block_message()
-                            .unwrap_or("Worktree is not ready to merge.")
-                            .to_string(),
-                    );
-                    return;
-                }
-            }
             self.confirm_merge = true;
             self.merge_wi_id = Some(wi_id);
             return;
@@ -6565,6 +6507,18 @@ impl App {
         // so when retreating from Review we drop the helper entry to prevent
         // poll_pr_merge from applying a stale result. The background thread
         // will finish on its own; we just ignore its result.
+        //
+        // The merge can be in either of two phases here:
+        // 1. Live precheck (`merge_precheck_rx` populated, no
+        //    `UserActionPayload::PrMerge` attached yet).
+        // 2. Actual `gh pr merge` (payload attached).
+        // Both phases share the same `UserActionKey::PrMerge` slot, so
+        // `is_user_action_in_flight` is the single check that covers them.
+        // `merge_precheck_rx` MUST be cleared in lockstep with releasing
+        // the slot - otherwise the precheck thread's late `Ready` arrives
+        // at `poll_merge_precheck`, which calls
+        // `perform_merge_after_precheck` -> `attach_user_action_payload`
+        // and panics because the slot is gone.
         if current_status == WorkItemStatus::Review
             && self.is_user_action_in_flight(&UserActionKey::PrMerge)
         {
@@ -6572,6 +6526,7 @@ impl App {
             self.merge_in_progress = false;
             self.confirm_merge = false;
             self.merge_wi_id = None;
+            self.merge_precheck_rx = None;
         }
 
         // Cancel any in-flight or pending PR creation for the retreating item.
@@ -7203,9 +7158,9 @@ impl App {
     ///
     /// Runs `WorktreeService::list_worktrees` on a background thread
     /// and translates the result into a `MergePreCheckMessage`:
-    /// `Ready` if the live worktree state passes
-    /// `WorktreeCleanliness::is_merge_blocking`, otherwise `Blocked`
-    /// with the same user-facing text the cached path used. The
+    /// `Ready` if `WorktreeCleanliness::merge_block_message` returns
+    /// `None` for the live `WorktreeInfo`, otherwise `Blocked` with
+    /// the same user-facing text the cached path used. The
     /// receiver is stashed on `self.merge_precheck_rx` and drained on
     /// the next ~200ms background tick by `poll_merge_precheck`.
     ///
@@ -7315,6 +7270,21 @@ impl App {
                 repo_path,
                 owner_repo,
             } => {
+                // Defense in depth: if the `PrMerge` slot was released
+                // between the precheck spawn and now (e.g. a cancel
+                // path ended the user action without also clearing
+                // `merge_precheck_rx`), `perform_merge_after_precheck`
+                // would panic in `attach_user_action_payload` because
+                // there is no slot to attach to. The known cancel
+                // sites (`retreat_stage`, `delete_work_item_by_id`)
+                // already clear the receiver in lockstep, but this
+                // guard makes the contract enforceable from the
+                // poller side too so a future cancel path that
+                // forgets the lockstep cannot crash the UI - the
+                // stale `Ready` is just dropped silently.
+                if !self.is_user_action_in_flight(&UserActionKey::PrMerge) {
+                    return;
+                }
                 self.perform_merge_after_precheck(wi_id, strategy, branch, repo_path, owner_repo);
             }
             MergePreCheckMessage::Blocked { reason } => {
@@ -12283,7 +12253,10 @@ mod tests {
 
     /// Install a `RepoFetchResult` that carries a worktree with the
     /// given cleanliness fields. Used by the merge-guard tests to
-    /// drive `App::worktree_cleanliness` through each variant.
+    /// stage stale-cache scenarios that exercise the live precheck
+    /// path: the cache says one thing, the live
+    /// `WorktreeService::list_worktrees` mock returns another, and
+    /// the test verifies the precheck is the authority.
     fn install_cached_repo_with_cleanliness(
         app: &mut App,
         repo_path: &std::path::Path,
@@ -12350,106 +12323,100 @@ mod tests {
         app.selected_item = Some(app.display_list.len() - 1);
     }
 
-    /// Priority ordering contract of `App::worktree_cleanliness`:
+    /// Priority ordering contract of
+    /// `WorktreeCleanliness::from_worktree_info`:
     ///   Dirty > Untracked > Unpushed > BehindOnly > Clean
+    ///
+    /// This is the single canonical classifier used by the live
+    /// merge precheck (`spawn_merge_precheck`). Any drift on the
+    /// priority would make `dirty + untracked + unpushed` worktrees
+    /// surface a wrong-flavor block message, so the order is pinned
+    /// here.
     #[test]
     fn worktree_cleanliness_priority_order() {
-        let mut app = App::new();
-        let repo = PathBuf::from("/tmp/cleanliness-priority");
+        fn wt(
+            dirty: Option<bool>,
+            untracked: Option<bool>,
+            unpushed: Option<u32>,
+            behind: Option<u32>,
+        ) -> crate::worktree_service::WorktreeInfo {
+            crate::worktree_service::WorktreeInfo {
+                path: PathBuf::from("/tmp/priority/.worktrees/b"),
+                branch: Some("b".into()),
+                is_main: false,
+                dirty,
+                untracked,
+                unpushed,
+                behind_remote: behind,
+                ..crate::worktree_service::WorktreeInfo::default()
+            }
+        }
 
         // Dirty wins over everything else.
-        install_cached_repo_with_cleanliness(
-            &mut app,
-            &repo,
-            "b",
-            Some(true),
-            Some(true),
-            Some(5),
-            Some(5),
-        );
         assert_eq!(
-            app.worktree_cleanliness(&repo, "b"),
+            WorktreeCleanliness::from_worktree_info(&wt(Some(true), Some(true), Some(5), Some(5),)),
             WorktreeCleanliness::Dirty,
         );
 
         // Untracked wins over Unpushed + BehindOnly.
-        install_cached_repo_with_cleanliness(
-            &mut app,
-            &repo,
-            "b",
-            Some(false),
-            Some(true),
-            Some(3),
-            Some(3),
-        );
         assert_eq!(
-            app.worktree_cleanliness(&repo, "b"),
+            WorktreeCleanliness::from_worktree_info(
+                &wt(Some(false), Some(true), Some(3), Some(3),)
+            ),
             WorktreeCleanliness::Untracked,
         );
 
         // Unpushed wins over BehindOnly.
-        install_cached_repo_with_cleanliness(
-            &mut app,
-            &repo,
-            "b",
-            Some(false),
-            Some(false),
-            Some(2),
-            Some(4),
-        );
         assert_eq!(
-            app.worktree_cleanliness(&repo, "b"),
+            WorktreeCleanliness::from_worktree_info(&wt(
+                Some(false),
+                Some(false),
+                Some(2),
+                Some(4),
+            )),
             WorktreeCleanliness::Unpushed(2),
         );
 
         // BehindOnly when only behind.
-        install_cached_repo_with_cleanliness(
-            &mut app,
-            &repo,
-            "b",
-            Some(false),
-            Some(false),
-            Some(0),
-            Some(7),
-        );
         assert_eq!(
-            app.worktree_cleanliness(&repo, "b"),
+            WorktreeCleanliness::from_worktree_info(&wt(
+                Some(false),
+                Some(false),
+                Some(0),
+                Some(7),
+            )),
             WorktreeCleanliness::BehindOnly(7),
         );
 
         // All zero / clean.
-        install_cached_repo_with_cleanliness(
-            &mut app,
-            &repo,
-            "b",
-            Some(false),
-            Some(false),
-            Some(0),
-            Some(0),
-        );
         assert_eq!(
-            app.worktree_cleanliness(&repo, "b"),
+            WorktreeCleanliness::from_worktree_info(&wt(
+                Some(false),
+                Some(false),
+                Some(0),
+                Some(0),
+            )),
             WorktreeCleanliness::Clean,
         );
 
-        // Missing cache entry => Clean (safe default).
-        let never_fetched = PathBuf::from("/tmp/never-fetched-cleanliness");
+        // All-None fields (fetcher check not yet run) => Clean: the
+        // safe default that lets the live precheck proceed and
+        // re-classify against fresh data.
         assert_eq!(
-            app.worktree_cleanliness(&never_fetched, "whatever"),
-            WorktreeCleanliness::Clean,
-        );
-
-        // All-None fields (fetcher check not yet run) => Clean.
-        install_cached_repo_with_cleanliness(&mut app, &repo, "b", None, None, None, None);
-        assert_eq!(
-            app.worktree_cleanliness(&repo, "b"),
+            WorktreeCleanliness::from_worktree_info(&wt(None, None, None, None)),
             WorktreeCleanliness::Clean,
         );
     }
 
-    /// `is_merge_blocking` blocks everything except Clean and BehindOnly.
+    /// `merge_block_message` is the single source of truth for
+    /// "does this state block the Review -> Done merge?": every
+    /// blocking variant returns `Some` and every non-blocking
+    /// variant returns `None`. The merge precheck path uses the
+    /// `Some` / `None` discriminant directly, so this test pins
+    /// both that contract and the user-facing wording so copy
+    /// edits to `merge_block_message` get caught.
     #[test]
-    fn worktree_cleanliness_merge_blocking_matches_message() {
+    fn worktree_cleanliness_merge_block_message_classifies_correctly() {
         for (state, blocking) in [
             (WorktreeCleanliness::Clean, false),
             (WorktreeCleanliness::Dirty, true),
@@ -12457,11 +12424,10 @@ mod tests {
             (WorktreeCleanliness::Unpushed(1), true),
             (WorktreeCleanliness::BehindOnly(1), false),
         ] {
-            assert_eq!(state.is_merge_blocking(), blocking, "{state:?}");
             assert_eq!(
                 state.merge_block_message().is_some(),
                 blocking,
-                "{state:?} message presence must match is_merge_blocking",
+                "{state:?} message presence must reflect blocking-ness",
             );
         }
         // Spot-check the specific wording so copy edits are caught.
@@ -12485,10 +12451,19 @@ mod tests {
         );
     }
 
-    /// Review -> Done on a Dirty worktree must block the merge modal
-    /// with a dirty-specific alert, and the work item stays in Review.
+    /// Regression: a stale `dirty: true` cache on the primary
+    /// association must NOT prevent `advance_stage` from opening the
+    /// merge confirm modal. The cached guard that used to live here
+    /// short-circuited the live `WorktreeService::list_worktrees`
+    /// precheck (which only runs from `execute_merge`, downstream of
+    /// the modal), so users whose cache had gone stale across a long
+    /// session would see "Uncommitted changes" forever even after
+    /// committing. The authoritative merge guard now lives entirely
+    /// in `execute_merge` -> `spawn_merge_precheck`; this test pins
+    /// the absence of the cached guard so a future regression cannot
+    /// re-introduce it without rewriting the assertions.
     #[test]
-    fn advance_stage_review_to_done_blocked_when_dirty() {
+    fn advance_stage_review_to_done_opens_modal_when_cache_dirty() {
         let mut app = App::new();
         let repo = PathBuf::from("/tmp/merge-guard-dirty");
         let branch = "feature/dirty";
@@ -12507,8 +12482,18 @@ mod tests {
         app.advance_stage();
 
         assert!(
-            !app.confirm_merge,
-            "merge modal must NOT open when worktree is dirty",
+            app.confirm_merge,
+            "merge modal must open even when cache says dirty - the live precheck in execute_merge is the only authority",
+        );
+        assert_eq!(
+            app.merge_wi_id.as_ref(),
+            Some(&wi_id),
+            "merge_wi_id must be set so the modal knows which item it's gating",
+        );
+        assert!(
+            app.alert_message.is_none(),
+            "no alert should fire from advance_stage; got: {:?}",
+            app.alert_message,
         );
         assert_eq!(
             app.work_items
@@ -12517,17 +12502,16 @@ mod tests {
                 .unwrap()
                 .status,
             WorkItemStatus::Review,
-            "item must stay in Review on blocked advance",
-        );
-        let msg = app.alert_message.as_deref().unwrap_or("");
-        assert!(
-            msg.contains("Uncommitted changes"),
-            "alert should tell user to commit & push, got: {msg}",
+            "item stays in Review while the modal is open",
         );
     }
 
+    /// Same regression as `..._opens_modal_when_cache_dirty` but for
+    /// a stale `untracked: true` cache. See that test's doc comment
+    /// for the why - the cached guard had a per-variant arm that
+    /// also needs to be gone.
     #[test]
-    fn advance_stage_review_to_done_blocked_when_untracked() {
+    fn advance_stage_review_to_done_opens_modal_when_cache_untracked() {
         let mut app = App::new();
         let repo = PathBuf::from("/tmp/merge-guard-untracked");
         let branch = "feature/untracked";
@@ -12545,13 +12529,14 @@ mod tests {
 
         app.advance_stage();
 
-        assert!(!app.confirm_merge);
-        let msg = app.alert_message.as_deref().unwrap_or("");
-        assert!(msg.contains("Untracked files"), "got: {msg}");
+        assert!(app.confirm_merge);
+        assert!(app.alert_message.is_none(), "{:?}", app.alert_message);
     }
 
+    /// Same regression as `..._opens_modal_when_cache_dirty` but for
+    /// a stale `unpushed > 0` cache.
     #[test]
-    fn advance_stage_review_to_done_blocked_when_unpushed() {
+    fn advance_stage_review_to_done_opens_modal_when_cache_unpushed() {
         let mut app = App::new();
         let repo = PathBuf::from("/tmp/merge-guard-unpushed");
         let branch = "feature/unpushed";
@@ -12569,9 +12554,8 @@ mod tests {
 
         app.advance_stage();
 
-        assert!(!app.confirm_merge);
-        let msg = app.alert_message.as_deref().unwrap_or("");
-        assert!(msg.contains("Unpushed commits"), "got: {msg}");
+        assert!(app.confirm_merge);
+        assert!(app.alert_message.is_none(), "{:?}", app.alert_message);
     }
 
     /// BehindOnly is a soft warning and must NOT block the merge.
@@ -12789,6 +12773,159 @@ mod tests {
         assert!(
             msg.contains("Uncommitted changes"),
             "alert must surface the precheck reason; got: {msg}",
+        );
+    }
+
+    /// Regression: `retreat_stage` must clear `merge_precheck_rx`
+    /// in lockstep with releasing the `UserActionKey::PrMerge` slot.
+    /// Otherwise a late `Ready` message from the still-running
+    /// precheck thread would arrive at `poll_merge_precheck`, call
+    /// `perform_merge_after_precheck`, and panic in
+    /// `attach_user_action_payload` because the slot is gone.
+    #[test]
+    fn retreat_stage_clears_merge_precheck_rx() {
+        let mut app = App::new();
+        let repo = PathBuf::from("/tmp/retreat-clears-precheck");
+        let branch = "feature/retreat-clears-precheck";
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            branch,
+            Some(false),
+            Some(false),
+            Some(0),
+            Some(0),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/retreat-clears-precheck.json"));
+        push_selected_review_item(&mut app, &wi_id, &repo, branch);
+
+        // Mirror the post-`execute_merge` state: the helper slot is
+        // admitted (precheck phase) and `merge_precheck_rx` is
+        // populated with a never-completing receiver.
+        app.try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging PR...")
+            .expect("helper admit should succeed in test setup");
+        app.merge_in_progress = true;
+        app.confirm_merge = true;
+        app.merge_wi_id = Some(wi_id.clone());
+        let (_tx_keep_alive, rx) = crossbeam_channel::bounded::<MergePreCheckMessage>(1);
+        app.merge_precheck_rx = Some(rx);
+
+        app.retreat_stage();
+
+        assert!(
+            !app.is_user_action_in_flight(&UserActionKey::PrMerge),
+            "retreat must release the PrMerge slot",
+        );
+        assert!(
+            app.merge_precheck_rx.is_none(),
+            "retreat must clear merge_precheck_rx in lockstep with releasing the slot",
+        );
+        assert!(!app.merge_in_progress);
+        assert!(!app.confirm_merge);
+        assert!(app.merge_wi_id.is_none());
+    }
+
+    /// Regression: `delete_work_item_by_id` (Phase 5 in-flight
+    /// cleanup) must clear `merge_precheck_rx` for the same reason
+    /// as `retreat_stage`. See `retreat_stage_clears_merge_precheck_rx`
+    /// for the panic this guards against.
+    #[test]
+    fn delete_work_item_clears_merge_precheck_rx() {
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(CountingPlanBackend::default()) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/delete-clears-precheck.json"));
+        let repo_path = PathBuf::from("/tmp/delete-clears-precheck-repo");
+        let branch_name = "feature/delete-clears-precheck".to_string();
+
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "delete-clears-precheck".into(),
+            description: None,
+            status: WorkItemStatus::Review,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: repo_path.clone(),
+                branch: Some(branch_name.clone()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        // Mirror post-`execute_merge` precheck phase: slot admitted,
+        // receiver populated with a never-completing channel.
+        app.try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging PR...")
+            .expect("helper admit should succeed in test setup");
+        app.merge_in_progress = true;
+        app.merge_wi_id = Some(wi_id.clone());
+        let (_tx_keep_alive, rx) = crossbeam_channel::bounded::<MergePreCheckMessage>(1);
+        app.merge_precheck_rx = Some(rx);
+
+        let mut warnings: Vec<String> = Vec::new();
+        let mut orphan_worktrees: Vec<OrphanWorktree> = Vec::new();
+        app.delete_work_item_by_id(&wi_id, &mut warnings, &mut orphan_worktrees)
+            .expect("delete must succeed");
+
+        assert!(
+            !app.is_user_action_in_flight(&UserActionKey::PrMerge),
+            "delete-cleanup must release the PrMerge slot",
+        );
+        assert!(
+            app.merge_precheck_rx.is_none(),
+            "delete-cleanup must clear merge_precheck_rx in lockstep with releasing the slot",
+        );
+        assert!(!app.merge_in_progress);
+    }
+
+    /// Defense-in-depth: even if a future cancel path forgets to
+    /// clear `merge_precheck_rx`, `poll_merge_precheck` must drop a
+    /// `Ready` message silently when no `PrMerge` slot is reserved.
+    /// Pre-fix this would call `perform_merge_after_precheck`, which
+    /// in turn calls `attach_user_action_payload` and panics with
+    /// "attach_user_action_payload called without a prior successful
+    /// try_begin_user_action".
+    #[test]
+    fn poll_merge_precheck_ready_drops_when_slot_released() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/precheck-orphaned.json"));
+
+        // No `try_begin_user_action` - the slot is intentionally
+        // empty. Inject a Ready message via a synthetic channel.
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(MergePreCheckMessage::Ready {
+            wi_id,
+            strategy: "squash".into(),
+            branch: "feature/orphaned".into(),
+            repo_path: PathBuf::from("/tmp/precheck-orphaned-repo"),
+            owner_repo: "owner/repo".into(),
+        })
+        .unwrap();
+        app.merge_precheck_rx = Some(rx);
+
+        // Must not panic.
+        app.poll_merge_precheck();
+
+        assert!(
+            app.merge_precheck_rx.is_none(),
+            "poll must consume the receiver even on the orphan path",
+        );
+        assert!(
+            !app.is_user_action_in_flight(&UserActionKey::PrMerge),
+            "no slot existed and none should be created",
+        );
+        assert!(
+            app.alert_message.is_none(),
+            "orphan drops are silent; got: {:?}",
+            app.alert_message,
         );
     }
 

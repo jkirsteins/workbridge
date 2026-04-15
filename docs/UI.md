@@ -206,25 +206,30 @@ read from the cache**. Concretely:
 - Worktree / branch metadata - read from
   `self.repo_data[repo_path].worktrees` (which carries
   `has_commits_ahead` so `branch_has_commits` is a pure cache lookup,
-  plus `dirty` / `untracked` / `unpushed` / `behind_remote` so
-  `App::worktree_cleanliness` can classify a worktree's local state
-  without shelling out). The `!cl` chip renderer reads this cache
-  directly. The Review -> Done **merge guard**, however, runs a live
-  `WorktreeService::list_worktrees` precheck on a background thread
-  (`App::spawn_merge_precheck` / `App::poll_merge_precheck`) before
-  letting the actual `gh pr merge` thread fire - the cache stays
-  authoritative for the chip but is no longer trusted for the
-  irrevocable merge decision, because long sessions can leave the
-  cached `dirty: true` value stale long after the user has committed
-  and pushed. Both the cached and live paths classify the
-  `WorktreeInfo` through the same
-  `WorktreeCleanliness::from_worktree_info` associated function so
-  they cannot drift on the priority ordering or wording. The merge
-  guard reserves its `UserActionKey::PrMerge` slot in
-  `execute_merge` BEFORE spawning the precheck and only releases it
-  on the Blocked / disconnected branches of `poll_merge_precheck`,
-  so the precheck and the actual merge share one single-flight slot
-  across both phases.
+  plus `dirty` / `untracked` / `unpushed` / `behind_remote` so the
+  `format_work_item_entry` `!cl` chip renderer can flag an unclean
+  worktree without shelling out). The Review -> Done **merge guard**
+  runs a live `WorktreeService::list_worktrees` precheck on a
+  background thread (`App::spawn_merge_precheck` /
+  `App::poll_merge_precheck`) before letting the actual `gh pr merge`
+  thread fire - the cache stays authoritative for the `!cl` chip but
+  is NEVER consulted for the irrevocable merge decision, because long
+  sessions can leave the cached `dirty: true` value stale long after
+  the user has committed and pushed. The classification is done via
+  `WorktreeCleanliness::from_worktree_info` against the live
+  `WorktreeInfo` so the precheck and the chip render share one
+  canonical priority ordering and wording. `App::advance_stage` does
+  NOT do its own cleanliness check on the Review -> Done branch: it
+  unconditionally opens the merge confirm modal, and the live
+  precheck inside `execute_merge` is the only authority. (The
+  earlier cached guard in `advance_stage` was the source of a stale-
+  cache regression where users could not merge after committing
+  because the fetcher cache had not refreshed yet.) The merge guard
+  reserves its `UserActionKey::PrMerge` slot in `execute_merge`
+  BEFORE spawning the precheck and only releases it on the Blocked /
+  disconnected branches of `poll_merge_precheck`, so the precheck
+  and the actual merge share one single-flight slot across both
+  phases.
 - Backend file reads (`read_plan`, `list`) - clone the `Arc<dyn
   WorkItemBackend>` into the background closure and run the read there.
 - `default_branch`, `github_remote`, `git diff` - clone the
@@ -770,6 +775,23 @@ Key semantics:
   slot. This keeps the helper's single-flight invariant intact across
   the precheck-to-merge handoff while still letting the precheck
   thread run on a background thread without blocking the UI.
+
+  The precheck receiver lives on `App::merge_precheck_rx` rather
+  than inside the helper map's `UserActionPayload`, because at spawn
+  time there is no merge-thread receiver to attach yet (that comes
+  later in `perform_merge_after_precheck`). This means
+  `merge_precheck_rx` is NOT cleared automatically when the slot is
+  released, so every cancellation site that calls
+  `end_user_action(&UserActionKey::PrMerge)` MUST also set
+  `merge_precheck_rx = None` in lockstep. The known sites are
+  `retreat_stage` (Review -> Implementing rework) and
+  `delete_work_item_by_id` (Phase 5 in-flight cleanup). If a future
+  cancel path forgets the lockstep, `poll_merge_precheck` has a
+  defense-in-depth guard that drops a stale `Ready` message
+  silently when `is_user_action_in_flight(&UserActionKey::PrMerge)`
+  returns false - this prevents `perform_merge_after_precheck` from
+  panicking inside `attach_user_action_payload`, but the cancel
+  site is still considered buggy because it is leaking a receiver.
 - **Caller-local rejection messages.** When `try_begin_user_action`
   returns `None`, the caller re-adds its existing alert / status
   string verbatim. `execute_merge` keeps `"PR merge already in
