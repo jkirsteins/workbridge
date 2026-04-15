@@ -575,6 +575,99 @@ pub struct SessionOpenPending {
     pub activity: ActivityId,
 }
 
+/// Result of the second session-open stage: the background worker
+/// that writes the MCP config files, spawns the MCP socket server,
+/// and forks the Claude PTY. This is the final result
+/// `poll_session_spawns` inserts into `self.sessions`.
+///
+/// The stage was added in response to a Codex adversarial review
+/// finding: the prior flow wrote `.mcp.json` and a temp
+/// `--mcp-config` file with `std::fs::write`, plus started the MCP
+/// socket server (which `remove_file`s and `bind`s a Unix socket),
+/// plus called `Session::spawn` (which forks a PTY), all on the UI
+/// thread from `finish_session_open`. Every one of those calls is
+/// filesystem / process I/O that `docs/UI.md` "Blocking I/O
+/// Prohibition" forbids on the tick path. Moving the whole tail
+/// into a dedicated background worker lets the UI thread do only
+/// in-memory state updates in response to the completed spawn.
+pub struct SessionSpawnResult {
+    /// Work item the spawn was requested for.
+    pub wi_id: WorkItemId,
+    /// Stage captured at `begin_session_open` time (threaded through
+    /// the entire async pipeline so the session is inserted under
+    /// the right key even if someone were to re-order the layers).
+    pub stage: WorkItemStatus,
+    /// Outcome of the I/O-heavy tail. On success, the UI thread
+    /// inserts the session and MCP server into their respective
+    /// maps. On error, it surfaces the message via `status_message`
+    /// and leaves the maps untouched.
+    pub outcome: Result<SessionSpawnOk, String>,
+}
+
+/// Success payload of a [`SessionSpawnResult`]. Carries both the
+/// live PTY session and the MCP socket server, both of which are
+/// owned by background-thread-borrowed resources that the UI thread
+/// has to accept ownership of before the spawn completes.
+///
+/// `warning` forwards non-fatal MCP config file-write failures from
+/// the background worker. `.mcp.json` and the temp `--mcp-config`
+/// file are written on a best-effort basis (Claude can still
+/// connect to the MCP server via either path alone), so a single
+/// write failure is not fatal but should still surface via
+/// `status_message` so the user notices the degraded state.
+pub struct SessionSpawnOk {
+    pub session: crate::session::Session,
+    pub mcp_server: McpSocketServer,
+    pub warning: Option<String>,
+}
+
+/// Per-entry state for the `session_spawn_rx` map, mirroring
+/// `SessionOpenPending`. `poll_session_spawns` uses the
+/// `ActivityId` to end the "Spawning Claude session..." spinner on
+/// every terminal arm (success, error, disconnect).
+pub struct SessionSpawnPending {
+    pub rx: crossbeam_channel::Receiver<SessionSpawnResult>,
+    pub activity: ActivityId,
+}
+
+/// Owned-data bundle that `finish_session_open` gathers on the UI
+/// thread before handing off to the `begin_session_spawn`
+/// background worker. Every field is `Send` / `'static` so the
+/// closure can move it across the thread boundary without borrowing
+/// `self`.
+///
+/// Grouped into a struct rather than passed positionally so the
+/// `begin_session_spawn` signature stays readable as more fields
+/// accrete. The worker consumes the whole struct by move in its
+/// prologue.
+pub struct SessionSpawnInputs {
+    /// `serde_json::to_string(work_item_id)` - pre-serialized on
+    /// the UI thread so the worker does not have to re-borrow the
+    /// ID.
+    pub wi_id_str: String,
+    /// `format!("{:?}", wi.kind)` captured on the UI thread.
+    pub wi_kind: String,
+    /// Pre-rendered MCP `get_context` payload that the socket
+    /// server will serve to Claude.
+    pub context_json: String,
+    /// Activity log path from `backend.activity_path_for(wi_id)`.
+    pub activity_log_path: Option<PathBuf>,
+    /// Repo-level MCP servers gathered from the config on the UI
+    /// thread.
+    pub repo_mcp_servers: Vec<crate::config::McpServerEntry>,
+    /// Path to the workbridge executable, resolved via
+    /// `std::env::current_exe` on the UI thread so the worker
+    /// does not have to handle the failure arm.
+    pub exe: PathBuf,
+    /// Clone of `App::mcp_tx` so the spawned `McpSocketServer` can
+    /// forward events back to the main thread.
+    pub mcp_tx: crossbeam_channel::Sender<McpEvent>,
+    /// PTY column dimension captured on the UI thread.
+    pub pane_cols: u16,
+    /// PTY row dimension captured on the UI thread.
+    pub pane_rows: u16,
+}
+
 /// Which form of session-identity flag workbridge is asking Claude Code
 /// to honour on a given spawn.
 ///
@@ -969,6 +1062,20 @@ pub struct App {
     /// a background thread; this map is how the result flows back.
     pub session_open_rx: HashMap<WorkItemId, SessionOpenPending>,
 
+    /// Per-work-item pending receivers for the second session-open
+    /// stage: the background worker that spawns the MCP socket
+    /// server, writes `.mcp.json` + a temp `--mcp-config` file, and
+    /// forks the Claude PTY. See `SessionSpawnResult` for the
+    /// rationale (Codex adversarial review required all of this I/O
+    /// to leave the UI thread). Drained by `poll_session_spawns` on
+    /// every background tick.
+    ///
+    /// Keyed by `WorkItemId` so concurrent spawns for different work
+    /// items cannot collide - pressing Enter on several items in
+    /// quick succession enqueues independent spawns that each finish
+    /// on their own schedule.
+    pub session_spawn_rx: HashMap<WorkItemId, SessionSpawnPending>,
+
     /// Sender for completion messages from `spawn_orphan_worktree_cleanup`
     /// background threads. Cloned into each spawned closure. The closure
     /// always sends exactly one `OrphanCleanupFinished` when it finishes
@@ -1169,6 +1276,7 @@ impl App {
             pr_identity_backfill_rx: None,
             pr_identity_backfill_activity: None,
             session_open_rx: HashMap::new(),
+            session_spawn_rx: HashMap::new(),
             orphan_cleanup_finished_tx,
             orphan_cleanup_finished_rx,
             global_drawer_open: false,
@@ -1650,6 +1758,16 @@ impl App {
         // gone, and the thread exits. `finish_session_open` also has
         // its own deleted-work-item guard as a second line of defence.
         self.drop_session_open_entry(wi_id);
+        // Same for the second session-open stage: if a background
+        // worker is currently writing MCP config files and forking
+        // the PTY for this work item, drop the pending receiver so
+        // `poll_session_spawns` cannot land its session into
+        // `self.sessions` after the work item has been deleted.
+        // When the background thread does complete, `poll_session_spawns`
+        // also re-validates the work item exists, so the session
+        // inside the dropped receiver falls out of scope and its
+        // `Drop` impl tears down the PTY and child process.
+        self.drop_session_spawn_entry(wi_id);
     }
 
     /// Stop all MCP servers, clear activity state, and remove temp config files.
@@ -4027,12 +4145,22 @@ impl App {
             return;
         }
 
-        // Start MCP socket server for this session.
-        let mcp_result = self.start_mcp_for_session(cwd, &work_item_id);
-        let session_key = (work_item_id.clone(), stage);
+        // Everything from here on is pure UI-thread data gathering:
+        // looking up the work item in `self.work_items`, consuming
+        // one-shot state from `self.rework_reasons` /
+        // `self.review_gate_findings` via `stage_system_prompt`, and
+        // reading scalar PTY dimensions. All actual I/O (MCP socket
+        // bind, `.mcp.json` + temp `--mcp-config` writes, PTY fork
+        // via `Session::spawn`) is deferred to a background worker
+        // via `begin_session_spawn`. The UI thread must NOT call
+        // `std::fs::write` or `Session::spawn` in the tick path - see
+        // `docs/UI.md` "Blocking I/O Prohibition", and the Codex
+        // adversarial-review finding that the earlier inline writes
+        // and spawn were UI-blocking on slow / network home
+        // directories, full disks, antivirus scans, and FUSE mounts.
         let has_gate_findings = self.review_gate_findings.contains_key(&work_item_id);
         let system_prompt = self.stage_system_prompt(&work_item_id, cwd, plan_text);
-        let mut cmd = Self::build_claude_cmd(
+        let cmd = Self::build_claude_cmd(
             &stage,
             system_prompt.as_deref(),
             has_gate_findings,
@@ -4040,82 +4168,336 @@ impl App {
             spawn_flag,
         );
 
-        // Write MCP config as .mcp.json in the worktree AND pass via --mcp-config.
-        // Both are needed: .mcp.json for Claude Code's project discovery, --mcp-config
-        // as a backup. The socket must be listening before Claude starts (it is - the
-        // socket server was started above).
-        if let Ok((ref server, _)) = mcp_result {
-            match std::env::current_exe() {
-                Ok(exe) => {
-                    let repo_mcp_servers: Vec<crate::config::McpServerEntry> = self
-                        .work_items
-                        .iter()
-                        .find(|w| w.id == work_item_id)
-                        .and_then(|wi| wi.repo_associations.first())
-                        .map(|assoc| {
-                            let repo_display = crate::config::collapse_home(&assoc.repo_path);
-                            self.config
-                                .mcp_servers_for_repo(&repo_display)
-                                .into_iter()
-                                .cloned()
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let mcp_config =
-                        crate::mcp::build_mcp_config(&exe, &server.socket_path, &repo_mcp_servers);
-
-                    // Write .mcp.json to the worktree root.
-                    let mcp_json_path = cwd.join(".mcp.json");
-                    if let Err(e) = std::fs::write(&mcp_json_path, &mcp_config) {
-                        self.status_message = Some(format!("MCP config write error: {e}"));
-                    }
-
-                    // Also pass via --mcp-config as a temp file.
-                    let config_path = std::env::temp_dir().join(format!(
-                        "workbridge-mcp-config-{}.json",
-                        uuid::Uuid::new_v4()
-                    ));
-                    if let Err(e) = std::fs::write(&config_path, &mcp_config) {
-                        self.status_message = Some(format!("MCP config write error: {e}"));
-                    } else {
-                        cmd.push("--mcp-config".to_string());
-                        cmd.push(config_path.to_string_lossy().to_string());
-                    }
-                }
-                Err(e) => {
-                    self.status_message = Some(format!("Cannot resolve executable path: {e}"));
-                }
+        // Snapshot the MCP server inputs that the background worker
+        // will need. All values are owned so the worker closure can
+        // move them without borrowing `self` across the thread
+        // boundary. `start_mcp_for_session` used to gather these
+        // from `self` on the UI thread AND also called
+        // `McpSocketServer::start` (which does `remove_file` +
+        // `UnixListener::bind`, both I/O) on the UI thread; here we
+        // only do the reads.
+        let wi_id_str = match serde_json::to_string(&work_item_id) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status_message = Some(format!(
+                    "MCP unavailable: could not serialize work item ID: {e}"
+                ));
+                return;
             }
+        };
+        let context_json = {
+            let wi = self.work_items.iter().find(|w| w.id == work_item_id);
+            if let Some(wi) = wi {
+                let pr_url = wi
+                    .repo_associations
+                    .first()
+                    .and_then(|a| a.pr.as_ref())
+                    .map(|pr| pr.url.as_str())
+                    .unwrap_or("");
+                serde_json::json!({
+                    "work_item_id": wi_id_str,
+                    "stage": format!("{:?}", wi.status),
+                    "title": wi.title,
+                    "description": wi.description,
+                    "repo": cwd.display().to_string(),
+                    "pr_url": pr_url,
+                })
+                .to_string()
+            } else {
+                "{}".to_string()
+            }
+        };
+        let activity_log_path = self.backend.activity_path_for(&work_item_id);
+        let wi_kind = self
+            .work_items
+            .iter()
+            .find(|w| w.id == work_item_id)
+            .map(|w| format!("{:?}", w.kind))
+            .unwrap_or_default();
+        let repo_mcp_servers: Vec<crate::config::McpServerEntry> = self
+            .work_items
+            .iter()
+            .find(|w| w.id == work_item_id)
+            .and_then(|wi| wi.repo_associations.first())
+            .map(|assoc| {
+                let repo_display = crate::config::collapse_home(&assoc.repo_path);
+                self.config
+                    .mcp_servers_for_repo(&repo_display)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                self.status_message = Some(format!("Cannot resolve executable path: {e}"));
+                return;
+            }
+        };
+        let mcp_tx = self.mcp_tx.clone();
+        let pane_cols = self.pane_cols;
+        let pane_rows = self.pane_rows;
+        let cwd_owned = cwd.to_path_buf();
+
+        self.begin_session_spawn(
+            work_item_id,
+            stage,
+            cwd_owned,
+            cmd,
+            SessionSpawnInputs {
+                wi_id_str,
+                wi_kind,
+                context_json,
+                activity_log_path,
+                repo_mcp_servers,
+                exe,
+                mcp_tx,
+                pane_cols,
+                pane_rows,
+            },
+        );
+    }
+
+    /// Stage 2 of the session-open pipeline: spawn a background
+    /// worker that starts the MCP socket server, writes both MCP
+    /// config files, and forks the Claude PTY.
+    ///
+    /// All three operations are filesystem / process I/O and MUST
+    /// run off the UI thread (`docs/UI.md` "Blocking I/O
+    /// Prohibition"). The worker sends a `SessionSpawnResult`
+    /// through a per-work-item `Receiver` stored in
+    /// `session_spawn_rx`; `poll_session_spawns` drains the result
+    /// on the next background tick and inserts the live session /
+    /// MCP server into their respective maps.
+    ///
+    /// If another spawn is already pending for the same work item,
+    /// the new request is dropped with a status message. This
+    /// cannot deadlock because `poll_session_spawns` always removes
+    /// the entry before invoking anything else.
+    fn begin_session_spawn(
+        &mut self,
+        work_item_id: WorkItemId,
+        stage: WorkItemStatus,
+        cwd: PathBuf,
+        cmd: Vec<String>,
+        inputs: SessionSpawnInputs,
+    ) {
+        if self.session_spawn_rx.contains_key(&work_item_id) {
+            self.status_message = Some("Session spawn already in progress...".into());
+            return;
         }
 
-        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let wi_id_for_thread = work_item_id.clone();
+        std::thread::spawn(move || {
+            let SessionSpawnInputs {
+                wi_id_str,
+                wi_kind,
+                context_json,
+                activity_log_path,
+                repo_mcp_servers,
+                exe,
+                mcp_tx,
+                pane_cols,
+                pane_rows,
+            } = inputs;
 
-        match Session::spawn(self.pane_cols, self.pane_rows, Some(cwd), &cmd_refs) {
-            Ok(session) => {
-                let parser = Arc::clone(&session.parser);
-                let entry = SessionEntry {
-                    parser,
-                    alive: true,
-                    session: Some(session),
-                    scrollback_offset: 0,
-                    selection: None,
-                };
-                self.sessions.insert(session_key.clone(), entry);
-                match mcp_result {
-                    Ok((server, _)) => {
-                        self.mcp_servers.insert(work_item_id.clone(), server);
-                    }
-                    Err(msg) => {
-                        self.status_message = Some(msg);
-                        self.focus = FocusPanel::Right;
-                        return;
-                    }
+            // Start the MCP socket server (remove_file +
+            // UnixListener::bind). This has to happen before the
+            // config content can be built because the config
+            // embeds the socket path.
+            let socket_path = crate::mcp::socket_path_for_session();
+            let server = match McpSocketServer::start(
+                socket_path,
+                wi_id_str,
+                wi_kind,
+                context_json,
+                activity_log_path,
+                mcp_tx,
+                false, // read_only: interactive sessions need full tool access
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(SessionSpawnResult {
+                        wi_id: wi_id_for_thread,
+                        stage,
+                        outcome: Err(format!(
+                            "MCP unavailable: failed to start socket server: {e}"
+                        )),
+                    });
+                    return;
                 }
-                self.focus = FocusPanel::Right;
-                self.status_message = Some("Right panel focused - press Ctrl+] to return".into());
+            };
+
+            // Build the MCP config JSON (depends on the socket path
+            // we just got).
+            let mcp_config =
+                crate::mcp::build_mcp_config(&exe, &server.socket_path, &repo_mcp_servers);
+
+            // Write .mcp.json to the worktree root. This is the
+            // path Claude Code's project discovery picks up
+            // automatically; the --mcp-config flag below is a
+            // defense-in-depth backup in case project discovery is
+            // disabled or points elsewhere. A write failure is not
+            // fatal - Claude will still start with the --mcp-config
+            // flag - so surface it via the status message but keep
+            // going.
+            let mcp_json_path = cwd.join(".mcp.json");
+            let mut status_warning: Option<String> = None;
+            if let Err(e) = std::fs::write(&mcp_json_path, &mcp_config) {
+                status_warning = Some(format!("MCP config write error: {e}"));
             }
-            Err(e) => {
-                self.status_message = Some(format!("Error spawning session: {e}"));
+
+            // Write the temp --mcp-config file. If this fails we
+            // log the error and continue without the flag; Claude
+            // will still be able to reach the MCP server via the
+            // .mcp.json written above (if that write succeeded).
+            let config_path = std::env::temp_dir().join(format!(
+                "workbridge-mcp-config-{}.json",
+                uuid::Uuid::new_v4()
+            ));
+            let mut final_cmd = cmd;
+            match std::fs::write(&config_path, &mcp_config) {
+                Ok(()) => {
+                    final_cmd.push("--mcp-config".to_string());
+                    final_cmd.push(config_path.to_string_lossy().to_string());
+                }
+                Err(e) => {
+                    status_warning = Some(format!("MCP config write error: {e}"));
+                }
+            }
+
+            // Fork the Claude PTY. This is the blocking call that
+            // previously ran on the UI thread; moving it here
+            // removes the last bit of session-open I/O from the
+            // tick path. On success, forward `status_warning` so
+            // the UI thread can surface any non-fatal MCP config
+            // file-write failures via `status_message`. On
+            // failure, the spawn error wins and the warning is
+            // dropped - the user will see the spawn failure,
+            // which already explains why no session appeared.
+            let cmd_refs: Vec<&str> = final_cmd.iter().map(|s| s.as_str()).collect();
+            let outcome = match crate::session::Session::spawn(
+                pane_cols,
+                pane_rows,
+                Some(cwd.as_path()),
+                &cmd_refs,
+            ) {
+                Ok(session) => Ok(SessionSpawnOk {
+                    session,
+                    mcp_server: server,
+                    warning: status_warning,
+                }),
+                Err(e) => Err(format!("Error spawning session: {e}")),
+            };
+
+            let _ = tx.send(SessionSpawnResult {
+                wi_id: wi_id_for_thread,
+                stage,
+                outcome,
+            });
+        });
+
+        let activity = self.start_activity("Spawning Claude session...");
+        self.session_spawn_rx
+            .insert(work_item_id, SessionSpawnPending { rx, activity });
+    }
+
+    /// Remove a pending `session_spawn_rx` entry and end its
+    /// spinner activity. Mirror of `drop_session_open_entry` so the
+    /// two terminal paths (result delivered, background thread
+    /// disconnected) cannot leak the "Spawning Claude session..."
+    /// spinner.
+    fn drop_session_spawn_entry(&mut self, wi_id: &WorkItemId) {
+        if let Some(entry) = self.session_spawn_rx.remove(wi_id) {
+            self.end_activity(entry.activity);
+        }
+    }
+
+    /// Poll pending session-spawn workers. Called from the
+    /// background-work tick in `salsa.rs`. For each completed
+    /// receiver, removes the pending entry and inserts the live
+    /// session + MCP server into `self.sessions` / `self.mcp_servers`.
+    ///
+    /// Re-validates the work item / stage on completion: the spawn
+    /// is allowed to land only if the work item still exists AND
+    /// its current stage still matches the captured one, mirroring
+    /// the guards in `finish_session_open`. A drift here means the
+    /// user advanced past the stage (or the item was deleted)
+    /// while the PTY was being forked; `check_liveness` will reap
+    /// any orphaned session, but we want to avoid creating the
+    /// orphan in the first place.
+    pub fn poll_session_spawns(&mut self) {
+        if self.session_spawn_rx.is_empty() {
+            return;
+        }
+        let wi_ids: Vec<WorkItemId> = self.session_spawn_rx.keys().cloned().collect();
+        for wi_id in wi_ids {
+            let result = match self.session_spawn_rx.get(&wi_id) {
+                Some(entry) => match entry.rx.try_recv() {
+                    Ok(r) => r,
+                    Err(crossbeam_channel::TryRecvError::Empty) => continue,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        self.drop_session_spawn_entry(&wi_id);
+                        self.status_message =
+                            Some("Session spawn: background thread exited unexpectedly".into());
+                        continue;
+                    }
+                },
+                None => continue,
+            };
+            self.drop_session_spawn_entry(&wi_id);
+
+            // Re-validate the work item still exists and the stage
+            // still matches the captured one. Drop the spawn on
+            // the floor otherwise - the session would be immediately
+            // orphaned by the stage mismatch.
+            let still_current = self
+                .work_items
+                .iter()
+                .find(|w| w.id == result.wi_id)
+                .map(|w| w.status == result.stage)
+                .unwrap_or(false);
+            if !still_current {
+                // On drop, the `Session` inside `SessionSpawnOk`
+                // tears down its PTY and child process via its
+                // `Drop` impl. No manual cleanup needed.
+                continue;
+            }
+
+            match result.outcome {
+                Ok(SessionSpawnOk {
+                    session,
+                    mcp_server,
+                    warning,
+                }) => {
+                    let parser = Arc::clone(&session.parser);
+                    let entry = SessionEntry {
+                        parser,
+                        alive: true,
+                        session: Some(session),
+                        scrollback_offset: 0,
+                        selection: None,
+                    };
+                    self.sessions
+                        .insert((result.wi_id.clone(), result.stage), entry);
+                    self.mcp_servers.insert(result.wi_id, mcp_server);
+                    self.focus = FocusPanel::Right;
+                    // Prefer the warning (degraded state) over the
+                    // generic "right panel focused" message: if
+                    // .mcp.json or the temp --mcp-config file could
+                    // not be written, the user should see that.
+                    // Claude is still running (the MCP socket
+                    // server itself is up), but the fallback config
+                    // delivery is reduced.
+                    self.status_message = Some(warning.unwrap_or_else(|| {
+                        "Right panel focused - press Ctrl+] to return".to_string()
+                    }));
+                }
+                Err(msg) => {
+                    self.status_message = Some(msg);
+                }
             }
         }
     }
@@ -4501,73 +4883,6 @@ impl App {
             .and_then(|wts| wts.iter().find(|wt| wt.branch.as_deref() == Some(branch)))
             .and_then(|wt| wt.has_commits_ahead)
             .unwrap_or(false)
-    }
-
-    /// Start an MCP socket server for a work item session.
-    /// MCP config is passed to Claude via --mcp-config CLI flag, not written
-    /// to disk. Returns (server, unused_path) on success, or an error message
-    /// on failure.
-    fn start_mcp_for_session(
-        &self,
-        worktree_path: &std::path::Path,
-        work_item_id: &WorkItemId,
-    ) -> Result<(McpSocketServer, PathBuf), String> {
-        let socket_path = crate::mcp::socket_path_for_session();
-
-        // Serialize the work item ID for the MCP server.
-        let wi_id_str = serde_json::to_string(work_item_id)
-            .map_err(|e| format!("MCP unavailable: could not serialize work item ID: {e}"))?;
-
-        // Build context JSON for get_context tool.
-        // Uses the worktree path (not the main repo) so Claude operates in
-        // the correct working directory.
-        let context_json = {
-            let wi = self.work_items.iter().find(|w| w.id == *work_item_id);
-            if let Some(wi) = wi {
-                let pr_url = wi
-                    .repo_associations
-                    .first()
-                    .and_then(|a| a.pr.as_ref())
-                    .map(|pr| pr.url.as_str())
-                    .unwrap_or("");
-                serde_json::json!({
-                    "work_item_id": wi_id_str,
-                    "stage": format!("{:?}", wi.status),
-                    "title": wi.title,
-                    "description": wi.description,
-                    "repo": worktree_path.display().to_string(),
-                    "pr_url": pr_url,
-                })
-                .to_string()
-            } else {
-                "{}".to_string()
-            }
-        };
-
-        // Compute the activity log path for the query_log MCP tool.
-        let activity_log_path = self.backend.activity_path_for(work_item_id);
-
-        // Determine work item kind for conditional MCP tool exposure.
-        let wi_kind = self
-            .work_items
-            .iter()
-            .find(|w| w.id == *work_item_id)
-            .map(|w| format!("{:?}", w.kind))
-            .unwrap_or_default();
-
-        // Start the socket server.
-        let server = McpSocketServer::start(
-            socket_path,
-            wi_id_str,
-            wi_kind,
-            context_json,
-            activity_log_path,
-            self.mcp_tx.clone(),
-            false, // read_only: interactive sessions need full tool access
-        )
-        .map_err(|e| format!("MCP unavailable: failed to start socket server: {e}"))?;
-
-        Ok((server, PathBuf::new()))
     }
 
     /// Drain MCP events from the crossbeam channel.
@@ -6086,6 +6401,15 @@ impl App {
         // stages like Done or Mergequeue. Dropping the entry here also
         // ends the "Opening session..." spinner.
         self.drop_session_open_entry(wi_id);
+        // Same for the second session-open stage. A pending spawn
+        // worker keyed by `wi_id` lives in `session_spawn_rx` with
+        // no entry in `self.sessions` yet, so the session-kill
+        // branch below would miss it. `poll_session_spawns`
+        // re-validates the stage on completion and will drop any
+        // stale result, but without the unconditional drop here the
+        // "Spawning Claude session..." spinner would linger on the
+        // status bar until the background PTY fork completes.
+        self.drop_session_spawn_entry(wi_id);
 
         // Kill the old session for this work item before spawning a new one.
         // Previously relied on orphan cleanup in check_liveness, but that
@@ -16370,6 +16694,109 @@ mod tests {
             "finish_session_open must refuse to spawn for a no-session \
              stage even when the captured and current stages agree",
         );
+    }
+
+    /// Codex adversarial-review finding: the session-open tail
+    /// (MCP socket bind, `.mcp.json` write, temp `--mcp-config`
+    /// write, `Session::spawn` PTY fork) is all filesystem / process
+    /// I/O and therefore MUST NOT run on the UI thread per
+    /// `docs/UI.md` "Blocking I/O Prohibition". The refactor moves
+    /// all of that into a background worker that
+    /// `begin_session_spawn` kicks off and `poll_session_spawns`
+    /// drains; `finish_session_open` on the UI thread only does
+    /// owned-data gathering and registers a pending receiver.
+    ///
+    /// This test pins the structural contract: after a synchronous
+    /// call to `finish_session_open` for a valid work item with a
+    /// populated (`Fresh`) spawn flag, the function must return
+    /// WITHOUT having inserted anything into `self.sessions` /
+    /// `self.mcp_servers` on the UI thread, and it must have
+    /// registered a pending entry in `session_spawn_rx` with an
+    /// active "Spawning Claude session..." activity spinner.
+    ///
+    /// The background worker itself may or may not successfully
+    /// complete by the time the test drops `app` (it depends on
+    /// whether `claude` is available in the test env). We do NOT
+    /// call `poll_session_spawns` here because that would block on
+    /// the actual PTY fork; we only verify the structural handoff.
+    /// The pending entry's receiver is dropped together with `app`,
+    /// which lets the background worker's `tx.send` fail cleanly
+    /// without blocking.
+    #[test]
+    fn finish_session_open_defers_spawn_to_background_worker() {
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-finish-session-open-bg.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "codex-finish-bg".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/codex-finish-bg-repo"),
+                branch: Some("feature/codex-finish-bg".into()),
+                worktree_path: Some(PathBuf::from("/tmp/codex-finish-bg-wt")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        let captured_stage = WorkItemStatus::Implementing;
+        let plan_result = SessionOpenPlanResult {
+            wi_id: wi_id.clone(),
+            cwd: PathBuf::from("/tmp/codex-finish-bg-wt"),
+            stage: captured_stage,
+            plan_text: String::new(),
+            read_error: None,
+            session_id: crate::session_id::session_id_for(&wi_id, captured_stage),
+            spawn_flag: Some(SpawnFlag::Fresh),
+            probe_error: None,
+        };
+
+        // Sanity: clean starting state.
+        assert!(app.sessions.is_empty());
+        assert!(app.session_spawn_rx.is_empty());
+        assert!(app.current_activity().is_none());
+
+        app.finish_session_open(plan_result);
+
+        // The UI-thread call must have enqueued a pending spawn
+        // and NOT synchronously inserted into `self.sessions`.
+        // If someone moves `Session::spawn` or the config writes
+        // back onto the UI thread, this assertion will fail
+        // because `self.sessions` would already contain the entry.
+        assert!(
+            app.sessions.is_empty(),
+            "finish_session_open must NOT synchronously spawn the PTY - \
+             Session::spawn is process I/O, forbidden on the UI thread \
+             (docs/UI.md 'Blocking I/O Prohibition')",
+        );
+        assert!(
+            app.mcp_servers.is_empty(),
+            "finish_session_open must NOT synchronously start the MCP \
+             socket server - UnixListener::bind is filesystem I/O",
+        );
+        assert!(
+            app.session_spawn_rx.contains_key(&wi_id),
+            "finish_session_open must register a pending spawn receiver \
+             in session_spawn_rx so poll_session_spawns can drain it on \
+             the next background tick",
+        );
+        let activity = app
+            .current_activity()
+            .expect("a 'Spawning Claude session...' spinner must be active");
+        assert_eq!(activity, "Spawning Claude session...");
     }
 
     /// Codex adversarial-review finding: when the disk probe returns

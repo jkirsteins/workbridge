@@ -424,6 +424,17 @@ pub fn app_event(
                 // and `docs/UI.md` "Blocking I/O Prohibition".
                 state.poll_session_opens();
 
+                // Poll the second session-open stage: the background
+                // worker that spawns the MCP socket server, writes the
+                // `.mcp.json` / temp `--mcp-config` files, and forks
+                // the Claude PTY. Must run AFTER `poll_session_opens`
+                // so a finished plan read can enqueue its spawn on
+                // this same tick and land the session on the next one.
+                // See `App::begin_session_spawn` and the Codex
+                // adversarial-review finding that moved all the tail
+                // I/O off the UI thread.
+                state.poll_session_spawns();
+
                 // Poll async unlinked-item cleanup result.
                 state.poll_unlinked_cleanup();
 
