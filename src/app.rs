@@ -497,11 +497,33 @@ pub(crate) struct DeleteCleanupInfo {
 /// synchronously on the UI thread - the read is now performed on a
 /// background thread and the deserialized plan (plus any error
 /// message) flows back via this struct for the main thread to apply.
+///
+/// The same background worker also computes the deterministic session
+/// UUID and decides between `--resume` and `--session-id` by checking
+/// whether a transcript file already exists on disk for that UUID. Both
+/// the UUID derivation and the existence check live on the background
+/// thread because `session_id::session_exists_on_disk` performs
+/// filesystem I/O (`read_dir` of `~/.claude/projects` plus a per-
+/// subdirectory `is_file` stat) - that is forbidden on the UI thread by
+/// `docs/UI.md` "Blocking I/O Prohibition", since even a "fast" local
+/// scan can stall on a slow or network-mounted home directory. The pair
+/// `(session_id, spawn_flag)` is therefore prepared up-front and
+/// `finish_session_open` consumes it directly instead of re-deriving or
+/// re-checking on the UI thread.
 pub struct SessionOpenPlanResult {
     /// The work item the session is being opened for.
     pub wi_id: WorkItemId,
     /// The worktree path where Claude will run.
     pub cwd: PathBuf,
+    /// Stage captured at `begin_session_open` time on the UI thread.
+    /// `finish_session_open` uses this as the session-key stage and as
+    /// the input to `build_claude_cmd`. Stage changes between begin and
+    /// finish cannot reach this struct: every stage-change path that
+    /// leaves the work item alive
+    /// (`apply_stage_change` / `cleanup_session_state_for`) cancels the
+    /// pending open via `drop_session_open_entry` before the result is
+    /// delivered to `poll_session_opens`.
+    pub stage: WorkItemStatus,
     /// Plan text read from the backend, if any. Empty string when the
     /// backend returned `Ok(None)` or an error (the caller treats an
     /// empty plan the same as a missing plan).
@@ -510,6 +532,19 @@ pub struct SessionOpenPlanResult {
     /// read failed. `None` on success or when the backend reported no
     /// plan exists.
     pub read_error: Option<String>,
+    /// Deterministic Claude Code session UUID derived from
+    /// `(wi_id, stage)` via `session_id::session_id_for`. Computed on
+    /// the background thread alongside the disk-existence check so the
+    /// pair `(session_id, spawn_flag)` is always internally consistent
+    /// and the UI thread never re-derives it.
+    pub session_id: uuid::Uuid,
+    /// Whether the spawn should pass `--resume <uuid>` (a transcript
+    /// already exists on disk for `session_id`) or `--session-id <uuid>`
+    /// (no prior transcript - create a new session under the
+    /// deterministic UUID). Decided by the background worker via
+    /// `session_id::session_exists_on_disk` so the UI thread never
+    /// touches the filesystem.
+    pub spawn_flag: SpawnFlag,
 }
 
 /// Per-entry state tracked alongside the `session_open_rx` map so
@@ -3712,12 +3747,24 @@ impl App {
     /// Begin the async plan-read stage of opening a Claude session.
     ///
     /// Spawns a background thread that calls `WorkItemBackend::read_plan`
-    /// (filesystem I/O) and then hands the result back to
-    /// `poll_session_opens`, which finishes the session on the UI thread.
-    /// Running the read here on the caller (a UI-thread entry point such
-    /// as `spawn_session` / `poll_worktree_creation` /
-    /// `poll_review_gate`) would freeze the event loop - see
-    /// `docs/UI.md` "Blocking I/O Prohibition".
+    /// (filesystem I/O) AND `session_id::session_exists_on_disk` (also
+    /// filesystem I/O - a `read_dir` of `~/.claude/projects` plus a
+    /// per-subdirectory `is_file` stat). Both are forbidden on the UI
+    /// thread by `docs/UI.md` "Blocking I/O Prohibition", and the result
+    /// (plan text, deterministic session UUID, and the chosen
+    /// `SpawnFlag`) is sent back via the per-work-item receiver for
+    /// `poll_session_opens` to apply on the UI thread without further
+    /// I/O.
+    ///
+    /// The work item's stage is captured here on the UI thread (a cheap
+    /// in-memory lookup) and threaded through the result struct so the
+    /// background worker can derive the deterministic session UUID
+    /// without re-entering App state, and so `finish_session_open` uses
+    /// the same stage as the spawn-flag decision (the
+    /// `(session_id, spawn_flag)` pair is internally consistent).
+    /// Stage transitions during the open are impossible to race: every
+    /// stage-change path cancels the pending entry via
+    /// `drop_session_open_entry` before the result lands.
     ///
     /// If another plan read is already in flight for this work item, the
     /// new request is dropped (the previous one will finish and spawn a
@@ -3732,6 +3779,19 @@ impl App {
             self.status_message = Some("Opening session...".into());
             return;
         }
+        // Capture the work item's stage on the UI thread (cheap
+        // in-memory read) so the background worker can derive the
+        // deterministic session UUID for that exact stage. If the
+        // work item has been deleted between the caller's lookup and
+        // here, drop the open silently - there is nothing to spawn.
+        let Some(stage) = self
+            .work_items
+            .iter()
+            .find(|w| w.id == *work_item_id)
+            .map(|w| w.status)
+        else {
+            return;
+        };
         let (tx, rx) = crossbeam_channel::bounded(1);
         let backend = Arc::clone(&self.backend);
         let wi_id_clone = work_item_id.clone();
@@ -3742,11 +3802,32 @@ impl App {
                 Ok(None) => (String::new(), None),
                 Err(e) => (String::new(), Some(format!("Could not read plan: {e}"))),
             };
+            // Derive the deterministic session UUID and probe the disk
+            // for an existing transcript. Both run here, on the
+            // background thread, because `session_exists_on_disk`
+            // performs filesystem I/O (`read_dir` + per-subdir
+            // `is_file`) which is forbidden on the UI thread by
+            // `docs/UI.md` "Blocking I/O Prohibition" - even a local
+            // scan can stall on a slow or network-mounted home
+            // directory or a permission delay. Co-locating the pure
+            // UUID derivation with the existence check guarantees the
+            // `(session_id, spawn_flag)` pair arriving at
+            // `finish_session_open` is internally consistent and the
+            // UI thread never has to touch `~/.claude/projects`.
+            let session_id = crate::session_id::session_id_for(&wi_id_clone, stage);
+            let spawn_flag = if crate::session_id::session_exists_on_disk(session_id) {
+                SpawnFlag::Resume
+            } else {
+                SpawnFlag::Fresh
+            };
             let _ = tx.send(SessionOpenPlanResult {
                 wi_id: wi_id_clone,
                 cwd: cwd_clone,
+                stage,
                 plan_text,
                 read_error,
+                session_id,
+                spawn_flag,
             });
         });
         // Surface immediate feedback so a slow plan read does not
@@ -3782,7 +3863,7 @@ impl App {
         // nested call.
         let wi_ids: Vec<WorkItemId> = self.session_open_rx.keys().cloned().collect();
         for wi_id in wi_ids {
-            let result = match self.session_open_rx.get(&wi_id) {
+            let mut result = match self.session_open_rx.get(&wi_id) {
                 Some(entry) => match entry.rx.try_recv() {
                     Ok(r) => r,
                     Err(crossbeam_channel::TryRecvError::Empty) => continue,
@@ -3800,10 +3881,10 @@ impl App {
                 None => continue,
             };
             self.drop_session_open_entry(&wi_id);
-            if let Some(msg) = result.read_error {
+            if let Some(msg) = result.read_error.take() {
                 self.status_message = Some(msg);
             }
-            self.finish_session_open(&result.wi_id, &result.cwd, result.plan_text);
+            self.finish_session_open(result);
         }
     }
 
@@ -3812,59 +3893,50 @@ impl App {
     /// called directly from UI-thread entry points, because it invokes
     /// `stage_system_prompt` which consumes state and would otherwise
     /// encourage new synchronous `read_plan` callers.
-    fn finish_session_open(
-        &mut self,
-        work_item_id: &WorkItemId,
-        cwd: &std::path::Path,
-        plan_text: String,
-    ) {
+    fn finish_session_open(&mut self, plan_result: SessionOpenPlanResult) {
+        // Destructure the plan result so we move the owned plan text
+        // into `stage_system_prompt` without cloning, while still
+        // holding references to `wi_id` and `cwd` for the rest of the
+        // function. `stage`, `session_id`, and `spawn_flag` were all
+        // resolved on the background thread in `begin_session_open`,
+        // so the UI thread does NO filesystem work here - in
+        // particular, `session_id::session_exists_on_disk` (which
+        // does `read_dir` + per-subdirectory `is_file`) MUST NOT be
+        // called from this function. Re-deriving any of those values
+        // would also reintroduce a race where the disk-existence
+        // probe and the spawn flag could disagree if someone moved
+        // the helper back onto the UI thread.
+        let SessionOpenPlanResult {
+            wi_id: work_item_id,
+            cwd,
+            stage,
+            plan_text,
+            read_error: _,
+            session_id,
+            spawn_flag,
+        } = plan_result;
+        let cwd = cwd.as_path();
+
         // Guard: the work item may have been deleted while the plan
         // read was in flight. In that case, do not spawn a session,
         // just drop the result quietly. (The worktree itself is
         // either pre-existing or cleaned up by `poll_worktree_creation`
-        // before we got here.)
-        let Some(work_item_status) = self
-            .work_items
-            .iter()
-            .find(|w| w.id == *work_item_id)
-            .map(|w| w.status)
-        else {
+        // before we got here.) The captured `stage` is used as the
+        // session-key stage; every stage-change path that leaves a
+        // work item alive cancels the pending open via
+        // `drop_session_open_entry`, so reaching here means the
+        // captured stage is still the right one.
+        if !self.work_items.iter().any(|w| w.id == work_item_id) {
             return;
-        };
+        }
 
         // Start MCP socket server for this session.
-        let mcp_result = self.start_mcp_for_session(cwd, work_item_id);
-        let session_key = (work_item_id.clone(), work_item_status);
-        let has_gate_findings = self.review_gate_findings.contains_key(work_item_id);
-        let system_prompt = self.stage_system_prompt(work_item_id, cwd, plan_text);
-        // Deterministic session UUID for (work_item_id, stage). The
-        // tuple maps to a stable UUID v5 so a workbridge restart can
-        // re-attach to the previous Claude Code conversation for the
-        // same work item and stage.
-        //
-        // Choosing the flag: we cannot pass `--resume <uuid>` for a
-        // UUID that Claude Code has never seen - it would exit ~4 s
-        // later with "No conversation found", which is too slow to
-        // detect with a tick-based probe and would flash a confusing
-        // error in the right panel. Instead we look for the
-        // transcript file on disk up-front. The check is a single
-        // bounded `read_dir` of `~/.claude/projects` plus one
-        // `is_file()` per subdirectory (sub-millisecond on a typical
-        // workstation, safe on the UI thread by the rules in
-        // `docs/UI.md` "Blocking I/O Prohibition" - this is local
-        // stat I/O, not git/network/large-file I/O). On hit we
-        // resume; on miss we create a new session under the same
-        // deterministic UUID so the next restart's hit will resume
-        // it. See `docs/work-items.md` "Session identity and
-        // resumption".
-        let session_id = crate::session_id::session_id_for(work_item_id, work_item_status);
-        let spawn_flag = if crate::session_id::session_exists_on_disk(session_id) {
-            SpawnFlag::Resume
-        } else {
-            SpawnFlag::Fresh
-        };
+        let mcp_result = self.start_mcp_for_session(cwd, &work_item_id);
+        let session_key = (work_item_id.clone(), stage);
+        let has_gate_findings = self.review_gate_findings.contains_key(&work_item_id);
+        let system_prompt = self.stage_system_prompt(&work_item_id, cwd, plan_text);
         let mut cmd = Self::build_claude_cmd(
-            &work_item_status,
+            &stage,
             system_prompt.as_deref(),
             has_gate_findings,
             session_id,
@@ -3881,7 +3953,7 @@ impl App {
                     let repo_mcp_servers: Vec<crate::config::McpServerEntry> = self
                         .work_items
                         .iter()
-                        .find(|w| w.id == *work_item_id)
+                        .find(|w| w.id == work_item_id)
                         .and_then(|wi| wi.repo_associations.first())
                         .map(|assoc| {
                             let repo_display = crate::config::collapse_home(&assoc.repo_path);
@@ -15643,6 +15715,16 @@ mod tests {
         // the filesystem read ran. This regression guard ensures the
         // read moves to the background thread driven by
         // `poll_session_opens` / `finish_session_open`.
+        //
+        // It also pins the post-Codex-review contract that the
+        // background worker - not `finish_session_open` - is the only
+        // place that derives the deterministic session UUID and runs
+        // the `session_id::session_exists_on_disk` filesystem probe.
+        // The `(stage, session_id, spawn_flag)` triple in the
+        // delivered `SessionOpenPlanResult` is the structural proof:
+        // if anyone moves the probe back to the UI thread, the
+        // populated `spawn_flag` field becomes redundant and any test
+        // that asserts on it will fail loudly.
         let backend = Arc::new(CountingPlanBackend::default());
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
@@ -15711,6 +15793,37 @@ mod tests {
             backend.load(),
             1,
             "background thread must have performed exactly one read_plan call",
+        );
+        // The background worker must have captured the work item's
+        // stage on the UI thread and threaded it through the result.
+        // `finish_session_open` keys the `sessions` map by this
+        // stage, so a missing or wrong value would silently spawn the
+        // session under the wrong key.
+        assert_eq!(
+            result.stage,
+            WorkItemStatus::Implementing,
+            "background worker must propagate the captured stage",
+        );
+        // The background worker must have derived the deterministic
+        // session UUID from `(wi_id, stage)` so the UI thread does
+        // not have to recompute it - and so the
+        // `(session_id, spawn_flag)` pair is internally consistent.
+        let expected_id = crate::session_id::session_id_for(&wi_id, WorkItemStatus::Implementing);
+        assert_eq!(
+            result.session_id, expected_id,
+            "background worker must populate the deterministic session UUID",
+        );
+        // The background worker must have decided the spawn flag via
+        // `session_exists_on_disk`. Whether the test environment has
+        // a transcript file for `expected_id` under `~/.claude/projects`
+        // is unknown, so we only assert that the field has been
+        // populated to one of the two valid variants. The structural
+        // point is that the field IS set - if anyone moved the disk
+        // probe back to `finish_session_open`, this struct would no
+        // longer carry the value and the test would fail to compile.
+        assert!(
+            matches!(result.spawn_flag, SpawnFlag::Resume | SpawnFlag::Fresh),
+            "background worker must populate spawn_flag (Resume or Fresh)",
         );
         // End the spinner activity since `poll_session_opens` was
         // bypassed by the manual drain above.

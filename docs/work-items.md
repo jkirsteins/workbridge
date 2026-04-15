@@ -356,12 +356,11 @@ history is restored. Stage transitions deliberately change the UUID
 (because the tuple changes), so each stage keeps its own isolated
 resumable history and there is no cross-stage history bleed.
 
-The spawn protocol in `App::finish_session_open` chooses between
-`--resume <uuid>` and `--session-id <uuid>` up-front, before the
-process is spawned. The choice is driven by
-`session_id::session_exists_on_disk`, which scans
-`~/.claude/projects/*/` for a transcript file named `<uuid>.jsonl`
-matching the deterministic UUID:
+The spawn protocol chooses between `--resume <uuid>` and
+`--session-id <uuid>` up-front, before the process is spawned. The
+choice is driven by `session_id::session_exists_on_disk`, which
+scans `~/.claude/projects/*/` for a transcript file named
+`<uuid>.jsonl` matching the deterministic UUID:
 
 - **Hit (transcript exists)**: spawn with `--resume <uuid>`. Claude
   Code reattaches to the prior conversation and the user sees the
@@ -370,17 +369,28 @@ matching the deterministic UUID:
   Code creates a new session under the deterministic UUID, so the
   next restart's existence check will hit and resume it.
 
-The disk check is one bounded `read_dir` of `~/.claude/projects` plus
-one `Path::is_file()` per subdirectory - sub-millisecond on a typical
-workstation, safe on the UI thread per `docs/UI.md` "Blocking I/O
-Prohibition" (this is local stat I/O, not git/network/large-file
-I/O). Doing the check up-front avoids a tick-based probe and the
-~4-second visible "No conversation found" flicker that
-`claude --resume <unknown-uuid>` would otherwise display before
-exiting. The check scans by exact UUID rather than reconstructing
-Claude Code's encoded-cwd directory name, so the scheme is robust
-against changes to that encoding (e.g. how `_`/`.` get mangled) and
-finds the transcript wherever Claude Code chose to put it.
+The disk check runs on a background thread, **never on the UI
+thread**. It is co-located with the existing background `read_plan`
+worker spawned by `App::begin_session_open`: that worker captures the
+stage on the UI thread, then on its background thread reads the plan,
+derives the deterministic UUID via `session_id::session_id_for`, calls
+`session_exists_on_disk(uuid)`, and bundles
+`(plan_text, stage, session_id, spawn_flag)` into a
+`SessionOpenPlanResult`. The UI-thread `App::finish_session_open`
+consumes that struct directly and does no filesystem work of its own.
+The scan itself is one `read_dir` of `~/.claude/projects` plus a
+`Path::is_file()` per subdirectory, which is forbidden on the UI
+thread by `docs/UI.md` "Blocking I/O Prohibition" - even a local
+stat scan can stall on a slow or network-mounted home directory or a
+permission delay, freezing the TUI for real users. Doing the check
+up-front (instead of relying on a tick-based probe of an actual
+`claude --resume` exit) avoids the ~4-second visible "No conversation
+found" flicker that `claude --resume <unknown-uuid>` would otherwise
+display before exiting. The check scans by exact UUID rather than
+reconstructing Claude Code's encoded-cwd directory name, so the
+scheme is robust against changes to that encoding (e.g. how `_`/`.`
+get mangled) and finds the transcript wherever Claude Code chose to
+put it.
 
 The review gate's ephemeral `claude --print` subprocess (see
 `spawn_review_gate`) and the global assistant drawer (see

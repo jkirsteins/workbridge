@@ -88,24 +88,35 @@ pub fn session_id_for(id: &WorkItemId, stage: WorkItemStatus) -> uuid::Uuid {
 /// project subdirectory and reports `true` if any of them contains a
 /// file whose stem matches the UUID.
 ///
-/// The scan is one `read_dir` of `~/.claude/projects` plus one cheap
-/// `Path::is_file()` syscall per subdirectory. On a typical workstation
-/// with a few hundred project directories this completes in well under
-/// a millisecond, which is fast enough to call from the UI thread (see
-/// `docs/UI.md` "Blocking I/O Prohibition" - this is bounded local
-/// stat I/O, not git/network/large-file I/O).
+/// **Blocking I/O - background-thread only.** The scan performs
+/// `std::fs::read_dir` on `~/.claude/projects` plus a `Path::is_file()`
+/// stat per subdirectory. On a typical local workstation it completes
+/// in well under a millisecond, but the latency is unbounded in the
+/// general case: it grows linearly with the number of project
+/// directories and stalls on slow / network-mounted home directories,
+/// permission delays, and FUSE-backed filesystems. Calling this on
+/// the UI thread would freeze the TUI for real users, which violates
+/// the absolute "Blocking I/O Prohibition" rule in `docs/UI.md`.
+///
+/// The production caller is the background worker spawned by
+/// `App::begin_session_open`, which co-locates this disk probe with
+/// the deterministic UUID derivation and the `WorkItemBackend::read_plan`
+/// filesystem read. The UI thread receives only the resolved
+/// `(session_id, spawn_flag)` pair via `SessionOpenPlanResult` and
+/// never re-checks. There is no UI-thread fallback - if you need this
+/// answer on a tick handler, hand it off to a background thread first.
 ///
 /// Returns `false` if the home directory cannot be resolved or the
 /// projects directory does not exist (which itself implies Claude Code
 /// has never run, so no session can possibly exist).
 ///
-/// `finish_session_open` calls this helper to decide between
-/// `--resume <uuid>` (file exists, prior conversation should be
-/// restored) and `--session-id <uuid>` (no prior file, create a new
-/// session under the deterministic UUID). The check happens once
-/// before the spawn, so the user never sees a transient "No
-/// conversation found" error and there is no probe state machine to
-/// maintain.
+/// The result drives the spawn flag: a hit becomes `--resume <uuid>`
+/// (file exists, prior conversation should be restored) and a miss
+/// becomes `--session-id <uuid>` (no prior file, create a new session
+/// under the deterministic UUID). The check happens once, on the
+/// background worker, so the user never sees a transient
+/// "No conversation found" error and there is no probe state machine
+/// to maintain.
 pub fn session_exists_on_disk(session_id: uuid::Uuid) -> bool {
     let Some(user_dirs) = directories::UserDirs::new() else {
         return false;

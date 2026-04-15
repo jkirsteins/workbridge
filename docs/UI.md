@@ -172,12 +172,22 @@ Examples of the cache-first pattern:
   interval), with no auto-retry.
 - `spawn_session` routes through `begin_session_open` +
   `poll_session_opens` instead of calling `stage_system_prompt`
-  directly. `begin_session_open` spawns a background thread that runs
-  `backend.read_plan(...)` and sends a `SessionOpenPlanResult` through
-  a per-work-item receiver; `poll_session_opens` drains completed
-  receivers and invokes `finish_session_open`, which builds the claude
-  command and spawns the PTY on the UI thread. `stage_system_prompt`
-  now takes the pre-read plan text as a parameter and MUST NOT call
+  directly. `begin_session_open` captures the work item's stage on
+  the UI thread (a cheap in-memory read), then spawns a background
+  thread that runs `backend.read_plan(...)`, derives the deterministic
+  Claude Code session UUID via `session_id::session_id_for(wi, stage)`,
+  and probes the disk via `session_id::session_exists_on_disk(uuid)`
+  to decide between `--resume <uuid>` and `--session-id <uuid>`. The
+  background worker bundles `(plan_text, stage, session_id, spawn_flag)`
+  into a `SessionOpenPlanResult` and sends it through a per-work-item
+  receiver; `poll_session_opens` drains completed receivers and
+  invokes `finish_session_open`, which builds the claude command and
+  spawns the PTY on the UI thread WITHOUT any further filesystem I/O
+  (`session_exists_on_disk` MUST NOT be called from
+  `finish_session_open` or any other UI-thread code path - it does
+  `read_dir` + per-subdir stat, which can stall on a slow or
+  network-mounted home directory). `stage_system_prompt` similarly
+  takes the pre-read plan text as a parameter and MUST NOT call
   `backend.read_plan(...)` itself. The receiver map is keyed by
   `WorkItemId` so parallel session opens for different items cannot
   collide.
