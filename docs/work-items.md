@@ -407,16 +407,21 @@ This means:
 
 ### Backward compatibility with records missing `id`
 
-Records created before the `id` field was added are accepted similarly
-to the `display_id` migration note below: on first load, the backend
-injects `id = LocalFile(<file path>)` (matching what
-`LocalFileBackend::create` would have produced for that path) and
-rewrites the file atomically so subsequent loads parse cleanly. Only a
-genuinely missing `id` key triggers the migration; records with a
-present-but-malformed `id` still surface as `CorruptRecord`, as do
-other parse failures (malformed JSON, missing `title`/`status`, etc.).
-The migration applies equally to `list()` and `read()`, so callers
-that skip past `list()` still recover legacy records transparently.
+Records created before the `id` field was added are accepted via the
+same `#[serde(default)]` mechanism as the other migrated fields
+(`description`, `kind`, `display_id`, `plan`, `done_at`): the `id`
+field defaults to a placeholder `LocalFile(PathBuf::new())` produced
+by `placeholder_work_item_id()`, and both `list()` and `read()`
+immediately overwrite `record.id` with `LocalFile(<file path>)` -
+the real on-disk path - right after `serde_json::from_str` returns.
+The placeholder therefore never escapes the backend layer. Legacy
+files on disk are not rewritten on load; they keep their old shape
+until the next modify-write through the normal `modify_record` path,
+at which point the current serializer naturally includes the `id`
+field. Records with a *present-but-malformed* `id` value (e.g. a
+bare string instead of a tagged enum) still fail strict
+deserialization and surface as `CorruptRecord`, as do other parse
+failures (malformed JSON, missing `title`/`status`, etc.).
 
 ## Display IDs
 
