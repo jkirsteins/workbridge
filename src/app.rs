@@ -4346,12 +4346,21 @@ impl App {
         // Shared cancellation flag. `drop_session_spawn_entry`
         // sets this to `true` when a stage change, work-item
         // delete, or cleanup path fires while the worker is still
-        // running its I/O-heavy tail. The worker checks it right
-        // before `Session::spawn` and skips the PTY fork if
-        // cancellation has happened. Closes the Codex
-        // adversarial-review window where a stale spawn could
-        // launch `claude --dangerously-skip-permissions` for a
-        // stage the work item had already left.
+        // running its I/O-heavy tail. The worker checks it at
+        // FOUR points: (1) at entry, (2) right after
+        // `McpSocketServer::start` but before any worktree file
+        // writes, (3) right after the writes but before the PTY
+        // fork, and (4) [historical - now step 3] immediately
+        // before `Session::spawn`. Cancellation at step 3 also
+        // rolls back the worktree `.mcp.json` and the temp
+        // `--mcp-config` file so a cancelled spawn cannot leave
+        // stale Claude Code control files pointing at a dead
+        // socket behind. Closes the Codex adversarial-review
+        // window where a stale spawn could launch
+        // `claude --dangerously-skip-permissions` for a stage
+        // the work item had already left OR write stale
+        // `.mcp.json` into a worktree whose session was never
+        // actually created.
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_for_thread = Arc::clone(&cancel);
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -4368,6 +4377,45 @@ impl App {
                 pane_cols,
                 pane_rows,
             } = inputs;
+
+            // Helper that ships a cancelled outcome back to the
+            // UI thread and cleans up any worktree / temp files
+            // already written. `files_to_remove` is a set of
+            // optional paths that may or may not have been
+            // written depending on which step of the worker was
+            // interrupted. Each path is `remove_file`-d on a
+            // best-effort basis; a failure (e.g. NotFound
+            // because we never got to that write) is benign.
+            //
+            // Deletions happen on THIS background thread, not
+            // the UI thread, so they do not block the tick path
+            // (`docs/UI.md` "Blocking I/O Prohibition"). This
+            // mirrors the `teardown_session_async` hop used on
+            // the post-fork cancellation path.
+            fn send_cancelled(
+                tx: &crossbeam_channel::Sender<SessionSpawnResult>,
+                wi_id: WorkItemId,
+                stage: WorkItemStatus,
+                files_to_remove: &[&std::path::Path],
+            ) {
+                for path in files_to_remove {
+                    let _ = std::fs::remove_file(path);
+                }
+                let _ = tx.send(SessionSpawnResult {
+                    wi_id,
+                    stage,
+                    outcome: Err("Session spawn cancelled".to_string()),
+                });
+            }
+
+            // Cancel check 1: at entry. If `apply_stage_change`
+            // or a delete fired before the worker even scheduled,
+            // skip the MCP server start entirely. Nothing has
+            // been written yet, so nothing to clean up.
+            if cancel_for_thread.load(std::sync::atomic::Ordering::Acquire) {
+                send_cancelled(&tx, wi_id_for_thread, stage, &[]);
+                return;
+            }
 
             // Start the MCP socket server (remove_file +
             // UnixListener::bind). This has to happen before the
@@ -4396,6 +4444,20 @@ impl App {
                 }
             };
 
+            // Cancel check 2: after MCP server start, before
+            // any worktree / temp file writes. The server just
+            // bound a Unix domain socket; if cancellation
+            // happened between check 1 and now, let the server
+            // fall out of scope via the early return - its
+            // `Drop` runs `stop() + remove_file(socket_path)` on
+            // THIS background thread. No worktree writes have
+            // happened yet, so there is nothing to roll back
+            // beyond the server's own socket file.
+            if cancel_for_thread.load(std::sync::atomic::Ordering::Acquire) {
+                send_cancelled(&tx, wi_id_for_thread, stage, &[]);
+                return;
+            }
+
             // Build the MCP config JSON (depends on the socket path
             // we just got).
             let mcp_config =
@@ -4411,8 +4473,12 @@ impl App {
             // going.
             let mcp_json_path = cwd.join(".mcp.json");
             let mut status_warning: Option<String> = None;
-            if let Err(e) = std::fs::write(&mcp_json_path, &mcp_config) {
-                status_warning = Some(format!("MCP config write error: {e}"));
+            let mut wrote_mcp_json = false;
+            match std::fs::write(&mcp_json_path, &mcp_config) {
+                Ok(()) => wrote_mcp_json = true,
+                Err(e) => {
+                    status_warning = Some(format!("MCP config write error: {e}"));
+                }
             }
 
             // Write the temp --mcp-config file. If this fails we
@@ -4424,8 +4490,10 @@ impl App {
                 uuid::Uuid::new_v4()
             ));
             let mut final_cmd = cmd;
+            let mut wrote_temp_config = false;
             match std::fs::write(&config_path, &mcp_config) {
                 Ok(()) => {
+                    wrote_temp_config = true;
                     final_cmd.push("--mcp-config".to_string());
                     final_cmd.push(config_path.to_string_lossy().to_string());
                 }
@@ -4434,30 +4502,25 @@ impl App {
                 }
             }
 
-            // Final cancellation check immediately before the
-            // PTY fork. This is the last point where a stale
-            // spawn can be aborted without any Claude process
-            // having been created. If `drop_session_spawn_entry`
-            // has flipped the flag (stage change,
-            // work-item delete, or cleanup path fired between
-            // when this worker started and now), return
-            // `Err("cancelled")` and let the MCP server fall out
-            // of scope - its `Drop` runs `stop() + unlink` on
-            // THIS thread (the background thread), not the UI
-            // thread. Any post-fork race (cancellation happens
-            // during the few milliseconds between `Session::spawn`
-            // returning and the UI-thread `poll_session_spawns`
-            // re-validating the stage) is closed by the
-            // `teardown_session_async` hop in
-            // `poll_session_spawns` / `drop_session_spawn_entry`,
-            // which keeps even the force-killed stale session off
-            // the UI tick path.
+            // Cancel check 3: after the worktree writes, before
+            // the PTY fork. If cancellation fired during the
+            // writes (or between check 2 and now), roll back the
+            // `.mcp.json` and the temp config file so the
+            // worktree is not left with a stale Claude Code
+            // control file pointing at a socket that is about to
+            // be destroyed. Codex adversarial review explicitly
+            // called this out: without the rollback, a cancelled
+            // spawn would leave `.mcp.json` in the worktree
+            // forever, referencing a dead MCP socket.
             if cancel_for_thread.load(std::sync::atomic::Ordering::Acquire) {
-                let _ = tx.send(SessionSpawnResult {
-                    wi_id: wi_id_for_thread,
-                    stage,
-                    outcome: Err("Session spawn cancelled".to_string()),
-                });
+                let mut to_remove: Vec<&std::path::Path> = Vec::new();
+                if wrote_mcp_json {
+                    to_remove.push(mcp_json_path.as_path());
+                }
+                if wrote_temp_config {
+                    to_remove.push(config_path.as_path());
+                }
+                send_cancelled(&tx, wi_id_for_thread, stage, &to_remove);
                 return;
             }
 
