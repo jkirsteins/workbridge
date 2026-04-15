@@ -3917,16 +3917,52 @@ impl App {
         } = plan_result;
         let cwd = cwd.as_path();
 
-        // Guard: the work item may have been deleted while the plan
-        // read was in flight. In that case, do not spawn a session,
-        // just drop the result quietly. (The worktree itself is
-        // either pre-existing or cleaned up by `poll_worktree_creation`
-        // before we got here.) The captured `stage` is used as the
-        // session-key stage; every stage-change path that leaves a
-        // work item alive cancels the pending open via
-        // `drop_session_open_entry`, so reaching here means the
-        // captured stage is still the right one.
-        if !self.work_items.iter().any(|w| w.id == work_item_id) {
+        // Guards: do not spawn Claude unless the work item is still
+        // around AND its current stage still matches the stage we
+        // captured when the open began AND that stage is session-
+        // eligible. Three failure modes are covered:
+        //
+        // 1. Deletion - the work item was removed while the plan read
+        //    was in flight. Drop the result quietly. (The worktree
+        //    itself is either pre-existing or cleaned up by
+        //    `poll_worktree_creation` before we got here.)
+        //
+        // 2. Stage drift via a non-`apply_stage_change` path. The
+        //    obvious one is `reassemble_work_items` deriving the item
+        //    to `Done` from a freshly-merged PR (`status_derived =
+        //    true`), which does NOT route through `apply_stage_change`
+        //    and therefore does NOT call `drop_session_open_entry`.
+        //    Without this check, a slow background probe could land
+        //    after the derive and we would still spawn `claude` with
+        //    `--dangerously-skip-permissions` for a stage the user
+        //    has already left. The session would later be reaped by
+        //    `check_liveness`, but the process has already auto-
+        //    started and could touch user state.
+        //
+        // 3. The captured stage was somehow a no-session stage
+        //    (Backlog / Done / Mergequeue). `spawn_session` filters
+        //    these out before calling `begin_session_open`, so this
+        //    branch is defense-in-depth against a future caller
+        //    forgetting that filter. Spawning Claude for a no-session
+        //    stage would create an entry in `self.sessions` keyed by
+        //    a stage that the rest of the code treats as terminal,
+        //    which is exactly the cross-stage corruption the
+        //    deterministic UUID scheme was designed to avoid.
+        let Some(current_status) = self
+            .work_items
+            .iter()
+            .find(|w| w.id == work_item_id)
+            .map(|w| w.status)
+        else {
+            return;
+        };
+        if current_status != stage {
+            return;
+        }
+        if matches!(
+            stage,
+            WorkItemStatus::Backlog | WorkItemStatus::Done | WorkItemStatus::Mergequeue
+        ) {
             return;
         }
 
@@ -16108,6 +16144,157 @@ mod tests {
         assert!(
             app.current_activity().is_none(),
             "stage change must end the 'Opening session...' spinner",
+        );
+    }
+
+    /// Codex adversarial-review finding: `finish_session_open` must
+    /// drop a stale `SessionOpenPlanResult` if the work item's current
+    /// stage no longer matches the captured stage. Not every stage
+    /// drift goes through `apply_stage_change` (which cancels pending
+    /// opens via `drop_session_open_entry`) - in particular,
+    /// `reassemble_work_items` derives a freshly-merged PR's work
+    /// item to `Done` directly by setting `status_derived = true`,
+    /// without touching `session_open_rx`. Without this guard, a slow
+    /// background worker could land its result after the derive and
+    /// `finish_session_open` would still spawn `claude
+    /// --dangerously-skip-permissions` for an item that has just left
+    /// the Implementing stage. `check_liveness` may eventually reap
+    /// the orphan, but the auto-started process has already had a
+    /// chance to touch user state.
+    ///
+    /// This test pins the structural fix: feed a stale result for an
+    /// item whose current status has been derived to `Done` and
+    /// assert that no entry lands in `self.sessions`.
+    #[test]
+    fn finish_session_open_drops_result_when_current_stage_changed() {
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-stale-result.json"));
+        // Start the work item in the "current state" the user has
+        // already drifted into: a Done item that was derived from a
+        // merged PR (`status_derived = true`). The captured stage in
+        // the SessionOpenPlanResult below will be Implementing, so
+        // the guard MUST fire and drop the spawn.
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "codex-stale-result".into(),
+            description: None,
+            status: WorkItemStatus::Done,
+            status_derived: true,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/codex-stale-repo"),
+                branch: Some("feature/codex-stale".into()),
+                worktree_path: Some(PathBuf::from("/tmp/codex-stale-wt")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        // Simulate the background worker's output for a pending open
+        // that started while the item was still Implementing.
+        let captured_stage = WorkItemStatus::Implementing;
+        let stale_result = SessionOpenPlanResult {
+            wi_id: wi_id.clone(),
+            cwd: PathBuf::from("/tmp/codex-stale-wt"),
+            stage: captured_stage,
+            plan_text: String::new(),
+            read_error: None,
+            session_id: crate::session_id::session_id_for(&wi_id, captured_stage),
+            spawn_flag: SpawnFlag::Fresh,
+        };
+
+        // Sanity: no sessions to start with.
+        assert!(app.sessions.is_empty());
+
+        app.finish_session_open(stale_result);
+
+        // The guard must have fired - no session entry under either
+        // the captured stage or the current (drifted) stage.
+        assert!(
+            app.sessions.is_empty(),
+            "finish_session_open must drop a stale result whose captured \
+             stage no longer matches the work item's current stage - \
+             otherwise a slow background probe race-spawns Claude for \
+             a Done-derived item, see Codex adversarial review",
+        );
+        assert!(
+            !app.sessions
+                .contains_key(&(wi_id.clone(), WorkItemStatus::Implementing)),
+            "no entry must be created under the captured Implementing stage",
+        );
+        assert!(
+            !app.sessions.contains_key(&(wi_id, WorkItemStatus::Done)),
+            "no entry must be created under the current Done stage either - \
+             Done is a no-session stage",
+        );
+    }
+
+    /// Defense-in-depth: even if some future caller accidentally
+    /// passes a `SessionOpenPlanResult` whose captured `stage` is a
+    /// no-session stage (Backlog / Done / Mergequeue),
+    /// `finish_session_open` must refuse to spawn. `spawn_session`
+    /// already filters these out before calling `begin_session_open`,
+    /// so this branch is purely a structural guard - but the cost of
+    /// missing it is a session entry keyed by a terminal stage,
+    /// exactly the cross-stage corruption the deterministic UUID
+    /// scheme was designed to prevent.
+    #[test]
+    fn finish_session_open_refuses_no_session_stage_even_if_consistent() {
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-no-session-stage.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "codex-no-session-stage".into(),
+            description: None,
+            status: WorkItemStatus::Mergequeue,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/codex-no-session-repo"),
+                branch: Some("feature/codex-no-session".into()),
+                worktree_path: Some(PathBuf::from("/tmp/codex-no-session-wt")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        let captured_stage = WorkItemStatus::Mergequeue;
+        let result = SessionOpenPlanResult {
+            wi_id: wi_id.clone(),
+            cwd: PathBuf::from("/tmp/codex-no-session-wt"),
+            stage: captured_stage,
+            plan_text: String::new(),
+            read_error: None,
+            session_id: crate::session_id::session_id_for(&wi_id, captured_stage),
+            spawn_flag: SpawnFlag::Fresh,
+        };
+
+        app.finish_session_open(result);
+
+        assert!(
+            app.sessions.is_empty(),
+            "finish_session_open must refuse to spawn for a no-session \
+             stage even when the captured and current stages agree",
         );
     }
 
