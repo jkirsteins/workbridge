@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::assembly;
+use crate::click_targets::{ClickKind, ClickRegistry};
 use crate::config::{Config, ConfigProvider, RepoEntry, RepoSource};
 use crate::create_dialog::CreateDialog;
 use crate::github_client::GithubError;
@@ -20,6 +21,73 @@ use crate::work_item_backend::{
     WorkItemBackend,
 };
 use crate::worktree_service::WorktreeService;
+
+/// A transient top-right notification shown after a click-to-copy
+/// action. Auto-dismisses when `expires_at` is reached. Rendered by
+/// `ui::draw_toasts` on top of everything else, including the global
+/// drawer and settings overlay.
+#[derive(Clone, Debug)]
+pub struct Toast {
+    pub text: String,
+    pub expires_at: Instant,
+}
+
+/// Truncate a copy-target value for display in a toast so very long
+/// URLs / file paths do not blow out the frame width. Returns a short
+/// human-readable form; the untruncated value is what actually lands
+/// on the clipboard.
+///
+/// Kind-specific policy:
+/// - `PrUrl`: keep the trailing `<owner>/<repo>/pull/<n>` tail, or just
+///   the last 40 chars if the URL has no recognizable tail.
+/// - `RepoPath`: show the basename only.
+/// - `Branch` / `Title`: truncate to 40 chars with an ellipsis marker.
+pub fn short_display(value: &str, kind: ClickKind) -> String {
+    const MAX: usize = 40;
+    match kind {
+        ClickKind::PrUrl => {
+            // Find `/pull/` and keep everything from one segment
+            // before it: e.g. `owner/repo/pull/123`.
+            if let Some(idx) = value.find("/pull/") {
+                let before = &value[..idx];
+                let owner_repo = before.rsplit('/').take(2).collect::<Vec<_>>();
+                let owner_repo = owner_repo.into_iter().rev().collect::<Vec<_>>().join("/");
+                let tail = &value[idx..];
+                format!("{owner_repo}{tail}")
+            } else {
+                truncate_tail(value, MAX)
+            }
+        }
+        ClickKind::RepoPath => std::path::Path::new(value)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| truncate_tail(value, MAX)),
+        ClickKind::Branch | ClickKind::Title => truncate_head(value, MAX),
+    }
+}
+
+/// Head-truncate: keep the first `max` chars, append `...` if cut.
+fn truncate_head(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max.saturating_sub(3)).collect();
+        format!("{head}...")
+    }
+}
+
+/// Tail-truncate: keep the last `max` chars, prepend `...` if cut.
+fn truncate_tail(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        s.to_string()
+    } else {
+        let skip = total - max.saturating_sub(3);
+        let tail: String = s.chars().skip(skip).collect();
+        format!("...{tail}")
+    }
+}
 
 /// Which panel currently has keyboard focus.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1007,6 +1075,21 @@ pub struct App {
     pub terminal_sessions: HashMap<WorkItemId, SessionEntry>,
     /// Buffered bytes destined for the active terminal PTY session.
     pub pending_terminal_pty_bytes: Vec<u8>,
+
+    /// Per-frame click-to-copy target registry. Populated during draw
+    /// (via `&App`, which is why this is a `RefCell`), consumed by
+    /// `handle_mouse`. Cleared at the top of every frame.
+    pub click_registry: RefCell<ClickRegistry>,
+
+    /// Tracks a pending click-to-copy gesture between `Down(Left)` and
+    /// `Up(Left)`. A drag or an `Up` outside the original target
+    /// cancels the gesture. Stored as `(col, row, kind, value)` in
+    /// absolute frame coordinates.
+    pub pending_chrome_click: Option<(u16, u16, ClickKind, String)>,
+
+    /// Transient top-right toast notifications. Newest is at the end of
+    /// the vector. Pruned each tick by `prune_toasts`.
+    pub toasts: Vec<Toast>,
 }
 
 impl App {
@@ -1177,10 +1260,49 @@ impl App {
             right_panel_tab: RightPanelTab::ClaudeCode,
             terminal_sessions: HashMap::new(),
             pending_terminal_pty_bytes: Vec::new(),
+            click_registry: RefCell::new(ClickRegistry::default()),
+            pending_chrome_click: None,
+            toasts: Vec::new(),
         };
         app.reassemble_work_items();
         app.build_display_list();
         app
+    }
+
+    // -- Toast API --
+
+    /// Show a transient top-right toast for ~2 seconds. Newest toasts
+    /// stack at the top of the column. Multiple calls in quick
+    /// succession produce a visible stack; each auto-dismisses
+    /// independently. Called from `fire_chrome_copy` and any other
+    /// handler that wants to surface a short confirmation without
+    /// hijacking the status bar.
+    pub fn push_toast(&mut self, text: String) {
+        self.toasts.push(Toast {
+            text,
+            expires_at: Instant::now() + Duration::from_secs(2),
+        });
+    }
+
+    /// Drop any toasts whose deadline has passed. Cheap - called from
+    /// the per-tick hook in `salsa::app_event`. Keeps the vector from
+    /// growing unbounded and is the only thing that removes toasts.
+    pub fn prune_toasts(&mut self) {
+        let now = Instant::now();
+        self.toasts.retain(|t| t.expires_at > now);
+    }
+
+    /// Fire a click-to-copy action: write `value` to the clipboard via
+    /// the OSC 52 + arboard backend and push a confirmation toast. The
+    /// toast shows a short-form of `value` based on `kind` so long
+    /// URLs and file paths do not overflow the frame.
+    ///
+    /// Does not touch the PTY selection state - this path is
+    /// independent of the existing drag-select copy flow.
+    pub fn fire_chrome_copy(&mut self, value: String, kind: ClickKind) {
+        crate::clipboard::copy(&value);
+        let short = short_display(&value, kind);
+        self.push_toast(format!("Copied: {short}"));
     }
 
     // -- Activity indicator API --

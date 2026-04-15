@@ -1915,14 +1915,18 @@ fn encode_mouse_scroll(
 /// has NOT enabled mouse reporting (or when in local scrollback mode).
 ///
 /// Returns `true` if the event modified app state, `false` otherwise.
+/// Abstract categorization of a mouse event. Used by `handle_mouse`
+/// and its helpers (`handle_chrome_click_fallback`) to share the
+/// classification logic without having to inspect
+/// `MouseEventKind` in multiple places.
+enum MouseAction {
+    Scroll { up: bool },
+    SelectDown,
+    SelectDrag,
+    SelectUp,
+}
+
 pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
-    // Categorize the event.
-    enum MouseAction {
-        Scroll { up: bool },
-        SelectDown,
-        SelectDrag,
-        SelectUp,
-    }
     let action = match mouse.kind {
         MouseEventKind::ScrollUp => MouseAction::Scroll { up: true },
         MouseEventKind::ScrollDown => MouseAction::Scroll { up: false },
@@ -1935,6 +1939,13 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
     // Ignore during shutdown or when overlays are visible.
     if app.shutting_down || any_modal_visible(app) {
         return false;
+    }
+
+    // Any drag cancels a click-to-copy gesture in progress. Must
+    // happen before target dispatch because a drag over a PTY pane
+    // still invalidates a pending chrome click that started elsewhere.
+    if matches!(action, MouseAction::SelectDrag) {
+        app.pending_chrome_click = None;
     }
 
     match mouse_target(app, mouse.column, mouse.row) {
@@ -2006,7 +2017,60 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
             }
             MouseAction::SelectUp => handle_selection_up_right(app, local_row, local_col),
         },
-        MouseTarget::None => false,
+        MouseTarget::None => handle_chrome_click_fallback(app, mouse, action),
+    }
+}
+
+/// Click-to-copy fallback: when a mouse event does not land on a PTY
+/// pane, consult the per-frame `ClickRegistry` and, if the event hits
+/// a registered target, run the click-to-copy gesture.
+///
+/// The gesture is a `Down(Left)` followed by `Up(Left)` that both land
+/// on the same registered target. Any intervening `Drag(Left)` cancels
+/// the gesture (see the unconditional clear above).
+///
+/// `try_borrow` is used defensively so that an accidentally overlapping
+/// borrow becomes a silent no-op rather than a panic - the registry is
+/// only supposed to be borrowed during draw, which never overlaps with
+/// mouse handling, but defense in depth is cheap here.
+fn handle_chrome_click_fallback(app: &mut App, mouse: MouseEvent, action: MouseAction) -> bool {
+    match action {
+        MouseAction::SelectDown => {
+            let hit = app
+                .click_registry
+                .try_borrow()
+                .ok()
+                .and_then(|r| r.hit_test(mouse.column, mouse.row).cloned());
+            if let Some(target) = hit {
+                app.pending_chrome_click =
+                    Some((mouse.column, mouse.row, target.kind, target.value));
+                true
+            } else {
+                false
+            }
+        }
+        MouseAction::SelectDrag => {
+            // Already cleared above; nothing to do here.
+            false
+        }
+        MouseAction::SelectUp => {
+            let pending = app.pending_chrome_click.take();
+            let hit = app
+                .click_registry
+                .try_borrow()
+                .ok()
+                .and_then(|r| r.hit_test(mouse.column, mouse.row).cloned());
+            match (pending, hit) {
+                (Some((_, _, pending_kind, pending_value)), Some(target))
+                    if target.kind == pending_kind =>
+                {
+                    app.fire_chrome_copy(pending_value, pending_kind);
+                    true
+                }
+                _ => false,
+            }
+        }
+        MouseAction::Scroll { .. } => false,
     }
 }
 
@@ -2236,10 +2300,11 @@ fn copy_selection_to_clipboard(entry: &crate::work_item::SessionEntry) {
         return;
     }
 
-    // Copy to system clipboard.
-    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-        let _ = clipboard.set_text(text);
-    }
+    // Copy to system clipboard via the OSC 52 + arboard dual-path
+    // helper. This fixes the existing PTY drag-select path over SSH
+    // as a side benefit: OSC 52 works when `arboard` can't reach a
+    // native display.
+    crate::clipboard::copy(&text);
 }
 
 /// Normalize a selection so (start_row, start_col) is before (end_row, end_col).
@@ -3022,5 +3087,114 @@ mod tests {
             Some("Refresh already in progress"),
             "count-gate rejection must surface the user-visible message",
         );
+    }
+
+    /// End-to-end chrome click: seed a click target in the per-frame
+    /// registry, synthesize `Down(Left)` + `Up(Left)` inside its rect,
+    /// and assert that `handle_mouse` fired the copy path and pushed a
+    /// toast. The clipboard side-effects (OSC 52 to stdout, arboard
+    /// attempt) are harmless in the test harness - `cargo test`
+    /// captures stdout and arboard failures are best-effort.
+    #[test]
+    fn chrome_click_registers_toast_on_down_up() {
+        use crate::click_targets::ClickKind;
+        use ratatui_core::layout::Rect;
+        use ratatui_crossterm::crossterm::event::KeyModifiers;
+
+        let mut app = App::new();
+        // Seed the registry directly - we don't need to run a real
+        // draw to get a target in place.
+        {
+            let mut reg = app.click_registry.borrow_mut();
+            reg.push(
+                Rect {
+                    x: 10,
+                    y: 5,
+                    width: 20,
+                    height: 1,
+                },
+                "feat/my-branch".to_string(),
+                ClickKind::Branch,
+            );
+        }
+
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 15,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 15,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(handle_mouse(&mut app, down));
+        assert!(
+            app.pending_chrome_click.is_some(),
+            "Down(Left) must arm the pending click",
+        );
+        assert!(handle_mouse(&mut app, up));
+        assert!(
+            app.pending_chrome_click.is_none(),
+            "Up(Left) must clear the pending click",
+        );
+        assert_eq!(app.toasts.len(), 1, "one toast must be queued");
+        assert!(
+            app.toasts[0].text.contains("feat/my-branch"),
+            "toast text must mention the copied value, got {:?}",
+            app.toasts[0].text,
+        );
+    }
+
+    /// A drag between Down and Up cancels the click-to-copy gesture -
+    /// no toast is pushed.
+    #[test]
+    fn chrome_click_drag_cancels_copy() {
+        use crate::click_targets::ClickKind;
+        use ratatui_core::layout::Rect;
+        use ratatui_crossterm::crossterm::event::KeyModifiers;
+
+        let mut app = App::new();
+        {
+            let mut reg = app.click_registry.borrow_mut();
+            reg.push(
+                Rect {
+                    x: 10,
+                    y: 5,
+                    width: 20,
+                    height: 1,
+                },
+                "https://example.com/pull/42".to_string(),
+                ClickKind::PrUrl,
+            );
+        }
+
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 15,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 17,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 17,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse(&mut app, down);
+        handle_mouse(&mut app, drag);
+        handle_mouse(&mut app, up);
+        assert!(app.toasts.is_empty(), "drag must cancel the copy gesture",);
+        assert!(app.pending_chrome_click.is_none());
     }
 }

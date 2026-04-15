@@ -355,6 +355,11 @@ pub fn app_event(
                     state.spinner_tick = state.spinner_tick.wrapping_add(1);
                 }
 
+                // Drop expired click-to-copy toasts. Cheap in-memory
+                // retain; runs every tick so the stack auto-clears
+                // ~2 seconds after the most recent copy.
+                state.prune_toasts();
+
                 // Poll MCP status updates BEFORE liveness check so that a
                 // review gate verdict arriving in the same tick as session
                 // exit is processed before check_liveness clears the gate

@@ -26,8 +26,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     App, BOARD_COLUMNS, DisplayEntry, FocusPanel, GroupHeaderKind, RightPanelTab,
-    SettingsListFocus, SettingsTab, UserActionKey, ViewMode, WorkItemContext,
+    SettingsListFocus, SettingsTab, Toast, UserActionKey, ViewMode, WorkItemContext,
 };
+use crate::click_targets::ClickKind;
 use crate::config;
 use crate::create_dialog::{CreateDialog, CreateDialogFocus};
 use crate::layout;
@@ -56,6 +57,11 @@ const SPINNER_FRAMES: &[char] = &[
 /// `rat-widget` text fields inside `CreateDialog`) need `&mut State` to
 /// render.
 pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme) {
+    // Clear stale click targets from the previous frame before any
+    // render pushes. `handle_mouse` never runs during a draw, so
+    // this `borrow_mut` never conflicts with a concurrent borrow.
+    app.click_registry.borrow_mut().clear();
+
     // Vertical split: 1-row view mode header + main area + optional context bar + optional status bar.
     let has_context = app.selected_work_item_context().is_some();
     let has_status = app.has_visible_status_bar();
@@ -341,6 +347,75 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
     // `TextArea` stateful widgets need `&mut State` to render.
     if app.create_dialog.visible {
         draw_create_dialog(buf, &mut app.create_dialog, theme, area);
+    }
+
+    // Top-right toast stack. Rendered LAST so it sits on top of
+    // every other overlay including the global drawer and settings.
+    draw_toasts(buf, &app.toasts, theme, area);
+}
+
+/// Draw the top-right transient toast stack. Each toast is a small
+/// bordered block; multiple stack vertically with the newest on top.
+/// Toasts whose rect would overflow the frame are skipped (rather
+/// than clipped) so a small terminal degrades gracefully.
+fn draw_toasts(buf: &mut Buffer, toasts: &[Toast], theme: &Theme, frame_area: Rect) {
+    if toasts.is_empty() {
+        return;
+    }
+    const TOAST_HEIGHT: u16 = 3; // bordered block + 1 content row
+    const MAX_WIDTH: u16 = 60;
+    const MIN_WIDTH: u16 = 16;
+    const MARGIN_RIGHT: u16 = 2;
+    const MARGIN_TOP: u16 = 1;
+
+    // Newest toast first (visually on top of the stack).
+    for (index, toast) in toasts.iter().rev().enumerate() {
+        let index_u16 = index as u16;
+        // `value.len() + 4` = text + two borders + two pad cells.
+        let desired = (UnicodeWidthStr::width(toast.text.as_str()) as u16).saturating_add(4);
+        let width = desired.clamp(MIN_WIDTH, MAX_WIDTH);
+
+        // Frame too narrow for even the minimum toast width: bail.
+        if width > frame_area.width.saturating_sub(MARGIN_RIGHT) {
+            return;
+        }
+
+        let y = frame_area
+            .y
+            .saturating_add(MARGIN_TOP)
+            .saturating_add(index_u16.saturating_mul(TOAST_HEIGHT));
+        if y.saturating_add(TOAST_HEIGHT) > frame_area.y.saturating_add(frame_area.height) {
+            // This toast and every further (older) toast would
+            // overflow the bottom. Stop stacking.
+            return;
+        }
+
+        let x = frame_area
+            .x
+            .saturating_add(frame_area.width)
+            .saturating_sub(width)
+            .saturating_sub(MARGIN_RIGHT);
+
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height: TOAST_HEIGHT,
+        };
+
+        // Clear under the toast so it occludes whatever was drawn
+        // previously (status bar, context bar, etc.).
+        Clear.render(rect, buf);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme.style_text());
+        let paragraph = Paragraph::new(Line::from(Span::styled(
+            toast.text.clone(),
+            theme.style_text(),
+        )))
+        .block(block);
+        paragraph.render(rect, buf);
     }
 }
 
@@ -2119,6 +2194,7 @@ fn format_work_item_error(error: &WorkItemError) -> (String, Option<String>) {
 /// it survives longer than a transient `status_message`.
 fn draw_work_item_detail(
     buf: &mut Buffer,
+    app: &App,
     wi: Option<&crate::work_item::WorkItem>,
     theme: &Theme,
     block: Block<'_>,
@@ -2137,6 +2213,13 @@ fn draw_work_item_detail(
         paragraph.render(area, buf);
         return;
     };
+
+    // Inner rect of the bordered block, in absolute frame coordinates.
+    // All click-target rects below are computed by adding a line index
+    // and a column offset to this origin so `handle_mouse` receives
+    // the same coordinates it reads from `MouseEvent`.
+    let inner = block.inner(area);
+    let mut registry = app.click_registry.borrow_mut();
 
     let first_assoc = wi.repo_associations.first();
     let label_style = theme.style_heading();
@@ -2208,39 +2291,145 @@ fn draw_work_item_detail(
         }
     };
 
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(format!("  {}", wi.title), theme.style_text())),
-        Line::from(""),
-    ];
+    // Interactive labels (title, repo path, branch, PR URL) render
+    // with the `theme.style_interactive()` accent + underline and are
+    // registered in the per-frame `ClickRegistry` so `handle_mouse`
+    // can fire a click-to-copy action. See docs/UI.md "Interactive
+    // labels" for the convention.
+    //
+    // Rects are computed from `inner.x` / `inner.y` + the current line
+    // index + the column offset of the value span inside its line.
+    // All coordinates are absolute frame coordinates so they can be
+    // compared directly to `MouseEvent::column` / `row`.
+    //
+    // "(none)" placeholders are NOT registered as click targets (the
+    // underline would be misleading - there is nothing to copy) and
+    // keep the existing muted style.
+    const LABEL_INDENT: u16 = 2; // "  " indent before every row.
+    const LABEL_WIDTH: u16 = 12; // Padded label column width.
 
-    // Each detail row: "  Label:      value"
-    let fields: Vec<(&str, &str)> = vec![
-        ("Status", status_str),
-        ("Backend", backend_str),
-        ("Repo", &repo_str),
-        ("Branch", branch_str),
-        ("Worktree", &worktree_str),
-        ("PR", &pr_str),
-        ("Issue", &issue_str),
-        ("Errors", &errors_str),
-    ];
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
-    for (label, value) in &fields {
+    // lines[0]: blank
+    lines.push(Line::from(""));
+
+    // lines[1]: "  <title>". Split into a leading pad span and a
+    // styled title span so the click rect covers only the title
+    // glyphs - clicking on the pad should not count as a hit.
+    if wi.title.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  ".to_string(),
+            theme.style_text(),
+        )));
+    } else {
+        let title_value = wi.title.clone();
+        let title_width = UnicodeWidthStr::width(title_value.as_str()) as u16;
+        registry.push(
+            Rect {
+                x: inner.x.saturating_add(LABEL_INDENT),
+                y: inner.y.saturating_add(1),
+                width: title_width,
+                height: 1,
+            },
+            title_value.clone(),
+            ClickKind::Title,
+        );
         lines.push(Line::from(vec![
-            Span::styled(format!("  {label:<12}"), label_style),
-            Span::styled(value.to_string(), val_style(value)),
+            Span::styled("  ".to_string(), theme.style_text()),
+            Span::styled(title_value, theme.style_interactive()),
         ]));
     }
+
+    // lines[2]: blank separator
+    lines.push(Line::from(""));
+
+    // Render detail rows in the historical order. Repo and Branch
+    // are the two interactive rows; everything else is rendered as a
+    // non-interactive "  Label       value" row.
+    let plain_row = |label: &str, value: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("  {label:<12}"), label_style),
+            Span::styled(value.to_string(), val_style(value)),
+        ])
+    };
+
+    lines.push(plain_row("Status", status_str));
+    lines.push(plain_row("Backend", backend_str));
+
+    // Repo row (interactive).
+    {
+        let line_index = lines.len() as u16;
+        if repo_str == "(none)" {
+            lines.push(plain_row("Repo", &repo_str));
+        } else {
+            let value_width = UnicodeWidthStr::width(repo_str.as_str()) as u16;
+            registry.push(
+                Rect {
+                    x: inner.x.saturating_add(LABEL_INDENT + LABEL_WIDTH),
+                    y: inner.y.saturating_add(line_index),
+                    width: value_width,
+                    height: 1,
+                },
+                repo_str.clone(),
+                ClickKind::RepoPath,
+            );
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<12}", "Repo"), label_style),
+                Span::styled(repo_str.clone(), theme.style_interactive()),
+            ]));
+        }
+    }
+
+    // Branch row (interactive).
+    {
+        let line_index = lines.len() as u16;
+        if branch_str == "(none)" {
+            lines.push(plain_row("Branch", branch_str));
+        } else {
+            let value_width = UnicodeWidthStr::width(branch_str) as u16;
+            registry.push(
+                Rect {
+                    x: inner.x.saturating_add(LABEL_INDENT + LABEL_WIDTH),
+                    y: inner.y.saturating_add(line_index),
+                    width: value_width,
+                    height: 1,
+                },
+                branch_str.to_string(),
+                ClickKind::Branch,
+            );
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<12}", "Branch"), label_style),
+                Span::styled(branch_str.to_string(), theme.style_interactive()),
+            ]));
+        }
+    }
+
+    lines.push(plain_row("Worktree", &worktree_str));
+    lines.push(plain_row("PR", &pr_str));
+    lines.push(plain_row("Issue", &issue_str));
+    lines.push(plain_row("Errors", &errors_str));
 
     // PR URL on its own line so it gets the full inner width.
     if let Some(url) = pr_url {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("  PR URL", label_style)));
-        lines.push(Line::from(Span::styled(
-            format!("  {url}"),
-            theme.style_text(),
-        )));
+        let line_index = lines.len() as u16;
+        let url_value = url.to_string();
+        let url_width = UnicodeWidthStr::width(url_value.as_str()) as u16;
+        registry.push(
+            Rect {
+                x: inner.x.saturating_add(LABEL_INDENT),
+                y: inner.y.saturating_add(line_index),
+                width: url_width,
+                height: 1,
+            },
+            url_value.clone(),
+            ClickKind::PrUrl,
+        );
+        lines.push(Line::from(vec![
+            Span::styled("  ".to_string(), theme.style_text()),
+            Span::styled(url_value, theme.style_interactive()),
+        ]));
     }
 
     lines.push(Line::from(""));
@@ -2268,6 +2457,12 @@ fn draw_work_item_detail(
             theme.style_error(),
         )));
     }
+
+    // Drop the registry borrow before rendering. Rendering does not
+    // touch the registry, but explicitly ending the borrow here keeps
+    // the lifetime obvious and guards against a future render path
+    // that might try to borrow it again.
+    drop(registry);
 
     let text = Text::from(lines);
     let paragraph = Paragraph::new(text).block(block);
@@ -2647,7 +2842,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                         let poll_error = wi
                             .and_then(|w| app.mergequeue_poll_errors.get(&w.id))
                             .map(String::as_str);
-                        draw_work_item_detail(buf, wi, theme, block, area, poll_error);
+                        draw_work_item_detail(buf, app, wi, theme, block, area, poll_error);
                     }
                 }
             }

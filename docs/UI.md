@@ -76,7 +76,7 @@ mouse button. Selection works like a standard terminal emulator:
 
 - Click-and-drag highlights the selected text (inverted colors).
 - On mouse release, the selected text is automatically copied to the
-  system clipboard via the arboard crate.
+  system clipboard.
 - Clicking without dragging clears any existing selection.
 - Any keypress clears the selection.
 - Selection works in both live view and scrollback mode.
@@ -86,6 +86,54 @@ enabled mouse reporting (MouseProtocolMode::None). When the child
 has enabled mouse reporting (e.g., vim, htop), mouse events are
 forwarded to the PTY as before. Exception: in local scrollback mode,
 selection is always available since the PTY is not receiving events.
+
+Clipboard writes go through `src/clipboard.rs::copy`, which attempts
+BOTH an OSC 52 escape sequence (written directly to stdout) and
+`arboard`. OSC 52 makes the copy work over SSH and inside tmux
+(tmux users must have `set -g set-clipboard on` in their tmux.conf);
+`arboard` covers terminals that strip OSC 52. Either path succeeding
+counts as a successful copy. The escape sequence is built by
+`osc52_sequence` so it can be unit-tested without hitting stdout.
+
+### Interactive labels
+
+In the work item detail view, four fields are click-to-copy:
+
+- **Title** (the work item title span)
+- **Repo** path
+- **Branch** name
+- **PR URL**
+
+Each is rendered with `theme.style_interactive()` - the new
+`interactive_fg` theme slot (default Cyan) plus a `Modifier::UNDERLINED`
+affordance. The underline is the persistent visual signal that says
+"clickable". A left-click on any of these fields copies the full
+untruncated value via `clipboard::copy` and pushes a top-right toast
+(`Copied: <short-value>`) that auto-dismisses after ~2 seconds.
+Multiple toasts stack vertically with the newest on top.
+
+Implementation:
+
+- Each renderer that draws an interactive label pushes a
+  `ClickTarget { rect, value, kind }` into `App::click_registry`
+  (a `RefCell<ClickRegistry>`) as part of its draw call. The rect
+  is in **absolute frame coordinates** so it can be compared
+  directly to `MouseEvent::column` / `row`.
+- `draw_to_buffer` clears the registry at the top of every frame so
+  stale targets from the previous draw never leak.
+- `handle_mouse` consults the registry as a fallback after PTY
+  classification: if a `MouseTarget::None` event lands inside a
+  registered rect, `handle_chrome_click_fallback` arms a pending
+  click on `Down(Left)`, cancels on any `Drag(Left)`, and fires
+  `App::fire_chrome_copy` on a matching `Up(Left)`.
+- Values that read as `"(none)"` are NOT registered and render in
+  the muted style - the underline would be misleading if there is
+  nothing to copy.
+
+To add a new click-to-copy label elsewhere in the UI, follow the
+same convention: style with `theme.style_interactive()`, push a
+`ClickTarget` into `app.click_registry` with the absolute rect, and
+pick (or add) a `ClickKind` variant.
 
 ### Blocking I/O Prohibition
 

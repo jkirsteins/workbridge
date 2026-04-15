@@ -1,5 +1,7 @@
 mod app;
 mod assembly;
+mod click_targets;
+mod clipboard;
 mod config;
 mod create_dialog;
 mod dashboard_seed;
