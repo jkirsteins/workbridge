@@ -4404,14 +4404,77 @@ impl App {
             .insert(work_item_id, SessionSpawnPending { rx, activity });
     }
 
+    /// Move a live `Session` + `McpSocketServer` onto a background
+    /// thread whose only job is to drop them.
+    ///
+    /// Codex adversarial review flagged that letting either of
+    /// these drop on the UI tick path re-introduces the exact
+    /// blocking-I/O class the two-stage spawn refactor was built
+    /// to eliminate: `Session::Drop` runs `force_kill` (process
+    /// SIGTERM/SIGKILL + `child.wait`) and joins the PTY reader
+    /// thread, and `McpSocketServer::Drop` runs `stop` + an
+    /// unlink syscall on the socket path. Both are forbidden on
+    /// the UI thread by `docs/UI.md` "Blocking I/O Prohibition"
+    /// (absolute rule - cannot be overridden by authorization).
+    ///
+    /// The helper is `static` on purpose: it must not borrow
+    /// `self` because the call sites (stale result in
+    /// `poll_session_spawns`, buffered result in
+    /// `drop_session_spawn_entry`) already hold a mutable
+    /// reference to `App` through `&mut self`. A one-shot
+    /// `std::thread::spawn` is cheap relative to the blocking
+    /// teardown it replaces - teardown is at most a few hundred
+    /// ms, including the SIGTERM grace window - and there are
+    /// never more than a handful of pending teardowns at once in
+    /// practice (one per interrupted stage change).
+    fn teardown_session_async(session: crate::session::Session, mcp_server: McpSocketServer) {
+        std::thread::spawn(move || {
+            // Dropping here on this thread (not the UI thread)
+            // runs Session::Drop and McpSocketServer::Drop off
+            // the tick path. Both implementations are tested in
+            // their owning modules; we just move them into this
+            // closure so they fall out of scope on the right
+            // thread.
+            drop(session);
+            drop(mcp_server);
+        });
+    }
+
     /// Remove a pending `session_spawn_rx` entry and end its
     /// spinner activity. Mirror of `drop_session_open_entry` so the
     /// two terminal paths (result delivered, background thread
     /// disconnected) cannot leak the "Spawning Claude session..."
     /// spinner.
+    ///
+    /// If the background worker has already sent a live
+    /// `SessionSpawnOk` into the channel but `poll_session_spawns`
+    /// has not yet drained it (the common race when a stage change
+    /// or work-item delete fires after `tx.send` but before the
+    /// next background tick), the buffered result is pulled out
+    /// here and its `Session` + `McpSocketServer` are handed to
+    /// `teardown_session_async` so their blocking `Drop` impls run
+    /// off the UI thread. Without this hop, the call site's
+    /// `self.session_spawn_rx.remove(wi_id)` would drop the
+    /// Receiver inline, which drops the buffered `SessionSpawnOk`
+    /// (including the `Session`) on the UI thread - exactly the
+    /// Codex adversarial-review finding this helper exists to
+    /// prevent.
     fn drop_session_spawn_entry(&mut self, wi_id: &WorkItemId) {
         if let Some(entry) = self.session_spawn_rx.remove(wi_id) {
             self.end_activity(entry.activity);
+            // Drain any buffered result BEFORE the Receiver
+            // inside `entry` falls out of scope. If the channel
+            // was empty the `try_recv` returns immediately with
+            // `Err(Empty)`; if the background worker had already
+            // sent, we get an owned `SessionSpawnResult` that we
+            // can route to the async teardown helper. Errors
+            // (empty / disconnected) are not distinguished here
+            // because both mean "no buffered session to hand off".
+            if let Ok(result) = entry.rx.try_recv()
+                && let Ok(ok) = result.outcome
+            {
+                Self::teardown_session_async(ok.session, ok.mcp_server);
+            }
         }
     }
 
@@ -4460,9 +4523,21 @@ impl App {
                 .map(|w| w.status == result.stage)
                 .unwrap_or(false);
             if !still_current {
-                // On drop, the `Session` inside `SessionSpawnOk`
-                // tears down its PTY and child process via its
-                // `Drop` impl. No manual cleanup needed.
+                // Hand the live Session + McpSocketServer to the
+                // async teardown helper so their blocking `Drop`
+                // impls run on a background thread. Letting them
+                // drop inline here would call Session::Drop ->
+                // force_kill + reader-thread join on the UI tick
+                // path (Codex adversarial review P0), which
+                // synchronously SIGTERMs/SIGKILLs a Claude
+                // process, sleeps the SIGTERM grace window, and
+                // blocks on `child.wait` + `handle.join()`.
+                // `SessionSpawnResult::Err` has no Session to
+                // tear down and just falls out of scope - no hop
+                // needed.
+                if let Ok(ok) = result.outcome {
+                    Self::teardown_session_async(ok.session, ok.mcp_server);
+                }
                 continue;
             }
 
@@ -16693,6 +16768,137 @@ mod tests {
             app.sessions.is_empty(),
             "finish_session_open must refuse to spawn for a no-session \
              stage even when the captured and current stages agree",
+        );
+    }
+
+    /// Codex adversarial-review finding: when the stage-drift or
+    /// work-item-deleted guard in `poll_session_spawns` fires AFTER
+    /// the background spawn worker has already produced an `Ok`
+    /// result, the UI thread must NOT drop the live `Session`
+    /// inline. `Session::Drop` calls `force_kill` (SIGTERM +
+    /// sleep + SIGKILL + `child.wait`) and joins the PTY reader
+    /// thread, and `McpSocketServer::Drop` runs an `unlink`
+    /// syscall - all of which is blocking. They have to be moved
+    /// onto the background teardown thread via
+    /// `teardown_session_async` so the tick path only does
+    /// in-memory map updates.
+    ///
+    /// This test drives a real `sleep` PTY through the stale path
+    /// and verifies that the UI thread returns promptly without
+    /// waiting for the child process to exit. The session never
+    /// lands in `self.sessions` and the teardown completes
+    /// asynchronously in the background.
+    #[test]
+    #[cfg(unix)]
+    fn poll_session_spawns_tears_down_stale_session_off_ui_thread() {
+        use crossbeam_channel::bounded;
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-stale-teardown.json"));
+        // Put the work item in Done so the stage drift guard
+        // fires and the spawn result is classified as stale even
+        // though the work item still exists.
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "codex-stale-teardown".into(),
+            description: None,
+            status: WorkItemStatus::Done,
+            status_derived: true,
+            repo_associations: vec![],
+            errors: vec![],
+        });
+
+        // Spawn a real `sleep` PTY. Using sleep instead of claude
+        // keeps the test self-contained and deterministic; the
+        // property under test is the teardown hop, not which
+        // binary sits behind the master fd.
+        let session = crate::session::Session::spawn(80, 24, None, &["sleep", "30"])
+            .expect("test PTY must spawn");
+
+        // Fake MCP socket server - put a real one next to the
+        // session so the teardown thread has something to drop.
+        // We use a short, unique socket path to stay under the
+        // SUN_LEN limit (~104 on macOS, ~108 on Linux) while
+        // still being collision-free across parallel test runs.
+        let (mcp_tx, _mcp_rx) = crossbeam_channel::unbounded();
+        let socket_path = std::env::temp_dir().join(format!("wb-td-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket_path);
+        let mcp_server = McpSocketServer::start(
+            socket_path,
+            "\"test\"".to_string(),
+            "Own".to_string(),
+            "{}".to_string(),
+            None,
+            mcp_tx,
+            false,
+        )
+        .expect("test MCP socket must bind");
+
+        // Pack an Ok result and install it directly in
+        // session_spawn_rx as if the background worker had just
+        // finished. Captured stage is Implementing; the work
+        // item is currently Done, so poll_session_spawns' stage
+        // drift guard must fire and route the Session into
+        // teardown_session_async.
+        let captured_stage = WorkItemStatus::Implementing;
+        let (tx, rx) = bounded(1);
+        tx.send(SessionSpawnResult {
+            wi_id: wi_id.clone(),
+            stage: captured_stage,
+            outcome: Ok(SessionSpawnOk {
+                session,
+                mcp_server,
+                warning: None,
+            }),
+        })
+        .expect("test channel send must succeed");
+        let activity = app.start_activity("Spawning Claude session...");
+        app.session_spawn_rx
+            .insert(wi_id.clone(), SessionSpawnPending { rx, activity });
+
+        // Drive the poll. This is the UI-thread tick path under
+        // test. It must return quickly - the teardown is
+        // asynchronous, so poll_session_spawns itself should not
+        // block on `child.wait` (which would cost up to 50ms
+        // SIGTERM grace + reader join).
+        let before = std::time::Instant::now();
+        app.poll_session_spawns();
+        let elapsed = before.elapsed();
+
+        // The guard must have fired.
+        assert!(
+            app.sessions.is_empty(),
+            "stale Ok result must not land in sessions when the \
+             captured stage no longer matches",
+        );
+        assert!(
+            !app.session_spawn_rx.contains_key(&wi_id),
+            "pending spawn entry must be removed",
+        );
+        // The spinner must be ended (drop_session_spawn_entry
+        // handles this).
+        assert!(
+            app.current_activity().is_none(),
+            "stale teardown must end the 'Spawning Claude session...' spinner",
+        );
+        // Structural latency assertion: poll_session_spawns must
+        // return well under the SIGTERM grace window (50ms) plus
+        // reader-join time. We allow a generous 30ms budget to
+        // cover slow CI jitter while still being far below the
+        // inline-drop blocking cost.
+        assert!(
+            elapsed < std::time::Duration::from_millis(30),
+            "poll_session_spawns must not block on Session::Drop \
+             - inline drop would take at least the SIGTERM grace \
+             window (50ms). Elapsed: {elapsed:?}",
         );
     }
 
