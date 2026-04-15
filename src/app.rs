@@ -671,10 +671,6 @@ pub struct SessionSpawnInputs {
     /// Repo-level MCP servers gathered from the config on the UI
     /// thread.
     pub repo_mcp_servers: Vec<crate::config::McpServerEntry>,
-    /// Path to the workbridge executable, resolved via
-    /// `std::env::current_exe` on the UI thread so the worker
-    /// does not have to handle the failure arm.
-    pub exe: PathBuf,
     /// Clone of `App::mcp_tx` so the spawned `McpSocketServer` can
     /// forward events back to the main thread.
     pub mcp_tx: crossbeam_channel::Sender<McpEvent>,
@@ -4313,18 +4309,20 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
-        let exe = match std::env::current_exe() {
-            Ok(exe) => exe,
-            Err(e) => {
-                self.status_message = Some(format!("Cannot resolve executable path: {e}"));
-                return;
-            }
-        };
         let mcp_tx = self.mcp_tx.clone();
         let pane_cols = self.pane_cols;
         let pane_rows = self.pane_rows;
         let cwd_owned = cwd.to_path_buf();
 
+        // `std::env::current_exe()` does a readlink /
+        // procfs-style syscall to resolve the running binary's
+        // path. Codex adversarial review flagged that as a
+        // filesystem lookup on the UI tick path, even though it
+        // is cheap in practice. Move the call into the
+        // `begin_session_spawn` background worker so the UI
+        // thread does ZERO filesystem I/O. Resolution failures
+        // surface via `SessionSpawnResult::Err`, routed through
+        // the same channel as every other spawn failure.
         self.begin_session_spawn(
             work_item_id,
             stage,
@@ -4336,7 +4334,6 @@ impl App {
                 context_json,
                 activity_log_path,
                 repo_mcp_servers,
-                exe,
                 mcp_tx,
                 pane_cols,
                 pane_rows,
@@ -4402,7 +4399,6 @@ impl App {
                 context_json,
                 activity_log_path,
                 repo_mcp_servers,
-                exe,
                 mcp_tx,
                 pane_cols,
                 pane_rows,
@@ -4440,12 +4436,32 @@ impl App {
 
             // Cancel check 1: at entry. If `apply_stage_change`
             // or a delete fired before the worker even scheduled,
-            // skip the MCP server start entirely. Nothing has
-            // been written yet, so nothing to clean up.
+            // skip everything - including the executable
+            // resolution, the MCP server start, and every
+            // write. Nothing has been written yet, so nothing
+            // to clean up.
             if cancel_for_thread.load(std::sync::atomic::Ordering::Acquire) {
                 send_cancelled(&tx, wi_id_for_thread, stage, &[]);
                 return;
             }
+
+            // Resolve the running binary's path here, on the
+            // background thread, rather than on the UI thread.
+            // `std::env::current_exe` does a readlink /
+            // procfs-style syscall which Codex adversarial
+            // review flagged as filesystem I/O that must not
+            // run on the tick path.
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.send(SessionSpawnResult {
+                        wi_id: wi_id_for_thread,
+                        stage,
+                        outcome: Err(format!("Cannot resolve executable path: {e}")),
+                    });
+                    return;
+                }
+            };
 
             // Start the MCP socket server (remove_file +
             // UnixListener::bind). This has to happen before the
