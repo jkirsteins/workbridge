@@ -588,6 +588,28 @@ removal that follows on the cleanup thread. The PID is cleared by
 the sub-thread after `wait_with_output` returns, so a concurrent
 `drop_rebase_gate` can never SIGKILL a stale-PID slot.
 
+The pre-spawn window (default-branch resolution, `git fetch`, MCP
+server start, temp-config write) cannot rely on `child_pid`
+because the harness has not been spawned yet. To close that race,
+`RebaseGateState::cancelled` is an `Arc<AtomicBool>` set by
+`drop_rebase_gate` BEFORE the SIGKILL. The background thread
+polls the flag at every phase boundary and exits cleanly (dropping
+its MCP server and removing its temp config) on a `true` reading.
+The harness sub-thread checks the same flag immediately after
+`Command::spawn` returns and, if set, kills the just-spawned child
+itself before stashing the PID. The flag covers the entire
+pre-spawn lifecycle; the PID covers everything after spawn. To
+make the cancellation race unhittable from the start, the gate
+state is inserted into `App.rebase_gates` BEFORE the background
+thread is spawned, so any `drop_rebase_gate` call sees the entry
+even if the thread has not been scheduled yet.
+
+The single-flight admission (`UserActionKey::RebaseOnMain`) is
+now released only when `drop_rebase_gate` sees the slot owned by
+the same work item it is dropping; otherwise dropping a stale
+gate for one item could clear the global slot while a different
+item still owns it, admitting an overlapping rebase.
+
 **Codex (secondary, not implemented)**: **supported**. The
 lifecycle contract is a POSIX process-group protocol, not a
 harness-specific one. As long as Codex does not install a SIGTERM
@@ -853,10 +875,20 @@ produce a false "Rebased onto origin/<base>" status in the UI.
 This is the user-facing-claim verification mandated by CLAUDE.md.
 
 The rebase gate's audit trail (the "later session viewing this
-work item can see the rebase happened" record) is written by
-`poll_rebase_gate` directly via `App.backend.append_activity`
-once the harness exits and the verification above has run. The
-entry's `event_type` is `rebase_completed` for success or
+work item can see the rebase happened" record) is written on the
+background thread via `App.backend.append_activity`, NOT on the
+UI thread - the local backend implementation opens and writes the
+activity log file, so doing it from `poll_rebase_gate` would
+violate the absolute blocking-I/O-on-the-UI-thread invariant. The
+spawning thread owns an `Arc<dyn WorkItemBackend>` clone (cloned
+from `App.backend` at `spawn_rebase_gate` setup time); after the
+ancestry verification above runs, it builds the activity entry,
+calls `append_activity`, and stashes any error string in
+`RebaseResult::*::activity_log_error`. The poll loop reads that
+field and suffixes the error onto the user-visible status message
+so the user can see when the audit trail did not land.
+
+The entry's `event_type` is `rebase_completed` for success or
 `rebase_failed` for failure, and the payload carries
 `base_branch`, `conflicts_resolved` / `conflicts_attempted`, and
 the harness's `reason` (failure case only). The gate prompt
@@ -1145,3 +1177,31 @@ harness adapter is introduced, add a dated bullet here.
   `poll_rebase_gate` directly via `App.backend.append_activity` as
   a `rebase_completed` / `rebase_failed` activity log entry. RP6
   documents the new entry shape.
+- 2026-04-16: Second Codex pass on the rebase gate uncovered three
+  additional issues, all addressed in the same commit. (1) P0:
+  The activity log append from the previous round was running on
+  the UI thread, violating the absolute blocking-I/O invariant.
+  The append now runs on the background thread; `RebaseResult`
+  variants gain an `activity_log_error: Option<String>` field
+  that travels back through the result channel and is suffixed
+  onto the user-visible status message in `poll_rebase_gate`, so
+  failures are surfaced rather than swallowed. (2) P1:
+  `drop_rebase_gate` was unconditionally clearing the
+  `UserActionKey::RebaseOnMain` slot, so dropping a stale gate
+  for one work item could clear the global single-flight slot
+  while a different item still owned it, admitting an overlapping
+  rebase. The helper now only ends the user action when the slot
+  is currently owned by the work item being dropped. (3) P1: A
+  cancellation race in the pre-spawn window (default-branch
+  resolution, `git fetch`, MCP server start, temp-config write,
+  the harness sub-thread's post-spawn pre-PID-stash window) could
+  let the harness keep running against a worktree that
+  `spawn_delete_cleanup` was about to remove. The gate now carries
+  a `RebaseGateState::cancelled: Arc<AtomicBool>` flag set by
+  `drop_rebase_gate` BEFORE the SIGKILL; the background thread
+  polls the flag at every phase boundary and the harness sub-thread
+  checks it again immediately after `Command::spawn` returns. To
+  make the race unhittable from the start, the gate state is now
+  inserted into `App.rebase_gates` BEFORE the background thread is
+  spawned. C10 documents the full cancellation contract; RP6
+  documents the off-UI-thread persistence path.
