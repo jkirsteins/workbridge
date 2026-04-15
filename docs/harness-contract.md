@@ -594,10 +594,11 @@ which uses `libc::killpg` for the same reason; `Session::spawn`
 gets the new group via `libc::setsid` in `pre_exec` while the
 rebase gate uses the simpler `Command::process_group(0)` because
 it does not need a controlling terminal. Work-item delete
-(`delete_work_item_by_id`) and force-quit (`force_kill_all`)
-both call `drop_rebase_gate` to stop in-flight rebases before
-their write-side calls race the worktree removal. The PID is
-cleared by the sub-thread after `wait_with_output` returns, so a
+(`delete_work_item_by_id`), force-quit (`force_kill_all`), AND
+graceful quit (`send_sigterm_all` + `all_dead`) all tear down
+in-flight rebase gates so no shutdown entrypoint can leave a
+runaway harness running against a worktree. The PID is cleared
+by the sub-thread after `wait_with_output` returns, so a
 concurrent `drop_rebase_gate` can never `killpg` a stale-PID
 slot.
 
@@ -637,6 +638,79 @@ now released only when `drop_rebase_gate` sees the slot owned by
 the same work item it is dropping; otherwise dropping a stale
 gate for one item could clear the global slot while a different
 item still owns it, admitting an overlapping rebase.
+
+#### Architectural rule: cancellation must precede destruction
+
+The rebase gate's background thread writes its own
+`rebase_completed` / `rebase_failed` activity-log entry directly
+via `App.backend.append_activity` from the bg thread (off the UI
+thread per the blocking-I/O invariant). This means any code path
+that destroys a work item's backing data MUST first signal
+cancellation to the rebase gate, otherwise the bg thread can
+race the destruction and write to the activity log AFTER
+`backend.delete` has archived it - `append_activity` opens with
+`OpenOptions::create(true)`, so a post-delete write recreates an
+orphan active log file for a deleted item.
+
+The rule is enforced by three layers in increasing order of
+strictness:
+
+1. **`Drop for RebaseGateState` (insurance)**. Any removal of a
+   gate from `App.rebase_gates` (via `HashMap::remove`,
+   `HashMap::clear`, the App being dropped on a panic, or any
+   other path) sets the `cancelled` flag and `libc::killpg`s the
+   harness process group via the stashed PID. This is structural
+   defense against forgetting to call the helper from a new
+   cleanup site: the worst case becomes "leaked spinner /
+   debounce slot", not "runaway harness against deleted
+   worktree".
+2. **`App::drop_rebase_gate` (preferred entrypoint)**. Removes
+   the gate from the map (which fires Drop) AND ends the
+   status-bar activity AND releases the
+   `UserActionKey::RebaseOnMain` single-flight slot when its
+   payload owner matches. The activity / slot teardown needs
+   `App` access and so cannot live inside Drop; this is the
+   helper to call when you know you want a single specific gate
+   gone.
+3. **`App::abort_background_ops_for_work_item` (canonical
+   pre-delete sink)**. The single entrypoint that
+   `delete_work_item_by_id` calls in **Phase 1**, BEFORE any
+   destructive backend operation. Today this only wraps
+   `drop_rebase_gate`, but it is the extension point for any
+   future long-running background op with the same "writes to a
+   work-item-scoped resource after destruction" hazard. New ops
+   should be added here so existing destructive call sites pick
+   them up automatically.
+
+The graceful-quit path closes a parallel race: pressing Q calls
+`send_sigterm_all` and then loops on `all_dead` until it returns
+true. Before this rule, `send_sigterm_all` only signalled PTY
+sessions and `all_dead` only checked them, so a rebase started
+with no other live session would let the loop drop through
+immediately (because PTY sessions were already dead) and leave
+the harness running. After the rule, `send_sigterm_all` empties
+the rebase_gates map (Drop SIGKILLs each harness group), and
+`all_dead` includes `rebase_gates.is_empty()` so the loop can
+never let `Control::Quit` fire while a gate is still tracked.
+
+The rule is pinned by these unit tests in `src/app.rs`:
+
+- `delete_work_item_cancels_rebase_gate_before_backend_delete`
+  uses a fake backend whose `delete` impl observes the rebase
+  gate's cancellation flag at invocation time and asserts it is
+  `true`. Fails if a future refactor reorders the cleanup phases
+  or skips the `abort_background_ops_for_work_item` call.
+- `send_sigterm_all_drains_rebase_gates_for_graceful_quit` and
+  `force_kill_all_still_drains_rebase_gates` pin the two
+  shutdown paths.
+- `all_dead_returns_false_while_rebase_gate_is_in_flight` pins
+  the `all_dead` check so a refactor cannot accidentally let the
+  shutdown loop drop through with a gate still tracked.
+- `drop_rebase_gate_state_sets_cancelled_flag` pins the Drop
+  insurance directly.
+- `abort_background_ops_for_work_item_drops_rebase_gate` pins
+  the helper itself, including the "only the targeted work
+  item's gate is touched" guarantee.
 
 **Codex (secondary, not implemented)**: **supported**. The
 lifecycle contract is a POSIX process-group protocol, not a
@@ -1227,6 +1301,38 @@ harness adapter is introduced, add a dated bullet here.
   `poll_rebase_gate` directly via `App.backend.append_activity` as
   a `rebase_completed` / `rebase_failed` activity log entry. RP6
   documents the new entry shape.
+- 2026-04-16: Architectural pass on the rebase gate's cleanup
+  contract in response to the sixth Codex review (graceful-quit
+  oversight + delete ordering window). Generalised the fix into
+  a three-layer "cancellation must precede destruction" rule
+  documented in C10 and pinned by six new unit tests:
+  (1) `Drop for RebaseGateState` (insurance) - any removal of a
+  gate from `App.rebase_gates` now sets the `cancelled` flag and
+  `killpg`s the harness process group, so even a forgotten
+  helper call cannot leave a runaway harness; (2)
+  `App::drop_rebase_gate` keeps the explicit teardown for
+  status-bar activity and single-flight slot release, but the
+  cancellation/killpg code path moved into Drop; (3) new
+  `App::abort_background_ops_for_work_item` is the canonical
+  pre-delete sink and is now called from
+  `delete_work_item_by_id` Phase 1, BEFORE `backend.delete` can
+  archive the active activity log. Also: `send_sigterm_all` now
+  empties the rebase_gates map (closing the graceful-quit
+  oversight where the shutdown loop could exit before a rebase
+  was signalled because `all_dead` only checked PTY sessions),
+  `all_dead` now includes `rebase_gates.is_empty()` so the loop
+  cannot drop through with a gate still tracked, and
+  `force_kill_all`'s rebase-gate loop is left in place as
+  defense against future shutdown entrypoints that bypass
+  `send_sigterm_all`. The unit tests
+  `delete_work_item_cancels_rebase_gate_before_backend_delete`,
+  `send_sigterm_all_drains_rebase_gates_for_graceful_quit`,
+  `force_kill_all_still_drains_rebase_gates`,
+  `all_dead_returns_false_while_rebase_gate_is_in_flight`,
+  `abort_background_ops_for_work_item_drops_rebase_gate`, and
+  `drop_rebase_gate_state_sets_cancelled_flag` pin every layer
+  of the rule so a future refactor cannot regress any of them
+  without test failures.
 - 2026-04-16: Fifth Codex pass flagged a P2 doc/code drift: the
   pre-harness failure paths in `spawn_rebase_gate` (git fetch
   failure, MCP server start failure, `current_exe` failure,

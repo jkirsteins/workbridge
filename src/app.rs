@@ -555,6 +555,46 @@ pub struct RebaseGateState {
     pub cancelled: Arc<AtomicBool>,
 }
 
+/// Defense-in-depth `Drop` impl for `RebaseGateState`. Removing a
+/// gate from `App.rebase_gates` (via `HashMap::remove`, via clearing
+/// the map, or via `App` itself being dropped on a panic) is now
+/// sufficient to signal cancellation and SIGKILL the harness process
+/// group: the `cancelled` flag is set so the background thread bails
+/// out of its next phase check, and `libc::killpg` takes down the
+/// harness AND any `git rebase` / `git add` subprocesses it has
+/// started. This is a structural insurance against forgetting to
+/// call `App::drop_rebase_gate` from a new cleanup site - the helper
+/// is still the preferred entrypoint because it ALSO ends the
+/// status-bar activity and releases the user-action slot (both of
+/// which need `App` access and so cannot live inside `Drop`), but
+/// the worst case if a future caller forgets the helper is a leaked
+/// spinner / debounce slot, NOT a runaway harness against a deleted
+/// worktree.
+///
+/// The Drop runs synchronously when the state goes out of scope, so
+/// `HashMap::remove` -> let-binding fall off scope -> Drop happens
+/// in tens of microseconds. This is the same window as the explicit
+/// `killpg` in `drop_rebase_gate`, just guaranteed for every removal
+/// path including ones we have not written yet.
+impl Drop for RebaseGateState {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        let pid_to_kill = self.child_pid.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(pid) = pid_to_kill {
+            // SAFETY: `libc::killpg` is an FFI call into a stable
+            // POSIX syscall; arguments are a process-group id and a
+            // signal number, both plain integers. The harness was
+            // spawned with `Command::process_group(0)` (see
+            // `spawn_rebase_gate`), so its PID equals its
+            // process-group id. `ESRCH` after a freshly-reaped group
+            // is harmless.
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 /// Per-work-item state for an in-flight review gate.
 pub struct ReviewGateState {
     pub rx: crossbeam_channel::Receiver<ReviewGateMessage>,
@@ -2505,6 +2545,21 @@ impl App {
     /// Send SIGTERM to all alive sessions without waiting.
     /// Used to initiate graceful shutdown - the main loop continues
     /// running so the UI stays responsive.
+    ///
+    /// Also tears down all in-flight rebase gates immediately. Rebase
+    /// gates do NOT have a graceful-exit path: the headless harness
+    /// process does not handle SIGTERM (it is `claude --print`, not
+    /// an interactive PTY session), so there is nothing to "wait
+    /// for". Dropping the gate here SIGKILLs the harness process
+    /// group via `Drop for RebaseGateState`, which is safe because
+    /// the rebase gate's own state is structural - the next
+    /// `all_dead`/`all_background_done` check will see the empty
+    /// map and let the shutdown loop proceed. Without this call,
+    /// pressing Q while a rebase was in flight (with no other PTY
+    /// session alive) would let the shutdown loop exit immediately
+    /// (because `all_dead` only checks PTY sessions) and leave the
+    /// harness child running against the worktree, which is the
+    /// failure mode docs/harness-contract.md C10 calls out.
     pub fn send_sigterm_all(&mut self) {
         for entry in self.sessions.values_mut() {
             if entry.alive
@@ -2526,13 +2581,36 @@ impl App {
                 session.send_sigterm();
             }
         }
+        // Cancel all in-flight rebase gates. SIGKILL via Drop is
+        // immediate; no second pass needed in `force_kill_all`
+        // because by the time the loop reaches that path the
+        // rebase_gates map is already empty. The `force_kill_all`
+        // version of this loop is left in place so that an explicit
+        // force-quit (signal-during-shutdown / 10s deadline) is
+        // still safe even if a future caller bypasses
+        // `send_sigterm_all`.
+        let rebase_keys: Vec<WorkItemId> = self.rebase_gates.keys().cloned().collect();
+        for key in rebase_keys {
+            self.drop_rebase_gate(&key);
+        }
     }
 
     /// Check if all sessions are dead (or there are no sessions).
+    /// Also returns false if any rebase gate is still tracked: the
+    /// rebase gate is a long-running background op with its own
+    /// process tree, and the shutdown loop must not let `Control::Quit`
+    /// fire while one is in flight or workbridge will exit before
+    /// the harness has been signalled. `send_sigterm_all` empties
+    /// the rebase_gates map on the first shutdown tick, so this
+    /// check is satisfied as soon as the SIGKILL has propagated;
+    /// the explicit dependency keeps any future caller that adds a
+    /// new shutdown entrypoint from accidentally letting the loop
+    /// drop through with rebase gates still alive.
     pub fn all_dead(&self) -> bool {
         self.sessions.values().all(|entry| !entry.alive)
             && self.global_session.as_ref().is_none_or(|s| !s.alive)
             && self.terminal_sessions.values().all(|entry| !entry.alive)
+            && self.rebase_gates.is_empty()
     }
 
     /// SIGKILL all remaining alive sessions. Used for force-quit during
@@ -3093,6 +3171,23 @@ impl App {
         warnings: &mut Vec<String>,
         orphan_worktrees: &mut Vec<OrphanWorktree>,
     ) -> Result<(), crate::work_item_backend::BackendError> {
+        // -- Phase 1: Cancel long-running background ops BEFORE
+        //    destroying any backend state. The architectural rule
+        //    here is "cancellation must precede destruction" - the
+        //    rebase gate's background thread writes its own activity
+        //    log entry, and if `backend.delete` archives the active
+        //    log first there is a window where the bg thread can
+        //    call `append_activity` and recreate an orphan active
+        //    log for a deleted item (the failure mode described in
+        //    docs/harness-contract.md C10). Routing every delete
+        //    site through `abort_background_ops_for_work_item`
+        //    closes that window structurally: by the time we reach
+        //    `backend.delete` below, the gate has been removed from
+        //    the map (so its `Drop` impl set the cancelled flag and
+        //    SIGKILLed the harness group) and the bg thread will
+        //    exit on its next phase check without writing.
+        self.abort_background_ops_for_work_item(wi_id);
+
         // -- Phase 2: Backend cleanup (fatal on delete failure) --
         if let Err(e) = self.backend.pre_delete_cleanup(wi_id) {
             warnings.push(format!("pre-delete cleanup: {e}"));
@@ -3203,15 +3298,12 @@ impl App {
             self.confirm_merge = false;
         }
         self.drop_review_gate(wi_id);
-        // Drop any in-flight rebase gate for this work item. This
-        // both frees the user-action guard slot (so a recreated work
-        // item can rebase again without waiting on a stale debounce)
-        // and SIGKILLs the harness child so it cannot keep running
-        // `git rebase` against the worktree that `spawn_delete_cleanup`
-        // is about to remove on a background thread. Without this
-        // call the harness would race the worktree removal and could
-        // mutate / leave artifacts in a partially-deleted worktree.
-        self.drop_rebase_gate(wi_id);
+        // The rebase gate was already torn down in Phase 1 via
+        // `abort_background_ops_for_work_item`, BEFORE
+        // `backend.delete` ran, so no second call is needed here.
+        // Calling `drop_rebase_gate` again would be a no-op (the
+        // map entry is gone) but the redundancy would invite future
+        // confusion about the canonical cancellation point.
         if self
             .branch_gone_prompt
             .as_ref()
@@ -9577,20 +9669,20 @@ impl App {
     }
 
     /// Drop a rebase gate and end its status-bar activity. Mirrors
-    /// `drop_review_gate`: structural ownership of the
-    /// `ActivityId` lives inside `RebaseGateState`, so every site that
-    /// removes a `rebase_gates` entry MUST go through this helper to
-    /// avoid leaking a spinner.
-    ///
-    /// Cancellation contract: the helper sets the `cancelled` flag
-    /// FIRST so the background thread bails out of any blocking
-    /// pre-spawn phase it may currently be in (default-branch
-    /// resolution, `git fetch`, MCP server start, temp-config write,
-    /// or the harness sub-thread's post-spawn pre-PID-stash window).
-    /// Then it SIGKILLs the harness child if a PID is stashed in
-    /// `child_pid`. Together these two steps cover the whole gate
-    /// lifecycle: pre-spawn (via the flag) and post-spawn (via the
-    /// PID).
+    /// `drop_review_gate`. The cancellation flag and the harness
+    /// process-group SIGKILL now live in `Drop for RebaseGateState`,
+    /// so removing the entry from `rebase_gates` is sufficient on its
+    /// own to signal the background thread and kill the harness
+    /// tree. This helper still exists because it ALSO ends the
+    /// status-bar activity and releases the `UserActionKey::RebaseOnMain`
+    /// single-flight slot - both of which need `App` access and so
+    /// cannot live inside `Drop`. New code paths SHOULD prefer this
+    /// helper (or the higher-level
+    /// `App::abort_background_ops_for_work_item` that wraps it) over
+    /// raw `rebase_gates.remove(...)`, but the structural insurance
+    /// in `Drop` means a forgotten helper call is "leaked spinner /
+    /// debounce slot" rather than "runaway harness against deleted
+    /// worktree".
     ///
     /// Single-flight guard: the helper only ends the
     /// `UserActionKey::RebaseOnMain` user action if the slot is
@@ -9604,42 +9696,10 @@ impl App {
             self.user_action_work_item(&UserActionKey::RebaseOnMain) == Some(wi_id);
 
         if let Some(state) = removed {
-            // Set the cancellation flag BEFORE killing the child so
-            // the harness sub-thread, if it is currently between
-            // `Command::spawn` and the PID stash, sees the flag and
-            // kills the just-spawned child itself.
-            state.cancelled.store(true, Ordering::SeqCst);
-
-            // Take the PID under the lock and signal outside the
-            // lock. A `Some` here means the harness sub-thread has
-            // populated the slot but `wait_with_output` has not yet
-            // cleared it - i.e. the child either exists or finished
-            // microseconds ago. `libc::killpg` on a freshly-reaped
-            // PID is a harmless `ESRCH` error rather than a
-            // wrong-process signal.
-            //
-            // We use `killpg` rather than `kill` because the harness
-            // is spawned in its own process group via
-            // `Command::process_group(0)` (see `spawn_rebase_gate`):
-            // claude can run any number of `git rebase` / `git add`
-            // subprocesses while it works, and SIGKILLing only the
-            // claude PID would leave those subprocesses as orphans
-            // still mutating the worktree. Signalling the group
-            // takes the whole tree down at once, mirroring the
-            // pattern in `Session::force_kill`.
-            let pid_to_kill = state.child_pid.lock().ok().and_then(|mut slot| slot.take());
-            if let Some(pid) = pid_to_kill {
-                // SAFETY: `libc::killpg` is an FFI call into a
-                // stable POSIX syscall. The arguments are a process-
-                // group id and a signal number, both plain integers;
-                // no Rust aliasing or lifetime invariants are at
-                // risk. The harness's PID equals its process-group
-                // id because it was spawned with `process_group(0)`,
-                // which makes the child its own group leader.
-                unsafe {
-                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
+            // Cancellation + killpg happen in `Drop for
+            // RebaseGateState` when `state` falls out of scope at
+            // the end of this block. We do NOT need to manually
+            // signal them here.
             self.end_activity(state.activity);
         }
 
@@ -9648,6 +9708,39 @@ impl App {
         if slot_owner_matches {
             self.end_user_action(&UserActionKey::RebaseOnMain);
         }
+    }
+
+    /// Cancel every long-running background operation associated
+    /// with `wi_id` BEFORE the work item's backing data is
+    /// destroyed. This is the entrypoint that
+    /// `delete_work_item_by_id` (and any future
+    /// resource-destruction site) MUST call before doing anything
+    /// destructive to the work item's backend record, activity
+    /// log, worktree, or in-memory state.
+    ///
+    /// The architectural rule this helper enforces is **"cancellation
+    /// must precede destruction"**. The motivating failure mode: the
+    /// rebase gate's background thread writes a `rebase_completed`
+    /// or `rebase_failed` entry to the work item's activity log
+    /// directly (background-thread write, off the UI thread per the
+    /// blocking-I/O invariant). If `backend.delete` archives the
+    /// active activity log BEFORE the background thread is told to
+    /// stop, there is a window where the thread can still call
+    /// `append_activity` and recreate an orphan active log via
+    /// `OpenOptions::create(true)`. Routing every destructive call
+    /// site through this helper closes that window structurally:
+    /// after this returns, the gate has been removed from the map
+    /// (so its `Drop` impl has set the `cancelled` flag and SIGKILLed
+    /// the harness group) and the bg thread will exit on its next
+    /// phase check without writing.
+    ///
+    /// Today this only cancels the rebase gate. Other long-running
+    /// background ops with similar "writes after destruction"
+    /// hazards (none currently) should be added here as a single
+    /// extension point so future cleanup sites pick them up
+    /// automatically.
+    fn abort_background_ops_for_work_item(&mut self, wi_id: &WorkItemId) {
+        self.drop_rebase_gate(wi_id);
     }
 
     /// Poll all async review gates for results. Called on each timer tick.
@@ -20239,6 +20332,380 @@ mod tests {
         app.selected_item = Some(0);
         app.start_rebase_on_main();
         assert_eq!(app.status_message.as_deref(), Some("No branch to rebase"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Rebase-gate cancellation contract tests. These are the structural
+    // guards behind the architectural rule "cancellation must precede
+    // destruction" that lives in docs/harness-contract.md C10. They
+    // exercise: (a) the `Drop` impl on `RebaseGateState`, (b) the new
+    // `all_dead` check including rebase gates, (c) `send_sigterm_all`
+    // tearing down rebase gates on graceful quit, and (d) the
+    // `delete_work_item_by_id` ordering rule (cancel the gate BEFORE
+    // `backend.delete`).
+    // -----------------------------------------------------------------------
+
+    /// Helper: fabricate a `RebaseGateState` with a known cancellation
+    /// flag and PID slot for assertion. The receiver end of the
+    /// channel is dropped by the helper; the gate's poll loop will
+    /// see a disconnected channel on its next tick, which is
+    /// acceptable for tests that only exercise the cleanup paths.
+    fn make_rebase_gate_state(
+        cancelled: Arc<AtomicBool>,
+        child_pid: Arc<Mutex<Option<u32>>>,
+    ) -> RebaseGateState {
+        let (_tx, rx) = crossbeam_channel::unbounded::<RebaseGateMessage>();
+        RebaseGateState {
+            rx,
+            progress: None,
+            activity: ActivityId(0),
+            child_pid,
+            cancelled,
+        }
+    }
+
+    #[test]
+    fn drop_rebase_gate_state_sets_cancelled_flag() {
+        // Direct test of the `Drop for RebaseGateState` insurance:
+        // dropping the state by ANY removal path (HashMap::remove,
+        // map::clear, App drop on panic, ...) must signal the
+        // background thread via the cancelled flag. We deliberately
+        // use a `None` PID slot here because `killpg(0, SIGKILL)`
+        // would kill the calling process group (the test runner)
+        // and any non-zero stand-in would either fail with EPERM
+        // (PID 1) or risk hitting an unrelated process. The killpg
+        // path itself is exercised end-to-end by the rebase-gate
+        // integration in `spawn_rebase_gate`, where the PID is a
+        // real freshly-spawned harness child; here we only assert
+        // that Drop sets the flag.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let child_pid: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+        {
+            let _gate = make_rebase_gate_state(Arc::clone(&cancelled), Arc::clone(&child_pid));
+            assert!(!cancelled.load(Ordering::SeqCst));
+        } // gate drops here -> Drop impl fires
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "Drop impl must set the cancellation flag"
+        );
+        assert_eq!(
+            *child_pid.lock().unwrap(),
+            None,
+            "Drop impl must leave a None PID slot unchanged"
+        );
+    }
+
+    #[test]
+    fn all_dead_returns_false_while_rebase_gate_is_in_flight() {
+        // The shutdown loop in salsa.rs treats `all_dead()` as the
+        // "ready to quit" signal. Before the rebase gate's
+        // architectural fix, `all_dead` only checked PTY sessions,
+        // so a rebase running with no other live session would let
+        // the shutdown loop drop through immediately and leave the
+        // harness running against the worktree. The rebase_gates
+        // entry must keep `all_dead` returning false.
+        let mut app = App::new();
+        assert!(
+            app.all_dead(),
+            "fresh App with no sessions and no gates must be considered dead",
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/all-dead.json"));
+        app.rebase_gates.insert(
+            wi_id.clone(),
+            make_rebase_gate_state(Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None))),
+        );
+        assert!(
+            !app.all_dead(),
+            "all_dead must return false while a rebase gate is tracked"
+        );
+        // Removing the gate (which `send_sigterm_all` /
+        // `force_kill_all` do) must let `all_dead` return true again.
+        app.rebase_gates.remove(&wi_id);
+        assert!(
+            app.all_dead(),
+            "all_dead must return true once the rebase gate is removed",
+        );
+    }
+
+    #[test]
+    fn send_sigterm_all_drains_rebase_gates_for_graceful_quit() {
+        // The graceful quit path (Q press / first SIGTERM) calls
+        // `send_sigterm_all` followed by `all_dead` checks. Before
+        // the architectural fix, `send_sigterm_all` only signalled
+        // PTY sessions, so a rebase gate with no PTY session alive
+        // would be left untouched and the shutdown loop would let
+        // `Control::Quit` fire immediately. After the fix,
+        // `send_sigterm_all` empties the rebase_gates map (which
+        // SIGKILLs the harness process group via Drop).
+        let mut app = App::new();
+        let wi_id_a = WorkItemId::LocalFile(PathBuf::from("/tmp/quit-a.json"));
+        let wi_id_b = WorkItemId::LocalFile(PathBuf::from("/tmp/quit-b.json"));
+        let cancelled_a = Arc::new(AtomicBool::new(false));
+        let cancelled_b = Arc::new(AtomicBool::new(false));
+        app.rebase_gates.insert(
+            wi_id_a.clone(),
+            make_rebase_gate_state(Arc::clone(&cancelled_a), Arc::new(Mutex::new(None))),
+        );
+        app.rebase_gates.insert(
+            wi_id_b.clone(),
+            make_rebase_gate_state(Arc::clone(&cancelled_b), Arc::new(Mutex::new(None))),
+        );
+        assert_eq!(app.rebase_gates.len(), 2);
+        assert!(!app.all_dead());
+
+        app.send_sigterm_all();
+
+        assert!(
+            app.rebase_gates.is_empty(),
+            "send_sigterm_all must drain all rebase gates",
+        );
+        assert!(
+            cancelled_a.load(Ordering::SeqCst),
+            "rebase gate A's cancellation flag must be set after graceful quit",
+        );
+        assert!(
+            cancelled_b.load(Ordering::SeqCst),
+            "rebase gate B's cancellation flag must be set after graceful quit",
+        );
+        assert!(
+            app.all_dead(),
+            "all_dead must return true after send_sigterm_all empties the map",
+        );
+    }
+
+    #[test]
+    fn force_kill_all_still_drains_rebase_gates() {
+        // Even though `send_sigterm_all` now empties the map on its
+        // own, `force_kill_all` must keep its own loop as defense
+        // against future shutdown entrypoints that bypass
+        // `send_sigterm_all`. This test pins that behaviour so a
+        // refactor that removes the `force_kill_all` rebase loop
+        // can't ship silently.
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/force-kill.json"));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        app.rebase_gates.insert(
+            wi_id.clone(),
+            make_rebase_gate_state(Arc::clone(&cancelled), Arc::new(Mutex::new(None))),
+        );
+
+        app.force_kill_all();
+
+        assert!(
+            app.rebase_gates.is_empty(),
+            "force_kill_all must also drain rebase gates",
+        );
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "force_kill_all must trigger the cancellation flag via Drop",
+        );
+    }
+
+    #[test]
+    fn abort_background_ops_for_work_item_drops_rebase_gate() {
+        // The unified pre-delete helper must drop the rebase gate
+        // for the given work item without touching unrelated gates.
+        let mut app = App::new();
+        let wi_id_a = WorkItemId::LocalFile(PathBuf::from("/tmp/abort-a.json"));
+        let wi_id_b = WorkItemId::LocalFile(PathBuf::from("/tmp/abort-b.json"));
+        let cancelled_a = Arc::new(AtomicBool::new(false));
+        let cancelled_b = Arc::new(AtomicBool::new(false));
+        app.rebase_gates.insert(
+            wi_id_a.clone(),
+            make_rebase_gate_state(Arc::clone(&cancelled_a), Arc::new(Mutex::new(None))),
+        );
+        app.rebase_gates.insert(
+            wi_id_b.clone(),
+            make_rebase_gate_state(Arc::clone(&cancelled_b), Arc::new(Mutex::new(None))),
+        );
+
+        app.abort_background_ops_for_work_item(&wi_id_a);
+
+        assert!(
+            !app.rebase_gates.contains_key(&wi_id_a),
+            "rebase gate for the targeted work item must be removed",
+        );
+        assert!(
+            cancelled_a.load(Ordering::SeqCst),
+            "cancellation flag for the targeted gate must be set",
+        );
+        assert!(
+            app.rebase_gates.contains_key(&wi_id_b),
+            "rebase gate for an unrelated work item must NOT be removed",
+        );
+        assert!(
+            !cancelled_b.load(Ordering::SeqCst),
+            "cancellation flag for an unrelated gate must NOT be touched",
+        );
+    }
+
+    #[test]
+    fn delete_work_item_cancels_rebase_gate_before_backend_delete() {
+        // The architectural rule "cancellation must precede
+        // destruction" exists because the rebase gate's background
+        // thread writes its own activity log entry; if
+        // `backend.delete` archives the active log BEFORE the gate
+        // is told to stop, there is a window where the bg thread
+        // can call `append_activity` and recreate an orphan active
+        // log via `OpenOptions::create(true)`. This test pins the
+        // ordering by having the fake backend's `delete` impl
+        // observe the rebase gate's cancellation flag and store
+        // what it sees; the assertion below requires the flag to be
+        // `true` at the time backend.delete ran.
+        use crate::work_item::WorkItemKind;
+        use crate::work_item_backend::{
+            ActivityEntry, BackendError, CreateWorkItem, ListResult, WorkItemRecord,
+        };
+
+        struct OrderingBackend {
+            records: std::sync::Mutex<Vec<WorkItemRecord>>,
+            cancelled_observer: Arc<AtomicBool>,
+            observed_cancelled_at_delete: Arc<AtomicBool>,
+            delete_call_count: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl WorkItemBackend for OrderingBackend {
+            fn list(&self) -> Result<ListResult, BackendError> {
+                Ok(ListResult {
+                    records: self.records.lock().unwrap().clone(),
+                    corrupt: Vec::new(),
+                })
+            }
+            fn read(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
+                self.records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.id == *id)
+                    .cloned()
+                    .ok_or_else(|| BackendError::NotFound(id.clone()))
+            }
+            fn create(&self, _req: CreateWorkItem) -> Result<WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not used".into()))
+            }
+            fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
+                // Snapshot the cancellation flag at the exact moment
+                // `delete` is called. If the architectural fix is in
+                // place, `abort_background_ops_for_work_item` ran
+                // before this and the flag is `true`.
+                let observed = self.cancelled_observer.load(Ordering::SeqCst);
+                self.observed_cancelled_at_delete
+                    .store(observed, Ordering::SeqCst);
+                self.delete_call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut records = self.records.lock().unwrap();
+                if let Some(pos) = records.iter().position(|r| r.id == *id) {
+                    records.remove(pos);
+                    Ok(())
+                } else {
+                    Err(BackendError::NotFound(id.clone()))
+                }
+            }
+            fn update_status(
+                &self,
+                _id: &WorkItemId,
+                _status: WorkItemStatus,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn import(
+                &self,
+                _unlinked: &crate::work_item::UnlinkedPr,
+            ) -> Result<WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not used".into()))
+            }
+            fn import_review_request(
+                &self,
+                _rr: &crate::work_item::ReviewRequestedPr,
+            ) -> Result<WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not used".into()))
+            }
+            fn append_activity(
+                &self,
+                _id: &WorkItemId,
+                _entry: &ActivityEntry,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
+                Ok(None)
+            }
+            fn set_done_at(
+                &self,
+                _id: &WorkItemId,
+                _done_at: Option<u64>,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn activity_path_for(&self, _id: &WorkItemId) -> Option<PathBuf> {
+                None
+            }
+            fn backend_type(&self) -> BackendType {
+                BackendType::LocalFile
+            }
+        }
+
+        let cancelled_observer = Arc::new(AtomicBool::new(false));
+        let observed_cancelled_at_delete = Arc::new(AtomicBool::new(false));
+        let delete_call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = Arc::new(OrderingBackend {
+            records: std::sync::Mutex::new(Vec::new()),
+            cancelled_observer: Arc::clone(&cancelled_observer),
+            observed_cancelled_at_delete: Arc::clone(&observed_cancelled_at_delete),
+            delete_call_count: Arc::clone(&delete_call_count),
+        });
+
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/ordering.json"));
+        let record = WorkItemRecord {
+            display_id: None,
+            id: wi_id.clone(),
+            kind: WorkItemKind::Own,
+            title: "ordering".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            done_at: None,
+            plan: None,
+            repo_associations: Vec::new(),
+        };
+        backend.records.lock().unwrap().push(record);
+
+        // Insert a rebase gate whose `cancelled` flag is the SAME
+        // Arc the backend is observing. The Drop impl on
+        // RebaseGateState will set this flag when the gate is
+        // removed, so observing `true` inside `backend.delete`
+        // proves the helper ran first.
+        app.rebase_gates.insert(
+            wi_id.clone(),
+            make_rebase_gate_state(Arc::clone(&cancelled_observer), Arc::new(Mutex::new(None))),
+        );
+
+        let mut warnings: Vec<String> = Vec::new();
+        let mut orphan_worktrees: Vec<OrphanWorktree> = Vec::new();
+        app.delete_work_item_by_id(&wi_id, &mut warnings, &mut orphan_worktrees)
+            .expect("delete must succeed");
+
+        assert_eq!(
+            delete_call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "backend.delete must have been invoked exactly once",
+        );
+        assert!(
+            observed_cancelled_at_delete.load(Ordering::SeqCst),
+            "rebase gate cancellation flag must be set BEFORE backend.delete - \
+             the architectural rule 'cancellation must precede destruction' is broken",
+        );
+        assert!(
+            !app.rebase_gates.contains_key(&wi_id),
+            "rebase gate must be removed from the map after delete",
+        );
     }
 
     // -- Feature: ReviewRequest merge auto-close polling --
