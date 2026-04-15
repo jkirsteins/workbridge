@@ -625,9 +625,25 @@ pub struct SessionSpawnOk {
 /// `SessionOpenPending`. `poll_session_spawns` uses the
 /// `ActivityId` to end the "Spawning Claude session..." spinner on
 /// every terminal arm (success, error, disconnect).
+///
+/// `cancel` is a shared atomic flag that the background worker
+/// checks right before `Session::spawn`. If
+/// `drop_session_spawn_entry` has set the flag to `true` (because
+/// `apply_stage_change`, `cleanup_session_state_for`, or a delete
+/// path fired while the worker was still running its I/O-heavy
+/// tail), the worker skips the PTY fork entirely and returns an
+/// `Err("cancelled")` outcome. That closes the Codex
+/// adversarial-review window where a stale background worker
+/// could still launch `claude --dangerously-skip-permissions
+/// <kickoff-prompt>` for a work item whose stage had already
+/// advanced - which with the auto-start positional prompt in the
+/// command line would make a stale Claude process actually start
+/// touching the worktree before the UI thread's `Drop` had a
+/// chance to kill it.
 pub struct SessionSpawnPending {
     pub rx: crossbeam_channel::Receiver<SessionSpawnResult>,
     pub activity: ActivityId,
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Owned-data bundle that `finish_session_open` gathers on the UI
@@ -4327,6 +4343,17 @@ impl App {
             return;
         }
 
+        // Shared cancellation flag. `drop_session_spawn_entry`
+        // sets this to `true` when a stage change, work-item
+        // delete, or cleanup path fires while the worker is still
+        // running its I/O-heavy tail. The worker checks it right
+        // before `Session::spawn` and skips the PTY fork if
+        // cancellation has happened. Closes the Codex
+        // adversarial-review window where a stale spawn could
+        // launch `claude --dangerously-skip-permissions` for a
+        // stage the work item had already left.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_for_thread = Arc::clone(&cancel);
         let (tx, rx) = crossbeam_channel::bounded(1);
         let wi_id_for_thread = work_item_id.clone();
         std::thread::spawn(move || {
@@ -4407,6 +4434,33 @@ impl App {
                 }
             }
 
+            // Final cancellation check immediately before the
+            // PTY fork. This is the last point where a stale
+            // spawn can be aborted without any Claude process
+            // having been created. If `drop_session_spawn_entry`
+            // has flipped the flag (stage change,
+            // work-item delete, or cleanup path fired between
+            // when this worker started and now), return
+            // `Err("cancelled")` and let the MCP server fall out
+            // of scope - its `Drop` runs `stop() + unlink` on
+            // THIS thread (the background thread), not the UI
+            // thread. Any post-fork race (cancellation happens
+            // during the few milliseconds between `Session::spawn`
+            // returning and the UI-thread `poll_session_spawns`
+            // re-validating the stage) is closed by the
+            // `teardown_session_async` hop in
+            // `poll_session_spawns` / `drop_session_spawn_entry`,
+            // which keeps even the force-killed stale session off
+            // the UI tick path.
+            if cancel_for_thread.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = tx.send(SessionSpawnResult {
+                    wi_id: wi_id_for_thread,
+                    stage,
+                    outcome: Err("Session spawn cancelled".to_string()),
+                });
+                return;
+            }
+
             // Fork the Claude PTY. This is the blocking call that
             // previously ran on the UI thread; moving it here
             // removes the last bit of session-open I/O from the
@@ -4439,8 +4493,14 @@ impl App {
         });
 
         let activity = self.start_activity("Spawning Claude session...");
-        self.session_spawn_rx
-            .insert(work_item_id, SessionSpawnPending { rx, activity });
+        self.session_spawn_rx.insert(
+            work_item_id,
+            SessionSpawnPending {
+                rx,
+                activity,
+                cancel,
+            },
+        );
     }
 
     /// Move a live `Session` + `McpSocketServer` onto a background
@@ -4524,6 +4584,16 @@ impl App {
     /// prevent.
     fn drop_session_spawn_entry(&mut self, wi_id: &WorkItemId) {
         if let Some(entry) = self.session_spawn_rx.remove(wi_id) {
+            // Flip the shared cancellation flag FIRST so the
+            // background worker, if it is still running, aborts
+            // before `Session::spawn` and never forks a stale
+            // Claude process. If the worker has already passed
+            // the cancel check and reached the fork, the
+            // `try_recv` below + the post-fork teardown hop in
+            // `poll_session_spawns` catches the race.
+            entry
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
             self.end_activity(entry.activity);
             // Drain any buffered result BEFORE the Receiver
             // inside `entry` falls out of scope. If the channel
@@ -17111,8 +17181,14 @@ mod tests {
         })
         .expect("test channel send must succeed");
         let activity = app.start_activity("Spawning Claude session...");
-        app.session_spawn_rx
-            .insert(wi_id.clone(), SessionSpawnPending { rx, activity });
+        app.session_spawn_rx.insert(
+            wi_id.clone(),
+            SessionSpawnPending {
+                rx,
+                activity,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
 
         // Drive the poll. This is the UI-thread tick path under
         // test. It must return quickly - the teardown is
@@ -17149,6 +17225,76 @@ mod tests {
             "poll_session_spawns must not block on Session::Drop \
              - inline drop would take at least the SIGTERM grace \
              window (50ms). Elapsed: {elapsed:?}",
+        );
+    }
+
+    /// Codex adversarial-review finding: `drop_session_spawn_entry`
+    /// MUST set the shared cancellation flag on the pending entry
+    /// before the Receiver falls out of scope. The flag is what
+    /// lets the background worker abort right before `Session::spawn`
+    /// and avoid forking a stale Claude process for a stage that
+    /// has already been advanced away from. Without this set, a
+    /// stage change fired during the worker's I/O tail would still
+    /// result in `claude --dangerously-skip-permissions <kickoff>`
+    /// being launched against the worktree.
+    ///
+    /// Structural test: construct a `SessionSpawnPending` with a
+    /// known `Arc<AtomicBool>`, install it under a work-item key,
+    /// hold a second Arc clone of the same flag, call
+    /// `drop_session_spawn_entry`, and assert the second clone
+    /// now reads `true`. The Receiver side of the pending entry
+    /// is drained empty so the function takes the "no buffered
+    /// result" branch.
+    #[test]
+    fn drop_session_spawn_entry_sets_cancel_flag() {
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-cancel-flag.json"));
+
+        // Make a closed channel so try_recv returns Empty (no
+        // buffered result) - the cancel flag should still be
+        // set regardless of whether anything is buffered.
+        let (_tx, rx) = crossbeam_channel::bounded::<SessionSpawnResult>(1);
+
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_witness = Arc::clone(&cancel);
+
+        let activity = app.start_activity("Spawning Claude session...");
+        app.session_spawn_rx.insert(
+            wi_id.clone(),
+            SessionSpawnPending {
+                rx,
+                activity,
+                cancel,
+            },
+        );
+
+        assert!(
+            !cancel_witness.load(std::sync::atomic::Ordering::Acquire),
+            "cancel flag starts false before drop_session_spawn_entry",
+        );
+
+        app.drop_session_spawn_entry(&wi_id);
+
+        assert!(
+            cancel_witness.load(std::sync::atomic::Ordering::Acquire),
+            "drop_session_spawn_entry must flip the cancel flag so \
+             the background worker aborts before Session::spawn - \
+             without this, a stale spawn can still launch claude \
+             --dangerously-skip-permissions for an advanced stage",
+        );
+        assert!(
+            !app.session_spawn_rx.contains_key(&wi_id),
+            "the pending entry must also be removed from the map",
+        );
+        assert!(
+            app.current_activity().is_none(),
+            "the 'Spawning Claude session...' spinner must be ended",
         );
     }
 
