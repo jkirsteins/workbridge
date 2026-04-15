@@ -1772,6 +1772,13 @@ impl App {
         }
 
         // Remove terminal sessions whose work item no longer exists.
+        // Terminal sessions do NOT have paired MCP servers (they're
+        // raw shell spawns in the Terminal tab), so pass `None` to
+        // the teardown helper. The kill + grace sleep + wait all
+        // run on the background thread per Codex adversarial review
+        // - running them inline here would freeze the TUI on a
+        // liveness tick that sweeps a terminal tab whose work item
+        // was just deleted.
         let terminal_orphans: Vec<_> = self
             .terminal_sessions
             .keys()
@@ -1779,10 +1786,10 @@ impl App {
             .cloned()
             .collect();
         for wi_id in terminal_orphans {
-            if let Some(mut entry) = self.terminal_sessions.remove(&wi_id)
-                && let Some(mut session) = entry.session.take()
+            if let Some(entry) = self.terminal_sessions.remove(&wi_id)
+                && let Some(session) = entry.session
             {
-                session.kill();
+                Self::teardown_live_session_async(session, None);
             }
         }
     }
@@ -2443,18 +2450,29 @@ impl App {
         self.backend.delete(wi_id)?;
 
         // -- Phase 3: Kill session and clean up MCP --
+        //
+        // `cleanup_session_state_for` routes any pending opens /
+        // spawns + the MCP server through the async teardown
+        // helpers; the session itself is handled here. Both the
+        // Claude session and the terminal session are handed to
+        // `teardown_live_session_async` so `Session::kill`'s
+        // SIGTERM + 50ms grace + SIGKILL + `child.wait` runs on
+        // a background thread, not on the UI-thread delete path.
+        // Codex adversarial review flagged the inline kills here
+        // as a `docs/UI.md` "Blocking I/O Prohibition" violation
+        // analogous to the `apply_stage_change` case.
         self.cleanup_session_state_for(wi_id);
         if let Some(key) = self.session_key_for(wi_id)
-            && let Some(mut entry) = self.sessions.remove(&key)
-            && let Some(ref mut session) = entry.session
+            && let Some(entry) = self.sessions.remove(&key)
+            && let Some(session) = entry.session
         {
-            session.kill();
+            Self::teardown_live_session_async(session, None);
         }
         // Kill associated terminal session.
-        if let Some(mut entry) = self.terminal_sessions.remove(wi_id)
-            && let Some(ref mut session) = entry.session
+        if let Some(entry) = self.terminal_sessions.remove(wi_id)
+            && let Some(session) = entry.session
         {
-            session.kill();
+            Self::teardown_live_session_async(session, None);
         }
 
         // -- Phase 4: (removed) Resource cleanup runs on a background
