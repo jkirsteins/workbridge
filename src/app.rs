@@ -778,6 +778,14 @@ pub struct App {
     pub unlinked_prs: Vec<UnlinkedPr>,
     /// PRs where the user has been requested as a reviewer.
     pub review_requested_prs: Vec<ReviewRequestedPr>,
+    /// Cached GitHub login of the authenticated user, as reported by
+    /// the fetcher thread (which in turn calls `gh api user`). None
+    /// until the first successful fetch reports it; subsequent fetch
+    /// results never clobber a `Some` value with `None` so transient
+    /// `gh api user` failures do not erase a previously known login.
+    /// Consumed by review-request row rendering and sorting to decide
+    /// which rows are direct-to-you vs. team-only.
+    pub current_user_login: Option<String>,
     /// Sessions keyed by (work item ID, stage).
     pub sessions: HashMap<(WorkItemId, WorkItemStatus), SessionEntry>,
     /// Fetched data per repo path (populated by background fetcher).
@@ -1106,6 +1114,7 @@ impl App {
             work_items: Vec::new(),
             unlinked_prs: Vec::new(),
             review_requested_prs: Vec::new(),
+            current_user_login: None,
             sessions: HashMap::new(),
             repo_data: HashMap::new(),
             fetch_rx: None,
@@ -2019,6 +2028,15 @@ impl App {
                                 }
                             }
                         }
+                    }
+                    // Capture the authenticated user's login so review-
+                    // request row rendering can classify direct-to-you vs.
+                    // team. Never clobber a known login with None - a
+                    // transient `gh api user` failure should not erase a
+                    // value that was successfully resolved earlier in the
+                    // session.
+                    if let Some(login) = result.current_user_login.clone() {
+                        self.current_user_login = Some(login);
                     }
                     self.repo_data.insert(result.repo_path.clone(), result);
                     // Clear re-open suppression only after ALL repos have
@@ -3095,7 +3113,24 @@ impl App {
                     count: self.review_requested_prs.len(),
                     kind: GroupHeaderKind::Normal,
                 });
-                for i in 0..self.review_requested_prs.len() {
+                // Sort direct-to-you rows to the top of the block so the
+                // most actionable reviews are always surfaced first. The
+                // sort key is the `is_direct_request` boolean (false < true
+                // but we negate below so direct comes first) and Rust's
+                // `sort_by_key` is stable, so the original `gh` order is
+                // preserved within each bucket. When the login is unknown
+                // (fetch has not yet reported one), every row classifies
+                // as team and the original order is preserved unchanged.
+                let login = self.current_user_login.as_deref();
+                let mut indices: Vec<usize> = (0..self.review_requested_prs.len()).collect();
+                indices.sort_by_key(|&i| {
+                    if self.review_requested_prs[i].is_direct_request(login) {
+                        0u8
+                    } else {
+                        1u8
+                    }
+                });
+                for i in indices {
                     list.push(DisplayEntry::ReviewRequestItem(i));
                 }
             }
@@ -9126,7 +9161,7 @@ mod tests {
             worktrees: Ok(vec![]),
             prs: Ok(vec![]),
             review_requested_prs: Ok(vec![]),
-
+            current_user_login: None,
             issues: vec![],
         }))
         .unwrap();
@@ -9190,7 +9225,7 @@ mod tests {
             worktrees: Ok(vec![]),
             prs: Ok(vec![]),
             review_requested_prs: Ok(vec![]),
-
+            current_user_login: None,
             issues: vec![],
         }))
         .unwrap();
@@ -9207,7 +9242,7 @@ mod tests {
             worktrees: Ok(vec![]),
             prs: Ok(vec![]),
             review_requested_prs: Ok(vec![]),
-
+            current_user_login: None,
             issues: vec![],
         }))
         .unwrap();
@@ -9270,7 +9305,7 @@ mod tests {
                 worktrees: Ok(vec![]),
                 prs: Ok(vec![]),
                 review_requested_prs: Ok(vec![]),
-
+                current_user_login: None,
                 issues: vec![],
             },
         );
@@ -9300,7 +9335,7 @@ mod tests {
                 worktrees: Ok(vec![]),
                 prs: Ok(vec![]),
                 review_requested_prs: Ok(vec![]),
-
+                current_user_login: None,
                 issues: vec![],
             },
         );
@@ -9312,7 +9347,7 @@ mod tests {
                 worktrees: Ok(vec![]),
                 prs: Ok(vec![]),
                 review_requested_prs: Ok(vec![]),
-
+                current_user_login: None,
                 issues: vec![],
             },
         );
@@ -9355,7 +9390,7 @@ mod tests {
             worktrees: Err(WorktreeError::GitError("not a git repository".into())),
             prs: Ok(vec![]),
             review_requested_prs: Ok(vec![]),
-
+            current_user_login: None,
             issues: vec![],
         }))
         .unwrap();
@@ -9385,7 +9420,7 @@ mod tests {
             worktrees: Err(WorktreeError::GitError("still broken".into())),
             prs: Ok(vec![]),
             review_requested_prs: Ok(vec![]),
-
+            current_user_login: None,
             issues: vec![],
         }))
         .unwrap();
@@ -9849,7 +9884,7 @@ mod tests {
                 "rate limited".into(),
             )),
             review_requested_prs: Ok(vec![]),
-
+            current_user_login: None,
             issues: vec![],
         }))
         .unwrap();
@@ -11364,6 +11399,104 @@ mod tests {
     }
 
     #[test]
+    fn display_list_review_requests_sorted_direct_first_stable() {
+        use crate::work_item::{
+            CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision, ReviewRequestedPr,
+        };
+
+        fn make_rr(number: u64, reviewers: &[&str], teams: &[&str]) -> ReviewRequestedPr {
+            ReviewRequestedPr {
+                repo_path: PathBuf::from("/repo"),
+                pr: PrInfo {
+                    number,
+                    title: format!("PR {number}"),
+                    state: PrState::Open,
+                    is_draft: false,
+                    review_decision: ReviewDecision::Pending,
+                    checks: CheckStatus::None,
+                    mergeable: MergeableState::Unknown,
+                    url: format!("https://example.com/{number}"),
+                },
+                branch: format!("feature-{number}"),
+                requested_reviewer_logins: reviewers.iter().map(|s| (*s).to_string()).collect(),
+                requested_team_slugs: teams.iter().map(|s| (*s).to_string()).collect(),
+            }
+        }
+
+        // Input order (as returned by gh):
+        //   1 team-only (core-team)
+        //   2 direct (alice)
+        //   3 team-only (backend)
+        //   4 direct (alice)
+        //   5 team-only (frontend)
+        //
+        // Expected order after sort:
+        //   2 direct, 4 direct, 1 team, 3 team, 5 team.
+        // Within each bucket the original gh order is preserved (stable).
+        let mut app = App::new();
+        app.current_user_login = Some("alice".into());
+        app.review_requested_prs = vec![
+            make_rr(1, &[], &["core-team"]),
+            make_rr(2, &["alice"], &[]),
+            make_rr(3, &[], &["backend"]),
+            make_rr(4, &["alice"], &["core-team"]),
+            make_rr(5, &[], &["frontend"]),
+        ];
+        app.build_display_list();
+
+        let review_numbers: Vec<u64> = app
+            .display_list
+            .iter()
+            .filter_map(|e| match e {
+                DisplayEntry::ReviewRequestItem(i) => Some(app.review_requested_prs[*i].pr.number),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(review_numbers, vec![2, 4, 1, 3, 5]);
+    }
+
+    #[test]
+    fn display_list_review_requests_no_reorder_when_login_unknown() {
+        use crate::work_item::{
+            CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision, ReviewRequestedPr,
+        };
+
+        let mut app = App::new();
+        // Login unknown - first fetch tick hasn't resolved it yet.
+        app.current_user_login = None;
+        let make = |number: u64, reviewers: &[&str]| ReviewRequestedPr {
+            repo_path: PathBuf::from("/repo"),
+            pr: PrInfo {
+                number,
+                title: format!("PR {number}"),
+                state: PrState::Open,
+                is_draft: false,
+                review_decision: ReviewDecision::Pending,
+                checks: CheckStatus::None,
+                mergeable: MergeableState::Unknown,
+                url: String::new(),
+            },
+            branch: format!("b{number}"),
+            requested_reviewer_logins: reviewers.iter().map(|s| (*s).to_string()).collect(),
+            requested_team_slugs: Vec::new(),
+        };
+        app.review_requested_prs =
+            vec![make(1, &["alice"]), make(2, &["bob"]), make(3, &["alice"])];
+        app.build_display_list();
+
+        let review_numbers: Vec<u64> = app
+            .display_list
+            .iter()
+            .filter_map(|e| match e {
+                DisplayEntry::ReviewRequestItem(i) => Some(app.review_requested_prs[*i].pr.number),
+                _ => None,
+            })
+            .collect();
+        // Stable sort with equal keys preserves input order.
+        assert_eq!(review_numbers, vec![1, 2, 3]);
+    }
+
+    #[test]
     fn display_list_multiple_repos_get_separate_groups() {
         let mut app = App::new();
         app.work_items = vec![
@@ -11485,6 +11618,7 @@ mod tests {
                 prs: Ok(Vec::new()),
                 review_requested_prs: Ok(Vec::new()),
                 issues: Vec::new(),
+                current_user_login: None,
             },
         );
     }
@@ -12339,6 +12473,7 @@ mod tests {
                 worktrees: Ok(Vec::new()),
                 prs: Ok(Vec::new()),
                 review_requested_prs: Ok(Vec::new()),
+                current_user_login: None,
                 issues: Vec::new(),
             },
         );
@@ -14644,6 +14779,7 @@ mod tests {
                 }]),
                 prs: Ok(vec![]),
                 review_requested_prs: Ok(vec![]),
+                current_user_login: None,
                 issues: vec![],
             },
         );
@@ -14796,8 +14932,11 @@ mod tests {
                     head_repo_owner: None,
                     author: None,
                     mergeable: String::new(),
+                    requested_reviewer_logins: Vec::new(),
+                    requested_team_slugs: Vec::new(),
                 }]),
                 review_requested_prs: Ok(vec![]),
+                current_user_login: None,
                 issues: vec![],
             },
         );
@@ -15364,6 +15503,7 @@ mod tests {
                 worktrees: Ok(worktrees),
                 prs: Ok(Vec::new()),
                 review_requested_prs: Ok(Vec::new()),
+                current_user_login: None,
                 issues: Vec::new(),
             },
         );

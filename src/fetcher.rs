@@ -142,6 +142,14 @@ fn fetcher_loop(
             None => Ok(Vec::new()),
         };
 
+        // Step 3c: resolve the current user's GitHub login so the UI
+        // can classify review-request rows as direct-to-you vs. team.
+        // The GhCliClient caches the result after the first successful
+        // call, so repeated ticks cost nothing beyond the cache read.
+        // Failure here is non-fatal: the UI degrades by classifying
+        // everything as team (no row is falsely promoted to "you").
+        let current_user_login = github_client.current_user_login().ok();
+
         // Step 4: extract issue numbers from worktree branch names AND
         // extra branches (backend records without worktrees) and fetch each
         let mut issues = Vec::new();
@@ -188,6 +196,7 @@ fn fetcher_loop(
             prs,
             review_requested_prs,
             issues,
+            current_user_login,
         };
 
         if tx.send(FetchMessage::RepoData(result)).is_err() {
@@ -384,6 +393,8 @@ mod tests {
                 head_repo_owner: None,
                 author: None,
                 mergeable: String::new(),
+                requested_reviewer_logins: Vec::new(),
+                requested_team_slugs: Vec::new(),
             }],
             issues: vec![GithubIssue {
                 number: 42,

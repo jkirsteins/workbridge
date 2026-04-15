@@ -489,7 +489,8 @@ fn main() -> Result<(), AppError> {
         };
     let worktree_service: Arc<dyn worktree_service::WorktreeService + Send + Sync> =
         Arc::new(GitWorktreeService);
-    let github_client: Arc<dyn github_client::GithubClient + Send + Sync> = Arc::new(GhCliClient);
+    let github_client: Arc<dyn github_client::GithubClient + Send + Sync> =
+        Arc::new(GhCliClient::new());
 
     let mut app = App::with_config_and_worktree_service(
         cfg,
