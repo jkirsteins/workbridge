@@ -608,14 +608,29 @@ because the harness has not been spawned yet. To close that race,
 `drop_rebase_gate` BEFORE the SIGKILL. The background thread
 polls the flag at every phase boundary and exits cleanly (dropping
 its MCP server and removing its temp config) on a `true` reading.
-The harness sub-thread checks the same flag immediately after
-`Command::spawn` returns and, if set, kills the just-spawned child
-itself before stashing the PID. The flag covers the entire
-pre-spawn lifecycle; the PID covers everything after spawn. To
-make the cancellation race unhittable from the start, the gate
-state is inserted into `App.rebase_gates` BEFORE the background
-thread is spawned, so any `drop_rebase_gate` call sees the entry
-even if the thread has not been scheduled yet.
+The harness sub-thread stashes the PID into `child_pid` FIRST
+and then re-checks the flag, in that order: stashing first means
+that for every interleaving with `drop_rebase_gate` either the
+drop path sees the PID and `killpg`s it, or the sub-thread sees
+the (sticky) cancellation flag and `killpg`s the group itself.
+The flag's stickiness (once set, never cleared) is the
+load-bearing property. The flag covers the entire pre-spawn
+lifecycle; the PID covers everything after spawn. To make the
+cancellation race unhittable from the start, the gate state is
+inserted into `App.rebase_gates` BEFORE the background thread is
+spawned, so any `drop_rebase_gate` call sees the entry even if
+the thread has not been scheduled yet.
+
+There is one final cancellation check between the harness exit
+and the background thread's `backend.append_activity` call. If
+the flag is set there, the thread exits without writing the
+activity log entry and without sending the result through `tx`.
+Without this check, a delete that races the harness exit could
+let the background thread call `append_activity` after
+`backend.delete` has already moved the active log to `archive/`;
+because `append_activity` opens with `OpenOptions::create(true)`,
+it would recreate an orphan active activity log for a deleted
+work item.
 
 The single-flight admission (`UserActionKey::RebaseOnMain`) is
 now released only when `drop_rebase_gate` sees the slot owned by
@@ -1212,6 +1227,28 @@ harness adapter is introduced, add a dated bullet here.
   `poll_rebase_gate` directly via `App.backend.append_activity` as
   a `rebase_completed` / `rebase_failed` activity log entry. RP6
   documents the new entry shape.
+- 2026-04-16: Fourth Codex pass on the rebase gate found two
+  more cancellation races. (1) P1: The harness sub-thread was
+  checking `cancelled` BEFORE stashing the PID into `child_pid`,
+  which left a window where `drop_rebase_gate` could fire
+  between the check and the stash, find `None` in the slot, and
+  silently fail to `killpg` the group. The sub-thread then
+  stashed the PID and waited normally, leaving claude (and its
+  `git rebase` subprocesses, since `process_group(0)` is in
+  effect) running against a worktree the cleanup thread was
+  about to remove. The fix flips the order: the PID is stashed
+  FIRST, then `cancelled` is re-checked. The flag's stickiness
+  (once set, never cleared) means every interleaving converges
+  on either the drop path or the sub-thread killpg-ing the
+  group. (2) P2: The background thread's
+  `backend.append_activity` call had no cancellation guard, so a
+  delete racing the harness exit could let the thread append to
+  the work item's activity log AFTER `backend.delete` had
+  archived the active log, recreating an orphan active log via
+  `OpenOptions::create(true)`. The thread now re-checks
+  `cancelled` immediately before the append and exits without
+  writing or sending the result if the flag is set. C10 updated
+  with both new ordering rules.
 - 2026-04-16: Third Codex pass on the rebase gate found two more
   issues. (1) P1: The cancellation path was using `libc::kill`
   against the claude PID alone, but claude was inheriting

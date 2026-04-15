@@ -9202,28 +9202,50 @@ impl App {
                             return;
                         }
                     };
-                    // Cancellation check immediately after spawn. If
-                    // the gate was torn down between the parent
-                    // thread's pre-spawn check and `Command::spawn`
-                    // returning, we hold the only handle to a child
-                    // that nobody is going to wait on; signal the
-                    // entire process group (not just the harness
-                    // PID) and reap so any subprocesses claude has
-                    // already started are also stopped.
+                    // Stash the PID FIRST, then check cancellation.
+                    // The previous ordering (check then stash) had a
+                    // race window: if `drop_rebase_gate` ran between
+                    // the cancellation check and the stash, it would
+                    // set `cancelled = true`, find `None` in the
+                    // PID slot, and silently fail to killpg the
+                    // group; the sub-thread would then continue past
+                    // the (already-passed) check, stash the PID, and
+                    // call `wait_with_output` against a child
+                    // nobody was going to kill. By stashing first
+                    // and checking second we guarantee one of two
+                    // outcomes for every interleaving: either the
+                    // drop path sees the PID and killpgs it for us,
+                    // or we see the cancellation flag (which is
+                    // sticky once set) and killpg the group
+                    // ourselves below. The flag's stickiness is the
+                    // load-bearing property here.
+                    let pid = child.id();
+                    if let Ok(mut slot) = child_pid.lock() {
+                        *slot = Some(pid);
+                    }
                     if cancelled.load(Ordering::SeqCst) {
+                        // Clear the slot first so `drop_rebase_gate`
+                        // does not also try to killpg this PID
+                        // (double kill would be `ESRCH` after the
+                        // first one reaped, which is harmless but
+                        // pointless).
+                        if let Ok(mut slot) = child_pid.lock() {
+                            *slot = None;
+                        }
                         // SAFETY: `libc::killpg` is an FFI call into
                         // a stable POSIX syscall; arguments are a
                         // process-group id and a signal number. The
-                        // group leader is `child.id()` because we
-                        // passed `process_group(0)` above.
+                        // group leader is `pid` because we passed
+                        // `process_group(0)` above. Calling killpg
+                        // on a freshly-reaped group is a harmless
+                        // ESRCH error rather than a wrong-process
+                        // signal, so racing with `drop_rebase_gate`
+                        // having already killpg'd is safe.
                         unsafe {
-                            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
                         }
                         let _ = child.wait();
                         return;
-                    }
-                    if let Ok(mut slot) = child_pid.lock() {
-                        *slot = Some(child.id());
                     }
                     let result = child.wait_with_output();
                     if let Ok(mut slot) = child_pid.lock() {
@@ -9393,6 +9415,25 @@ impl App {
                     activity_log_error: None,
                 },
             };
+
+            // Final cancellation check before we touch the backend.
+            // If the gate was torn down (work item deleted, force-
+            // quit) while we were processing the harness output,
+            // the work item's active activity log has already been
+            // moved to `archive/` by `backend.delete`, and
+            // `append_activity` opens with `create(true)` -
+            // recreating an orphan active activity log for a
+            // deleted item. Skipping the append AND the result send
+            // here closes that race for the common case (delete
+            // happens before the harness finishes or while the
+            // result is being processed). The result send is also
+            // gated because by this point `drop_rebase_gate` has
+            // dropped the receiver, so the send would be a silent
+            // no-op anyway, but skipping it makes the cancellation
+            // contract uniform with the earlier phases.
+            if cancelled.load(Ordering::SeqCst) {
+                return;
+            }
 
             // Build the activity log entry from the result and
             // append it via the backend on THIS background thread.
