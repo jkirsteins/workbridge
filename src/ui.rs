@@ -1664,11 +1664,17 @@ fn format_unlinked_item<'a>(
     // title (4 spaces: 2 for margin + 2 for "? " prefix). The meta (repo dir)
     // line is indented by 2 spaces to align with the branch title, matching
     // the convention in `format_work_item_entry`.
+    //
+    // rest_width budgets against `max_width` (not `content_width`): continuation
+    // rows carry no margin span, so the full panel width `max_width =
+    // content_width + 2` is available, and the 4-space indent consumes 4 of
+    // those cols. That leaves `max_width - 4 = content_width - 2` cols for the
+    // wrapped text body.
     let prefix = "? ";
     let first_width = content_width
         .saturating_sub(prefix.width() + right.width() + 1)
         .max(1);
-    let rest_width = content_width.saturating_sub(4).max(1);
+    let rest_width = content_width.saturating_sub(2).max(1);
 
     let branch_lines = wrap_two_widths(&unlinked.branch, first_width, rest_width);
     let first_branch = branch_lines.first().cloned().unwrap_or_default();
@@ -1717,14 +1723,14 @@ fn format_unlinked_item<'a>(
     // in case of a very narrow pane or a pathologically long directory name.
     // `wrap_text`'s budget is per-line content width (the prepended "  " is
     // added on top), so pass `content_width` directly to match
-    // `format_work_item_entry`'s meta wrap convention.
+    // `format_work_item_entry`'s meta wrap convention exactly.
     let repo_name: String = unlinked
         .repo_path
         .file_name()
         .and_then(|n| n.to_str())
         .map(str::to_string)
         .unwrap_or_else(|| "<unknown repo>".to_string());
-    for wrapped in wrap_text(&repo_name, content_width.max(1)) {
+    for wrapped in wrap_text(&repo_name, content_width) {
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(wrapped, meta_style),
