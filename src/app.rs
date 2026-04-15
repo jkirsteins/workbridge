@@ -714,6 +714,47 @@ impl SpawnFlag {
     }
 }
 
+/// Write `contents` to `path` with owner-only permissions
+/// (`0600` on Unix). Used by `begin_session_spawn`'s background
+/// worker to persist the per-session MCP config file under
+/// `std::env::temp_dir()`.
+///
+/// The MCP config embeds each repo's configured MCP server
+/// `env` values (see `crate::mcp::build_mcp_config`), which can
+/// contain API tokens and other secrets. Writing the file with
+/// the default umask would leave it world-readable on many
+/// installations, exposing those secrets to any other local
+/// user or process that can list `/tmp`. This helper routes
+/// through `std::fs::OpenOptions::mode(0o600)` on Unix so the
+/// file is readable only by its owner; Codex adversarial
+/// review flagged the earlier `std::fs::write` as a leak
+/// vector.
+///
+/// On non-Unix platforms the mode flag is silently dropped and
+/// the helper falls back to a plain `std::fs::write` - there
+/// is no portable file-permission API, and workbridge's
+/// supported platforms are macOS and Linux where the mode is
+/// always enforced.
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents)?;
+        f.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
 /// Result from the asynchronous worktree creation thread.
 pub struct WorktreeCreateResult {
     /// The work item the worktree was created for.
@@ -1836,14 +1877,41 @@ impl App {
 
     /// Stop all MCP servers, clear activity state, and remove temp config files.
     /// Called on app exit.
+    ///
+    /// Takes the MCP servers and the global config path out of
+    /// `App` synchronously (pure in-memory map operations), then
+    /// hands them to a detached background thread that runs
+    /// `McpSocketServer::Drop` (`stop()` + `remove_file` on the
+    /// socket path) and `std::fs::remove_file` on the global
+    /// temp config. Codex adversarial review flagged the earlier
+    /// synchronous clear as a `docs/UI.md` "Blocking I/O
+    /// Prohibition" P0: `cleanup_all_mcp` is called on the exit
+    /// path from `salsa.rs`, and the per-server unlink happens
+    /// while the UI is still painting the last frame. Moving
+    /// the drops off-thread is the same pattern as the
+    /// per-session teardown path. On exit the background thread
+    /// may still be running when `main` returns, which is fine -
+    /// the OS cleans up any unfinished temp-file / socket
+    /// unlinks on process exit.
     pub fn cleanup_all_mcp(&mut self) {
-        self.mcp_servers.clear();
         self.claude_working.clear();
-        self.global_mcp_server = None;
-        if let Some(ref path) = self.global_mcp_config_path {
-            let _ = std::fs::remove_file(path);
+        let session_servers: Vec<McpSocketServer> =
+            self.mcp_servers.drain().map(|(_, v)| v).collect();
+        let global_server = self.global_mcp_server.take();
+        let global_config_path = self.global_mcp_config_path.take();
+
+        if session_servers.is_empty() && global_server.is_none() && global_config_path.is_none() {
+            return;
         }
-        self.global_mcp_config_path = None;
+        std::thread::spawn(move || {
+            for server in session_servers {
+                drop(server);
+            }
+            drop(global_server);
+            if let Some(path) = global_config_path {
+                let _ = std::fs::remove_file(path);
+            }
+        });
     }
 
     /// Resize PTY sessions and vt100 parsers to match the current pane
@@ -4545,7 +4613,21 @@ impl App {
                 uuid::Uuid::new_v4()
             ));
             let mut final_cmd = cmd;
-            if let Err(e) = std::fs::write(&config_path, &mcp_config) {
+            // Write with mode 0600 so the file is readable only
+            // by the owning user. The MCP config embeds each
+            // repo's configured MCP server `env` values (see
+            // `crate::mcp::build_mcp_config`), which can contain
+            // API tokens and other secrets. Writing to a shared
+            // temp directory with the default umask (often
+            // world-readable) exposes those secrets to any
+            // other local user or process that can list `/tmp`.
+            // Codex adversarial review flagged the earlier
+            // `std::fs::write` as a leak vector. On non-Unix
+            // platforms we fall back to the plain write - there
+            // is no portable permission API - but workbridge's
+            // supported platforms are macOS and Linux, where
+            // the explicit mode is enforced.
+            if let Err(e) = write_private_file(&config_path, mcp_config.as_bytes()) {
                 let _ = tx.send(SessionSpawnResult {
                     wi_id: wi_id_for_thread,
                     stage,
@@ -17477,6 +17559,33 @@ mod tests {
              - inline drop would take at least the SIGTERM grace \
              window (50ms). Elapsed: {elapsed:?}",
         );
+    }
+
+    /// Codex adversarial-review finding: the per-session MCP
+    /// config file is written to the shared temp directory and
+    /// embeds each repo's configured MCP server `env` values,
+    /// which can contain API tokens. The file MUST be written
+    /// with owner-only (0600) permissions so other local users
+    /// or processes cannot read the secrets out of /tmp. This
+    /// test writes a file via `write_private_file` and asserts
+    /// the resulting mode has exactly the owner-read + owner-
+    /// write bits set, with every "other" permission bit clear.
+    #[test]
+    #[cfg(unix)]
+    fn write_private_file_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let path = tmp.path().join("secret.json");
+        write_private_file(&path, br#"{"secret": "redacted"}"#).expect("write must succeed");
+        let meta = std::fs::metadata(&path).expect("stat must succeed");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "write_private_file must create the file with mode 0600, got {mode:o}",
+        );
+        // Sanity: the content is actually there.
+        let content = std::fs::read_to_string(&path).expect("read must succeed");
+        assert_eq!(content, r#"{"secret": "redacted"}"#);
     }
 
     /// Codex adversarial-review finding: `apply_stage_change`
