@@ -361,16 +361,6 @@ pub fn app_event(
                 // from review_gates.
                 state.poll_mcp_status_updates();
 
-                // Detect and respawn sessions that died instantly after
-                // a `--resume <unknown-uuid>` attempt. MUST run before
-                // `check_liveness`: the retry reuses the existing
-                // per-work-item MCP server, so we cannot let
-                // `check_liveness` -> `cleanup_session_state_for` tear
-                // it down first. See `App::poll_resume_probes` and
-                // `docs/work-items.md` "Session identity and
-                // resumption" for the protocol.
-                state.poll_resume_probes();
-
                 // Liveness check on all sessions.
                 state.check_liveness();
 

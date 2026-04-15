@@ -356,21 +356,31 @@ history is restored. Stage transitions deliberately change the UUID
 (because the tuple changes), so each stage keeps its own isolated
 resumable history and there is no cross-stage history bleed.
 
-The spawn protocol in `App::finish_session_open` always starts with
-`--resume <uuid>`. If no session yet exists under that UUID (fresh
-install, new work item, a stage being entered for the first time after
-the feature landed) Claude Code exits almost immediately with a
-"No conversation found" message. A background `poll_resume_probes`
-tick detects the near-instant exit and transparently respawns once
-with `--session-id <uuid>`, which creates a new session under the
-same deterministic UUID. The user never sees the retry. The probe
-state machine is self-terminating: it retries at most once, and on
-the second failure it surfaces a normal spawn-error status message.
-The probe lives in a map keyed by `(WorkItemId, WorkItemStatus)` - the
-same key `App::sessions` uses - so every probe structurally owns the
-retry state of exactly one session spawn and orphan cleanup is
-handled by the polling tick itself rather than scattered cleanup
-calls.
+The spawn protocol in `App::finish_session_open` chooses between
+`--resume <uuid>` and `--session-id <uuid>` up-front, before the
+process is spawned. The choice is driven by
+`session_id::session_exists_on_disk`, which scans
+`~/.claude/projects/*/` for a transcript file named `<uuid>.jsonl`
+matching the deterministic UUID:
+
+- **Hit (transcript exists)**: spawn with `--resume <uuid>`. Claude
+  Code reattaches to the prior conversation and the user sees the
+  full history.
+- **Miss (no transcript)**: spawn with `--session-id <uuid>`. Claude
+  Code creates a new session under the deterministic UUID, so the
+  next restart's existence check will hit and resume it.
+
+The disk check is one bounded `read_dir` of `~/.claude/projects` plus
+one `Path::is_file()` per subdirectory - sub-millisecond on a typical
+workstation, safe on the UI thread per `docs/UI.md` "Blocking I/O
+Prohibition" (this is local stat I/O, not git/network/large-file
+I/O). Doing the check up-front avoids a tick-based probe and the
+~4-second visible "No conversation found" flicker that
+`claude --resume <unknown-uuid>` would otherwise display before
+exiting. The check scans by exact UUID rather than reconstructing
+Claude Code's encoded-cwd directory name, so the scheme is robust
+against changes to that encoding (e.g. how `_`/`.` get mangled) and
+finds the transcript wherever Claude Code chose to put it.
 
 The review gate's ephemeral `claude --print` subprocess (see
 `spawn_review_gate`) and the global assistant drawer (see
