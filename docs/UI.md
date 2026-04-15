@@ -281,15 +281,33 @@ Examples of the cache-first pattern:
   interval), with no auto-retry.
 - `spawn_session` routes through `begin_session_open` +
   `poll_session_opens` instead of calling `stage_system_prompt`
-  directly. `begin_session_open` spawns a background thread that runs
-  `backend.read_plan(...)` and sends a `SessionOpenPlanResult` through
-  a per-work-item receiver; `poll_session_opens` drains completed
-  receivers and invokes `finish_session_open`, which builds the claude
-  command and spawns the PTY on the UI thread. `stage_system_prompt`
-  now takes the pre-read plan text as a parameter and MUST NOT call
-  `backend.read_plan(...)` itself. The receiver map is keyed by
-  `WorkItemId` so parallel session opens for different items cannot
-  collide.
+  directly. `begin_session_open` spawns a background thread that
+  runs **every** blocking step the spawn needs: `backend.read_plan(...)`,
+  `McpSocketServer::start(...)` (which binds the socket and spawns
+  the accept loop), `AgentBackend::write_session_files(...)` (the
+  worktree `.mcp.json` for Claude Code's project discovery), and
+  the `std::fs::write` on the temp `--mcp-config` file. It then
+  sends a `SessionOpenPlanResult` through a per-work-item receiver.
+  `poll_session_opens` drains completed receivers and invokes
+  `finish_session_open`, which is pure-CPU work plus the
+  `Session::spawn` fork+exec - no filesystem I/O runs on the UI
+  thread. `stage_system_prompt` consumes the pre-read plan text
+  as a parameter and MUST NOT call `backend.read_plan(...)` itself.
+  The receiver map is keyed by `WorkItemId` so parallel session
+  opens for different items cannot collide.
+- `spawn_global_session` uses the same two-phase pattern: the UI
+  thread precomputes the system prompt and shared MCP context,
+  then spawns a worker that starts the global MCP server, writes
+  the temp `--mcp-config` file, creates the scratch cwd via
+  `std::fs::create_dir_all`, and calls `Session::spawn` itself.
+  The result flows back through `GlobalSessionOpenPending::rx` and
+  `poll_global_session_open` moves the handles into
+  `App::global_session` / `App::global_mcp_server` /
+  `App::global_mcp_config_path`. Teardown
+  (`teardown_global_session`) cancels any in-flight preparation
+  by dropping the pending entry and routes the temp config file
+  removal through `App::spawn_agent_file_cleanup` so the
+  `std::fs::remove_file` runs on a background thread.
 
 #### Streaming progress variant
 

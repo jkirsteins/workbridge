@@ -312,10 +312,13 @@ the current Codex CLI surface).
 
 **Claude (reference)**: Interactive mode is produced by
 `App::finish_session_open` -> `Session::spawn` in `src/session.rs:57`,
-which forks a `claude` process attached to a PTY slave fd. Headless
-mode is produced by the review gate at `src/app.rs:7848`, which runs
-the argv produced by `ClaudeCodeBackend::build_review_gate_command`
-in `src/agent_backend.rs` (yielding `claude --print --output-format
+which forks a `claude` process attached to a PTY slave fd. The
+global assistant's interactive mode is produced by the worker
+thread inside `App::spawn_global_session` (so the fork+exec runs
+off the UI thread). Headless mode is produced by the review gate
+worker thread at `src/app.rs:8000`, which runs the argv produced
+by `ClaudeCodeBackend::build_review_gate_command` in
+`src/agent_backend.rs` (yielding `claude --print --output-format
 json --json-schema ...`) via `std::process::Command::output()`. The
 backend is selected through the `Arc<dyn AgentBackend>` stored on
 `App::agent_backend`; the spawn sites call the trait methods and
@@ -335,10 +338,12 @@ violation.
 **Claude (reference)**: `Session::spawn` at `src/session.rs:57`
 honours the `cwd` argument via `std::process::Command::current_dir`.
 `App::finish_session_open` passes the worktree path for work-item
-spawns at `src/app.rs:3979`. `spawn_global_session` at
-`src/app.rs:8344` passes a stable workbridge-owned scratch directory
-(`$TMPDIR/workbridge-global-assistant-cwd`, created idempotently by
-`std::fs::create_dir_all` just before the spawn). The scratch path
+spawns at `src/app.rs:4198`. The worker thread inside
+`App::spawn_global_session` at `src/app.rs:8572` passes a stable
+workbridge-owned scratch directory
+(`$TMPDIR/workbridge-global-assistant-cwd`, created idempotently
+by `std::fs::create_dir_all` on the same worker thread just before
+the spawn - never on the UI thread). The scratch path
 is used instead of `$HOME` because Claude Code's workspace trust
 dialog persists per non-home directory but NOT for `$HOME`, so
 spawning in home would re-prompt the user on every Ctrl+G; spawning
@@ -359,8 +364,8 @@ works. No clause violation.
 **Claude (reference)**: `ClaudeCodeBackend::build_command` in
 `src/agent_backend.rs` pushes `--dangerously-skip-permissions` into
 argv for every write-capable spawn; both work-item sessions
-(`App::finish_session_open` at `src/app.rs:3979`) and the global
-assistant (`App::spawn_global_session` at `src/app.rs:8344`) go
+(`App::finish_session_open` at `src/app.rs:4159`) and the global
+assistant (`App::spawn_global_session` at `src/app.rs:8430`) go
 through the same method. The review gate uses
 `ClaudeCodeBackend::build_review_gate_command` instead, which does
 NOT pass the bypass because `claude --print` is non-interactive and
@@ -378,25 +383,48 @@ clause violation.
 
 **Claude (reference)**: `build_mcp_config` in `src/mcp.rs:1378`
 produces the JSON blob, and `McpSocketServer::start` at
-`src/mcp.rs:80` starts the accept loop. Work-item spawns write
-`.mcp.json` to the worktree root via
-`ClaudeCodeBackend::write_session_files` (called from
-`App::finish_session_open` and returning the written path so
-`AgentBackend::cleanup_session_files` can reverse it on
-teardown / `workbridge_delete` - the actual `std::fs::remove_file`
-calls run on a detached background thread via
-`App::spawn_agent_file_cleanup`, never on the UI thread, per
-`docs/UI.md` "Blocking I/O Prohibition") AND the caller writes a separate
-`/tmp/workbridge-mcp-config-<uuid>.json` tempfile whose path is
-threaded into `SpawnConfig::mcp_config_path`. The backend then
+`src/mcp.rs:80` starts the accept loop. Every filesystem side effect
+on the spawn path runs on a background thread - the UI thread only
+ever does pure-CPU precomputation plus the channel handoff. This
+is enforced by `docs/UI.md` "Blocking I/O Prohibition" and is the
+reason the session-open worker is structured as a single fat
+closure that reads the plan, starts the MCP server, writes the
+side-car files, writes the tempfile, and then sends a
+`SessionOpenPlanResult` back for `poll_session_opens` to consume.
+
+Work-item spawns call
+`ClaudeCodeBackend::write_session_files` **from the background
+worker inside `App::begin_session_open`** to write `.mcp.json` into
+the worktree root (for Claude Code's project discovery). The
+worker also writes a separate `/tmp/workbridge-mcp-config-<uuid>.json`
+tempfile and threads its path into `SpawnConfig::mcp_config_path`.
+Both paths are captured in `SessionEntry::agent_written_files` so
+`AgentBackend::cleanup_session_files` can reverse them on teardown
+/ `workbridge_delete`; the reverse path also runs on a detached
+background thread via `App::spawn_agent_file_cleanup`. The backend
 appends `--mcp-config <tempfile>` in its own argv order
 (`ClaudeCodeBackend::build_command` places it AFTER the auto-start
 positional - see RP1 and the `claude_interactive_argv_for_planning`
-test). The review gate uses a matching tempfile at
-`src/app.rs:7793` and passes it via
-`ClaudeCodeBackend::build_review_gate_command`; the global
-assistant uses the same path construction at `src/app.rs:8309`. The
-bridge process is the same workbridge binary re-invoked with
+test).
+
+The review gate writes its own tempfile inside its own
+`std::thread::spawn` closure in `App::spawn_review_gate` (all three
+spawn sites have always been background for the review gate) and
+passes it via `ClaudeCodeBackend::build_review_gate_command`.
+
+The global assistant uses the same two-phase pattern: the UI
+thread in `App::spawn_global_session` precomputes the system
+prompt and spawns a background worker that runs
+`McpSocketServer::start_global`, the temp-config `std::fs::write`,
+the `std::fs::create_dir_all` on the scratch cwd, AND
+`Session::spawn` itself, then hands the `McpSocketServer`,
+`Session`, and config path back through
+`GlobalSessionOpenPending::rx` for `poll_global_session_open` to
+drain into `App::global_session` / `App::global_mcp_server` /
+`App::global_mcp_config_path`. No step on this path writes to
+disk, binds a socket, or spawns a subprocess from the UI thread.
+
+The bridge process is the same workbridge binary re-invoked with
 `--mcp-bridge --socket <path>` (see `build_mcp_config`).
 
 **Codex (secondary, not implemented)**: **workaround**. Codex reads
@@ -415,8 +443,9 @@ stdio transport) is still achievable.
 list from the `WORK_ITEM_ALLOWED_TOOLS` constant - the 15
 workbridge MCP tools shared between work-item and global-assistant
 profiles. Both spawn sites (`App::finish_session_open` at
-`src/app.rs:3979` and `App::spawn_global_session` at
-`src/app.rs:8344`) hand the same constant to
+`src/app.rs:4159` via `App::build_agent_cmd` at `src/app.rs:4249`,
+and the global worker spawned from `App::spawn_global_session` at
+`src/app.rs:8430`) hand the same constant to
 `SpawnConfig::allowed_tools`. The review gate uses
 `build_review_gate_command` instead, which does NOT pass
 `--allowedTools`; it relies entirely on the MCP server exposing
@@ -807,11 +836,30 @@ These are the only places in `src/` that launch an LLM harness child
 process today. Any new spawn site MUST update this table **and**
 update the Implementation Map section above.
 
-| File          | Line  | Mode        | Scope      | Cwd                                       |
-|---------------|-------|-------------|------------|-------------------------------------------|
-| `src/app.rs`  | 3979  | Interactive | WorkItem   | Work-item worktree                        |
-| `src/app.rs`  | 7848  | Headless    | ReviewGate | inherited                                 |
-| `src/app.rs`  | 8344  | Interactive | Global     | `$TMPDIR/workbridge-global-assistant-cwd` |
+| File          | Line  | Mode        | Scope      | Thread     | Cwd                                       |
+|---------------|-------|-------------|------------|------------|-------------------------------------------|
+| `src/app.rs`  | 4198  | Interactive | WorkItem   | UI thread  | Work-item worktree                        |
+| `src/app.rs`  | 8000  | Headless    | ReviewGate | Background | inherited                                 |
+| `src/app.rs`  | 8572  | Interactive | Global     | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
+
+The "Thread" column records which thread actually calls
+`Session::spawn` / `std::process::Command::output()`. Two of the
+three sites are fully off the UI thread; the work-item site still
+does its `Session::spawn` on the UI thread for historical reasons
+(the pre-refactor code did the same, and the fork+exec is typically
+sub-millisecond). Every **filesystem** side effect on every spawn
+path - the backend's `write_session_files` call, the
+`--mcp-config` tempfile, the global assistant's scratch
+`create_dir_all`, and the review gate's temporary `--mcp-config`
+file - runs on a background worker thread per `docs/UI.md`
+"Blocking I/O Prohibition". The work-item worker is
+`App::begin_session_open` at `src/app.rs:3906` (drained by
+`poll_session_opens` at 4095, which hands the prepared
+`SessionOpenPlanResult` to `finish_session_open` at 4159). The
+global worker is `App::spawn_global_session` at `src/app.rs:8430`
+(drained by `poll_global_session_open`). The review gate worker is
+`App::spawn_review_gate` at `src/app.rs:7636` (its own closure at
+`src/app.rs:7711`).
 
 All three sites go through `src/session.rs:57` (`Session::spawn`) for
 the interactive path or `std::process::Command::output()` directly
@@ -819,14 +867,21 @@ for the headless path; argv is built by
 `ClaudeCodeBackend::build_command` / `::build_review_gate_command` in
 `src/agent_backend.rs` via `self.agent_backend` - no spawn site
 constructs a Claude-specific argv inline. `App::build_agent_cmd` at
-`src/app.rs:4030` is the thin wrapper the work-item and global
+`src/app.rs:4249` is the thin wrapper the work-item and global
 spawn sites call. Global assistant teardown lives at
-`src/app.rs:8224` (`App::teardown_global_session`); see C10 and C12
+`src/app.rs:8383` (`App::teardown_global_session`); see C10 and C12
 for why each drawer open spawns a fresh session and each close
-fully tears it down. Work-item session teardown goes through
-`App::delete_work_item_by_id` at `src/app.rs:2259`, which hands the
+fully tears it down. Teardown drops any in-flight
+`GlobalSessionOpenPending` entry (so a drawer-close mid-preparation
+cancels the worker cleanly) and routes the global `--mcp-config`
+tempfile removal through `App::spawn_agent_file_cleanup` so no
+`std::fs::remove_file` runs on the event loop.
+
+Work-item session teardown goes through
+`App::delete_work_item_by_id` at `src/app.rs:2343`, which hands the
 list of written side-car files back to the backend via
-`AgentBackend::cleanup_session_files`.
+`AgentBackend::cleanup_session_files` - routed off the UI thread
+via `App::spawn_agent_file_cleanup`.
 
 ## Change Log
 
@@ -874,3 +929,32 @@ harness adapter is introduced, add a dated bullet here.
   `CodexBackend` is not wired; a shape-verification test
   `codex_shape_compiles` asserts the trait fits a second harness
   with `--full-auto`, `--config`, and no `PostToolUse` equivalent.
+- 2026-04-15: Blocking-I/O compliance pass for every spawn path
+  (same PR, follow-up to adversarial review rounds 1 and 2). Every
+  `std::fs::*` call and every `McpSocketServer::start*` call on
+  the session-open paths now runs on a background worker thread;
+  no filesystem I/O is left on the UI thread on any spawn or
+  teardown path. Work-item sessions: `App::begin_session_open`
+  now pre-computes MCP context on the UI thread and hands a fat
+  worker the plan read, `McpSocketServer::start`,
+  `AgentBackend::write_session_files`, and the
+  `std::fs::write` on the temp `--mcp-config` file; the worker's
+  `SessionOpenPlanResult` grew `server` / `written_files` /
+  `mcp_config_path` / `server_error` / `mcp_config_error` fields
+  which `poll_session_opens` drains on the next tick.
+  `finish_session_open` is now pure-CPU plus `Session::spawn`
+  (which stays on the UI thread for the work-item path because
+  it was already there pre-refactor and fork+exec is sub-ms).
+  `start_mcp_for_session` was removed since its only caller is
+  gone. Global assistant: `App::spawn_global_session` now runs
+  `McpSocketServer::start_global`, both `std::fs::write` calls,
+  `std::fs::create_dir_all`, AND `Session::spawn` itself on a
+  background worker; `App::poll_global_session_open` drains the
+  `GlobalSessionOpenPending::rx` and moves handles into the
+  durable `global_session` / `global_mcp_server` /
+  `global_mcp_config_path` fields. `teardown_global_session` now
+  cancels any in-flight preparation and routes the temp config
+  file removal through `App::spawn_agent_file_cleanup`.
+  `cleanup_all_mcp` also routes its file removal through
+  `spawn_agent_file_cleanup` now. `docs/UI.md` updated to
+  describe the two-phase pattern for both spawn sites.

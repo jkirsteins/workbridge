@@ -984,15 +984,19 @@ pub(crate) struct DeleteCleanupInfo {
     github_remote: Option<(String, String)>,
 }
 
-/// Result from the asynchronous plan-read that precedes opening a
-/// Claude session. `stage_system_prompt` previously read the plan
-/// synchronously on the UI thread - the read is now performed on a
-/// background thread and the deserialized plan (plus any error
-/// message) flows back via this struct for the main thread to apply.
+/// Result from the asynchronous session-open preparation thread.
+///
+/// The UI thread must never touch the filesystem or spawn subprocesses
+/// directly on the session-open path; this struct is the handoff point
+/// where a background worker returns ALL the preparation work (plan
+/// read, MCP socket bind, side-car file writes, temp `--mcp-config`
+/// file write) so `finish_session_open` only has to do pure-CPU work
+/// plus `Session::spawn`. See `docs/UI.md` "Blocking I/O Prohibition"
+/// and `docs/harness-contract.md` C4 / C10.
 pub struct SessionOpenPlanResult {
     /// The work item the session is being opened for.
     pub wi_id: WorkItemId,
-    /// The worktree path where Claude will run.
+    /// The worktree path where the agent CLI will run.
     pub cwd: PathBuf,
     /// Plan text read from the backend, if any. Empty string when the
     /// backend returned `Ok(None)` or an error (the caller treats an
@@ -1002,6 +1006,29 @@ pub struct SessionOpenPlanResult {
     /// read failed. `None` on success or when the backend reported no
     /// plan exists.
     pub read_error: Option<String>,
+    /// MCP socket server handle produced by the worker. `None` if the
+    /// worker could not start the server (`server_error` carries the
+    /// reason). When `Some`, the UI thread moves this into
+    /// `App::mcp_servers` on successful spawn.
+    pub server: Option<McpSocketServer>,
+    /// Human-readable error from the background MCP server start. Not
+    /// fatal: a failed server still lets the session spawn in degraded
+    /// mode without MCP tools, matching the pre-refactor behaviour.
+    pub server_error: Option<String>,
+    /// Backend-specific side-car files written on the background thread
+    /// via `AgentBackend::write_session_files` (and the temp MCP config
+    /// tempfile). Threaded into `SessionEntry::agent_written_files` so
+    /// `delete_work_item_by_id` can hand the list back to
+    /// `spawn_agent_file_cleanup` on teardown.
+    pub written_files: Vec<PathBuf>,
+    /// Path to the temp `--mcp-config` file (populated on the
+    /// background thread). `None` when the server failed to start or
+    /// the write itself failed; the backend sees `None` and falls back
+    /// to the degraded argv path.
+    pub mcp_config_path: Option<PathBuf>,
+    /// Non-fatal MCP config / side-car file write error. Surfaced to
+    /// the user via the status bar but does not abort the spawn.
+    pub mcp_config_error: Option<String>,
 }
 
 /// Per-entry state tracked alongside the `session_open_rx` map so
@@ -1013,6 +1040,43 @@ pub struct SessionOpenPlanResult {
 pub struct SessionOpenPending {
     pub rx: crossbeam_channel::Receiver<SessionOpenPlanResult>,
     pub activity: ActivityId,
+}
+
+/// Fully-prepared global assistant session, produced entirely on a
+/// background worker thread so no filesystem I/O or PTY fork/exec
+/// runs on the event loop. See `docs/UI.md` "Blocking I/O Prohibition"
+/// and `docs/harness-contract.md` C4 / C10.
+///
+/// On success the UI thread moves `session`, `mcp_server`, and
+/// `config_path` into `App::global_session`, `App::global_mcp_server`,
+/// and `App::global_mcp_config_path` respectively. On any error the
+/// worker populates `error` and the UI thread resets the drawer to
+/// closed.
+///
+/// If the worker completes successfully but the UI thread has already
+/// cancelled the open (drawer closed mid-flight, so the receiver is
+/// dropped), the worker's `tx.send` returns `Err(SendError(result))`
+/// and the worker MUST remove `config_path` from disk itself before
+/// returning - dropping the `Session` handle force-kills the child
+/// process group, and dropping the `McpSocketServer` stops the accept
+/// loop and removes the socket file, but the `--mcp-config` tempfile
+/// has no `Drop` impl and would otherwise leak to `/tmp`.
+pub struct GlobalSessionPrepResult {
+    pub mcp_server: Option<McpSocketServer>,
+    pub session: Option<Session>,
+    pub config_path: Option<PathBuf>,
+    pub error: Option<String>,
+}
+
+/// Per-entry state tracked while the global assistant preparation
+/// worker is in flight. `activity` owns the "Opening global
+/// assistant..." spinner. `pre_drawer_focus` is captured at spawn
+/// time so we can restore it on a worker-reported error without
+/// touching UI-thread state during the drop path.
+pub struct GlobalSessionOpenPending {
+    pub rx: crossbeam_channel::Receiver<GlobalSessionPrepResult>,
+    pub activity: ActivityId,
+    pub pre_drawer_focus: FocusPanel,
 }
 
 /// Result from the asynchronous worktree creation thread.
@@ -1483,6 +1547,18 @@ pub struct App {
     /// Path to the temp MCP config file for the global assistant.
     /// Tracked so it can be cleaned up on shutdown or respawn.
     pub global_mcp_config_path: Option<PathBuf>,
+    /// In-flight preparation for the global assistant session.
+    /// Populated by `spawn_global_session` while a background worker
+    /// runs `McpSocketServer::start_global`, `std::fs::write` on the
+    /// `--mcp-config` tempfile, `std::fs::create_dir_all` on the
+    /// scratch cwd, and `Session::spawn` itself. Drained by
+    /// `poll_global_session_open` on each background tick, which
+    /// moves the worker's result into the three durable fields
+    /// (`global_session`, `global_mcp_server`, `global_mcp_config_path`)
+    /// or restores the drawer state on failure. Kept as a named
+    /// struct (rather than a tuple) so the activity ID cannot be
+    /// accidentally dropped and leak a permanent spinner.
+    pub global_session_open_pending: Option<GlobalSessionOpenPending>,
     /// True when repo/work-item data has changed since the last
     /// `refresh_global_mcp_context` call. Set by `drain_fetch_results`
     /// returning true; cleared after the refresh runs.
@@ -2087,6 +2163,7 @@ impl App {
             global_pane_cols: 80,
             global_pane_rows: 24,
             global_mcp_config_path: None,
+            global_session_open_pending: None,
             global_mcp_context_dirty: false,
             pending_active_pty_bytes: Vec::new(),
             pending_global_pty_bytes: Vec::new(),
@@ -2622,10 +2699,17 @@ impl App {
         self.mcp_servers.clear();
         self.agent_working.clear();
         self.global_mcp_server = None;
-        if let Some(ref path) = self.global_mcp_config_path {
-            let _ = std::fs::remove_file(path);
+        // Route the global `--mcp-config` tempfile removal off the
+        // UI thread. `cleanup_all_mcp` runs during graceful
+        // shutdown but the event loop is still alive for up to 10
+        // seconds (waiting for child processes to exit); a wedged
+        // filesystem would freeze the shutdown-wait UI otherwise.
+        // See `docs/UI.md` "Blocking I/O Prohibition".
+        let mut files_to_clean: Vec<PathBuf> = Vec::new();
+        if let Some(path) = self.global_mcp_config_path.take() {
+            files_to_clean.push(path);
         }
-        self.global_mcp_config_path = None;
+        self.spawn_agent_file_cleanup(files_to_clean);
     }
 
     /// Resize PTY sessions and vt100 parsers to match the current pane
@@ -4926,23 +5010,26 @@ impl App {
         }
     }
 
-    /// Begin the async plan-read stage of opening a Claude session.
+    /// Begin the async preparation stage of opening an agent session.
     ///
-    /// Spawns a background thread that calls `WorkItemBackend::read_plan`
-    /// (filesystem I/O) and then hands the result back to
-    /// `poll_session_opens`, which finishes the session on the UI thread.
-    /// Running the read here on the caller (a UI-thread entry point such
-    /// as `spawn_session` / `poll_worktree_creation` /
-    /// `poll_review_gate`) would freeze the event loop - see
-    /// `docs/UI.md` "Blocking I/O Prohibition".
+    /// Spawns a background thread that performs ALL of the blocking
+    /// work the session-open path needs (plan read, MCP socket bind,
+    /// backend side-car file writes, temp `--mcp-config` file write)
+    /// and then hands the result back to `poll_session_opens`, which
+    /// finishes the session on the UI thread by only doing pure-CPU
+    /// work plus `Session::spawn`. Running any of these I/O operations
+    /// on the caller (a UI-thread entry point such as `spawn_session`
+    /// / `poll_worktree_creation` / `poll_review_gate`) would freeze
+    /// the event loop - see `docs/UI.md` "Blocking I/O Prohibition"
+    /// and `docs/harness-contract.md` C4.
     ///
-    /// If another plan read is already in flight for this work item, the
-    /// new request is dropped (the previous one will finish and spawn a
-    /// session). This cannot deadlock: `poll_session_opens` removes the
-    /// entry as soon as the result arrives.
+    /// If another preparation is already in flight for this work item,
+    /// the new request is dropped (the previous one will finish and
+    /// spawn a session). This cannot deadlock: `poll_session_opens`
+    /// removes the entry as soon as the result arrives.
     fn begin_session_open(&mut self, work_item_id: &WorkItemId, cwd: &std::path::Path) {
         if self.session_open_rx.contains_key(work_item_id) {
-            // Already in flight - the pending read will finish the open.
+            // Already in flight - the pending worker will finish the open.
             // Re-surface the spinner message so a repeat Enter press is
             // not silent; the existing activity entry is still alive so
             // the duplicate start below would otherwise stack.
@@ -4951,24 +5038,161 @@ impl App {
         }
         let (tx, rx) = crossbeam_channel::bounded(1);
         let backend = Arc::clone(&self.backend);
+        let agent_backend = Arc::clone(&self.agent_backend);
         let wi_id_clone = work_item_id.clone();
         let cwd_clone = cwd.to_path_buf();
+
+        // Precompute every MCP-setup input that requires `&self` here
+        // on the UI thread. All of these are pure in-memory lookups;
+        // no filesystem or subprocess calls happen in this block (the
+        // docs tag is intentional - see `docs/UI.md` "Blocking I/O
+        // Prohibition" for why an audit of this exact block matters).
+        let socket_path = crate::mcp::socket_path_for_session();
+        let wi_id_str = serde_json::to_string(work_item_id).unwrap_or_default();
+        let (wi_kind, context_json, repo_mcp_servers) = {
+            let wi = self.work_items.iter().find(|w| w.id == *work_item_id);
+            let wi_kind = wi.map(|w| format!("{:?}", w.kind)).unwrap_or_default();
+            let context_json = if let Some(wi) = wi {
+                let pr_url = wi
+                    .repo_associations
+                    .first()
+                    .and_then(|a| a.pr.as_ref())
+                    .map(|pr| pr.url.as_str())
+                    .unwrap_or("");
+                serde_json::json!({
+                    "work_item_id": wi_id_str,
+                    "stage": format!("{:?}", wi.status),
+                    "title": wi.title,
+                    "description": wi.description,
+                    "repo": cwd_clone.display().to_string(),
+                    "pr_url": pr_url,
+                })
+                .to_string()
+            } else {
+                "{}".to_string()
+            };
+            let repo_mcp_servers: Vec<crate::config::McpServerEntry> = wi
+                .and_then(|w| w.repo_associations.first())
+                .map(|assoc| {
+                    let repo_display = crate::config::collapse_home(&assoc.repo_path);
+                    self.config
+                        .mcp_servers_for_repo(&repo_display)
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            (wi_kind, context_json, repo_mcp_servers)
+        };
+        // `activity_path_for` is a pure in-memory path computation in
+        // `LocalFileBackend` (no filesystem I/O); kept here on the UI
+        // thread to avoid cloning the whole `Arc<dyn WorkItemBackend>`
+        // into the worker purely for a path join.
+        let activity_log_path = self.backend.activity_path_for(work_item_id);
+        let mcp_tx = self.mcp_tx.clone();
+        let socket_path_for_worker = socket_path;
+
         std::thread::spawn(move || {
+            // Phase A: plan read. Must stay first so the existing
+            // `begin_session_open_defers_backend_read_plan_to_background_thread`
+            // regression guard continues to pass (it holds a gate
+            // that parks the worker until the test releases it).
             let (plan_text, read_error) = match backend.read_plan(&wi_id_clone) {
                 Ok(Some(plan)) => (plan, None),
                 Ok(None) => (String::new(), None),
                 Err(e) => (String::new(), Some(format!("Could not read plan: {e}"))),
             };
+
+            // Phase B: start MCP socket server. The socket bind, the
+            // stale-file remove, and the accept-loop thread spawn all
+            // live inside `McpSocketServer::start`; running it here
+            // keeps every one of those operations off the UI thread.
+            let (server, server_error) = match McpSocketServer::start(
+                socket_path_for_worker.clone(),
+                wi_id_str,
+                wi_kind,
+                context_json,
+                activity_log_path,
+                mcp_tx,
+                false, // read_only: interactive sessions need full tool access
+            ) {
+                Ok(s) => (Some(s), None),
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "MCP unavailable: failed to start socket server: {e}"
+                    )),
+                ),
+            };
+
+            // Phase C: write the backend-specific side-car files and
+            // the temp `--mcp-config` file. Both are `std::fs::write`
+            // calls that block on the worktree / tmpfs filesystem and
+            // so must NEVER run on the UI thread. Only executed when
+            // the server came up; otherwise there is no socket to
+            // wire the agent CLI up to and the spawn proceeds in
+            // degraded mode with `mcp_config_path: None`.
+            let mut written_files: Vec<PathBuf> = Vec::new();
+            let mut mcp_config_path: Option<PathBuf> = None;
+            let mut mcp_config_error: Option<String> = None;
+            if let Some(ref server) = server {
+                match std::env::current_exe() {
+                    Ok(exe) => {
+                        let mcp_config = crate::mcp::build_mcp_config(
+                            &exe,
+                            &server.socket_path,
+                            &repo_mcp_servers,
+                        );
+
+                        // Backend side-car files (Claude: the worktree
+                        // `.mcp.json` for project discovery).
+                        match agent_backend.write_session_files(&cwd_clone, &mcp_config) {
+                            Ok(paths) => written_files.extend(paths),
+                            Err(e) => {
+                                mcp_config_error = Some(format!("MCP config write error: {e}"));
+                            }
+                        }
+
+                        // Primary MCP wire-up: a per-spawn temp file
+                        // whose path flows into the backend via
+                        // `SpawnConfig::mcp_config_path`.
+                        let config_path = std::env::temp_dir().join(format!(
+                            "workbridge-mcp-config-{}.json",
+                            uuid::Uuid::new_v4()
+                        ));
+                        match std::fs::write(&config_path, &mcp_config) {
+                            Ok(()) => {
+                                written_files.push(config_path.clone());
+                                mcp_config_path = Some(config_path);
+                            }
+                            Err(e) => {
+                                if mcp_config_error.is_none() {
+                                    mcp_config_error = Some(format!("MCP config write error: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        mcp_config_error = Some(format!("Cannot resolve executable path: {e}"));
+                    }
+                }
+            }
+
             let _ = tx.send(SessionOpenPlanResult {
                 wi_id: wi_id_clone,
                 cwd: cwd_clone,
                 plan_text,
                 read_error,
+                server,
+                server_error,
+                written_files,
+                mcp_config_path,
+                mcp_config_error,
             });
         });
-        // Surface immediate feedback so a slow plan read does not
-        // make the TUI look hung between the Enter keypress and the
-        // next `poll_session_opens` tick (200ms). The spinner is
+        // Surface immediate feedback so a slow background phase does
+        // not make the TUI look hung between the Enter keypress and
+        // the next `poll_session_opens` tick (200ms). The spinner is
         // ended in `poll_session_opens` for every terminal arm
         // (success, read_error, disconnect) via `drop_session_open_entry`.
         let activity = self.start_activity("Opening session...");
@@ -4986,10 +5210,12 @@ impl App {
         }
     }
 
-    /// Poll pending session-open plan reads. Called from the
+    /// Poll pending session-open preparation workers. Called from the
     /// background-work tick in `salsa.rs`. Each completed receiver
-    /// finishes the session open by calling `finish_session_open`
-    /// with the plan text read on the background thread.
+    /// hands a fully-prepared `SessionOpenPlanResult` (plan text, MCP
+    /// server handle, written side-car files, temp config path) to
+    /// `finish_session_open`, which then only has to do pure-CPU work
+    /// plus `Session::spawn`. No filesystem I/O happens here.
     pub fn poll_session_opens(&mut self) {
         if self.session_open_rx.is_empty() {
             return;
@@ -5017,114 +5243,73 @@ impl App {
                 None => continue,
             };
             self.drop_session_open_entry(&wi_id);
-            if let Some(msg) = result.read_error {
+            // Surface every non-fatal error the worker reported. None
+            // of these abort the spawn - they flow into the status bar
+            // alongside the session. Order matters: the worker
+            // populates at most one of the three slots per failure
+            // class, and the last non-empty message wins in the bar.
+            if let Some(msg) = result.read_error.clone() {
                 self.status_message = Some(msg);
             }
-            self.finish_session_open(&result.wi_id, &result.cwd, result.plan_text);
+            if let Some(msg) = result.server_error.clone() {
+                self.status_message = Some(msg);
+            }
+            if let Some(msg) = result.mcp_config_error.clone() {
+                self.status_message = Some(msg);
+            }
+            self.finish_session_open(
+                &result.wi_id,
+                &result.cwd,
+                result.plan_text,
+                result.server,
+                result.written_files,
+                result.mcp_config_path,
+            );
         }
     }
 
-    /// Finish the session-open flow after the plan text has been read on
-    /// a background thread. Called by `poll_session_opens` - MUST NOT be
-    /// called directly from UI-thread entry points, because it invokes
-    /// `stage_system_prompt` which consumes state and would otherwise
-    /// encourage new synchronous `read_plan` callers.
+    /// Finish the session-open flow after the background worker has
+    /// completed every blocking step (plan read, MCP socket bind,
+    /// side-car writes, temp config write).
+    ///
+    /// Called only from `poll_session_opens`. MUST NOT be called from
+    /// any UI-thread entry point that has not first gone through the
+    /// background worker: this function calls `stage_system_prompt`
+    /// which consumes `rework_reasons` / `review_gate_findings` state,
+    /// so calling it twice for the same work item would discard user
+    /// state. It is also explicitly free of filesystem I/O - every
+    /// `std::fs::*` call lives in the background worker in
+    /// `begin_session_open`.
     fn finish_session_open(
         &mut self,
         work_item_id: &WorkItemId,
         cwd: &std::path::Path,
         plan_text: String,
+        mcp_server: Option<McpSocketServer>,
+        written_files: Vec<PathBuf>,
+        mcp_config_path: Option<PathBuf>,
     ) {
-        // Guard: the work item may have been deleted while the plan
-        // read was in flight. In that case, do not spawn a session,
-        // just drop the result quietly. (The worktree itself is
-        // either pre-existing or cleaned up by `poll_worktree_creation`
-        // before we got here.)
+        // Guard: the work item may have been deleted while the
+        // background worker was in flight. In that case, do not spawn
+        // a session. The server (if any) is dropped here, which
+        // triggers its accept-loop shutdown via `Drop for
+        // McpSocketServer`; the side-car files are handed to
+        // `spawn_agent_file_cleanup` so their removal runs off the UI
+        // thread just like the normal delete path.
         let Some(work_item_status) = self
             .work_items
             .iter()
             .find(|w| w.id == *work_item_id)
             .map(|w| w.status)
         else {
+            drop(mcp_server);
+            self.spawn_agent_file_cleanup(written_files);
             return;
         };
 
-        // Start MCP socket server for this session.
-        let mcp_result = self.start_mcp_for_session(cwd, work_item_id);
         let session_key = (work_item_id.clone(), work_item_status);
         let has_gate_findings = self.review_gate_findings.contains_key(work_item_id);
         let system_prompt = self.stage_system_prompt(work_item_id, cwd, plan_text);
-
-        // Write the backend-specific session files and produce a path to
-        // the MCP config tempfile, if any. The path feeds into the trait
-        // as `SpawnConfig::mcp_config_path`; on any failure we fall back
-        // to a degraded `None` so the user still sees a session and the
-        // error status bar message.
-        //
-        // `written_files` collects every path the backend wrote so the
-        // corresponding `cleanup_session_files` call on session teardown
-        // (see `delete_work_item_by_id`) can undo the side effects.
-        let mut written_files: Vec<PathBuf> = Vec::new();
-        let mcp_config_path = if let Ok((ref server, _)) = mcp_result {
-            match std::env::current_exe() {
-                Ok(exe) => {
-                    let repo_mcp_servers: Vec<crate::config::McpServerEntry> = self
-                        .work_items
-                        .iter()
-                        .find(|w| w.id == *work_item_id)
-                        .and_then(|wi| wi.repo_associations.first())
-                        .map(|assoc| {
-                            let repo_display = crate::config::collapse_home(&assoc.repo_path);
-                            self.config
-                                .mcp_servers_for_repo(&repo_display)
-                                .into_iter()
-                                .cloned()
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let mcp_config =
-                        crate::mcp::build_mcp_config(&exe, &server.socket_path, &repo_mcp_servers);
-
-                    // Write backend-specific side-car files (Claude: the
-                    // worktree's `.mcp.json` for project discovery).
-                    // Errors are surfaced as a status message but do not
-                    // block the spawn - the `--mcp-config` temp file is
-                    // the primary path and is handled separately below.
-                    match self.agent_backend.write_session_files(cwd, &mcp_config) {
-                        Ok(paths) => written_files.extend(paths),
-                        Err(e) => {
-                            self.status_message = Some(format!("MCP config write error: {e}"))
-                        }
-                    }
-
-                    // Primary MCP wire-up: write a temp file and pass its
-                    // path via `SpawnConfig::mcp_config_path`. The backend
-                    // decides which flag to attach (Claude uses
-                    // `--mcp-config`, a future Codex adapter would use
-                    // `--config mcp_servers.workbridge.config=...`).
-                    let config_path = std::env::temp_dir().join(format!(
-                        "workbridge-mcp-config-{}.json",
-                        uuid::Uuid::new_v4()
-                    ));
-                    match std::fs::write(&config_path, &mcp_config) {
-                        Ok(()) => {
-                            written_files.push(config_path.clone());
-                            Some(config_path)
-                        }
-                        Err(e) => {
-                            self.status_message = Some(format!("MCP config write error: {e}"));
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.status_message = Some(format!("Cannot resolve executable path: {e}"));
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
         let cmd = self.build_agent_cmd(
             work_item_status,
@@ -5146,23 +5331,23 @@ impl App {
                     // Hand the written-files list to the session so its
                     // death path can call `cleanup_session_files` on the
                     // backend, per `docs/harness-contract.md` C4.
-                    agent_written_files: std::mem::take(&mut written_files),
+                    agent_written_files: written_files,
                 };
                 self.sessions.insert(session_key.clone(), entry);
-                match mcp_result {
-                    Ok((server, _)) => {
-                        self.mcp_servers.insert(work_item_id.clone(), server);
-                    }
-                    Err(msg) => {
-                        self.status_message = Some(msg);
-                        self.focus = FocusPanel::Right;
-                        return;
-                    }
+                if let Some(server) = mcp_server {
+                    self.mcp_servers.insert(work_item_id.clone(), server);
                 }
                 self.focus = FocusPanel::Right;
                 self.status_message = Some("Right panel focused - press Ctrl+] to return".into());
             }
             Err(e) => {
+                // Session spawn failed. The MCP server and side-car
+                // files are already live on disk; drop the server so
+                // its accept-loop exits and hand the written files to
+                // the background cleanup helper so nothing is removed
+                // on the UI thread.
+                drop(mcp_server);
+                self.spawn_agent_file_cleanup(written_files);
                 self.status_message = Some(format!("Error spawning session: {e}"));
             }
         }
@@ -5731,6 +5916,58 @@ impl App {
         .map_err(|e| format!("MCP unavailable: failed to start socket server: {e}"))?;
 
         Ok((server, PathBuf::new()))
+    }
+
+    /// Classify a worktree's local state for the unclean-worktree
+    /// indicator and the Review -> Done merge guard. Pure cache lookup
+    /// from `self.repo_data[repo_path].worktrees` - must NOT shell out
+    /// on the UI thread. See `docs/UI.md` "Blocking I/O Prohibition".
+    ///
+    /// Priority order when multiple conditions are present:
+    ///   Dirty > Untracked > Unpushed > BehindOnly > Clean
+    ///
+    /// Dirty is highest because a user with both uncommitted changes
+    /// and untracked files almost always means "I haven't committed
+    /// yet" - the tracked-change wording is the more actionable
+    /// message. BehindOnly is lowest because it is the only variant
+    /// that does not block merging.
+    ///
+    /// Missing cache (first fetch in flight, repo never fetched, no
+    /// matching worktree, missing branch) collapses to `Clean`: the
+    /// safe default that allows the merge flow to proceed. Once the
+    /// fetcher populates real state, subsequent calls return the
+    /// correct classification.
+    pub fn worktree_cleanliness(
+        &self,
+        repo_path: &std::path::Path,
+        branch: &str,
+    ) -> WorktreeCleanliness {
+        let Some(wt) = self
+            .repo_data
+            .get(repo_path)
+            .and_then(|rd| rd.worktrees.as_ref().ok())
+            .and_then(|wts| wts.iter().find(|wt| wt.branch.as_deref() == Some(branch)))
+        else {
+            return WorktreeCleanliness::Clean;
+        };
+
+        if wt.dirty.unwrap_or(false) {
+            return WorktreeCleanliness::Dirty;
+        }
+        if wt.untracked.unwrap_or(false) {
+            return WorktreeCleanliness::Untracked;
+        }
+        if let Some(ahead) = wt.unpushed
+            && ahead > 0
+        {
+            return WorktreeCleanliness::Unpushed(ahead);
+        }
+        if let Some(behind) = wt.behind_remote
+            && behind > 0
+        {
+            return WorktreeCleanliness::BehindOnly(behind);
+        }
+        WorktreeCleanliness::Clean
     }
 
     /// Drain MCP events from the crossbeam channel.
@@ -10612,14 +10849,29 @@ impl App {
     /// resources. Safe to call when no session exists.
     ///
     /// Steps:
-    /// 1. SIGTERM + 50 ms grace + SIGKILL the `claude` child process via
-    ///    `Session::kill` so no zombie survives.
-    /// 2. Drop the `SessionEntry`; `Session::Drop` joins the reader thread.
-    /// 3. Drop the MCP server (same as `cleanup_all_mcp`).
-    /// 4. Remove the temp MCP config file and clear its path.
-    /// 5. Drop any keystrokes queued for the old session's PTY so they
+    /// 1. If an in-flight preparation worker is still running, drop
+    ///    the pending entry - the worker's `tx.send` will observe the
+    ///    dropped receiver and clean up any files it wrote itself
+    ///    (see `GlobalSessionPrepResult`). End the pending spinner.
+    /// 2. SIGTERM + 50 ms grace + SIGKILL the `claude` child process
+    ///    via `Session::kill` so no zombie survives.
+    /// 3. Drop the `SessionEntry`; `Session::Drop` joins the reader thread.
+    /// 4. Drop the MCP server (same as `cleanup_all_mcp`).
+    /// 5. Remove the temp MCP config file on a background thread via
+    ///    `spawn_agent_file_cleanup` - `std::fs::remove_file` blocks
+    ///    on the filesystem and is forbidden on the UI thread per
+    ///    `docs/UI.md` "Blocking I/O Prohibition".
+    /// 6. Drop any keystrokes queued for the old session's PTY so they
     ///    don't leak into the next session on reopen.
     fn teardown_global_session(&mut self) {
+        // Cancel any in-flight preparation. Dropping the pending
+        // entry closes the receiver; when the worker tries to send,
+        // it will observe `Err(SendError)` and run its own cleanup
+        // (see `GlobalSessionPrepResult` doc).
+        if let Some(pending) = self.global_session_open_pending.take() {
+            self.end_activity(pending.activity);
+        }
+
         if let Some(ref mut entry) = self.global_session
             && let Some(ref mut session) = entry.session
         {
@@ -10627,10 +10879,15 @@ impl App {
         }
         self.global_session = None;
         self.global_mcp_server = None;
-        if let Some(ref path) = self.global_mcp_config_path {
-            let _ = std::fs::remove_file(path);
+        // Route file removal off the UI thread via the same helper
+        // that `delete_work_item_by_id` uses for session side-car
+        // cleanup. `std::fs::remove_file` inline would freeze the
+        // event loop on a slow or wedged filesystem.
+        let mut files_to_clean: Vec<PathBuf> = Vec::new();
+        if let Some(path) = self.global_mcp_config_path.take() {
+            files_to_clean.push(path);
         }
-        self.global_mcp_config_path = None;
+        self.spawn_agent_file_cleanup(files_to_clean);
         self.pending_global_pty_bytes.clear();
     }
 
@@ -10640,127 +10897,267 @@ impl App {
     /// not hard-code any harness-specific flags. See
     /// `docs/harness-contract.md` "Known Spawn Sites" (Global row) and
     /// C2 for the scratch cwd rationale.
+    ///
+    /// The UI thread only runs pure-CPU work in this function: it
+    /// refreshes the shared MCP context, builds the system prompt
+    /// from the cached repo list, clones the handful of Arcs the
+    /// worker needs, and then spawns a background thread that runs
+    /// ALL of the blocking work (`McpSocketServer::start_global`,
+    /// the `--mcp-config` tempfile `std::fs::write`, the scratch
+    /// `std::fs::create_dir_all`, and `Session::spawn` itself). The
+    /// worker returns a `GlobalSessionPrepResult` through the
+    /// `GlobalSessionOpenPending` receiver; `poll_global_session_open`
+    /// drains it on the next background tick and moves the handles
+    /// into the durable `App::global_*` fields. See `docs/UI.md`
+    /// "Blocking I/O Prohibition" for why this split is mandatory.
     fn spawn_global_session(&mut self) {
-        // Build dynamic context and start MCP server.
-        self.refresh_global_mcp_context();
-        let socket_path = crate::mcp::socket_path_for_session();
-        let mcp_server = match McpSocketServer::start_global(
-            socket_path.clone(),
-            Arc::clone(&self.global_mcp_context),
-            self.mcp_tx.clone(),
-        ) {
-            Ok(server) => server,
-            Err(e) => {
-                self.status_message = Some(format!("Global assistant MCP error: {e}"));
-                self.global_drawer_open = false;
-                self.focus = self.pre_drawer_focus;
-                return;
-            }
-        };
+        // If a previous preparation is still in flight, cancel it
+        // first so we don't end up with two workers racing each
+        // other for the same temp config path. `teardown_global_session`
+        // is the canonical cleanup path but the caller of
+        // `spawn_global_session` usually calls teardown first anyway,
+        // so this branch is defence in depth.
+        if let Some(pending) = self.global_session_open_pending.take() {
+            self.end_activity(pending.activity);
+        }
 
-        // Build repo list for the system prompt.
+        // Refresh the shared MCP context on the UI thread (pure CPU -
+        // the context lives behind an `Arc<Mutex<String>>` that the
+        // background worker's accept loop reads by reference, and
+        // the dynamic state we pull from comes straight from the
+        // in-memory repo / work-item caches).
+        self.refresh_global_mcp_context();
+
+        // Build the repo list and system prompt here (pure CPU on
+        // UI-thread state).
         let repo_list: String = self
             .active_repo_cache
             .iter()
             .map(|r| format!("- {}", r.path.display()))
             .collect::<Vec<_>>()
             .join("\n");
-
         let system_prompt = {
             let mut vars = std::collections::HashMap::new();
             vars.insert("repo_list", repo_list.as_str());
             crate::prompts::render("global_assistant", &vars)
         };
 
-        // Write MCP config to a temp file so the agent backend can point
-        // its harness-specific flag at it. Use a deterministic PID-based
-        // path so respawns overwrite the previous file instead of leaking
-        // a new one each time.
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                self.status_message = Some(format!(
-                    "Global assistant: cannot resolve executable path: {e}"
-                ));
-                self.global_drawer_open = false;
-                self.focus = self.pre_drawer_focus;
+        // Capture everything the worker needs. All Send + Sync.
+        let mcp_context_shared = Arc::clone(&self.global_mcp_context);
+        let mcp_tx = self.mcp_tx.clone();
+        let agent_backend = Arc::clone(&self.agent_backend);
+        let pane_cols = self.global_pane_cols;
+        let pane_rows = self.global_pane_rows;
+        let pre_drawer_focus = self.pre_drawer_focus;
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        std::thread::spawn(move || {
+            // Phase A: start the global MCP socket server. Socket
+            // bind + stale-file remove + accept-loop thread spawn
+            // all live here.
+            let socket_path = crate::mcp::socket_path_for_session();
+            let mcp_server =
+                match McpSocketServer::start_global(socket_path, mcp_context_shared, mcp_tx) {
+                    Ok(server) => server,
+                    Err(e) => {
+                        let _ = tx.send(GlobalSessionPrepResult {
+                            mcp_server: None,
+                            session: None,
+                            config_path: None,
+                            error: Some(format!("Global assistant MCP error: {e}")),
+                        });
+                        return;
+                    }
+                };
+
+            // Phase B: resolve exe path and build MCP config bytes.
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.send(GlobalSessionPrepResult {
+                        mcp_server: Some(mcp_server),
+                        session: None,
+                        config_path: None,
+                        error: Some(format!(
+                            "Global assistant: cannot resolve executable path: {e}"
+                        )),
+                    });
+                    return;
+                }
+            };
+            let mcp_config = crate::mcp::build_mcp_config(&exe, &mcp_server.socket_path, &[]);
+
+            // Phase C: write the temp `--mcp-config` file. Uses a
+            // deterministic PID-based filename so respawns overwrite
+            // the previous file instead of leaking a new one each
+            // time.
+            let config_path = std::env::temp_dir()
+                .join(format!("workbridge-global-mcp-{}.json", std::process::id()));
+            if let Err(e) = std::fs::write(&config_path, &mcp_config) {
+                let _ = tx.send(GlobalSessionPrepResult {
+                    mcp_server: Some(mcp_server),
+                    session: None,
+                    config_path: None,
+                    error: Some(format!("Global assistant MCP config error: {e}")),
+                });
                 return;
             }
-        };
-        let mcp_config = crate::mcp::build_mcp_config(&exe, &mcp_server.socket_path, &[]);
-        let config_path =
-            std::env::temp_dir().join(format!("workbridge-global-mcp-{}.json", std::process::id()));
-        if let Err(e) = std::fs::write(&config_path, &mcp_config) {
-            self.status_message = Some(format!("Global assistant MCP config error: {e}"));
-            self.global_drawer_open = false;
-            self.focus = self.pre_drawer_focus;
-            return;
-        }
-        self.global_mcp_config_path = Some(config_path.clone());
 
-        // Build argv via the pluggable backend. `stage: Implementing` is
-        // used solely so the C8 planning-reminder hook is NOT installed
-        // (Planning is the only stage that triggers the reminder); the
-        // global assistant has no stage concept. `auto_start_message:
-        // None` because the global assistant waits for the first user
-        // keystroke before doing anything.
-        let cfg = SpawnConfig {
-            stage: WorkItemStatus::Implementing,
-            system_prompt: system_prompt.as_deref(),
-            mcp_config_path: Some(&config_path),
-            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
-            auto_start_message: None,
-            read_only: false,
-        };
-        let cmd = self.agent_backend.build_command(&cfg);
-
-        // Use a dedicated workbridge-owned scratch directory as cwd.
-        //
-        // We deliberately avoid `$HOME` here: Claude Code's workspace trust
-        // dialog ("Do you trust the files in this folder?") persists its
-        // acceptance per-project in `~/.claude.json`, but the home directory
-        // does not reliably persist that acceptance, so using `$HOME` as the
-        // cwd produces the trust prompt on every single Ctrl+G. Every
-        // non-home project path Claude Code sees DOES persist trust
-        // correctly, so a stable workbridge-owned scratch directory sidesteps
-        // the problem entirely without workbridge ever reading or writing
-        // `~/.claude.json`. On macOS `$TMPDIR` is per-user and stable across
-        // reboots, so the scratch path string is stable across workbridge
-        // runs, which means Claude Code's normal trust persistence carries
-        // over from one run to the next. The `create_dir_all` call is
-        // idempotent and also handles the case where the OS tmp cleaner has
-        // wiped the directory since the last spawn.
-        let scratch = std::env::temp_dir().join("workbridge-global-assistant-cwd");
-        if let Err(e) = std::fs::create_dir_all(&scratch) {
-            self.status_message = Some(format!("Global assistant scratch dir error: {e}"));
-            self.global_drawer_open = false;
-            self.focus = self.pre_drawer_focus;
-            return;
-        }
-
-        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        match Session::spawn(
-            self.global_pane_cols,
-            self.global_pane_rows,
-            Some(&scratch),
-            &cmd_refs,
-        ) {
-            Ok(session) => {
-                let parser = Arc::clone(&session.parser);
-                self.global_session = Some(SessionEntry {
-                    parser,
-                    alive: true,
-                    session: Some(session),
-                    scrollback_offset: 0,
-                    selection: None,
-                    agent_written_files: Vec::new(),
+            // Phase D: ensure the scratch cwd exists. We deliberately
+            // avoid `$HOME` here: Claude Code's workspace trust
+            // dialog persists its acceptance per-project in
+            // `~/.claude.json`, but the home directory does not
+            // reliably persist that acceptance, so using `$HOME` as
+            // the cwd produces the trust prompt on every single
+            // Ctrl+G. Every non-home project path Claude Code sees
+            // DOES persist trust correctly, so a stable
+            // workbridge-owned scratch directory sidesteps the
+            // problem entirely without workbridge ever reading or
+            // writing `~/.claude.json`. On macOS `$TMPDIR` is
+            // per-user and stable across reboots. `create_dir_all`
+            // is idempotent and handles the case where the OS tmp
+            // cleaner has wiped the directory since the last spawn.
+            let scratch = std::env::temp_dir().join("workbridge-global-assistant-cwd");
+            if let Err(e) = std::fs::create_dir_all(&scratch) {
+                let _ = std::fs::remove_file(&config_path);
+                let _ = tx.send(GlobalSessionPrepResult {
+                    mcp_server: Some(mcp_server),
+                    session: None,
+                    config_path: None,
+                    error: Some(format!("Global assistant scratch dir error: {e}")),
                 });
-                self.global_mcp_server = Some(mcp_server);
+                return;
             }
-            Err(e) => {
-                self.status_message = Some(format!("Global assistant spawn error: {e}"));
+
+            // Phase E: build argv via the pluggable backend.
+            // `stage: Implementing` is used solely so the C8
+            // planning-reminder hook is NOT installed (Planning is
+            // the only stage that triggers the reminder); the global
+            // assistant has no stage concept. `auto_start_message:
+            // None` because the global assistant waits for the first
+            // user keystroke before doing anything.
+            let cfg = SpawnConfig {
+                stage: WorkItemStatus::Implementing,
+                system_prompt: system_prompt.as_deref(),
+                mcp_config_path: Some(&config_path),
+                allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+                auto_start_message: None,
+                read_only: false,
+            };
+            let cmd = agent_backend.build_command(&cfg);
+            let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+
+            // Phase F: spawn the PTY session. The fork+exec is
+            // normally sub-millisecond but still blocks on process
+            // creation, so it runs here rather than on the UI
+            // thread.
+            let session = match Session::spawn(pane_cols, pane_rows, Some(&scratch), &cmd_refs) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&config_path);
+                    let _ = tx.send(GlobalSessionPrepResult {
+                        mcp_server: Some(mcp_server),
+                        session: None,
+                        config_path: None,
+                        error: Some(format!("Global assistant spawn error: {e}")),
+                    });
+                    return;
+                }
+            };
+
+            let result = GlobalSessionPrepResult {
+                mcp_server: Some(mcp_server),
+                session: Some(session),
+                config_path: Some(config_path),
+                error: None,
+            };
+
+            // Try to hand the result back to the UI thread. If the
+            // receiver has been dropped (drawer closed mid-flight),
+            // clean up the tempfile ourselves on this thread so
+            // nothing leaks to `/tmp`. The `McpSocketServer` and
+            // `Session` handles inside `result` run their own Drop
+            // impls on scope exit, which stop the accept loop,
+            // remove the socket file, and force-kill the child
+            // process group respectively.
+            if let Err(send_err) = tx.send(result) {
+                let dropped = send_err.0;
+                if let Some(path) = dropped.config_path {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        });
+
+        let activity = self.start_activity("Opening global assistant...");
+        self.global_session_open_pending = Some(GlobalSessionOpenPending {
+            rx,
+            activity,
+            pre_drawer_focus,
+        });
+    }
+
+    /// Drain any pending global-assistant preparation worker result.
+    /// Called from the background-work tick alongside the other
+    /// `poll_*` methods. On success, the worker's session / server
+    /// handles are moved into the durable `global_session`,
+    /// `global_mcp_server`, and `global_mcp_config_path` fields; on
+    /// error the drawer is reset to closed and the pre-drawer focus
+    /// is restored.
+    pub fn poll_global_session_open(&mut self) {
+        let recv_result = match self.global_session_open_pending.as_ref() {
+            Some(pending) => match pending.rx.try_recv() {
+                Ok(r) => Ok(r),
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
+            },
+            None => return,
+        };
+        let pending = match self.global_session_open_pending.take() {
+            Some(p) => p,
+            None => return,
+        };
+        self.end_activity(pending.activity);
+
+        match recv_result {
+            Ok(result) => {
+                if let Some(err) = result.error {
+                    // Worker reported a fatal error. Any handles it
+                    // created (mcp_server) are dropped here, which
+                    // triggers their shutdown sequences.
+                    drop(result.mcp_server);
+                    drop(result.session);
+                    self.status_message = Some(err);
+                    self.global_drawer_open = false;
+                    self.focus = pending.pre_drawer_focus;
+                    return;
+                }
+
+                // Success path: move worker handles into the durable
+                // App fields.
+                if let Some(session) = result.session {
+                    let parser = Arc::clone(&session.parser);
+                    self.global_session = Some(SessionEntry {
+                        parser,
+                        alive: true,
+                        session: Some(session),
+                        scrollback_offset: 0,
+                        selection: None,
+                        agent_written_files: Vec::new(),
+                    });
+                }
+                if let Some(server) = result.mcp_server {
+                    self.global_mcp_server = Some(server);
+                }
+                if let Some(path) = result.config_path {
+                    self.global_mcp_config_path = Some(path);
+                }
+            }
+            Err(()) => {
+                self.status_message =
+                    Some("Global assistant: preparation worker exited unexpectedly".into());
                 self.global_drawer_open = false;
-                self.focus = self.pre_drawer_focus;
+                self.focus = pending.pre_drawer_focus;
             }
         }
     }
@@ -11115,6 +11512,26 @@ mod tests {
     use super::*;
     use crate::work_item::BackendType;
     use std::path::PathBuf;
+
+    /// Poll-wait for a path to be removed from disk, bounded by
+    /// `timeout`. Used in tests that drive teardown paths whose file
+    /// removal runs on a detached background thread via
+    /// `App::spawn_agent_file_cleanup` (blocking I/O on the UI thread
+    /// is forbidden by `docs/UI.md` "Blocking I/O Prohibition", so
+    /// the removal cannot run synchronously inside the helper the
+    /// test calls). The thread spins up exactly one `remove_file`
+    /// call, so in practice the file disappears within a few
+    /// milliseconds; the 5-second default timeout is for stressed
+    /// CI hosts, not for correctness.
+    fn wait_until_file_removed(path: &std::path::Path, timeout: std::time::Duration) {
+        let start = std::time::Instant::now();
+        while path.exists() {
+            if start.elapsed() >= timeout {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     // -- F-1 regression test --
 
@@ -16391,9 +16808,17 @@ mod tests {
             "pending_global_pty_bytes must be drained so stale keystrokes \
              don't leak into the next session",
         );
+        // File removal runs on a detached background thread via
+        // `spawn_agent_file_cleanup` (blocking I/O on the UI thread
+        // is forbidden - see `docs/UI.md`), so poll-wait for the
+        // file to disappear. The cleanup thread spins up a single
+        // `std::fs::remove_file` call, so a short bounded wait is
+        // sufficient and deterministic in CI.
+        wait_until_file_removed(&temp_path, std::time::Duration::from_secs(5));
         assert!(
             !temp_path.exists(),
-            "teardown must delete the temp MCP config file from disk",
+            "teardown must delete the temp MCP config file from disk \
+             (via the background `spawn_agent_file_cleanup` worker)",
         );
     }
 
@@ -16467,9 +16892,13 @@ mod tests {
             app.pending_global_pty_bytes.is_empty(),
             "close must drain pending_global_pty_bytes",
         );
+        // Mirrors the `teardown_global_session_clears_all_state`
+        // wait: file removal runs on a detached background thread.
+        wait_until_file_removed(&temp_path, std::time::Duration::from_secs(5));
         assert!(
             !temp_path.exists(),
-            "close must delete the temp MCP config file",
+            "close must delete the temp MCP config file \
+             (via the background `spawn_agent_file_cleanup` worker)",
         );
     }
 

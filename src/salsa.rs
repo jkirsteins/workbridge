@@ -445,10 +445,21 @@ pub fn app_event(
                 // Poll async session-open plan reads. Must run AFTER
                 // poll_worktree_creation so a just-created worktree can
                 // kick off its plan read on the same tick and see its
-                // result on the next one. The plan read itself runs on
-                // a background thread - see `App::begin_session_open`
-                // and `docs/UI.md` "Blocking I/O Prohibition".
+                // result on the next one. Every blocking step (plan
+                // read, MCP socket bind, backend side-car writes, temp
+                // `--mcp-config` write) runs on a background thread -
+                // see `App::begin_session_open` and `docs/UI.md`
+                // "Blocking I/O Prohibition".
                 state.poll_session_opens();
+
+                // Drain the global assistant preparation worker.
+                // Every blocking step (MCP socket bind, temp config
+                // write, scratch dir create, PTY fork+exec) runs on
+                // a background thread spawned by
+                // `spawn_global_session`; this poll moves the result
+                // into the durable `App::global_*` fields. See
+                // `docs/UI.md` "Blocking I/O Prohibition".
+                state.poll_global_session_open();
 
                 // Poll async unlinked-item cleanup result.
                 state.poll_unlinked_cleanup();
