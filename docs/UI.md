@@ -275,6 +275,14 @@ and board views but not inside open dialogs or overlays.
   triggering an immediate fetch cycle. The status bar shows the
   "Refreshing GitHub data" spinner during the fetch, using the same
   code path as the periodic 120-second auto-refresh.
+- Ctrl+\\: cycle the right-panel tab between Claude Code and Terminal.
+  Works from both panels without changing focus, so the user can flip
+  the right panel without leaving the work item list and (more
+  importantly) can flip the tab from inside the PTY - plain Tab is
+  forwarded to the PTY so Claude Code's autocomplete works, which
+  means the tab switcher can't live on Tab itself. The
+  `ClaudeCode -> Terminal` transition is a no-op if the selected work
+  item has no worktree.
 
 ## Focus Model
 
@@ -286,7 +294,8 @@ because the right panel forwards almost all keys to the PTY, which is
 incompatible with rat-focus's widget navigation model.
 
 - Enter on a work item: focus right panel
-- Tab (when right panel focused): cycle between Claude Code and Terminal tabs
+- Ctrl+\\: cycle between Claude Code and Terminal tabs (global, does
+  not change focus - see "Global Shortcuts" above)
 - Ctrl+]: return to left panel
 - Ctrl+D / Delete: delete selected work item (modal confirmation)
 - Dead session: auto-return to left panel
@@ -944,21 +953,30 @@ worktree; otherwise only "Claude Code" is shown.
   first tab switch. One terminal session per work item, stored in
   `App::terminal_sessions` keyed by `WorkItemId`.
 
-Tab switching (while right panel is focused):
-- Tab: cycle between Claude Code and Terminal. Still fires even when
-  the current tab's session has ended - the on-screen "Press Tab to
+Tab switching:
+- Ctrl+\\: cycle between Claude Code and Terminal. Global intercept
+  in `handle_key()` so it works from both panels and does not change
+  focus. The `ClaudeCode -> Terminal` transition is a no-op if the
+  selected work item has no worktree. Still fires even when the
+  current tab's session has ended - the on-screen "Press Ctrl+\\ to
   switch back to Claude Code" hint (shown on the dead-terminal
   placeholder in `src/ui.rs`) and the symmetric dead-Claude case both
-  rely on this. Focus stays on the right panel across the flip. On
-  the Claude-Code-dead -> Terminal flip, the terminal session is
+  rely on this. Because the intercept runs before the right-panel
+  dead-session early-return, a dead session never blocks the flip.
+  On the Claude-Code-dead -> Terminal flip, the terminal session is
   spawned lazily via `spawn_terminal_session()` if the work item has
-  a worktree (same path as the live-session Tab flip).
+  a worktree.
+- Tab (while right panel is focused): forwarded to the PTY as `\t`
+  (0x09) so Claude Code's autocomplete fires. Not intercepted by
+  workbridge. On a dead right-panel session Tab takes the standard
+  escape-hatch path (see below).
+- Shift+Tab (while right panel is focused, live session): forwarded
+  to PTY as CSI Z (not intercepted).
 - All other keys on a dead right-panel session redirect focus to the
   left panel with a "returned to work items" status message (the
-  existing escape hatch). Ctrl+], Shift+Tab / BackTab, plain letters,
-  Enter, Esc all take this path.
-- Shift+Tab (on a live session): forwarded to PTY as CSI Z (not
-  intercepted).
+  existing escape hatch). Ctrl+], Tab, Shift+Tab / BackTab, plain
+  letters, Enter, Esc all take this path. Only the global `Ctrl+\\`
+  intercept bypasses it.
 
 Terminal sessions are cleaned up on:
 - Work item deletion (killed in `delete_work_item_by_id`)

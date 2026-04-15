@@ -2409,7 +2409,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     Line::from(""),
                     Line::from("  Terminal session has ended."),
                     Line::from(""),
-                    Line::from("  Press Tab to switch back to Claude Code."),
+                    Line::from("  Press Ctrl+\\ to switch back to Claude Code."),
                 ]);
                 let paragraph = Paragraph::new(text).block(block).style(theme.style_error());
                 paragraph.render(area, buf);
@@ -3154,6 +3154,7 @@ fn draw_settings_keybindings_tab(buf: &mut Buffer, app: &App, theme: &Theme, are
         binding("Ctrl+N", "Quick-start session"),
         binding("Ctrl+B", "New backlog ticket"),
         binding("Ctrl+G", "Global assistant"),
+        binding("Ctrl+\\", "Cycle Claude Code <-> Terminal tab"),
         binding("?", "Settings / keybindings (this overlay)"),
         binding("Q / Ctrl+Q", "Quit"),
         Line::from(""),
