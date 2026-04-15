@@ -178,19 +178,31 @@ Examples of the cache-first pattern:
   Claude Code session UUID via `session_id::session_id_for(wi, stage)`,
   and probes the disk via `session_id::session_exists_on_disk(uuid)`
   to decide between `--resume <uuid>` and `--session-id <uuid>`. The
-  background worker bundles `(plan_text, stage, session_id, spawn_flag)`
-  into a `SessionOpenPlanResult` and sends it through a per-work-item
+  probe returns a three-state `SessionProbe`:
+  `Exists` -> `spawn_flag = Some(Resume)`;
+  `Missing` -> `spawn_flag = Some(Fresh)`;
+  `Indeterminate(msg)` -> `spawn_flag = None`, `probe_error =
+  Some(msg)`. The `Indeterminate` case exists because `read_dir` and
+  per-subdirectory `metadata` stats can fail for reasons other than
+  NotFound (permission denied, FUSE error, unreadable directory),
+  and falling through to `Fresh` on those errors would silently lose
+  the user's prior conversation context. The background worker
+  bundles
+  `(plan_text, stage, session_id, spawn_flag, probe_error)` into a
+  `SessionOpenPlanResult` and sends it through a per-work-item
   receiver; `poll_session_opens` drains completed receivers and
   invokes `finish_session_open`, which builds the claude command and
   spawns the PTY on the UI thread WITHOUT any further filesystem I/O
   (`session_exists_on_disk` MUST NOT be called from
   `finish_session_open` or any other UI-thread code path - it does
   `read_dir` + per-subdir stat, which can stall on a slow or
-  network-mounted home directory). `stage_system_prompt` similarly
-  takes the pre-read plan text as a parameter and MUST NOT call
-  `backend.read_plan(...)` itself. The receiver map is keyed by
-  `WorkItemId` so parallel session opens for different items cannot
-  collide.
+  network-mounted home directory). When `spawn_flag` is `None`,
+  `finish_session_open` refuses to spawn and surfaces `probe_error`
+  via `status_message` so the user can fix the underlying condition
+  and retry. `stage_system_prompt` similarly takes the pre-read plan
+  text as a parameter and MUST NOT call `backend.read_plan(...)`
+  itself. The receiver map is keyed by `WorkItemId` so parallel
+  session opens for different items cannot collide.
 
 #### Streaming progress variant
 

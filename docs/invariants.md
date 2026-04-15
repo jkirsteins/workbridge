@@ -247,3 +247,56 @@ Heavy background work (liveness checks, fetch drains, signal handling)
 is throttled inside the timer handler to run only every ~200ms
 (BACKGROUND_TICK_DIVISOR). The fast tick drives rendering only; it must
 not increase the frequency of expensive periodic work.
+
+## Authorized Invariant Edits
+
+`CLAUDE.md` treats `docs/invariants.md` as effectively immutable:
+any edit is P0 unless covered by a specific, recorded session
+authorization naming the exact bullet, the user's rationale, and the
+scope boundary. This section is the persistent record of such
+authorizations so adversarial reviewers (human or automated) can
+verify that every edit to this file was sanctioned.
+
+Format per entry: date, PR / work-item ID, invariant bullet touched,
+user rationale, scope boundary, and (if relevant) the skill or review
+channel that carried the authorization. Entries are append-only: once
+recorded, do not rewrite or remove a prior authorization - add a new
+entry if a subsequent edit refines or supersedes it.
+
+### 2026-04-15, PR #91, invariant 13 "Fresh Claude session per stage"
+
+- **Bullet touched:** The entire body of invariant 13, including the
+  new "`Fresh` means per `(WorkItemId, WorkItemStatus)`, not per
+  workbridge process" paragraph, the stage-transitions-still-change-
+  the-tuple paragraph, the revised per-stage session lifecycle
+  list, the rewritten "Sessions gain conversational context only
+  from the deterministic transcript for the same `(wi_id, stage)`
+  tuple and from MCP tools" clause, and the closing note about the
+  review gate and global assistant being outside the scheme.
+- **User rationale (verbatim from PR #91 task description):** "If
+  we quit workbridge and resume, it should re-spawn the last known
+  claude sessions using their session IDs. There should be 1
+  session to resume, so when we switch phases, we should update
+  it." Quitting and re-entering workbridge must not wipe Claude's
+  in-stage conversational context for an active work item; each
+  stage still keeps its own isolated transcript.
+- **Scope boundary:** The edit relaxes the "one fresh session per
+  stage transition" contract ONLY for the restart-resume case
+  within the same `(WorkItemId, WorkItemStatus)` tuple. Stage
+  transitions (Planning -> Implementing -> Review) still produce
+  a new deterministic UUID, so the Review session is structurally
+  unable to see the Implementing transcript and cross-stage
+  context bleed remains impossible by construction. The review
+  gate's ephemeral `claude --print` subprocess and the global
+  assistant drawer remain explicitly outside the scheme. No other
+  invariant bullet is touched and no unrelated "session hygiene"
+  rule is relaxed.
+- **Authorization channel:** Codex adversarial review flagged the
+  unauthorised edit on 2026-04-15 during PR #91's review-gate
+  stage. The user was presented with a summary of the conflict
+  and two explicit options (A: authorise the invariant edit, B:
+  drop the resume feature). The user replied "Option A - feel
+  free to edit invariant-13" in the same review session. This
+  record pins that authorization to the specific edit so future
+  reviewers can verify the edit matches the scope above without
+  re-reading the conversation transcript.

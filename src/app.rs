@@ -544,7 +544,24 @@ pub struct SessionOpenPlanResult {
     /// deterministic UUID). Decided by the background worker via
     /// `session_id::session_exists_on_disk` so the UI thread never
     /// touches the filesystem.
-    pub spawn_flag: SpawnFlag,
+    ///
+    /// `None` means the probe returned `SessionProbe::Indeterminate`:
+    /// the background worker could not tell whether a transcript
+    /// existed because filesystem I/O failed. Codex adversarial review
+    /// flagged silently falling through to `Fresh` in this case. On a
+    /// degraded home directory it would quietly lose the user's prior
+    /// conversation context with no error surfaced anywhere.
+    /// `finish_session_open` MUST refuse to spawn when this is `None`
+    /// and surface `probe_error` on the status bar instead so the user
+    /// can fix the underlying condition and retry.
+    pub spawn_flag: Option<SpawnFlag>,
+    /// Human-readable probe error paired with `spawn_flag == None`.
+    /// `Some(msg)` when `session_exists_on_disk` returned
+    /// `SessionProbe::Indeterminate(msg)`; `None` otherwise. The
+    /// struct invariant is that exactly one of `spawn_flag` and
+    /// `probe_error` is `Some`. See `finish_session_open` for the
+    /// consumer-side enforcement.
+    pub probe_error: Option<String>,
 }
 
 /// Per-entry state tracked alongside the `session_open_rx` map so
@@ -3806,7 +3823,7 @@ impl App {
             // for an existing transcript. Both run here, on the
             // background thread, because `session_exists_on_disk`
             // performs filesystem I/O (`read_dir` + per-subdir
-            // `is_file`) which is forbidden on the UI thread by
+            // `metadata` stat) which is forbidden on the UI thread by
             // `docs/UI.md` "Blocking I/O Prohibition" - even a local
             // scan can stall on a slow or network-mounted home
             // directory or a permission delay. Co-locating the pure
@@ -3814,12 +3831,36 @@ impl App {
             // `(session_id, spawn_flag)` pair arriving at
             // `finish_session_open` is internally consistent and the
             // UI thread never has to touch `~/.claude/projects`.
+            //
+            // The probe returns a three-state enum:
+            // - `Exists` -> spawn `Resume`
+            // - `Missing` -> spawn `Fresh` (creates the new session
+            //   under the deterministic UUID so the next restart's
+            //   probe hits and resumes)
+            // - `Indeterminate(msg)` -> do NOT guess. Leave
+            //   `spawn_flag = None` and hand the error back via
+            //   `probe_error`; `finish_session_open` refuses to
+            //   spawn and surfaces the message so the user can
+            //   fix the underlying condition and retry. Falling
+            //   through to `Fresh` on an indeterminate probe would
+            //   silently lose the user's prior conversation
+            //   context on a degraded home directory, which is
+            //   the exact failure mode Codex adversarial review
+            //   flagged against the earlier `-> bool` helper.
             let session_id = crate::session_id::session_id_for(&wi_id_clone, stage);
-            let spawn_flag = if crate::session_id::session_exists_on_disk(session_id) {
-                SpawnFlag::Resume
-            } else {
-                SpawnFlag::Fresh
-            };
+            let (spawn_flag, probe_error) =
+                match crate::session_id::session_exists_on_disk(session_id) {
+                    crate::session_id::SessionProbe::Exists => (Some(SpawnFlag::Resume), None),
+                    crate::session_id::SessionProbe::Missing => (Some(SpawnFlag::Fresh), None),
+                    crate::session_id::SessionProbe::Indeterminate(msg) => (
+                        None,
+                        Some(format!(
+                            "Could not probe Claude transcript store: {msg}. \
+                         Session will not open - fix the underlying \
+                         filesystem condition and retry."
+                        )),
+                    ),
+                };
             let _ = tx.send(SessionOpenPlanResult {
                 wi_id: wi_id_clone,
                 cwd: cwd_clone,
@@ -3828,6 +3869,7 @@ impl App {
                 read_error,
                 session_id,
                 spawn_flag,
+                probe_error,
             });
         });
         // Surface immediate feedback so a slow plan read does not
@@ -3897,15 +3939,15 @@ impl App {
         // Destructure the plan result so we move the owned plan text
         // into `stage_system_prompt` without cloning, while still
         // holding references to `wi_id` and `cwd` for the rest of the
-        // function. `stage`, `session_id`, and `spawn_flag` were all
-        // resolved on the background thread in `begin_session_open`,
-        // so the UI thread does NO filesystem work here - in
-        // particular, `session_id::session_exists_on_disk` (which
-        // does `read_dir` + per-subdirectory `is_file`) MUST NOT be
-        // called from this function. Re-deriving any of those values
-        // would also reintroduce a race where the disk-existence
-        // probe and the spawn flag could disagree if someone moved
-        // the helper back onto the UI thread.
+        // function. `stage`, `session_id`, `spawn_flag`, and
+        // `probe_error` were all resolved on the background thread in
+        // `begin_session_open`, so the UI thread does NO filesystem
+        // work here - in particular, `session_id::session_exists_on_disk`
+        // (which does `read_dir` + per-subdirectory `metadata` stat)
+        // MUST NOT be called from this function. Re-deriving any of
+        // those values would also reintroduce a race where the
+        // disk-existence probe and the spawn flag could disagree if
+        // someone moved the helper back onto the UI thread.
         let SessionOpenPlanResult {
             wi_id: work_item_id,
             cwd,
@@ -3914,8 +3956,27 @@ impl App {
             read_error: _,
             session_id,
             spawn_flag,
+            probe_error,
         } = plan_result;
         let cwd = cwd.as_path();
+
+        // Guard: the disk probe was `Indeterminate` (permission denied
+        // on `~/.claude/projects`, a FUSE stat failure, an unreadable
+        // subdirectory, etc.). The background worker explicitly set
+        // `spawn_flag = None` so we would NOT silently fall through to
+        // `--session-id` and lose the user's prior conversation
+        // context under degraded filesystem conditions. Surface the
+        // error via `status_message` so the user can fix the
+        // underlying condition and retry. This is the Codex
+        // adversarial-review finding that the earlier `-> bool` probe
+        // collapsed real I/O errors into "no transcript" and shipped
+        // `Fresh` on the back of that.
+        let Some(spawn_flag) = spawn_flag else {
+            self.status_message = Some(probe_error.unwrap_or_else(|| {
+                "Could not probe Claude transcript store; session will not open".to_string()
+            }));
+            return;
+        };
 
         // Guards: do not spawn Claude unless the work item is still
         // around AND its current stage still matches the stage we
@@ -15853,14 +15914,25 @@ mod tests {
         // `session_exists_on_disk`. Whether the test environment has
         // a transcript file for `expected_id` under `~/.claude/projects`
         // is unknown, so we only assert that the field has been
-        // populated to one of the two valid variants. The structural
-        // point is that the field IS set - if anyone moved the disk
-        // probe back to `finish_session_open`, this struct would no
-        // longer carry the value and the test would fail to compile.
-        assert!(
-            matches!(result.spawn_flag, SpawnFlag::Resume | SpawnFlag::Fresh),
-            "background worker must populate spawn_flag (Resume or Fresh)",
-        );
+        // populated to one of the two valid variants (or, for the
+        // indeterminate branch, that `probe_error` is populated
+        // instead). The structural point is that SOMETHING IS set -
+        // if anyone moved the disk probe back to
+        // `finish_session_open`, both fields would be redundant and
+        // this test would fail to compile.
+        match (result.spawn_flag, &result.probe_error) {
+            (Some(SpawnFlag::Resume), None) | (Some(SpawnFlag::Fresh), None) => {}
+            (None, Some(msg)) => {
+                assert!(
+                    !msg.is_empty(),
+                    "probe_error must carry a non-empty message on Indeterminate",
+                );
+            }
+            other => panic!(
+                "background worker must populate exactly one of (spawn_flag, probe_error); \
+                 got {other:?}",
+            ),
+        }
         // End the spinner activity since `poll_session_opens` was
         // bypassed by the manual drain above.
         app.end_activity(entry.activity);
@@ -16210,7 +16282,8 @@ mod tests {
             plan_text: String::new(),
             read_error: None,
             session_id: crate::session_id::session_id_for(&wi_id, captured_stage),
-            spawn_flag: SpawnFlag::Fresh,
+            spawn_flag: Some(SpawnFlag::Fresh),
+            probe_error: None,
         };
 
         // Sanity: no sessions to start with.
@@ -16286,7 +16359,8 @@ mod tests {
             plan_text: String::new(),
             read_error: None,
             session_id: crate::session_id::session_id_for(&wi_id, captured_stage),
-            spawn_flag: SpawnFlag::Fresh,
+            spawn_flag: Some(SpawnFlag::Fresh),
+            probe_error: None,
         };
 
         app.finish_session_open(result);
@@ -16295,6 +16369,81 @@ mod tests {
             app.sessions.is_empty(),
             "finish_session_open must refuse to spawn for a no-session \
              stage even when the captured and current stages agree",
+        );
+    }
+
+    /// Codex adversarial-review finding: when the disk probe returns
+    /// `SessionProbe::Indeterminate`, the background worker sets
+    /// `spawn_flag = None` and puts a human-readable error in
+    /// `probe_error`. `finish_session_open` MUST refuse to spawn in
+    /// this case and surface the error via `status_message` instead
+    /// of guessing `--session-id` and quietly losing the user's
+    /// prior conversation context. This test pins that contract.
+    ///
+    /// Construct a SessionOpenPlanResult that mirrors what the
+    /// background worker produces on an I/O-error probe, hand it to
+    /// `finish_session_open`, and assert that no session is created
+    /// and the status bar carries the probe error.
+    #[test]
+    fn finish_session_open_refuses_indeterminate_probe_and_surfaces_error() {
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-probe-error.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "codex-probe-error".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/codex-probe-error-repo"),
+                branch: Some("feature/codex-probe-error".into()),
+                worktree_path: Some(PathBuf::from("/tmp/codex-probe-error-wt")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        let captured_stage = WorkItemStatus::Implementing;
+        let error_msg = "Could not probe Claude transcript store: Failed to read /home/test/.claude/projects: \
+             Permission denied (os error 13). Session will not open - fix the underlying \
+             filesystem condition and retry.";
+        let result = SessionOpenPlanResult {
+            wi_id: wi_id.clone(),
+            cwd: PathBuf::from("/tmp/codex-probe-error-wt"),
+            stage: captured_stage,
+            plan_text: String::new(),
+            read_error: None,
+            session_id: crate::session_id::session_id_for(&wi_id, captured_stage),
+            spawn_flag: None,
+            probe_error: Some(error_msg.to_string()),
+        };
+
+        app.finish_session_open(result);
+
+        assert!(
+            app.sessions.is_empty(),
+            "finish_session_open must refuse to spawn when the background \
+             probe was indeterminate - guessing --session-id would silently \
+             lose prior conversation context on a degraded home directory",
+        );
+        let status = app
+            .status_message
+            .as_deref()
+            .expect("probe error must be surfaced via status_message");
+        assert!(
+            status.contains("transcript store") || status.contains("Permission denied"),
+            "status message must carry the probe_error context, got: {status}",
         );
     }
 
