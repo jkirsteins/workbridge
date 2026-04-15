@@ -89,7 +89,7 @@ to roughly every 25th tick (~200ms) to keep CPU usage reasonable.
 ## Mergequeue watch can bind to the wrong PR after an app restart
 
 **What:** When a work item is in Mergequeue and the TUI is closed, the
-in-memory `MergequeueWatch.pr_number` pin is lost. On next launch,
+in-memory `PrMergeWatch.pr_number` pin is lost. On next launch,
 `reconstruct_mergequeue_watches` rebuilds the watch with `pr_number = None`
 and the first poll falls back to `gh pr view <branch>`. `gh` resolves a
 branch name to "the most recent PR for that branch", not the specific PR

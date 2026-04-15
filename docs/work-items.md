@@ -161,8 +161,19 @@ Stage restrictions for ReviewRequest items:
   ReviewRequest kind check server-side.
 - **Auto-close on external merge**: ReviewRequest items in Review are
   polled every 30 seconds via `gh pr view <target> --repo
-  <owner/repo> --json state,number,title,url`, mirroring the
-  Mergequeue poll. When the PR is detected as merged, the item
+  <owner/repo> --json state,number,title,url`. The ReviewRequest
+  poller (`App::poll_review_request_merges` /
+  `App::reconstruct_review_request_merge_watches`) and the Mergequeue
+  poller (`App::poll_mergequeue` /
+  `App::reconstruct_mergequeue_watches`) are generated from a single
+  pair of macros (`impl_pr_merge_poll_method!` +
+  `impl_pr_merge_reconstruct_method!` in `src/app.rs`) so the
+  subprocess path, the 30 s cooldown, the Phase 1 drain, the
+  still-eligible guard, the `pr_number` backfill, and the merge-gate
+  dispatch cannot drift between the two stages. Per-stage deltas
+  (source stage, kind filter, strategy tag, status messages, whether
+  the merged branch runs `cleanup_worktree_for_item`) are passed as
+  macro arguments. When the PR is detected as merged, the item
   auto-transitions to Done through the merge-gate invariant (`source
   == "pr_merge"`) and the merged PR's identity is persisted to
   `pr_identity` so the assembly fallback keeps the merged-PR link
