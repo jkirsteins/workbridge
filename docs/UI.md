@@ -198,15 +198,16 @@ Examples of the cache-first pattern:
   via `status_message` so the user can fix the underlying condition
   and retry.
 - **Stage 2** is `begin_session_spawn` + `poll_session_spawns`: on
-  the UI thread, `finish_session_open` gathers the owned MCP inputs
-  it needs (`wi_id_str`, context JSON, `wi_kind`, the exe path from
-  `current_exe`, repo-level MCP server entries, a clone of
-  `mcp_tx`, PTY dimensions) into a `SessionSpawnInputs` struct and
-  hands off to a second background worker via `begin_session_spawn`.
-  That worker does ALL the remaining I/O: starts the `McpSocketServer`
-  (`remove_file` + `UnixListener::bind`), builds the MCP config JSON,
-  writes `.mcp.json` to the worktree root, writes a temp
-  `--mcp-config` file, forks the Claude PTY via
+  the UI thread, `finish_session_open` gathers the owned MCP
+  inputs it needs (`wi_id_str`, context JSON, `wi_kind`,
+  repo-level MCP server entries, a clone of `mcp_tx`, PTY
+  dimensions) into a `SessionSpawnInputs` struct and hands off to
+  a second background worker via `begin_session_spawn`. That
+  worker does ALL the remaining I/O: resolves
+  `std::env::current_exe()` (readlink syscall), starts the
+  `McpSocketServer` (`remove_file` + `UnixListener::bind`), builds
+  the MCP config JSON, writes a temp `--mcp-config` file under
+  `std::env::temp_dir()`, forks the Claude PTY via
   `Session::spawn`, and sends a `SessionSpawnResult` back via a
   per-work-item receiver stored in `session_spawn_rx`.
   `poll_session_spawns` drains the result on the next background
@@ -216,11 +217,27 @@ Examples of the cache-first pattern:
   derived-Done race), and inserts the live session / MCP server
   into `self.sessions` / `self.mcp_servers`. If the work item or
   stage has drifted in the meantime, the `Session` inside
-  `SessionSpawnOk` is dropped and its `Drop` impl tears down the
-  PTY and child process; the session never becomes observable in
-  the map. Non-fatal MCP config file-write failures are propagated
-  via `SessionSpawnOk::warning` and surfaced through
-  `status_message` alongside the live session.
+  `SessionSpawnOk` is routed through `teardown_session_async` so
+  its blocking `Drop` tears down on a background thread; the
+  session never becomes observable in the map.
+- **Workbridge does NOT write `.mcp.json` into the worktree
+  root.** Earlier iterations wrote both a worktree `.mcp.json`
+  and a temp `--mcp-config` file as defense-in-depth, but the
+  worktree file is indistinguishable from a user- or repo-owned
+  `.mcp.json` - a rollback on cancellation or spawn failure
+  would silently delete it, and a successful write on top of a
+  pre-existing user file would overwrite user state. Codex
+  adversarial review flagged that as unrecoverable data loss
+  and a violation of the CLAUDE.md rule against mutating
+  third-party tool control files outside workbridge-owned
+  directories. The temp `--mcp-config` path lives under
+  `std::env::temp_dir()` with a UUID-tagged filename, so it is
+  unambiguously workbridge-owned and can be cleaned up on every
+  failure path. Claude Code accepts `--mcp-config` as a
+  first-class CLI flag, so a single delivery path is sufficient
+  to reach the MCP server. A write failure on the temp path is
+  therefore fatal and aborts the spawn; there is no backup path
+  to fall through to.
 - `finish_session_open` and `poll_session_spawns` together contain
   ZERO filesystem I/O on the UI thread: no `session_exists_on_disk`
   call (moved to stage 1), no `std::fs::write` calls (moved to

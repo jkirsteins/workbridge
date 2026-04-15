@@ -609,12 +609,14 @@ pub struct SessionSpawnResult {
 /// owned by background-thread-borrowed resources that the UI thread
 /// has to accept ownership of before the spawn completes.
 ///
-/// `warning` forwards non-fatal MCP config file-write failures from
-/// the background worker. `.mcp.json` and the temp `--mcp-config`
-/// file are written on a best-effort basis (Claude can still
-/// connect to the MCP server via either path alone), so a single
-/// write failure is not fatal but should still surface via
-/// `status_message` so the user notices the degraded state.
+/// `warning` used to forward non-fatal MCP config file-write
+/// failures from the background worker back to the UI thread. It
+/// is currently always `None` because workbridge now has exactly
+/// ONE MCP config delivery path (the temp `--mcp-config` file),
+/// and a write failure there is fatal - the spawn is aborted
+/// before reaching `Session::spawn` and the outcome is an `Err`
+/// instead. The field is kept so a future warning surface can be
+/// added without touching call sites.
 pub struct SessionSpawnOk {
     pub session: crate::session::Session,
     pub mcp_server: McpSocketServer,
@@ -978,8 +980,6 @@ pub struct App {
     /// Work item IDs where Claude has signaled it is actively working
     /// (via workbridge_set_activity). Cleared when the session dies.
     pub claude_working: std::collections::HashSet<WorkItemId>,
-    /// Paths to .mcp.json files written to worktrees, keyed by work item ID.
-    /// Tracked so they can be cleaned up when sessions die or work items are deleted.
     /// Receiver for MCP events from all socket servers.
     pub mcp_rx: Option<crossbeam_channel::Receiver<McpEvent>>,
     /// Sender for MCP events (cloned for each socket server).
@@ -1075,11 +1075,13 @@ pub struct App {
     pub session_open_rx: HashMap<WorkItemId, SessionOpenPending>,
 
     /// Per-work-item pending receivers for the second session-open
-    /// stage: the background worker that spawns the MCP socket
-    /// server, writes `.mcp.json` + a temp `--mcp-config` file, and
-    /// forks the Claude PTY. See `SessionSpawnResult` for the
-    /// rationale (Codex adversarial review required all of this I/O
-    /// to leave the UI thread). Drained by `poll_session_spawns` on
+    /// stage: the background worker that resolves
+    /// `std::env::current_exe`, spawns the MCP socket server,
+    /// writes the temp `--mcp-config` file (under
+    /// `std::env::temp_dir()`, NOT the worktree), and forks the
+    /// Claude PTY. See `SessionSpawnResult` for the rationale
+    /// (Codex adversarial review required all of this I/O to
+    /// leave the UI thread). Drained by `poll_session_spawns` on
     /// every background tick.
     ///
     /// Keyed by `WorkItemId` so concurrent spawns for different work
@@ -1646,7 +1648,11 @@ impl App {
     ///
     /// The reader threads handle PTY output continuously - no reading
     /// happens here. This only checks if child processes have exited.
-    /// Also cleans up .mcp.json files and MCP servers for dead sessions.
+    /// Also cleans up MCP servers (via `teardown_mcp_server_async` in
+    /// `cleanup_session_state_for`) for dead sessions and routes any
+    /// orphaned live sessions through `teardown_live_session_async`.
+    /// Workbridge no longer writes `.mcp.json` into the worktree, so
+    /// there is nothing to clean up there.
     pub fn check_liveness(&mut self) {
         let mut dead_ids: Vec<WorkItemId> = Vec::new();
         let mut dead_implementing: Vec<WorkItemId> = Vec::new();
@@ -3699,9 +3705,11 @@ impl App {
     ///
     /// 1. It is registered with git for the target `branch`.
     /// 2. It is NOT the main worktree (`is_main = false`). Reusing the
-    ///    user's primary repo checkout would spawn Claude sessions inside
-    ///    it and drop workbridge state (`.mcp.json`) there, violating
-    ///    invariant #3 in `docs/invariants.md`.
+    ///    user's primary repo checkout would spawn a Claude session
+    ///    inside the user's live default-branch checkout, violating
+    ///    invariant #3 ("a worktree must not be on the default
+    ///    branch") in `docs/invariants.md` and risking edits to the
+    ///    user's primary working copy.
     /// 3. Its canonicalized path equals the canonicalized `wt_target` the
     ///    import/session-spawn flow would have created. This rules out
     ///    adopting unrelated worktrees the user made manually or that
@@ -4509,110 +4517,79 @@ impl App {
             let mcp_config =
                 crate::mcp::build_mcp_config(&exe, &server.socket_path, &repo_mcp_servers);
 
-            // Write .mcp.json to the worktree root. This is the
-            // path Claude Code's project discovery picks up
-            // automatically; the --mcp-config flag below is a
-            // defense-in-depth backup in case project discovery is
-            // disabled or points elsewhere. A write failure is not
-            // fatal - Claude will still start with the --mcp-config
-            // flag - so surface it via the status message but keep
-            // going.
-            let mcp_json_path = cwd.join(".mcp.json");
-            let mut status_warning: Option<String> = None;
-            let mut wrote_mcp_json = false;
-            match std::fs::write(&mcp_json_path, &mcp_config) {
-                Ok(()) => wrote_mcp_json = true,
-                Err(e) => {
-                    status_warning = Some(format!("MCP config write error: {e}"));
-                }
-            }
-
-            // Write the temp --mcp-config file. A failure is
-            // only survivable if the worktree `.mcp.json` write
-            // above succeeded - Claude can still reach the MCP
-            // server via project discovery. If BOTH writes fail
-            // (double failure), we abort the spawn below: a
-            // Claude session with no MCP delivery path is
-            // functionally broken because required tools like
-            // `workbridge_set_plan` / `workbridge_set_status`
-            // cannot reach the socket server.
+            // Write the temp `--mcp-config` file. This is the
+            // ONLY MCP config delivery path workbridge controls;
+            // we deliberately do NOT write `.mcp.json` into the
+            // user's worktree root because we cannot tell
+            // workbridge-owned files from user-owned files
+            // there. A pre-existing `.mcp.json` belonging to the
+            // user or the repo would be silently overwritten on
+            // success and silently deleted on the rollback /
+            // spawn-error paths, which is unrecoverable data
+            // loss. It also violates the CLAUDE.md rule against
+            // mutating third-party tool control files outside of
+            // workbridge-owned directories.
+            //
+            // Claude Code supports `--mcp-config <path>` as a
+            // first-class CLI flag, so routing the config
+            // through an exclusively workbridge-owned path in
+            // `std::env::temp_dir()` is sufficient to reach the
+            // socket server. If this single write fails, the
+            // spawn is aborted: the Claude session would be
+            // structurally unable to reach the workbridge MCP
+            // server, and tools like `workbridge_set_plan` /
+            // `workbridge_set_status` would silently break the
+            // workflow.
             let config_path = std::env::temp_dir().join(format!(
                 "workbridge-mcp-config-{}.json",
                 uuid::Uuid::new_v4()
             ));
             let mut final_cmd = cmd;
-            let mut wrote_temp_config = false;
-            match std::fs::write(&config_path, &mcp_config) {
-                Ok(()) => {
-                    wrote_temp_config = true;
-                    final_cmd.push("--mcp-config".to_string());
-                    final_cmd.push(config_path.to_string_lossy().to_string());
-                }
-                Err(e) => {
-                    status_warning = Some(format!("MCP config write error: {e}"));
-                }
-            }
-
-            // Codex adversarial review: if BOTH MCP delivery
-            // paths failed (neither `.mcp.json` in the worktree
-            // nor the temp `--mcp-config` file landed), abort
-            // the spawn instead of launching a Claude session
-            // that is structurally unable to see the MCP server.
-            // Without this guard the UI would insert a session
-            // entry that looks "alive" but cannot run
-            // `workbridge_set_plan` / `workbridge_set_status`,
-            // silently breaking the workflow.
-            if !wrote_mcp_json && !wrote_temp_config {
+            if let Err(e) = std::fs::write(&config_path, &mcp_config) {
                 let _ = tx.send(SessionSpawnResult {
                     wi_id: wi_id_for_thread,
                     stage,
                     outcome: Err(format!(
-                        "Session spawn aborted: both MCP config \
-                         delivery paths failed. {}. Claude would \
+                        "Session spawn aborted: could not write \
+                         MCP config to {}: {e}. Claude would \
                          have no way to reach the workbridge MCP \
                          server, so the session is unusable.",
-                        status_warning
-                            .as_deref()
-                            .unwrap_or("No specific error message was captured",),
+                        config_path.display(),
                     )),
                 });
                 return;
             }
+            // The write succeeded - everything from here on out
+            // has a real config file at `config_path` to clean
+            // up on failure / cancellation. The `.mcp.json` in
+            // the worktree root is NOT touched on any path: we
+            // deliberately never write it, so there is nothing
+            // to clean up and no risk of overwriting a user- or
+            // repo-owned `.mcp.json`.
+            final_cmd.push("--mcp-config".to_string());
+            final_cmd.push(config_path.to_string_lossy().to_string());
 
-            // Cancel check 3: after the worktree writes, before
-            // the PTY fork. If cancellation fired during the
-            // writes (or between check 2 and now), roll back the
-            // `.mcp.json` and the temp config file so the
-            // worktree is not left with a stale Claude Code
-            // control file pointing at a socket that is about to
-            // be destroyed. Codex adversarial review explicitly
-            // called this out: without the rollback, a cancelled
-            // spawn would leave `.mcp.json` in the worktree
-            // forever, referencing a dead MCP socket.
+            // Cancel check 3: after the temp config write,
+            // before the PTY fork. If cancellation fired during
+            // the write (or between check 2 and now), remove
+            // the temp config file so /tmp does not accumulate
+            // orphaned workbridge-mcp-config-*.json files for
+            // every cancelled spawn. The file is exclusively
+            // workbridge-owned (we just wrote it to a
+            // UUID-tagged path under `std::env::temp_dir()`),
+            // so deleting it is safe.
             if cancel_for_thread.load(std::sync::atomic::Ordering::Acquire) {
-                let mut to_remove: Vec<&std::path::Path> = Vec::new();
-                if wrote_mcp_json {
-                    to_remove.push(mcp_json_path.as_path());
-                }
-                if wrote_temp_config {
-                    to_remove.push(config_path.as_path());
-                }
-                send_cancelled(&tx, wi_id_for_thread, stage, &to_remove);
+                send_cancelled(&tx, wi_id_for_thread, stage, &[config_path.as_path()]);
                 return;
             }
 
-            // Fork the Claude PTY. This is the blocking call that
-            // previously ran on the UI thread; moving it here
-            // removes the last bit of session-open I/O from the
-            // tick path. On success, forward `status_warning` so
-            // the UI thread can surface any non-fatal MCP config
-            // file-write failures via `status_message`. On
-            // failure, remove any files we wrote for this spawn
-            // so the worktree does not end up with stale
-            // `.mcp.json` pointing at a socket that was just
-            // destroyed - Codex adversarial review flagged this
-            // as the symmetric rollback to the cancellation
-            // path above.
+            // Fork the Claude PTY. This is the blocking call
+            // that previously ran on the UI thread; moving it
+            // here removes the last bit of session-open I/O
+            // from the tick path. On failure, remove the temp
+            // config file so /tmp does not accumulate orphans;
+            // the file is exclusively workbridge-owned, so
+            // deleting it is safe.
             let cmd_refs: Vec<&str> = final_cmd.iter().map(|s| s.as_str()).collect();
             let outcome = match crate::session::Session::spawn(
                 pane_cols,
@@ -4623,15 +4600,10 @@ impl App {
                 Ok(session) => Ok(SessionSpawnOk {
                     session,
                     mcp_server: server,
-                    warning: status_warning,
+                    warning: None,
                 }),
                 Err(e) => {
-                    if wrote_mcp_json {
-                        let _ = std::fs::remove_file(&mcp_json_path);
-                    }
-                    if wrote_temp_config {
-                        let _ = std::fs::remove_file(&config_path);
-                    }
+                    let _ = std::fs::remove_file(&config_path);
                     Err(format!("Error spawning session: {e}"))
                 }
             };
@@ -4935,13 +4907,13 @@ impl App {
                     self.sessions.insert(session_key, entry);
                     self.mcp_servers.insert(result.wi_id, mcp_server);
                     self.focus = FocusPanel::Right;
-                    // Prefer the warning (degraded state) over the
-                    // generic "right panel focused" message: if
-                    // .mcp.json or the temp --mcp-config file could
-                    // not be written, the user should see that.
-                    // Claude is still running (the MCP socket
-                    // server itself is up), but the fallback config
-                    // delivery is reduced.
+                    // `warning` is a hook for future non-fatal
+                    // degradations. Today the temp `--mcp-config`
+                    // write is the only MCP delivery path, so a
+                    // failure there aborts the spawn before
+                    // reaching this branch - `warning` is always
+                    // `None` on the success arm and the default
+                    // "right panel focused" message always wins.
                     self.status_message = Some(warning.unwrap_or_else(|| {
                         "Right panel focused - press Ctrl+] to return".to_string()
                     }));
