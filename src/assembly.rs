@@ -498,7 +498,17 @@ fn collect_unlinked_prs(
 }
 
 /// Collect PRs where the authenticated user has been requested as a
-/// reviewer. Skips PRs already claimed by a work item (imported).
+/// reviewer. Skips PRs in two cases:
+///
+/// 1. The PR is already claimed by a work item (imported). The user is
+///    tracking it through the normal work-item flow, so it should not
+///    also appear as an untracked review request.
+/// 2. The PR's review decision is `Approved` or `ChangesRequested`. Both
+///    are non-actionable states for the current user - they have already
+///    submitted a terminal review on this PR. Only `Pending`
+///    (review required, not yet submitted) and `None` (no decision at
+///    all) remain visible, which matches "items that still need my
+///    action".
 fn collect_review_requested_prs(
     repo_data: &HashMap<PathBuf, RepoFetchResult>,
     claimed_branches: &HashSet<(PathBuf, String)>,
@@ -510,15 +520,23 @@ fn collect_review_requested_prs(
                 if pr.head_branch.is_empty() {
                     continue;
                 }
-                if !claimed_branches.contains(&(repo_path.clone(), pr.head_branch.clone())) {
-                    result.push(ReviewRequestedPr {
-                        repo_path: repo_path.clone(),
-                        pr: convert_pr(pr),
-                        branch: pr.head_branch.clone(),
-                        requested_reviewer_logins: pr.requested_reviewer_logins.clone(),
-                        requested_team_slugs: pr.requested_team_slugs.clone(),
-                    });
+                if claimed_branches.contains(&(repo_path.clone(), pr.head_branch.clone())) {
+                    continue;
                 }
+                let decision = convert_review_decision(&pr.review_decision);
+                if matches!(
+                    decision,
+                    ReviewDecision::Approved | ReviewDecision::ChangesRequested
+                ) {
+                    continue;
+                }
+                result.push(ReviewRequestedPr {
+                    repo_path: repo_path.clone(),
+                    pr: convert_pr(pr),
+                    branch: pr.head_branch.clone(),
+                    requested_reviewer_logins: pr.requested_reviewer_logins.clone(),
+                    requested_team_slugs: pr.requested_team_slugs.clone(),
+                });
             }
         }
     }
@@ -1395,6 +1413,106 @@ mod tests {
         );
         assert_eq!(convert_review_decision(""), ReviewDecision::None);
         assert_eq!(convert_review_decision("UNKNOWN"), ReviewDecision::None);
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_review_requested_prs filter tests
+    // -----------------------------------------------------------------------
+
+    /// Build a repo_data map with a single review-requested PR on the given
+    /// branch and review decision. Helper for the filter tests below.
+    fn repo_data_with_review_request(
+        rp: PathBuf,
+        branch: &str,
+        review_decision: &str,
+    ) -> HashMap<PathBuf, RepoFetchResult> {
+        let pr = GithubPr {
+            number: 1,
+            title: "Needs your review".to_string(),
+            state: "OPEN".to_string(),
+            is_draft: false,
+            head_branch: branch.to_string(),
+            url: "https://github.com/o/r/pull/1".to_string(),
+            review_decision: review_decision.to_string(),
+            status_check_rollup: "".to_string(),
+            head_repo_owner: Some("other".to_string()),
+            author: Some("someone-else".to_string()),
+            mergeable: String::new(),
+            requested_reviewer_logins: Vec::new(),
+            requested_team_slugs: Vec::new(),
+        };
+        let fetch = RepoFetchResult {
+            repo_path: rp.clone(),
+            github_remote: Some(("owner".to_string(), "repo".to_string())),
+            worktrees: Ok(vec![]),
+            prs: Ok(vec![]),
+            review_requested_prs: Ok(vec![pr]),
+            issues: vec![],
+            current_user_login: None,
+        };
+        HashMap::from([(rp, fetch)])
+    }
+
+    #[test]
+    fn review_requests_hidden_when_approved() {
+        let repo_data = repo_data_with_review_request(repo_path("alpha"), "feat-a", "APPROVED");
+        let claimed: HashSet<(PathBuf, String)> = HashSet::new();
+        let result = collect_review_requested_prs(&repo_data, &claimed);
+        assert!(
+            result.is_empty(),
+            "Approved review requests must not appear in the sidebar, got: {:?}",
+            result.iter().map(|r| &r.branch).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn review_requests_hidden_when_changes_requested() {
+        let repo_data =
+            repo_data_with_review_request(repo_path("alpha"), "feat-a", "CHANGES_REQUESTED");
+        let claimed: HashSet<(PathBuf, String)> = HashSet::new();
+        let result = collect_review_requested_prs(&repo_data, &claimed);
+        assert!(
+            result.is_empty(),
+            "ChangesRequested review requests must not appear in the sidebar, got: {:?}",
+            result.iter().map(|r| &r.branch).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn review_requests_shown_when_pending() {
+        let repo_data =
+            repo_data_with_review_request(repo_path("alpha"), "feat-a", "REVIEW_REQUIRED");
+        let claimed: HashSet<(PathBuf, String)> = HashSet::new();
+        let result = collect_review_requested_prs(&repo_data, &claimed);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].branch, "feat-a");
+        assert_eq!(result[0].pr.review_decision, ReviewDecision::Pending);
+    }
+
+    #[test]
+    fn review_requests_shown_when_no_decision() {
+        let repo_data = repo_data_with_review_request(repo_path("alpha"), "feat-a", "");
+        let claimed: HashSet<(PathBuf, String)> = HashSet::new();
+        let result = collect_review_requested_prs(&repo_data, &claimed);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].branch, "feat-a");
+        assert_eq!(result[0].pr.review_decision, ReviewDecision::None);
+    }
+
+    #[test]
+    fn review_requests_hidden_when_claimed_regardless_of_decision() {
+        // Regression guard on the existing claim filter: even a
+        // genuinely-actionable Pending review request must be hidden
+        // when the branch is already tracked by a work item.
+        let rp = repo_path("alpha");
+        let repo_data = repo_data_with_review_request(rp.clone(), "feat-a", "REVIEW_REQUIRED");
+        let mut claimed: HashSet<(PathBuf, String)> = HashSet::new();
+        claimed.insert((rp, "feat-a".to_string()));
+        let result = collect_review_requested_prs(&repo_data, &claimed);
+        assert!(
+            result.is_empty(),
+            "Claimed review requests must not appear regardless of decision",
+        );
     }
 
     #[test]

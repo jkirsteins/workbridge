@@ -126,10 +126,15 @@ The `reassemble()` function produces a 4-tuple:
 `(work_items, unlinked_prs, review_requested_prs, reopen_ids)`. The
 `collect_review_requested_prs()` helper filters out any
 review-requested PRs that are already claimed by an existing work item,
-so only genuinely untracked review requests appear in the sidebar.
-Review-requested PRs are distinct from unlinked PRs - unlinked PRs are
-the user's own PRs without a work item, while review-requested PRs are
-other people's PRs where the user is a reviewer.
+as well as PRs whose `reviewDecision` is `APPROVED` or
+`CHANGES_REQUESTED` (the current user has already submitted a terminal
+review on these, so they are no longer actionable). Only `Pending`
+(review required but not yet submitted) and `None` (no decision at
+all) remain visible, so the sidebar shows only genuinely untracked and
+actionable review requests. Review-requested PRs are distinct from
+unlinked PRs - unlinked PRs are the user's own PRs without a work
+item, while review-requested PRs are other people's PRs where the
+user is a reviewer.
 
 The `reopen_ids` vector contains WorkItemIds for Done ReviewRequest items
 whose branch still appears in the review-requested set from GitHub. The

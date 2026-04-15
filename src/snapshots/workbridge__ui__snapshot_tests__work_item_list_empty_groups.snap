@@ -1,5 +1,6 @@
 ---
 source: src/ui.rs
+assertion_line: 4527
 expression: "render(&app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
@@ -11,12 +12,12 @@ expression: "render(&app, 80, 24)"
 │  Ctrl+B: backlog ticke││  Ctrl+B    - New backlog ticket                     │
 │                       ││  Up/Down   - Navigate items                         │
 │                       ││  Enter     - Open session / Import                  │
+│                       ││  o         - Open PR in browser                     │
 │                       ││  Ctrl+]    - Return to item list                    │
 │                       ││  Ctrl+G    - Global assistant                       │
 │                       ││  Ctrl+D    - Delete work item                       │
 │                       ││  ?         - Settings                               │
 │                       ││  Q/Ctrl+Q  - Quit                                   │
-│                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

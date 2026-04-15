@@ -373,6 +373,14 @@ incompatible with rat-focus's widget navigation model.
   not change focus - see "Global Shortcuts" above)
 - Ctrl+]: return to left panel
 - Ctrl+D / Delete: delete selected work item (modal confirmation)
+- o (left panel only): open the selected entry's PR in the default
+  browser via `open`. Works on work items (first repo association with
+  a PR wins), unlinked PRs, and review requests. Sets a "No PR to open"
+  status message on selections that have no PR (group headers, work
+  items with no PR yet). Not bound on the right panel because single
+  keystrokes there forward to the PTY. The `open` subprocess is
+  spawned on a background thread so a stalled launch cannot block the
+  UI event loop (see "Blocking I/O Prohibition" below).
 - Dead session: auto-return to left panel
 - Up/Down in left panel: reset right panel tab to Claude Code
 
