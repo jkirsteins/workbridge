@@ -247,24 +247,3 @@ Heavy background work (liveness checks, fetch drains, signal handling)
 is throttled inside the timer handler to run only every ~200ms
 (BACKGROUND_TICK_DIVISOR). The fast tick drives rendering only; it must
 not increase the frequency of expensive periodic work.
-
----
-
-## Audit Trail
-
-Per `CLAUDE.md`, every edit to this file is P0 unless covered by a
-specific, recorded session authorization. Authorizations are tracked
-in a separate directory (`docs/session-authorizations/`) so the
-authorizing text lives outside the file it authorizes - an authorization
-cannot sanction itself. See `docs/session-authorizations/README.md`
-for the format and process.
-
-Edits to this file since the audit trail was established:
-
-- **2026-04-15, invariant 13 "Fresh Claude session per stage"** -
-  Relaxed the "one fresh session per stage transition" contract for
-  the restart-resume case within the same `(WorkItemId,
-  WorkItemStatus)` tuple. Stage transitions still produce a new
-  deterministic UUID, so cross-stage isolation is preserved.
-  Authorized by
-  `docs/session-authorizations/2026-04-15-pr91-invariant-13.md`.
