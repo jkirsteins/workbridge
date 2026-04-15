@@ -1775,6 +1775,7 @@ fn handle_textarea_key(app: &mut App, key: KeyEvent) {
 // -- Mouse scroll handling ---------------------------------------------------
 
 /// Which PTY area (if any) the mouse cursor is over.
+#[derive(Debug)]
 enum MouseTarget {
     /// Mouse is over the global assistant drawer's inner area.
     GlobalDrawer { local_col: u16, local_row: u16 },
@@ -1784,15 +1785,24 @@ enum MouseTarget {
     None,
 }
 
-/// Determine which PTY area contains the given terminal-absolute coordinates.
+/// Determine which PTY area contains the given terminal-absolute
+/// coordinates, given an explicit `(cols, rows)` terminal size.
 ///
-/// Checks the global drawer first (since it overlays everything), then the
-/// right panel. Returns `MouseTarget::None` if outside both areas.
-fn mouse_target(app: &App, column: u16, row: u16) -> MouseTarget {
-    let Ok((cols, rows)) = ratatui_crossterm::crossterm::terminal::size() else {
-        return MouseTarget::None;
-    };
-
+/// Checks the global drawer first (since it overlays everything), then
+/// the right panel. Returns `MouseTarget::None` if outside both areas.
+///
+/// Callers on the UI-event path pass `crossterm::terminal::size()`;
+/// unit tests pass an explicit size so the geometric classifier
+/// actually runs under `cargo test` (where `terminal::size()` returns
+/// `Err` and would otherwise collapse classification to
+/// `MouseTarget::None`, silently bypassing the PTY-area dispatch and
+/// masking regressions).
+fn mouse_target_with_size(
+    app: &App,
+    column: u16,
+    row: u16,
+    (cols, rows): (u16, u16),
+) -> MouseTarget {
     // Check global drawer first (it overlays everything when open).
     if app.global_drawer_open {
         let dl = layout::compute_drawer(cols, rows);
@@ -1927,6 +1937,21 @@ enum MouseAction {
 }
 
 pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    let terminal_size = ratatui_crossterm::crossterm::terminal::size().ok();
+    handle_mouse_with_terminal_size(app, mouse, terminal_size)
+}
+
+/// Test seam for `handle_mouse`: accepts an explicit terminal size so
+/// unit tests can force `mouse_target` to classify a click as
+/// `GlobalDrawer` / `RightPanel` and verify the dispatch actually runs
+/// in that arm. Under `cargo test` `crossterm::terminal::size()`
+/// returns `Err`, so the production path would otherwise collapse to
+/// `MouseTarget::None` and silently skip the PTY-area branches.
+fn handle_mouse_with_terminal_size(
+    app: &mut App,
+    mouse: MouseEvent,
+    terminal_size: Option<(u16, u16)>,
+) -> bool {
     let action = match mouse.kind {
         MouseEventKind::ScrollUp => MouseAction::Scroll { up: true },
         MouseEventKind::ScrollDown => MouseAction::Scroll { up: false },
@@ -1948,7 +1973,38 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
         app.pending_chrome_click = None;
     }
 
-    match mouse_target(app, mouse.column, mouse.row) {
+    // Interactive labels (click-to-copy) take priority over the
+    // geometric PTY-area classification. The `ClickRegistry` is
+    // cleared at the top of every frame and is only populated by
+    // renderers that draw interactive labels, so a hit here is an
+    // unambiguous signal that the click belongs to chrome rather than
+    // to a PTY. Without this shortcut, clicks on labels drawn inside
+    // the right panel (`draw_work_item_detail`, the no-session detail
+    // view) would be classified as `MouseTarget::RightPanel` and the
+    // text-selection branch would swallow them: `Down(Left)` would
+    // try to attach a selection to `active_session_entry_mut_for_tab`,
+    // find `None`, and still return `true`. The advertised
+    // click-to-copy behavior would silently no-op. Keeping the check
+    // structural (before classification) means new callers that draw
+    // interactive labels anywhere - right panel, global drawer,
+    // future overlays - stay clickable without touching this function.
+    if matches!(action, MouseAction::SelectDown | MouseAction::SelectUp) {
+        let hits_registry = app
+            .click_registry
+            .try_borrow()
+            .ok()
+            .is_some_and(|r| r.hit_test(mouse.column, mouse.row).is_some());
+        if hits_registry {
+            return handle_chrome_click_fallback(app, mouse, action);
+        }
+    }
+
+    let target = match terminal_size {
+        Some(size) => mouse_target_with_size(app, mouse.column, mouse.row, size),
+        None => MouseTarget::None,
+    };
+
+    match target {
         MouseTarget::GlobalDrawer {
             local_col,
             local_row,
@@ -2021,13 +2077,23 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
     }
 }
 
-/// Click-to-copy fallback: when a mouse event does not land on a PTY
-/// pane, consult the per-frame `ClickRegistry` and, if the event hits
-/// a registered target, run the click-to-copy gesture.
+/// Click-to-copy dispatch: consult the per-frame `ClickRegistry` and,
+/// if the event hits a registered target, run the click-to-copy
+/// gesture. Called from two places in `handle_mouse_with_terminal_size`:
+///
+/// 1. **Priority path:** before PTY-area classification, when the
+///    cursor is already known to hit a registered interactive label.
+///    This is the path that wins for labels drawn inside the right
+///    panel (e.g. the work item detail view), which would otherwise
+///    be consumed by the text-selection branch.
+/// 2. **None path:** after classification, when the cursor is not
+///    inside any PTY area at all. This keeps labels drawn in chrome
+///    (outside both the right panel and the global drawer)
+///    clickable.
 ///
 /// The gesture is a `Down(Left)` followed by `Up(Left)` that both land
 /// on the same registered target. Any intervening `Drag(Left)` cancels
-/// the gesture (see the unconditional clear above).
+/// the gesture (see the unconditional clear in the caller).
 ///
 /// `try_borrow` is used defensively so that an accidentally overlapping
 /// borrow becomes a silent no-op rather than a panic - the registry is
@@ -3089,28 +3155,87 @@ mod tests {
         );
     }
 
-    /// End-to-end chrome click: seed a click target in the per-frame
-    /// registry, synthesize `Down(Left)` + `Up(Left)` inside its rect,
-    /// and assert that `handle_mouse` fired the copy path and pushed a
-    /// toast. The clipboard side-effects (OSC 52 to stdout, arboard
-    /// attempt) are harmless in the test harness - `cargo test`
-    /// captures stdout and arboard failures are best-effort.
+    // -- Chrome click (click-to-copy) regression tests --
+    //
+    // These tests exercise `handle_mouse_with_terminal_size` directly
+    // so the geometric classifier (`mouse_target_with_size`) runs
+    // against a known terminal size. Passing a real size is essential:
+    // under `cargo test`, `crossterm::terminal::size()` returns `Err`
+    // and the public `handle_mouse` would collapse to
+    // `MouseTarget::None`, silently bypassing the PTY-area dispatch
+    // and masking any regression where right-panel clicks swallow
+    // interactive labels. See `docs/UI.md` "Interactive labels".
+    //
+    // Terminal chosen: 120 cols x 40 rows. With `App::new()` (no
+    // status bar, no context bar, no drawer open), `mouse_target_with_size`
+    // computes `left_width=30`, right-panel inner rect
+    // `(col in [31..119), row in [2..39))`. Any coordinate inside
+    // that rect is classified as `RightPanel` - that's the exact
+    // arm the priority check must rescue.
+
+    const TEST_COLS: u16 = 120;
+    const TEST_ROWS: u16 = 40;
+    const TEST_SIZE: Option<(u16, u16)> = Some((TEST_COLS, TEST_ROWS));
+
+    /// Make a `MouseEvent` with `KeyModifiers::NONE`. Keeps test
+    /// bodies readable - the tests only care about kind/column/row.
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        use ratatui_crossterm::crossterm::event::KeyModifiers;
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Sanity check: confirm the test terminal size really does put
+    /// our sample coordinate inside the right panel. If this test
+    /// ever breaks (because `layout::compute` or
+    /// `mouse_target_with_size` changes), the rest of the chrome
+    /// click tests below need their coordinates updated too.
     #[test]
-    fn chrome_click_registers_toast_on_down_up() {
+    fn mouse_target_with_size_classifies_right_panel_for_test_size() {
+        let app = App::new();
+        // (column=50, row=10) sits comfortably inside
+        // (col in [31..119), row in [2..39)) for a 120x40 terminal.
+        let target = mouse_target_with_size(&app, 50, 10, (TEST_COLS, TEST_ROWS));
+        assert!(
+            matches!(target, MouseTarget::RightPanel { .. }),
+            "expected RightPanel classification, got {:?}",
+            target,
+        );
+    }
+
+    /// **Regression for the "labels are unreachable" bug.**
+    ///
+    /// Seed a click target at a coordinate that `mouse_target_with_size`
+    /// classifies as `MouseTarget::RightPanel`, then dispatch
+    /// `Down(Left)` + `Up(Left)` through
+    /// `handle_mouse_with_terminal_size` with the real terminal size.
+    /// The priority check in `handle_mouse_with_terminal_size` must
+    /// route the click through `handle_chrome_click_fallback` instead
+    /// of the text-selection branch, and a toast must fire.
+    ///
+    /// Before the fix, the `RightPanel` arm would match first,
+    /// `active_session_entry_mut_for_tab` would return `None` (no
+    /// session on a fresh `App`), and the Down event would be
+    /// consumed as a no-op selection click - `pending_chrome_click`
+    /// would never get set and no toast would be pushed.
+    #[test]
+    fn chrome_click_inside_right_panel_still_fires() {
         use crate::click_targets::ClickKind;
         use ratatui_core::layout::Rect;
-        use ratatui_crossterm::crossterm::event::KeyModifiers;
 
         let mut app = App::new();
-        // Seed the registry directly - we don't need to run a real
-        // draw to get a target in place.
+        // Register a target that overlaps the right-panel inner area.
         {
             let mut reg = app.click_registry.borrow_mut();
             reg.push(
                 Rect {
-                    x: 10,
-                    y: 5,
-                    width: 20,
+                    x: 40,
+                    y: 10,
+                    width: 30,
                     height: 1,
                 },
                 "feat/my-branch".to_string(),
@@ -3118,25 +3243,28 @@ mod tests {
             );
         }
 
-        let down = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 15,
-            row: 5,
-            modifiers: KeyModifiers::NONE,
-        };
-        let up = MouseEvent {
-            kind: MouseEventKind::Up(MouseButton::Left),
-            column: 15,
-            row: 5,
-            modifiers: KeyModifiers::NONE,
-        };
+        // Independently assert that the click coordinate really does
+        // hit the RightPanel arm with the test terminal size. Without
+        // this, a future change to the layout math could silently
+        // move the test click outside the right panel and make the
+        // whole test vacuous.
+        let classification = mouse_target_with_size(&app, 50, 10, (TEST_COLS, TEST_ROWS));
+        assert!(
+            matches!(classification, MouseTarget::RightPanel { .. }),
+            "test coordinate must land inside the right panel, got {:?}",
+            classification,
+        );
 
-        assert!(handle_mouse(&mut app, down));
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 50, 10);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 50, 10);
+
+        assert!(handle_mouse_with_terminal_size(&mut app, down, TEST_SIZE));
         assert!(
             app.pending_chrome_click.is_some(),
-            "Down(Left) must arm the pending click",
+            "Down(Left) on a registered label must arm the pending click \
+             even when geometric classification says RightPanel",
         );
-        assert!(handle_mouse(&mut app, up));
+        assert!(handle_mouse_with_terminal_size(&mut app, up, TEST_SIZE));
         assert!(
             app.pending_chrome_click.is_none(),
             "Up(Left) must clear the pending click",
@@ -3149,22 +3277,23 @@ mod tests {
         );
     }
 
-    /// A drag between Down and Up cancels the click-to-copy gesture -
-    /// no toast is pushed.
+    /// Regression companion: a drag between Down and Up cancels the
+    /// click-to-copy gesture even when the click coordinate is
+    /// classified as `RightPanel`. Guards against a future priority
+    /// check that forgets to honour the drag-cancel invariant.
     #[test]
-    fn chrome_click_drag_cancels_copy() {
+    fn chrome_click_drag_inside_right_panel_cancels() {
         use crate::click_targets::ClickKind;
         use ratatui_core::layout::Rect;
-        use ratatui_crossterm::crossterm::event::KeyModifiers;
 
         let mut app = App::new();
         {
             let mut reg = app.click_registry.borrow_mut();
             reg.push(
                 Rect {
-                    x: 10,
-                    y: 5,
-                    width: 20,
+                    x: 40,
+                    y: 10,
+                    width: 30,
                     height: 1,
                 },
                 "https://example.com/pull/42".to_string(),
@@ -3172,29 +3301,126 @@ mod tests {
             );
         }
 
-        let down = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 15,
-            row: 5,
-            modifiers: KeyModifiers::NONE,
-        };
-        let drag = MouseEvent {
-            kind: MouseEventKind::Drag(MouseButton::Left),
-            column: 17,
-            row: 5,
-            modifiers: KeyModifiers::NONE,
-        };
-        let up = MouseEvent {
-            kind: MouseEventKind::Up(MouseButton::Left),
-            column: 17,
-            row: 5,
-            modifiers: KeyModifiers::NONE,
-        };
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 50, 10);
+        let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 52, 10);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 52, 10);
 
-        handle_mouse(&mut app, down);
-        handle_mouse(&mut app, drag);
-        handle_mouse(&mut app, up);
-        assert!(app.toasts.is_empty(), "drag must cancel the copy gesture",);
+        handle_mouse_with_terminal_size(&mut app, down, TEST_SIZE);
+        handle_mouse_with_terminal_size(&mut app, drag, TEST_SIZE);
+        handle_mouse_with_terminal_size(&mut app, up, TEST_SIZE);
+        assert!(
+            app.toasts.is_empty(),
+            "drag must cancel the copy gesture, got toasts={:?}",
+            app.toasts.iter().map(|t| &t.text).collect::<Vec<_>>(),
+        );
         assert!(app.pending_chrome_click.is_none());
+    }
+
+    /// Negative test: a right-panel click that does NOT hit any
+    /// registered target must fall through to the normal RightPanel
+    /// arm (which is a no-op on a fresh `App` with no session), NOT
+    /// spuriously arm a pending chrome click. Guards against a
+    /// future priority check that accidentally hit-tests the empty
+    /// registry loosely (e.g. "any click in the area arms").
+    #[test]
+    fn right_panel_click_without_registry_hit_does_not_arm_chrome_click() {
+        use crate::click_targets::ClickKind;
+        use ratatui_core::layout::Rect;
+
+        let mut app = App::new();
+        // Register a target somewhere on the same row, but NOT at
+        // the click coordinate.
+        {
+            let mut reg = app.click_registry.borrow_mut();
+            reg.push(
+                Rect {
+                    x: 80,
+                    y: 10,
+                    width: 10,
+                    height: 1,
+                },
+                "never-copied".to_string(),
+                ClickKind::RepoPath,
+            );
+        }
+
+        // Sanity: (50, 10) is inside the right panel but outside the
+        // registered rect.
+        assert!(matches!(
+            mouse_target_with_size(&app, 50, 10, (TEST_COLS, TEST_ROWS)),
+            MouseTarget::RightPanel { .. }
+        ));
+
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 50, 10);
+        handle_mouse_with_terminal_size(&mut app, down, TEST_SIZE);
+        assert!(
+            app.pending_chrome_click.is_none(),
+            "click outside any registered target must not arm a chrome copy",
+        );
+
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 50, 10);
+        handle_mouse_with_terminal_size(&mut app, up, TEST_SIZE);
+        assert!(
+            app.toasts.is_empty(),
+            "unregistered click must not push a toast, got {:?}",
+            app.toasts.iter().map(|t| &t.text).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Future-proofing: the priority check must also rescue clicks
+    /// on registered targets drawn inside the global drawer. Today
+    /// `draw_work_item_detail` is the only caller that pushes
+    /// targets, but the priority rule is structural - labels
+    /// rendered anywhere in chrome should stay clickable. This test
+    /// forces the `GlobalDrawer` classification by opening the
+    /// drawer and seeding a target in its inner area.
+    #[test]
+    fn chrome_click_inside_global_drawer_still_fires() {
+        use crate::click_targets::ClickKind;
+        use ratatui_core::layout::Rect;
+
+        let mut app = App::new();
+        app.global_drawer_open = true;
+
+        // Pick a drawer-inside coordinate. `compute_drawer(120, 40)`
+        // produces a drawer wide enough that (col=10, row=30) is
+        // comfortably inside the inner area for this test size.
+        // Verify the classification before relying on it.
+        let classification = mouse_target_with_size(&app, 10, 30, (TEST_COLS, TEST_ROWS));
+        assert!(
+            matches!(classification, MouseTarget::GlobalDrawer { .. }),
+            "test coordinate must land inside the global drawer, got {:?}",
+            classification,
+        );
+
+        {
+            let mut reg = app.click_registry.borrow_mut();
+            reg.push(
+                Rect {
+                    x: 5,
+                    y: 30,
+                    width: 20,
+                    height: 1,
+                },
+                "workbridge".to_string(),
+                ClickKind::Title,
+            );
+        }
+
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 10, 30);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 10, 30);
+
+        assert!(handle_mouse_with_terminal_size(&mut app, down, TEST_SIZE));
+        assert!(
+            app.pending_chrome_click.is_some(),
+            "priority check must also rescue drawer-area clicks",
+        );
+        assert!(handle_mouse_with_terminal_size(&mut app, up, TEST_SIZE));
+        assert_eq!(app.toasts.len(), 1, "one toast must be queued");
+        assert!(
+            app.toasts[0].text.contains("workbridge"),
+            "toast text must mention the copied value, got {:?}",
+            app.toasts[0].text,
+        );
     }
 }

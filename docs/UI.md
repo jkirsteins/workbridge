@@ -121,11 +121,25 @@ Implementation:
   directly to `MouseEvent::column` / `row`.
 - `draw_to_buffer` clears the registry at the top of every frame so
   stale targets from the previous draw never leak.
-- `handle_mouse` consults the registry as a fallback after PTY
-  classification: if a `MouseTarget::None` event lands inside a
-  registered rect, `handle_chrome_click_fallback` arms a pending
-  click on `Down(Left)`, cancels on any `Drag(Left)`, and fires
-  `App::fire_chrome_copy` on a matching `Up(Left)`.
+- `handle_mouse` consults the registry **before** the geometric PTY
+  classification on every `Down(Left)` / `Up(Left)`: if the cursor
+  is inside a registered rect, the event is routed to
+  `handle_chrome_click_fallback` regardless of where
+  `mouse_target` would have placed it. This priority rule is
+  structural - interactive labels drawn anywhere in chrome (right
+  panel detail view, global drawer, future overlays) stay clickable
+  without per-site plumbing. Without it, labels drawn inside the
+  right panel area would be classified as `MouseTarget::RightPanel`
+  and swallowed by the text-selection branch. If the priority check
+  does not fire, `handle_chrome_click_fallback` is also called as
+  the `MouseTarget::None` arm so labels drawn outside all PTY areas
+  remain reachable.
+- `handle_chrome_click_fallback` arms a pending click on `Down(Left)`,
+  cancels on any `Drag(Left)`, and fires `App::fire_chrome_copy` on
+  a matching `Up(Left)`. The drag-cancel check runs unconditionally
+  at the top of `handle_mouse` so a drag over a PTY pane still
+  invalidates an in-flight click-to-copy gesture that started on a
+  chrome label.
 - Values that read as `"(none)"` are NOT registered and render in
   the muted style - the underline would be misleading if there is
   nothing to copy.
