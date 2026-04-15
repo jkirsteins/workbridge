@@ -159,6 +159,29 @@ Stage restrictions for ReviewRequest items:
   These submit a GitHub PR review via `gh pr review` and auto-move the
   item to Done on success. The MCP tools/call handler enforces the
   ReviewRequest kind check server-side.
+- **Auto-close on external merge**: ReviewRequest items in Review are
+  polled every 30 seconds via `gh pr view <target> --repo
+  <owner/repo> --json state,number,title,url`, mirroring the
+  Mergequeue poll. When the PR is detected as merged, the item
+  auto-transitions to Done through the merge-gate invariant (`source
+  == "pr_merge"`) and the merged PR's identity is persisted to
+  `pr_identity` so the assembly fallback keeps the merged-PR link
+  visible afterwards. The Claude review session is killed by the
+  transition (same behavior as every other Review -> Done transition in
+  the codebase); the worktree is left on disk and cleaned up later by
+  auto-archive (default 7 days) or immediately by the user with Ctrl+D.
+  A closed-without-merge PR is NOT auto-closed (it would bypass the
+  merge-gate invariant) - a warning is surfaced instead and the user
+  can Ctrl+D to clean up. `gh pr view` failures are stored in the
+  detail pane as "Last poll error: ..." and persist across ticks
+  instead of vanishing with the transient status message. This poll
+  is the *only* code path that can observe a merged review-request
+  PR: the `gh pr list --author @me` fetch cannot see it (wrong
+  author), the `review-requested:@me` search is `--state open` (wrong
+  state), the `pr_identity` fallback is `Done`-only (wrong status),
+  and the startup merged-PR backfill is also author-filtered. Without
+  this poll, a ReviewRequest item whose PR was merged outside the
+  TUI would stay stuck in `[RR][RV]` forever.
 
 ### Re-open on re-request
 
@@ -338,6 +361,8 @@ In the Mergequeue state:
 During assembly, if any repo association has a merged PR (`PrState::Merged`), the work item's status is set to Done regardless of what the backend record says. This is marked as a derived status (`status_derived = true`). When the status is derived, manual stage transitions (advance/retreat) and MCP transitions are blocked.
 
 This includes synthetic PrInfo produced by the PR identity fallback: when a backend record is Done and has a persisted PR identity snapshot but no live PR, assembly injects a PrInfo with PrState::Merged. The derived-Done logic then fires on this synthetic PR, setting `status_derived = true`. Because the fallback only activates when the backend record is already Done, non-Done items are never forced into derived-Done by a stale snapshot.
+
+A parallel poll exists for ReviewRequest items in Review (see "Auto-close on external merge" under "Review request behavior"). When that poll detects an external merge, the item is advanced to Done via `apply_stage_change` with `source == "pr_merge"` *and* the merged PR's identity is persisted into `pr_identity`. On the next reassembly the same `pr_identity` fallback fires, so the item is reached from both directions: the backend record status is already Done (from the `apply_stage_change`) and the derived-Done logic re-confirms it from the synthetic `PrInfo { state: Merged }`. The net effect is that reviewer-side merges and author-side Mergequeue merges reach the same end state (Done, with `status_derived = true` and a stable merged-PR link in the UI).
 
 ### Auto-archive of Done items
 
