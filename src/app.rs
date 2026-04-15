@@ -3338,9 +3338,13 @@ impl App {
             // reverse any side-car files it wrote on spawn (Claude's
             // `.mcp.json` in the worktree, the `--mcp-config` tempfile).
             // See `docs/harness-contract.md` C4 and
-            // `AgentBackend::write_session_files`.
-            self.agent_backend
-                .cleanup_session_files(&entry.agent_written_files);
+            // `AgentBackend::write_session_files`. The actual
+            // `std::fs::remove_file` calls run on a dedicated
+            // background thread via `spawn_agent_file_cleanup` -
+            // doing them inline would block the UI thread on slow
+            // or wedged filesystems, forbidden by `docs/UI.md`
+            // "Blocking I/O Prohibition".
+            self.spawn_agent_file_cleanup(std::mem::take(&mut entry.agent_written_files));
             if let Some(ref mut session) = entry.session {
                 session.kill();
             }
@@ -3919,6 +3923,36 @@ impl App {
             &UserActionKey::DeleteCleanup,
             UserActionPayload::DeleteCleanup { rx },
         );
+    }
+
+    /// Fire-and-forget background disposer for the side-car files the
+    /// `AgentBackend` wrote on spawn (Claude's worktree `.mcp.json`, the
+    /// `--mcp-config` tempfile, or any other backend's equivalent). See
+    /// `docs/harness-contract.md` C4 and
+    /// `AgentBackend::write_session_files`.
+    ///
+    /// The removal must not run on the UI thread: `std::fs::remove_file`
+    /// blocks on the filesystem and a slow or wedged FS would freeze the
+    /// event loop, violating `docs/UI.md` "Blocking I/O Prohibition".
+    /// Called from `delete_work_item_by_id` (every delete path - modal
+    /// confirm, MCP `workbridge_delete`, auto-archive), so every caller
+    /// inherits the off-UI-thread guarantee without having to plumb the
+    /// list through `spawn_delete_cleanup` (which is itself gated by the
+    /// `DeleteCleanup` user-action single-flight and so cannot be shared
+    /// by the auto-archive path). Each delete spawns at most one
+    /// detached thread and file removals are idempotent, so there is no
+    /// result channel - errors are swallowed by the default trait impl.
+    ///
+    /// `Arc<dyn AgentBackend>` is `Send + Sync` by the trait bound, so
+    /// cloning it into the thread is safe.
+    fn spawn_agent_file_cleanup(&self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let backend = Arc::clone(&self.agent_backend);
+        std::thread::spawn(move || {
+            backend.cleanup_session_files(&paths);
+        });
     }
 
     /// Background cleanup for a single orphaned worktree. Used when

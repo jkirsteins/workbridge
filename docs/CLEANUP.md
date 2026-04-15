@@ -6,7 +6,13 @@ how they are reversed via `AgentBackend::cleanup_session_files` on
 work-item deletion, see `docs/harness-contract.md` C4 and the C10
 lifecycle section. This file only covers the OS-level signal dance
 and the work-item resource cleanup phases that sit above the harness
-contract.
+contract. Note that `cleanup_session_files` itself performs
+`std::fs::remove_file` and therefore must NOT run on the UI thread:
+`delete_work_item_by_id()` routes the file list to
+`spawn_agent_file_cleanup()`, a dedicated fire-and-forget background
+thread, per `docs/UI.md` "Blocking I/O Prohibition". Every delete
+path (manual Ctrl+D, MCP `workbridge_delete`, auto-archive) inherits
+this routing.
 
 ## Normal quit (Q twice)
 

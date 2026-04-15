@@ -383,7 +383,10 @@ produces the JSON blob, and `McpSocketServer::start` at
 `ClaudeCodeBackend::write_session_files` (called from
 `App::finish_session_open` and returning the written path so
 `AgentBackend::cleanup_session_files` can reverse it on
-teardown / `workbridge_delete`) AND the caller writes a separate
+teardown / `workbridge_delete` - the actual `std::fs::remove_file`
+calls run on a detached background thread via
+`App::spawn_agent_file_cleanup`, never on the UI thread, per
+`docs/UI.md` "Blocking I/O Prohibition") AND the caller writes a separate
 `/tmp/workbridge-mcp-config-<uuid>.json` tempfile whose path is
 threaded into `SpawnConfig::mcp_config_path`. The backend then
 appends `--mcp-config <tempfile>` in its own argv order
@@ -533,10 +536,15 @@ at `src/session.rs:304` is the SIGKILL-immediately path used in
 force-kills and joins the reader thread; slave-PTY close on child
 exit gives the reader its EOF. Work-item session teardown goes
 through `App::delete_work_item_by_id` at `src/app.rs:2259`, which
-calls `AgentBackend::cleanup_session_files` on the list stored in
-`SessionEntry::agent_written_files` so Claude's `.mcp.json` and any
-future backend's side-car files are reversed when the work item is
-deleted. The global-assistant teardown adds one extra layer on top
+takes ownership of `SessionEntry::agent_written_files` and hands
+the list to `App::spawn_agent_file_cleanup`. That helper spawns a
+detached background thread that calls
+`AgentBackend::cleanup_session_files` off the UI thread (see
+`docs/UI.md` "Blocking I/O Prohibition" - `std::fs::remove_file`
+blocks on the filesystem and must never run on the event loop), so
+Claude's `.mcp.json` and any future backend's side-car files are
+reversed when the work item is deleted without freezing the TUI
+on a slow or wedged filesystem. The global-assistant teardown adds one extra layer on top
 of `Session::kill`: `App::teardown_global_session` at
 `src/app.rs:8224` kills the child, drops the `SessionEntry` (which
 joins the reader via `Drop`), drops the MCP server, removes the
