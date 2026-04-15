@@ -771,27 +771,27 @@ Key semantics:
   `poll_pr_merge`). Only the Blocked / disconnected branches of
   `poll_merge_precheck` and the terminal arms of `poll_pr_merge`
   release the slot. `perform_merge_after_precheck` does NOT re-admit
-  the key; it only attaches the merge payload to the already-reserved
-  slot. This keeps the helper's single-flight invariant intact across
-  the precheck-to-merge handoff while still letting the precheck
-  thread run on a background thread without blocking the UI.
+  the key; it only swaps the payload from
+  `UserActionPayload::PrMergePrecheck` to
+  `UserActionPayload::PrMerge` via `attach_user_action_payload`,
+  which drops the precheck receiver in the same step. This keeps
+  the helper's single-flight invariant intact across the
+  precheck-to-merge handoff while still letting the precheck thread
+  run on a background thread without blocking the UI.
 
-  The precheck receiver lives on `App::merge_precheck_rx` rather
-  than inside the helper map's `UserActionPayload`, because at spawn
-  time there is no merge-thread receiver to attach yet (that comes
-  later in `perform_merge_after_precheck`). This means
-  `merge_precheck_rx` is NOT cleared automatically when the slot is
-  released, so every cancellation site that calls
-  `end_user_action(&UserActionKey::PrMerge)` MUST also set
-  `merge_precheck_rx = None` in lockstep. The known sites are
-  `retreat_stage` (Review -> Implementing rework) and
-  `delete_work_item_by_id` (Phase 5 in-flight cleanup). If a future
-  cancel path forgets the lockstep, `poll_merge_precheck` has a
-  defense-in-depth guard that drops a stale `Ready` message
-  silently when `is_user_action_in_flight(&UserActionKey::PrMerge)`
-  returns false - this prevents `perform_merge_after_precheck` from
-  panicking inside `attach_user_action_payload`, but the cancel
-  site is still considered buggy because it is leaking a receiver.
+  Both phases own their receivers structurally inside the helper
+  slot's payload: the precheck rx lives in `PrMergePrecheck { rx }`
+  and the merge rx lives in `PrMerge { rx }`. There is no sibling
+  `Option<Receiver>` field on `App`. Every cancellation site that
+  calls `end_user_action(&UserActionKey::PrMerge)` (currently
+  `retreat_stage` and `delete_work_item_by_id`) drops the entire
+  helper entry, which drops whichever payload it held, which drops
+  the receiver - one structural step, no lockstep clears to forget.
+  This is the "structural ownership over manual correlation"
+  pattern from `CLAUDE.md` applied to the merge precheck. The UI
+  uses `App::is_merge_precheck_phase()` to switch the modal body
+  between "Checking working tree..." and "Merging pull request..."
+  by inspecting the payload variant directly.
 - **Caller-local rejection messages.** When `try_begin_user_action`
   returns `None`, the caller re-adds its existing alert / status
   string verbatim. `execute_merge` keeps `"PR merge already in

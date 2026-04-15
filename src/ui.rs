@@ -164,11 +164,12 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
             // While the live working-tree precheck is in flight we
             // show a "Checking working tree..." body so the user knows
             // the merge has not yet started shelling out to GitHub. As
-            // soon as `poll_merge_precheck` clears
-            // `merge_precheck_rx`, the next render switches to the
-            // "Merging pull request..." body without re-laying out
-            // the dialog (same `KeyChoice` shape, same spinner).
-            let body = if app.merge_precheck_rx.is_some() {
+            // soon as `poll_merge_precheck` swaps the helper slot's
+            // payload from `PrMergePrecheck` to `PrMerge`, the next
+            // render switches to the "Merging pull request..." body
+            // without re-laying out the dialog (same `KeyChoice`
+            // shape, same spinner).
+            let body = if app.is_merge_precheck_phase() {
                 format!("{spinner} Checking working tree... Please wait.")
             } else {
                 format!("{spinner} Merging pull request... Please wait.")
