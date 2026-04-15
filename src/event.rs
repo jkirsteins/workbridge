@@ -433,6 +433,19 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    // Ctrl+\ - cycle right-panel tab (Claude Code <-> Terminal).
+    //
+    // Global so the shortcut works from both the left panel (when the
+    // user wants to flip the pending view without focusing it) and the
+    // right panel (when Claude Code is focused and Tab is being
+    // forwarded to the PTY for autocomplete). Does NOT change focus -
+    // left panel stays focused if pressed from left, right panel stays
+    // focused if pressed from right.
+    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('\\') {
+        cycle_right_panel_tab(app);
+        return true;
+    }
+
     // Board mode (without drill-down) has its own key handler.
     if app.view_mode == ViewMode::Board && !app.board_drill_down {
         handle_key_board(app, key);
@@ -452,6 +465,32 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
         FocusPanel::Right => state_changed || handle_key_right(app, key),
+    }
+}
+
+/// Cycle the right-panel tab between Claude Code and Terminal.
+///
+/// Bound to the global `Ctrl+\` intercept so it works from either
+/// panel. Intentionally does NOT touch `app.focus` or call
+/// `sync_layout` - focus is preserved on whichever panel the user was
+/// in, and the caller is responsible for triggering a re-render
+/// (`handle_key()` returns `true`).
+///
+/// The worktree guard on the `ClaudeCode -> Terminal` arm is
+/// preserved: if the selected work item has no worktree, the
+/// transition is a no-op (the terminal session is spawned in the
+/// worktree path and has nothing to attach to otherwise).
+fn cycle_right_panel_tab(app: &mut App) {
+    match app.right_panel_tab {
+        RightPanelTab::ClaudeCode => {
+            if app.selected_work_item_has_worktree() {
+                app.right_panel_tab = RightPanelTab::Terminal;
+                app.spawn_terminal_session();
+            }
+        }
+        RightPanelTab::Terminal => {
+            app.right_panel_tab = RightPanelTab::ClaudeCode;
+        }
     }
 }
 
@@ -818,56 +857,50 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
         entry.scrollback_offset = 0;
     }
 
-    // Plain Tab (no modifiers) is exempt from the dead-session early-return
-    // so it can reach the Tab-cycle handler below. This matches the on-screen
-    // hint "Press Tab to switch back to Claude Code" rendered on the dead
-    // terminal placeholder (src/ui.rs) and the docs/UI.md contract that Tab
-    // cycles between Claude Code and Terminal tabs. Shift+Tab / BackTab are
-    // NOT exempted - they keep the existing dead-session "return to work
-    // items" escape-hatch behavior.
-    let is_tab_cycle = key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT);
-
     // Check if the active session/terminal is dead before forwarding keys.
     // Flush any buffered PTY bytes before changing state.
-    if !is_tab_cycle {
-        match app.right_panel_tab {
-            RightPanelTab::ClaudeCode => {
-                if let Some(entry) = app.active_session_entry() {
-                    if !entry.alive {
-                        app.flush_pty_buffers();
-                        app.focus = FocusPanel::Left;
-                        app.status_message =
-                            Some("Session has ended - returned to work items".into());
-                        sync_layout(app);
-                        return true;
-                    }
-                } else {
-                    // No session for this work item - return to left panel.
+    //
+    // No Tab exemption is needed here: the right-panel tab cycler lives on
+    // the global `Ctrl+\` intercept in `handle_key()` above, which runs
+    // before this function is reached. Plain Tab is just a PTY byte now,
+    // so on a dead session it falls through to the standard "return to
+    // work items" escape-hatch like every other key.
+    match app.right_panel_tab {
+        RightPanelTab::ClaudeCode => {
+            if let Some(entry) = app.active_session_entry() {
+                if !entry.alive {
                     app.flush_pty_buffers();
                     app.focus = FocusPanel::Left;
-                    app.status_message = None;
+                    app.status_message = Some("Session has ended - returned to work items".into());
                     sync_layout(app);
                     return true;
                 }
+            } else {
+                // No session for this work item - return to left panel.
+                app.flush_pty_buffers();
+                app.focus = FocusPanel::Left;
+                app.status_message = None;
+                sync_layout(app);
+                return true;
             }
-            RightPanelTab::Terminal => {
-                if let Some(entry) = app.active_terminal_entry() {
-                    if !entry.alive {
-                        app.flush_pty_buffers();
-                        app.focus = FocusPanel::Left;
-                        app.status_message =
-                            Some("Terminal session has ended - returned to work items".into());
-                        sync_layout(app);
-                        return true;
-                    }
-                } else {
-                    // No terminal session yet - return to left panel.
+        }
+        RightPanelTab::Terminal => {
+            if let Some(entry) = app.active_terminal_entry() {
+                if !entry.alive {
                     app.flush_pty_buffers();
                     app.focus = FocusPanel::Left;
-                    app.status_message = None;
+                    app.status_message =
+                        Some("Terminal session has ended - returned to work items".into());
                     sync_layout(app);
                     return true;
                 }
+            } else {
+                // No terminal session yet - return to left panel.
+                app.flush_pty_buffers();
+                app.focus = FocusPanel::Left;
+                app.status_message = None;
+                sync_layout(app);
+                return true;
             }
         }
     }
@@ -938,18 +971,11 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
                 // Shift+Tab = CSI Z - forward to PTY.
                 app.buffer_bytes_to_right_panel(b"\x1b[Z");
             } else {
-                // Plain Tab: cycle right panel tab (Claude Code <-> Terminal).
-                match app.right_panel_tab {
-                    RightPanelTab::ClaudeCode => {
-                        if app.selected_work_item_has_worktree() {
-                            app.right_panel_tab = RightPanelTab::Terminal;
-                            app.spawn_terminal_session();
-                        }
-                    }
-                    RightPanelTab::Terminal => {
-                        app.right_panel_tab = RightPanelTab::ClaudeCode;
-                    }
-                }
+                // Plain Tab is forwarded to the PTY as a literal tab byte
+                // so Claude Code's autocomplete can fire. Right-panel tab
+                // cycling lives on Ctrl+\ instead; see the global intercept
+                // in `handle_key()`.
+                app.buffer_bytes_to_right_panel(b"\t");
             }
         }
         KeyCode::BackTab => {
@@ -2520,15 +2546,18 @@ mod tests {
         );
     }
 
-    // -- Right-panel Tab cycling on dead sessions (regression) --
+    // -- Right-panel Ctrl+\ cycling on dead sessions (regression) --
 
-    /// Regression: plain Tab on the Terminal tab when the terminal
+    /// Regression: `Ctrl+\` on the Terminal tab when the terminal
     /// session has ended must cycle back to Claude Code, NOT redirect
-    /// to the left panel. The on-screen hint "Press Tab to switch back
-    /// to Claude Code" (dead-terminal placeholder in `src/ui.rs`) and
-    /// the `docs/UI.md` "Right Panel Tabs" contract both rely on this.
+    /// to the left panel. The on-screen hint "Press Ctrl+\ to switch
+    /// back to Claude Code" (dead-terminal placeholder in `src/ui.rs`)
+    /// and the `docs/UI.md` "Right Panel Tabs" contract both rely on
+    /// this. The global `Ctrl+\` intercept in `handle_key()` runs
+    /// before the right-panel dead-session early-return, so the flip
+    /// works regardless of session liveness.
     #[test]
-    fn tab_on_dead_terminal_cycles_to_claude_code() {
+    fn ctrl_backslash_on_dead_terminal_cycles_to_claude_code() {
         use crate::work_item::{
             BackendType, RepoAssociation, SessionEntry, WorkItem, WorkItemId, WorkItemKind,
             WorkItemStatus,
@@ -2541,7 +2570,7 @@ mod tests {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: WorkItemKind::Own,
-            title: "Tab cycle test".into(),
+            title: "Ctrl+\\ cycle test".into(),
             display_id: None,
             description: None,
             status: WorkItemStatus::Implementing,
@@ -2576,17 +2605,17 @@ mod tests {
         app.right_panel_tab = RightPanelTab::Terminal;
         app.focus = FocusPanel::Right;
 
-        // Plain Tab should cycle to Claude Code, NOT redirect to the left panel.
-        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
-        handle_key(&mut app, tab);
+        // Ctrl+\ should cycle to Claude Code, NOT redirect to the left panel.
+        let key = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        handle_key(&mut app, key);
 
         assert!(
             matches!(app.right_panel_tab, RightPanelTab::ClaudeCode),
-            "plain Tab must flip the dead-terminal tab to Claude Code",
+            "Ctrl+\\ must flip the dead-terminal tab to Claude Code",
         );
         assert!(
             matches!(app.focus, FocusPanel::Right),
-            "focus must stay on the right panel after the Tab flip",
+            "focus must stay on the right panel after the Ctrl+\\ flip",
         );
         let status = app.status_message.as_deref().unwrap_or("");
         assert!(
@@ -2595,14 +2624,14 @@ mod tests {
         );
     }
 
-    /// Symmetric regression: plain Tab on the Claude Code tab when the
+    /// Symmetric regression: `Ctrl+\` on the Claude Code tab when the
     /// Claude session has ended must cycle to Terminal (when the work
     /// item has a worktree), keeping focus on the right panel. A
     /// pre-installed LIVE terminal session makes
     /// `spawn_terminal_session()` return early so the test does not
     /// fork a real shell.
     #[test]
-    fn tab_on_dead_claude_code_cycles_to_terminal() {
+    fn ctrl_backslash_on_dead_claude_code_cycles_to_terminal() {
         use crate::work_item::{
             BackendType, RepoAssociation, SessionEntry, WorkItem, WorkItemId, WorkItemKind,
             WorkItemStatus,
@@ -2616,7 +2645,7 @@ mod tests {
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: WorkItemKind::Own,
-            title: "Tab cycle test".into(),
+            title: "Ctrl+\\ cycle test".into(),
             display_id: None,
             description: None,
             status: WorkItemStatus::Implementing,
@@ -2647,8 +2676,8 @@ mod tests {
                 selection: None,
             },
         );
-        // Pre-install a LIVE terminal session so the Tab-flip's call to
-        // spawn_terminal_session() sees the live entry and returns
+        // Pre-install a LIVE terminal session so the Ctrl+\ flip's call
+        // to spawn_terminal_session() sees the live entry and returns
         // early - it does NOT fork a real shell from inside the test.
         let live_parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
         app.terminal_sessions.insert(
@@ -2665,16 +2694,16 @@ mod tests {
         app.right_panel_tab = RightPanelTab::ClaudeCode;
         app.focus = FocusPanel::Right;
 
-        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
-        handle_key(&mut app, tab);
+        let key = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        handle_key(&mut app, key);
 
         assert!(
             matches!(app.right_panel_tab, RightPanelTab::Terminal),
-            "plain Tab must flip the dead Claude Code tab to Terminal",
+            "Ctrl+\\ must flip the dead Claude Code tab to Terminal",
         );
         assert!(
             matches!(app.focus, FocusPanel::Right),
-            "focus must stay on the right panel after the Tab flip",
+            "focus must stay on the right panel after the Ctrl+\\ flip",
         );
         let status = app.status_message.as_deref().unwrap_or("");
         assert!(
