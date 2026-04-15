@@ -4481,10 +4481,15 @@ impl App {
                 }
             }
 
-            // Write the temp --mcp-config file. If this fails we
-            // log the error and continue without the flag; Claude
-            // will still be able to reach the MCP server via the
-            // .mcp.json written above (if that write succeeded).
+            // Write the temp --mcp-config file. A failure is
+            // only survivable if the worktree `.mcp.json` write
+            // above succeeded - Claude can still reach the MCP
+            // server via project discovery. If BOTH writes fail
+            // (double failure), we abort the spawn below: a
+            // Claude session with no MCP delivery path is
+            // functionally broken because required tools like
+            // `workbridge_set_plan` / `workbridge_set_status`
+            // cannot reach the socket server.
             let config_path = std::env::temp_dir().join(format!(
                 "workbridge-mcp-config-{}.json",
                 uuid::Uuid::new_v4()
@@ -4500,6 +4505,32 @@ impl App {
                 Err(e) => {
                     status_warning = Some(format!("MCP config write error: {e}"));
                 }
+            }
+
+            // Codex adversarial review: if BOTH MCP delivery
+            // paths failed (neither `.mcp.json` in the worktree
+            // nor the temp `--mcp-config` file landed), abort
+            // the spawn instead of launching a Claude session
+            // that is structurally unable to see the MCP server.
+            // Without this guard the UI would insert a session
+            // entry that looks "alive" but cannot run
+            // `workbridge_set_plan` / `workbridge_set_status`,
+            // silently breaking the workflow.
+            if !wrote_mcp_json && !wrote_temp_config {
+                let _ = tx.send(SessionSpawnResult {
+                    wi_id: wi_id_for_thread,
+                    stage,
+                    outcome: Err(format!(
+                        "Session spawn aborted: both MCP config \
+                         delivery paths failed. {}. Claude would \
+                         have no way to reach the workbridge MCP \
+                         server, so the session is unusable.",
+                        status_warning
+                            .as_deref()
+                            .unwrap_or("No specific error message was captured",),
+                    )),
+                });
+                return;
             }
 
             // Cancel check 3: after the worktree writes, before
@@ -4530,9 +4561,12 @@ impl App {
             // tick path. On success, forward `status_warning` so
             // the UI thread can surface any non-fatal MCP config
             // file-write failures via `status_message`. On
-            // failure, the spawn error wins and the warning is
-            // dropped - the user will see the spawn failure,
-            // which already explains why no session appeared.
+            // failure, remove any files we wrote for this spawn
+            // so the worktree does not end up with stale
+            // `.mcp.json` pointing at a socket that was just
+            // destroyed - Codex adversarial review flagged this
+            // as the symmetric rollback to the cancellation
+            // path above.
             let cmd_refs: Vec<&str> = final_cmd.iter().map(|s| s.as_str()).collect();
             let outcome = match crate::session::Session::spawn(
                 pane_cols,
@@ -4545,7 +4579,15 @@ impl App {
                     mcp_server: server,
                     warning: status_warning,
                 }),
-                Err(e) => Err(format!("Error spawning session: {e}")),
+                Err(e) => {
+                    if wrote_mcp_json {
+                        let _ = std::fs::remove_file(&mcp_json_path);
+                    }
+                    if wrote_temp_config {
+                        let _ = std::fs::remove_file(&config_path);
+                    }
+                    Err(format!("Error spawning session: {e}"))
+                }
             };
 
             let _ = tx.send(SessionSpawnResult {
