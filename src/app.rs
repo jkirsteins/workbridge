@@ -9574,21 +9574,15 @@ impl App {
                 None => return,
             };
 
-            // Final cancellation check before we touch the backend.
-            // If the gate was torn down (work item deleted, force-
-            // quit) while we were processing the harness output,
-            // the work item's active activity log has already been
-            // moved to `archive/` by `backend.delete`, and
-            // `append_activity` opens with `create(true)` -
-            // recreating an orphan active activity log for a
-            // deleted item. Skipping the append AND the result send
-            // here closes that race for the common case (delete
-            // happens before the harness finishes or while the
-            // result is being processed). The result send is also
-            // gated because by this point `drop_rebase_gate` has
-            // dropped the receiver, so the send would be a silent
-            // no-op anyway, but skipping it makes the cancellation
-            // contract uniform with the earlier phases.
+            // Early-out on cancellation: skip the append entirely
+            // and do not send the result. This is a fast-path
+            // optimization - the structural guarantee that a
+            // cancelled gate cannot create an orphan active log
+            // comes from `append_activity_existing_only` below,
+            // NOT from this check. The check still matters because
+            // it avoids doing the backend work (and sending a
+            // result the dropped receiver would never read) when
+            // we already know the gate is gone.
             if cancelled.load(Ordering::SeqCst) {
                 return;
             }
@@ -9599,7 +9593,26 @@ impl App {
             // the UI thread) which violated the absolute blocking-
             // I/O invariant: a slow filesystem could freeze the TUI.
             // Doing it here keeps the UI thread out of the file
-            // write entirely. Any error is captured into
+            // write entirely.
+            //
+            // CRITICAL: we call `append_activity_existing_only`, NOT
+            // `append_activity`. The former opens with
+            // `OpenOptions::create(false)` so a `backend.delete` +
+            // `archive_activity_log` that races the append cannot
+            // recreate an orphan active activity log for a deleted
+            // item. POSIX semantics: if the main thread renames
+            // active -> archive AFTER we open the fd but BEFORE we
+            // write, the write lands in the archived file because
+            // the fd still points at the same inode. If the rename
+            // happens before we open, the open returns `ENOENT` and
+            // the method returns `Ok(false)`, which we handle as
+            // "the item was deleted while we were finishing up - no
+            // audit trail to write, no error to surface". This is
+            // the load-bearing structural fix for the
+            // "cancellation must precede destruction" rule; the
+            // earlier cancellation check is now just an
+            // optimization on top of it. Any other error
+            // (permission, I/O) is captured into
             // `activity_log_error` and surfaced via the result.
             let activity_entry = match &result {
                 RebaseResult::Success {
@@ -9631,10 +9644,25 @@ impl App {
                     }),
                 },
             };
-            let activity_log_error = backend
-                .append_activity(&wi_id_clone, &activity_entry)
-                .err()
-                .map(|e| e.to_string());
+            let activity_log_error =
+                match backend.append_activity_existing_only(&wi_id_clone, &activity_entry) {
+                    // Appended successfully - either to the active log
+                    // or (under a concurrent archive rename) to the
+                    // now-archived file via the still-valid fd.
+                    Ok(true) => None,
+                    // Active log was missing when we tried to open it:
+                    // the work item was deleted and its log archived
+                    // between the cancellation check above and this
+                    // append. Do NOT surface this as an error - the
+                    // item is gone, so there is nothing to audit, and
+                    // the result send below is a silent no-op because
+                    // `drop_rebase_gate` already dropped the receiver.
+                    // Returning here also prevents sending a spurious
+                    // "activity log missing" suffix onto a status
+                    // message that no UI will ever see.
+                    Ok(false) => return,
+                    Err(e) => Some(e.to_string()),
+                };
 
             // Re-attach the activity_log_error to the appropriate
             // variant. The verbosity is intentional: keeping the
@@ -20705,6 +20733,230 @@ mod tests {
         assert!(
             !app.rebase_gates.contains_key(&wi_id),
             "rebase gate must be removed from the map after delete",
+        );
+    }
+
+    /// Structural fix for the orphan-active-log race: the rebase
+    /// gate's background thread calls
+    /// `append_activity_existing_only`, NOT `append_activity`, so a
+    /// `backend.delete` that already archived the active log cannot
+    /// be silently reverted by a racing background append. This test
+    /// exercises the real `LocalFileBackend` code path (no
+    /// fabricated gate state, no fake backends) to prove that the
+    /// structural guarantee holds at the filesystem level. The
+    /// earlier `delete_work_item_cancels_rebase_gate_before_backend_delete`
+    /// test pins the ordering invariant; this test pins the backend
+    /// primitive that makes the ordering invariant robust even if a
+    /// future refactor reorders phases or forgets a cancellation
+    /// check.
+    #[test]
+    fn append_activity_existing_only_does_not_recreate_orphan_after_delete() {
+        use crate::work_item_backend::{
+            ActivityEntry, CreateWorkItem, LocalFileBackend, RepoAssociationRecord, WorkItemBackend,
+        };
+
+        let dir = std::env::temp_dir().join("workbridge-test-orphan-activity-log");
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend =
+            LocalFileBackend::with_dir(dir.clone()).expect("backend must be constructable");
+
+        // Create a work item. `LocalFileBackend::create` seeds an
+        // initial `created` activity log entry, so the active log
+        // file exists on disk at this point.
+        let record = backend
+            .create(CreateWorkItem {
+                title: "orphan-log-test".into(),
+                description: None,
+                status: WorkItemStatus::Implementing,
+                kind: crate::work_item::WorkItemKind::Own,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/tmp/orphan-repo"),
+                    branch: Some("feature".into()),
+                    pr_identity: None,
+                }],
+            })
+            .expect("create must succeed");
+        let wi_id = record.id.clone();
+
+        let active_path = backend
+            .activity_path_for(&wi_id)
+            .expect("activity path must be defined for LocalFileBackend");
+        assert!(
+            active_path.exists(),
+            "sanity check: initial activity log should have been seeded by create",
+        );
+
+        // Simulate the main thread's `backend.delete` call that the
+        // rebase gate's background thread is racing against.
+        backend.delete(&wi_id).expect("delete must succeed");
+        assert!(
+            !active_path.exists(),
+            "backend.delete must archive the active activity log",
+        );
+
+        // Now the background thread wakes up to write its
+        // `rebase_completed` entry. Under the old
+        // `append_activity(create(true))` path this would silently
+        // recreate an orphan active log file. The new
+        // `append_activity_existing_only` primitive returns
+        // `Ok(false)` and leaves the filesystem untouched.
+        let entry = ActivityEntry {
+            timestamp: "2026-04-16T00:00:00Z".into(),
+            event_type: "rebase_completed".into(),
+            payload: serde_json::json!({
+                "base_branch": "main",
+                "conflicts_resolved": false,
+                "source": "rebase_gate",
+            }),
+        };
+        let appended = backend
+            .append_activity_existing_only(&wi_id, &entry)
+            .expect("append_activity_existing_only must not error on ENOENT");
+        assert!(
+            !appended,
+            "append_activity_existing_only must return Ok(false) when the \
+             active log was archived by a concurrent delete",
+        );
+        assert!(
+            !active_path.exists(),
+            "append_activity_existing_only must NOT recreate the active \
+             activity log after delete (that is the orphan bug this \
+             primitive exists to prevent)",
+        );
+
+        // Witness the bug being fixed: the old `append_activity`
+        // path WOULD have created the orphan file. We verify this
+        // both to document the hazard in an executable form and to
+        // pin the invariant that the two primitives behave
+        // differently on ENOENT. The creation is immediately
+        // cleaned up so the test leaves the temp dir in a sane
+        // shape.
+        backend
+            .append_activity(&wi_id, &entry)
+            .expect("legacy append_activity should succeed (that is the bug)");
+        assert!(
+            active_path.exists(),
+            "legacy append_activity recreates the orphan active log - this \
+             assertion documents the hazard append_activity_existing_only \
+             exists to avoid",
+        );
+        let _ = std::fs::remove_file(&active_path);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Default trait impl: backends that do NOT explicitly override
+    /// `append_activity_existing_only` MUST get a loud
+    /// `BackendError::Validation` instead of silently falling
+    /// through to `append_activity` (which is the orphan-creating
+    /// call this primitive exists to replace). The reference
+    /// `LocalFileBackend` overrides it; any future backend that
+    /// forgets to override it will fail at the first call site
+    /// instead of silently regressing the orphan-active-log race.
+    /// This is the round 2 fix for the PR #104 review log entry
+    /// "Default impl of append_activity_existing_only silently
+    /// re-introduces the bug for any future backend".
+    #[test]
+    fn append_activity_existing_only_default_impl_returns_err() {
+        use crate::work_item::BackendType;
+        use crate::work_item_backend::{
+            ActivityEntry, BackendError, CreateWorkItem, ListResult, WorkItemBackend,
+            WorkItemRecord,
+        };
+
+        #[derive(Default)]
+        struct NonOverridingBackend {
+            appended: std::sync::Mutex<Vec<ActivityEntry>>,
+        }
+        impl WorkItemBackend for NonOverridingBackend {
+            fn list(&self) -> Result<ListResult, BackendError> {
+                Ok(ListResult {
+                    records: Vec::new(),
+                    corrupt: Vec::new(),
+                })
+            }
+            fn read(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
+                Err(BackendError::NotFound(id.clone()))
+            }
+            fn create(&self, _req: CreateWorkItem) -> Result<WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not used".into()))
+            }
+            fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn update_status(
+                &self,
+                _id: &WorkItemId,
+                _status: WorkItemStatus,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn import(
+                &self,
+                _unlinked: &crate::work_item::UnlinkedPr,
+            ) -> Result<WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not used".into()))
+            }
+            fn import_review_request(
+                &self,
+                _rr: &crate::work_item::ReviewRequestedPr,
+            ) -> Result<WorkItemRecord, BackendError> {
+                Err(BackendError::Validation("not used".into()))
+            }
+            fn append_activity(
+                &self,
+                _id: &WorkItemId,
+                entry: &ActivityEntry,
+            ) -> Result<(), BackendError> {
+                self.appended.lock().unwrap().push(entry.clone());
+                Ok(())
+            }
+            // Deliberately does NOT override append_activity_existing_only;
+            // the test asserts that the trait default refuses the call.
+            fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
+                Ok(None)
+            }
+            fn set_done_at(
+                &self,
+                _id: &WorkItemId,
+                _done_at: Option<u64>,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn activity_path_for(&self, _id: &WorkItemId) -> Option<PathBuf> {
+                None
+            }
+            fn backend_type(&self) -> BackendType {
+                BackendType::LocalFile
+            }
+        }
+
+        let backend = NonOverridingBackend::default();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/non-overriding.json"));
+        let entry = ActivityEntry {
+            timestamp: "2026-04-16T00:00:00Z".into(),
+            event_type: "test".into(),
+            payload: serde_json::json!({}),
+        };
+        let result = backend.append_activity_existing_only(&wi_id, &entry);
+        match result {
+            Err(BackendError::Validation(msg)) => {
+                assert!(
+                    msg.contains("append_activity_existing_only"),
+                    "default-impl error message must name the missing \
+                     primitive; got: {msg}",
+                );
+            }
+            other => panic!("default impl must return BackendError::Validation; got: {other:?}",),
+        }
+        assert!(
+            backend.appended.lock().unwrap().is_empty(),
+            "default impl must NOT forward to append_activity; doing so \
+             would silently re-create the orphan-active-log hazard for \
+             any future non-LocalFileBackend impl",
         );
     }
 

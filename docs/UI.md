@@ -1054,11 +1054,17 @@ envelope) the gate downgrades to a Failure status naming the
 ancestry mismatch. The UI never claims a rebase succeeded without
 local git verification. The audit trail (so a later session
 viewing this work item can see the rebase happened) is written by
-the background thread via `App.backend.append_activity` (NOT the
-UI thread, per the absolute blocking-I/O invariant), using a
-backend Arc cloned at `spawn_rebase_gate` setup time. Any append
-error is surfaced as a suffix on the status message rather than
-silently dropped. The harness is explicitly told NOT to call
+the background thread via
+`App.backend.append_activity_existing_only` (NOT the UI thread,
+per the absolute blocking-I/O invariant), using a backend Arc
+cloned at `spawn_rebase_gate` setup time. The `_existing_only`
+variant - not `append_activity` - is the structural orphan-log
+defense: it opens with `OpenOptions::create(false)`, so a racing
+`backend.delete` that already archived the active log cannot be
+silently reverted by a post-cancellation append. See
+`docs/harness-contract.md` C10 / C11 for the full POSIX
+explanation. Any append error is surfaced as a suffix on the
+status message rather than silently dropped. The harness is explicitly told NOT to call
 `workbridge_set_status` for this purpose because that would be a
 no-op `Implementing -> Implementing` transition.
 No `git push` is performed - after a successful rebase the user

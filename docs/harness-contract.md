@@ -313,10 +313,12 @@ the current Codex CLI surface).
 **Claude (reference)**: Interactive mode is produced by
 `App::spawn_session` -> `Session::spawn` in `src/session.rs:57`,
 which forks a `claude` process attached to a PTY slave fd. Headless
-mode is produced by the review gate at `src/app.rs:8423` and the
-rebase gate at `src/app.rs:8696`, which run `claude --print
+mode is produced by the review gate at `src/app.rs:8857` and the
+rebase gate at `src/app.rs:9283`, which run `claude --print
 --output-format json --json-schema ...` via
-`std::process::Command::output()`. The rebase gate also passes
+`std::process::Command::output()` (review gate) or
+`Command::spawn()` + `Child::wait_with_output()` (rebase gate, see
+C10). The rebase gate also passes
 `--dangerously-skip-permissions` because `claude --print` runs
 non-interactively and any pre-flight tool the harness wants to
 execute (`git rebase`, `git add`, etc.) must succeed without an
@@ -337,8 +339,8 @@ clause violation.
 **Claude (reference)**: `Session::spawn` at `src/session.rs:57`
 honours the `cwd` argument via `std::process::Command::current_dir`.
 `App::finish_session_open` passes the worktree path for work-item
-spawns at `src/app.rs:4636`. `spawn_global_session` at
-`src/app.rs:9384` passes a stable workbridge-owned scratch directory
+spawns at `src/app.rs:4821`. `spawn_global_session` at
+`src/app.rs:10219` passes a stable workbridge-owned scratch directory
 (`$TMPDIR/workbridge-global-assistant-cwd`, created idempotently by
 `std::fs::create_dir_all` just before the spawn). The scratch path
 is used instead of `$HOME` because Claude Code's workspace trust
@@ -350,7 +352,7 @@ reading or writing `~/.claude.json`. The review gate runs `git diff`
 inside the worktree on a background thread (not in the harness
 child) but the harness child for `claude --print` is spawned with
 the default cwd because the gate only needs MCP access to fetch the
-plan. The rebase gate at `src/app.rs:8696` is the opposite case:
+plan. The rebase gate at `src/app.rs:9283` is the opposite case:
 the harness child needs to actually run `git rebase` against the
 worktree, so its `Command::new("claude").current_dir(&worktree_path)`
 sets the cwd to the work-item's worktree path explicitly. The cwd
@@ -373,13 +375,13 @@ works. No clause violation.
 
 ### C3 - Permissions
 
-**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4672` and
-`spawn_global_session` at `src/app.rs:9272` both push
+**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4935` and
+`spawn_global_session` at `src/app.rs:10219` both push
 `--dangerously-skip-permissions` into argv unconditionally. The
-review gate at `src/app.rs:8423` does not need it because
+review gate at `src/app.rs:8857` does not need it because
 `claude --print` is non-interactive and the read-only MCP server
 forbids the only mutations a permission prompt would normally
-guard. The rebase gate at `src/app.rs:8696` DOES pass
+guard. The rebase gate at `src/app.rs:9283` DOES pass
 `--dangerously-skip-permissions` because its job is to run the
 write-side `git rebase` / `git add` / `git rebase --continue`
 sequence in the worktree; an interactive consent prompt in
@@ -398,21 +400,31 @@ produces the JSON blob, and `McpSocketServer::start` at
 `src/mcp.rs:80` starts the accept loop. All four spawn sites
 deliver the MCP config exclusively via `--mcp-config <tempfile>`
 under `std::env::temp_dir()` (workbridge-owned): work-item spawns
-at `src/app.rs:4624` (see `finish_session_open`), the review gate
-at `src/app.rs:8434`, the rebase gate at `src/app.rs:8706`, and the
-global assistant at `src/app.rs:9272`. No spawn site drops
+at `src/app.rs:4887` (see `finish_session_open`), the review gate
+at `src/app.rs:8842`, the rebase gate at `src/app.rs:9188`, and the
+global assistant at `src/app.rs:10303`. No spawn site drops
 `.mcp.json` or any other harness-state file into the worktree -
 doing so would violate the "file injection" invariant
 cross-referenced in C2 (CLAUDE.md severity overrides). The bridge
 process is the same workbridge binary re-invoked with
 `--mcp-bridge --socket <path>` (see `build_mcp_config`). The
 rebase gate's MCP server is started with `read_only: false`
-because the harness must call `workbridge_set_status` and
-`workbridge_log_event` to persist the rebase outcome; the rebase
-gate's `Sender<McpEvent>` is a private channel owned by the
-spawning thread (NOT `App::mcp_tx`) so the gate's progress events
-do not pollute the main TUI dispatch loop. The thread translates
-incoming `McpEvent::ReviewGateProgress` and
+solely because the harness must call `workbridge_log_event` to
+stream live `rebase_progress` events to the spinning right-pane
+indicator; the rebase outcome audit trail is NOT persisted
+through the harness. The prompt explicitly tells the harness not
+to call `workbridge_set_status`, and the background thread
+spawned from `spawn_rebase_gate` writes the
+`rebase_completed` / `rebase_failed` entry directly via
+`App.backend.append_activity_existing_only` after the harness
+exits (see C10, C11, and RP6). The rebase gate's
+`Sender<McpEvent>` is a private channel owned by the spawning
+thread (NOT `App::mcp_tx`) so the gate's progress events do not
+pollute the main TUI dispatch loop, and the dispatch loop's
+`Ok(_)` arm deliberately drops any stray `StatusUpdate` /
+`SetPlan` / `SetTitle` events that a misbehaving harness might
+emit. The thread translates incoming
+`McpEvent::ReviewGateProgress` and
 `McpEvent::LogEvent { event_type: "rebase_progress", .. }` calls
 into `RebaseGateMessage::Progress` updates, which the right-pane
 takeover in `src/ui.rs` renders into the spinner panel.
@@ -428,22 +440,28 @@ stdio transport) is still achievable.
 
 ### C5 - Tool allowlist by spawn type
 
-**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4672`
+**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4935`
 passes `--allowedTools` with a comma-separated list of the 15
 workbridge MCP tools for work-item profiles.
-`spawn_global_session` at `src/app.rs:9272` uses the same list.
+`spawn_global_session` at `src/app.rs:10219` uses the same list.
 The review gate does not pass `--allowedTools`; it relies entirely
 on the MCP server exposing only the 4 read-only tools (see
 `src/mcp.rs` `tools/list` handling and the
 `read_only_mode_exposes_only_read_tools` test at `src/mcp.rs:1510`).
-The rebase gate at `src/app.rs:8696` also does not pass
+The rebase gate at `src/app.rs:9283` also does not pass
 `--allowedTools`: with `read_only: false` on its MCP server, the
 harness has access to the full work-item tool set, but in practice
-the rebase prompt only asks for `workbridge_log_event` (progress)
-and `workbridge_set_status` (final result) plus the harness's own
-shell tool to run `git rebase`. The "no allowlist" choice keeps the
-spawn site uniform with the review gate; the prompt's instructions
-are the upper bound on which tools actually get called.
+the rebase prompt only asks for `workbridge_log_event` (live
+`rebase_progress` streaming) plus the harness's own shell tool
+to run `git rebase`. The prompt explicitly tells the harness NOT
+to call `workbridge_set_status`; the
+`rebase_completed` / `rebase_failed` audit trail is written by
+the background thread spawned from `spawn_rebase_gate` via
+`App.backend.append_activity_existing_only` rather than through
+the harness (see C11, RP6). The "no allowlist" choice keeps the
+spawn site uniform with the review gate; the prompt's
+instructions are the upper bound on which tools actually get
+called.
 
 **Codex (secondary, not implemented)**: **workaround**. Codex does
 not expose a fine-grained MCP tool allowlist at the CLI level; its
@@ -458,15 +476,15 @@ defence in depth.
 
 ### C6 - System prompt injection per stage
 
-**Claude (reference)**: `stage_system_prompt` at `src/app.rs:4308`
+**Claude (reference)**: `stage_system_prompt` at `src/app.rs:5106`
 builds the prompt by rendering a per-stage template
 (`planning` / `planning_retroactive` / `planning_quickstart` /
 `implementing_with_plan` / `implementing_rework` /
 `implementing_no_plan` / `blocked` / `review` /
 `review_with_findings`) from `src/prompts.rs`. The result is passed
 via `--system-prompt <string>` in `build_claude_cmd` at
-`src/app.rs:4672`. The review gate renders the `review_gate`
-template and passes it with the same flag at `src/app.rs:8423`.
+`src/app.rs:4935`. The review gate renders the `review_gate`
+template and passes it with the same flag at `src/app.rs:8857`.
 The rebase gate does NOT pass a separate `--system-prompt`; the
 prompt is delivered as the positional `-p` payload (an inline
 string built in `spawn_rebase_gate`) because the rebase task has no
@@ -488,7 +506,7 @@ injection at spawn time) is still met.
 
 ### C7 - Auto-start prompt
 
-**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4672`
+**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4935`
 appends a literal positional prompt ("Explain who you are and start
 working." for Planning/Implementing, a review-gate-findings
 presentation prompt for Review) when `auto_start` is true. It is
@@ -496,7 +514,7 @@ placed **before** `--mcp-config` because Claude Code otherwise
 treats it as an additional config file path. The headless gates
 have their own initial prompts: the review gate passes the review
 skill as `-p <prompt>`, and the rebase gate passes its inlined
-rebase-task prompt as `-p <prompt>` at `src/app.rs:8696`. The
+rebase-task prompt as `-p <prompt>` at `src/app.rs:9283`. The
 clause is met for headless spawns the same way it is met for
 interactive spawns: the harness child has work to do before any
 human input could possibly arrive.
@@ -508,7 +526,7 @@ as the `-p` / stdin payload in `codex exec`. No clause violation.
 ### C8 - Stage reminders
 
 **Claude (reference)**: Planning sessions get a second-layer
-reminder via `--settings`, passed at `src/app.rs:4672` with a JSON
+reminder via `--settings`, passed at `src/app.rs:4971` with a JSON
 blob that installs a `PostToolUse` hook on `TodoWrite`. The hook
 greps the tool payload for `workbridge_set_plan`; if missing, it
 writes a reminder to stderr so Claude sees it on the next turn.
@@ -536,8 +554,8 @@ the first turn.
 (`src/session.rs:164`) loops on `libc::read` against a dup'd master
 fd and calls `vt100::Parser::process` on every chunk. The UI thread
 locks the parser and renders its screen (`App::render_*` paths).
-Headless capture lives at `src/app.rs:8423` (review gate) and
-`src/app.rs:8696` (rebase gate) - both consume stdout from the
+Headless capture lives at `src/app.rs:8857` (review gate) and
+`src/app.rs:9283` (rebase gate) - both consume stdout from the
 harness child and parse the top-level JSON envelope, reaching into
 `envelope["structured_output"]` for the fields. The review gate
 uses the convenience `Command::output()` because it has no kill
@@ -567,7 +585,7 @@ at `src/session.rs:304` is the SIGKILL-immediately path used in
 force-kills and joins the reader thread; slave-PTY close on child
 exit gives the reader its EOF. The global-assistant teardown adds
 one extra layer on top of `Session::kill`:
-`App::teardown_global_session` at `src/app.rs:9256` kills the
+`App::teardown_global_session` at `src/app.rs:10203` kills the
 child, drops the `SessionEntry` (which joins the reader via
 `Drop`), drops the MCP server, removes the temp MCP config file,
 and drains any buffered keystrokes - symmetric with the work-item
@@ -623,15 +641,47 @@ spawned, so any `drop_rebase_gate` call sees the entry even if
 the thread has not been scheduled yet.
 
 There is one final cancellation check between the harness exit
-and the background thread's `backend.append_activity` call. If
-the flag is set there, the thread exits without writing the
-activity log entry and without sending the result through `tx`.
-Without this check, a delete that races the harness exit could
-let the background thread call `append_activity` after
-`backend.delete` has already moved the active log to `archive/`;
-because `append_activity` opens with `OpenOptions::create(true)`,
-it would recreate an orphan active activity log for a deleted
-work item.
+and the background thread's activity-log append. If the flag is
+set there, the thread exits without touching the backend and
+without sending the result through `tx`. That check is a
+fast-path optimization only: the **load-bearing structural fix**
+for the orphan-active-log race is that the background thread
+calls `backend.append_activity_existing_only(...)`, NOT
+`backend.append_activity(...)`. The `_existing_only` variant
+opens the activity log with `OpenOptions::create(false)`, so a
+`backend.delete` that already archived the active log cannot be
+silently reverted by a racing background append. POSIX semantics
+guarantee this is race-free without locking:
+
+1. If the background thread opens the fd BEFORE the main thread
+   runs `fs::rename(active -> archive/...)`, the fd still points
+   at the same inode. The write lands in the archived file, not
+   an orphan active log.
+2. If the rename happens FIRST, the background thread's open
+   returns `ENOENT` and `append_activity_existing_only` returns
+   `Ok(false)`. The bg thread then swallows the result entirely
+   (no audit, no send) because the work item is gone and the
+   dropped receiver cannot surface anything to the UI anyway.
+
+Under `append_activity` (`create(true)`), a lost TOCTOU between
+the cancellation check and the open would silently recreate an
+orphan `activity-*.jsonl` for the deleted item, which the
+metrics aggregator would then count as a phantom work item.
+Under `append_activity_existing_only` that failure mode is
+impossible regardless of how the phases interleave, which is
+why the structural primitive is preferred over a tighter lock
+or a smarter ordering of atomic checks. The trait-level
+docstring on `WorkItemBackend::append_activity_existing_only`
+in `src/work_item_backend.rs` documents the POSIX invariant in
+full; `LocalFileBackend::append_activity_existing_only` is the
+override with the actual `create(false)` open. The trait's
+default impl deliberately returns
+`Err(BackendError::Validation(...))` rather than delegating to
+`append_activity` so that any future backend impl that forgets
+to override this method fails loudly at the first call site
+instead of silently re-creating the orphan-active-log hazard
+(see round 2 of the PR #104 review log for why "default Err"
+is preferred over "default delegate").
 
 The single-flight admission (`UserActionKey::RebaseOnMain`) is
 now released only when `drop_rebase_gate` sees the slot owned by
@@ -643,14 +693,21 @@ item still owns it, admitting an overlapping rebase.
 
 The rebase gate's background thread writes its own
 `rebase_completed` / `rebase_failed` activity-log entry directly
-via `App.backend.append_activity` from the bg thread (off the UI
-thread per the blocking-I/O invariant). This means any code path
-that destroys a work item's backing data MUST first signal
-cancellation to the rebase gate, otherwise the bg thread can
-race the destruction and write to the activity log AFTER
-`backend.delete` has archived it - `append_activity` opens with
-`OpenOptions::create(true)`, so a post-delete write recreates an
-orphan active log file for a deleted item.
+via `App.backend.append_activity_existing_only` from the bg
+thread (off the UI thread per the blocking-I/O invariant). The
+`_existing_only` variant is the **structural** defense against
+the orphan-active-log race: it opens with
+`OpenOptions::create(false)`, so a `backend.delete` that already
+archived the active log cannot be silently reverted by a racing
+background append (see the detailed POSIX explanation above).
+The three layers below enforce the "cancellation must precede
+destruction" **ordering** - they are a fast-path optimization
+(don't do pointless work after cancellation) and a
+harness-process-group SIGKILL path (stop the child so it cannot
+keep mutating the worktree), not the orphan-log guarantee
+itself. The orphan-log guarantee is a single-line change in the
+backend primitive called from the bg thread and is impossible to
+bypass from the call site.
 
 The rule is enforced by three layers in increasing order of
 strictness:
@@ -711,6 +768,24 @@ The rule is pinned by these unit tests in `src/app.rs`:
 - `abort_background_ops_for_work_item_drops_rebase_gate` pins
   the helper itself, including the "only the targeted work
   item's gate is touched" guarantee.
+- `append_activity_existing_only_does_not_recreate_orphan_after_delete`
+  is a **filesystem-level** regression test that drives a real
+  `LocalFileBackend` through the exact sequence the race
+  exhibits (create -> delete -> archive -> post-delete append
+  attempt) and asserts that `append_activity_existing_only`
+  returns `Ok(false)` and leaves no orphan active log. The
+  ordering tests above pin the `cancelled` flag handshake; this
+  test pins the backend primitive so a future refactor that
+  reorders the phases or drops the cancellation check cannot
+  regress the structural guarantee.
+- `append_activity_existing_only_default_impl_returns_err` pins
+  the trait-level default impl: any backend that does NOT
+  explicitly override the method gets a loud
+  `BackendError::Validation` instead of silently delegating to
+  `append_activity` (which is the orphan-creating call this
+  primitive exists to replace). This forces every future backend
+  impl to make the choice explicitly and prevents a silent
+  regression of the orphan-active-log race.
 
 **Codex (secondary, not implemented)**: **supported**. The
 lifecycle contract is a POSIX process-group protocol, not a
@@ -721,23 +796,25 @@ behaviour), the existing `Session` struct handles it unchanged.
 ### C11 - Read-only sessions
 
 **Claude (reference)**: The review gate passes `read_only: true` to
-`McpSocketServer::start` at `src/app.rs:8375`. The server at
+`McpSocketServer::start` at `src/app.rs:8809`. The server at
 `src/mcp.rs:80` stores the flag into `SessionMcpConfig` and threads
 it through `handle_message`, which filters `tools/list` (see
-`src/mcp.rs` around line 439) and rejects mutating `tools/call`
-(line 608). The unit tests
+`src/mcp.rs` around line 411) and rejects mutating `tools/call`
+(line 600). The unit tests
 `read_only_mode_exposes_only_read_tools` and
 `read_only_mode_rejects_mutating_tool_calls` in `src/mcp.rs:1510`
 pin the contract. The rebase gate's `McpSocketServer::start` at
-`src/app.rs:8599` is intentionally NOT read-only:
+`src/app.rs:9143` is intentionally NOT read-only:
 `read_only: false` is passed because the harness must call
 `workbridge_log_event` to stream live `rebase_progress` events to
 the spinning right-pane indicator. The rebase gate does NOT use
 the harness to persist its outcome - the prompt explicitly tells
-the harness not to call `workbridge_set_status`, and
-`poll_rebase_gate` writes a `rebase_completed` / `rebase_failed`
-activity log entry directly via `App.backend.append_activity` once
-the harness exits. Status / plan / title MCP events that arrive on
+the harness not to call `workbridge_set_status`, and the background
+thread spawned from `spawn_rebase_gate` writes a
+`rebase_completed` / `rebase_failed` activity log entry directly
+via `App.backend.append_activity_existing_only` once the harness
+exits (NOT `append_activity` - see the structural fix described
+above in C10). Status / plan / title MCP events that arrive on
 the gate's private channel are dropped (see `Ok(_)` arm in
 `spawn_rebase_gate`) so a misbehaving harness cannot rename the
 work item or overwrite its plan as a side effect of running a
@@ -753,15 +830,15 @@ harness-agnostic. A Codex adapter just sets the same flag.
 
 **Claude (reference)**: Sessions are stored in `App::sessions` keyed
 by `(WorkItemId, WorkItemStatus)` and inserted at
-`src/app.rs:4646`. Stage transitions orphan old entries, which are
+`src/app.rs:4909`. Stage transitions orphan old entries, which are
 killed by the periodic liveness sweep. The poll handler in
-`poll_review_gate` at `src/app.rs:8846` explicitly kills the
+`poll_review_gate` at `src/app.rs:9777` explicitly kills the
 current session and respawns when a gate rejects or errors. The
 global assistant drawer uses a simpler identity rule: exactly one
 live session at a time, torn down on every drawer close and
 re-spawned fresh on every drawer open via
 `App::toggle_global_drawer` calling `teardown_global_session`
-(`src/app.rs:9256`) and `spawn_global_session` (`src/app.rs:9272`);
+(`src/app.rs:10203`) and `spawn_global_session` (`src/app.rs:10219`);
 see also `docs/UI.md` "Global assistant drawer session lifetime".
 The rebase gate's "session" is implicit: it is keyed by
 `WorkItemId` in `App.rebase_gates` and lives only as long as the
@@ -811,12 +888,12 @@ claude
   --mcp-config /tmp/workbridge-mcp-config-<uuid>.json
 ```
 
-Source: `App::build_claude_cmd` at `src/app.rs:4137`, followed by
+Source: `App::build_claude_cmd` at `src/app.rs:4935`, followed by
 the `--mcp-config` append inside `finish_session_open` at
-`src/app.rs:4089`. Cwd: the work item's worktree path. The
+`src/app.rs:4887`. Cwd: the work item's worktree path. The
 positional prompt MUST precede `--mcp-config`; see the regression
 test `build_claude_cmd_prompt_before_mcp_config` at
-`src/app.rs:13104`.
+`src/app.rs:15612`.
 
 ### RP2 - Headless review-gate argv
 
@@ -831,7 +908,7 @@ claude
 ```
 
 Source: `std::process::Command::new("claude")` at
-`src/app.rs:8423`. Cwd: inherited (unspecified). The review gate
+`src/app.rs:8857`. Cwd: inherited (unspecified). The review gate
 does NOT pass `--dangerously-skip-permissions` because
 `--print` is non-interactive and never prompts. The review gate
 does NOT pass `--allowedTools`; it relies on the read-only MCP
@@ -850,8 +927,10 @@ claude
 ```
 
 Source: `std::process::Command::new("claude")` at
-`src/app.rs:8696`. Cwd: the work-item's worktree path (set
-explicitly via `Command::current_dir`). Unlike RP2, the rebase gate
+`src/app.rs:9283` (inside the harness sub-thread spawned by
+`spawn_rebase_gate` at `src/app.rs:8950`). Cwd: the work-item's
+worktree path (set explicitly via `Command::current_dir`).
+Unlike RP2, the rebase gate
 spawns via `Command::spawn()` + `Child::wait_with_output()` rather
 than `Command::output()` so the harness child's PID can be stashed
 in `RebaseGateState::child_pid`; this is what lets
@@ -873,9 +952,13 @@ backing the rebase gate is started with `read_only: false` so the
 harness can call `workbridge_log_event` to stream `rebase_progress`
 events to the spinning right-pane indicator. The prompt explicitly
 tells the harness NOT to call `workbridge_set_status` - the
-audit-trail record is written by `poll_rebase_gate` directly via
-`App.backend.append_activity` (see RP6) so the harness does not
-have to make persistence decisions.
+audit-trail record is written by the background thread spawned
+from `spawn_rebase_gate` directly via
+`App.backend.append_activity_existing_only` (see RP6) so the
+harness does not have to make persistence decisions, and the
+structural guarantee that a cancelled gate cannot recreate an
+orphan active log for a deleted item lives in the backend
+primitive rather than in the gate's control flow.
 
 ### RP3 - MCP config JSON
 
@@ -921,7 +1004,7 @@ on name collision. The socket path is produced by
 ```
 
 Source: inline JSON literal in `build_claude_cmd` at
-`src/app.rs:4175`. Passed as the argument to `--settings` on
+`src/app.rs:4971`. Passed as the argument to `--settings` on
 Planning spawns only. The harness fires the command after every
 `TodoWrite` tool call; the command greps stdin (the tool payload)
 for `workbridge_set_plan` and, if missing, emits a stderr
@@ -942,7 +1025,7 @@ The review gate parses the top-level JSON document emitted by
 }
 ```
 
-Source: `src/app.rs:8442` ("The structured output is in the
+Source: `src/app.rs:8876` ("The structured output is in the
 `structured_output` field."). The harness MUST produce an envelope
 whose structured body conforms to the `--json-schema` payload in
 RP2; workbridge uses `.as_bool()` and `.as_str()` with safe
@@ -964,7 +1047,7 @@ the same `structured_output` field, but expects a different shape:
 }
 ```
 
-Source: `src/app.rs:8766`. `success` MUST be `true` if and only if
+Source: `src/app.rs:9437`. `success` MUST be `true` if and only if
 the worktree is now rebased onto `origin/<base>`; the harness is
 expected to run `git rebase --abort` and report `success=false` on
 any give-up path. `conflicts_resolved` is informational and used
@@ -1000,17 +1083,35 @@ also handled.
 
 The rebase gate's audit trail (the "later session viewing this
 work item can see the rebase happened" record) is written on the
-background thread via `App.backend.append_activity`, NOT on the
-UI thread - the local backend implementation opens and writes the
-activity log file, so doing it from `poll_rebase_gate` would
-violate the absolute blocking-I/O-on-the-UI-thread invariant. The
-spawning thread owns an `Arc<dyn WorkItemBackend>` clone (cloned
-from `App.backend` at `spawn_rebase_gate` setup time); after the
-ancestry verification above runs, it builds the activity entry,
-calls `append_activity`, and stashes any error string in
+background thread via `App.backend.append_activity_existing_only`,
+NOT on the UI thread - the local backend implementation opens
+and writes the activity log file, so doing it from
+`poll_rebase_gate` would violate the absolute
+blocking-I/O-on-the-UI-thread invariant. The spawning thread owns
+an `Arc<dyn WorkItemBackend>` clone (cloned from `App.backend` at
+`spawn_rebase_gate` setup time); after the ancestry verification
+above runs, it builds the activity entry, calls
+`append_activity_existing_only`, and stashes any error string in
 `RebaseResult::*::activity_log_error`. The poll loop reads that
 field and suffixes the error onto the user-visible status message
 so the user can see when the audit trail did not land.
+
+`append_activity_existing_only` (not `append_activity`) is the
+deliberate choice that closes the orphan-active-log race described
+in C10. `append_activity_existing_only` opens the log file with
+`OpenOptions::create(false)`, so a `backend.delete` that has
+already archived the active log cannot be silently reverted by a
+racing background append. On `ENOENT` the method returns
+`Ok(false)` and the background thread swallows the result
+entirely (no audit, no send). The audit trail is therefore
+best-effort at a well-defined boundary: if the work item still
+exists when the rebase finishes, the entry lands; if the work
+item was deleted while the rebase was in flight, the entry is
+dropped and no orphan active log file is resurrected. See the
+"Architectural rule: cancellation must precede destruction"
+subsection in C10 for the full rationale and the
+`append_activity_existing_only_does_not_recreate_orphan_after_delete`
+regression test that pins the invariant at the filesystem level.
 
 The entry's `event_type` is `rebase_completed` for success or
 `rebase_failed` for failure, and the payload carries
@@ -1181,30 +1282,37 @@ update the Implementation Map section above.
 
 | File          | Line  | Mode        | Scope      | Cwd                                       |
 |---------------|-------|-------------|------------|-------------------------------------------|
-| `src/app.rs`  | 4636  | Interactive | WorkItem   | Work-item worktree                        |
-| `src/app.rs`  | 8423  | Headless    | ReviewGate | inherited                                 |
-| `src/app.rs`  | 8696  | Headless    | RebaseGate | Work-item worktree                        |
-| `src/app.rs`  | 9384  | Interactive | Global     | `$TMPDIR/workbridge-global-assistant-cwd` |
+| `src/app.rs`  | 4821  | Interactive | WorkItem   | Work-item worktree                        |
+| `src/app.rs`  | 8857  | Headless    | ReviewGate | inherited                                 |
+| `src/app.rs`  | 9283  | Headless    | RebaseGate | Work-item worktree                        |
+| `src/app.rs`  | 10219 | Interactive | Global     | `$TMPDIR/workbridge-global-assistant-cwd` |
 
-All four sites go through `src/session.rs:57` (`Session::spawn`) for
-the interactive path; the headless review gate uses
-`std::process::Command::output()` directly, and the headless rebase
-gate uses `Command::spawn()` + `Child::wait_with_output()` so the
-harness child's PID can be stashed in `RebaseGateState::child_pid`
-for the cleanup-path SIGKILL described in C10. Argv is built in
-`App::build_claude_cmd` at `src/app.rs:4672` for the work-item
-path, inlined at `src/app.rs:8423` for the review gate, inlined
-at `src/app.rs:8696` for the rebase gate, and inlined at
-`src/app.rs:9272` (`spawn_global_session`) for the global assistant.
-The rebase gate is the second headless spawn site: it runs `claude
---print --dangerously-skip-permissions --output-format json
---json-schema ... --mcp-config <tempfile>` with cwd set to the
-work-item's worktree path so the harness can run `git rebase
-origin/<main>` in the right repo and resolve any conflicts in
-place. Global assistant teardown lives at `src/app.rs:9256`
-(`App::teardown_global_session`); see C10 and C12 for why each
-drawer open spawns a fresh session and each close fully tears it
-down.
+The "Line" column points at the nearest stable anchor for each
+spawn: `finish_session_open` for the work-item interactive path
+(the actual `Session::spawn` call follows inside the same
+function), the `std::process::Command::new("claude")` call site
+for each headless gate, and `spawn_global_session` for the global
+drawer. All four sites go through `src/session.rs:57`
+(`Session::spawn`) for the interactive path; the headless review
+gate uses `std::process::Command::output()` directly, and the
+headless rebase gate uses `Command::spawn()` +
+`Child::wait_with_output()` so the harness child's PID can be
+stashed in `RebaseGateState::child_pid` for the cleanup-path
+SIGKILL described in C10. Argv is built in `App::build_claude_cmd`
+at `src/app.rs:4935` for the work-item path, inlined at
+`src/app.rs:8857` for the review gate, inlined at
+`src/app.rs:9283` for the rebase gate (inside the harness
+sub-thread spawned by `spawn_rebase_gate` at `src/app.rs:8950`),
+and inlined at `src/app.rs:10219` (`spawn_global_session`) for
+the global assistant. The rebase gate is the second headless
+spawn site: it runs `claude --print --dangerously-skip-permissions
+--output-format json --json-schema ... --mcp-config <tempfile>`
+with cwd set to the work-item's worktree path so the harness can
+run `git rebase origin/<main>` in the right repo and resolve any
+conflicts in place. Global assistant teardown lives at
+`src/app.rs:10203` (`App::teardown_global_session`); see C10 and
+C12 for why each drawer open spawns a fresh session and each
+close fully tears it down.
 
 ## Change Log
 
@@ -1301,6 +1409,88 @@ harness adapter is introduced, add a dated bullet here.
   `poll_rebase_gate` directly via `App.backend.append_activity` as
   a `rebase_completed` / `rebase_failed` activity log entry. RP6
   documents the new entry shape.
+- 2026-04-16: Hardened the rebase gate's
+  "cancellation must precede destruction" rule against the last
+  reachable orphan-active-log interleaving, and refreshed every
+  `src/app.rs:NNNN` citation in the Known Spawn Sites table and
+  Implementation Map against the current tree. (1) Added a new
+  trait primitive
+  `WorkItemBackend::append_activity_existing_only` (default impl
+  delegates to `append_activity`; `LocalFileBackend` overrides
+  with `OpenOptions::create(false)`) and switched the rebase
+  gate's background-thread audit write to call it. The previous
+  TOCTOU window - `cancelled.load` check, then
+  `append_activity(create(true))` - could reopen and silently
+  resurrect an orphan `activity-*.jsonl` for a deleted item if
+  `backend.delete` ran between the check and the open. Under the
+  new primitive the structural guarantee is impossible to bypass
+  from the call site: a racing rename either leaves the open fd
+  pointing at the archived inode (write lands in archive, no
+  orphan), or the open returns `ENOENT` and the bg thread
+  swallows the result. Added a real-filesystem regression test
+  `append_activity_existing_only_does_not_recreate_orphan_after_delete`
+  that drives a real `LocalFileBackend` through the exact
+  create -> delete -> archive -> post-delete append sequence and
+  asserts no orphan is created, plus
+  `append_activity_existing_only_default_impl_delegates` pinning
+  the default-impl contract. Updated C10 "final cancellation
+  check" paragraph and the "Architectural rule" subsection to
+  document the split: the three-layer rule provides ordering and
+  process-group SIGKILL; the backend primitive provides the
+  orphan-log structural guarantee. (2) Refreshed every stale
+  `src/app.rs:NNNN` citation in the Implementation Map (C1-C13)
+  and the Known Spawn Sites table against the current tree:
+  finish_session_open 4636 -> 4821, build_claude_cmd 4672 -> 4935
+  (plus argv-build references in C3/C5/C6/C7/C8),
+  stage_system_prompt 4308 -> 5106, --settings hook JSON 4175 ->
+  4971, spawn_review_gate 8423 -> 8508 and its
+  Command::new 8423 -> 8857 / McpSocketServer::start 8375 ->
+  8809 / --mcp-config append 8434 -> 8842,
+  spawn_rebase_gate 8696 -> 8950 and its
+  Command::new 8696 -> 9283 / McpSocketServer::start 8599 ->
+  9143 / --mcp-config append 8706 -> 9188,
+  poll_review_gate 8792/8846 -> 9777,
+  teardown_global_session 9256 -> 10203,
+  spawn_global_session 9272/9384 -> 10219 and its
+  --mcp-config append 9272 -> 10303,
+  sessions.insert 4646 -> 4909,
+  build_claude_cmd_prompt_before_mcp_config 13104 -> 15612,
+  RP5 review-gate parse 8442 -> 8876,
+  RP6 rebase-gate parse 8766 -> 9437,
+  tools/list filter ~439 -> 411,
+  tools/call rejection 608 -> 600.
+  The table and Implementation Map are now byte-accurate against
+  the current tree so the "table and Implementation Map must
+  stay in sync with the code" rule holds in full.
+- 2026-04-16: Round 2 of the same review loop addressed three
+  follow-ups missed by round 1. (1) P0: round 1 measured the
+  post-spawn_rebase_gate citations against a stale tree, leaving
+  every function past line ~9700 off by 28-38 lines. Refreshed
+  poll_review_gate 9749 -> 9777, teardown_global_session 9256 ->
+  10203 (round 1 wrote 10175), spawn_global_session 9272 ->
+  10219 (round 1 wrote 10191), the global `--mcp-config` push
+  9272 -> 10303 (round 1 wrote 10265), and the
+  build_claude_cmd_prompt_before_mcp_config test anchor 13104 ->
+  15612 (round 1 wrote 15584). The Known Spawn Sites table's
+  Global row now reads 10219. (2) P0: docs/UI.md still named the
+  old `append_activity` primitive in the rebase-gate section -
+  the literal call the round 1 fix replaced with
+  `append_activity_existing_only`. Updated the doc to name the
+  new primitive and added a one-sentence note about the
+  structural orphan-log defense, with a back-reference to C10
+  and C11 here. (3) P2: round 1's default impl of
+  `WorkItemBackend::append_activity_existing_only` silently
+  delegated to `append_activity`, which is the orphan-creating
+  call the primitive exists to replace. Any future non-
+  LocalFileBackend impl that forgot to override the method would
+  silently re-introduce the bug. The default impl now returns
+  `Err(BackendError::Validation(...))` so the failure is loud
+  and fail-fast at the first call site. The default-impl
+  contract test was renamed
+  `append_activity_existing_only_default_impl_delegates` ->
+  `append_activity_existing_only_default_impl_returns_err`
+  and now pins the new behaviour. C10 prose and the test list
+  in this doc were updated to match.
 - 2026-04-16: Architectural pass on the rebase gate's cleanup
   contract in response to the sixth Codex review (graceful-quit
   oversight + delete ordering window). Generalised the fix into
