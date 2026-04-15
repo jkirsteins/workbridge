@@ -1,5 +1,13 @@
 # Cleanup and Shutdown Behavior
 
+For the agent-backend-specific side-car files written on spawn (e.g.
+Claude Code's worktree `.mcp.json`, the `--mcp-config` tempfile) and
+how they are reversed via `AgentBackend::cleanup_session_files` on
+work-item deletion, see `docs/harness-contract.md` C4 and the C10
+lifecycle section. This file only covers the OS-level signal dance
+and the work-item resource cleanup phases that sit above the harness
+contract.
+
 ## Normal quit (Q twice)
 
 1. First Q press shows a confirmation prompt.

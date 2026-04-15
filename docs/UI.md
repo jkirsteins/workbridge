@@ -7,6 +7,11 @@ input dialogs.
 
 ## Event Loop
 
+For the contract between workbridge and the external coding agent it
+spawns (argv, MCP injection, session lifecycle, read-only sessions,
+etc.) see `docs/harness-contract.md`; this file only covers what is
+observable inside the TUI process.
+
 The application runs via `rat_salsa::run_tui()` which manages terminal
 setup/teardown, event polling, and the render cycle. Four callbacks drive
 the application:

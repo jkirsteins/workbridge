@@ -2883,6 +2883,7 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
+                agent_written_files: Vec::new(),
             },
         );
 
@@ -2973,6 +2974,7 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
+                agent_written_files: Vec::new(),
             },
         );
         // Pre-install a LIVE terminal session so the Ctrl+\ flip's call
@@ -2987,6 +2989,7 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
+                agent_written_files: Vec::new(),
             },
         );
 

@@ -40,7 +40,7 @@ worktree exists, WorkBridge has:
 
 - A path on disk (where the code lives)
 - A branch name (the identity of the work)
-- A location to spawn a Claude Code session
+- A location to spawn an agent session (see `docs/harness-contract.md`)
 
 Note: git dirty/clean status and ahead/behind counts are defined in the
 data model (GitState) but currently hardcoded to false/0/0. Real git state
@@ -276,8 +276,8 @@ planning phase.
 Work items follow a seven-stage workflow:
 
 - **Backlog** - Work has been identified but not started. (Stored as "Backlog" in the backend; legacy "Todo" values are accepted via serde alias.)
-- **Planning** - A Claude session produces an implementation plan. Advancing to Implementing requires the plan to be set via `workbridge_set_plan`; manual advance is blocked.
-- **Implementing** - Active development. A Claude session works on the code.
+- **Planning** - An agent session produces an implementation plan. The session auto-transitions to Implementing the moment `workbridge_set_plan` returns successfully (see `docs/harness-contract.md` C8 stage reminder); manual advance without a plan is blocked.
+- **Implementing** - Active development. An agent session works on the code.
 - **Blocked** - The implementation is stuck and needs user input. Can move back to Implementing when unblocked.
 - **Review** - Implementation is complete and under review. Entering Review from Implementing or Blocked triggers a review gate (async plan-vs-implementation check) and auto-creates a PR.
 - **Mergequeue** - Waiting for a PR to be merged externally (e.g., by a CI merge queue, another person, or manual merge outside the TUI). The TUI polls the PR state every 30 seconds and auto-transitions to Done when the PR is detected as merged. Can retreat back to Review.
@@ -285,7 +285,7 @@ Work items follow a seven-stage workflow:
 
 ### Status transitions
 
-Most forward transitions are triggered by the user via TUI keybinds (advance/retreat). Claude sessions can request a limited set of transitions via the `workbridge_set_status` MCP tool:
+Most forward transitions are triggered by the user via TUI keybinds (advance/retreat). Agent sessions can request a limited set of transitions via the `workbridge_set_status` MCP tool:
 
 - Implementing -> Review (routed through the review gate)
 - Implementing -> Blocked
@@ -311,7 +311,7 @@ created by a now-removed Backlog creation path that stored
 `branch: None`). See `docs/UI.md` "Set branch recovery dialog" for the
 UI contract.
 
-Claude sessions can also delete the current work item via the `workbridge_delete` MCP tool, available for all non-read-only sessions (both regular work items and review requests). The backend record is deleted and the session is killed immediately on the main thread. Resource cleanup (worktree removal, branch deletion, PR closure) runs asynchronously on a background thread to avoid blocking the UI. Force mode is always used (no interactive dirty-worktree confirmation). See docs/CLEANUP.md for the deletion phases.
+Agent sessions can also delete the current work item via the `workbridge_delete` MCP tool, available for all non-read-only sessions (both regular work items and review requests). The backend record is deleted and the session is killed immediately on the main thread. Resource cleanup (worktree removal, branch deletion, PR closure) runs asynchronously on a background thread to avoid blocking the UI. Force mode is always used (no interactive dirty-worktree confirmation). See docs/CLEANUP.md for the deletion phases.
 
 ### Review gate
 
@@ -330,16 +330,18 @@ user- or MCP-initiated), a review gate runs asynchronously in three phases:
    names of the failed checks. If no checks are configured, this phase is
    skipped.
 
-3. **Adversarial code review** - spawns a `claude --print` session with MCP
-   access to fetch the plan (via `workbridge_get_plan`) and run `git diff`
-   itself, then compares the plan against the implementation. If no plan
-   exists, the gate is blocked before it can start. During this phase, Claude
-   reports live progress via the `workbridge_report_progress` MCP tool (e.g.
-   "Reviewing 8 changed files against plan", "Found 3 potential issues,
-   verifying..."). These messages are shown in the right panel.
+3. **Adversarial code review** - spawns a headless agent session via
+   `AgentBackend::build_review_gate_command` (see
+   `docs/harness-contract.md` C1 headless + RP2) with MCP access to fetch
+   the plan (via `workbridge_get_plan`) and run `git diff` itself, then
+   compares the plan against the implementation. If no plan exists, the
+   gate is blocked before it can start. During this phase, the agent
+   reports live progress via the `workbridge_report_progress` MCP tool
+   (e.g. "Reviewing 8 changed files against plan", "Found 3 potential
+   issues, verifying..."). These messages are shown in the right panel.
 
 If the gate approves, the work item advances to Review. If it rejects (at any
-phase), the rejection reason is fed back to the implementing Claude session as
+phase), the rejection reason is fed back to the implementing agent session as
 rework feedback.
 
 While the gate is running, the work item stays in Implementing (or Blocked) on
@@ -350,7 +352,7 @@ badge is derived from `app.review_gates.contains_key(&wi.id)`, appears the
 instant the gate spawns, and disappears the instant `drop_review_gate` removes
 the entry on approve / reject / retreat / delete. This lets users tell at a
 glance that a row is sitting at the gate without opening the right panel,
-since the cyan braille spinner in the left margin is shared with "Claude
+since the cyan braille spinner in the left margin is shared with "agent
 actively coding" and on its own is ambiguous. See docs/UI.md "Layout: Flat
 List Mode" for the full list row anatomy.
 
@@ -423,12 +425,16 @@ operations are cancelled, and in-memory state is cleared.
 Each work item may have associated PTY sessions running inside its worktree.
 There are two session types:
 
-- **Claude Code session** - the interactive Claude Code process where the user
-  does the actual work. Spawned automatically when entering certain stages.
+- **Agent session** - the interactive coding-agent process where the user
+  does the actual work. Spawned automatically when entering certain stages
+  via the pluggable `AgentBackend` trait - today the only backend is
+  Claude Code. See `docs/harness-contract.md` for the full contract
+  (clauses C1..C13, reference payloads RP1..RP5) and
+  `src/agent_backend.rs` for the reference implementation.
 - **Terminal session** - a shell (`$SHELL`, falling back to `/bin/sh`) launched
   in the worktree directory. Spawned lazily when the user switches to the
   Terminal tab in the right panel. Available whenever the work item has a
-  worktree, regardless of whether a Claude Code session exists.
+  worktree, regardless of whether an agent session exists.
 
 Session states (both types):
 
@@ -559,7 +565,8 @@ warnings but do not prevent the delete.
 - Worktree directory on disk
 - Local git branch (force-deleted with `-D`)
 - Open PR on GitHub (closed via `gh pr close`)
-- Active Claude Code session (killed)
+- Active agent session (killed; side-car files written by the backend
+  are reversed via `AgentBackend::cleanup_session_files`)
 - Active terminal session (killed)
 - MCP socket server
 - In-memory state: rework reasons, review gate findings, no-plan prompt queue,

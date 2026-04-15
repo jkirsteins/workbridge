@@ -349,7 +349,7 @@ pub fn app_event(
                     || state.merge_in_progress
                     || state.is_user_action_in_flight(&crate::app::UserActionKey::UnlinkedCleanup);
                 if !state.activities.is_empty()
-                    || !state.claude_working.is_empty()
+                    || !state.agent_working.is_empty()
                     || modal_in_progress
                 {
                     state.spinner_tick = state.spinner_tick.wrapping_add(1);
