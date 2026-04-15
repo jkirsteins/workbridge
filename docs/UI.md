@@ -1027,16 +1027,28 @@ RebaseGateState>` per the structural-ownership rule, mirroring
 text view while a rebase is in flight (the rebase-gate render block
 lives in `src/ui.rs` immediately before the review-gate block and
 takes precedence over it). On completion, `poll_rebase_gate` drops
-the gate via `drop_rebase_gate` (which ends the status-bar activity
-AND clears the user-action guard slot in one place) and surfaces a
+the gate via `drop_rebase_gate` (which ends the status-bar activity,
+clears the user-action guard slot, AND SIGKILLs the harness child
+via the `child_pid` slot if it is still alive) and surfaces a
 "Rebased onto origin/<main>" or "Rebase onto origin/<main> failed:
-<reason>" status message. The "Rebased" success status is gated on
-a local `git merge-base --is-ancestor origin/<main> HEAD` check
-that the spawning thread runs against the worktree before emitting
+<reason>" status message. `drop_rebase_gate` is also called from
+`delete_work_item_by_id` and `force_kill_all`, so deleting a work
+item or quitting workbridge while a rebase is in flight tears the
+gate down cleanly: the harness child receives SIGKILL before the
+background `spawn_delete_cleanup` thread runs `git worktree remove`
+underneath it. The "Rebased" success status is gated on a local
+`git merge-base --is-ancestor origin/<main> HEAD` check that the
+spawning thread runs against the worktree before emitting
 `RebaseResult::Success`; if the check fails (harness hallucinated,
 ran the wrong command, or emitted a stale envelope) the gate
 downgrades to a Failure status naming the ancestry mismatch. The
 UI never claims a rebase succeeded without local git verification.
+The audit trail (so a later session viewing this work item can
+see the rebase happened) is written by `poll_rebase_gate` directly
+via `App.backend.append_activity` as a `rebase_completed` /
+`rebase_failed` activity log entry; the harness is explicitly told
+NOT to call `workbridge_set_status` for this purpose because that
+would be a no-op `Implementing -> Implementing` transition.
 No `git push` is performed - after a successful rebase the user
 sees `!pushed` (and likely `!pulled`) on the row and pushes
 manually.

@@ -506,6 +506,26 @@ pub struct RebaseGateState {
     pub rx: crossbeam_channel::Receiver<RebaseGateMessage>,
     pub progress: Option<String>,
     pub activity: ActivityId,
+    /// PID of the harness child while it is alive, written by the
+    /// spawning sub-thread immediately after `Command::spawn` returns
+    /// and cleared after `wait_with_output` returns. The main thread
+    /// uses this in `drop_rebase_gate` to SIGKILL the harness when the
+    /// owning work item is deleted, the user force-quits, or any other
+    /// cleanup path tears the gate down. Without this handle the
+    /// harness child would happily keep running `git rebase` /
+    /// `git add` / `git rebase --continue` against a worktree that is
+    /// being concurrently removed by `spawn_delete_cleanup`, which is
+    /// the failure mode the cleanup-path drops protect against.
+    ///
+    /// Wrapped in `Arc<Mutex>` because the spawning sub-thread (which
+    /// writes the PID) and the main thread (which reads + clears it
+    /// during `drop_rebase_gate`) both need shared access. There is a
+    /// microsecond race window between `wait_with_output` returning
+    /// and the sub-thread clearing the PID; in practice the kernel
+    /// will not reuse the PID inside that window, and SIGKILL on a
+    /// recently-reaped PID is a no-op error rather than a wrong-process
+    /// kill.
+    pub child_pid: Arc<Mutex<Option<u32>>>,
 }
 
 /// Per-work-item state for an in-flight review gate.
@@ -2507,6 +2527,16 @@ impl App {
         for key in gate_keys {
             self.drop_review_gate(&key);
         }
+        // Cancel all in-flight rebase gates. `drop_rebase_gate`
+        // SIGKILLs the harness child if it is still running, so
+        // force-quit cannot leave a `claude` / `git rebase` process
+        // mutating a worktree after the TUI exits. Mirrors the
+        // review-gate loop above; the helper is the single place that
+        // knows how to tear a rebase gate down.
+        let rebase_keys: Vec<WorkItemId> = self.rebase_gates.keys().cloned().collect();
+        for key in rebase_keys {
+            self.drop_rebase_gate(&key);
+        }
         if let Some(ref mut entry) = self.global_session {
             if let Some(ref mut session) = entry.session {
                 session.force_kill();
@@ -3146,6 +3176,15 @@ impl App {
             self.confirm_merge = false;
         }
         self.drop_review_gate(wi_id);
+        // Drop any in-flight rebase gate for this work item. This
+        // both frees the user-action guard slot (so a recreated work
+        // item can rebase again without waiting on a stale debounce)
+        // and SIGKILLs the harness child so it cannot keep running
+        // `git rebase` against the worktree that `spawn_delete_cleanup`
+        // is about to remove on a background thread. Without this
+        // call the harness would race the worktree removal and could
+        // mutate / leave artifacts in a partially-deleted worktree.
+        self.drop_rebase_gate(wi_id);
         if self
             .branch_gone_prompt
             .as_ref()
@@ -8819,6 +8858,14 @@ impl App {
         let ws = Arc::clone(&self.worktree_service);
         let (tx, rx) = crossbeam_channel::unbounded::<RebaseGateMessage>();
         let wi_id_clone = wi_id.clone();
+        // Shared PID slot for the harness child. The outer thread
+        // here owns the Arc and stores a clone in `RebaseGateState`
+        // below; the inner harness sub-thread (further down) gets
+        // its own clone so it can populate the PID after spawning
+        // and clear it after `wait_with_output` returns. The main
+        // thread can SIGKILL via `drop_rebase_gate` at any time.
+        let child_pid: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+        let child_pid_for_state = Arc::clone(&child_pid);
 
         std::thread::spawn(move || {
             // === Phase 1: resolve default branch (background only) ===
@@ -8959,9 +9006,11 @@ impl App {
                  - `conflicts_resolved` = true if you had to resolve at least one \
                  conflict before finishing.\n\
                  - `detail` = a human-readable one-line summary.\n\n\
-                 Then call `workbridge_set_status` with status `Implementing` and a \
-                 `reason` describing the final outcome so a later session viewing \
-                 this work item can see the rebase happened."
+                 Workbridge writes its own activity log entry for the rebase \
+                 outcome (success or failure) after this process exits, so do NOT \
+                 call `workbridge_set_status` to leave a record - the work item is \
+                 already in `Implementing` and the activity log entry below is the \
+                 audit trail."
             );
 
             let json_schema = r#"{"type":"object","properties":{"success":{"type":"boolean"},"conflicts_resolved":{"type":"boolean"},"detail":{"type":"string"}},"required":["success","detail"]}"#;
@@ -8974,14 +9023,23 @@ impl App {
             // context resolves to. Pointing the child at the registered
             // repo root would silently rebase the main checkout's
             // branch instead of `branch`.
+            //
+            // We use `spawn()` + `wait_with_output()` instead of the
+            // simpler `output()` so the PID can be stashed in
+            // `child_pid` immediately after spawning. The main thread
+            // reads that PID from `drop_rebase_gate` and SIGKILLs the
+            // child if the gate is torn down (delete, force-quit). The
+            // PID is cleared after the child is reaped so the main
+            // thread does not signal a stale entry.
             let (output_tx, output_rx) =
                 crossbeam_channel::bounded::<std::io::Result<std::process::Output>>(1);
             {
                 let config_path = config_path.clone();
                 let worktree_path = worktree_path.clone();
                 let prompt = prompt.clone();
+                let child_pid = Arc::clone(&child_pid);
                 std::thread::spawn(move || {
-                    let result = std::process::Command::new("claude")
+                    let spawn_result = std::process::Command::new("claude")
                         .args([
                             "--print",
                             "--dangerously-skip-permissions",
@@ -8994,8 +9052,24 @@ impl App {
                             "--mcp-config",
                             &config_path.to_string_lossy(),
                         ])
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
                         .current_dir(&worktree_path)
-                        .output();
+                        .spawn();
+                    let child = match spawn_result {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = output_tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    if let Ok(mut slot) = child_pid.lock() {
+                        *slot = Some(child.id());
+                    }
+                    let result = child.wait_with_output();
+                    if let Ok(mut slot) = child_pid.lock() {
+                        *slot = None;
+                    }
                     let _ = output_tx.send(result);
                 });
             }
@@ -9022,10 +9096,16 @@ impl App {
                                 }
                             }
                             Ok(_) => {
-                                // Other MCP events (set_status, set_plan, ...) are
-                                // intentionally ignored: the rebase gate does not
-                                // act on them, only on the harness's structured
-                                // exit envelope below.
+                                // Other MCP events (StatusUpdate, SetPlan,
+                                // SetTitle, ...) are intentionally ignored.
+                                // The rebase gate writes its own activity log
+                                // entry from `poll_rebase_gate` after the
+                                // harness exits, so the prompt does not ask
+                                // the harness to call `workbridge_set_status`
+                                // and we do not forward stray events here.
+                                // Forwarding would let a misbehaving harness
+                                // rename the work item or overwrite its plan
+                                // as a side effect of running a rebase.
                             }
                             Err(_) => {
                                 // Channel disconnected - server gone. Continue
@@ -9152,6 +9232,7 @@ impl App {
                 rx,
                 progress: Some("Resolving base branch...".to_string()),
                 activity,
+                child_pid: child_pid_for_state,
             },
         );
     }
@@ -9162,9 +9243,28 @@ impl App {
     /// removes a `rebase_gates` entry MUST go through this helper to
     /// avoid leaking a spinner. Also clears the user-action guard slot
     /// so a follow-up `m` press can run without waiting for the
-    /// debounce window.
+    /// debounce window, and SIGKILLs the harness child if it is still
+    /// alive so a delete / force-quit cannot leave the rebase mutating
+    /// a worktree underneath the cleanup that is about to remove it.
     fn drop_rebase_gate(&mut self, wi_id: &WorkItemId) {
         if let Some(state) = self.rebase_gates.remove(wi_id) {
+            // Take the PID under the lock and signal outside the
+            // lock. A `Some` here means the harness sub-thread has
+            // populated the slot but `wait_with_output` has not yet
+            // cleared it - i.e. the child either exists or finished
+            // microseconds ago. `libc::kill` on a freshly-reaped PID
+            // is a harmless `ESRCH` error rather than a wrong-process
+            // signal.
+            let pid_to_kill = state.child_pid.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(pid) = pid_to_kill {
+                // SAFETY: `libc::kill` is an FFI call into a stable
+                // POSIX syscall. The arguments are a PID and a
+                // signal number, both plain integers; no Rust
+                // aliasing or lifetime invariants are at risk.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
             self.end_activity(state.activity);
         }
         self.end_user_action(&UserActionKey::RebaseOnMain);
@@ -9492,6 +9592,49 @@ impl App {
             };
 
             self.drop_rebase_gate(&wi_id);
+
+            // Persist the rebase outcome to the activity log so a
+            // later session viewing this work item can see the
+            // rebase happened. This replaces the prompt-side
+            // `workbridge_set_status` call we removed: setting
+            // status to `Implementing` while the work item was
+            // already `Implementing` was a no-op transition that the
+            // App's StatusUpdate validator would have rejected
+            // anyway, and the audit trail belongs in the activity
+            // log rather than smuggled through the status field.
+            // The append error is intentionally swallowed - the
+            // rebase outcome status message below is the primary
+            // user-visible signal, and a failed log append should
+            // not be allowed to overwrite it.
+            let activity_entry = match &result {
+                RebaseResult::Success {
+                    base_branch,
+                    conflicts_resolved,
+                } => ActivityEntry {
+                    timestamp: now_iso8601(),
+                    event_type: "rebase_completed".to_string(),
+                    payload: serde_json::json!({
+                        "base_branch": base_branch,
+                        "conflicts_resolved": conflicts_resolved,
+                        "source": "rebase_gate",
+                    }),
+                },
+                RebaseResult::Failure {
+                    base_branch,
+                    reason,
+                    conflicts_attempted,
+                } => ActivityEntry {
+                    timestamp: now_iso8601(),
+                    event_type: "rebase_failed".to_string(),
+                    payload: serde_json::json!({
+                        "base_branch": base_branch,
+                        "reason": reason,
+                        "conflicts_attempted": conflicts_attempted,
+                        "source": "rebase_gate",
+                    }),
+                },
+            };
+            let _ = self.backend.append_activity(&wi_id, &activity_entry);
 
             match result {
                 RebaseResult::Success {
