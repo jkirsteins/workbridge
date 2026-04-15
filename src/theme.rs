@@ -43,6 +43,11 @@ pub struct Theme {
     pub text_heading: Color,
     /// Error / dead session messages.
     pub text_error: Color,
+    /// Interactive / click-to-copy label accent (used together with an
+    /// UNDERLINED modifier to signal a clickable affordance). See
+    /// `style_interactive()` for the combined style and docs/UI.md
+    /// "Interactive labels" for the convention.
+    pub interactive_fg: Color,
 
     // -- Titles --
     /// Title foreground color.
@@ -151,6 +156,9 @@ impl Theme {
             text_muted: Color::Reset,
             text_heading: Color::Cyan,
             text_error: Color::Red,
+            // Cyan reads well against both dark and light terminal
+            // backgrounds and matches the existing heading accent.
+            interactive_fg: Color::Cyan,
 
             title_fg: Color::Reset,
             title_bg: Color::Reset,
@@ -256,6 +264,16 @@ impl Theme {
 
     pub fn style_text(&self) -> Style {
         Style::default().fg(self.text)
+    }
+
+    /// Style for click-to-copy UI labels: the `interactive_fg` accent
+    /// color plus an UNDERLINE modifier. The underline is the persistent
+    /// visual affordance that signals "clickable"; apply this style to
+    /// any label that is registered in the `ClickRegistry`.
+    pub fn style_interactive(&self) -> Style {
+        Style::default()
+            .fg(self.interactive_fg)
+            .add_modifier(Modifier::UNDERLINED)
     }
 
     pub fn style_text_muted(&self) -> Style {

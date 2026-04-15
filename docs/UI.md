@@ -76,7 +76,7 @@ mouse button. Selection works like a standard terminal emulator:
 
 - Click-and-drag highlights the selected text (inverted colors).
 - On mouse release, the selected text is automatically copied to the
-  system clipboard via the arboard crate.
+  system clipboard.
 - Clicking without dragging clears any existing selection.
 - Any keypress clears the selection.
 - Selection works in both live view and scrollback mode.
@@ -86,6 +86,81 @@ enabled mouse reporting (MouseProtocolMode::None). When the child
 has enabled mouse reporting (e.g., vim, htop), mouse events are
 forwarded to the PTY as before. Exception: in local scrollback mode,
 selection is always available since the PTY is not receiving events.
+
+Clipboard writes go through `src/clipboard.rs::copy`, which attempts
+BOTH an OSC 52 escape sequence (written directly to stdout) and
+`arboard`. OSC 52 makes the copy work over SSH and inside tmux
+(tmux users must have `set -g set-clipboard on` in their tmux.conf);
+`arboard` covers terminals that strip OSC 52. Either path succeeding
+counts as a successful copy. The escape sequence is built by
+`osc52_sequence` so it can be unit-tested without hitting stdout.
+
+### Interactive labels
+
+In the work item detail view, four fields are click-to-copy:
+
+- **Title** (the work item title span)
+- **Repo** path
+- **Branch** name
+- **PR URL**
+
+Each is rendered with `theme.style_interactive()` - the new
+`interactive_fg` theme slot (default Cyan) plus a `Modifier::UNDERLINED`
+affordance. The underline is the persistent visual signal that says
+"clickable". A left-click on any of these fields copies the full
+untruncated value via `clipboard::copy` and pushes a top-right toast
+that auto-dismisses after ~2 seconds. Multiple toasts stack
+vertically with the newest on top.
+
+The toast text reflects the actual clipboard result, not the intent:
+on success it reads `Copied: <short-value>`, on failure (both OSC 52
+and `arboard` returned an error) it reads `Copy failed: <short-value>`.
+Lying about the clipboard state is the worst UX failure mode for this
+feature - a user who believes the copy succeeded will paste stale
+content and only notice long after. `fire_chrome_copy` in `src/app.rs`
+branches on the bool returned by `clipboard::copy`.
+
+Implementation:
+
+- Each renderer that draws an interactive label pushes a
+  `ClickTarget { rect, value, kind }` into `App::click_registry`
+  (a `RefCell<ClickRegistry>`) as part of its draw call. The rect
+  is in **absolute frame coordinates** so it can be compared
+  directly to `MouseEvent::column` / `row`.
+- `draw_to_buffer` clears the registry at the top of every frame so
+  stale targets from the previous draw never leak.
+- `handle_mouse` consults the registry **before** the geometric PTY
+  classification on every `Down(Left)` / `Up(Left)`: if the cursor
+  is inside a registered rect, the event is routed to
+  `handle_chrome_click_fallback` regardless of where
+  `mouse_target` would have placed it. This priority rule is
+  structural - interactive labels drawn anywhere in chrome (right
+  panel detail view, global drawer, future overlays) stay clickable
+  without per-site plumbing. Without it, labels drawn inside the
+  right panel area would be classified as `MouseTarget::RightPanel`
+  and swallowed by the text-selection branch. If the priority check
+  does not fire, `handle_chrome_click_fallback` is also called as
+  the `MouseTarget::None` arm so labels drawn outside all PTY areas
+  remain reachable.
+- `handle_chrome_click_fallback` arms a pending click on `Down(Left)`,
+  cancels on any `Drag(Left)`, and fires `App::fire_chrome_copy` on
+  a matching `Up(Left)`. The drag-cancel check runs unconditionally
+  at the top of `handle_mouse` so a drag over a PTY pane still
+  invalidates an in-flight click-to-copy gesture that started on a
+  chrome label. A `SelectUp` that does NOT hit any registered target
+  also unconditionally clears `pending_chrome_click`: this guards
+  against terminals that coalesce or drop `Drag` events (some X10
+  mouse modes, SSH sessions with packet loss), where a stale pending
+  click could otherwise linger and fire a false copy on a later
+  unrelated `SelectUp` over a same-kind label.
+- Values that read as `"(none)"` are NOT registered and render in
+  the muted style - the underline would be misleading if there is
+  nothing to copy.
+
+To add a new click-to-copy label elsewhere in the UI, follow the
+same convention: style with `theme.style_interactive()`, push a
+`ClickTarget` into `app.click_registry` with the absolute rect, and
+pick (or add) a `ClickKind` variant.
 
 ### Blocking I/O Prohibition
 
