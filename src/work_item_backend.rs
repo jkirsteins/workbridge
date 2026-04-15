@@ -58,6 +58,17 @@ impl fmt::Display for BackendError {
 /// by the assembly layer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkItemRecord {
+    /// Internal key. For `LocalFileBackend` this is always
+    /// `LocalFile(<path of the file on disk>)`; the JSON value is never
+    /// trusted because the path IS the id. Both `list()` and
+    /// `read_record()` overwrite this field with the actual path
+    /// immediately after deserialization, so the deserialized value -
+    /// including the placeholder that `#[serde(default)]` produces for
+    /// legacy records written before this field existed - is discarded
+    /// on every load. Records with a *present-but-malformed* `id`
+    /// value (e.g. a string instead of a tagged enum) still fail
+    /// strict deserialization and surface as `CorruptRecord`.
+    #[serde(default = "placeholder_work_item_id")]
     pub id: WorkItemId,
     pub title: String,
     /// Optional description providing context for planning/refinement.
@@ -89,6 +100,18 @@ pub struct WorkItemRecord {
     /// Defaults to None for migration compatibility with existing records.
     #[serde(default)]
     pub done_at: Option<u64>,
+}
+
+/// Placeholder `WorkItemId` used only by `#[serde(default)]` on
+/// `WorkItemRecord::id`. Every caller that deserializes a record
+/// immediately overwrites `record.id` with the real on-disk path
+/// (see `LocalFileBackend::list()` and `LocalFileBackend::read_record()`),
+/// so this value must never escape the backend layer. It exists solely
+/// so that records written before the `id` field was added still
+/// deserialize cleanly instead of surfacing as `CorruptRecord` with a
+/// "missing field `id`" reason.
+fn placeholder_work_item_id() -> WorkItemId {
+    WorkItemId::LocalFile(PathBuf::new())
 }
 
 /// An entry in a work item's append-only activity log.
@@ -492,6 +515,12 @@ impl LocalFileBackend {
     }
 
     /// Read and deserialize a work item record from disk.
+    ///
+    /// The deserialized `record.id` is always overwritten with
+    /// `WorkItemId::LocalFile(path)` so records written before the `id`
+    /// field existed (which deserialize with a placeholder via
+    /// `#[serde(default)]`) and records whose file was moved after
+    /// write both end up with the correct on-disk path as the id.
     fn read_record(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
         match id {
             WorkItemId::LocalFile(path) => {
@@ -501,9 +530,11 @@ impl LocalFileBackend {
                 let contents = fs::read_to_string(path).map_err(|e| {
                     BackendError::Io(format!("failed to read {}: {e}", path.display()))
                 })?;
-                serde_json::from_str(&contents).map_err(|e| {
+                let mut record: WorkItemRecord = serde_json::from_str(&contents).map_err(|e| {
                     BackendError::Io(format!("failed to parse {}: {e}", path.display()))
-                })
+                })?;
+                record.id = WorkItemId::LocalFile(path.clone());
+                Ok(record)
             }
             other => Err(BackendError::UnsupportedId(other.clone())),
         }
@@ -599,8 +630,14 @@ impl WorkItemBackend for LocalFileBackend {
             };
             match serde_json::from_str::<WorkItemRecord>(&contents) {
                 Ok(mut record) => {
-                    // Ensure the id reflects the actual file path on disk.
-                    record.id = WorkItemId::LocalFile(path);
+                    // Ensure the id reflects the actual file path on
+                    // disk. This always runs: for modern records it
+                    // corrects a stale path (e.g. if the file was
+                    // moved after write); for legacy records written
+                    // before the `id` field existed it replaces the
+                    // `#[serde(default)]` placeholder with the real
+                    // path. See the comment on `WorkItemRecord::id`.
+                    record.id = WorkItemId::LocalFile(path.clone());
                     records.push(record);
                 }
                 Err(e) => {
@@ -1978,6 +2015,144 @@ mod tests {
             result.corrupt
         );
         assert_eq!(result.records.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // Missing-`id` backward-compatibility tests
+    //
+    // Work item files written before the `id` field was added must
+    // still load cleanly. `WorkItemRecord::id` carries
+    // `#[serde(default = "placeholder_work_item_id")]`, and both
+    // `list()` and `read_record()` overwrite the deserialized value
+    // with `LocalFile(<file path>)` immediately after parsing, so the
+    // placeholder never escapes the backend layer. Records with a
+    // *present-but-malformed* `id` value still fail strict
+    // deserialization and surface as `CorruptRecord`, as does
+    // genuinely malformed JSON.
+    // -----------------------------------------------------------------
+
+    /// Legacy v1 JSON without the `id` field.
+    const LEGACY_WITHOUT_ID: &str = r#"{
+        "title": "Legacy item",
+        "status": "Implementing",
+        "kind": "Own",
+        "repo_associations": [
+            {"repo_path": "/repos/foo", "branch": "feature/x"}
+        ]
+    }"#;
+
+    #[test]
+    fn legacy_record_missing_id_loads_cleanly_via_list() {
+        let dir = temp_dir("missing-id-list");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let legacy_path = dir.join("legacy-no-id.json");
+        fs::write(&legacy_path, LEGACY_WITHOUT_ID).unwrap();
+
+        // Precondition: the file really does not contain an `id` key.
+        let raw_before = fs::read_to_string(&legacy_path).unwrap();
+        assert!(
+            !raw_before.contains("\"id\""),
+            "precondition: legacy file must not contain an id field"
+        );
+
+        let result = backend.list().unwrap();
+        assert!(
+            result.corrupt.is_empty(),
+            "legacy record without id must not surface as corrupt: {:?}",
+            result.corrupt
+        );
+        assert_eq!(result.records.len(), 1);
+        let record = &result.records[0];
+        assert_eq!(record.title, "Legacy item");
+        assert_eq!(record.status, WorkItemStatus::Implementing);
+        // The id must be `LocalFile(<path of the file>)` - the
+        // placeholder from `#[serde(default)]` has been overwritten
+        // by `list()` with the real on-disk path.
+        assert_eq!(record.id, WorkItemId::LocalFile(legacy_path));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_record_missing_id_loads_cleanly_via_read() {
+        let dir = temp_dir("missing-id-read");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let legacy_path = dir.join("legacy-read.json");
+        fs::write(&legacy_path, LEGACY_WITHOUT_ID).unwrap();
+
+        // `read()` must apply the same placeholder overwrite as
+        // `list()` so callers that bypass `list()` (direct
+        // `backend.read(&id)` after the id is known) also recover
+        // legacy records transparently.
+        let record = backend
+            .read(&WorkItemId::LocalFile(legacy_path.clone()))
+            .expect("legacy record without id must read cleanly");
+        assert_eq!(record.title, "Legacy item");
+        assert_eq!(record.status, WorkItemStatus::Implementing);
+        assert_eq!(record.id, WorkItemId::LocalFile(legacy_path));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_json_still_surfaces_in_corrupt_list() {
+        // Genuine corruption (malformed JSON) must NOT be swept up by
+        // the missing-id serde default. It has to keep surfacing as a
+        // CorruptRecord with a "corrupt JSON" reason.
+        let dir = temp_dir("missing-id-still-corrupt");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        fs::write(dir.join("broken.json"), "{ this is not json").unwrap();
+
+        let result = backend.list().unwrap();
+        assert_eq!(result.records.len(), 0);
+        assert_eq!(result.corrupt.len(), 1);
+        assert!(
+            result.corrupt[0].reason.contains("corrupt JSON"),
+            "reason should still mention corrupt JSON, got: {}",
+            result.corrupt[0].reason
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_id_value_still_surfaces_as_corrupt() {
+        // Boundary case: the `id` key is present but its value is not
+        // a valid `WorkItemId` (here, a bare string instead of a
+        // tagged enum). Strict deserialization must fail - the
+        // `#[serde(default)]` fallback only kicks in when the field
+        // is absent, not when it's present-but-wrong - and the record
+        // must surface as `CorruptRecord`. Guards against a future
+        // refactor that "helps" by synthesizing a placeholder for any
+        // parse error on the id field.
+        let dir = temp_dir("malformed-id-still-corrupt");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        fs::write(
+            dir.join("bad-id.json"),
+            r#"{
+                "id": "not a valid WorkItemId",
+                "title": "Broken item",
+                "status": "Implementing",
+                "kind": "Own",
+                "repo_associations": []
+            }"#,
+        )
+        .unwrap();
+
+        let result = backend.list().unwrap();
+        assert_eq!(result.records.len(), 0);
+        assert_eq!(result.corrupt.len(), 1);
+        assert!(
+            result.corrupt[0].reason.contains("corrupt JSON"),
+            "reason should mention corrupt JSON, got: {}",
+            result.corrupt[0].reason
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

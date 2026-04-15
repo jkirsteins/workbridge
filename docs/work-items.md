@@ -405,6 +405,24 @@ This means:
 - One branch can never have multiple worktrees on the same machine,
   because git prohibits two worktrees on the same branch.
 
+### Backward compatibility with records missing `id`
+
+Records created before the `id` field was added are accepted via the
+same `#[serde(default)]` mechanism as the other migrated fields
+(`description`, `kind`, `display_id`, `plan`, `done_at`): the `id`
+field defaults to a placeholder `LocalFile(PathBuf::new())` produced
+by `placeholder_work_item_id()`, and both `list()` and `read()`
+immediately overwrite `record.id` with `LocalFile(<file path>)` -
+the real on-disk path - right after `serde_json::from_str` returns.
+The placeholder therefore never escapes the backend layer. Legacy
+files on disk are not rewritten on load; they keep their old shape
+until the next modify-write through the normal `modify_record` path,
+at which point the current serializer naturally includes the `id`
+field. Records with a *present-but-malformed* `id` value (e.g. a
+bare string instead of a tagged enum) still fail strict
+deserialization and surface as `CorruptRecord`, as do other parse
+failures (malformed JSON, missing `title`/`status`, etc.).
+
 ## Display IDs
 
 Every work item also carries a backend-provided `display_id: Option<String>`,
