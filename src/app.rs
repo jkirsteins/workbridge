@@ -8953,159 +8953,174 @@ impl App {
                 return;
             }
 
-            // === Phase 2: git fetch origin <base> ===
+            // The compute-result block below uses `break 'compute` to
+            // emit a `RebaseResult` from any phase. Pre-harness
+            // failures (fetch failure, MCP server start failure,
+            // exe-path failure, config-write failure) used to `return`
+            // immediately, which bypassed the audit-log append below
+            // and silently dropped the `rebase_failed` entry that
+            // RP6 / docs/UI.md promise will be written. The labeled
+            // block routes every non-cancelled outcome through the
+            // common audit path.
             //
-            // We use the explicit refspec
-            // `+<base>:refs/remotes/origin/<base>` instead of the
-            // shorthand `git fetch origin <base>` so the fetch is
-            // guaranteed to update the remote-tracking ref the
-            // harness and the verification below both consult. The
-            // shorthand form relies on git's "opportunistic
-            // remote-tracking branch update", which only fires when
-            // the remote's configured fetch refspec covers `<base>`;
-            // in repos cloned with `--single-branch` of a different
-            // branch, or with a customised `[remote "origin"] fetch`
-            // refspec that omits `<base>`, the shorthand would only
-            // update FETCH_HEAD and `origin/<base>` could stay
-            // stale, producing a false "Rebased onto origin/<base>"
-            // success even though the rebase landed on an old tip.
-            // The leading `+` enables non-fast-forward updates so a
-            // force-pushed base branch is also handled correctly.
-            let refspec = format!("+{base_branch}:refs/remotes/origin/{base_branch}");
-            let _ = tx.send(RebaseGateMessage::Progress(format!(
-                "Fetching origin/{base_branch}..."
-            )));
-            match crate::worktree_service::git_command()
-                .arg("-C")
-                .arg(&worktree_path)
-                .args(["fetch", "origin", &refspec])
-                .output()
-            {
-                Ok(out) if out.status.success() => {}
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                    let _ = tx.send(RebaseGateMessage::Result(RebaseResult::Failure {
+            // `gate_server` and `config_path` are declared OUTSIDE
+            // the block so cleanup can run uniformly after the block
+            // exits, regardless of which branch caused the break.
+            // Cancellation paths break with `None`, which the
+            // post-block check converts into a bare `return` (no
+            // audit, no send) per the cancellation contract in C10.
+            let mut gate_server: Option<crate::mcp::McpSocketServer> = None;
+            let mut config_path: Option<std::path::PathBuf> = None;
+            let mut conflicts_attempted_observed = false;
+
+            let computed: Option<RebaseResult> = 'compute: {
+                // === Phase 2: git fetch origin <base> ===
+                //
+                // We use the explicit refspec
+                // `+<base>:refs/remotes/origin/<base>` instead of the
+                // shorthand `git fetch origin <base>` so the fetch is
+                // guaranteed to update the remote-tracking ref the
+                // harness and the verification below both consult. The
+                // shorthand form relies on git's "opportunistic
+                // remote-tracking branch update", which only fires when
+                // the remote's configured fetch refspec covers `<base>`;
+                // in repos cloned with `--single-branch` of a different
+                // branch, or with a customised `[remote "origin"] fetch`
+                // refspec that omits `<base>`, the shorthand would only
+                // update FETCH_HEAD and `origin/<base>` could stay
+                // stale, producing a false "Rebased onto origin/<base>"
+                // success even though the rebase landed on an old tip.
+                // The leading `+` enables non-fast-forward updates so a
+                // force-pushed base branch is also handled correctly.
+                let refspec = format!("+{base_branch}:refs/remotes/origin/{base_branch}");
+                let _ = tx.send(RebaseGateMessage::Progress(format!(
+                    "Fetching origin/{base_branch}..."
+                )));
+                match crate::worktree_service::git_command()
+                    .arg("-C")
+                    .arg(&worktree_path)
+                    .args(["fetch", "origin", &refspec])
+                    .output()
+                {
+                    Ok(out) if out.status.success() => {}
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                        break 'compute Some(RebaseResult::Failure {
+                            base_branch: base_branch.clone(),
+                            reason: format!("git fetch failed: {}", stderr.trim()),
+                            conflicts_attempted: false,
+                            activity_log_error: None,
+                        });
+                    }
+                    Err(e) => {
+                        break 'compute Some(RebaseResult::Failure {
+                            base_branch: base_branch.clone(),
+                            reason: format!("git fetch could not run: {e}"),
+                            conflicts_attempted: false,
+                            activity_log_error: None,
+                        });
+                    }
+                }
+
+                // Cancellation check between phase 2 and phase 3:
+                // `git fetch` is the longest blocking step in the
+                // pre-spawn window, so the gate may have been cancelled
+                // while we were waiting on the network. Bailing here
+                // avoids starting the MCP server, writing the temp
+                // config, and spawning the harness child for nothing.
+                if cancelled.load(Ordering::SeqCst) {
+                    break 'compute None;
+                }
+
+                let _ = tx.send(RebaseGateMessage::Progress(
+                    "Fetched. Asking the assistant to rebase...".into(),
+                ));
+
+                // === Phase 3: launch headless harness with workbridge MCP ===
+                //
+                // The MCP server gets its OWN local sender/receiver pair so
+                // the spawning thread can drain `workbridge_log_event` /
+                // `workbridge_report_progress` calls in real time and
+                // translate them into `RebaseGateMessage::Progress`. The
+                // server's tx is intentionally NOT `self.mcp_tx` because
+                // routing the rebase gate's progress through the main
+                // dispatch loop would mix it with unrelated events and
+                // require new branches in the main `McpEvent` handler.
+                let (gate_mcp_tx, gate_mcp_rx) = crossbeam_channel::unbounded::<McpEvent>();
+                let gate_socket = crate::mcp::socket_path_for_session();
+                match crate::mcp::McpSocketServer::start(
+                    gate_socket.clone(),
+                    serde_json::to_string(&wi_id_clone).unwrap_or_default(),
+                    String::new(),
+                    serde_json::json!({
+                        "work_item_id": serde_json::to_string(&wi_id_clone).unwrap_or_default(),
+                        "repo_path": worktree_path.display().to_string(),
+                        "branch": branch,
+                        "base_branch": base_branch,
+                    })
+                    .to_string(),
+                    None,
+                    gate_mcp_tx,
+                    false, // read_only=false: harness must call workbridge_log_event for live progress
+                ) {
+                    Ok(s) => {
+                        gate_server = Some(s);
+                    }
+                    Err(e) => {
+                        break 'compute Some(RebaseResult::Failure {
+                            base_branch: base_branch.clone(),
+                            reason: format!("rebase gate: could not start MCP server: {e}"),
+                            conflicts_attempted: false,
+                            activity_log_error: None,
+                        });
+                    }
+                };
+
+                // Cancellation check after starting the MCP server.
+                // The post-block cleanup will drop `gate_server`.
+                if cancelled.load(Ordering::SeqCst) {
+                    break 'compute None;
+                }
+
+                let exe_path = match std::env::current_exe() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        break 'compute Some(RebaseResult::Failure {
+                            base_branch: base_branch.clone(),
+                            reason: format!("rebase gate: could not resolve exe path: {e}"),
+                            conflicts_attempted: false,
+                            activity_log_error: None,
+                        });
+                    }
+                };
+                let mcp_config = crate::mcp::build_mcp_config(&exe_path, &gate_socket, &[]);
+                let path = std::env::temp_dir().join(format!(
+                    "workbridge-rebase-mcp-{}.json",
+                    uuid::Uuid::new_v4()
+                ));
+                if let Err(e) = std::fs::write(&path, &mcp_config) {
+                    break 'compute Some(RebaseResult::Failure {
                         base_branch: base_branch.clone(),
-                        reason: format!("git fetch failed: {}", stderr.trim()),
+                        reason: format!("rebase gate: could not write MCP config: {e}"),
                         conflicts_attempted: false,
                         activity_log_error: None,
-                    }));
-                    return;
+                    });
                 }
-                Err(e) => {
-                    let _ = tx.send(RebaseGateMessage::Result(RebaseResult::Failure {
-                        base_branch: base_branch.clone(),
-                        reason: format!("git fetch could not run: {e}"),
-                        conflicts_attempted: false,
-                        activity_log_error: None,
-                    }));
-                    return;
+                config_path = Some(path);
+
+                // Cancellation check immediately before spawning the
+                // harness sub-thread. This is the last cheap point
+                // where we can avoid spawning the harness child
+                // entirely; once the sub-thread runs `Command::spawn`,
+                // the harness is alive and the kill must go through
+                // `child_pid`. The post-block cleanup handles
+                // dropping `gate_server` and removing `config_path`.
+                if cancelled.load(Ordering::SeqCst) {
+                    break 'compute None;
                 }
-            }
 
-            // Cancellation check between phase 2 and phase 3:
-            // `git fetch` is the longest blocking step in the
-            // pre-spawn window, so the gate may have been cancelled
-            // while we were waiting on the network. Bailing here
-            // avoids starting the MCP server, writing the temp
-            // config, and spawning the harness child for nothing.
-            if cancelled.load(Ordering::SeqCst) {
-                return;
-            }
-
-            let _ = tx.send(RebaseGateMessage::Progress(
-                "Fetched. Asking the assistant to rebase...".into(),
-            ));
-
-            // === Phase 3: launch headless harness with workbridge MCP ===
-            //
-            // The MCP server gets its OWN local sender/receiver pair so
-            // the spawning thread can drain `workbridge_log_event` /
-            // `workbridge_report_progress` calls in real time and
-            // translate them into `RebaseGateMessage::Progress`. The
-            // server's tx is intentionally NOT `self.mcp_tx` because
-            // routing the rebase gate's progress through the main
-            // dispatch loop would mix it with unrelated events and
-            // require new branches in the main `McpEvent` handler.
-            let (gate_mcp_tx, gate_mcp_rx) = crossbeam_channel::unbounded::<McpEvent>();
-            let gate_socket = crate::mcp::socket_path_for_session();
-            let gate_server = match crate::mcp::McpSocketServer::start(
-                gate_socket.clone(),
-                serde_json::to_string(&wi_id_clone).unwrap_or_default(),
-                String::new(),
-                serde_json::json!({
-                    "work_item_id": serde_json::to_string(&wi_id_clone).unwrap_or_default(),
-                    "repo_path": worktree_path.display().to_string(),
-                    "branch": branch,
-                    "base_branch": base_branch,
-                })
-                .to_string(),
-                None,
-                gate_mcp_tx,
-                false, // read_only=false: harness must call workbridge_log_event for live progress
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.send(RebaseGateMessage::Result(RebaseResult::Failure {
-                        base_branch: base_branch.clone(),
-                        reason: format!("rebase gate: could not start MCP server: {e}"),
-                        conflicts_attempted: false,
-                        activity_log_error: None,
-                    }));
-                    return;
-                }
-            };
-
-            // Cancellation check after starting the MCP server: if
-            // the gate was torn down, drop the just-started server
-            // and exit before doing any more work.
-            if cancelled.load(Ordering::SeqCst) {
-                drop(gate_server);
-                return;
-            }
-
-            let exe_path = match std::env::current_exe() {
-                Ok(p) => p,
-                Err(e) => {
-                    drop(gate_server);
-                    let _ = tx.send(RebaseGateMessage::Result(RebaseResult::Failure {
-                        base_branch: base_branch.clone(),
-                        reason: format!("rebase gate: could not resolve exe path: {e}"),
-                        conflicts_attempted: false,
-                        activity_log_error: None,
-                    }));
-                    return;
-                }
-            };
-            let mcp_config = crate::mcp::build_mcp_config(&exe_path, &gate_socket, &[]);
-            let config_path = std::env::temp_dir().join(format!(
-                "workbridge-rebase-mcp-{}.json",
-                uuid::Uuid::new_v4()
-            ));
-            if let Err(e) = std::fs::write(&config_path, &mcp_config) {
-                drop(gate_server);
-                let _ = tx.send(RebaseGateMessage::Result(RebaseResult::Failure {
-                    base_branch: base_branch.clone(),
-                    reason: format!("rebase gate: could not write MCP config: {e}"),
-                    conflicts_attempted: false,
-                    activity_log_error: None,
-                }));
-                return;
-            }
-
-            // Cancellation check immediately before spawning the
-            // harness sub-thread. This is the last cheap point where
-            // we can avoid spawning the harness child entirely; once
-            // the sub-thread runs `Command::spawn`, the harness is
-            // alive and the kill must go through `child_pid`.
-            if cancelled.load(Ordering::SeqCst) {
-                drop(gate_server);
-                let _ = std::fs::remove_file(&config_path);
-                return;
-            }
-
-            let prompt = format!(
-                "You are running inside a workbridge rebase gate. Your job is to rebase \
+                let prompt = format!(
+                    "You are running inside a workbridge rebase gate. Your job is to rebase \
                  the current branch (`{branch}`) onto `origin/{base_branch}` in this \
                  working directory and resolve any conflicts that arise.\n\n\
                  Steps:\n\
@@ -9136,284 +9151,335 @@ impl App {
                  call `workbridge_set_status` to leave a record - the work item is \
                  already in `Implementing` and the activity log entry below is the \
                  audit trail."
-            );
+                );
 
-            let json_schema = r#"{"type":"object","properties":{"success":{"type":"boolean"},"conflicts_resolved":{"type":"boolean"},"detail":{"type":"string"}},"required":["success","detail"]}"#;
+                let json_schema = r#"{"type":"object","properties":{"success":{"type":"boolean"},"conflicts_resolved":{"type":"boolean"},"detail":{"type":"string"}},"required":["success","detail"]}"#;
 
-            // Spawn the harness child in a sub-thread so we can drain
-            // gate_mcp_rx for live progress events while waiting for
-            // the child to exit. The `current_dir` MUST be the work
-            // item's worktree path: each git worktree has its own HEAD,
-            // and `git rebase` operates on whatever HEAD the cwd's git
-            // context resolves to. Pointing the child at the registered
-            // repo root would silently rebase the main checkout's
-            // branch instead of `branch`.
-            //
-            // We use `spawn()` + `wait_with_output()` instead of the
-            // simpler `output()` so the PID can be stashed in
-            // `child_pid` immediately after spawning. The main thread
-            // reads that PID from `drop_rebase_gate` and SIGKILLs the
-            // child if the gate is torn down (delete, force-quit). The
-            // PID is cleared after the child is reaped so the main
-            // thread does not signal a stale entry.
-            let (output_tx, output_rx) =
-                crossbeam_channel::bounded::<std::io::Result<std::process::Output>>(1);
-            {
-                let config_path = config_path.clone();
-                let worktree_path = worktree_path.clone();
-                let prompt = prompt.clone();
-                let child_pid = Arc::clone(&child_pid);
-                let cancelled = Arc::clone(&cancelled);
-                std::thread::spawn(move || {
-                    let spawn_result = std::process::Command::new("claude")
-                        .args([
-                            "--print",
-                            "--dangerously-skip-permissions",
-                            "-p",
-                            &prompt,
-                            "--output-format",
-                            "json",
-                            "--json-schema",
-                            json_schema,
-                            "--mcp-config",
-                            &config_path.to_string_lossy(),
-                        ])
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .current_dir(&worktree_path)
-                        // Put the harness in its OWN process group so
-                        // `drop_rebase_gate` can SIGKILL the entire
-                        // tree (claude + any `git rebase` / `git add`
-                        // subprocesses it has spawned). Without
-                        // `process_group(0)`, claude inherits
-                        // workbridge's process group and `killpg`
-                        // would either kill workbridge itself or
-                        // leave claude's git subprocesses orphaned
-                        // and still mutating the worktree. Mirrors
-                        // the pattern in `Session::spawn`, which
-                        // achieves the same isolation via
-                        // `libc::setsid` in `pre_exec`.
-                        .process_group(0)
-                        .spawn();
-                    let mut child = match spawn_result {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let _ = output_tx.send(Err(e));
+                // Spawn the harness child in a sub-thread so we can drain
+                // gate_mcp_rx for live progress events while waiting for
+                // the child to exit. The `current_dir` MUST be the work
+                // item's worktree path: each git worktree has its own HEAD,
+                // and `git rebase` operates on whatever HEAD the cwd's git
+                // context resolves to. Pointing the child at the registered
+                // repo root would silently rebase the main checkout's
+                // branch instead of `branch`.
+                //
+                // We use `spawn()` + `wait_with_output()` instead of the
+                // simpler `output()` so the PID can be stashed in
+                // `child_pid` immediately after spawning. The main thread
+                // reads that PID from `drop_rebase_gate` and SIGKILLs the
+                // child if the gate is torn down (delete, force-quit). The
+                // PID is cleared after the child is reaped so the main
+                // thread does not signal a stale entry.
+                let (output_tx, output_rx) =
+                    crossbeam_channel::bounded::<std::io::Result<std::process::Output>>(1);
+                {
+                    // `config_path` is wrapped in `Option<PathBuf>` outside
+                    // the labeled block so post-block cleanup can remove it
+                    // uniformly. `expect` is infallible here because the
+                    // only path to this point in the labeled block sets
+                    // `config_path = Some(path)` immediately above.
+                    let config_path = config_path
+                        .as_ref()
+                        .expect("config_path was set just above")
+                        .clone();
+                    let worktree_path = worktree_path.clone();
+                    let prompt = prompt.clone();
+                    let child_pid = Arc::clone(&child_pid);
+                    let cancelled = Arc::clone(&cancelled);
+                    std::thread::spawn(move || {
+                        let spawn_result = std::process::Command::new("claude")
+                            .args([
+                                "--print",
+                                "--dangerously-skip-permissions",
+                                "-p",
+                                &prompt,
+                                "--output-format",
+                                "json",
+                                "--json-schema",
+                                json_schema,
+                                "--mcp-config",
+                                &config_path.to_string_lossy(),
+                            ])
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .current_dir(&worktree_path)
+                            // Put the harness in its OWN process group so
+                            // `drop_rebase_gate` can SIGKILL the entire
+                            // tree (claude + any `git rebase` / `git add`
+                            // subprocesses it has spawned). Without
+                            // `process_group(0)`, claude inherits
+                            // workbridge's process group and `killpg`
+                            // would either kill workbridge itself or
+                            // leave claude's git subprocesses orphaned
+                            // and still mutating the worktree. Mirrors
+                            // the pattern in `Session::spawn`, which
+                            // achieves the same isolation via
+                            // `libc::setsid` in `pre_exec`.
+                            .process_group(0)
+                            .spawn();
+                        let mut child = match spawn_result {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = output_tx.send(Err(e));
+                                return;
+                            }
+                        };
+                        // Stash the PID FIRST, then check cancellation.
+                        // The previous ordering (check then stash) had a
+                        // race window: if `drop_rebase_gate` ran between
+                        // the cancellation check and the stash, it would
+                        // set `cancelled = true`, find `None` in the
+                        // PID slot, and silently fail to killpg the
+                        // group; the sub-thread would then continue past
+                        // the (already-passed) check, stash the PID, and
+                        // call `wait_with_output` against a child
+                        // nobody was going to kill. By stashing first
+                        // and checking second we guarantee one of two
+                        // outcomes for every interleaving: either the
+                        // drop path sees the PID and killpgs it for us,
+                        // or we see the cancellation flag (which is
+                        // sticky once set) and killpg the group
+                        // ourselves below. The flag's stickiness is the
+                        // load-bearing property here.
+                        let pid = child.id();
+                        if let Ok(mut slot) = child_pid.lock() {
+                            *slot = Some(pid);
+                        }
+                        if cancelled.load(Ordering::SeqCst) {
+                            // Clear the slot first so `drop_rebase_gate`
+                            // does not also try to killpg this PID
+                            // (double kill would be `ESRCH` after the
+                            // first one reaped, which is harmless but
+                            // pointless).
+                            if let Ok(mut slot) = child_pid.lock() {
+                                *slot = None;
+                            }
+                            // SAFETY: `libc::killpg` is an FFI call into
+                            // a stable POSIX syscall; arguments are a
+                            // process-group id and a signal number. The
+                            // group leader is `pid` because we passed
+                            // `process_group(0)` above. Calling killpg
+                            // on a freshly-reaped group is a harmless
+                            // ESRCH error rather than a wrong-process
+                            // signal, so racing with `drop_rebase_gate`
+                            // having already killpg'd is safe.
+                            unsafe {
+                                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                            }
+                            let _ = child.wait();
                             return;
                         }
-                    };
-                    // Stash the PID FIRST, then check cancellation.
-                    // The previous ordering (check then stash) had a
-                    // race window: if `drop_rebase_gate` ran between
-                    // the cancellation check and the stash, it would
-                    // set `cancelled = true`, find `None` in the
-                    // PID slot, and silently fail to killpg the
-                    // group; the sub-thread would then continue past
-                    // the (already-passed) check, stash the PID, and
-                    // call `wait_with_output` against a child
-                    // nobody was going to kill. By stashing first
-                    // and checking second we guarantee one of two
-                    // outcomes for every interleaving: either the
-                    // drop path sees the PID and killpgs it for us,
-                    // or we see the cancellation flag (which is
-                    // sticky once set) and killpg the group
-                    // ourselves below. The flag's stickiness is the
-                    // load-bearing property here.
-                    let pid = child.id();
-                    if let Ok(mut slot) = child_pid.lock() {
-                        *slot = Some(pid);
-                    }
-                    if cancelled.load(Ordering::SeqCst) {
-                        // Clear the slot first so `drop_rebase_gate`
-                        // does not also try to killpg this PID
-                        // (double kill would be `ESRCH` after the
-                        // first one reaped, which is harmless but
-                        // pointless).
+                        let result = child.wait_with_output();
                         if let Ok(mut slot) = child_pid.lock() {
                             *slot = None;
                         }
-                        // SAFETY: `libc::killpg` is an FFI call into
-                        // a stable POSIX syscall; arguments are a
-                        // process-group id and a signal number. The
-                        // group leader is `pid` because we passed
-                        // `process_group(0)` above. Calling killpg
-                        // on a freshly-reaped group is a harmless
-                        // ESRCH error rather than a wrong-process
-                        // signal, so racing with `drop_rebase_gate`
-                        // having already killpg'd is safe.
-                        unsafe {
-                            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-                        }
-                        let _ = child.wait();
-                        return;
-                    }
-                    let result = child.wait_with_output();
-                    if let Ok(mut slot) = child_pid.lock() {
-                        *slot = None;
-                    }
-                    let _ = output_tx.send(result);
-                });
-            }
+                        let _ = output_tx.send(result);
+                    });
+                }
 
-            let mut conflicts_attempted_observed = false;
-            let final_output = loop {
-                crossbeam_channel::select! {
-                    recv(gate_mcp_rx) -> evt => {
-                        match evt {
-                            Ok(McpEvent::ReviewGateProgress { message, .. }) => {
-                                let _ = tx.send(RebaseGateMessage::Progress(message));
-                            }
-                            Ok(McpEvent::LogEvent { event_type, payload, .. }) => {
-                                if event_type == "rebase_progress" {
-                                    let msg = payload
-                                        .get("message")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("...")
-                                        .to_string();
-                                    if msg.to_lowercase().contains("conflict") {
-                                        conflicts_attempted_observed = true;
+                // `conflicts_attempted_observed` is declared OUTSIDE the
+                // labeled block (before the block starts) so this select-
+                // loop can mutate it while still being inside the block.
+                // Reset to a known state here (in case any future caller
+                // factors out the block - currently this is the only
+                // place that mutates it).
+                let final_output = loop {
+                    crossbeam_channel::select! {
+                        recv(gate_mcp_rx) -> evt => {
+                            match evt {
+                                Ok(McpEvent::ReviewGateProgress { message, .. }) => {
+                                    let _ = tx.send(RebaseGateMessage::Progress(message));
+                                }
+                                Ok(McpEvent::LogEvent { event_type, payload, .. }) => {
+                                    if event_type == "rebase_progress" {
+                                        let msg = payload
+                                            .get("message")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("...")
+                                            .to_string();
+                                        if msg.to_lowercase().contains("conflict") {
+                                            conflicts_attempted_observed = true;
+                                        }
+                                        let _ = tx.send(RebaseGateMessage::Progress(msg));
                                     }
-                                    let _ = tx.send(RebaseGateMessage::Progress(msg));
+                                }
+                                Ok(_) => {
+                                    // Other MCP events (StatusUpdate, SetPlan,
+                                    // SetTitle, ...) are intentionally ignored.
+                                    // The rebase gate writes its own activity log
+                                    // entry from `poll_rebase_gate` after the
+                                    // harness exits, so the prompt does not ask
+                                    // the harness to call `workbridge_set_status`
+                                    // and we do not forward stray events here.
+                                    // Forwarding would let a misbehaving harness
+                                    // rename the work item or overwrite its plan
+                                    // as a side effect of running a rebase.
+                                }
+                                Err(_) => {
+                                    // Channel disconnected - server gone. Continue
+                                    // waiting for the child to exit; the output_rx
+                                    // arm below will fire shortly.
                                 }
                             }
-                            Ok(_) => {
-                                // Other MCP events (StatusUpdate, SetPlan,
-                                // SetTitle, ...) are intentionally ignored.
-                                // The rebase gate writes its own activity log
-                                // entry from `poll_rebase_gate` after the
-                                // harness exits, so the prompt does not ask
-                                // the harness to call `workbridge_set_status`
-                                // and we do not forward stray events here.
-                                // Forwarding would let a misbehaving harness
-                                // rename the work item or overwrite its plan
-                                // as a side effect of running a rebase.
-                            }
-                            Err(_) => {
-                                // Channel disconnected - server gone. Continue
-                                // waiting for the child to exit; the output_rx
-                                // arm below will fire shortly.
-                            }
+                        }
+                        recv(output_rx) -> output_result => {
+                            break output_result;
                         }
                     }
-                    recv(output_rx) -> output_result => {
-                        break output_result;
-                    }
-                }
-            };
+                };
 
-            // Clean up the MCP server and the temp config file before
-            // building the result so the temp-file rm is not skipped on
-            // any of the early-return arms below.
-            drop(gate_server);
-            let _ = std::fs::remove_file(&config_path);
-
-            // Initial result without the activity_log_error field;
-            // the field is filled in below after the activity-log
-            // append runs (which itself runs on this background
-            // thread, NOT on the UI thread, per the absolute
-            // blocking-I/O invariant).
-            let result = match final_output {
-                Ok(Ok(output)) if output.status.success() => {
-                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    match serde_json::from_str::<serde_json::Value>(&stdout) {
-                        Ok(envelope) => {
-                            let structured = &envelope["structured_output"];
-                            let success = structured["success"].as_bool().unwrap_or(false);
-                            let conflicts_resolved =
-                                structured["conflicts_resolved"].as_bool().unwrap_or(false);
-                            let detail = structured["detail"].as_str().unwrap_or("").to_string();
-                            if success {
-                                // Verify the harness's success claim
-                                // against local git state before
-                                // surfacing it to the user. The harness
-                                // can hallucinate, run the wrong
-                                // command, or emit a stale envelope; in
-                                // any of those cases the worktree's
-                                // HEAD will not actually contain
-                                // `origin/<base_branch>`. The
-                                // user-facing-claim rule in CLAUDE.md
-                                // requires that any "it happened"
-                                // status that the code can verify
-                                // locally MUST be verified before
-                                // rendering. `git merge-base
-                                // --is-ancestor A B` exits 0 iff A is
-                                // an ancestor of B and 1 otherwise; any
-                                // other exit is an error and is also
-                                // treated as "did not land".
-                                let ancestry_ok = match crate::worktree_service::git_command()
-                                    .arg("-C")
-                                    .arg(&worktree_path)
-                                    .args([
-                                        "merge-base",
-                                        "--is-ancestor",
-                                        &format!("origin/{base_branch}"),
-                                        "HEAD",
-                                    ])
-                                    .output()
-                                {
-                                    Ok(o) => o.status.success(),
-                                    Err(_) => false,
-                                };
-                                if ancestry_ok {
-                                    RebaseResult::Success {
-                                        base_branch: base_branch.clone(),
-                                        conflicts_resolved,
-                                        activity_log_error: None,
+                // === Phase 5: build result from harness output ===
+                //
+                // This is the final break of the 'compute block on
+                // the harness happy path. Pre-harness early failures
+                // have already broken with their own `Some(Failure)`
+                // values above; cancellation paths break with `None`.
+                // Cleanup of `gate_server` and `config_path` happens
+                // AFTER the block, uniformly for every break path.
+                Some(match final_output {
+                    Ok(Ok(output)) if output.status.success() => {
+                        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        match serde_json::from_str::<serde_json::Value>(&stdout) {
+                            Ok(envelope) => {
+                                let structured = &envelope["structured_output"];
+                                let success = structured["success"].as_bool().unwrap_or(false);
+                                let conflicts_resolved =
+                                    structured["conflicts_resolved"].as_bool().unwrap_or(false);
+                                let detail =
+                                    structured["detail"].as_str().unwrap_or("").to_string();
+                                if success {
+                                    // Verify the harness's success claim
+                                    // against local git state before
+                                    // surfacing it to the user. The harness
+                                    // can hallucinate, run the wrong
+                                    // command, or emit a stale envelope; in
+                                    // any of those cases the worktree's
+                                    // HEAD will not actually contain
+                                    // `origin/<base_branch>`. The
+                                    // user-facing-claim rule in CLAUDE.md
+                                    // requires that any "it happened"
+                                    // status that the code can verify
+                                    // locally MUST be verified before
+                                    // rendering. `git merge-base
+                                    // --is-ancestor A B` exits 0 iff A is
+                                    // an ancestor of B and 1 otherwise; any
+                                    // other exit is an error and is also
+                                    // treated as "did not land".
+                                    let ancestry_ok = match crate::worktree_service::git_command()
+                                        .arg("-C")
+                                        .arg(&worktree_path)
+                                        .args([
+                                            "merge-base",
+                                            "--is-ancestor",
+                                            &format!("origin/{base_branch}"),
+                                            "HEAD",
+                                        ])
+                                        .output()
+                                    {
+                                        Ok(o) => o.status.success(),
+                                        Err(_) => false,
+                                    };
+                                    if ancestry_ok {
+                                        RebaseResult::Success {
+                                            base_branch: base_branch.clone(),
+                                            conflicts_resolved,
+                                            activity_log_error: None,
+                                        }
+                                    } else {
+                                        RebaseResult::Failure {
+                                            base_branch: base_branch.clone(),
+                                            reason: format!(
+                                                "harness reported success but origin/{base_branch} is not an ancestor of HEAD"
+                                            ),
+                                            conflicts_attempted: conflicts_resolved
+                                                || conflicts_attempted_observed,
+                                            activity_log_error: None,
+                                        }
                                     }
                                 } else {
                                     RebaseResult::Failure {
                                         base_branch: base_branch.clone(),
-                                        reason: format!(
-                                            "harness reported success but origin/{base_branch} is not an ancestor of HEAD"
-                                        ),
+                                        reason: if detail.is_empty() {
+                                            "harness reported failure".into()
+                                        } else {
+                                            detail
+                                        },
                                         conflicts_attempted: conflicts_resolved
                                             || conflicts_attempted_observed,
                                         activity_log_error: None,
                                     }
                                 }
-                            } else {
-                                RebaseResult::Failure {
-                                    base_branch: base_branch.clone(),
-                                    reason: if detail.is_empty() {
-                                        "harness reported failure".into()
-                                    } else {
-                                        detail
-                                    },
-                                    conflicts_attempted: conflicts_resolved
-                                        || conflicts_attempted_observed,
-                                    activity_log_error: None,
-                                }
                             }
+                            Err(e) => RebaseResult::Failure {
+                                base_branch: base_branch.clone(),
+                                reason: format!("rebase gate: invalid JSON envelope: {e}"),
+                                conflicts_attempted: conflicts_attempted_observed,
+                                activity_log_error: None,
+                            },
                         }
-                        Err(e) => RebaseResult::Failure {
+                    }
+                    Ok(Ok(output)) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                        RebaseResult::Failure {
                             base_branch: base_branch.clone(),
-                            reason: format!("rebase gate: invalid JSON envelope: {e}"),
+                            reason: format!("harness exited with error: {}", stderr.trim()),
                             conflicts_attempted: conflicts_attempted_observed,
                             activity_log_error: None,
-                        },
+                        }
                     }
-                }
-                Ok(Ok(output)) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    RebaseResult::Failure {
+                    Ok(Err(e)) => RebaseResult::Failure {
                         base_branch: base_branch.clone(),
-                        reason: format!("harness exited with error: {}", stderr.trim()),
+                        reason: format!("could not run harness: {e}"),
                         conflicts_attempted: conflicts_attempted_observed,
                         activity_log_error: None,
-                    }
-                }
-                Ok(Err(e)) => RebaseResult::Failure {
-                    base_branch: base_branch.clone(),
-                    reason: format!("could not run harness: {e}"),
-                    conflicts_attempted: conflicts_attempted_observed,
-                    activity_log_error: None,
-                },
-                Err(e) => RebaseResult::Failure {
-                    base_branch: base_branch.clone(),
-                    reason: format!("rebase gate: harness thread disconnected: {e}"),
-                    conflicts_attempted: conflicts_attempted_observed,
-                    activity_log_error: None,
-                },
+                    },
+                    Err(e) => RebaseResult::Failure {
+                        base_branch: base_branch.clone(),
+                        reason: format!("rebase gate: harness thread disconnected: {e}"),
+                        conflicts_attempted: conflicts_attempted_observed,
+                        activity_log_error: None,
+                    },
+                })
+            };
+
+            // === Post-'compute cleanup ===
+            //
+            // Drop the MCP server and remove the temp config file.
+            // Both are wrapped in `Option<>` so this runs uniformly
+            // regardless of which break arm exited the block: a
+            // pre-server failure leaves both `None` (no-op cleanup),
+            // a post-server pre-config failure drops the server but
+            // skips the rm, and a successful run drops both. The
+            // server MUST be alive while the harness child is
+            // running - that constraint is satisfied by the harness
+            // sub-thread spawning and waiting INSIDE the block, so
+            // by the time we reach this cleanup the harness has
+            // already exited or we have already broken with an
+            // early failure that did not reach the spawn.
+            if let Some(server) = gate_server.take() {
+                drop(server);
+            }
+            if let Some(path) = config_path.take()
+                && let Err(_e) = std::fs::remove_file(&path)
+            {
+                // Best-effort cleanup: the file is in `$TMPDIR` and
+                // the OS will clean it up eventually. Logging would
+                // be misleading because the typical "error" here is
+                // ENOENT after a normal harness run that already
+                // consumed the config.
+            }
+
+            // Convert the labeled-block result into either a
+            // concrete `RebaseResult` (audit + send below) or a bare
+            // `return` for the cancellation path. The `None` case
+            // means a `cancelled` check inside the block fired; the
+            // cancellation contract in C10 says cancelled gates do
+            // NOT write to the activity log and do NOT send a
+            // result through `tx`.
+            let result = match computed {
+                Some(r) => r,
+                None => return,
             };
 
             // Final cancellation check before we touch the backend.

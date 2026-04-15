@@ -1227,6 +1227,29 @@ harness adapter is introduced, add a dated bullet here.
   `poll_rebase_gate` directly via `App.backend.append_activity` as
   a `rebase_completed` / `rebase_failed` activity log entry. RP6
   documents the new entry shape.
+- 2026-04-16: Fifth Codex pass flagged a P2 doc/code drift: the
+  pre-harness failure paths in `spawn_rebase_gate` (git fetch
+  failure, MCP server start failure, `current_exe` failure,
+  config write failure) were each `tx.send`-ing their own
+  `RebaseResult::Failure` and `return`ing immediately, bypassing
+  the common `backend.append_activity` block. The UI status
+  message still landed, but no `rebase_failed` activity-log entry
+  was written for those attempts even though RP6 says every
+  rebase outcome (success or failure) gets a log entry. The
+  background closure is now wrapped in a labeled `'compute:`
+  block: each pre-harness failure becomes
+  `break 'compute Some(RebaseResult::Failure { ... })` instead
+  of `tx.send` + `return`, and the harness happy path uses
+  `break 'compute Some(... built from final_output)`. After the
+  block, the result flows through the same audit + send path as
+  the harness-level outcomes, so every non-cancelled rebase
+  attempt now leaves a `rebase_completed` or `rebase_failed`
+  entry. `gate_server` and `config_path` were lifted into
+  `Option<>` slots outside the block so cleanup runs uniformly
+  regardless of which break arm fired. Cancellation paths still
+  break with `None`, which the post-block check converts back
+  into a bare `return` (no audit, no send) per the cancellation
+  contract.
 - 2026-04-16: Fourth Codex pass on the rebase gate found two
   more cancellation races. (1) P1: The harness sub-thread was
   checking `cancelled` BEFORE stashing the PID into `child_pid`,
