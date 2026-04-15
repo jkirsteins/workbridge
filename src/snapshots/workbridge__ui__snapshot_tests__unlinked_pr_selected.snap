@@ -6,11 +6,11 @@ expression: "render(&app, 80, 24)"
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  UNLINKED (1)         ││                                                     │
 │> ? fix-typo      PR#45││  Unlinked PR #45                                    │
-│  ACTIVE (0) (1)       ││                                                     │
-│  [IM] Active  PR#30 ok││  PR          #45 https://github.com/o/r/pull/45     │
-│  feature              ││  Repo        /repo/unlinked                         │
-│  branch-prog-1 [no wt]││  Branch      fix-typo                               │
-│                       ││  State       Open                                   │
+│  unlinked             ││                                                     │
+│  ACTIVE (0) (1)       ││  PR          #45 https://github.com/o/r/pull/45     │
+│  [IM] Active  PR#30 ok││  Repo        /repo/unlinked                         │
+│  feature              ││  Branch      fix-typo                               │
+│  branch-prog-1 [no wt]││  State       Open                                   │
 │                       ││  Draft       No                                     │
 │                       ││  Review      (none)                                 │
 │                       ││  Checks      (none)                                 │
