@@ -1058,11 +1058,26 @@ pub struct SessionOpenPlanResult {
 /// `spawn_agent_file_cleanup` on cancellation so the tempfile
 /// cannot be orphaned even if the worker writes it after the
 /// cancellation flag was set.
+///
+/// `committed_files` is the shared running list of side-car files
+/// the worker has actually written to disk (e.g. Claude's
+/// worktree `.mcp.json`, returned from
+/// `AgentBackend::write_session_files`). The worker pushes each
+/// successfully-written path into this `Mutex<Vec<PathBuf>>`
+/// immediately after the write returns; the main thread drains it
+/// on cancellation and feeds the entries into
+/// `spawn_agent_file_cleanup` alongside `mcp_config_path`. This
+/// closes the leak window where the worker has written a file but
+/// `tx.send(...)` never reaches the main thread because the
+/// receiver was already dropped (cancellation race), so the
+/// `written_files` Vec inside `SessionOpenPlanResult` is silently
+/// discarded along with the result.
 pub struct SessionOpenPending {
     pub rx: crossbeam_channel::Receiver<SessionOpenPlanResult>,
     pub activity: ActivityId,
     pub cancelled: Arc<AtomicBool>,
     pub mcp_config_path: PathBuf,
+    pub committed_files: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 /// Fully-prepared global assistant session, produced entirely on a
@@ -2785,6 +2800,13 @@ impl App {
             if let Some(entry) = self.session_open_rx.remove(&wi_id) {
                 entry.cancelled.store(true, Ordering::Release);
                 self.end_activity(entry.activity);
+                // Drain side-car files the worker already wrote
+                // (Claude's worktree `.mcp.json`, etc.). Symmetric
+                // with `cancel_session_open_entry`'s cleanup so
+                // shutdown does not leak them.
+                if let Ok(mut guard) = entry.committed_files.lock() {
+                    files_to_clean.extend(guard.drain(..));
+                }
                 files_to_clean.push(entry.mcp_config_path);
             }
         }
@@ -2963,19 +2985,70 @@ impl App {
 
     /// Flush buffered PTY bytes to their respective sessions as single
     /// writes. Called on each timer tick before rendering.
+    ///
+    /// Each per-session flush is gated on the corresponding session
+    /// actually existing AND being alive. Without that gate,
+    /// `send_bytes_to_*` is a no-op and the keystrokes get silently
+    /// dropped, because `std::mem::take` already cleared the buffer
+    /// before the helper noticed there was nowhere to write to. This
+    /// matters for the global assistant in particular: after the
+    /// async `spawn_global_session` refactor (see
+    /// `docs/harness-contract.md` C10), `App::global_session` is
+    /// `None` for ~one timer tick between drawer-open and the
+    /// background worker installing the session via
+    /// `poll_global_session_open`. Keystrokes the user types in
+    /// that window stay parked in `pending_global_pty_bytes` until
+    /// the session is installed, then flush in one batch on the
+    /// next tick. Same gate applies to the work-item active pane
+    /// (worker session-open) and the terminal pane.
     pub fn flush_pty_buffers(&mut self) {
-        if !self.pending_active_pty_bytes.is_empty() {
+        if !self.pending_active_pty_bytes.is_empty() && self.has_alive_active_session() {
             let data = std::mem::take(&mut self.pending_active_pty_bytes);
             self.send_bytes_to_active(&data);
         }
-        if !self.pending_global_pty_bytes.is_empty() {
+        if !self.pending_global_pty_bytes.is_empty()
+            && self
+                .global_session
+                .as_ref()
+                .is_some_and(|e| e.alive && e.session.is_some())
+        {
             let data = std::mem::take(&mut self.pending_global_pty_bytes);
             self.send_bytes_to_global(&data);
         }
-        if !self.pending_terminal_pty_bytes.is_empty() {
+        if !self.pending_terminal_pty_bytes.is_empty() && self.has_alive_terminal_session() {
             let data = std::mem::take(&mut self.pending_terminal_pty_bytes);
             self.send_bytes_to_terminal(&data);
         }
+    }
+
+    /// True when the active (work-item) session for the currently
+    /// selected work item exists and is alive. Used by
+    /// `flush_pty_buffers` to gate the work-item PTY flush so
+    /// keystrokes typed during a session-open worker's in-flight
+    /// window are not silently dropped on the floor.
+    fn has_alive_active_session(&self) -> bool {
+        let Some(work_item_id) = self.selected_work_item_id() else {
+            return false;
+        };
+        let Some(key) = self.session_key_for(&work_item_id) else {
+            return false;
+        };
+        self.sessions
+            .get(&key)
+            .is_some_and(|e| e.alive && e.session.is_some())
+    }
+
+    /// True when the terminal session for the currently selected
+    /// work item exists and is alive. Symmetric with
+    /// `has_alive_active_session` so the terminal pane behaves the
+    /// same on the keystroke-buffering path.
+    fn has_alive_terminal_session(&self) -> bool {
+        let Some(work_item_id) = self.selected_work_item_id() else {
+            return false;
+        };
+        self.terminal_sessions
+            .get(&work_item_id)
+            .is_some_and(|e| e.alive && e.session.is_some())
     }
 
     /// Send raw bytes to the active session's PTY.
@@ -5144,6 +5217,18 @@ impl App {
         let worker_cancelled = Arc::clone(&cancelled);
         let worker_mcp_config_path = mcp_config_path.clone();
 
+        // Shared running list of side-car files the worker has
+        // successfully written. Populated by the worker immediately
+        // after each `write_session_files` / `std::fs::write` call;
+        // drained by `cancel_session_open_entry` on cancellation
+        // alongside `mcp_config_path`. This closes the leak window
+        // where the worker writes Claude's `.mcp.json` then loses
+        // the receiver to a cancellation race - the path would
+        // otherwise vanish along with the dropped result and
+        // orphan the file in the worktree.
+        let committed_files: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let worker_committed_files = Arc::clone(&committed_files);
+
         // Precompute every MCP-setup input that requires `&self` here
         // on the UI thread. All of these are pure in-memory lookups;
         // no filesystem or subprocess calls happen in this block (the
@@ -5264,9 +5349,29 @@ impl App {
                         );
 
                         // Backend side-car files (Claude: the worktree
-                        // `.mcp.json` for project discovery).
+                        // `.mcp.json` for project discovery). Push
+                        // each successfully-written path into the
+                        // shared `worker_committed_files` list under
+                        // the mutex BEFORE continuing, so a
+                        // cancellation that arrives between the
+                        // write and the eventual `tx.send(...)`
+                        // can still find the path and clean it up
+                        // via `cancel_session_open_entry`. Without
+                        // this push, a cancelled work item would
+                        // orphan Claude's `.mcp.json` in the
+                        // worktree (the worktree usually goes
+                        // away on delete, but stage transitions
+                        // to no-session stages would leak it).
                         match agent_backend.write_session_files(&cwd_clone, &mcp_config) {
-                            Ok(paths) => written_files.extend(paths),
+                            Ok(paths) => {
+                                if !paths.is_empty() {
+                                    worker_committed_files
+                                        .lock()
+                                        .unwrap()
+                                        .extend(paths.iter().cloned());
+                                }
+                                written_files.extend(paths);
+                            }
                             Err(e) => {
                                 mcp_config_error = Some(format!("MCP config write error: {e}"));
                             }
@@ -5325,6 +5430,7 @@ impl App {
                 activity,
                 cancelled,
                 mcp_config_path,
+                committed_files,
             },
         );
     }
@@ -5346,25 +5452,45 @@ impl App {
     /// Cancel a pending `session_open_rx` entry: signal the worker to
     /// skip any remaining file writes (via the shared
     /// `cancelled: Arc<AtomicBool>`), route the UI-thread-committed
-    /// `mcp_config_path` through `spawn_agent_file_cleanup` so the
-    /// tempfile is not leaked to `/tmp` if the worker already wrote
-    /// it, and end the spinner activity. Called from every abort
-    /// path (`cleanup_session_state_for`, a dead-worker arm in
+    /// `mcp_config_path` AND any side-car files the worker has
+    /// already written (via the shared `committed_files` mutex)
+    /// through `spawn_agent_file_cleanup` so neither the tempfile
+    /// nor Claude's worktree `.mcp.json` are leaked, and end the
+    /// spinner activity. Called from every abort path
+    /// (`cleanup_session_state_for`, a dead-worker arm in
     /// `poll_session_opens`, the stage-transition respawn path, and
     /// `cleanup_all_mcp` at shutdown).
     ///
     /// There is still a sub-microsecond race window where the worker
     /// loads `cancelled == false`, the main thread sets
     /// `cancelled = true`, and the worker then writes the file
-    /// anyway. The scheduled `spawn_agent_file_cleanup` is
-    /// fire-and-forget and may run before that race resolves; under
-    /// a wedged filesystem the file can leak. This is acknowledged
-    /// in the `SessionOpenPending::cancelled` doc comment. The OS
-    /// tmp cleaner reaps orphaned entries eventually.
+    /// anyway. For the temp `--mcp-config` file (path known to the
+    /// main thread up front) and for any side-car file the worker
+    /// has already pushed into `committed_files` under the mutex,
+    /// the scheduled `spawn_agent_file_cleanup` removes them. The
+    /// only residual leak is a side-car write that races: worker
+    /// returns `Ok(paths)` from `write_session_files` AFTER the
+    /// main thread has already drained `committed_files` here.
+    /// That window is bounded by the time between
+    /// `agent_backend.write_session_files(...)` returning and the
+    /// `worker_committed_files.lock().unwrap().extend(...)` push -
+    /// nanoseconds in normal conditions. The OS tmp cleaner reaps
+    /// orphaned entries; in the work-item case the worktree itself
+    /// is usually about to be removed by `spawn_delete_cleanup`
+    /// which sweeps the entire directory.
     fn cancel_session_open_entry(&mut self, wi_id: &WorkItemId) {
         if let Some(entry) = self.session_open_rx.remove(wi_id) {
             entry.cancelled.store(true, Ordering::Release);
-            self.spawn_agent_file_cleanup(vec![entry.mcp_config_path]);
+            // Drain any side-car files the worker has already
+            // committed to disk. The lock is held briefly inside
+            // `Mutex::lock().unwrap()` - effectively wait-free
+            // unless the worker is mid-push.
+            let mut files_to_clean: Vec<PathBuf> = Vec::new();
+            if let Ok(mut guard) = entry.committed_files.lock() {
+                files_to_clean.extend(guard.drain(..));
+            }
+            files_to_clean.push(entry.mcp_config_path);
+            self.spawn_agent_file_cleanup(files_to_clean);
             self.end_activity(entry.activity);
         }
     }
@@ -17085,6 +17211,165 @@ mod tests {
         assert!(app.global_mcp_server.is_none());
         assert!(app.global_mcp_config_path.is_none());
         assert!(app.pending_global_pty_bytes.is_empty());
+    }
+
+    /// Regression guard for the post-async-spawn keystroke-loss bug:
+    /// `flush_pty_buffers` must NOT drain `pending_global_pty_bytes`
+    /// when there is no live `global_session` yet. Before the gate
+    /// was added, the keystrokes a user typed in the ~one-tick
+    /// window between `Ctrl+G` opening the drawer and
+    /// `poll_global_session_open` installing the session were
+    /// silently lost: `flush_pty_buffers` would `take` the buffer
+    /// and call `send_bytes_to_global`, which is a no-op when no
+    /// session exists, dropping the bytes on the floor. The fix is
+    /// to leave the buffer untouched until a live session can
+    /// actually consume the bytes.
+    #[test]
+    fn flush_pty_buffers_preserves_global_bytes_when_no_session() {
+        let mut app = App::new();
+        assert!(app.global_session.is_none());
+
+        // User types something while the drawer is opening but
+        // before the worker has installed the session.
+        app.buffer_bytes_to_global(b"hello");
+        assert_eq!(
+            app.pending_global_pty_bytes, b"hello",
+            "buffer_bytes_to_global should accumulate bytes on the buffer",
+        );
+
+        // The next timer tick fires `flush_pty_buffers`. Without
+        // the no-session gate this would `take` the buffer and
+        // throw the bytes away (the no-op `send_bytes_to_global`
+        // path).
+        app.flush_pty_buffers();
+
+        assert_eq!(
+            app.pending_global_pty_bytes, b"hello",
+            "flush_pty_buffers must NOT drain the global buffer when \
+             there is no live global_session yet - the keystrokes \
+             would be lost otherwise",
+        );
+    }
+
+    /// Regression guard for the side-car file leak on cancellation.
+    /// `cancel_session_open_entry` must drain the worker's
+    /// `committed_files` mutex into the cleanup call so files the
+    /// worker already wrote (Claude's worktree `.mcp.json`, etc.)
+    /// are removed even when the worker's `tx.send(...)` is
+    /// silently dropped against a closed receiver. Pre-fix the
+    /// path was carried only via the `written_files` Vec inside
+    /// `SessionOpenPlanResult`, which got discarded along with
+    /// the result on a cancellation race.
+    #[test]
+    fn cancel_session_open_entry_cleans_committed_side_car_files() {
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/p0-cancel-cleanup.json"));
+
+        // Create two real tempfiles that mimic the side-car files
+        // the worker would have written by the time the user
+        // cancels.
+        let temp_dir = std::env::temp_dir();
+        let mcp_config_path = temp_dir.join(format!(
+            "workbridge-cancel-test-mcp-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mcp_json_path = temp_dir.join(format!(
+            "workbridge-cancel-test-mcpjson-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&mcp_config_path, b"{}").expect("create mcp_config tempfile");
+        std::fs::write(&mcp_json_path, b"{}").expect("create mcp.json tempfile");
+
+        // Synthesize a SessionOpenPending entry that looks like a
+        // worker mid-flight after Phase C (side-car file written
+        // and pushed into `committed_files`).
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let committed_files = Arc::new(Mutex::new(vec![mcp_json_path.clone()]));
+        let (_tx, rx) = crossbeam_channel::bounded::<SessionOpenPlanResult>(1);
+        let activity = app.start_activity("Opening session...");
+        app.session_open_rx.insert(
+            wi_id.clone(),
+            SessionOpenPending {
+                rx,
+                activity,
+                cancelled: Arc::clone(&cancelled),
+                mcp_config_path: mcp_config_path.clone(),
+                committed_files: Arc::clone(&committed_files),
+            },
+        );
+
+        // Cancel the entry. This should:
+        // 1. Set the cancelled flag.
+        // 2. Drain committed_files into the cleanup call.
+        // 3. Push mcp_config_path into the same cleanup call.
+        // 4. Schedule a background `spawn_agent_file_cleanup`.
+        app.cancel_session_open_entry(&wi_id);
+
+        assert!(
+            cancelled.load(Ordering::Acquire),
+            "cancel_session_open_entry must set the cancelled flag",
+        );
+        assert!(
+            committed_files.lock().unwrap().is_empty(),
+            "cancel_session_open_entry must drain the committed_files mutex",
+        );
+        assert!(
+            !app.session_open_rx.contains_key(&wi_id),
+            "cancel_session_open_entry must remove the pending entry",
+        );
+
+        // The cleanup runs on a detached background thread; poll
+        // until both files are gone or the bounded timeout elapses.
+        wait_until_file_removed(&mcp_config_path, std::time::Duration::from_secs(5));
+        wait_until_file_removed(&mcp_json_path, std::time::Duration::from_secs(5));
+        assert!(
+            !mcp_config_path.exists(),
+            "spawn_agent_file_cleanup should have removed the temp \
+             --mcp-config file",
+        );
+        assert!(
+            !mcp_json_path.exists(),
+            "spawn_agent_file_cleanup should have removed the worktree \
+             .mcp.json side-car file the worker pushed into committed_files",
+        );
+    }
+
+    /// Companion to `flush_pty_buffers_preserves_global_bytes_when_no_session`:
+    /// once a live `global_session` exists, the next
+    /// `flush_pty_buffers` MUST drain the buffered bytes. Without
+    /// this, the keystrokes parked during the async session-open
+    /// window would never reach the PTY.
+    #[test]
+    fn flush_pty_buffers_drains_global_bytes_once_session_alive() {
+        let mut app = App::new();
+
+        // Stash bytes that accumulated during the in-flight open.
+        app.buffer_bytes_to_global(b"hello");
+
+        // Install a SessionEntry with no actual `Session` handle
+        // (PTY-less, but `alive == true`). The send path will
+        // observe `session.is_none()` and skip the write, but
+        // crucially the gate in `flush_pty_buffers` requires
+        // `session.is_some()`, so the buffer should still NOT be
+        // drained in this half-installed state. This guards
+        // against a regression where the gate is too loose.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        app.global_session = Some(SessionEntry {
+            parser,
+            alive: true,
+            session: None,
+            scrollback_offset: 0,
+            selection: None,
+            agent_written_files: Vec::new(),
+        });
+
+        app.flush_pty_buffers();
+
+        assert_eq!(
+            app.pending_global_pty_bytes, b"hello",
+            "flush_pty_buffers must keep the buffer when the session \
+             entry exists but has no PTY handle",
+        );
     }
 
     /// The close branch of `toggle_global_drawer` must run the teardown so
