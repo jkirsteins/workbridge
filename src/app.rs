@@ -1037,9 +1037,32 @@ pub struct SessionOpenPlanResult {
 /// than a bare tuple) so the activity ID cannot be accidentally
 /// dropped if the map grows new fields - a missed `end_activity`
 /// would leak a permanent spinner in the status bar.
+///
+/// `cancelled` is a shared cancellation signal: the worker thread
+/// loads it via `Ordering::Acquire` before each `std::fs::write`
+/// (and before `McpSocketServer::start`) and skips the write when
+/// set, so a cancelled open cannot leak side-car files to disk.
+/// `drop_session_open_entry` (the canonical cancellation site) and
+/// `cleanup_all_mcp` (the shutdown path) both set the flag via
+/// `Ordering::Release` before scheduling the file cleanup. There is
+/// still a sub-microsecond race window (worker reads the flag,
+/// main thread sets the flag, worker proceeds with the stale
+/// false) that this flag cannot fully close without a mutex
+/// across the write itself, but the file is still committed to
+/// `mcp_config_path` (below), which is known to the main thread
+/// regardless of whether the worker reached the write.
+///
+/// `mcp_config_path` is the temp `--mcp-config` file path that the
+/// UI thread commits to BEFORE spawning the worker (the worker
+/// uses this exact path). It is routed through
+/// `spawn_agent_file_cleanup` on cancellation so the tempfile
+/// cannot be orphaned even if the worker writes it after the
+/// cancellation flag was set.
 pub struct SessionOpenPending {
     pub rx: crossbeam_channel::Receiver<SessionOpenPlanResult>,
     pub activity: ActivityId,
+    pub cancelled: Arc<AtomicBool>,
+    pub mcp_config_path: PathBuf,
 }
 
 /// Fully-prepared global assistant session, produced entirely on a
@@ -1076,11 +1099,21 @@ pub struct GlobalSessionPrepResult {
 /// on the send-error arm. The path is per-call unique (UUID) so
 /// two concurrent workers under rapid drawer toggling can never
 /// collide on a shared filename.
+///
+/// `cancelled` is a shared cancellation signal: the worker thread
+/// loads it via `Ordering::Acquire` before each `std::fs::write`,
+/// `McpSocketServer::start_global`, and `std::fs::create_dir_all`
+/// and skips the op when set. `teardown_global_session` and
+/// `cleanup_all_mcp` both set it via `Ordering::Release` before
+/// scheduling the file cleanup. See the matching doc on
+/// `SessionOpenPending::cancelled` for the residual race-window
+/// caveat.
 pub struct GlobalSessionOpenPending {
     pub rx: crossbeam_channel::Receiver<GlobalSessionPrepResult>,
     pub activity: ActivityId,
     pub pre_drawer_focus: FocusPanel,
     pub config_path: PathBuf,
+    pub cancelled: Arc<AtomicBool>,
 }
 
 /// Result from the asynchronous worktree creation thread.
@@ -2699,12 +2732,15 @@ impl App {
     fn cleanup_session_state_for(&mut self, wi_id: &WorkItemId) {
         self.mcp_servers.remove(wi_id);
         self.agent_working.remove(wi_id);
-        // Drop any pending background plan read and end its
-        // "Opening session..." spinner. The thread will complete and
-        // try to send; the send will fail because the receiver is
-        // gone, and the thread exits. `finish_session_open` also has
-        // its own deleted-work-item guard as a second line of defence.
-        self.drop_session_open_entry(wi_id);
+        // Cancel any pending background session-open: signal the
+        // worker to skip remaining file writes, route the committed
+        // `mcp_config_path` through `spawn_agent_file_cleanup`, and
+        // end the "Opening session..." spinner. The worker will
+        // then finish and try to send; the send fails because the
+        // receiver is gone, and the thread exits.
+        // `finish_session_open` also has its own deleted-work-item
+        // guard as a second line of defence.
+        self.cancel_session_open_entry(wi_id);
     }
 
     /// Stop all MCP servers, clear activity state, and remove temp config files.
@@ -2713,15 +2749,44 @@ impl App {
         self.mcp_servers.clear();
         self.agent_working.clear();
         self.global_mcp_server = None;
-        // Route the global `--mcp-config` tempfile removal off the
-        // UI thread. `cleanup_all_mcp` runs during graceful
-        // shutdown but the event loop is still alive for up to 10
-        // seconds (waiting for child processes to exit); a wedged
-        // filesystem would freeze the shutdown-wait UI otherwise.
-        // See `docs/UI.md` "Blocking I/O Prohibition".
+        // Route every tempfile removal off the UI thread.
+        // `cleanup_all_mcp` runs during graceful shutdown but the
+        // event loop is still alive for up to 10 seconds (waiting
+        // for child processes to exit); a wedged filesystem would
+        // freeze the shutdown-wait UI otherwise. See `docs/UI.md`
+        // "Blocking I/O Prohibition".
+        //
+        // We collect paths from THREE sources so every in-flight
+        // or live tempfile is caught:
+        //   1. Live global assistant session (`global_mcp_config_path`)
+        //   2. In-flight global preparation worker
+        //      (`global_session_open_pending.config_path`)
+        //   3. In-flight work-item preparation workers
+        //      (`session_open_rx` entries' `mcp_config_path`)
+        //
+        // For (2) and (3) we also flip each worker's `cancelled`
+        // flag via `Ordering::Release` so workers that have not yet
+        // reached their Phase C `std::fs::write` skip the write and
+        // exit. Workers that already wrote before we flip the flag
+        // leave files on disk; the scheduled
+        // `spawn_agent_file_cleanup` removes them asynchronously
+        // on the same background thread.
         let mut files_to_clean: Vec<PathBuf> = Vec::new();
         if let Some(path) = self.global_mcp_config_path.take() {
             files_to_clean.push(path);
+        }
+        if let Some(pending) = self.global_session_open_pending.take() {
+            pending.cancelled.store(true, Ordering::Release);
+            self.end_activity(pending.activity);
+            files_to_clean.push(pending.config_path);
+        }
+        let pending_wi_ids: Vec<WorkItemId> = self.session_open_rx.keys().cloned().collect();
+        for wi_id in pending_wi_ids {
+            if let Some(entry) = self.session_open_rx.remove(&wi_id) {
+                entry.cancelled.store(true, Ordering::Release);
+                self.end_activity(entry.activity);
+                files_to_clean.push(entry.mcp_config_path);
+            }
         }
         self.spawn_agent_file_cleanup(files_to_clean);
     }
@@ -5056,6 +5121,29 @@ impl App {
         let wi_id_clone = work_item_id.clone();
         let cwd_clone = cwd.to_path_buf();
 
+        // Commit the temp `--mcp-config` path UP FRONT on the UI
+        // thread (not inside the worker) so the main thread knows
+        // exactly which file the worker will create, and can route
+        // it through `spawn_agent_file_cleanup` on cancellation
+        // without needing to see the worker's `SessionOpenPlanResult`.
+        // Per-call UUID so concurrent workers for different work
+        // items cannot collide on a shared filename.
+        let mcp_config_path = std::env::temp_dir().join(format!(
+            "workbridge-mcp-config-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        // Shared cancellation flag. `drop_session_open_entry` sets it
+        // (via `Ordering::Release`) when the user deletes the work
+        // item while the worker is still in flight; the worker
+        // checks it (via `Ordering::Acquire`) before each blocking
+        // operation and returns early on `true`. Combined with the
+        // UI-thread-committed `mcp_config_path`, this keeps the
+        // tempfile-leak window bounded.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_mcp_config_path = mcp_config_path.clone();
+
         // Precompute every MCP-setup input that requires `&self` here
         // on the UI thread. All of these are pure in-memory lookups;
         // no filesystem or subprocess calls happen in this block (the
@@ -5117,6 +5205,17 @@ impl App {
                 Err(e) => (String::new(), Some(format!("Could not read plan: {e}"))),
             };
 
+            // Cancellation check before any filesystem side effect.
+            // If the main thread cancelled this open (work item
+            // deleted, drawer closed, shutdown), bail out early
+            // without starting the MCP server or writing any
+            // side-car files. The `mcp_config_path` the main
+            // thread committed to is cleaned up by whichever site
+            // dropped the pending entry.
+            if worker_cancelled.load(Ordering::Acquire) {
+                return;
+            }
+
             // Phase B: start MCP socket server. The socket bind, the
             // stale-file remove, and the accept-loop thread spawn all
             // live inside `McpSocketServer::start`; running it here
@@ -5143,13 +5242,19 @@ impl App {
             // the temp `--mcp-config` file. Both are `std::fs::write`
             // calls that block on the worktree / tmpfs filesystem and
             // so must NEVER run on the UI thread. Only executed when
-            // the server came up; otherwise there is no socket to
-            // wire the agent CLI up to and the spawn proceeds in
-            // degraded mode with `mcp_config_path: None`.
+            // the server came up AND the open has not been
+            // cancelled; otherwise there is no socket to wire the
+            // agent CLI up to and the spawn proceeds in degraded
+            // mode with `mcp_config_path: None`. The cancellation
+            // check here is a best-effort race window reduction:
+            // the main thread's cleanup still owns `mcp_config_path`
+            // even if the flag flip happens after this load.
             let mut written_files: Vec<PathBuf> = Vec::new();
-            let mut mcp_config_path: Option<PathBuf> = None;
+            let mut mcp_config_path_out: Option<PathBuf> = None;
             let mut mcp_config_error: Option<String> = None;
-            if let Some(ref server) = server {
+            if let Some(ref server) = server
+                && !worker_cancelled.load(Ordering::Acquire)
+            {
                 match std::env::current_exe() {
                     Ok(exe) => {
                         let mcp_config = crate::mcp::build_mcp_config(
@@ -5167,21 +5272,24 @@ impl App {
                             }
                         }
 
-                        // Primary MCP wire-up: a per-spawn temp file
-                        // whose path flows into the backend via
-                        // `SpawnConfig::mcp_config_path`.
-                        let config_path = std::env::temp_dir().join(format!(
-                            "workbridge-mcp-config-{}.json",
-                            uuid::Uuid::new_v4()
-                        ));
-                        match std::fs::write(&config_path, &mcp_config) {
-                            Ok(()) => {
-                                written_files.push(config_path.clone());
-                                mcp_config_path = Some(config_path);
-                            }
-                            Err(e) => {
-                                if mcp_config_error.is_none() {
-                                    mcp_config_error = Some(format!("MCP config write error: {e}"));
+                        // Primary MCP wire-up: write to the
+                        // `mcp_config_path` the UI thread committed
+                        // to. The path flows back into the backend
+                        // via `SpawnConfig::mcp_config_path`. Re-check
+                        // the cancellation flag right before the
+                        // write so a rapid user cancel can still
+                        // skip the write in the common case.
+                        if !worker_cancelled.load(Ordering::Acquire) {
+                            match std::fs::write(&worker_mcp_config_path, &mcp_config) {
+                                Ok(()) => {
+                                    written_files.push(worker_mcp_config_path.clone());
+                                    mcp_config_path_out = Some(worker_mcp_config_path.clone());
+                                }
+                                Err(e) => {
+                                    if mcp_config_error.is_none() {
+                                        mcp_config_error =
+                                            Some(format!("MCP config write error: {e}"));
+                                    }
                                 }
                             }
                         }
@@ -5200,7 +5308,7 @@ impl App {
                 server,
                 server_error,
                 written_files,
-                mcp_config_path,
+                mcp_config_path: mcp_config_path_out,
                 mcp_config_error,
             });
         });
@@ -5210,16 +5318,53 @@ impl App {
         // ended in `poll_session_opens` for every terminal arm
         // (success, read_error, disconnect) via `drop_session_open_entry`.
         let activity = self.start_activity("Opening session...");
-        self.session_open_rx
-            .insert(work_item_id.clone(), SessionOpenPending { rx, activity });
+        self.session_open_rx.insert(
+            work_item_id.clone(),
+            SessionOpenPending {
+                rx,
+                activity,
+                cancelled,
+                mcp_config_path,
+            },
+        );
     }
 
     /// Remove a pending `session_open_rx` entry and end its spinner
-    /// activity. Centralising this keeps the two terminal paths
-    /// (result delivered, background thread disconnected) symmetric so
-    /// no terminal arm can leak a spinner.
+    /// activity after the worker has successfully delivered its
+    /// result. Does NOT set the cancellation flag and does NOT
+    /// schedule any file cleanup - the worker already wrote the
+    /// tempfile and the main thread is about to hand it to
+    /// `finish_session_open` which moves it into
+    /// `SessionEntry::agent_written_files`. Use
+    /// `cancel_session_open_entry` for the abort paths.
     fn drop_session_open_entry(&mut self, wi_id: &WorkItemId) {
         if let Some(entry) = self.session_open_rx.remove(wi_id) {
+            self.end_activity(entry.activity);
+        }
+    }
+
+    /// Cancel a pending `session_open_rx` entry: signal the worker to
+    /// skip any remaining file writes (via the shared
+    /// `cancelled: Arc<AtomicBool>`), route the UI-thread-committed
+    /// `mcp_config_path` through `spawn_agent_file_cleanup` so the
+    /// tempfile is not leaked to `/tmp` if the worker already wrote
+    /// it, and end the spinner activity. Called from every abort
+    /// path (`cleanup_session_state_for`, a dead-worker arm in
+    /// `poll_session_opens`, the stage-transition respawn path, and
+    /// `cleanup_all_mcp` at shutdown).
+    ///
+    /// There is still a sub-microsecond race window where the worker
+    /// loads `cancelled == false`, the main thread sets
+    /// `cancelled = true`, and the worker then writes the file
+    /// anyway. The scheduled `spawn_agent_file_cleanup` is
+    /// fire-and-forget and may run before that race resolves; under
+    /// a wedged filesystem the file can leak. This is acknowledged
+    /// in the `SessionOpenPending::cancelled` doc comment. The OS
+    /// tmp cleaner reaps orphaned entries eventually.
+    fn cancel_session_open_entry(&mut self, wi_id: &WorkItemId) {
+        if let Some(entry) = self.session_open_rx.remove(wi_id) {
+            entry.cancelled.store(true, Ordering::Release);
+            self.spawn_agent_file_cleanup(vec![entry.mcp_config_path]);
             self.end_activity(entry.activity);
         }
     }
@@ -5244,11 +5389,14 @@ impl App {
                     Ok(r) => r,
                     Err(crossbeam_channel::TryRecvError::Empty) => continue,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        // Background thread died without sending - drop
-                        // the entry (and end its spinner) so a retry is
-                        // possible and surface the failure in the status
-                        // bar.
-                        self.drop_session_open_entry(&wi_id);
+                        // Background thread died without sending - the
+                        // worker may have written its `.mcp.json` and
+                        // `--mcp-config` files before panicking, so
+                        // route the committed tempfile path through
+                        // `spawn_agent_file_cleanup` via
+                        // `cancel_session_open_entry` and end the
+                        // spinner so a retry is possible.
+                        self.cancel_session_open_entry(&wi_id);
                         self.status_message =
                             Some("Session open: background thread exited unexpectedly".into());
                         continue;
@@ -7696,12 +7844,15 @@ impl App {
         // BEFORE the session kill block. The plan-read receiver lives in
         // `session_open_rx` (no entry in `self.sessions` yet), so the
         // session-kill branch below would not see it; without this
-        // unconditional drop, a stale pending open from the old stage
-        // would survive the transition and `finish_session_open` would
-        // later spawn Claude for the new stage - including no-session
-        // stages like Done or Mergequeue. Dropping the entry here also
-        // ends the "Opening session..." spinner.
-        self.drop_session_open_entry(wi_id);
+        // unconditional cancel, a stale pending open from the old
+        // stage would survive the transition and `finish_session_open`
+        // would later spawn the agent for the new stage - including
+        // no-session stages like Done or Mergequeue. Cancelling the
+        // entry here also signals the worker to skip remaining file
+        // writes, routes the committed tempfile through
+        // `spawn_agent_file_cleanup`, and ends the
+        // "Opening session..." spinner.
+        self.cancel_session_open_entry(wi_id);
 
         // Kill the old session for this work item before spawning a new one.
         // Previously relied on orphan cleanup in check_liveness, but that
@@ -10887,16 +11038,19 @@ impl App {
     ///    don't leak into the next session on reopen.
     fn teardown_global_session(&mut self) {
         // Cancel any in-flight preparation. Take the pending entry so
-        // we can (a) end its spinner without leaking it, and (b)
-        // collect the `config_path` it committed to so we can route
-        // the cleanup through `spawn_agent_file_cleanup` alongside
-        // the durable-session config path below. The worker is left
-        // running; when its `tx.send(...)` fires on a dropped
-        // receiver the result is silently discarded (the `Session`
-        // and `McpSocketServer` handles run their own `Drop` impls
-        // and clean themselves up).
+        // we can (a) end its spinner without leaking it, (b) collect
+        // the `config_path` it committed to so we can route the
+        // cleanup through `spawn_agent_file_cleanup` alongside the
+        // durable-session config path below, and (c) flip the
+        // shared `cancelled` flag so the worker bails out of its
+        // remaining blocking operations before they run. The
+        // worker is left running; when its `tx.send(...)` fires on
+        // a dropped receiver the result is silently discarded (the
+        // `Session` and `McpSocketServer` handles run their own
+        // `Drop` impls and clean themselves up).
         let mut files_to_clean: Vec<PathBuf> = Vec::new();
         if let Some(pending) = self.global_session_open_pending.take() {
+            pending.cancelled.store(true, Ordering::Release);
             self.end_activity(pending.activity);
             files_to_clean.push(pending.config_path);
         }
@@ -10983,6 +11137,15 @@ impl App {
             uuid::Uuid::new_v4()
         ));
 
+        // Shared cancellation flag. `teardown_global_session` and
+        // `cleanup_all_mcp` set it via `Ordering::Release`; the
+        // worker checks it via `Ordering::Acquire` before each
+        // blocking operation and bails out early. See the matching
+        // flag on the work-item session path
+        // (`SessionOpenPending::cancelled`) for the race-window
+        // caveat.
+        let cancelled = Arc::new(AtomicBool::new(false));
+
         // Capture everything the worker needs. All Send + Sync.
         let mcp_context_shared = Arc::clone(&self.global_mcp_context);
         let mcp_tx = self.mcp_tx.clone();
@@ -10991,10 +11154,19 @@ impl App {
         let pane_rows = self.global_pane_rows;
         let pre_drawer_focus = self.pre_drawer_focus;
         let worker_config_path = config_path.clone();
+        let worker_cancelled = Arc::clone(&cancelled);
 
         let (tx, rx) = crossbeam_channel::bounded(1);
 
         std::thread::spawn(move || {
+            // Cancellation check before any blocking operation. If
+            // the main thread cancelled this spawn already (rapid
+            // Ctrl+G toggle, shutdown), bail out before the socket
+            // bind so no socket file is ever created.
+            if worker_cancelled.load(Ordering::Acquire) {
+                return;
+            }
+
             // Phase A: start the global MCP socket server. Socket
             // bind + stale-file remove + accept-loop thread spawn
             // all live here.
@@ -11011,6 +11183,14 @@ impl App {
                         return;
                     }
                 };
+
+            if worker_cancelled.load(Ordering::Acquire) {
+                // Drop the server we just started (its Drop impl
+                // stops the accept loop and removes the socket
+                // file) and exit without writing the tempfile.
+                drop(mcp_server);
+                return;
+            }
 
             // Phase B: resolve exe path and build MCP config bytes.
             let exe = match std::env::current_exe() {
@@ -11034,7 +11214,14 @@ impl App {
             // `teardown_global_session` can clean it up via
             // `spawn_agent_file_cleanup` if the drawer closes
             // mid-flight - the worker itself never needs to remove
-            // the file on a cancellation path.
+            // the file on a cancellation path. Last cancellation
+            // check right before the write; covers the common case
+            // where the user toggles the drawer while the worker
+            // is between Phase A and Phase C.
+            if worker_cancelled.load(Ordering::Acquire) {
+                drop(mcp_server);
+                return;
+            }
             if let Err(e) = std::fs::write(&worker_config_path, &mcp_config) {
                 let _ = tx.send(GlobalSessionPrepResult {
                     mcp_server: Some(mcp_server),
@@ -11058,6 +11245,10 @@ impl App {
             // per-user and stable across reboots. `create_dir_all`
             // is idempotent and handles the case where the OS tmp
             // cleaner has wiped the directory since the last spawn.
+            if worker_cancelled.load(Ordering::Acquire) {
+                drop(mcp_server);
+                return;
+            }
             let scratch = std::env::temp_dir().join("workbridge-global-assistant-cwd");
             if let Err(e) = std::fs::create_dir_all(&scratch) {
                 let _ = tx.send(GlobalSessionPrepResult {
@@ -11089,7 +11280,12 @@ impl App {
             // Phase F: spawn the PTY session. The fork+exec is
             // normally sub-millisecond but still blocks on process
             // creation, so it runs here rather than on the UI
-            // thread.
+            // thread. Last cancellation check: skip the fork+exec
+            // if the drawer was closed while we were in Phase C/D.
+            if worker_cancelled.load(Ordering::Acquire) {
+                drop(mcp_server);
+                return;
+            }
             let session = match Session::spawn(pane_cols, pane_rows, Some(&scratch), &cmd_refs) {
                 Ok(s) => s,
                 Err(e) => {
@@ -11127,6 +11323,7 @@ impl App {
             activity,
             pre_drawer_focus,
             config_path,
+            cancelled,
         });
     }
 
