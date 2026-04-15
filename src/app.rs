@@ -932,8 +932,6 @@ pub struct App {
     /// Work item IDs where Claude has signaled it is actively working
     /// (via workbridge_set_activity). Cleared when the session dies.
     pub claude_working: std::collections::HashSet<WorkItemId>,
-    /// Paths to .mcp.json files written to worktrees, keyed by work item ID.
-    /// Tracked so they can be cleaned up when sessions die or work items are deleted.
     /// Receiver for MCP events from all socket servers.
     pub mcp_rx: Option<crossbeam_channel::Receiver<McpEvent>>,
     /// Sender for MCP events (cloned for each socket server).
@@ -1656,7 +1654,7 @@ impl App {
     ///
     /// The reader threads handle PTY output continuously - no reading
     /// happens here. This only checks if child processes have exited.
-    /// Also cleans up .mcp.json files and MCP servers for dead sessions.
+    /// Also cleans up MCP servers for dead sessions.
     pub fn check_liveness(&mut self) {
         let mut dead_ids: Vec<WorkItemId> = Vec::new();
         let mut dead_implementing: Vec<WorkItemId> = Vec::new();
@@ -3667,10 +3665,12 @@ impl App {
     /// three conditions hold:
     ///
     /// 1. It is registered with git for the target `branch`.
-    /// 2. It is NOT the main worktree (`is_main = false`). Reusing the
-    ///    user's primary repo checkout would spawn Claude sessions inside
-    ///    it and drop workbridge state (`.mcp.json`) there, violating
-    ///    invariant #3 in `docs/invariants.md`.
+    /// 2. It is NOT the main worktree (`is_main = false`). The main
+    ///    worktree is pinned to the repo's default branch, and
+    ///    invariant #3 in `docs/invariants.md` forbids a work-item
+    ///    worktree on the default branch - reusing it would root the
+    ///    work item's session lifecycle inside the user's primary
+    ///    checkout and violate that invariant.
     /// 3. Its canonicalized path equals the canonicalized `wt_target` the
     ///    import/session-spawn flow would have created. This rules out
     ///    adopting unrelated worktrees the user made manually or that
@@ -4051,9 +4051,13 @@ impl App {
             has_gate_findings,
         );
 
-        // Write MCP config as .mcp.json in the worktree AND pass via --mcp-config.
-        // Both are needed: .mcp.json for Claude Code's project discovery, --mcp-config
-        // as a backup. The socket must be listening before Claude starts (it is - the
+        // Deliver the MCP config to Claude Code exclusively via
+        // `--mcp-config <tempfile>`. The temp file lives under
+        // `std::env::temp_dir()` (workbridge-owned) so no harness state
+        // is dropped into the user's worktree - see the "file
+        // injection" rule in CLAUDE.md severity overrides (commit
+        // acafae8) and the C4 clause in docs/harness-contract.md. The
+        // socket must be listening before Claude starts (it is - the
         // socket server was started above).
         if let Ok((ref server, _)) = mcp_result {
             match std::env::current_exe() {
@@ -4075,13 +4079,6 @@ impl App {
                     let mcp_config =
                         crate::mcp::build_mcp_config(&exe, &server.socket_path, &repo_mcp_servers);
 
-                    // Write .mcp.json to the worktree root.
-                    let mcp_json_path = cwd.join(".mcp.json");
-                    if let Err(e) = std::fs::write(&mcp_json_path, &mcp_config) {
-                        self.status_message = Some(format!("MCP config write error: {e}"));
-                    }
-
-                    // Also pass via --mcp-config as a temp file.
                     let config_path = std::env::temp_dir().join(format!(
                         "workbridge-mcp-config-{}.json",
                         uuid::Uuid::new_v4()
@@ -16381,6 +16378,103 @@ mod tests {
         // End the spinner activity since `poll_session_opens` was
         // bypassed by the manual drain above.
         app.end_activity(entry.activity);
+    }
+
+    #[test]
+    fn finish_session_open_does_not_write_mcp_json_into_worktree() {
+        // Regression guard for the P1 "file injection" review rule
+        // added to `CLAUDE.md` in commit `acafae8` ("Add P1 review
+        // rule: no harness-config file injection into worktrees",
+        // PR #97). Prior to this test, `finish_session_open` wrote
+        // `.mcp.json` to `cwd.join(".mcp.json")` alongside the
+        // `--mcp-config <tempfile>` argv delivery. That in-worktree
+        // write leaked harness state into user repos (observed in
+        // `Wordlike`, `GymApp`, `webometer`, which do not gitignore
+        // `.mcp.json`) and carried a silent-overwrite risk against a
+        // pre-existing user `.mcp.json`. The fix is a pure deletion
+        // of the write; MCP config keeps reaching Claude Code through
+        // the `--mcp-config <temp file under std::env::temp_dir()>`
+        // argv pair, which is workbridge-owned and unaffected.
+        //
+        // Proof: build an `App`, enqueue a session open against a
+        // real `tempfile::tempdir()` cwd, drain the background
+        // plan-read deterministically, and call `finish_session_open`
+        // directly (the same code path `poll_session_opens` would
+        // invoke). `Session::spawn` will fail cleanly - no `claude`
+        // binary is present in the test harness - but the failure is
+        // irrelevant to the assertion: we are pinning the file-write
+        // path, not the process launch path. After the call, the
+        // worktree's `.mcp.json` MUST NOT exist. A future refactor
+        // that reintroduces the write will fail this test with a
+        // traceable reason citing the rule and the PR.
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+
+        // Real tempdir so we can assert filesystem state after the
+        // call. The `.mcp.json` path being guarded is
+        // `cwd.join(".mcp.json")`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+
+        let wi_id = WorkItemId::LocalFile(PathBuf::from(
+            "/tmp/workbridge-no-mcp-json-in-worktree.json",
+        ));
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "no-mcp-json-write-in-worktree".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: cwd.clone(),
+                branch: Some("feature/no-mcp-json".into()),
+                worktree_path: Some(cwd.clone()),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+
+        // Enqueue the plan read on the background thread, then drain
+        // the result the same way `poll_session_opens` does on the UI
+        // thread - manually, via `recv_timeout`, so the test is
+        // deterministic instead of sleep-polling.
+        app.begin_session_open(&wi_id, &cwd);
+        let entry = app
+            .session_open_rx
+            .remove(&wi_id)
+            .expect("begin_session_open must register a pending receiver");
+        let result = entry
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("background plan-read must deliver a result");
+        app.end_activity(entry.activity);
+
+        // This is the function under test. The surfaced status
+        // message (from either the MCP config temp-write or the
+        // downstream `Session::spawn` failure) is irrelevant to the
+        // assertion below.
+        app.finish_session_open(&result.wi_id, &result.cwd, result.plan_text);
+
+        assert!(
+            !cwd.join(".mcp.json").exists(),
+            "finish_session_open must NOT drop `.mcp.json` into the \
+             work-item worktree - doing so pollutes user repos that do \
+             not gitignore the file and violates the CLAUDE.md \
+             'file injection' review rule (commit acafae8). MCP config \
+             is delivered exclusively via `--mcp-config <tempfile>` \
+             under std::env::temp_dir(); see `finish_session_open` and \
+             the C4 clause in docs/harness-contract.md.",
+        );
     }
 
     #[test]

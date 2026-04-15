@@ -366,13 +366,17 @@ clause violation.
 
 **Claude (reference)**: `build_mcp_config` in `src/mcp.rs:1378`
 produces the JSON blob, and `McpSocketServer::start` at
-`src/mcp.rs:80` starts the accept loop. Work-item spawns write
-`.mcp.json` to the worktree root (`src/app.rs:3906`) AND pass
-`--mcp-config <tempfile>` at `src/app.rs:3919`; the review gate
-passes only `--mcp-config` at `src/app.rs:7795`; the global
-assistant passes only `--mcp-config` at `src/app.rs:8285`. The
-bridge process is the same workbridge binary re-invoked with
-`--mcp-bridge --socket <path>` (see `build_mcp_config`).
+`src/mcp.rs:80` starts the accept loop. All three spawn sites
+deliver the MCP config exclusively via `--mcp-config <tempfile>`
+under `std::env::temp_dir()` (workbridge-owned): work-item spawns
+at `src/app.rs:4089` (see `finish_session_open`), the review gate
+at `src/app.rs:7965`, and the global assistant at
+`src/app.rs:8455`. No spawn site drops `.mcp.json` or any other
+harness-state file into the worktree - doing so would violate the
+"file injection" invariant cross-referenced in C2 (CLAUDE.md
+severity overrides). The bridge process is the same workbridge
+binary re-invoked with `--mcp-bridge --socket <path>` (see
+`build_mcp_config`).
 
 **Codex (secondary, not implemented)**: **workaround**. Codex reads
 MCP server definitions from `~/.codex/config.toml` under
@@ -571,11 +575,12 @@ claude
   --mcp-config /tmp/workbridge-mcp-config-<uuid>.json
 ```
 
-Source: `App::build_claude_cmd` at `src/app.rs:3967`, followed by
-the `--mcp-config` append at `src/app.rs:3919`. Cwd: the work
-item's worktree path. The positional prompt MUST precede
-`--mcp-config`; see the regression test
-`build_claude_cmd_prompt_before_mcp_config` at `src/app.rs:12834`.
+Source: `App::build_claude_cmd` at `src/app.rs:4137`, followed by
+the `--mcp-config` append inside `finish_session_open` at
+`src/app.rs:4089`. Cwd: the work item's worktree path. The
+positional prompt MUST precede `--mcp-config`; see the regression
+test `build_claude_cmd_prompt_before_mcp_config` at
+`src/app.rs:13104`.
 
 ### RP2 - Headless review-gate argv
 
@@ -865,3 +870,19 @@ harness adapter is introduced, add a dated bullet here.
   3870 -> 3967, review-gate Command::new 7500 -> 7784,
   spawn_global_session 7884 -> 8201, etc.). The Known Spawn Sites
   table now reflects the new line numbers and the new Global cwd.
+- 2026-04-15: Dropped the in-worktree `.mcp.json` write from the
+  work-item interactive spawn path (`finish_session_open`). All
+  three spawn sites now deliver the MCP config exclusively through
+  `--mcp-config <tempfile>` under `std::env::temp_dir()`; no
+  workbridge state file is ever written into the user's worktree.
+  This brings the C4 description in line with the "file injection"
+  invariant cross-referenced in C2 (CLAUDE.md severity overrides,
+  review rule added in commit `acafae8`). Observable motivation:
+  new work items rooted in repos that did NOT gitignore
+  `.mcp.json` (e.g. `Wordlike`, `GymApp`, `webometer`) were being
+  dirtied on session spawn. Updated C4 and RP1 source references
+  to the new work-item spawn layout (`--mcp-config` append now
+  lives inside `finish_session_open` at `src/app.rs:4089`,
+  `build_claude_cmd` is at `src/app.rs:4137`). Known Spawn Sites
+  table is unchanged by this PR - the spawn sites themselves did
+  not move, only the adjacent file write was deleted.
