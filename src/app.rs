@@ -8858,11 +8858,21 @@ impl App {
 
                         // Kill and respawn the session with the rework
                         // prompt so Claude sees the rejection reason.
+                        // Route through `teardown_live_session_async`
+                        // so SIGTERM + grace + SIGKILL + wait runs on
+                        // a background thread - `poll_review_gate`
+                        // runs on the UI tick path and the inline
+                        // `session.kill()` was a Codex adversarial-
+                        // review P0 under the blocking-I/O rule.
                         if let Some(key) = self.session_key_for(&wi_id)
-                            && let Some(mut entry) = self.sessions.remove(&key)
-                            && let Some(ref mut session) = entry.session
+                            && let Some(entry) = self.sessions.remove(&key)
                         {
-                            session.kill();
+                            let mcp_server = self.mcp_servers.remove(&wi_id);
+                            if let Some(session) = entry.session {
+                                Self::teardown_live_session_async(session, mcp_server);
+                            } else if let Some(mcp) = mcp_server {
+                                Self::teardown_mcp_server_async(mcp);
+                            }
                         }
                         self.cleanup_session_state_for(&wi_id);
                         self.spawn_session(&wi_id);
@@ -8970,11 +8980,20 @@ impl App {
 
                 // Kill the current session and respawn with the implementing_rework
                 // prompt that includes the rejection feedback.
+                // Symmetric with the blocked-gate arm above: route the
+                // live session and its paired MCP server through
+                // `teardown_live_session_async` so the SIGTERM grace
+                // window does not block the UI tick path. Codex
+                // adversarial-review P0.
                 if let Some(key) = self.session_key_for(&wi_id)
-                    && let Some(mut entry) = self.sessions.remove(&key)
-                    && let Some(ref mut session) = entry.session
+                    && let Some(entry) = self.sessions.remove(&key)
                 {
-                    session.kill();
+                    let mcp_server = self.mcp_servers.remove(&wi_id);
+                    if let Some(session) = entry.session {
+                        Self::teardown_live_session_async(session, mcp_server);
+                    } else if let Some(mcp) = mcp_server {
+                        Self::teardown_mcp_server_async(mcp);
+                    }
                 }
                 self.cleanup_session_state_for(&wi_id);
                 self.spawn_session(&wi_id);
@@ -9037,26 +9056,57 @@ impl App {
     /// resources. Safe to call when no session exists.
     ///
     /// Steps:
-    /// 1. SIGTERM + 50 ms grace + SIGKILL the `claude` child process via
-    ///    `Session::kill` so no zombie survives.
-    /// 2. Drop the `SessionEntry`; `Session::Drop` joins the reader thread.
-    /// 3. Drop the MCP server (same as `cleanup_all_mcp`).
-    /// 4. Remove the temp MCP config file and clear its path.
-    /// 5. Drop any keystrokes queued for the old session's PTY so they
-    ///    don't leak into the next session on reopen.
+    /// 1. Take the `SessionEntry`, MCP server, and temp config path
+    ///    OUT of the App state synchronously (pure in-memory map
+    ///    writes - no I/O).
+    /// 2. Hand the live session + MCP server + temp config path to
+    ///    a background thread that runs `Session::kill`
+    ///    (SIGTERM + grace + SIGKILL + wait), then drops the
+    ///    session (closes the master fd, joins the reader thread),
+    ///    then drops the MCP server (`stop()` + `remove_file` on
+    ///    the socket), then unlinks the temp MCP config file.
+    /// 3. Drop any keystrokes queued for the old session's PTY so
+    ///    they don't leak into the next session on reopen.
+    ///
+    /// This routing is required by `docs/UI.md` "Blocking I/O
+    /// Prohibition": `toggle_global_drawer` calls this function on
+    /// the UI tick path (both when closing the drawer and
+    /// defensively before opening a new one), and every blocking
+    /// operation in the old sequential implementation - the
+    /// SIGTERM grace sleep, the `child.wait` reap, the reader
+    /// thread join, the MCP socket unlink, the temp config
+    /// unlink - was running inline. Codex adversarial review
+    /// flagged the same pattern in `apply_stage_change` /
+    /// `check_liveness` / `poll_review_gate`; this fix extends it
+    /// to the global assistant drawer.
     fn teardown_global_session(&mut self) {
-        if let Some(ref mut entry) = self.global_session
-            && let Some(ref mut session) = entry.session
-        {
-            session.kill();
-        }
-        self.global_session = None;
-        self.global_mcp_server = None;
-        if let Some(ref path) = self.global_mcp_config_path {
-            let _ = std::fs::remove_file(path);
-        }
-        self.global_mcp_config_path = None;
+        let session = self
+            .global_session
+            .take()
+            .and_then(|mut entry| entry.session.take());
+        let mcp_server = self.global_mcp_server.take();
+        let config_path = self.global_mcp_config_path.take();
         self.pending_global_pty_bytes.clear();
+
+        if session.is_some() || mcp_server.is_some() || config_path.is_some() {
+            std::thread::spawn(move || {
+                // Graceful kill first if we have a session.
+                if let Some(mut session) = session {
+                    session.kill();
+                    drop(session);
+                }
+                // Then drop the MCP server (runs stop() +
+                // remove_file(socket_path)).
+                drop(mcp_server);
+                // Finally unlink the temp MCP config file. A
+                // failure here is benign - it's a temp file, and
+                // /tmp cleanup will catch it on reboot if
+                // nothing else does.
+                if let Some(path) = config_path {
+                    let _ = std::fs::remove_file(path);
+                }
+            });
+        }
     }
 
     /// Spawn the global assistant Claude Code session.
@@ -13572,6 +13622,10 @@ mod tests {
 
         app.teardown_global_session();
 
+        // In-memory state must be cleared synchronously on the
+        // UI thread. Only the blocking I/O (session kill, MCP
+        // socket unlink, temp config unlink) is deferred to a
+        // background thread.
         assert!(
             app.global_session.is_none(),
             "global_session must be cleared",
@@ -13589,9 +13643,19 @@ mod tests {
             "pending_global_pty_bytes must be drained so stale keystrokes \
              don't leak into the next session",
         );
+        // File deletion runs on a background thread per the
+        // Codex adversarial-review fix for
+        // `docs/UI.md` "Blocking I/O Prohibition" - poll for it
+        // with a short timeout. If the file is still present
+        // after ~500ms something is wrong.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while temp_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(
             !temp_path.exists(),
-            "teardown must delete the temp MCP config file from disk",
+            "teardown must (asynchronously) delete the temp MCP config \
+             file from disk",
         );
     }
 
@@ -13664,9 +13728,17 @@ mod tests {
             app.pending_global_pty_bytes.is_empty(),
             "close must drain pending_global_pty_bytes",
         );
+        // File deletion runs on a background thread per the
+        // Codex adversarial-review fix for
+        // `docs/UI.md` "Blocking I/O Prohibition". Poll with a
+        // short timeout.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while temp_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(
             !temp_path.exists(),
-            "close must delete the temp MCP config file",
+            "close must (asynchronously) delete the temp MCP config file",
         );
     }
 
