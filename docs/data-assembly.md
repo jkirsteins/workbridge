@@ -65,16 +65,35 @@ branches. This is a one-time migration - once all Done items have
 ### Tier 0: Local git (instant, always available)
 
 - Worktree path and existence (matched by branch name)
-- Dirty/clean status (not yet implemented - hardcoded to false)
-- Ahead/behind remote tracking branch (not yet implemented - hardcoded to 0/0)
+- Dirty/clean status (modified/staged/renamed/deleted tracked files) and
+  untracked-files presence - derived per-worktree by the background
+  fetcher from `git status --porcelain -uall` and cached on
+  `WorktreeInfo.dirty` / `WorktreeInfo.untracked`.
+- Ahead/behind remote tracking branch - derived per-worktree by the
+  background fetcher from `git rev-list --left-right --count HEAD...@{u}`
+  and cached on `WorktreeInfo.unpushed` / `WorktreeInfo.behind_remote`.
+  Missing upstream (e.g. newly-created local branch never pushed)
+  leaves both fields as `None` so they do not count as "unclean".
 
 This data comes from local git operations that complete in milliseconds.
 It is always available, even offline. Combined with Tier -1 data, the UI
 renders the sidebar with work item names and local git status on startup.
 
-Note: the GitState struct exists in the data model and is populated during
-assembly, but dirty/ahead/behind values are currently hardcoded placeholders.
-Real git state derivation is planned.
+The `GitState` struct is populated during assembly by projecting the
+cached `WorktreeInfo` fields:
+
+  - `GitState.dirty = wt.dirty || wt.untracked` - the union, because the
+    `!cl` list chip treats both the same way. Callers that need to
+    distinguish them (e.g. the merge-guard alert wording) go through
+    `App::worktree_cleanliness`, which reads the raw `WorktreeInfo`
+    fields directly and returns a `WorktreeCleanliness` enum.
+  - `GitState.ahead = wt.unpushed.unwrap_or(0)`
+  - `GitState.behind = wt.behind_remote.unwrap_or(0)`
+
+Reading these values on the UI thread is always a pure in-memory
+projection - no `git` subprocess is spawned from
+`format_work_item_entry`, `advance_stage`, or `execute_merge`. See
+`docs/UI.md` "Blocking I/O Prohibition" for the underlying rule.
 
 ### Tier 1: Git remote (fast, usually available)
 

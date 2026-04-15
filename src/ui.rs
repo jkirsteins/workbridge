@@ -1108,6 +1108,100 @@ fn find_current_group_header(display_list: &[DisplayEntry], offset: usize) -> Op
     None
 }
 
+/// Predict the `ListState::offset()` that ratatui's `List` widget will choose
+/// when rendered with the given per-item row heights, previous offset,
+/// selection, and available body height.
+///
+/// This mirrors `ratatui_widgets::list::List::get_items_bounds` for the
+/// default `scroll_padding = 0` case, and also mirrors the `ListState::select`
+/// side effect that resets `offset` to 0 when the selection is cleared
+/// (see `ratatui_widgets::list::state::ListState::select`). The production
+/// call site in `draw_work_item_list` runs
+/// `ListState::default().with_offset(predicted).select(selected)` in that
+/// order, so when `selected` is `None` ratatui will render from offset 0
+/// regardless of `prev_offset`, and this predictor matches that behavior.
+///
+/// It exists so the sticky-header overlay can reserve a dedicated row at
+/// the top of the list's inner area **before** the `List` widget renders,
+/// guaranteeing that the selected (and topmost visible) item is never
+/// painted over by the sticky row.
+///
+/// The predictor is kept faithful by the parallel-render tests in
+/// `mod sticky_header_tests` which compare its output against a real `List`
+/// rendered into a `TestBackend`.
+fn predict_list_offset(
+    item_heights: &[usize],
+    prev_offset: usize,
+    selected: Option<usize>,
+    max_height: usize,
+) -> usize {
+    if item_heights.is_empty() {
+        return 0;
+    }
+
+    let last_valid_index = item_heights.len() - 1;
+    // Mirror `ListState::select(None)`'s side effect: clearing the
+    // selection also resets the offset to 0. This matches what ratatui
+    // will actually render when the production call site invokes
+    // `state.select(None)` after `with_offset`.
+    let effective_prev_offset = match selected {
+        Some(_) => prev_offset.min(last_valid_index),
+        None => 0,
+    };
+    if max_height == 0 {
+        return effective_prev_offset;
+    }
+    let mut first_visible_index = effective_prev_offset;
+    let mut last_visible_index = first_visible_index;
+    let mut height_from_offset: usize = 0;
+
+    // Walk forward from the current offset, summing heights until the next
+    // item would overflow the viewport. After this loop `last_visible_index`
+    // is the exclusive end of the visible range (i.e. one past the last
+    // fully-visible item).
+    for h in item_heights.iter().skip(first_visible_index) {
+        if height_from_offset + h > max_height {
+            break;
+        }
+        height_from_offset += h;
+        last_visible_index += 1;
+    }
+
+    // With `scroll_padding = 0` the index we must keep on screen is just the
+    // selected item (falling back to the offset when nothing is selected).
+    let index_to_display = match selected {
+        Some(s) => s.min(last_valid_index),
+        None => first_visible_index,
+    };
+
+    // If the selected item is past the current viewport, scroll down: add
+    // items to the tail and drop items from the head until the selected
+    // index is visible.
+    while index_to_display >= last_visible_index {
+        height_from_offset = height_from_offset.saturating_add(item_heights[last_visible_index]);
+        last_visible_index += 1;
+        while height_from_offset > max_height && first_visible_index < last_visible_index {
+            height_from_offset =
+                height_from_offset.saturating_sub(item_heights[first_visible_index]);
+            first_visible_index += 1;
+        }
+    }
+
+    // If the selected item is before the current viewport, scroll up: add
+    // items to the head and drop items from the tail.
+    while index_to_display < first_visible_index {
+        first_visible_index -= 1;
+        height_from_offset = height_from_offset.saturating_add(item_heights[first_visible_index]);
+        while height_from_offset > max_height && last_visible_index > first_visible_index + 1 {
+            last_visible_index -= 1;
+            height_from_offset =
+                height_from_offset.saturating_sub(item_heights[last_visible_index]);
+        }
+    }
+
+    first_visible_index
+}
+
 fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // When the settings overlay is open, dim background panels so the
     // overlay is the clear focal point.
@@ -1207,65 +1301,128 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     let item_heights: Vec<usize> = items.iter().map(ListItem::height).collect();
     let total_rows: usize = item_heights.iter().sum();
 
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(theme.style_tab_highlight_bg());
+    // Draw the block (borders + title) directly into `area` so we can
+    // split the inner area ourselves and hand only a sub-rect to the
+    // `List` widget. This lets us reserve a dedicated 1-row slot at the
+    // top of the inner area for the sticky group header, guaranteeing
+    // the selected work item is never painted over by the sticky row.
+    Widget::render(block, area, buf);
+    let inner = area.inner(Margin::new(1, 1));
 
-    let mut state = ListState::default().with_offset(app.list_scroll_offset.get());
-    state.select(app.selected_item);
+    // Decide whether to reserve a sticky-header slot this frame. In
+    // board drill-down mode there are no group headers at all, so we
+    // never reserve. Otherwise we call `predict_list_offset` twice to
+    // converge on a stable decision: first with the full inner height
+    // to see if a sticky would fire, then (if yes) with `inner.height - 1`
+    // so ratatui's `List` math already accounts for the slot we're about
+    // to reserve.
+    let prev_offset = app.list_scroll_offset.get();
+    let selected = app.selected_item;
+    let drill_down = app.board_drill_stage.is_some();
 
-    StatefulWidget::render(list, area, buf, &mut state);
+    let (predicted_offset, body_area, sticky_slot) = if drill_down || inner.height < 2 {
+        let predicted =
+            predict_list_offset(&item_heights, prev_offset, selected, inner.height as usize);
+        (predicted, inner, None)
+    } else {
+        let offset_without_slot =
+            predict_list_offset(&item_heights, prev_offset, selected, inner.height as usize);
+        let sticky_would_fire = find_current_group_header(&app.display_list, offset_without_slot)
+            .is_some_and(|h| h < offset_without_slot);
+
+        if sticky_would_fire {
+            let body_height = inner.height - 1;
+            let offset_with_slot =
+                predict_list_offset(&item_heights, prev_offset, selected, body_height as usize);
+            let slot = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            };
+            let body = Rect {
+                x: inner.x,
+                y: inner.y + 1,
+                width: inner.width,
+                height: body_height,
+            };
+            (offset_with_slot, body, Some(slot))
+        } else {
+            (offset_without_slot, inner, None)
+        }
+    };
+
+    let list = List::new(items).highlight_style(theme.style_tab_highlight_bg());
+
+    let mut state = ListState::default().with_offset(predicted_offset);
+    state.select(selected);
+
+    StatefulWidget::render(list, body_area, buf, &mut state);
 
     // Persist the (possibly adjusted) offset for the next frame.
     app.list_scroll_offset.set(state.offset());
 
-    // --- Sticky group header overlay ---
-    // When a group header has scrolled above the viewport, render it pinned
-    // at the top of the list's inner area so the user always knows which
-    // group the visible items belong to.
-    if app.board_drill_stage.is_none() {
-        let offset = state.offset();
-        if let Some(header_idx) = find_current_group_header(&app.display_list, offset) {
-            // Only show sticky header when the original is NOT visible
-            // (i.e., it has scrolled above the viewport).
-            if header_idx < offset
-                && let DisplayEntry::GroupHeader {
+    // --- Sticky group header ---
+    // Paint the reserved slot (if any) using the post-render offset to
+    // cover any residual drift between the prediction and ratatui's
+    // actual scroll math. Because the slot was reserved structurally
+    // via `Layout`, the `List` body never overlaps it.
+    if !drill_down {
+        let actual_offset = state.offset();
+        let header_needed = find_current_group_header(&app.display_list, actual_offset)
+            .filter(|&h| h < actual_offset);
+
+        match (sticky_slot, header_needed) {
+            (Some(slot), Some(header_idx)) => {
+                if let DisplayEntry::GroupHeader {
                     ref label,
                     count,
                     ref kind,
                 } = app.display_list[header_idx]
-            {
-                let text = format!("{label} ({count})");
-                let style = match kind {
-                    GroupHeaderKind::Blocked => theme.style_sticky_header_blocked(),
-                    GroupHeaderKind::Normal => theme.style_sticky_header(),
-                };
-                // The block has Borders::ALL, so the inner area has 1-cell
-                // margin on each side.
-                let inner = area.inner(Margin::new(1, 1));
-                let sticky_area = Rect {
-                    x: inner.x,
-                    y: inner.y,
-                    width: inner.width,
-                    height: 1,
-                };
-                // Fill the entire row with the sticky background so it
-                // visually separates from the highlighted item below.
-                let bg_style = Style::default().bg(theme.sticky_header_bg);
-                let line = Line::from(vec![
-                    Span::styled("  ", bg_style),
-                    Span::styled(text, style),
-                ]);
-                Paragraph::new(line)
-                    .style(bg_style)
-                    .render(sticky_area, buf);
+                {
+                    let text = format!("{label} ({count})");
+                    let style = match kind {
+                        GroupHeaderKind::Blocked => theme.style_sticky_header_blocked(),
+                        GroupHeaderKind::Normal => theme.style_sticky_header(),
+                    };
+                    // Fill the entire row with the sticky background so it
+                    // visually separates from the highlighted item below.
+                    let bg_style = Style::default().bg(theme.sticky_header_bg);
+                    let line = Line::from(vec![
+                        Span::styled("  ", bg_style),
+                        Span::styled(text, style),
+                    ]);
+                    Paragraph::new(line).style(bg_style).render(slot, buf);
+                }
             }
+            (Some(_), None) => {
+                // Predicted a sticky but the actual offset doesn't need
+                // one. Slot stays blank - a 1-row waste, no visual harm.
+                debug_assert!(
+                    false,
+                    "sticky slot reserved but actual offset {actual_offset} does not need one"
+                );
+            }
+            (None, Some(_)) => {
+                // Predicted no slot but actual offset now needs one. This
+                // is a 1-frame glitch (selection jump edge case); the next
+                // frame will reserve correctly. We deliberately do NOT
+                // fall back to overlay-painting here, because that would
+                // reintroduce the overlap bug we just fixed.
+                debug_assert!(
+                    false,
+                    "sticky header needed at offset {actual_offset} but no slot was reserved"
+                );
+            }
+            (None, None) => {}
         }
     }
 
-    // Scrollbar - only when content overflows the viewport.
-    let inner_height = area.height.saturating_sub(2) as usize;
-    if total_rows > inner_height || state.offset() > 0 {
+    // Scrollbar - only when content overflows the list body. We use
+    // `body_area.height` (not `inner.height`) so the scrollbar track
+    // matches whichever area the `List` was rendered into.
+    let body_height = body_area.height as usize;
+    if total_rows > body_height || state.offset() > 0 {
         // Convert the item-based offset to a row-based offset so the
         // scrollbar thumb position matches the actual viewport scroll.
         let row_offset: usize = item_heights.iter().take(state.offset()).sum();
@@ -1277,9 +1434,28 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
             .thumb_style(theme.style_scrollbar_thumb())
             .track_style(theme.style_scrollbar_track());
 
-        let mut scrollbar_state = ScrollbarState::new(total_rows).position(row_offset);
+        // Ratatui's `Scrollbar::part_lengths` requires
+        // `position == content_length - 1` for the thumb's lower edge to
+        // reach the bottom of the track. The number of distinct row-granular
+        // scroll positions is `max_row_offset + 1`, so we size
+        // `content_length` accordingly and clamp `row_offset` to guard
+        // against variable-height edge cases where the list may reserve
+        // blank rows below the last item. `body_height` (not the block's
+        // full inner height) is the correct viewport size because the
+        // sticky slot reservation shrinks the area the `List` renders into.
+        let max_row_offset = total_rows.saturating_sub(body_height);
+        let content_length = max_row_offset + 1;
+        let position = row_offset.min(max_row_offset);
+        let mut scrollbar_state = ScrollbarState::new(content_length)
+            .viewport_content_length(body_height)
+            .position(position);
 
-        let scrollbar_area = area.inner(Margin::new(0, 1));
+        let scrollbar_area = Rect {
+            x: area.x,
+            y: body_area.y,
+            width: area.width,
+            height: body_area.height,
+        };
         StatefulWidget::render(scrollbar, scrollbar_area, buf, &mut scrollbar_state);
     }
 }
@@ -1299,40 +1475,80 @@ fn format_review_request_item<'a>(
         return ListItem::new(Line::from(format!("{margin}R <invalid>")));
     };
 
+    // Right-column text: PR badge + optional draft marker + optional
+    // reviewer badge. Assembled into a single String first so the wrap
+    // helper can reserve enough width on the first line for the whole
+    // stack - the spans are rebuilt below once the title is wrapped.
     let pr_badge = format!("PR#{}", rr.pr.number);
-    let mut draft_suffix = String::new();
-    if rr.pr.is_draft {
-        draft_suffix.push_str(" draft");
-    }
-    let right = format!("{pr_badge}{draft_suffix}");
+    let draft_suffix = if rr.pr.is_draft { " draft" } else { "" };
+    let reviewer_badge = rr.reviewer_badge(app.current_user_login.as_deref());
+    let reviewer_suffix = reviewer_badge
+        .as_deref()
+        .map(|s| format!(" {s}"))
+        .unwrap_or_default();
+    let right = format!("{pr_badge}{draft_suffix}{reviewer_suffix}");
 
     let title = &rr.pr.title;
 
-    // Layout: "{margin}R title    PR#N [draft]"
+    // Layout mirrors `format_work_item_entry`: the first line shares
+    // horizontal space with the right-column stack, continuation lines
+    // get the full panel width (minus the "R " prefix indent). The row
+    // marker is a fixed 2-column prefix so both widths subtract it.
     let prefix = "R ";
-    let available = content_width
+    let first_width = content_width
         .saturating_sub(prefix.width())
         .saturating_sub(right.width())
-        .saturating_sub(1);
-    let truncated_title = truncate_str(title, available);
+        .saturating_sub(if right.is_empty() { 0 } else { 1 });
+    let rest_width = content_width.saturating_sub(prefix.width());
+    let title_lines = wrap_two_widths(title, first_width.max(1), rest_width.max(1));
+    let first_title = title_lines.first().cloned().unwrap_or_default();
 
     let padding =
-        content_width.saturating_sub(prefix.width() + truncated_title.width() + right.width());
+        content_width.saturating_sub(prefix.width() + first_title.width() + right.width());
     let pad_str: String = " ".repeat(padding);
 
-    let margin_style = if is_selected {
-        theme.style_tab_highlight()
-    } else {
-        ratatui_core::style::Style::default()
-    };
+    // When selected, the List widget only sets the background. We
+    // still apply the highlight foreground per-span so the title and
+    // badges get the inverted look that work-item rows already use.
+    let hl = theme.style_tab_highlight();
+    let (margin_style, marker_style, title_style, pr_badge_style, reviewer_badge_style) =
+        if is_selected {
+            (hl, hl, hl, hl, hl)
+        } else {
+            (
+                ratatui_core::style::Style::default(),
+                theme.style_review_request_marker(),
+                theme.style_text(),
+                theme.style_badge_pr(),
+                theme.style_badge_pr(),
+            )
+        };
 
-    ListItem::new(Line::from(vec![
-        Span::styled(margin, margin_style),
-        Span::styled(prefix.to_string(), theme.style_review_request_marker()),
-        Span::styled(truncated_title, theme.style_text()),
+    let mut line1_spans = vec![
+        Span::styled(margin.to_string(), margin_style),
+        Span::styled(prefix.to_string(), marker_style),
+        Span::styled(first_title, title_style),
         Span::raw(pad_str),
-        Span::styled(right, theme.style_badge_pr()),
-    ]))
+        Span::styled(format!("{pr_badge}{draft_suffix}"), pr_badge_style),
+    ];
+    if let Some(badge) = reviewer_badge.as_deref() {
+        line1_spans.push(Span::raw(" "));
+        line1_spans.push(Span::styled(badge.to_string(), reviewer_badge_style));
+    }
+
+    let mut lines = vec![Line::from(line1_spans)];
+    // Continuation lines: indent to align with the column after the
+    // "R " marker so wrapped title text sits flush with the first
+    // line's title start.
+    for title_cont in title_lines.iter().skip(1) {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::raw(" ".repeat(prefix.width())),
+            Span::styled(title_cont.clone(), title_style),
+        ]));
+    }
+
+    ListItem::new(lines)
 }
 
 /// Format an unlinked PR entry for the left panel list.
@@ -1414,7 +1630,14 @@ fn format_work_item_entry<'a>(
 
     // -- Left margin: activity indicator or selection caret --
     let has_session = app.session_key_for(&wi.id).is_some();
-    let is_working = app.claude_working.contains(&wi.id) || app.review_gates.contains_key(&wi.id);
+    // Review gate is a transient substate where the item is still
+    // `Implementing`/`Blocked` on the model but is running the async
+    // PR/CI/adversarial-review checks on a background thread. We surface
+    // it both in the spinner (same cyan braille as Claude working) and
+    // as an explicit `[RG]` badge alongside the state badge below, so
+    // the user can tell at a glance without opening the right panel.
+    let at_review_gate = app.review_gates.contains_key(&wi.id);
+    let is_working = app.claude_working.contains(&wi.id) || at_review_gate;
     let (margin_text, margin_style): (String, ratatui_core::style::Style) = if is_working {
         let frame = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
         // On a highlighted row the list's bg is already Cyan, so a Cyan
@@ -1468,17 +1691,44 @@ fn format_work_item_entry<'a>(
         }
     }
 
+    // Unclean-worktree chip. Rendered whenever ANY repo association has
+    // a derived `GitState` that reports uncommitted changes, unpushed
+    // commits, or a behind-remote delta. `git_state.dirty` is the union
+    // of modified-tracked-files and untracked-files (see `GitState`
+    // doc comment); the merge guard in `App::advance_stage` /
+    // `App::execute_merge` distinguishes them via
+    // `App::worktree_cleanliness`, which reads the raw `WorktreeInfo`
+    // fields. Both paths are pure cache reads and cannot shell out,
+    // honouring the "no blocking I/O on the UI thread" invariant.
+    let is_unclean = wi.repo_associations.iter().any(|a| {
+        a.git_state
+            .as_ref()
+            .map(|gs| gs.dirty || gs.ahead > 0 || gs.behind > 0)
+            .unwrap_or(false)
+    });
+    if is_unclean {
+        right_parts.push((" !cl".to_string(), theme.style_badge_worktree_unclean()));
+    }
+
     // Multi-repo indicator.
     let repo_count = wi.repo_associations.len();
     if repo_count > 1 {
         right_parts.push((format!(" [{repo_count} repos]"), theme.style_text_muted()));
     }
 
-    // Stage badge + optional [RR] kind indicator + title. Done items omit the
-    // badge since the DONE group header already communicates their status.
+    // Stage badge + optional [RR] kind indicator + optional [RG]
+    // review-gate substate + title. Done items omit the badge since the
+    // DONE group header already communicates their status; the review
+    // gate is a transient substate and never applies to Done items, so
+    // `gate_tag` is empty on that branch by construction.
     let badge = wi.status.badge_text();
     let kind_tag = if wi.kind == WorkItemKind::ReviewRequest {
         "[RR]"
+    } else {
+        ""
+    };
+    let gate_tag = if at_review_gate && wi.status != WorkItemStatus::Done {
+        "[RG]"
     } else {
         ""
     };
@@ -1489,9 +1739,9 @@ fn format_work_item_entry<'a>(
             format!("{kind_tag} ")
         }
     } else if kind_tag.is_empty() {
-        format!("{badge} ")
+        format!("{badge}{gate_tag} ")
     } else {
-        format!("{kind_tag}{badge} ")
+        format!("{kind_tag}{badge}{gate_tag} ")
     };
     // Minimum number of display columns reserved for the title so it never
     // vanishes when badges consume all available width.
@@ -1575,6 +1825,27 @@ fn format_work_item_entry<'a>(
         line1_spans.insert(
             1,
             Span::styled("[RR]".to_string(), theme.style_badge_review_request_kind()),
+        );
+    }
+    // Insert [RG] badge immediately after the state badge for items
+    // currently at a review gate. Mirrors the [RR] pattern above. Never
+    // applies to Done items (they have no state badge and can't hold a
+    // review gate), so `gate_tag` is empty there by construction.
+    //
+    // Insertion index depends on whether `[RR]` was already inserted:
+    //   - Base non-Done layout: [margin, state_badge, " ", title, pad]
+    //     -> state badge at 1, [RG] goes at 2.
+    //   - With [RR] inserted at 1: [margin, [RR], state_badge, " ", ...]
+    //     -> state badge at 2, [RG] goes at 3.
+    if !gate_tag.is_empty() {
+        let insert_idx = if wi.kind == WorkItemKind::ReviewRequest {
+            3
+        } else {
+            2
+        };
+        line1_spans.insert(
+            insert_idx,
+            Span::styled("[RG]".to_string(), theme.style_badge_review_gate()),
         );
     }
     for (text, style) in &right_parts[..visible_badge_count] {
@@ -2009,6 +2280,13 @@ struct ImportablePrDetail<'a> {
     repo_path: &'a std::path::Path,
     branch: &'a str,
     hint: &'a str,
+    /// Optional authoritative reviewer-identity list for review-request
+    /// detail panels. Each element is a display string ready to join
+    /// with ", " ("you", "team-core", etc.). `None` for unlinked-PR
+    /// detail panels where the field is irrelevant; `Some` with at
+    /// least one entry for review-request detail panels. Names are
+    /// never truncated - the detail panel wraps naturally.
+    requested_from: Option<Vec<String>>,
 }
 
 /// Draw a structured detail view for an importable PR (unlinked or review request).
@@ -2066,7 +2344,16 @@ fn draw_importable_pr_detail(
         Line::from(""),
     ];
 
-    let fields: Vec<(&str, &str)> = vec![
+    // `Requested from:` joins the reviewer-identity list unmodified
+    // (no truncation). Built up-front so the `fields` slice can borrow
+    // a &str pointing into the owned String below.
+    let requested_from_joined = detail
+        .requested_from
+        .as_ref()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.join(", "));
+
+    let mut fields: Vec<(&str, &str)> = vec![
         ("PR", &pr_str),
         ("Repo", &repo_str),
         ("Branch", detail.branch),
@@ -2075,10 +2362,22 @@ fn draw_importable_pr_detail(
         ("Review", review_str),
         ("Checks", checks_str),
     ];
+    if let Some(ref joined) = requested_from_joined {
+        fields.push(("Requested from", joined.as_str()));
+    }
 
+    // Labels up to the historical 12-column width get the legacy
+    // fixed-width padding so the unlinked-PR detail panel (which has
+    // no long labels) renders byte-identically. "Requested from" and
+    // any future wider label fall back to a single trailing space.
     for (label, value) in &fields {
+        let label_str = if label.width() <= 12 {
+            format!("  {label:<12}")
+        } else {
+            format!("  {label} ")
+        };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {label:<12}"), label_style),
+            Span::styled(label_str, label_style),
             Span::styled(value.to_string(), val_style(value)),
         ]));
     }
@@ -2178,7 +2477,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     Line::from(""),
                     Line::from("  Terminal session has ended."),
                     Line::from(""),
-                    Line::from("  Press Tab to switch back to Claude Code."),
+                    Line::from("  Press Ctrl+\\ to switch back to Claude Code."),
                 ]);
                 let paragraph = Paragraph::new(text).block(block).style(theme.style_error());
                 paragraph.render(area, buf);
@@ -2362,6 +2661,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                         repo_path: &unlinked.repo_path,
                         branch: &unlinked.branch,
                         hint: "Press Enter to import this PR as a work item.  Ctrl+D to close PR and delete branch.",
+                        requested_from: None,
                     },
                     theme,
                     block,
@@ -2381,6 +2681,42 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         }
         Some(DisplayEntry::ReviewRequestItem(rr_idx)) => {
             if let Some(rr) = app.review_requested_prs.get(*rr_idx) {
+                // Build the authoritative reviewer-identity list for
+                // the detail panel. "you" goes first when the current
+                // user is directly requested; every other directly-
+                // requested user follows (rendered as their literal
+                // login); then every team slug, prefixed with "team "
+                // so the row reads naturally even when the team name
+                // does not start with "team-". A PR can request
+                // multiple direct reviewers (e.g. `alice` + `bob` +
+                // you), so we must iterate `requested_reviewer_logins`
+                // rather than only emit "you" - otherwise alice and
+                // bob silently vanish from the list. When no
+                // reviewers are known (degenerate fetch data) pass
+                // None so the detail panel omits the row entirely
+                // rather than rendering an empty list.
+                let login = app.current_user_login.as_deref();
+                let mut requested_from: Vec<String> = Vec::new();
+                if rr.is_direct_request(login) {
+                    requested_from.push("you".to_string());
+                }
+                for reviewer_login in &rr.requested_reviewer_logins {
+                    // Skip the current user - already added as "you"
+                    // above. Every other directly-requested user is
+                    // rendered as their literal login.
+                    if login.is_some_and(|l| l == reviewer_login) {
+                        continue;
+                    }
+                    requested_from.push(reviewer_login.clone());
+                }
+                for slug in &rr.requested_team_slugs {
+                    requested_from.push(format!("team {slug}"));
+                }
+                let requested_from = if requested_from.is_empty() {
+                    None
+                } else {
+                    Some(requested_from)
+                };
                 draw_importable_pr_detail(
                     buf,
                     &ImportablePrDetail {
@@ -2388,6 +2724,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                         repo_path: &rr.repo_path,
                         branch: &rr.branch,
                         hint: "Press Enter to import this review request as a work item.",
+                        requested_from,
                     },
                     theme,
                     block,
@@ -2923,6 +3260,7 @@ fn draw_settings_keybindings_tab(buf: &mut Buffer, app: &App, theme: &Theme, are
         binding("Ctrl+N", "Quick-start session"),
         binding("Ctrl+B", "New backlog ticket"),
         binding("Ctrl+G", "Global assistant"),
+        binding("Ctrl+\\", "Cycle Claude Code <-> Terminal tab"),
         binding("?", "Settings / keybindings (this overlay)"),
         binding("Q / Ctrl+Q", "Quit"),
         Line::from(""),
@@ -4217,12 +4555,198 @@ mod sticky_header_tests {
         // Scrolled to item in GROUP C (index 6).
         assert_eq!(find_current_group_header(&list, 6), Some(5));
     }
+
+    // -- predict_list_offset tests --
+    //
+    // The predictor must match `ratatui_widgets::list::List::get_items_bounds`
+    // for the default `scroll_padding = 0` case. The parallel-render helper
+    // below builds a real `List` widget from the same item heights and
+    // renders it into a `TestBackend`, then compares `state.offset()`
+    // against the predictor's output. This catches any drift between our
+    // simulation and ratatui's actual math (e.g. if a future ratatui
+    // version changes the algorithm).
+
+    use super::predict_list_offset;
+    use ratatui_core::{
+        backend::TestBackend,
+        layout::Rect,
+        terminal::Terminal,
+        text::{Line, Text},
+        widgets::StatefulWidget,
+    };
+    use ratatui_widgets::list::{List, ListItem, ListState};
+
+    /// Build a `Vec<ListItem>` where item `i` has `item_heights[i]` rows.
+    /// Each row is a short, unique placeholder line so ratatui sees the
+    /// heights we specified via `ListItem::height()`.
+    fn items_with_heights(item_heights: &[usize]) -> Vec<ListItem<'static>> {
+        item_heights
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| {
+                let lines: Vec<Line<'static>> =
+                    (0..h).map(|r| Line::from(format!("i{i}r{r}"))).collect();
+                ListItem::new(Text::from(lines))
+            })
+            .collect()
+    }
+
+    /// Render a real `List` through a `TestBackend` with the given heights,
+    /// prev offset, selection, and viewport height, and return the offset
+    /// that ratatui chose. This is the ground truth the predictor must
+    /// match.
+    fn ratatui_offset(
+        item_heights: &[usize],
+        prev_offset: usize,
+        selected: Option<usize>,
+        max_height: u16,
+    ) -> usize {
+        // Width is arbitrary; item_heights is authoritative.
+        let backend = TestBackend::new(20, max_height.max(1));
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = ListState::default().with_offset(prev_offset);
+        state.select(selected);
+        let items = items_with_heights(item_heights);
+        terminal
+            .draw(|frame| {
+                let list = List::new(items);
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: max_height,
+                };
+                StatefulWidget::render(list, area, frame.buffer_mut(), &mut state);
+            })
+            .unwrap();
+        state.offset()
+    }
+
+    /// Assert the predictor matches ratatui's actual offset for a given case.
+    fn assert_predictor_matches(
+        item_heights: &[usize],
+        prev_offset: usize,
+        selected: Option<usize>,
+        max_height: u16,
+        case: &str,
+    ) {
+        let actual = ratatui_offset(item_heights, prev_offset, selected, max_height);
+        let predicted =
+            predict_list_offset(item_heights, prev_offset, selected, max_height as usize);
+        assert_eq!(
+            predicted, actual,
+            "predictor disagreed with ratatui for case `{case}`: \
+             heights={item_heights:?} prev_offset={prev_offset} \
+             selected={selected:?} max_height={max_height}"
+        );
+    }
+
+    #[test]
+    fn predict_empty_list() {
+        assert_eq!(predict_list_offset(&[], 0, None, 10), 0);
+        assert_eq!(predict_list_offset(&[], 0, Some(5), 10), 0);
+        assert_eq!(predict_list_offset(&[], 7, Some(0), 10), 0);
+    }
+
+    #[test]
+    fn predict_zero_max_height() {
+        // Degenerate: zero rows available. The predictor returns the
+        // clamped prev_offset without touching ratatui (which would
+        // panic). This is a defensive path; production callers never
+        // pass max_height=0 because the inner area is always >= 1 row
+        // when this function is called.
+        assert_eq!(predict_list_offset(&[1, 2, 3], 1, Some(2), 0), 1);
+    }
+
+    #[test]
+    fn predict_no_scroll_needed() {
+        // Everything fits, selected item is first.
+        let heights = vec![1, 2, 2, 2];
+        assert_predictor_matches(&heights, 0, Some(0), 10, "no scroll, select first");
+    }
+
+    #[test]
+    fn predict_selection_below_viewport_scrolls_down() {
+        // Items don't fit; the selected index is past the tail, so the
+        // list must scroll down.
+        let heights = vec![1, 2, 2, 2, 1, 2, 2, 2, 2, 2];
+        assert_predictor_matches(&heights, 0, Some(9), 8, "scroll down to last");
+    }
+
+    #[test]
+    fn predict_selection_above_viewport_scrolls_up() {
+        // prev_offset is deep into the list but the selection is above
+        // it - must scroll back up.
+        let heights = vec![2, 2, 2, 2, 2, 2];
+        assert_predictor_matches(&heights, 4, Some(0), 6, "scroll up to first");
+    }
+
+    #[test]
+    fn predict_variable_heights_mixed() {
+        // Headers (1 row) interleaved with work items (2 rows) - the
+        // bug case from the user's screenshot.
+        let heights = vec![1, 2, 2, 2, 1, 2, 2, 2, 2, 2];
+        assert_predictor_matches(&heights, 0, Some(9), 7, "sticky-bug layout");
+        assert_predictor_matches(&heights, 0, Some(8), 8, "sticky-bug layout deeper");
+    }
+
+    #[test]
+    fn predict_selection_is_first_item_of_second_group() {
+        // Display list with two 1-row headers at indices 0 and 4, and
+        // 2-row items elsewhere. Select the first item under the second
+        // header - exactly the scenario from the regression test.
+        let heights = vec![1, 2, 2, 2, 1, 2, 2];
+        assert_predictor_matches(&heights, 0, Some(5), 8, "first item of second group, fits");
+        // Same list with a shorter viewport.
+        assert_predictor_matches(
+            &heights,
+            0,
+            Some(5),
+            5,
+            "first item of second group, short viewport",
+        );
+    }
+
+    #[test]
+    fn predict_last_index_from_offset_zero() {
+        let heights = vec![3, 3, 3, 3, 3];
+        assert_predictor_matches(&heights, 0, Some(4), 6, "last item, tight");
+    }
+
+    #[test]
+    fn predict_selection_none_resets_offset_like_ratatui() {
+        // ratatui's `ListState::select(None)` also resets the offset to 0.
+        // The production call path renders with select() after with_offset,
+        // so when no item is selected the effective offset is 0 regardless
+        // of what prev_offset we pass in. The predictor must match.
+        let heights = vec![1, 1, 1, 1, 1, 1, 1, 1];
+        assert_predictor_matches(&heights, 3, None, 4, "no selection, reset to 0");
+        let predicted = predict_list_offset(&heights, 3, None, 4);
+        assert_eq!(predicted, 0);
+    }
+
+    #[test]
+    fn predict_single_item_fits() {
+        let heights = vec![1];
+        assert_predictor_matches(&heights, 0, Some(0), 3, "single item");
+    }
+
+    #[test]
+    fn predict_offset_past_end_is_clamped() {
+        // prev_offset exceeds the list length. ratatui clamps to
+        // items.len()-1 before doing any work; the predictor must match.
+        let heights = vec![1, 1, 1];
+        assert_predictor_matches(&heights, 99, Some(0), 3, "offset past end");
+    }
 }
 
 #[cfg(test)]
 mod snapshot_tests {
     use super::draw_to_buffer;
-    use crate::app::{App, FocusPanel, StubBackend, UserActionKey, ViewMode, is_selectable};
+    use crate::app::{
+        App, DisplayEntry, FocusPanel, ReviewGateOrigin, ReviewGateState, StubBackend,
+        UserActionKey, ViewMode, is_selectable,
+    };
     use crate::theme::Theme;
     use crate::work_item::{
         BackendType, CheckStatus, MergeableState, PrInfo, PrState, RepoAssociation, ReviewDecision,
@@ -4468,11 +4992,95 @@ mod snapshot_tests {
                     url: "https://github.com/o/r/pull/77".into(),
                 },
                 branch: "refactor-auth".into(),
+                requested_reviewer_logins: Vec::new(),
+                requested_team_slugs: Vec::new(),
             });
         app.build_display_list();
         // Select the review request item (index 1: header at 0, item at 1).
         app.selected_item = Some(1);
         insta::assert_snapshot!(render(&mut app, 80, 24));
+    }
+
+    /// Regression for a detail-panel bug where only "you" was added
+    /// to the "Requested from:" line, silently dropping every other
+    /// directly-requested user. A PR can request multiple direct
+    /// reviewers (e.g. `alice` + `bob` + you); the detail panel must
+    /// list every one of them, with "you" first, followed by the
+    /// other user logins, followed by team slugs prefixed with
+    /// "team ".
+    #[test]
+    fn review_request_pr_detail_lists_all_direct_reviewers() {
+        let mut app = App::new();
+        app.current_user_login = Some("bob".into());
+        app.review_requested_prs
+            .push(crate::work_item::ReviewRequestedPr {
+                repo_path: PathBuf::from("/repo/upstream"),
+                pr: PrInfo {
+                    number: 77,
+                    title: "Refactor auth middleware".into(),
+                    state: PrState::Open,
+                    is_draft: false,
+                    review_decision: ReviewDecision::Pending,
+                    checks: CheckStatus::Passing,
+                    mergeable: MergeableState::Unknown,
+                    url: "https://github.com/o/r/pull/77".into(),
+                },
+                branch: "refactor-auth".into(),
+                requested_reviewer_logins: vec!["alice".into(), "bob".into(), "carol".into()],
+                requested_team_slugs: vec!["frontend".into()],
+            });
+        app.build_display_list();
+        app.selected_item = Some(1);
+
+        // Use a wide terminal so the "Requested from:" line doesn't
+        // wrap and we can assert its full contents in one line.
+        let rendered = render(&mut app, 160, 24);
+
+        // "you" must come first, then the other direct reviewers in
+        // their original order, then teams prefixed with "team ".
+        // The detail panel uses ", " as the list separator.
+        assert!(
+            rendered.contains("Requested from you, alice, carol, team frontend"),
+            "detail panel must list every direct reviewer and every team; got:\n{rendered}",
+        );
+    }
+
+    /// When no current_user_login is known, the detail panel cannot
+    /// collapse any login to "you", so every directly-requested user
+    /// must be rendered as their literal login.
+    #[test]
+    fn review_request_pr_detail_renders_all_logins_when_login_unknown() {
+        let mut app = App::new();
+        app.current_user_login = None;
+        app.review_requested_prs
+            .push(crate::work_item::ReviewRequestedPr {
+                repo_path: PathBuf::from("/repo/upstream"),
+                pr: PrInfo {
+                    number: 77,
+                    title: "Refactor auth middleware".into(),
+                    state: PrState::Open,
+                    is_draft: false,
+                    review_decision: ReviewDecision::Pending,
+                    checks: CheckStatus::Passing,
+                    mergeable: MergeableState::Unknown,
+                    url: "https://github.com/o/r/pull/77".into(),
+                },
+                branch: "refactor-auth".into(),
+                requested_reviewer_logins: vec!["alice".into(), "bob".into()],
+                requested_team_slugs: Vec::new(),
+            });
+        app.build_display_list();
+        app.selected_item = Some(1);
+
+        let rendered = render(&mut app, 160, 24);
+        assert!(
+            rendered.contains("Requested from alice, bob"),
+            "detail panel must render every literal login when current user is unknown; got:\n{rendered}",
+        );
+        assert!(
+            !rendered.contains("Requested from you"),
+            "no 'you' should be promoted when current_user_login is None; got:\n{rendered}",
+        );
     }
 
     #[test]
@@ -4754,6 +5362,85 @@ mod snapshot_tests {
             ),
         ];
         let mut app = app_with_items(items, vec![]);
+        insta::assert_snapshot!(render(&mut app, 80, 24));
+    }
+
+    /// Test helper: mark the given work item id as currently at a
+    /// review gate by inserting a minimal `ReviewGateState` into
+    /// `app.review_gates`. Starts a status-bar activity so the
+    /// production `drop_review_gate` invariant (every drop site ends
+    /// the activity) stays exercisable.
+    ///
+    /// The receiver is a dead-end `unbounded()` channel: we never poll
+    /// the gate in this test, so no messages ever need to flow.
+    fn mark_at_review_gate(app: &mut App, wi_id: &WorkItemId) {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let activity = app.start_activity("test review gate");
+        app.review_gates.insert(
+            wi_id.clone(),
+            ReviewGateState {
+                rx,
+                progress: None,
+                origin: ReviewGateOrigin::Tui,
+                activity,
+            },
+        );
+    }
+
+    #[test]
+    fn work_item_list_review_gate() {
+        // Baseline: plain `[IM]` item (no gate) to confirm adjacent rows
+        // are unaffected.
+        let plain = make_work_item(
+            "plain-im",
+            "Plain implementing item",
+            WorkItemStatus::Implementing,
+            None,
+            1,
+        );
+        // `[IM]` item sitting at a review gate -> `[IM][RG]`.
+        let gated_im = make_work_item(
+            "gated-im",
+            "Implementing at review gate",
+            WorkItemStatus::Implementing,
+            None,
+            1,
+        );
+        // `[BK]` item sitting at a review gate -> `[BK][RG]`. The gate
+        // can still be active when a work item retreats from
+        // Implementing to Blocked (see `docs/work-items.md`).
+        let gated_bk = make_work_item(
+            "gated-bk",
+            "Blocked at review gate",
+            WorkItemStatus::Blocked,
+            None,
+            1,
+        );
+        // Review-request kind at a gate -> `[RR][IM][RG]`, confirming
+        // the [RG] badge composes correctly with the [RR] kind badge.
+        let mut gated_rr = make_work_item(
+            "gated-rr",
+            "Review request at gate",
+            WorkItemStatus::Implementing,
+            None,
+            1,
+        );
+        gated_rr.kind = crate::work_item::WorkItemKind::ReviewRequest;
+
+        let gated_im_id = gated_im.id.clone();
+        let gated_bk_id = gated_bk.id.clone();
+        let gated_rr_id = gated_rr.id.clone();
+
+        let items = vec![plain, gated_im, gated_bk, gated_rr];
+        let mut app = app_with_items(items, vec![]);
+        mark_at_review_gate(&mut app, &gated_im_id);
+        mark_at_review_gate(&mut app, &gated_bk_id);
+        mark_at_review_gate(&mut app, &gated_rr_id);
+        // Rebuild the display list after mutating review-gate state in
+        // case grouping/ordering depends on it. (It doesn't today, but
+        // keeping this call defensive matches how `app_with_items`
+        // primes the list.)
+        app.build_display_list();
         insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
@@ -5309,5 +5996,68 @@ mod snapshot_tests {
         }
         // Short viewport so the BACKLOGGED header scrolls off -> sticky.
         insta::assert_snapshot!(render(&mut app, 80, 12));
+    }
+
+    /// Regression: the sticky group header must NEVER paint over the first
+    /// wrapped line of the topmost visible (and in particular the selected)
+    /// work item. Before the structural-slot fix the sticky `Paragraph`
+    /// overlay overwrote the first row of the list body, hiding the title
+    /// of the selected item when it was the topmost visible entry and its
+    /// group header had scrolled above the viewport.
+    ///
+    /// This test uses a text-based assertion (not a snapshot) so small
+    /// unrelated layout changes do not require re-blessing the expectation.
+    /// It picks a title with a unique wrap-friendly substring and asserts
+    /// that:
+    ///   1. the sticky header is still displayed (the fix did not disable it),
+    ///   2. the selected item's first line is still present in the rendered
+    ///      output (the fix did not merely hide the sticky).
+    #[test]
+    fn sticky_header_does_not_overlap_selected_item() {
+        // Two groups. The first BACKLOGGED item gets a distinctive title
+        // chosen to mirror the user's screenshot - when it is selected and
+        // the ACTIVE group has scrolled above the viewport, the buggy
+        // overlay would paint "BACKLOGGED (repo)" over "show cwd in...".
+        let items = vec![
+            make_work_item("a1", "Active one", WorkItemStatus::Implementing, None, 1),
+            make_work_item("a2", "Active two", WorkItemStatus::Implementing, None, 1),
+            make_work_item("a3", "Active three", WorkItemStatus::Implementing, None, 1),
+            make_work_item("a4", "Active four", WorkItemStatus::Implementing, None, 1),
+            make_work_item(
+                "b1",
+                "show cwd in status bar for workitems",
+                WorkItemStatus::Backlog,
+                None,
+                1,
+            ),
+            make_work_item("b2", "Backlog other", WorkItemStatus::Backlog, None, 1),
+        ];
+        let mut app = app_with_items(items, vec![]);
+        // Select the first BACKLOGGED item specifically. With a short
+        // viewport this forces the list to scroll so that the BACKLOGGED
+        // group header sits at the top of the body and the ACTIVE group
+        // header is above the viewport - the exact scenario where the old
+        // overlay clobbered the selected item's first wrapped line.
+        let target = app
+            .display_list
+            .iter()
+            .position(|e| matches!(e, DisplayEntry::WorkItemEntry(idx) if *idx == 4))
+            .expect("target BACKLOGGED item must be in display list");
+        app.selected_item = Some(target);
+
+        let rendered = render(&mut app, 40, 12);
+
+        // The sticky (or real) BACKLOGGED header must still be shown.
+        assert!(
+            rendered.contains("BACKLOGGED"),
+            "BACKLOGGED header must still render after the fix:\n{rendered}"
+        );
+        // The distinctive first-line substring of the selected item must
+        // be present in the output. Before the fix it was painted over.
+        assert!(
+            rendered.contains("show cwd"),
+            "selected item's first wrapped line must be visible, \
+             not overlapped by the sticky header:\n{rendered}"
+        );
     }
 }

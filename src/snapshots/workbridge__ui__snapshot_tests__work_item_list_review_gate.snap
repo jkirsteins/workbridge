@@ -1,0 +1,28 @@
+---
+source: src/ui.rs
+expression: "render(&mut app, 80, 24)"
+---
+  List    Board    Dashboard                                   Tab: switch view
+┌ Work Items (4) ───────┐┌ Claude Code ────────────────────────────────────────┐
+│  BLOCKED (0) (1)      ││                                                     │
+│⠋ [BK][RG] Blocked at  ││  | Running review gate...                           │
+│  review gate          ││                                                     │
+│  branch-gated-bk [no  ││  Checking implementation against plan.              │
+│      wt]              ││                                                     │
+│  ACTIVE (0) (3)       ││                                                     │
+│  [IM] Plain           ││                                                     │
+│  implementing item    ││                                                     │
+│  branch-plain-im [no  ││                                                     │
+│      wt]              ││                                                     │
+│⠋ [IM][RG] Implementing││                                                     │
+│  at review gate       ││                                                     │
+│  branch-gated-im [no  ││                                                     │
+│      wt]              ││                                                     │
+│⠋ [RR][IM][RG] Review  ││                                                     │
+│  request at gate      ││                                                     │
+│  branch-gated-rr [no  ││                                                     │
+│      wt]              ││                                                     │
+│                       ││                                                     │
+└───────────────────────┘└─────────────────────────────────────────────────────┘
+Blocked at review gate | [Blocked] | 0
+ ⠋ test review gate (+2)

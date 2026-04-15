@@ -129,8 +129,12 @@ read from the cache**. Concretely:
   in flight), surface that to the user via `alert_message` / a status
   bar message rather than blocking.
 - Worktree / branch metadata - read from
-  `self.repo_data[repo_path].worktrees` (which now carries
-  `has_commits_ahead` so `branch_has_commits` is a pure cache lookup).
+  `self.repo_data[repo_path].worktrees` (which carries
+  `has_commits_ahead` so `branch_has_commits` is a pure cache lookup,
+  plus `dirty` / `untracked` / `unpushed` / `behind_remote` so
+  `App::worktree_cleanliness` can classify a worktree's local state
+  without shelling out - used by the `!cl` chip renderer and the
+  Review -> Done merge guard).
 - Backend file reads (`read_plan`, `list`) - clone the `Arc<dyn
   WorkItemBackend>` into the background closure and run the read there.
 - `default_branch`, `github_remote`, `git diff` - clone the
@@ -342,6 +346,14 @@ and board views but not inside open dialogs or overlays.
   triggering an immediate fetch cycle. The status bar shows the
   "Refreshing GitHub data" spinner during the fetch, using the same
   code path as the periodic 120-second auto-refresh.
+- Ctrl+\\: cycle the right-panel tab between Claude Code and Terminal.
+  Works from both panels without changing focus, so the user can flip
+  the right panel without leaving the work item list and (more
+  importantly) can flip the tab from inside the PTY - plain Tab is
+  forwarded to the PTY so Claude Code's autocomplete works, which
+  means the tab switcher can't live on Tab itself. The
+  `ClaudeCode -> Terminal` transition is a no-op if the selected work
+  item has no worktree.
 
 ## Focus Model
 
@@ -353,7 +365,8 @@ because the right panel forwards almost all keys to the PTY, which is
 incompatible with rat-focus's widget navigation model.
 
 - Enter on a work item: focus right panel
-- Tab (when right panel focused): cycle between Claude Code and Terminal tabs
+- Ctrl+\\: cycle between Claude Code and Terminal tabs (global, does
+  not change focus - see "Global Shortcuts" above)
 - Ctrl+]: return to left panel
 - Ctrl+D / Delete: delete selected work item (modal confirmation)
 - Dead session: auto-return to left panel
@@ -799,21 +812,50 @@ viewport, a "sticky" copy of that header is rendered at the top of the
 list's inner area. This ensures the user always knows which group the
 currently visible items belong to.
 
-The sticky header is rendered as a `Paragraph` widget overlay after the
-`List` widget has already rendered, overwriting the first row of the
-inner area. It uses a DarkGray background (`style_sticky_header()` /
-`style_sticky_header_blocked()`) to visually separate it from the
-highlighted item below, which uses a Cyan background.
+The sticky header uses a dedicated reserved row, not an overlay. In
+`draw_work_item_list` the left-panel `Block` is rendered into `area`
+first, then the inner area is split: if the frame is predicted to need
+a sticky header, the first row of the inner area is reserved as a
+sticky slot (1 row) and the `List` widget is rendered into a
+`body_area` that starts one row below. The sticky row itself is drawn
+as a `Paragraph` into the reserved slot. This guarantees that the
+topmost visible work item (including the selected item) is never
+painted over by the sticky header, fixing the overlap bug where the
+selected item's first wrapped line was clobbered.
+
+The "will a sticky fire this frame?" decision is made before rendering
+by `predict_list_offset()`, a faithful mirror of
+`ratatui_widgets::list::List::get_items_bounds` for the default
+`scroll_padding = 0` case. The predictor runs twice when necessary:
+first with the full `inner.height` to see if the sticky would fire,
+then (if yes) with `inner.height - 1` so that ratatui's internal
+scroll math already accounts for the slot we are about to reserve. The
+predictor is covered by parallel-render tests in
+`mod sticky_header_tests` that compare its output to a real `List`
+rendered into a `TestBackend`, so any future drift with ratatui is
+caught immediately.
+
+The sticky row uses a DarkGray background
+(`style_sticky_header()` / `style_sticky_header_blocked()`) to visually
+separate it from the highlighted item below, which uses a Cyan
+background.
 
 Behavior:
-- Only active in flat list mode (not board drill-down, which has no
-  group headers)
+- Only active in flat list mode. Board drill-down never reserves the
+  slot because the drill-down display list has no group headers.
 - Shows the most recent `GroupHeader` that precedes the current scroll
   offset
 - Disappears automatically when the original header scrolls back into
   view (i.e., the user scrolls up past it)
-- Does not affect scrollbar position or item selection
-- Overlays the first visible row - does not insert an extra row
+- Does not affect item selection. The scrollbar track follows the
+  `body_area` height (not the full inner) so the thumb represents the
+  list body, not the slot.
+- Reserves a dedicated 1-row slot when a sticky is predicted to fire.
+  In the rare edge case where selection jumps between frames and the
+  post-render offset disagrees with the prediction, we accept a
+  one-frame visual glitch (blank slot or briefly missing sticky) and
+  the next frame reserves correctly. `debug_assert!` fires in debug
+  builds so the mismatch is caught in development.
 
 The header lookup is performed by `find_current_group_header()` in
 `ui.rs`, which walks backwards from the scroll offset to find the
@@ -864,6 +906,19 @@ Each entry is rendered as a multi-line `ListItem` by
 4. **Branch subtitle line** - the branch name plus optional
    `[no wt]` marker when the worktree is missing. Also styled with
    `meta_style`.
+
+While a work item is running its async review gate (PR existence -> CI
+wait -> adversarial review, see docs/work-items.md "Review gate"), a
+yellow+bold `[RG]` badge is inserted immediately to the right of the
+stage badge (e.g. `[IM][RG] feature-3` or `[BK][RG] fix-5`). The badge
+appears the instant the id enters `app.review_gates` and disappears the
+instant it is removed via `drop_review_gate` (gate approved, rejected,
+or retreated). It never appears on Done items because the gate cannot
+run on a Done item. `[RG]` coexists with the `[RR]` review-request kind
+badge as `[RR][IM][RG]`. The presence-only `[RG]` badge is what makes
+"Claude actively coding" distinguishable from "gate running in the
+background" in the list, because both share the same cyan braille
+spinner in the left margin.
 
 Stage transitions: Shift+Right to advance, Shift+Left to retreat.
 
@@ -969,21 +1024,30 @@ worktree; otherwise only "Claude Code" is shown.
   first tab switch. One terminal session per work item, stored in
   `App::terminal_sessions` keyed by `WorkItemId`.
 
-Tab switching (while right panel is focused):
-- Tab: cycle between Claude Code and Terminal. Still fires even when
-  the current tab's session has ended - the on-screen "Press Tab to
+Tab switching:
+- Ctrl+\\: cycle between Claude Code and Terminal. Global intercept
+  in `handle_key()` so it works from both panels and does not change
+  focus. The `ClaudeCode -> Terminal` transition is a no-op if the
+  selected work item has no worktree. Still fires even when the
+  current tab's session has ended - the on-screen "Press Ctrl+\\ to
   switch back to Claude Code" hint (shown on the dead-terminal
   placeholder in `src/ui.rs`) and the symmetric dead-Claude case both
-  rely on this. Focus stays on the right panel across the flip. On
-  the Claude-Code-dead -> Terminal flip, the terminal session is
+  rely on this. Because the intercept runs before the right-panel
+  dead-session early-return, a dead session never blocks the flip.
+  On the Claude-Code-dead -> Terminal flip, the terminal session is
   spawned lazily via `spawn_terminal_session()` if the work item has
-  a worktree (same path as the live-session Tab flip).
+  a worktree.
+- Tab (while right panel is focused): forwarded to the PTY as `\t`
+  (0x09) so Claude Code's autocomplete fires. Not intercepted by
+  workbridge. On a dead right-panel session Tab takes the standard
+  escape-hatch path (see below).
+- Shift+Tab (while right panel is focused, live session): forwarded
+  to PTY as CSI Z (not intercepted).
 - All other keys on a dead right-panel session redirect focus to the
   left panel with a "returned to work items" status message (the
-  existing escape hatch). Ctrl+], Shift+Tab / BackTab, plain letters,
-  Enter, Esc all take this path.
-- Shift+Tab (on a live session): forwarded to PTY as CSI Z (not
-  intercepted).
+  existing escape hatch). Ctrl+], Tab, Shift+Tab / BackTab, plain
+  letters, Enter, Esc all take this path. Only the global `Ctrl+\\`
+  intercept bypasses it.
 
 Terminal sessions are cleaned up on:
 - Work item deletion (killed in `delete_work_item_by_id`)

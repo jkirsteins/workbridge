@@ -207,21 +207,36 @@ pub struct RepoAssociation {
     pub worktree_path: Option<PathBuf>,
     pub pr: Option<PrInfo>,
     pub issue: Option<IssueInfo>,
-    /// Read by assembly tests; will be shown in detail views.
-    #[allow(dead_code)]
+    /// Derived local git state for this worktree. Read by the work
+    /// item list renderer (`format_work_item_entry`) to decide whether
+    /// to show the `!cl` unclean-worktree chip, and by tests. Will
+    /// also feed future detail views (e.g., "3 ahead, 1 behind, dirty").
     pub git_state: Option<GitState>,
 }
 
-/// Local git state for a worktree.
-/// Populated by assembly; fields read in tests. Will be shown in work
-/// item detail views (e.g., "3 ahead, 1 behind, dirty").
+/// Local git state for a worktree. Fields are cache-projections of the
+/// background-fetcher `WorktreeInfo` values - reading them from the UI
+/// thread is always a pure in-memory op and never shells out.
+///
+/// - `dirty`: union of uncommitted tracked-file changes AND untracked
+///   files present in the worktree. The `!cl` chip treats both the
+///   same way; callers that need to distinguish them (e.g. the
+///   merge-guard alert wording) go through `App::worktree_cleanliness`
+///   which reads the raw `WorktreeInfo` fields directly.
+/// - `ahead`: commits on the local branch that are not yet on its
+///   upstream - i.e. unpushed work.
+/// - `behind`: commits on the upstream that the local branch does not
+///   have. Shown as a soft warning but does not block merges.
+///
+/// A `detached` flag was intentionally omitted: `assembly::reassemble`
+/// only populates `GitState` when a worktree matched by branch name,
+/// so detached-HEAD worktrees never produce a `GitState`, and there
+/// is nowhere the field could be meaningfully true.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct GitState {
     pub dirty: bool,
     pub ahead: u32,
     pub behind: u32,
-    pub detached: bool,
 }
 
 /// Aggregate CI check status for a PR.
@@ -344,6 +359,55 @@ pub struct ReviewRequestedPr {
     pub repo_path: PathBuf,
     pub pr: PrInfo,
     pub branch: String,
+    /// Logins of individual users explicitly requested for review on this
+    /// PR. Used to classify the row as direct-to-you (the current user's
+    /// login appears here) vs. team-only. Distinct from `PrInfo` so
+    /// unlinked-PR rows do not carry review-specific state.
+    pub requested_reviewer_logins: Vec<String>,
+    /// Slugs of teams explicitly requested for review on this PR. Used
+    /// to build the compact reviewer badge and the authoritative
+    /// "Requested from:" detail-panel line.
+    pub requested_team_slugs: Vec<String>,
+}
+
+impl ReviewRequestedPr {
+    /// Classify whether the current user was directly requested as a
+    /// reviewer on this PR. Returns false when the login is unknown
+    /// (e.g. `gh api user` has not yet succeeded) so the row stays in
+    /// the team bucket - a safe default that never falsely promotes a
+    /// row to "actionable by you".
+    pub fn is_direct_request(&self, current_user_login: Option<&str>) -> bool {
+        match current_user_login {
+            Some(login) if !login.is_empty() => {
+                self.requested_reviewer_logins.iter().any(|r| r == login)
+            }
+            _ => false,
+        }
+    }
+
+    /// Build the compact reviewer badge shown at the right edge of the
+    /// row in the REVIEW REQUESTS block. Returns None when both reviewer
+    /// lists are empty (degenerate data - gh returned a row with no
+    /// attached reviewer identity at all) so the caller can skip the
+    /// badge slot entirely. The rules:
+    ///
+    /// - direct request (login in `requested_reviewer_logins`) -> `[you]`
+    /// - single team -> `[team-slug]`
+    /// - multi team -> `[first-slug +N]` where N = `len() - 1`
+    ///
+    /// The "direct wins" policy means a PR requesting both the user and
+    /// a team still renders as `[you]`; the full identity list is
+    /// preserved in the detail panel.
+    pub fn reviewer_badge(&self, current_user_login: Option<&str>) -> Option<String> {
+        if self.is_direct_request(current_user_login) {
+            return Some("[you]".to_string());
+        }
+        match self.requested_team_slugs.len() {
+            0 => None,
+            1 => Some(format!("[{}]", self.requested_team_slugs[0])),
+            n => Some(format!("[{} +{}]", self.requested_team_slugs[0], n - 1)),
+        }
+    }
 }
 
 /// Mouse text selection state for a terminal session.
@@ -401,6 +465,17 @@ pub struct RepoFetchResult {
     /// PRs where the authenticated user has been requested as a reviewer.
     pub review_requested_prs: Result<Vec<GithubPr>, GithubError>,
     pub issues: Vec<(u64, Result<GithubIssue, GithubError>)>,
+    /// The GitHub login of the currently authenticated user, resolved
+    /// once per fetch tick via `gh api user` (cached inside the
+    /// github_client). None when the lookup has not yet succeeded -
+    /// e.g. the gh CLI is missing, auth is expired, or the first call
+    /// happens to hit a transient error. Lookup failures are NOT
+    /// silent: the fetcher emits a `FetchMessage::FetcherError` on
+    /// the same channel so the status bar surfaces the problem. The
+    /// UI reads this to classify review-request rows as direct-to-you
+    /// vs. team-only; a None value degrades gracefully by classifying
+    /// every row as team.
+    pub current_user_login: Option<String>,
 }
 
 /// Messages sent from background fetcher threads to the main thread.
@@ -490,5 +565,97 @@ mod tests {
         assert_eq!(WorkItemStatus::Blocked.badge_text(), "[BK]");
         assert_eq!(WorkItemStatus::Review.badge_text(), "[RV]");
         assert_eq!(WorkItemStatus::Done.badge_text(), "[DN]");
+    }
+
+    // ---- ReviewRequestedPr reviewer-identity helpers ----
+
+    fn make_rr(reviewers: &[&str], teams: &[&str]) -> ReviewRequestedPr {
+        ReviewRequestedPr {
+            repo_path: PathBuf::from("/repo"),
+            pr: PrInfo {
+                number: 1,
+                title: "Example PR".into(),
+                state: PrState::Open,
+                is_draft: false,
+                review_decision: ReviewDecision::Pending,
+                checks: CheckStatus::None,
+                mergeable: MergeableState::Unknown,
+                url: "https://example.com/pr/1".into(),
+            },
+            branch: "feature".into(),
+            requested_reviewer_logins: reviewers.iter().map(|s| (*s).to_string()).collect(),
+            requested_team_slugs: teams.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn is_direct_request_matches_current_user_login() {
+        let rr = make_rr(&["alice", "bob"], &[]);
+        assert!(rr.is_direct_request(Some("alice")));
+        assert!(rr.is_direct_request(Some("bob")));
+        assert!(!rr.is_direct_request(Some("carol")));
+    }
+
+    #[test]
+    fn is_direct_request_false_when_login_unknown() {
+        let rr = make_rr(&["alice"], &[]);
+        // Unknown login (first tick not yet arrived, or auth expired)
+        // must classify as team so no row is falsely promoted to "you".
+        assert!(!rr.is_direct_request(None));
+        // Empty-string login is treated the same as None.
+        assert!(!rr.is_direct_request(Some("")));
+    }
+
+    #[test]
+    fn reviewer_badge_you_wins_over_team() {
+        let rr = make_rr(&["alice"], &["core-team"]);
+        assert_eq!(rr.reviewer_badge(Some("alice")), Some("[you]".to_string()),);
+    }
+
+    #[test]
+    fn reviewer_badge_single_team() {
+        let rr = make_rr(&[], &["core-team"]);
+        assert_eq!(
+            rr.reviewer_badge(Some("alice")),
+            Some("[core-team]".to_string()),
+        );
+    }
+
+    #[test]
+    fn reviewer_badge_multi_team() {
+        let rr = make_rr(&[], &["core-team", "backend", "frontend"]);
+        assert_eq!(
+            rr.reviewer_badge(Some("alice")),
+            Some("[core-team +2]".to_string()),
+        );
+    }
+
+    #[test]
+    fn reviewer_badge_none_when_no_reviewers() {
+        let rr = make_rr(&[], &[]);
+        assert_eq!(rr.reviewer_badge(Some("alice")), None);
+    }
+
+    #[test]
+    fn reviewer_badge_team_bucket_when_login_unknown() {
+        // Login unknown + direct-user request in data -> falls back to
+        // team bucket (no team -> None; single team -> that team).
+        let rr_direct_only = make_rr(&["alice"], &[]);
+        assert_eq!(rr_direct_only.reviewer_badge(None), None);
+
+        let rr_mixed = make_rr(&["alice"], &["core-team"]);
+        assert_eq!(
+            rr_mixed.reviewer_badge(None),
+            Some("[core-team]".to_string()),
+        );
+    }
+
+    #[test]
+    fn reviewer_badge_long_team_name_not_truncated() {
+        let rr = make_rr(&[], &["super-long-team-name-that-stays-intact"]);
+        assert_eq!(
+            rr.reviewer_badge(Some("alice")),
+            Some("[super-long-team-name-that-stays-intact]".to_string()),
+        );
     }
 }

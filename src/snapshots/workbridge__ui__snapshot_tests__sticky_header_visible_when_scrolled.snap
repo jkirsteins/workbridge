@@ -1,16 +1,16 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 12)"
+expression: "render(&mut app, 80, 12)"
 ---
   List    Board    Dashboard                                   Tab: switch view
 ┌ Work Items (7) ───────┐┌ Claude Code ────────────────────────────────────────┐
 │  ACTIVE (0) (5)       ││                                                     │
-│  branch-a5 [no wt]    ││  Item B2                                            │
-│  BACKLOGGED (0) (2)   ││                                                     │
-│  [BL] Item B1         █│  Status      Backlog                                │
-│  branch-b1 [no wt]    █│  Backend     Local file                             │
-│> [BL] Item B2         █│  Repo        /repo/b2/0                             │
-│  branch-b2 [no wt]    ││  Branch      branch-b2                              │
-│                       ││  Worktree    (none)                                 │
+│  [IM] Item A5         ││  Item B2                                            │
+│  branch-a5 [no wt]    ││                                                     │
+│  BACKLOGGED (0) (2)   ││  Status      Backlog                                │
+│  [BL] Item B1         ││  Backend     Local file                             │
+│  branch-b1 [no wt]    █│  Repo        /repo/b2/0                             │
+│> [BL] Item B2         █│  Branch      branch-b2                              │
+│  branch-b2 [no wt]    █│  Worktree    (none)                                 │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
 Item B2 | [Backlog] | 0

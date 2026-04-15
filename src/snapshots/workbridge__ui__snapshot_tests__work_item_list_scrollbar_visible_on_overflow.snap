@@ -1,28 +1,28 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 24)"
+expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
 ┌ Work Items (15) ──────┐┌ Claude Code ────────────────────────────────────────┐
 │  ACTIVE (0) (10)      ││                                                     │
-│  number 14            ││  Work item number 10                                │
-│  branch-item-14 [no   ││                                                     │
-│      wt]              ││  Status      Backlog                                │
-│  BACKLOGGED (0) (5)   ││  Backend     Local file                             │
-│  [BL] Work item       ││  Repo        /repo/item-10/0                        │
-│  number 1             ││  Branch      branch-item-10                         │
-│  branch-item-1 [no wt]││  Worktree    (none)                                 │
-│  [BL] Work item       █│  PR          (none)                                 │
-│  number 4             █│  Issue       (none)                                 │
-│  branch-item-4 [no wt]█│  Errors      (none)                                 │
-│  [BL] Work item       █│                                                     │
-│  number 7             █│  Press Shift+Right to move to Planning.             │
+│  [RV] Work item       ││  Work item number 10                                │
+│  number 14            ││                                                     │
+│  branch-item-14 [no   ││  Status      Backlog                                │
+│      wt]              ││  Backend     Local file                             │
+│  BACKLOGGED (0) (5)   ││  Repo        /repo/item-10/0                        │
+│  [BL] Work item       ││  Branch      branch-item-10                         │
+│  number 1             ││  Worktree    (none)                                 │
+│  branch-item-1 [no wt]││  PR          (none)                                 │
+│  [BL] Work item       ││  Issue       (none)                                 │
+│  number 4             ││  Errors      (none)                                 │
+│  branch-item-4 [no wt]││                                                     │
+│  [BL] Work item       █│  Press Shift+Right to move to Planning.             │
+│  number 7             █│                                                     │
 │  branch-item-7 [no wt]█│                                                     │
-│> [BL] Work item       ││                                                     │
-│  number 10            ││                                                     │
-│  branch-item-10 [no   ││                                                     │
-│      wt]              ││                                                     │
-│                       ││                                                     │
+│> [BL] Work item       █│                                                     │
+│  number 10            █│                                                     │
+│  branch-item-10 [no   █│                                                     │
+│      wt]              █│                                                     │
 │                       ││                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
 Work item number 10 | [Backlog] | 0

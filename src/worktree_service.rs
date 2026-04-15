@@ -28,7 +28,7 @@ impl fmt::Display for WorktreeError {
 }
 
 /// Information about a single worktree.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct WorktreeInfo {
     /// Filesystem path to the worktree.
     pub path: PathBuf,
@@ -44,6 +44,31 @@ pub struct WorktreeInfo {
     /// check failed); the UI thread must treat `None` as "unknown - safe
     /// default" rather than retrying the shell-out.
     pub has_commits_ahead: Option<bool>,
+    /// Cached answer to "does this worktree have uncommitted tracked-file
+    /// changes (modified/staged/renamed/deleted)?" - populated by
+    /// `list_worktrees` from `git status --porcelain -uall`. `None` means
+    /// the check was not attempted or failed; UI-thread readers treat
+    /// `None` as "unknown" and fall back to their safe default. See the
+    /// "Unclean worktree indicator + merge guard" flow for how this
+    /// feeds `App::worktree_cleanliness`.
+    pub dirty: Option<bool>,
+    /// Cached answer to "does this worktree have any untracked files?" -
+    /// populated by `list_worktrees` from the same
+    /// `git status --porcelain -uall` call that sets `dirty`. `None` on
+    /// failure; treat as "unknown" / safe default.
+    pub untracked: Option<bool>,
+    /// Number of commits the worktree's branch is ahead of its upstream
+    /// (i.e. commits that exist locally but not on `@{u}`). Populated by
+    /// `list_worktrees` from
+    /// `git rev-list --left-right --count HEAD...@{u}`. `None` means the
+    /// branch has no upstream configured, the check failed, or the
+    /// worktree was skipped (main / detached HEAD).
+    pub unpushed: Option<u32>,
+    /// Number of commits the worktree's branch is behind its upstream
+    /// (i.e. commits that exist on `@{u}` but not locally). Populated by
+    /// the same `git rev-list` call as `unpushed`. `None` on missing
+    /// upstream / failure.
+    pub behind_remote: Option<u32>,
 }
 
 /// Trait for worktree operations. Implementations include
@@ -183,6 +208,10 @@ impl GitWorktreeService {
                         branch: current_branch.take(),
                         is_main: is_first,
                         has_commits_ahead: None,
+                        dirty: None,
+                        untracked: None,
+                        unpushed: None,
+                        behind_remote: None,
                     });
                     is_first = false;
                 }
@@ -211,10 +240,73 @@ impl GitWorktreeService {
                 branch: current_branch.take(),
                 is_main: is_first,
                 has_commits_ahead: None,
+                dirty: None,
+                untracked: None,
+                unpushed: None,
+                behind_remote: None,
             });
         }
 
         result
+    }
+
+    /// Parse `git status --porcelain -uall` output into
+    /// `(dirty, untracked)`:
+    ///
+    /// - `dirty` is true when at least one line describes a tracked-file
+    ///   change (modified, staged, renamed, deleted). Porcelain v1 lines
+    ///   for tracked changes have two status characters in columns 1-2
+    ///   followed by a space; untracked lines start with `??`. Ignored
+    ///   lines start with `!!` and count as neither.
+    /// - `untracked` is true when at least one line starts with `??`.
+    ///
+    /// Empty output means "clean worktree". Pure function, no I/O, so
+    /// the parser can be exercised from unit tests without a real repo.
+    fn parse_status_porcelain(output: &str) -> (bool, bool) {
+        let mut dirty = false;
+        let mut untracked = false;
+        for line in output.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with("??") {
+                untracked = true;
+            } else if line.starts_with("!!") {
+                // Ignored files - neither dirty nor untracked.
+                continue;
+            } else {
+                dirty = true;
+            }
+        }
+        (dirty, untracked)
+    }
+
+    /// Parse `git rev-list --left-right --count HEAD...@{u}` output into
+    /// `(unpushed, behind_remote)`.
+    ///
+    /// The `HEAD...@{u}` symmetric-difference syntax paired with
+    /// `--left-right --count` produces a single line with two integers
+    /// separated by whitespace: left-side (HEAD-only) and right-side
+    /// (`@{u}`-only). Left = commits that exist locally but not on the
+    /// upstream = "unpushed"; right = commits on the upstream but not
+    /// local = "behind_remote".
+    ///
+    /// Returns `None` for any output that does not parse as two
+    /// non-negative integers. Callers should only invoke this after
+    /// verifying the git command exited successfully - a non-zero exit
+    /// typically means the branch has no configured upstream, in which
+    /// case both counts should stay `None` rather than being coerced
+    /// to zero.
+    fn parse_rev_list_left_right(output: &str) -> Option<(u32, u32)> {
+        let trimmed = output.trim();
+        let mut parts = trimmed.split_whitespace();
+        let left = parts.next()?.parse::<u32>().ok()?;
+        let right = parts.next()?.parse::<u32>().ok()?;
+        // Reject trailing garbage so "1 2 3" does not silently parse.
+        if parts.next().is_some() {
+            return None;
+        }
+        Some((left, right))
     }
 
     /// Find the branch name for a worktree at the given path by looking
@@ -259,39 +351,92 @@ impl WorktreeService for GitWorktreeService {
             }
         });
 
-        // Populate `has_commits_ahead` for each non-main worktree so UI-thread
-        // code (`App::branch_has_commits`) can consult the cached answer
-        // instead of shelling out to `git log`. Runs one `git log` per
-        // worktree on the background fetcher thread; on error we leave the
-        // field as `None` and let callers fall back to their safe default.
-        // The main worktree is skipped because the review-gate / retroactive-
-        // analysis flows only care about side-branch worktrees.
+        // Populate cached per-worktree state for each non-main worktree so
+        // UI-thread code (`App::branch_has_commits`, `App::worktree_cleanliness`)
+        // can consult the cache instead of shelling out. Each populated
+        // field is documented on `WorktreeInfo` itself; we run three git
+        // commands per worktree on the background fetcher thread:
+        //
+        //   1. `git log <default>..HEAD --oneline`           -> has_commits_ahead
+        //   2. `git status --porcelain -uall`                -> dirty, untracked
+        //   3. `git rev-list --left-right --count HEAD...@{u}` -> unpushed, behind_remote
+        //
+        // The main worktree is skipped because the review-gate /
+        // retroactive-analysis flows only care about side-branch
+        // worktrees; detached-HEAD worktrees are skipped because they
+        // have no branch-ish HEAD so the range queries are meaningless.
+        // On any individual command failure the corresponding field stays
+        // `None` so callers fall back to "unknown / safe default" rather
+        // than retrying on the UI thread.
         for wt in worktrees.iter_mut() {
             if wt.is_main {
                 continue;
             }
-            // Skip detached-HEAD worktrees: they have no branch-ish HEAD so
-            // `<default>..HEAD` would be meaningless for the review-gate /
-            // retroactive-analysis callers.
             if wt.branch.is_none() {
                 continue;
             }
-            // Run from inside the worktree so HEAD resolves to that worktree's
-            // branch tip even when multiple worktrees are checked out.
+
+            // 1. has_commits_ahead: is this branch ahead of the default
+            //    branch at all? Run from inside the worktree so HEAD
+            //    resolves to that worktree's branch tip even when
+            //    multiple worktrees are checked out.
             let range = format!("{default}..HEAD");
-            let out = git_command()
+            let ahead_out = git_command()
                 .args(["log", &range, "--oneline"])
                 .current_dir(&wt.path)
                 .output();
-            wt.has_commits_ahead = match out {
+            wt.has_commits_ahead = match ahead_out {
                 Ok(o) if o.status.success() => {
                     let stdout = String::from_utf8_lossy(&o.stdout);
                     Some(!stdout.trim().is_empty())
                 }
-                // Leave as None on any failure - the main thread will treat
-                // that as "unknown" and apply its safe fallback.
                 _ => None,
             };
+
+            // 2. dirty + untracked: `git status --porcelain -uall`. The
+            //    `-uall` flag ensures untracked files inside untracked
+            //    directories are listed one-per-line (the default
+            //    `-unormal` collapses them into a single `??` line for
+            //    the directory, which still parses correctly here but
+            //    `-uall` is more predictable across git versions).
+            let status_out = git_command()
+                .args(["status", "--porcelain", "-uall"])
+                .current_dir(&wt.path)
+                .output();
+            match status_out {
+                Ok(o) if o.status.success() => {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    let (dirty, untracked) = Self::parse_status_porcelain(&stdout);
+                    wt.dirty = Some(dirty);
+                    wt.untracked = Some(untracked);
+                }
+                _ => {
+                    // Leave both as `None` so readers fall back to "unknown".
+                }
+            }
+
+            // 3. unpushed + behind_remote: `git rev-list --left-right
+            //    --count HEAD...@{u}`. A non-zero exit typically means
+            //    the branch has no upstream configured (e.g. freshly
+            //    created local branch never pushed). In that case both
+            //    fields stay `None` - the cleanliness helper treats
+            //    missing upstream data as "nothing to warn about" so
+            //    unpublished branches do not accidentally get flagged
+            //    as dirty. A branch that IS published but has unpushed
+            //    commits will exit 0 and return a non-zero left count.
+            let revlist_out = git_command()
+                .args(["rev-list", "--left-right", "--count", "HEAD...@{u}"])
+                .current_dir(&wt.path)
+                .output();
+            if let Ok(o) = revlist_out
+                && o.status.success()
+            {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                if let Some((ahead, behind)) = Self::parse_rev_list_left_right(&stdout) {
+                    wt.unpushed = Some(ahead);
+                    wt.behind_remote = Some(behind);
+                }
+            }
         }
 
         Ok(worktrees)
@@ -339,6 +484,14 @@ impl WorktreeService for GitWorktreeService {
             // (`branch_has_commits`) treat it the same as `Some(false)`
             // and defer the decision to the fetcher.
             has_commits_ahead: None,
+            // Cleanliness fields start unresolved for the same reason:
+            // the next fetcher cycle will populate them. Readers treat
+            // `None` as "unknown / assume clean" so this cannot make a
+            // brand-new worktree render as dirty.
+            dirty: None,
+            untracked: None,
+            unpushed: None,
+            behind_remote: None,
         })
     }
 
@@ -533,6 +686,175 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].path, PathBuf::from("/home/user/repo"));
         assert!(result[0].is_main);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_status_porcelain tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_status_porcelain_clean() {
+        assert_eq!(
+            GitWorktreeService::parse_status_porcelain(""),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn parse_status_porcelain_only_untracked() {
+        // `??` lines are untracked.
+        let output = "?? new-file.txt\n?? another.md\n";
+        assert_eq!(
+            GitWorktreeService::parse_status_porcelain(output),
+            (false, true),
+        );
+    }
+
+    #[test]
+    fn parse_status_porcelain_only_dirty() {
+        // Modified (` M`), staged add (`A `), staged rename (`R ` old -> new).
+        let output = " M src/main.rs\nA  src/new.rs\nR  a.rs -> b.rs\n";
+        assert_eq!(
+            GitWorktreeService::parse_status_porcelain(output),
+            (true, false),
+        );
+    }
+
+    #[test]
+    fn parse_status_porcelain_dirty_and_untracked() {
+        let output = " M src/main.rs\n?? new-file.txt\n";
+        assert_eq!(
+            GitWorktreeService::parse_status_porcelain(output),
+            (true, true),
+        );
+    }
+
+    #[test]
+    fn parse_status_porcelain_ignored_lines_are_neither() {
+        // `!!` lines are ignored files (git status --porcelain --ignored)
+        // and must not count toward `dirty` or `untracked`.
+        let output = "!! target/\n";
+        assert_eq!(
+            GitWorktreeService::parse_status_porcelain(output),
+            (false, false),
+        );
+    }
+
+    #[test]
+    fn parse_status_porcelain_mixed_with_ignored() {
+        let output = " M src/lib.rs\n?? new.rs\n!! target/debug\n";
+        assert_eq!(
+            GitWorktreeService::parse_status_porcelain(output),
+            (true, true),
+        );
+    }
+
+    #[test]
+    fn parse_status_porcelain_deleted_counts_as_dirty() {
+        let output = " D src/old.rs\n";
+        assert_eq!(
+            GitWorktreeService::parse_status_porcelain(output),
+            (true, false),
+        );
+    }
+
+    #[test]
+    fn parse_status_porcelain_blank_lines_ignored() {
+        // A spurious blank line must not tip the parser into false state.
+        let output = " M a.rs\n\n?? b.rs\n";
+        assert_eq!(
+            GitWorktreeService::parse_status_porcelain(output),
+            (true, true),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_rev_list_left_right tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_rev_list_left_right_clean() {
+        // No divergence from upstream: "0\t0".
+        assert_eq!(
+            GitWorktreeService::parse_rev_list_left_right("0\t0\n"),
+            Some((0, 0)),
+        );
+    }
+
+    #[test]
+    fn parse_rev_list_left_right_ahead_only() {
+        // Two unpushed local commits, upstream not behind.
+        assert_eq!(
+            GitWorktreeService::parse_rev_list_left_right("2\t0\n"),
+            Some((2, 0)),
+        );
+    }
+
+    #[test]
+    fn parse_rev_list_left_right_behind_only() {
+        // Upstream has 3 commits local does not: behind but not ahead.
+        assert_eq!(
+            GitWorktreeService::parse_rev_list_left_right("0\t3\n"),
+            Some((0, 3)),
+        );
+    }
+
+    #[test]
+    fn parse_rev_list_left_right_diverged() {
+        // Both ahead and behind (classic rebase-needed state).
+        assert_eq!(
+            GitWorktreeService::parse_rev_list_left_right("2\t3\n"),
+            Some((2, 3)),
+        );
+    }
+
+    #[test]
+    fn parse_rev_list_left_right_space_separator() {
+        // `git rev-list --count` uses tabs but split_whitespace is tolerant.
+        assert_eq!(
+            GitWorktreeService::parse_rev_list_left_right("4 7\n"),
+            Some((4, 7)),
+        );
+    }
+
+    #[test]
+    fn parse_rev_list_left_right_no_trailing_newline() {
+        assert_eq!(
+            GitWorktreeService::parse_rev_list_left_right("1\t2"),
+            Some((1, 2)),
+        );
+    }
+
+    #[test]
+    fn parse_rev_list_left_right_empty_returns_none() {
+        // Empty output (e.g. git exited 0 but produced nothing) is not
+        // a valid "0\t0" answer and must not silently parse as clean.
+        assert_eq!(GitWorktreeService::parse_rev_list_left_right(""), None);
+    }
+
+    #[test]
+    fn parse_rev_list_left_right_malformed_returns_none() {
+        // Non-numeric output (shouldn't happen in practice) is rejected.
+        assert_eq!(
+            GitWorktreeService::parse_rev_list_left_right("foo\tbar\n"),
+            None,
+        );
+    }
+
+    #[test]
+    fn parse_rev_list_left_right_trailing_garbage_rejected() {
+        // A three-number line would mean we're being fed unexpected
+        // output; refuse to parse rather than silently picking the
+        // first two.
+        assert_eq!(
+            GitWorktreeService::parse_rev_list_left_right("1\t2\t3\n"),
+            None,
+        );
+    }
+
+    #[test]
+    fn parse_rev_list_left_right_single_number_rejected() {
+        assert_eq!(GitWorktreeService::parse_rev_list_left_right("5\n"), None);
     }
 }
 
