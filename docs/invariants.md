@@ -170,6 +170,46 @@ is the handoff contract between stages. Different stages have different
 system prompts. All code-changing stages (Implementing, Review) must
 instruct Claude to commit all work before finishing.
 
+**"Fresh" means per stage instance, not per stage name.** Each
+`(WorkItemId, WorkItemStatus, stage_transition_count)` triple is
+assigned a deterministic Claude Code session UUID (UUID v5, derived
+from a workbridge-specific namespace; see `src/session_id.rs`).
+Spawning for a triple that Claude Code has already seen reattaches to
+its prior transcript via `claude --resume <uuid>`; spawning for a
+triple Claude Code has not seen creates a new session under the
+deterministic UUID via `claude --session-id <uuid>`. The UUID is
+recomputed from first principles on every spawn, so the invariant
+survives workbridge restarts, crashes, and backend format changes
+that do not touch the identifying fields. The user-facing semantic
+is that quitting workbridge mid-stage does not lose Claude's
+conversational context for that stage.
+
+`stage_transition_count` is a monotonic `u64` stored on
+`WorkItemRecord` (with `#[serde(default)] = 0` for records that
+predate the field). `LocalFileBackend::update_status` bumps it on
+every REAL stage transition and deliberately skips no-op writes
+(status unchanged), so a redundant `update_status(..., same_status)`
+call cannot shift the UUID out from under a live session. The
+counter is the ONLY piece of the identity the backend persists on
+the user's behalf; the rest of the derivation (the namespace
+constant, the canonical name format) is baked into the binary.
+
+Stage transitions still produce a new session because both the
+stage AND the counter change: `(wi_id, Implementing, N) -> (wi_id,
+Review, N+1)` yields a different UUID, so the Review session is
+structurally unable to see the Implementing transcript. Cycling
+back to a stage the work item has been at before ALSO produces a
+new session, because the counter has advanced in the meantime:
+`Planning -> Implementing -> Blocked -> Planning` lands on
+`(wi_id, Planning, 3)`, not `(wi_id, Planning, 0)`, so the second
+Planning visit gets a fresh transcript instead of resuming the
+first. `Review -> Implementing` rework works the same way. Without
+the counter, cycling back would resume the prior transcript and
+leak stage context into the new phase, which the "fresh per stage
+transition" rule is meant to prevent. The plan remains the
+handoff contract; cross-stage and cross-instance context bleed are
+both impossible by construction, not by process isolation.
+
 **Enforcement:** Sessions are keyed by `(WorkItemId, WorkItemStatus)` in the
 HashMap. When a work item's stage changes, the old session key becomes
 unreachable - lookups use the new stage, so the old session cannot be
@@ -182,14 +222,37 @@ killed during periodic liveness checks.
   `workbridge_set_plan` via MCP. This persists the plan and automatically
   advances to Implementing (the planning session becomes an orphan and is
   killed on the next liveness check).
-- Implementing: a fresh session starts with the plan in the system prompt.
-  Claude implements the plan, then calls `workbridge_set_status` to advance.
-- Review: a fresh session starts for addressing review feedback.
+- Implementing: a session starts with the plan in the system prompt
+  and either continues the current Implementing stage-instance's
+  transcript (on a workbridge restart that has not bumped the
+  counter) or creates a new one under that instance's deterministic
+  UUID. Claude implements the plan, then calls
+  `workbridge_set_status` to advance; the status bump increments
+  `stage_transition_count` so the next Review session gets a fresh
+  UUID.
+- Review: a session starts for addressing review feedback, resuming
+  the current Review stage-instance's transcript if one already
+  exists. A rework cycle (Review -> Implementing -> Review) bumps
+  the counter twice, so the second Review visit gets a fresh UUID
+  and a fresh transcript.
 
-Sessions gain context only via MCP tools (`workbridge_get_context`,
-`workbridge_set_plan`, `workbridge_set_status`), not from prior sessions.
-Manual advance from Planning to Implementing is blocked - the plan must
-be set via MCP to trigger the transition.
+Sessions gain conversational context only from the deterministic
+transcript for the same
+`(wi_id, stage, stage_transition_count)` triple and from MCP tools
+(`workbridge_get_context`, `workbridge_set_plan`,
+`workbridge_set_status`). They do NOT gain context from sessions
+belonging to a different stage of the same work item, from a
+different stage-instance of the same stage name, or from any other
+work item: each of those combinations yields a different UUID and
+therefore a different Claude Code transcript. Manual advance from
+Planning to Implementing is blocked - the plan must be set via MCP
+to trigger the transition.
+
+The review gate's ephemeral `claude --print` subprocess and the global
+assistant drawer are deliberately outside this scheme (they do not
+participate in the deterministic UUID derivation) because they are
+one-shot or separate-scope sessions that must not share identity with
+the work-item stage session.
 
 ### 14. Branch is required at creation
 

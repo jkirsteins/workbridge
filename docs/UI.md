@@ -174,17 +174,80 @@ Examples of the cache-first pattern:
   stale fetcher cache would let items get stuck in Implementing for
   up to two minutes after Claude's final commit (the fetch
   interval), with no auto-retry.
-- `spawn_session` routes through `begin_session_open` +
-  `poll_session_opens` instead of calling `stage_system_prompt`
-  directly. `begin_session_open` spawns a background thread that runs
-  `backend.read_plan(...)` and sends a `SessionOpenPlanResult` through
-  a per-work-item receiver; `poll_session_opens` drains completed
-  receivers and invokes `finish_session_open`, which builds the claude
-  command and spawns the PTY on the UI thread. `stage_system_prompt`
-  now takes the pre-read plan text as a parameter and MUST NOT call
-  `backend.read_plan(...)` itself. The receiver map is keyed by
-  `WorkItemId` so parallel session opens for different items cannot
-  collide.
+- `spawn_session` routes through a two-stage background pipeline
+  instead of calling `stage_system_prompt` and `Session::spawn`
+  directly on the UI thread. **Stage 1** is `begin_session_open` +
+  `poll_session_opens` + `finish_session_open`: it captures the
+  work item's stage on the UI thread (a cheap in-memory read),
+  then spawns a background thread that runs `backend.read_plan(...)`,
+  derives the deterministic Claude Code session UUID via
+  `session_id::session_id_for(wi, stage)`, and probes the disk via
+  `session_id::session_exists_on_disk(uuid)` to decide between
+  `--resume <uuid>` and `--session-id <uuid>`. The probe returns a
+  three-state `SessionProbe`:
+  `Exists` -> `spawn_flag = Some(Resume)`;
+  `Missing` -> `spawn_flag = Some(Fresh)`;
+  `Indeterminate(msg)` -> `spawn_flag = None`, `probe_error =
+  Some(msg)`. The `Indeterminate` case exists because `read_dir`
+  and per-subdirectory `metadata` stats can fail for reasons other
+  than NotFound (permission denied, FUSE error, unreadable
+  directory), and falling through to `Fresh` on those errors would
+  silently lose the user's prior conversation context. The stage 1
+  worker bundles
+  `(plan_text, stage, session_id, spawn_flag, probe_error)` into a
+  `SessionOpenPlanResult` and sends it through a per-work-item
+  receiver; `poll_session_opens` drains completed receivers and
+  invokes `finish_session_open`. When `spawn_flag` is `None`,
+  `finish_session_open` refuses to spawn and surfaces `probe_error`
+  via `status_message` so the user can fix the underlying condition
+  and retry.
+- **Stage 2** is `begin_session_spawn` + `poll_session_spawns`: on
+  the UI thread, `finish_session_open` gathers the owned MCP
+  inputs it needs (`wi_id_str`, context JSON, `wi_kind`,
+  repo-level MCP server entries, a clone of `mcp_tx`, PTY
+  dimensions) into a `SessionSpawnInputs` struct and hands off to
+  a second background worker via `begin_session_spawn`. That
+  worker does ALL the remaining I/O: resolves
+  `std::env::current_exe()` (readlink syscall), starts the
+  `McpSocketServer` (`remove_file` + `UnixListener::bind`), builds
+  the MCP config JSON, appends it inline to the claude argv as
+  `--mcp-config <json-string>`, forks the Claude PTY via
+  `Session::spawn`, and sends a `SessionSpawnResult` back via a
+  per-work-item receiver stored in `session_spawn_rx`.
+  `poll_session_spawns` drains the result on the next background
+  tick, re-validates that the work item still exists and the
+  captured stage still matches the current one, and inserts the
+  live session / MCP server into `self.sessions` / `self.mcp_servers`.
+  If the work item or stage has drifted in the meantime, the
+  `Session` is routed through `teardown_session_async` so its
+  blocking `Drop` tears down on a background thread.
+- **Workbridge does not write any MCP config files to disk.**
+  Claude Code accepts inline JSON literals for `--mcp-config`
+  (per `claude --help`: "Load MCP servers from JSON files or
+  strings"), so the per-session config JSON only ever lives in
+  workbridge's argv and Claude's argv. Earlier iterations wrote
+  `.mcp.json` to the worktree root and/or a temp config file
+  under `/tmp`, both of which had real downsides (overwriting
+  user-owned `.mcp.json`, accumulating secret-bearing temp
+  files, requiring rollback on every failure path). The inline
+  delivery satisfies harness-contract C4 ("per-session MCP
+  injection with stdio transport") without any of those
+  failure modes.
+- `finish_session_open` and `poll_session_spawns` together contain
+  ZERO filesystem I/O on the UI thread: no `session_exists_on_disk`
+  call (moved to stage 1), no `std::fs::write` calls (none exist
+  anywhere in the spawn path - the config goes inline), no
+  `Session::spawn` PTY fork (moved to stage 2), and no
+  `McpSocketServer::start` socket bind (also moved to stage 2).
+  Any future edit that reintroduces a synchronous `read_plan`,
+  `fs::write`, `fs::read`, `Session::spawn`, or
+  `McpSocketServer::start` call into those functions is a P0
+  regression against `docs/UI.md` "Blocking I/O Prohibition" and
+  must be rejected at review. `stage_system_prompt` similarly
+  takes the pre-read plan text as a parameter and MUST NOT call
+  `backend.read_plan(...)` itself. Both `session_open_rx` and
+  `session_spawn_rx` are keyed by `WorkItemId` so parallel opens
+  for different items cannot collide.
 
 #### Streaming progress variant
 

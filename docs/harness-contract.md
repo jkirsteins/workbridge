@@ -366,22 +366,41 @@ clause violation.
 
 **Claude (reference)**: `build_mcp_config` in `src/mcp.rs:1378`
 produces the JSON blob, and `McpSocketServer::start` at
-`src/mcp.rs:80` starts the accept loop. Work-item spawns write
-`.mcp.json` to the worktree root (`src/app.rs:3906`) AND pass
-`--mcp-config <tempfile>` at `src/app.rs:3919`; the review gate
-passes only `--mcp-config` at `src/app.rs:7795`; the global
-assistant passes only `--mcp-config` at `src/app.rs:8285`. The
-bridge process is the same workbridge binary re-invoked with
-`--mcp-bridge --socket <path>` (see `build_mcp_config`).
+`src/mcp.rs:80` starts the accept loop. All three spawn sites
+pass the JSON blob INLINE as a `--mcp-config <json-string>` CLI
+argument (Claude Code's `--mcp-config` accepts JSON files OR
+JSON strings, per `claude --help`):
+
+- Work-item spawns: `App::begin_session_spawn` background worker
+  appends `--mcp-config` + the JSON literal directly to the argv
+  built by `App::build_claude_cmd`.
+- Review gate: `App::spawn_review_gate` background worker passes
+  the JSON literal as the value of `--mcp-config` in the
+  `Command::args(...)` slice handed to `Command::output()`.
+- Global assistant: `App::spawn_global_session` appends
+  `--mcp-config` + the JSON literal to its argv before
+  `Session::spawn`.
+
+Workbridge does NOT write `.mcp.json` to the worktree root and
+does NOT write any temp `--mcp-config-*.json` file. The MCP
+config JSON only ever lives in this process's argv and Claude's
+argv. This eliminates a whole class of cleanup bugs (rollback on
+spawn failure, leak on app exit, mode-0600 secrets in `/tmp`,
+overwriting a user-owned `.mcp.json`) and avoids the CLAUDE.md
+prohibition against mutating third-party tool control files
+outside workbridge-owned directories.
+
+The bridge process is the same workbridge binary re-invoked
+with `--mcp-bridge --socket <path>` (see `build_mcp_config`).
 
 **Codex (secondary, not implemented)**: **workaround**. Codex reads
 MCP server definitions from `~/.codex/config.toml` under
 `[mcp_servers.*]`. There is no per-invocation `--mcp-config` flag
-equivalent. A Codex adapter would have to either write a temporary
-`config.toml` and point Codex at it via its config-override flag, or
-use `--config mcp_servers.workbridge=...` overrides. Both are shim-
-level work; the clause itself (per-session MCP injection with
-stdio transport) is still achievable.
+equivalent (file OR string). A Codex adapter would have to use
+the `--config mcp_servers.workbridge=...` overrides or pass the
+config via stdin if the harness ever exposes that path. The
+clause itself (per-session MCP injection with stdio transport)
+is still achievable.
 
 ### C5 - Tool allowlist by spawn type
 
@@ -564,18 +583,24 @@ this document alone.
 ```text
 claude
   --dangerously-skip-permissions
+  --session-id <deterministic-uuid-v5>     (or --resume <uuid> on restart)
   --allowedTools mcp__workbridge__workbridge_get_context,mcp__workbridge__workbridge_query_log,mcp__workbridge__workbridge_get_plan,mcp__workbridge__workbridge_report_progress,mcp__workbridge__workbridge_log_event,mcp__workbridge__workbridge_set_activity,mcp__workbridge__workbridge_approve_review,mcp__workbridge__workbridge_request_changes,mcp__workbridge__workbridge_set_status,mcp__workbridge__workbridge_set_plan,mcp__workbridge__workbridge_set_title,mcp__workbridge__workbridge_set_description,mcp__workbridge__workbridge_list_repos,mcp__workbridge__workbridge_list_work_items,mcp__workbridge__workbridge_repo_info
   [--settings '<RP4 hook JSON, Planning only>']
   --system-prompt '<stage system prompt from stage_system_prompt()>'
-  'Explain who you are and start working.'
-  --mcp-config /tmp/workbridge-mcp-config-<uuid>.json
+  ['Explain who you are and start working.']    (Fresh spawns only - resume spawns omit it)
+  --mcp-config '<RP3 JSON literal>'
 ```
 
-Source: `App::build_claude_cmd` at `src/app.rs:3967`, followed by
-the `--mcp-config` append at `src/app.rs:3919`. Cwd: the work
-item's worktree path. The positional prompt MUST precede
-`--mcp-config`; see the regression test
-`build_claude_cmd_prompt_before_mcp_config` at `src/app.rs:12834`.
+Source: `App::build_claude_cmd` builds everything except
+`--mcp-config`, which is appended inline by the
+`begin_session_spawn` background worker just before the PTY
+fork. Cwd: the work item's worktree path. The positional prompt
+MUST precede `--mcp-config`; see the regression test
+`build_claude_cmd_prompt_before_mcp_config`. The session ID
+flag selection (`--session-id` for fresh, `--resume` for an
+existing transcript) is governed by
+`session_id::session_exists_on_disk`; see `docs/work-items.md`
+"Session identity and resumption".
 
 ### RP2 - Headless review-gate argv
 
@@ -586,15 +611,16 @@ claude
   --system-prompt '<review_gate template with default_branch, branch, repo_path vars>'
   --output-format json
   --json-schema '{"type":"object","properties":{"approved":{"type":"boolean"},"detail":{"type":"string"}},"required":["approved","detail"]}'
-  --mcp-config /tmp/workbridge-rg-mcp-<uuid>.json
+  --mcp-config '<RP3 JSON literal>'
 ```
 
-Source: `std::process::Command::new("claude")` at
-`src/app.rs:7784`. Cwd: inherited (unspecified). The review gate
-does NOT pass `--dangerously-skip-permissions` because
-`--print` is non-interactive and never prompts. The review gate
-does NOT pass `--allowedTools`; it relies on the read-only MCP
-server to hide mutating tools.
+Source: `std::process::Command::new("claude")` inside
+`App::spawn_review_gate`'s background worker. Cwd: inherited
+(unspecified). The review gate does NOT pass
+`--dangerously-skip-permissions` because `--print` is
+non-interactive and never prompts. The review gate does NOT
+pass `--allowedTools`; it relies on the read-only MCP server to
+hide mutating tools.
 
 ### RP3 - MCP config JSON
 
@@ -827,18 +853,20 @@ update the Implementation Map section above.
 
 | File          | Line  | Mode        | Scope      | Cwd                                       |
 |---------------|-------|-------------|------------|-------------------------------------------|
-| `src/app.rs`  | 3931  | Interactive | WorkItem   | Work-item worktree                        |
-| `src/app.rs`  | 7784  | Headless    | ReviewGate | inherited                                 |
-| `src/app.rs`  | 8313  | Interactive | Global     | `$TMPDIR/workbridge-global-assistant-cwd` |
+| `src/app.rs`  | 4625  | Interactive | WorkItem   | Work-item worktree                        |
+| `src/app.rs`  | 8679  | Headless    | ReviewGate | inherited                                 |
+| `src/app.rs`  | 9212  | Interactive | Global     | `$TMPDIR/workbridge-global-assistant-cwd` |
 
-All three sites go through `src/session.rs:57` (`Session::spawn`) for
+All three sites go through `src/session.rs` (`Session::spawn`) for
 the interactive path or `std::process::Command::output()` directly
-for the headless path; argv is built in `App::build_claude_cmd` at
-`src/app.rs:3967` for the work-item path, inlined at
-`src/app.rs:7784` for the review gate, and inlined at
-`src/app.rs:8233` for the global assistant. Global assistant
-teardown lives at `src/app.rs:8185`
-(`App::teardown_global_session`); see C10 and C12 for why each
+for the headless path. The work-item argv skeleton is built in
+`App::build_claude_cmd` and finalised inside the
+`App::begin_session_spawn` background worker (which appends the
+inline `--mcp-config '<json>'` literal); the review-gate argv is
+inlined in `App::spawn_review_gate`'s background worker; the
+global-assistant argv is inlined in `App::spawn_global_session`.
+Global assistant teardown lives in
+`App::teardown_global_session`; see C10 and C12 for why each
 drawer open spawns a fresh session and each close fully tears it
 down.
 
@@ -865,3 +893,24 @@ harness adapter is introduced, add a dated bullet here.
   3870 -> 3967, review-gate Command::new 7500 -> 7784,
   spawn_global_session 7884 -> 8201, etc.). The Known Spawn Sites
   table now reflects the new line numbers and the new Global cwd.
+- 2026-04-15: PR #91 "Remember Claude session ID per work item
+  stage for resumption". Two related changes affect this doc:
+  (a) RP1 grew a `--session-id <uuid>` / `--resume <uuid>` flag
+  derived from `(WorkItemId, WorkItemStatus, stage_transition_count)`
+  so quitting and restarting workbridge re-attaches to the same
+  Claude transcript, and the auto-start positional prompt is now
+  gated on `SpawnFlag::Fresh` so a resume reattaches without
+  re-injecting the kickoff text. See `docs/work-items.md`
+  "Session identity and resumption" for the derivation.
+  (b) C4 / RP1 / RP2 switched from a temp-file delivery path to
+  inline `--mcp-config '<json-string>'`. Workbridge no longer
+  writes `.mcp.json` to the worktree, no longer writes
+  `workbridge-mcp-config-*.json` to `/tmp`, and no longer needs
+  to track or clean up any per-session config file. The MCP
+  config JSON only ever lives in workbridge's argv and Claude's
+  argv. The clause itself is unchanged - C4 only requires
+  per-session MCP injection with stdio transport, which inline
+  delivery satisfies as well as the file-based approach did.
+  Refreshed the Known Spawn Sites table line numbers and the
+  per-clause Implementation Map citations to match the
+  post-PR-91 tree.

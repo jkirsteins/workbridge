@@ -564,11 +564,33 @@ pub(crate) struct DeleteCleanupInfo {
 /// synchronously on the UI thread - the read is now performed on a
 /// background thread and the deserialized plan (plus any error
 /// message) flows back via this struct for the main thread to apply.
+///
+/// The same background worker also computes the deterministic session
+/// UUID and decides between `--resume` and `--session-id` by checking
+/// whether a transcript file already exists on disk for that UUID. Both
+/// the UUID derivation and the existence check live on the background
+/// thread because `session_id::session_exists_on_disk` performs
+/// filesystem I/O (`read_dir` of `~/.claude/projects` plus a per-
+/// subdirectory `is_file` stat) - that is forbidden on the UI thread by
+/// `docs/UI.md` "Blocking I/O Prohibition", since even a "fast" local
+/// scan can stall on a slow or network-mounted home directory. The pair
+/// `(session_id, spawn_flag)` is therefore prepared up-front and
+/// `finish_session_open` consumes it directly instead of re-deriving or
+/// re-checking on the UI thread.
 pub struct SessionOpenPlanResult {
     /// The work item the session is being opened for.
     pub wi_id: WorkItemId,
     /// The worktree path where Claude will run.
     pub cwd: PathBuf,
+    /// Stage captured at `begin_session_open` time on the UI thread.
+    /// `finish_session_open` uses this as the session-key stage and as
+    /// the input to `build_claude_cmd`. Stage changes between begin and
+    /// finish cannot reach this struct: every stage-change path that
+    /// leaves the work item alive
+    /// (`apply_stage_change` / `cleanup_session_state_for`) cancels the
+    /// pending open via `drop_session_open_entry` before the result is
+    /// delivered to `poll_session_opens`.
+    pub stage: WorkItemStatus,
     /// Plan text read from the backend, if any. Empty string when the
     /// backend returned `Ok(None)` or an error (the caller treats an
     /// empty plan the same as a missing plan).
@@ -577,6 +599,36 @@ pub struct SessionOpenPlanResult {
     /// read failed. `None` on success or when the backend reported no
     /// plan exists.
     pub read_error: Option<String>,
+    /// Deterministic Claude Code session UUID derived from
+    /// `(wi_id, stage)` via `session_id::session_id_for`. Computed on
+    /// the background thread alongside the disk-existence check so the
+    /// pair `(session_id, spawn_flag)` is always internally consistent
+    /// and the UI thread never re-derives it.
+    pub session_id: uuid::Uuid,
+    /// Whether the spawn should pass `--resume <uuid>` (a transcript
+    /// already exists on disk for `session_id`) or `--session-id <uuid>`
+    /// (no prior transcript - create a new session under the
+    /// deterministic UUID). Decided by the background worker via
+    /// `session_id::session_exists_on_disk` so the UI thread never
+    /// touches the filesystem.
+    ///
+    /// `None` means the probe returned `SessionProbe::Indeterminate`:
+    /// the background worker could not tell whether a transcript
+    /// existed because filesystem I/O failed. Codex adversarial review
+    /// flagged silently falling through to `Fresh` in this case. On a
+    /// degraded home directory it would quietly lose the user's prior
+    /// conversation context with no error surfaced anywhere.
+    /// `finish_session_open` MUST refuse to spawn when this is `None`
+    /// and surface `probe_error` on the status bar instead so the user
+    /// can fix the underlying condition and retry.
+    pub spawn_flag: Option<SpawnFlag>,
+    /// Human-readable probe error paired with `spawn_flag == None`.
+    /// `Some(msg)` when `session_exists_on_disk` returned
+    /// `SessionProbe::Indeterminate(msg)`; `None` otherwise. The
+    /// struct invariant is that exactly one of `spawn_flag` and
+    /// `probe_error` is `Some`. See `finish_session_open` for the
+    /// consumer-side enforcement.
+    pub probe_error: Option<String>,
 }
 
 /// Per-entry state tracked alongside the `session_open_rx` map so
@@ -588,6 +640,135 @@ pub struct SessionOpenPlanResult {
 pub struct SessionOpenPending {
     pub rx: crossbeam_channel::Receiver<SessionOpenPlanResult>,
     pub activity: ActivityId,
+}
+
+/// Result of the second session-open stage: the background worker
+/// that writes the MCP config files, spawns the MCP socket server,
+/// and forks the Claude PTY. This is the final result
+/// `poll_session_spawns` inserts into `self.sessions`.
+///
+/// The stage was added in response to a Codex adversarial review
+/// finding: the prior flow wrote `.mcp.json` and a temp
+/// `--mcp-config` file with `std::fs::write`, plus started the MCP
+/// socket server (which `remove_file`s and `bind`s a Unix socket),
+/// plus called `Session::spawn` (which forks a PTY), all on the UI
+/// thread from `finish_session_open`. Every one of those calls is
+/// filesystem / process I/O that `docs/UI.md` "Blocking I/O
+/// Prohibition" forbids on the tick path. Moving the whole tail
+/// into a dedicated background worker lets the UI thread do only
+/// in-memory state updates in response to the completed spawn.
+pub struct SessionSpawnResult {
+    /// Work item the spawn was requested for.
+    pub wi_id: WorkItemId,
+    /// Stage captured at `begin_session_open` time (threaded through
+    /// the entire async pipeline so the session is inserted under
+    /// the right key even if someone were to re-order the layers).
+    pub stage: WorkItemStatus,
+    /// Outcome of the I/O-heavy tail. On success, the UI thread
+    /// inserts the session and MCP server into their respective
+    /// maps. On error, it surfaces the message via `status_message`
+    /// and leaves the maps untouched.
+    pub outcome: Result<SessionSpawnOk, String>,
+}
+
+/// Success payload of a [`SessionSpawnResult`]. Carries the live
+/// PTY session and its paired MCP socket server, both of which are
+/// background-thread-borrowed resources that the UI thread has to
+/// accept ownership of before the spawn completes.
+pub struct SessionSpawnOk {
+    pub session: crate::session::Session,
+    pub mcp_server: McpSocketServer,
+}
+
+/// Per-entry state for the `session_spawn_rx` map, mirroring
+/// `SessionOpenPending`. `poll_session_spawns` uses the
+/// `ActivityId` to end the "Spawning Claude session..." spinner on
+/// every terminal arm (success, error, disconnect).
+///
+/// `cancel` is a shared atomic flag that the background worker
+/// checks right before `Session::spawn`. If
+/// `drop_session_spawn_entry` has set the flag to `true` (because
+/// `apply_stage_change`, `cleanup_session_state_for`, or a delete
+/// path fired while the worker was still running its I/O-heavy
+/// tail), the worker skips the PTY fork entirely and returns an
+/// `Err("cancelled")` outcome. That closes the Codex
+/// adversarial-review window where a stale background worker
+/// could still launch `claude --dangerously-skip-permissions
+/// <kickoff-prompt>` for a work item whose stage had already
+/// advanced - which with the auto-start positional prompt in the
+/// command line would make a stale Claude process actually start
+/// touching the worktree before the UI thread's `Drop` had a
+/// chance to kill it.
+pub struct SessionSpawnPending {
+    pub rx: crossbeam_channel::Receiver<SessionSpawnResult>,
+    pub activity: ActivityId,
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Owned-data bundle that `finish_session_open` gathers on the UI
+/// thread before handing off to the `begin_session_spawn`
+/// background worker. Every field is `Send` / `'static` so the
+/// closure can move it across the thread boundary without borrowing
+/// `self`.
+///
+/// Grouped into a struct rather than passed positionally so the
+/// `begin_session_spawn` signature stays readable as more fields
+/// accrete. The worker consumes the whole struct by move in its
+/// prologue.
+pub struct SessionSpawnInputs {
+    /// `serde_json::to_string(work_item_id)` - pre-serialized on
+    /// the UI thread so the worker does not have to re-borrow the
+    /// ID.
+    pub wi_id_str: String,
+    /// `format!("{:?}", wi.kind)` captured on the UI thread.
+    pub wi_kind: String,
+    /// Pre-rendered MCP `get_context` payload that the socket
+    /// server will serve to Claude.
+    pub context_json: String,
+    /// Activity log path from `backend.activity_path_for(wi_id)`.
+    pub activity_log_path: Option<PathBuf>,
+    /// Repo-level MCP servers gathered from the config on the UI
+    /// thread.
+    pub repo_mcp_servers: Vec<crate::config::McpServerEntry>,
+    /// Clone of `App::mcp_tx` so the spawned `McpSocketServer` can
+    /// forward events back to the main thread.
+    pub mcp_tx: crossbeam_channel::Sender<McpEvent>,
+    /// PTY column dimension captured on the UI thread.
+    pub pane_cols: u16,
+    /// PTY row dimension captured on the UI thread.
+    pub pane_rows: u16,
+}
+
+/// Which form of session-identity flag workbridge is asking Claude Code
+/// to honour on a given spawn.
+///
+/// `Resume` (`--resume <uuid>`) re-attaches to a previously existing
+/// session under that UUID. `Fresh` (`--session-id <uuid>`) creates a
+/// new session under the given UUID; Claude Code rejects this if a
+/// session under the same UUID already exists.
+///
+/// `finish_session_open` chooses between the two by checking whether
+/// the session's transcript file exists on disk via
+/// `session_id::session_exists_on_disk`. The check happens once,
+/// up-front, so the user never sees a transient "No conversation
+/// found" error during the first spawn for a (work_item, stage) tuple.
+///
+/// See `docs/work-items.md` "Session identity and resumption" for the
+/// end-to-end protocol and rationale for the deterministic UUID scheme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpawnFlag {
+    Resume,
+    Fresh,
+}
+
+impl SpawnFlag {
+    /// The `claude` CLI flag corresponding to this spawn-flag variant.
+    pub fn cli_flag(self) -> &'static str {
+        match self {
+            SpawnFlag::Resume => "--resume",
+            SpawnFlag::Fresh => "--session-id",
+        }
+    }
 }
 
 /// Result from the asynchronous worktree creation thread.
@@ -864,8 +1045,6 @@ pub struct App {
     /// Work item IDs where Claude has signaled it is actively working
     /// (via workbridge_set_activity). Cleared when the session dies.
     pub claude_working: std::collections::HashSet<WorkItemId>,
-    /// Paths to .mcp.json files written to worktrees, keyed by work item ID.
-    /// Tracked so they can be cleaned up when sessions die or work items are deleted.
     /// Receiver for MCP events from all socket servers.
     pub mcp_rx: Option<crossbeam_channel::Receiver<McpEvent>>,
     /// Sender for MCP events (cloned for each socket server).
@@ -960,6 +1139,22 @@ pub struct App {
     /// a background thread; this map is how the result flows back.
     pub session_open_rx: HashMap<WorkItemId, SessionOpenPending>,
 
+    /// Per-work-item pending receivers for the second session-open
+    /// stage: the background worker that resolves
+    /// `std::env::current_exe`, spawns the MCP socket server,
+    /// writes the temp `--mcp-config` file (under
+    /// `std::env::temp_dir()`, NOT the worktree), and forks the
+    /// Claude PTY. See `SessionSpawnResult` for the rationale
+    /// (Codex adversarial review required all of this I/O to
+    /// leave the UI thread). Drained by `poll_session_spawns` on
+    /// every background tick.
+    ///
+    /// Keyed by `WorkItemId` so concurrent spawns for different work
+    /// items cannot collide - pressing Enter on several items in
+    /// quick succession enqueues independent spawns that each finish
+    /// on their own schedule.
+    pub session_spawn_rx: HashMap<WorkItemId, SessionSpawnPending>,
+
     /// Sender for completion messages from `spawn_orphan_worktree_cleanup`
     /// background threads. Cloned into each spawned closure. The closure
     /// always sends exactly one `OrphanCleanupFinished` when it finishes
@@ -984,9 +1179,6 @@ pub struct App {
     pub global_pane_cols: u16,
     /// PTY rows for the global assistant drawer.
     pub global_pane_rows: u16,
-    /// Path to the temp MCP config file for the global assistant.
-    /// Tracked so it can be cleaned up on shutdown or respawn.
-    pub global_mcp_config_path: Option<PathBuf>,
     /// True when repo/work-item data has changed since the last
     /// `refresh_global_mcp_context` call. Set by `drain_fetch_results`
     /// returning true; cleared after the refresh runs.
@@ -1161,6 +1353,7 @@ impl App {
             pr_identity_backfill_rx: None,
             pr_identity_backfill_activity: None,
             session_open_rx: HashMap::new(),
+            session_spawn_rx: HashMap::new(),
             orphan_cleanup_finished_tx,
             orphan_cleanup_finished_rx,
             global_drawer_open: false,
@@ -1170,7 +1363,6 @@ impl App {
             pre_drawer_focus: FocusPanel::Left,
             global_pane_cols: 80,
             global_pane_rows: 24,
-            global_mcp_config_path: None,
             global_mcp_context_dirty: false,
             pending_active_pty_bytes: Vec::new(),
             pending_global_pty_bytes: Vec::new(),
@@ -1518,7 +1710,11 @@ impl App {
     ///
     /// The reader threads handle PTY output continuously - no reading
     /// happens here. This only checks if child processes have exited.
-    /// Also cleans up .mcp.json files and MCP servers for dead sessions.
+    /// Also cleans up MCP servers (via `teardown_mcp_server_async` in
+    /// `cleanup_session_state_for`) for dead sessions and routes any
+    /// orphaned live sessions through `teardown_live_session_async`.
+    /// Workbridge no longer writes `.mcp.json` into the worktree, so
+    /// there is nothing to clean up there.
     pub fn check_liveness(&mut self) {
         let mut dead_ids: Vec<WorkItemId> = Vec::new();
         let mut dead_implementing: Vec<WorkItemId> = Vec::new();
@@ -1576,6 +1772,15 @@ impl App {
         }
 
         // Kill sessions whose stage doesn't match the work item's current stage.
+        // Routed through `teardown_live_session_async` so the
+        // SIGTERM + grace sleep + SIGKILL + wait sequence runs
+        // on a background thread - `check_liveness` itself runs
+        // on the UI tick path and must not block. The paired
+        // MCP server (if any) is pulled out of `self.mcp_servers`
+        // and handed off to the same teardown thread so the
+        // socket cleanup happens alongside the session kill.
+        // Codex adversarial review P0 class, mirror of the
+        // `apply_stage_change` fix.
         let orphans: Vec<_> = self
             .sessions
             .keys()
@@ -1588,10 +1793,13 @@ impl App {
             .cloned()
             .collect();
         for key in orphans {
-            if let Some(mut entry) = self.sessions.remove(&key)
-                && let Some(mut session) = entry.session.take()
-            {
-                session.kill();
+            if let Some(entry) = self.sessions.remove(&key) {
+                let mcp_server = self.mcp_servers.remove(&key.0);
+                if let Some(session) = entry.session {
+                    Self::teardown_live_session_async(session, mcp_server);
+                } else if let Some(mcp) = mcp_server {
+                    Self::teardown_mcp_server_async(mcp);
+                }
             }
         }
 
@@ -1602,8 +1810,19 @@ impl App {
             } else {
                 entry.alive = false;
             }
-            if !entry.alive {
-                self.global_mcp_server = None;
+            if !entry.alive
+                && let Some(mcp_server) = self.global_mcp_server.take()
+            {
+                // Setting `self.global_mcp_server = None` would
+                // drop the `McpSocketServer` on the UI thread,
+                // running `McpSocketServer::Drop -> stop() +
+                // std::fs::remove_file` inline on the timer tick
+                // path. Route the takeout through the async
+                // teardown helper so the unlink runs on a
+                // background thread. Codex adversarial review
+                // P0 class, see `docs/UI.md` "Blocking I/O
+                // Prohibition".
+                Self::teardown_mcp_server_async(mcp_server);
             }
         }
 
@@ -1617,6 +1836,13 @@ impl App {
         }
 
         // Remove terminal sessions whose work item no longer exists.
+        // Terminal sessions do NOT have paired MCP servers (they're
+        // raw shell spawns in the Terminal tab), so pass `None` to
+        // the teardown helper. The kill + grace sleep + wait all
+        // run on the background thread per Codex adversarial review
+        // - running them inline here would freeze the TUI on a
+        // liveness tick that sweeps a terminal tab whose work item
+        // was just deleted.
         let terminal_orphans: Vec<_> = self
             .terminal_sessions
             .keys()
@@ -1624,17 +1850,33 @@ impl App {
             .cloned()
             .collect();
         for wi_id in terminal_orphans {
-            if let Some(mut entry) = self.terminal_sessions.remove(&wi_id)
-                && let Some(mut session) = entry.session.take()
+            if let Some(entry) = self.terminal_sessions.remove(&wi_id)
+                && let Some(session) = entry.session
             {
-                session.kill();
+                Self::teardown_live_session_async(session, None);
             }
         }
     }
 
     /// Stop MCP server and clear activity state for a work item.
+    ///
+    /// Called from `check_liveness` when a Claude session dies, and
+    /// from `apply_stage_change` + `delete_work_item_by_id` when
+    /// the work item's session should be torn down. All of those
+    /// call sites run on the UI thread / timer tick path, so this
+    /// helper MUST NOT drop `McpSocketServer` inline -
+    /// `McpSocketServer::Drop` calls `stop()` (cheap) plus
+    /// `std::fs::remove_file` (a real syscall). Codex adversarial
+    /// review flagged the earlier
+    /// `self.mcp_servers.remove(wi_id)` as a `docs/UI.md`
+    /// "Blocking I/O Prohibition" violation: a dying Claude
+    /// session triggered the inline unlink on the UI tick.
+    /// Route the removed server through `teardown_mcp_server_async`
+    /// so the `unlink` runs on a background thread.
     fn cleanup_session_state_for(&mut self, wi_id: &WorkItemId) {
-        self.mcp_servers.remove(wi_id);
+        if let Some(mcp_server) = self.mcp_servers.remove(wi_id) {
+            Self::teardown_mcp_server_async(mcp_server);
+        }
         self.claude_working.remove(wi_id);
         // Drop any pending background plan read and end its
         // "Opening session..." spinner. The thread will complete and
@@ -1642,18 +1884,38 @@ impl App {
         // gone, and the thread exits. `finish_session_open` also has
         // its own deleted-work-item guard as a second line of defence.
         self.drop_session_open_entry(wi_id);
+        // Same for the second session-open stage: if a background
+        // worker is currently writing MCP config files and forking
+        // the PTY for this work item, drop the pending receiver so
+        // `poll_session_spawns` cannot land its session into
+        // `self.sessions` after the work item has been deleted.
+        // When the background thread does complete, `poll_session_spawns`
+        // also re-validates the work item exists, so the session
+        // inside the dropped receiver falls out of scope and its
+        // `Drop` impl tears down the PTY and child process.
+        self.drop_session_spawn_entry(wi_id);
     }
 
-    /// Stop all MCP servers, clear activity state, and remove temp config files.
-    /// Called on app exit.
+    /// Stop all MCP servers and clear activity state. Called on app exit.
+    ///
+    /// Regression guard: `McpSocketServer::Drop` runs `stop()` +
+    /// `remove_file` on the socket path. Drain the maps
+    /// synchronously and drop the values on a background thread
+    /// so the UI's last frame is not held up by socket unlinks.
     pub fn cleanup_all_mcp(&mut self) {
-        self.mcp_servers.clear();
         self.claude_working.clear();
-        self.global_mcp_server = None;
-        if let Some(ref path) = self.global_mcp_config_path {
-            let _ = std::fs::remove_file(path);
+        let session_servers: Vec<McpSocketServer> =
+            self.mcp_servers.drain().map(|(_, v)| v).collect();
+        let global_server = self.global_mcp_server.take();
+        if session_servers.is_empty() && global_server.is_none() {
+            return;
         }
-        self.global_mcp_config_path = None;
+        std::thread::spawn(move || {
+            for server in session_servers {
+                drop(server);
+            }
+            drop(global_server);
+        });
     }
 
     /// Resize PTY sessions and vt100 parsers to match the current pane
@@ -2271,18 +2533,21 @@ impl App {
         self.backend.delete(wi_id)?;
 
         // -- Phase 3: Kill session and clean up MCP --
+        //
+        // Regression guard: every live session must go through
+        // `teardown_live_session_async` so Session::kill's
+        // SIGTERM grace sleep runs off the UI delete path.
         self.cleanup_session_state_for(wi_id);
         if let Some(key) = self.session_key_for(wi_id)
-            && let Some(mut entry) = self.sessions.remove(&key)
-            && let Some(ref mut session) = entry.session
+            && let Some(entry) = self.sessions.remove(&key)
+            && let Some(session) = entry.session
         {
-            session.kill();
+            Self::teardown_live_session_async(session, None);
         }
-        // Kill associated terminal session.
-        if let Some(mut entry) = self.terminal_sessions.remove(wi_id)
-            && let Some(ref mut session) = entry.session
+        if let Some(entry) = self.terminal_sessions.remove(wi_id)
+            && let Some(session) = entry.session
         {
-            session.kill();
+            Self::teardown_live_session_async(session, None);
         }
 
         // -- Phase 4: (removed) Resource cleanup runs on a background
@@ -3530,9 +3795,11 @@ impl App {
     ///
     /// 1. It is registered with git for the target `branch`.
     /// 2. It is NOT the main worktree (`is_main = false`). Reusing the
-    ///    user's primary repo checkout would spawn Claude sessions inside
-    ///    it and drop workbridge state (`.mcp.json`) there, violating
-    ///    invariant #3 in `docs/invariants.md`.
+    ///    user's primary repo checkout would spawn a Claude session
+    ///    inside the user's live default-branch checkout, violating
+    ///    invariant #3 ("a worktree must not be on the default
+    ///    branch") in `docs/invariants.md` and risking edits to the
+    ///    user's primary working copy.
     /// 3. Its canonicalized path equals the canonicalized `wt_target` the
     ///    import/session-spawn flow would have created. This rules out
     ///    adopting unrelated worktrees the user made manually or that
@@ -3782,12 +4049,24 @@ impl App {
     /// Begin the async plan-read stage of opening a Claude session.
     ///
     /// Spawns a background thread that calls `WorkItemBackend::read_plan`
-    /// (filesystem I/O) and then hands the result back to
-    /// `poll_session_opens`, which finishes the session on the UI thread.
-    /// Running the read here on the caller (a UI-thread entry point such
-    /// as `spawn_session` / `poll_worktree_creation` /
-    /// `poll_review_gate`) would freeze the event loop - see
-    /// `docs/UI.md` "Blocking I/O Prohibition".
+    /// (filesystem I/O) AND `session_id::session_exists_on_disk` (also
+    /// filesystem I/O - a `read_dir` of `~/.claude/projects` plus a
+    /// per-subdirectory `is_file` stat). Both are forbidden on the UI
+    /// thread by `docs/UI.md` "Blocking I/O Prohibition", and the result
+    /// (plan text, deterministic session UUID, and the chosen
+    /// `SpawnFlag`) is sent back via the per-work-item receiver for
+    /// `poll_session_opens` to apply on the UI thread without further
+    /// I/O.
+    ///
+    /// The work item's stage is captured here on the UI thread (a cheap
+    /// in-memory lookup) and threaded through the result struct so the
+    /// background worker can derive the deterministic session UUID
+    /// without re-entering App state, and so `finish_session_open` uses
+    /// the same stage as the spawn-flag decision (the
+    /// `(session_id, spawn_flag)` pair is internally consistent).
+    /// Stage transitions during the open are impossible to race: every
+    /// stage-change path cancels the pending entry via
+    /// `drop_session_open_entry` before the result lands.
     ///
     /// If another plan read is already in flight for this work item, the
     /// new request is dropped (the previous one will finish and spawn a
@@ -3802,6 +4081,30 @@ impl App {
             self.status_message = Some("Opening session...".into());
             return;
         }
+        // Capture the work item's stage AND its current
+        // stage-transition count on the UI thread (cheap in-memory
+        // reads) so the background worker can derive the
+        // deterministic session UUID for that exact stage-instance.
+        // The transition count is the nonce that distinguishes a
+        // cycle-back visit to the same stage from a restart-resume
+        // of the same visit: `Review -> Implementing` rework and
+        // `Blocked -> Planning` retreat both advance the count, so
+        // the second visit lands on a fresh UUID and the second
+        // spawn is a fresh session instead of resuming the prior
+        // transcript. See `src/session_id.rs::session_id_for` and
+        // the Codex adversarial-review finding that the original
+        // `(WorkItemId, WorkItemStatus)` derivation collapsed
+        // repeated stage visits. If the work item has been
+        // deleted between the caller's lookup and here, drop the
+        // open silently - there is nothing to spawn.
+        let Some((stage, transition_count)) = self
+            .work_items
+            .iter()
+            .find(|w| w.id == *work_item_id)
+            .map(|w| (w.status, w.stage_transition_count))
+        else {
+            return;
+        };
         let (tx, rx) = crossbeam_channel::bounded(1);
         let backend = Arc::clone(&self.backend);
         let wi_id_clone = work_item_id.clone();
@@ -3812,11 +4115,58 @@ impl App {
                 Ok(None) => (String::new(), None),
                 Err(e) => (String::new(), Some(format!("Could not read plan: {e}"))),
             };
+            // Derive the deterministic session UUID and probe the disk
+            // for an existing transcript. Both run here, on the
+            // background thread, because `session_exists_on_disk`
+            // performs filesystem I/O (`read_dir` + per-subdir
+            // `metadata` stat) which is forbidden on the UI thread by
+            // `docs/UI.md` "Blocking I/O Prohibition" - even a local
+            // scan can stall on a slow or network-mounted home
+            // directory or a permission delay. Co-locating the pure
+            // UUID derivation with the existence check guarantees the
+            // `(session_id, spawn_flag)` pair arriving at
+            // `finish_session_open` is internally consistent and the
+            // UI thread never has to touch `~/.claude/projects`.
+            //
+            // The probe returns a three-state enum:
+            // - `Exists` -> spawn `Resume`
+            // - `Missing` -> spawn `Fresh` (creates the new session
+            //   under the deterministic UUID so the next restart's
+            //   probe hits and resumes)
+            // - `Indeterminate(msg)` -> do NOT guess. Leave
+            //   `spawn_flag = None` and hand the error back via
+            //   `probe_error`; `finish_session_open` refuses to
+            //   spawn and surfaces the message so the user can
+            //   fix the underlying condition and retry. Falling
+            //   through to `Fresh` on an indeterminate probe would
+            //   silently lose the user's prior conversation
+            //   context on a degraded home directory, which is
+            //   the exact failure mode Codex adversarial review
+            //   flagged against the earlier `-> bool` helper.
+            let session_id =
+                crate::session_id::session_id_for(&wi_id_clone, stage, transition_count);
+            let (spawn_flag, probe_error) =
+                match crate::session_id::session_exists_on_disk(session_id) {
+                    crate::session_id::SessionProbe::Exists => (Some(SpawnFlag::Resume), None),
+                    crate::session_id::SessionProbe::Missing => (Some(SpawnFlag::Fresh), None),
+                    crate::session_id::SessionProbe::Indeterminate(msg) => (
+                        None,
+                        Some(format!(
+                            "Could not probe Claude transcript store: {msg}. \
+                         Session will not open - fix the underlying \
+                         filesystem condition and retry."
+                        )),
+                    ),
+                };
             let _ = tx.send(SessionOpenPlanResult {
                 wi_id: wi_id_clone,
                 cwd: cwd_clone,
+                stage,
                 plan_text,
                 read_error,
+                session_id,
+                spawn_flag,
+                probe_error,
             });
         });
         // Surface immediate feedback so a slow plan read does not
@@ -3852,7 +4202,7 @@ impl App {
         // nested call.
         let wi_ids: Vec<WorkItemId> = self.session_open_rx.keys().cloned().collect();
         for wi_id in wi_ids {
-            let result = match self.session_open_rx.get(&wi_id) {
+            let mut result = match self.session_open_rx.get(&wi_id) {
                 Some(entry) => match entry.rx.try_recv() {
                     Ok(r) => r,
                     Err(crossbeam_channel::TryRecvError::Empty) => continue,
@@ -3870,10 +4220,10 @@ impl App {
                 None => continue,
             };
             self.drop_session_open_entry(&wi_id);
-            if let Some(msg) = result.read_error {
+            if let Some(msg) = result.read_error.take() {
                 self.status_message = Some(msg);
             }
-            self.finish_session_open(&result.wi_id, &result.cwd, result.plan_text);
+            self.finish_session_open(result);
         }
     }
 
@@ -3882,113 +4232,651 @@ impl App {
     /// called directly from UI-thread entry points, because it invokes
     /// `stage_system_prompt` which consumes state and would otherwise
     /// encourage new synchronous `read_plan` callers.
-    fn finish_session_open(
-        &mut self,
-        work_item_id: &WorkItemId,
-        cwd: &std::path::Path,
-        plan_text: String,
-    ) {
-        // Guard: the work item may have been deleted while the plan
-        // read was in flight. In that case, do not spawn a session,
-        // just drop the result quietly. (The worktree itself is
-        // either pre-existing or cleaned up by `poll_worktree_creation`
-        // before we got here.)
-        let Some(work_item_status) = self
+    fn finish_session_open(&mut self, plan_result: SessionOpenPlanResult) {
+        // Destructure the plan result so we move the owned plan text
+        // into `stage_system_prompt` without cloning, while still
+        // holding references to `wi_id` and `cwd` for the rest of the
+        // function. `stage`, `session_id`, `spawn_flag`, and
+        // `probe_error` were all resolved on the background thread in
+        // `begin_session_open`, so the UI thread does NO filesystem
+        // work here - in particular, `session_id::session_exists_on_disk`
+        // (which does `read_dir` + per-subdirectory `metadata` stat)
+        // MUST NOT be called from this function. Re-deriving any of
+        // those values would also reintroduce a race where the
+        // disk-existence probe and the spawn flag could disagree if
+        // someone moved the helper back onto the UI thread.
+        let SessionOpenPlanResult {
+            wi_id: work_item_id,
+            cwd,
+            stage,
+            plan_text,
+            read_error: _,
+            session_id,
+            spawn_flag,
+            probe_error,
+        } = plan_result;
+        let cwd = cwd.as_path();
+
+        // Guard: the disk probe was `Indeterminate` (permission denied
+        // on `~/.claude/projects`, a FUSE stat failure, an unreadable
+        // subdirectory, etc.). The background worker explicitly set
+        // `spawn_flag = None` so we would NOT silently fall through to
+        // `--session-id` and lose the user's prior conversation
+        // context under degraded filesystem conditions. Surface the
+        // error via `status_message` so the user can fix the
+        // underlying condition and retry. This is the Codex
+        // adversarial-review finding that the earlier `-> bool` probe
+        // collapsed real I/O errors into "no transcript" and shipped
+        // `Fresh` on the back of that.
+        let Some(spawn_flag) = spawn_flag else {
+            self.status_message = Some(probe_error.unwrap_or_else(|| {
+                "Could not probe Claude transcript store; session will not open".to_string()
+            }));
+            return;
+        };
+
+        // Guards: do not spawn Claude unless the work item is still
+        // around AND its current stage still matches the stage we
+        // captured when the open began AND that stage is session-
+        // eligible. Three failure modes are covered:
+        //
+        // 1. Deletion - the work item was removed while the plan read
+        //    was in flight. Drop the result quietly. (The worktree
+        //    itself is either pre-existing or cleaned up by
+        //    `poll_worktree_creation` before we got here.)
+        //
+        // 2. Stage drift via a non-`apply_stage_change` path. The
+        //    obvious one is `reassemble_work_items` deriving the item
+        //    to `Done` from a freshly-merged PR (`status_derived =
+        //    true`), which does NOT route through `apply_stage_change`
+        //    and therefore does NOT call `drop_session_open_entry`.
+        //    Without this check, a slow background probe could land
+        //    after the derive and we would still spawn `claude` with
+        //    `--dangerously-skip-permissions` for a stage the user
+        //    has already left. The session would later be reaped by
+        //    `check_liveness`, but the process has already auto-
+        //    started and could touch user state.
+        //
+        // 3. The captured stage was somehow a no-session stage
+        //    (Backlog / Done / Mergequeue). `spawn_session` filters
+        //    these out before calling `begin_session_open`, so this
+        //    branch is defense-in-depth against a future caller
+        //    forgetting that filter. Spawning Claude for a no-session
+        //    stage would create an entry in `self.sessions` keyed by
+        //    a stage that the rest of the code treats as terminal,
+        //    which is exactly the cross-stage corruption the
+        //    deterministic UUID scheme was designed to avoid.
+        let Some(current_status) = self
             .work_items
             .iter()
-            .find(|w| w.id == *work_item_id)
+            .find(|w| w.id == work_item_id)
             .map(|w| w.status)
         else {
             return;
         };
-
-        // Start MCP socket server for this session.
-        let mcp_result = self.start_mcp_for_session(cwd, work_item_id);
-        let session_key = (work_item_id.clone(), work_item_status);
-        let has_gate_findings = self.review_gate_findings.contains_key(work_item_id);
-        let system_prompt = self.stage_system_prompt(work_item_id, cwd, plan_text);
-        let mut cmd = Self::build_claude_cmd(
-            &work_item_status,
-            system_prompt.as_deref(),
-            has_gate_findings,
-        );
-
-        // Write MCP config as .mcp.json in the worktree AND pass via --mcp-config.
-        // Both are needed: .mcp.json for Claude Code's project discovery, --mcp-config
-        // as a backup. The socket must be listening before Claude starts (it is - the
-        // socket server was started above).
-        if let Ok((ref server, _)) = mcp_result {
-            match std::env::current_exe() {
-                Ok(exe) => {
-                    let repo_mcp_servers: Vec<crate::config::McpServerEntry> = self
-                        .work_items
-                        .iter()
-                        .find(|w| w.id == *work_item_id)
-                        .and_then(|wi| wi.repo_associations.first())
-                        .map(|assoc| {
-                            let repo_display = crate::config::collapse_home(&assoc.repo_path);
-                            self.config
-                                .mcp_servers_for_repo(&repo_display)
-                                .into_iter()
-                                .cloned()
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let mcp_config =
-                        crate::mcp::build_mcp_config(&exe, &server.socket_path, &repo_mcp_servers);
-
-                    // Write .mcp.json to the worktree root.
-                    let mcp_json_path = cwd.join(".mcp.json");
-                    if let Err(e) = std::fs::write(&mcp_json_path, &mcp_config) {
-                        self.status_message = Some(format!("MCP config write error: {e}"));
-                    }
-
-                    // Also pass via --mcp-config as a temp file.
-                    let config_path = std::env::temp_dir().join(format!(
-                        "workbridge-mcp-config-{}.json",
-                        uuid::Uuid::new_v4()
-                    ));
-                    if let Err(e) = std::fs::write(&config_path, &mcp_config) {
-                        self.status_message = Some(format!("MCP config write error: {e}"));
-                    } else {
-                        cmd.push("--mcp-config".to_string());
-                        cmd.push(config_path.to_string_lossy().to_string());
-                    }
-                }
-                Err(e) => {
-                    self.status_message = Some(format!("Cannot resolve executable path: {e}"));
-                }
-            }
+        if current_status != stage {
+            return;
+        }
+        if matches!(
+            stage,
+            WorkItemStatus::Backlog | WorkItemStatus::Done | WorkItemStatus::Mergequeue
+        ) {
+            return;
         }
 
-        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        // Everything from here on is pure UI-thread data gathering:
+        // looking up the work item in `self.work_items`, consuming
+        // one-shot state from `self.rework_reasons` /
+        // `self.review_gate_findings` via `stage_system_prompt`, and
+        // reading scalar PTY dimensions. All actual I/O (MCP socket
+        // bind, `.mcp.json` + temp `--mcp-config` writes, PTY fork
+        // via `Session::spawn`) is deferred to a background worker
+        // via `begin_session_spawn`. The UI thread must NOT call
+        // `std::fs::write` or `Session::spawn` in the tick path - see
+        // `docs/UI.md` "Blocking I/O Prohibition", and the Codex
+        // adversarial-review finding that the earlier inline writes
+        // and spawn were UI-blocking on slow / network home
+        // directories, full disks, antivirus scans, and FUSE mounts.
+        let has_gate_findings = self.review_gate_findings.contains_key(&work_item_id);
+        let system_prompt = self.stage_system_prompt(&work_item_id, cwd, plan_text);
+        let cmd = Self::build_claude_cmd(
+            &stage,
+            system_prompt.as_deref(),
+            has_gate_findings,
+            session_id,
+            spawn_flag,
+        );
 
-        match Session::spawn(self.pane_cols, self.pane_rows, Some(cwd), &cmd_refs) {
-            Ok(session) => {
-                let parser = Arc::clone(&session.parser);
-                let entry = SessionEntry {
-                    parser,
-                    alive: true,
-                    session: Some(session),
-                    scrollback_offset: 0,
-                    selection: None,
-                };
-                self.sessions.insert(session_key.clone(), entry);
-                match mcp_result {
-                    Ok((server, _)) => {
-                        self.mcp_servers.insert(work_item_id.clone(), server);
-                    }
-                    Err(msg) => {
-                        self.status_message = Some(msg);
-                        self.focus = FocusPanel::Right;
-                        return;
-                    }
-                }
-                self.focus = FocusPanel::Right;
-                self.status_message = Some("Right panel focused - press Ctrl+] to return".into());
-            }
+        // Snapshot the MCP server inputs that the background worker
+        // will need. All values are owned so the worker closure can
+        // move them without borrowing `self` across the thread
+        // boundary. `start_mcp_for_session` used to gather these
+        // from `self` on the UI thread AND also called
+        // `McpSocketServer::start` (which does `remove_file` +
+        // `UnixListener::bind`, both I/O) on the UI thread; here we
+        // only do the reads.
+        let wi_id_str = match serde_json::to_string(&work_item_id) {
+            Ok(s) => s,
             Err(e) => {
-                self.status_message = Some(format!("Error spawning session: {e}"));
+                self.status_message = Some(format!(
+                    "MCP unavailable: could not serialize work item ID: {e}"
+                ));
+                return;
+            }
+        };
+        let context_json = {
+            let wi = self.work_items.iter().find(|w| w.id == work_item_id);
+            if let Some(wi) = wi {
+                let pr_url = wi
+                    .repo_associations
+                    .first()
+                    .and_then(|a| a.pr.as_ref())
+                    .map(|pr| pr.url.as_str())
+                    .unwrap_or("");
+                serde_json::json!({
+                    "work_item_id": wi_id_str,
+                    "stage": format!("{:?}", wi.status),
+                    "title": wi.title,
+                    "description": wi.description,
+                    "repo": cwd.display().to_string(),
+                    "pr_url": pr_url,
+                })
+                .to_string()
+            } else {
+                "{}".to_string()
+            }
+        };
+        let activity_log_path = self.backend.activity_path_for(&work_item_id);
+        let wi_kind = self
+            .work_items
+            .iter()
+            .find(|w| w.id == work_item_id)
+            .map(|w| format!("{:?}", w.kind))
+            .unwrap_or_default();
+        let repo_mcp_servers: Vec<crate::config::McpServerEntry> = self
+            .work_items
+            .iter()
+            .find(|w| w.id == work_item_id)
+            .and_then(|wi| wi.repo_associations.first())
+            .map(|assoc| {
+                let repo_display = crate::config::collapse_home(&assoc.repo_path);
+                self.config
+                    .mcp_servers_for_repo(&repo_display)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mcp_tx = self.mcp_tx.clone();
+        let pane_cols = self.pane_cols;
+        let pane_rows = self.pane_rows;
+        let cwd_owned = cwd.to_path_buf();
+
+        // `std::env::current_exe()` does a readlink /
+        // procfs-style syscall to resolve the running binary's
+        // path. Codex adversarial review flagged that as a
+        // filesystem lookup on the UI tick path, even though it
+        // is cheap in practice. Move the call into the
+        // `begin_session_spawn` background worker so the UI
+        // thread does ZERO filesystem I/O. Resolution failures
+        // surface via `SessionSpawnResult::Err`, routed through
+        // the same channel as every other spawn failure.
+        self.begin_session_spawn(
+            work_item_id,
+            stage,
+            cwd_owned,
+            cmd,
+            SessionSpawnInputs {
+                wi_id_str,
+                wi_kind,
+                context_json,
+                activity_log_path,
+                repo_mcp_servers,
+                mcp_tx,
+                pane_cols,
+                pane_rows,
+            },
+        );
+    }
+
+    /// Stage 2 of the session-open pipeline: spawn a background
+    /// worker that starts the MCP socket server, writes both MCP
+    /// config files, and forks the Claude PTY.
+    ///
+    /// All three operations are filesystem / process I/O and MUST
+    /// run off the UI thread (`docs/UI.md` "Blocking I/O
+    /// Prohibition"). The worker sends a `SessionSpawnResult`
+    /// through a per-work-item `Receiver` stored in
+    /// `session_spawn_rx`; `poll_session_spawns` drains the result
+    /// on the next background tick and inserts the live session /
+    /// MCP server into their respective maps.
+    ///
+    /// If another spawn is already pending for the same work item,
+    /// the new request is dropped with a status message. This
+    /// cannot deadlock because `poll_session_spawns` always removes
+    /// the entry before invoking anything else.
+    fn begin_session_spawn(
+        &mut self,
+        work_item_id: WorkItemId,
+        stage: WorkItemStatus,
+        cwd: PathBuf,
+        cmd: Vec<String>,
+        inputs: SessionSpawnInputs,
+    ) {
+        if self.session_spawn_rx.contains_key(&work_item_id) {
+            self.status_message = Some("Session spawn already in progress...".into());
+            return;
+        }
+
+        // Shared cancellation flag. `drop_session_spawn_entry`
+        // sets this to `true` when a stage change, work-item
+        // delete, or cleanup path fires while the worker is still
+        // running its I/O-heavy tail. The worker checks it at
+        // FOUR points: (1) at entry, (2) right after
+        // `McpSocketServer::start` but before any worktree file
+        // writes, (3) right after the writes but before the PTY
+        // fork, and (4) [historical - now step 3] immediately
+        // before `Session::spawn`. Cancellation at step 3 also
+        // rolls back the worktree `.mcp.json` and the temp
+        // `--mcp-config` file so a cancelled spawn cannot leave
+        // stale Claude Code control files pointing at a dead
+        // socket behind. Closes the Codex adversarial-review
+        // window where a stale spawn could launch
+        // `claude --dangerously-skip-permissions` for a stage
+        // the work item had already left OR write stale
+        // `.mcp.json` into a worktree whose session was never
+        // actually created.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_for_thread = Arc::clone(&cancel);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let wi_id_for_thread = work_item_id.clone();
+        std::thread::spawn(move || {
+            let SessionSpawnInputs {
+                wi_id_str,
+                wi_kind,
+                context_json,
+                activity_log_path,
+                repo_mcp_servers,
+                mcp_tx,
+                pane_cols,
+                pane_rows,
+            } = inputs;
+
+            // Helper that ships a cancelled outcome back to the
+            // UI thread and cleans up any worktree / temp files
+            // already written. `files_to_remove` is a set of
+            // optional paths that may or may not have been
+            // written depending on which step of the worker was
+            // interrupted. Each path is `remove_file`-d on a
+            // best-effort basis; a failure (e.g. NotFound
+            // because we never got to that write) is benign.
+            //
+            // Deletions happen on THIS background thread, not
+            // the UI thread, so they do not block the tick path
+            // (`docs/UI.md` "Blocking I/O Prohibition"). This
+            // mirrors the `teardown_session_async` hop used on
+            // the post-fork cancellation path.
+            fn send_cancelled(
+                tx: &crossbeam_channel::Sender<SessionSpawnResult>,
+                wi_id: WorkItemId,
+                stage: WorkItemStatus,
+                files_to_remove: &[&std::path::Path],
+            ) {
+                for path in files_to_remove {
+                    let _ = std::fs::remove_file(path);
+                }
+                let _ = tx.send(SessionSpawnResult {
+                    wi_id,
+                    stage,
+                    outcome: Err("Session spawn cancelled".to_string()),
+                });
+            }
+
+            // Cancel check 1: at entry. If `apply_stage_change`
+            // or a delete fired before the worker even scheduled,
+            // skip everything - including the executable
+            // resolution, the MCP server start, and every
+            // write. Nothing has been written yet, so nothing
+            // to clean up.
+            if cancel_for_thread.load(std::sync::atomic::Ordering::Acquire) {
+                send_cancelled(&tx, wi_id_for_thread, stage, &[]);
+                return;
+            }
+
+            // Resolve the running binary's path here, on the
+            // background thread, rather than on the UI thread.
+            // `std::env::current_exe` does a readlink /
+            // procfs-style syscall which Codex adversarial
+            // review flagged as filesystem I/O that must not
+            // run on the tick path.
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.send(SessionSpawnResult {
+                        wi_id: wi_id_for_thread,
+                        stage,
+                        outcome: Err(format!("Cannot resolve executable path: {e}")),
+                    });
+                    return;
+                }
+            };
+
+            // Start the MCP socket server (remove_file +
+            // UnixListener::bind). This has to happen before the
+            // config content can be built because the config
+            // embeds the socket path.
+            let socket_path = crate::mcp::socket_path_for_session();
+            let server = match McpSocketServer::start(
+                socket_path,
+                wi_id_str,
+                wi_kind,
+                context_json,
+                activity_log_path,
+                mcp_tx,
+                false, // read_only: interactive sessions need full tool access
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(SessionSpawnResult {
+                        wi_id: wi_id_for_thread,
+                        stage,
+                        outcome: Err(format!(
+                            "MCP unavailable: failed to start socket server: {e}"
+                        )),
+                    });
+                    return;
+                }
+            };
+
+            // Cancel check 2: after MCP server start, before
+            // any worktree / temp file writes. The server just
+            // bound a Unix domain socket; if cancellation
+            // happened between check 1 and now, let the server
+            // fall out of scope via the early return - its
+            // `Drop` runs `stop() + remove_file(socket_path)` on
+            // THIS background thread. No worktree writes have
+            // happened yet, so there is nothing to roll back
+            // beyond the server's own socket file.
+            if cancel_for_thread.load(std::sync::atomic::Ordering::Acquire) {
+                send_cancelled(&tx, wi_id_for_thread, stage, &[]);
+                return;
+            }
+
+            // Build the MCP config JSON and append it to the
+            // claude argv as an inline `--mcp-config <json>`
+            // string. Claude Code accepts inline JSON literals
+            // (per `--help`: "Load MCP servers from JSON files
+            // or strings"), so we never write the config to
+            // disk - the secrets-bearing JSON only ever lives
+            // in this process's argv and Claude's argv.
+            let mcp_config =
+                crate::mcp::build_mcp_config(&exe, &server.socket_path, &repo_mcp_servers);
+            let mut final_cmd = cmd;
+            final_cmd.push("--mcp-config".to_string());
+            final_cmd.push(mcp_config);
+
+            // Cancel check 3: last point before the PTY fork.
+            if cancel_for_thread.load(std::sync::atomic::Ordering::Acquire) {
+                send_cancelled(&tx, wi_id_for_thread, stage, &[]);
+                return;
+            }
+
+            let cmd_refs: Vec<&str> = final_cmd.iter().map(|s| s.as_str()).collect();
+            let outcome = match crate::session::Session::spawn(
+                pane_cols,
+                pane_rows,
+                Some(cwd.as_path()),
+                &cmd_refs,
+            ) {
+                Ok(session) => Ok(SessionSpawnOk {
+                    session,
+                    mcp_server: server,
+                }),
+                Err(e) => Err(format!("Error spawning session: {e}")),
+            };
+
+            let _ = tx.send(SessionSpawnResult {
+                wi_id: wi_id_for_thread,
+                stage,
+                outcome,
+            });
+        });
+
+        let activity = self.start_activity("Spawning Claude session...");
+        self.session_spawn_rx.insert(
+            work_item_id,
+            SessionSpawnPending {
+                rx,
+                activity,
+                cancel,
+            },
+        );
+    }
+
+    /// Move a live `Session` + `McpSocketServer` onto a background
+    /// thread whose only job is to drop them.
+    ///
+    /// Codex adversarial review flagged that letting either of
+    /// these drop on the UI tick path re-introduces the exact
+    /// blocking-I/O class the two-stage spawn refactor was built
+    /// to eliminate: `Session::Drop` runs `force_kill` (process
+    /// SIGTERM/SIGKILL + `child.wait`) and joins the PTY reader
+    /// thread, and `McpSocketServer::Drop` runs `stop` + an
+    /// unlink syscall on the socket path. Both are forbidden on
+    /// the UI thread by `docs/UI.md` "Blocking I/O Prohibition"
+    /// (absolute rule - cannot be overridden by authorization).
+    ///
+    /// The helper is `static` on purpose: it must not borrow
+    /// `self` because the call sites (stale result in
+    /// `poll_session_spawns`, buffered result in
+    /// `drop_session_spawn_entry`) already hold a mutable
+    /// reference to `App` through `&mut self`. A one-shot
+    /// `std::thread::spawn` is cheap relative to the blocking
+    /// teardown it replaces - teardown is at most a few hundred
+    /// ms, including the SIGTERM grace window - and there are
+    /// never more than a handful of pending teardowns at once in
+    /// practice (one per interrupted stage change).
+    fn teardown_session_async(
+        session: crate::session::Session,
+        mcp_server: Option<McpSocketServer>,
+    ) {
+        // Regression guard: Session::Drop and McpSocketServer::Drop
+        // are blocking (force_kill + reader-thread join + socket
+        // unlink). Any caller that drops these on the UI thread
+        // (including via a `HashMap::insert` that replaces a live
+        // entry) blocks the tick path. See `docs/UI.md` "Blocking
+        // I/O Prohibition".
+        std::thread::spawn(move || {
+            drop(session);
+            drop(mcp_server);
+        });
+    }
+
+    /// Gracefully tear down a live `Session` on a background
+    /// thread. Unlike `teardown_session_async`, this calls
+    /// `Session::kill` first (SIGTERM + grace + SIGKILL + reap)
+    /// before dropping - the grace-window sleep is blocking and
+    /// must not run on the UI tick path.
+    ///
+    /// Regression guard: callers MUST NOT drop `Session`,
+    /// `McpSocketServer`, or the temp `--mcp-config` file on the
+    /// UI thread directly - every map removal that yields a
+    /// live session has to flow through this helper (or
+    /// `teardown_session_async` for already-dead sessions) so
+    /// the blocking Drops run off-thread. `docs/UI.md` "Blocking
+    /// I/O Prohibition" is the absolute rule.
+    fn teardown_live_session_async(
+        mut session: crate::session::Session,
+        mcp_server: Option<McpSocketServer>,
+    ) {
+        std::thread::spawn(move || {
+            session.kill();
+            drop(session);
+            drop(mcp_server);
+        });
+    }
+
+    /// Move a live `McpSocketServer` onto a background thread
+    /// whose only job is to drop it.
+    ///
+    /// Mirror of [`teardown_session_async`] for code paths that
+    /// only hold an `McpSocketServer` (no paired `Session`). The
+    /// motivating case is the Codex adversarial review finding
+    /// that `poll_session_spawns`'s
+    /// `self.mcp_servers.insert(...)` can replace a pre-existing
+    /// server for the same work item: when a dead Claude session
+    /// is reopened, `open_session_for_selected` removes only the
+    /// dead `self.sessions` entry and leaves the old
+    /// `McpSocketServer` in `self.mcp_servers`. The subsequent
+    /// insert would then drop the old server on the UI thread,
+    /// and `McpSocketServer::Drop` runs `stop()` plus a
+    /// `std::fs::remove_file` syscall - blocking I/O that
+    /// `docs/UI.md` "Blocking I/O Prohibition" forbids on the
+    /// tick path. Routing the pre-existing entry through this
+    /// helper before the new insert keeps the UI thread free.
+    fn teardown_mcp_server_async(mcp_server: McpSocketServer) {
+        std::thread::spawn(move || {
+            drop(mcp_server);
+        });
+    }
+
+    /// Remove a pending `session_spawn_rx` entry and end its
+    /// spinner activity. Mirror of `drop_session_open_entry` so the
+    /// two terminal paths (result delivered, background thread
+    /// disconnected) cannot leak the "Spawning Claude session..."
+    /// spinner.
+    ///
+    /// If the background worker has already sent a live
+    /// `SessionSpawnOk` into the channel but `poll_session_spawns`
+    /// has not yet drained it (the common race when a stage change
+    /// or work-item delete fires after `tx.send` but before the
+    /// next background tick), the buffered result is pulled out
+    /// here and its `Session` + `McpSocketServer` are handed to
+    /// `teardown_session_async` so their blocking `Drop` impls run
+    /// off the UI thread. Without this hop, the call site's
+    /// `self.session_spawn_rx.remove(wi_id)` would drop the
+    /// Receiver inline, which drops the buffered `SessionSpawnOk`
+    /// (including the `Session`) on the UI thread - exactly the
+    /// Codex adversarial-review finding this helper exists to
+    /// prevent.
+    fn drop_session_spawn_entry(&mut self, wi_id: &WorkItemId) {
+        if let Some(entry) = self.session_spawn_rx.remove(wi_id) {
+            // Flip the shared cancellation flag FIRST so the
+            // background worker, if it is still running, aborts
+            // before `Session::spawn` and never forks a stale
+            // Claude process. If the worker has already passed
+            // the cancel check and reached the fork, the
+            // `try_recv` below + the post-fork teardown hop in
+            // `poll_session_spawns` catches the race.
+            entry
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.end_activity(entry.activity);
+            // Drain any buffered result BEFORE the Receiver
+            // inside `entry` falls out of scope. If the channel
+            // was empty the `try_recv` returns immediately with
+            // `Err(Empty)`; if the background worker had already
+            // sent, we get an owned `SessionSpawnResult` that we
+            // can route to the async teardown helper. Errors
+            // (empty / disconnected) are not distinguished here
+            // because both mean "no buffered session to hand off".
+            if let Ok(result) = entry.rx.try_recv()
+                && let Ok(ok) = result.outcome
+            {
+                Self::teardown_session_async(ok.session, Some(ok.mcp_server));
+            }
+        }
+    }
+
+    /// Poll pending session-spawn workers. Called from the
+    /// background-work tick in `salsa.rs`. For each completed
+    /// receiver, removes the pending entry and inserts the live
+    /// session + MCP server into `self.sessions` / `self.mcp_servers`.
+    ///
+    /// Re-validates the work item / stage on completion: the spawn
+    /// is allowed to land only if the work item still exists AND
+    /// its current stage still matches the captured one, mirroring
+    /// the guards in `finish_session_open`. A drift here means the
+    /// user advanced past the stage (or the item was deleted)
+    /// while the PTY was being forked; `check_liveness` will reap
+    /// any orphaned session, but we want to avoid creating the
+    /// orphan in the first place.
+    pub fn poll_session_spawns(&mut self) {
+        if self.session_spawn_rx.is_empty() {
+            return;
+        }
+        let wi_ids: Vec<WorkItemId> = self.session_spawn_rx.keys().cloned().collect();
+        for wi_id in wi_ids {
+            let result = match self.session_spawn_rx.get(&wi_id) {
+                Some(entry) => match entry.rx.try_recv() {
+                    Ok(r) => r,
+                    Err(crossbeam_channel::TryRecvError::Empty) => continue,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        self.drop_session_spawn_entry(&wi_id);
+                        self.status_message =
+                            Some("Session spawn: background thread exited unexpectedly".into());
+                        continue;
+                    }
+                },
+                None => continue,
+            };
+            self.drop_session_spawn_entry(&wi_id);
+
+            // Re-validate the work item still exists and the stage
+            // still matches the captured one. Drop the spawn on
+            // the floor otherwise - the session would be immediately
+            // orphaned by the stage mismatch.
+            let still_current = self
+                .work_items
+                .iter()
+                .find(|w| w.id == result.wi_id)
+                .map(|w| w.status == result.stage)
+                .unwrap_or(false);
+            if !still_current {
+                // Regression guard: never drop a live Session on
+                // the UI tick path - Session::Drop blocks.
+                if let Ok(ok) = result.outcome {
+                    Self::teardown_session_async(ok.session, Some(ok.mcp_server));
+                }
+                continue;
+            }
+
+            match result.outcome {
+                Ok(SessionSpawnOk {
+                    session,
+                    mcp_server,
+                }) => {
+                    // Regression guard: `HashMap::insert` below
+                    // would drop any stale value on the UI
+                    // thread. Route pre-existing resources
+                    // through the async teardown helpers first.
+                    let session_key = (result.wi_id.clone(), result.stage);
+                    let old_entry = self.sessions.remove(&session_key);
+                    let old_mcp = self.mcp_servers.remove(&result.wi_id);
+                    if let Some(old_entry) = old_entry
+                        && let Some(old_session) = old_entry.session
+                    {
+                        Self::teardown_session_async(old_session, old_mcp);
+                    } else if let Some(old_mcp) = old_mcp {
+                        Self::teardown_mcp_server_async(old_mcp);
+                    }
+                    let parser = Arc::clone(&session.parser);
+                    let entry = SessionEntry {
+                        parser,
+                        alive: true,
+                        session: Some(session),
+                        scrollback_offset: 0,
+                        selection: None,
+                    };
+                    self.sessions.insert(session_key, entry);
+                    self.mcp_servers.insert(result.wi_id, mcp_server);
+                    self.focus = FocusPanel::Right;
+                    self.status_message =
+                        Some("Right panel focused - press Ctrl+] to return".to_string());
+                }
+                Err(msg) => {
+                    self.status_message = Some(msg);
+                }
             }
         }
     }
@@ -3999,20 +4887,55 @@ impl App {
     /// `--mcp-config` so Claude Code does not mistake it for a config
     /// file path. The returned Vec does not include `--mcp-config` -
     /// callers append it after this returns.
+    ///
+    /// `session_id` is the deterministic UUID derived from the work
+    /// item and stage via `session_id::session_id_for`. `flag` selects
+    /// whether this spawn is a resume attempt (`--resume`) or a fresh
+    /// create under a known UUID (`--session-id`); the caller decides
+    /// based on `session_id::session_exists_on_disk`. See `SpawnFlag`
+    /// and `docs/work-items.md` "Session identity and resumption" for
+    /// the end-to-end protocol.
     fn build_claude_cmd(
         status: &WorkItemStatus,
         system_prompt: Option<&str>,
         force_auto_start: bool,
+        session_id: uuid::Uuid,
+        flag: SpawnFlag,
     ) -> Vec<String> {
         let is_planning = *status == WorkItemStatus::Planning;
-        let auto_start = force_auto_start
-            || matches!(
-                status,
-                WorkItemStatus::Planning | WorkItemStatus::Implementing
-            );
+        // Codex adversarial review: the positional "Explain who
+        // you are and start working." (Planning / Implementing)
+        // and "Present the review gate assessment..." (Review with
+        // findings) prompts are one-shot kickoffs for a FRESH
+        // session. Appending them on a `--resume <uuid>` spawn
+        // would re-inject the kickoff text as a new user turn in
+        // an already-running transcript - Claude Code would
+        // resume the prior conversation AND see a brand-new
+        // "start working" instruction, which can make it restart
+        // or duplicate work. Gate the prompt on `SpawnFlag::Fresh`
+        // so resume spawns just reattach to the live transcript
+        // without any extra user input.
+        let auto_start = flag == SpawnFlag::Fresh
+            && (force_auto_start
+                || matches!(
+                    status,
+                    WorkItemStatus::Planning | WorkItemStatus::Implementing
+                ));
 
         let mut cmd: Vec<String> = vec!["claude".to_string()];
         cmd.push("--dangerously-skip-permissions".to_string());
+        // Session identity: every interactive stage-session spawn
+        // carries a deterministic UUID derived from
+        // `(work_item_id, stage)`. The caller chooses `Resume`
+        // (`--resume`) when `session_id::session_exists_on_disk`
+        // already finds a transcript file under that UUID, and
+        // `Fresh` (`--session-id`) otherwise. `Fresh` creates a new
+        // session under the deterministic UUID so that the next
+        // restart's existence check will hit and resume it. The
+        // scheme is intentionally pure - nothing is persisted in
+        // workbridge's data model; see `src/session_id.rs`.
+        cmd.push(flag.cli_flag().to_string());
+        cmd.push(session_id.to_string());
         cmd.push("--allowedTools".to_string());
         cmd.push(
             [
@@ -4404,73 +5327,6 @@ impl App {
             return WorktreeCleanliness::BehindOnly(behind);
         }
         WorktreeCleanliness::Clean
-    }
-
-    /// Start an MCP socket server for a work item session.
-    /// MCP config is passed to Claude via --mcp-config CLI flag, not written
-    /// to disk. Returns (server, unused_path) on success, or an error message
-    /// on failure.
-    fn start_mcp_for_session(
-        &self,
-        worktree_path: &std::path::Path,
-        work_item_id: &WorkItemId,
-    ) -> Result<(McpSocketServer, PathBuf), String> {
-        let socket_path = crate::mcp::socket_path_for_session();
-
-        // Serialize the work item ID for the MCP server.
-        let wi_id_str = serde_json::to_string(work_item_id)
-            .map_err(|e| format!("MCP unavailable: could not serialize work item ID: {e}"))?;
-
-        // Build context JSON for get_context tool.
-        // Uses the worktree path (not the main repo) so Claude operates in
-        // the correct working directory.
-        let context_json = {
-            let wi = self.work_items.iter().find(|w| w.id == *work_item_id);
-            if let Some(wi) = wi {
-                let pr_url = wi
-                    .repo_associations
-                    .first()
-                    .and_then(|a| a.pr.as_ref())
-                    .map(|pr| pr.url.as_str())
-                    .unwrap_or("");
-                serde_json::json!({
-                    "work_item_id": wi_id_str,
-                    "stage": format!("{:?}", wi.status),
-                    "title": wi.title,
-                    "description": wi.description,
-                    "repo": worktree_path.display().to_string(),
-                    "pr_url": pr_url,
-                })
-                .to_string()
-            } else {
-                "{}".to_string()
-            }
-        };
-
-        // Compute the activity log path for the query_log MCP tool.
-        let activity_log_path = self.backend.activity_path_for(work_item_id);
-
-        // Determine work item kind for conditional MCP tool exposure.
-        let wi_kind = self
-            .work_items
-            .iter()
-            .find(|w| w.id == *work_item_id)
-            .map(|w| format!("{:?}", w.kind))
-            .unwrap_or_default();
-
-        // Start the socket server.
-        let server = McpSocketServer::start(
-            socket_path,
-            wi_id_str,
-            wi_kind,
-            context_json,
-            activity_log_path,
-            self.mcp_tx.clone(),
-            false, // read_only: interactive sessions need full tool access
-        )
-        .map_err(|e| format!("MCP unavailable: failed to start socket server: {e}"))?;
-
-        Ok((server, PathBuf::new()))
     }
 
     /// Drain MCP events from the crossbeam channel.
@@ -6024,16 +6880,29 @@ impl App {
         // stages like Done or Mergequeue. Dropping the entry here also
         // ends the "Opening session..." spinner.
         self.drop_session_open_entry(wi_id);
+        // Same for the second session-open stage. A pending spawn
+        // worker keyed by `wi_id` lives in `session_spawn_rx` with
+        // no entry in `self.sessions` yet, so the session-kill
+        // branch below would miss it. `poll_session_spawns`
+        // re-validates the stage on completion and will drop any
+        // stale result, but without the unconditional drop here the
+        // "Spawning Claude session..." spinner would linger on the
+        // status bar until the background PTY fork completes.
+        self.drop_session_spawn_entry(wi_id);
 
-        // Kill the old session for this work item before spawning a new one.
-        // Previously relied on orphan cleanup in check_liveness, but that
-        // leaves two sessions alive briefly and the old one can do work
-        // (push, commit, etc.) in the gap.
+        // Regression guard: the old session + its paired MCP
+        // server must be torn down via `teardown_live_session_async`
+        // so `Session::kill`'s SIGTERM grace sleep runs off the
+        // UI tick path. Do not re-introduce an inline
+        // `session.kill()` here.
         if let Some(old_key) = self.session_key_for(wi_id)
-            && let Some(mut entry) = self.sessions.remove(&old_key)
+            && let Some(entry) = self.sessions.remove(&old_key)
         {
-            if let Some(ref mut session) = entry.session {
-                session.kill();
+            let mcp_server = self.mcp_servers.remove(wi_id);
+            if let Some(session) = entry.session {
+                Self::teardown_live_session_async(session, mcp_server);
+            } else if let Some(mcp) = mcp_server {
+                Self::teardown_mcp_server_async(mcp);
             }
             self.cleanup_session_state_for(wi_id);
         }
@@ -7788,7 +8657,9 @@ impl App {
                 }
             };
 
-            // Build MCP config file for --mcp-config.
+            // Build the MCP config JSON and pass it inline via
+            // `--mcp-config <json>`. Claude Code accepts inline
+            // strings, so the gate never writes its config to disk.
             let exe_path = match std::env::current_exe() {
                 Ok(p) => p,
                 Err(e) => {
@@ -7802,17 +8673,6 @@ impl App {
                 }
             };
             let mcp_config = crate::mcp::build_mcp_config(&exe_path, &gate_socket, &[]);
-            let config_path = std::env::temp_dir()
-                .join(format!("workbridge-rg-mcp-{}.json", uuid::Uuid::new_v4()));
-            if let Err(e) = std::fs::write(&config_path, &mcp_config) {
-                drop(gate_server);
-                let _ = tx.send(ReviewGateMessage::Result(ReviewGateResult {
-                    work_item_id: wi_id_clone,
-                    approved: false,
-                    detail: format!("review gate: could not write MCP config: {e}"),
-                }));
-                return;
-            }
 
             let json_schema = r#"{"type":"object","properties":{"approved":{"type":"boolean"},"detail":{"type":"string"}},"required":["approved","detail"]}"#;
 
@@ -7828,7 +8688,7 @@ impl App {
                     "--json-schema",
                     json_schema,
                     "--mcp-config",
-                    &config_path.to_string_lossy(),
+                    &mcp_config,
                 ])
                 .output()
             {
@@ -7869,10 +8729,7 @@ impl App {
                 },
             };
 
-            // Clean up temporary MCP server and config file.
             drop(gate_server);
-            let _ = std::fs::remove_file(&config_path);
-
             let _ = tx.send(ReviewGateMessage::Result(result));
         });
 
@@ -8029,13 +8886,18 @@ impl App {
                             self.build_display_list();
                         }
 
-                        // Kill and respawn the session with the rework
-                        // prompt so Claude sees the rejection reason.
+                        // Regression guard: teardown must go through
+                        // the async helpers so SIGTERM grace + wait
+                        // runs off the UI tick path.
                         if let Some(key) = self.session_key_for(&wi_id)
-                            && let Some(mut entry) = self.sessions.remove(&key)
-                            && let Some(ref mut session) = entry.session
+                            && let Some(entry) = self.sessions.remove(&key)
                         {
-                            session.kill();
+                            let mcp_server = self.mcp_servers.remove(&wi_id);
+                            if let Some(session) = entry.session {
+                                Self::teardown_live_session_async(session, mcp_server);
+                            } else if let Some(mcp) = mcp_server {
+                                Self::teardown_mcp_server_async(mcp);
+                            }
                         }
                         self.cleanup_session_state_for(&wi_id);
                         self.spawn_session(&wi_id);
@@ -8143,11 +9005,20 @@ impl App {
 
                 // Kill the current session and respawn with the implementing_rework
                 // prompt that includes the rejection feedback.
+                // Symmetric with the blocked-gate arm above: route the
+                // live session and its paired MCP server through
+                // `teardown_live_session_async` so the SIGTERM grace
+                // window does not block the UI tick path. Codex
+                // adversarial-review P0.
                 if let Some(key) = self.session_key_for(&wi_id)
-                    && let Some(mut entry) = self.sessions.remove(&key)
-                    && let Some(ref mut session) = entry.session
+                    && let Some(entry) = self.sessions.remove(&key)
                 {
-                    session.kill();
+                    let mcp_server = self.mcp_servers.remove(&wi_id);
+                    if let Some(session) = entry.session {
+                        Self::teardown_live_session_async(session, mcp_server);
+                    } else if let Some(mcp) = mcp_server {
+                        Self::teardown_mcp_server_async(mcp);
+                    }
                 }
                 self.cleanup_session_state_for(&wi_id);
                 self.spawn_session(&wi_id);
@@ -8206,30 +9077,30 @@ impl App {
         }
     }
 
-    /// Tear down the global assistant session and all its associated
-    /// resources. Safe to call when no session exists.
+    /// Tear down the global assistant session. Safe to call when no
+    /// session exists.
     ///
-    /// Steps:
-    /// 1. SIGTERM + 50 ms grace + SIGKILL the `claude` child process via
-    ///    `Session::kill` so no zombie survives.
-    /// 2. Drop the `SessionEntry`; `Session::Drop` joins the reader thread.
-    /// 3. Drop the MCP server (same as `cleanup_all_mcp`).
-    /// 4. Remove the temp MCP config file and clear its path.
-    /// 5. Drop any keystrokes queued for the old session's PTY so they
-    ///    don't leak into the next session on reopen.
+    /// Regression guard: `Session::kill` and `McpSocketServer::Drop`
+    /// are blocking. Take the resources out synchronously and drop
+    /// them on a background thread so the UI tick path does no
+    /// process or filesystem I/O.
     fn teardown_global_session(&mut self) {
-        if let Some(ref mut entry) = self.global_session
-            && let Some(ref mut session) = entry.session
-        {
-            session.kill();
-        }
-        self.global_session = None;
-        self.global_mcp_server = None;
-        if let Some(ref path) = self.global_mcp_config_path {
-            let _ = std::fs::remove_file(path);
-        }
-        self.global_mcp_config_path = None;
+        let session = self
+            .global_session
+            .take()
+            .and_then(|mut entry| entry.session.take());
+        let mcp_server = self.global_mcp_server.take();
         self.pending_global_pty_bytes.clear();
+
+        if session.is_some() || mcp_server.is_some() {
+            std::thread::spawn(move || {
+                if let Some(mut session) = session {
+                    session.kill();
+                    drop(session);
+                }
+                drop(mcp_server);
+            });
+        }
     }
 
     /// Spawn the global assistant Claude Code session.
@@ -8293,9 +9164,11 @@ impl App {
             cmd.push(prompt.clone());
         }
 
-        // Write MCP config to a temp file and pass via --mcp-config.
-        // Use a deterministic PID-based path so respawns overwrite the
-        // previous file instead of leaking a new one each time.
+        // Build the MCP config JSON and pass it inline via
+        // `--mcp-config <json>`. Claude Code accepts inline JSON
+        // strings (per `--help`: "Load MCP servers from JSON
+        // files or strings"), so we never write the config to
+        // disk.
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
@@ -8308,17 +9181,8 @@ impl App {
             }
         };
         let mcp_config = crate::mcp::build_mcp_config(&exe, &mcp_server.socket_path, &[]);
-        let config_path =
-            std::env::temp_dir().join(format!("workbridge-global-mcp-{}.json", std::process::id()));
-        if let Err(e) = std::fs::write(&config_path, &mcp_config) {
-            self.status_message = Some(format!("Global assistant MCP config error: {e}"));
-            self.global_drawer_open = false;
-            self.focus = self.pre_drawer_focus;
-            return;
-        }
-        self.global_mcp_config_path = Some(config_path.clone());
         cmd.push("--mcp-config".to_string());
-        cmd.push(config_path.to_string_lossy().to_string());
+        cmd.push(mcp_config);
 
         // Use a dedicated workbridge-owned scratch directory as cwd.
         //
@@ -8896,6 +9760,7 @@ mod tests {
                     }],
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -8918,6 +9783,7 @@ mod tests {
                     plan: None,
                     description: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -9040,6 +9906,7 @@ mod tests {
                     repo_associations: req.repo_associations,
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 })
             }
             fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
@@ -9538,6 +10405,7 @@ mod tests {
             }],
             plan: None,
             done_at: None,
+            stage_transition_count: 0,
         };
         let record_b = crate::work_item_backend::WorkItemRecord {
             display_id: None,
@@ -9553,6 +10421,7 @@ mod tests {
             }],
             plan: None,
             done_at: None,
+            stage_transition_count: 0,
         };
 
         // Start with order A, B.
@@ -9595,6 +10464,7 @@ mod tests {
                     git_state: None,
                 }],
                 errors: vec![],
+                stage_transition_count: 0,
             },
             crate::work_item::WorkItem {
                 display_id: None,
@@ -9614,6 +10484,7 @@ mod tests {
                     git_state: None,
                 }],
                 errors: vec![],
+                stage_transition_count: 0,
             },
         ];
         app.build_display_list();
@@ -9643,11 +10514,11 @@ mod tests {
         repo: &str,
     ) -> crate::work_item::WorkItem {
         crate::work_item::WorkItem {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from(format!("/tmp/{title}.json"))),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
             title: title.to_string(),
-            display_id: None,
             description: None,
             status,
             status_derived: false,
@@ -9660,6 +10531,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         }
     }
 
@@ -9792,6 +10664,7 @@ mod tests {
                 }],
                 plan: None,
                 done_at: None,
+                stage_transition_count: 0,
             };
             let json = serde_json::to_string_pretty(&record).unwrap();
             std::fs::write(dir.join(name), json).unwrap();
@@ -10236,6 +11109,7 @@ mod tests {
                     }],
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -10258,6 +11132,7 @@ mod tests {
                     plan: None,
                     description: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -10514,6 +11389,7 @@ mod tests {
                     }],
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -10536,6 +11412,7 @@ mod tests {
                     plan: None,
                     description: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -10982,6 +11859,7 @@ mod tests {
                     }],
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -11004,6 +11882,7 @@ mod tests {
                     plan: None,
                     description: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -11147,6 +12026,7 @@ mod tests {
                     repo_associations: req.repo_associations,
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 Ok(record)
             }
@@ -11277,6 +12157,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         }
     }
 
@@ -11569,6 +12450,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -11650,6 +12532,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -11984,6 +12867,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.execute_merge(&wi_id, "squash");
         let status = app
@@ -12019,6 +12903,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.execute_merge(&wi_id, "squash");
         let status = app
@@ -12054,6 +12939,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
         // No repo_data entry for /tmp/repo, so the cached github_remote
         // lookup returns None and execute_merge blocks the merge.
@@ -12084,6 +12970,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         let (tx, rx) = crossbeam_channel::bounded(1);
         tx.send(PrMergeResult {
@@ -12123,6 +13010,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         let (tx, rx) = crossbeam_channel::bounded(1);
         tx.send(PrMergeResult {
@@ -12167,6 +13055,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.mergequeue_watches.push(MergequeueWatch {
             wi_id: wi_id.clone(),
@@ -12236,6 +13125,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.mergequeue_watches.push(MergequeueWatch {
             wi_id: wi_id.clone(),
@@ -12301,6 +13191,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         // Watch starts with pr_number = None, as if reconstructed from a
         // backend record after an app restart where the open-PR fetch had
@@ -12372,6 +13263,7 @@ mod tests {
                 status_derived: false,
                 repo_associations: vec![],
                 errors: vec![],
+                stage_transition_count: 0,
             });
             app.mergequeue_watches.push(MergequeueWatch {
                 wi_id: id.clone(),
@@ -12455,6 +13347,7 @@ mod tests {
             }],
             plan: None,
             done_at: None,
+            stage_transition_count: 0,
         };
 
         let backend = ArchiveTestBackend {
@@ -12510,6 +13403,7 @@ mod tests {
             }],
             plan: None,
             done_at: None,
+            stage_transition_count: 0,
         };
 
         let backend = ArchiveTestBackend {
@@ -12545,6 +13439,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -12591,6 +13486,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -12620,6 +13516,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -12965,25 +13862,39 @@ mod tests {
     /// Regression: the positional prompt must come BEFORE --mcp-config
     /// in the argument list. If it comes after, Claude Code treats it as
     /// a config file path and exits with "MCP config file not found".
+    ///
+    /// This test covers the Fresh spawn path (the one that emits the
+    /// positional kickoff prompt at all). Resume spawns deliberately
+    /// suppress the prompt - see
+    /// `build_claude_cmd_resume_spawns_suppress_auto_start_prompt` for
+    /// that property.
     #[test]
     fn build_claude_cmd_prompt_before_mcp_config() {
         // Planning session: has --dangerously-skip-permissions, --settings hook, and positional prompt.
-        let cmd =
-            App::build_claude_cmd(&WorkItemStatus::Planning, Some("system prompt here"), false);
+        let session_id = uuid::Uuid::nil();
+        let cmd = App::build_claude_cmd(
+            &WorkItemStatus::Planning,
+            Some("system prompt here"),
+            false,
+            session_id,
+            SpawnFlag::Fresh,
+        );
         assert_eq!(cmd[0], "claude");
         assert_eq!(cmd[1], "--dangerously-skip-permissions");
-        assert_eq!(cmd[2], "--allowedTools");
+        assert_eq!(cmd[2], "--session-id");
+        assert_eq!(cmd[3], session_id.to_string());
+        assert_eq!(cmd[4], "--allowedTools");
         assert!(
-            cmd[3].contains("mcp__workbridge__workbridge_get_context"),
+            cmd[5].contains("mcp__workbridge__workbridge_get_context"),
             "allowed tools must include workbridge MCP tools",
         );
-        assert_eq!(cmd[4], "--settings");
+        assert_eq!(cmd[6], "--settings");
         assert!(
-            cmd[5].contains("PostToolUse") && cmd[5].contains("workbridge_set_plan"),
+            cmd[7].contains("PostToolUse") && cmd[7].contains("workbridge_set_plan"),
             "planning sessions must include TodoWrite reminder hook via --settings",
         );
-        assert_eq!(cmd[6], "--system-prompt");
-        assert_eq!(cmd[7], "system prompt here");
+        assert_eq!(cmd[8], "--system-prompt");
+        assert_eq!(cmd[9], "system prompt here");
         // Positional prompt is the LAST element - callers append
         // --mcp-config after this, so it stays after the prompt.
         assert_eq!(
@@ -12997,21 +13908,149 @@ mod tests {
         );
     }
 
-    /// Implementing sessions also get an auto-start prompt.
+    /// Implementing sessions also get an auto-start prompt on Fresh
+    /// spawns. Resume spawns suppress the prompt, see
+    /// `build_claude_cmd_resume_spawns_suppress_auto_start_prompt`.
     #[test]
     fn build_claude_cmd_implementing_has_prompt() {
-        let cmd = App::build_claude_cmd(&WorkItemStatus::Implementing, Some("impl prompt"), false);
+        let session_id = uuid::Uuid::nil();
+        let cmd = App::build_claude_cmd(
+            &WorkItemStatus::Implementing,
+            Some("impl prompt"),
+            false,
+            session_id,
+            SpawnFlag::Fresh,
+        );
         assert_eq!(cmd[0], "claude");
         assert_eq!(cmd[1], "--dangerously-skip-permissions");
-        assert_eq!(cmd[2], "--allowedTools");
+        assert_eq!(cmd[2], "--session-id");
+        assert_eq!(cmd[3], session_id.to_string());
+        assert_eq!(cmd[4], "--allowedTools");
         assert!(
-            cmd[3].contains("mcp__workbridge__workbridge_get_context"),
+            cmd[5].contains("mcp__workbridge__workbridge_get_context"),
             "allowed tools must include workbridge MCP tools",
         );
-        assert_eq!(cmd[4], "--system-prompt");
+        assert_eq!(cmd[6], "--system-prompt");
         assert!(
             cmd.last().unwrap().contains("start working"),
-            "implementing should have auto-start prompt",
+            "implementing should have auto-start prompt on a Fresh spawn",
+        );
+    }
+
+    /// Codex adversarial review finding: Resume spawns MUST NOT
+    /// append the positional kickoff prompt. `claude --resume <uuid>
+    /// "Explain who you are and start working."` would restore the
+    /// prior transcript AND inject the kickoff text as a new user
+    /// turn, which can make Claude restart or duplicate work. This
+    /// test pins the Fresh-only gate for all three prompt sites
+    /// (Planning, Implementing, and force_auto_start Review).
+    #[test]
+    fn build_claude_cmd_resume_spawns_suppress_auto_start_prompt() {
+        let session_id = uuid::Uuid::nil();
+
+        // Planning + Resume: no positional prompt.
+        let planning = App::build_claude_cmd(
+            &WorkItemStatus::Planning,
+            Some("planning prompt"),
+            false,
+            session_id,
+            SpawnFlag::Resume,
+        );
+        assert!(
+            !planning
+                .iter()
+                .any(|a| a.contains("start working") || a.contains("review gate assessment")),
+            "Resume Planning must not inject the fresh-session kickoff prompt",
+        );
+
+        // Implementing + Resume: no positional prompt.
+        let implementing = App::build_claude_cmd(
+            &WorkItemStatus::Implementing,
+            Some("impl prompt"),
+            false,
+            session_id,
+            SpawnFlag::Resume,
+        );
+        assert!(
+            !implementing.iter().any(|a| a.contains("start working")),
+            "Resume Implementing must not inject 'Explain who you are and start working.'",
+        );
+
+        // Review + force_auto_start + Resume: no positional prompt.
+        // The review-gate findings presentation is a one-shot
+        // instruction for a FRESH gate-triggered session; on resume
+        // the user has already seen the findings in the prior
+        // transcript, so re-injecting them is wrong.
+        let review = App::build_claude_cmd(
+            &WorkItemStatus::Review,
+            Some("review prompt"),
+            true,
+            session_id,
+            SpawnFlag::Resume,
+        );
+        assert!(
+            !review.iter().any(|a| a.contains("review gate assessment")),
+            "Resume Review with findings must not re-present the gate \
+             assessment - the prior transcript already contains it",
+        );
+    }
+
+    /// `SpawnFlag::Fresh` must emit `--session-id <uuid>` instead of
+    /// `--resume <uuid>` so that the first spawn for a new
+    /// `(work_item, stage)` tuple creates a session under the
+    /// deterministic UUID. The next spawn (after restart) finds the
+    /// transcript on disk and switches to `SpawnFlag::Resume`.
+    #[test]
+    fn build_claude_cmd_fresh_flag_uses_session_id() {
+        let session_id = uuid::Uuid::nil();
+        let cmd = App::build_claude_cmd(
+            &WorkItemStatus::Implementing,
+            Some("impl prompt"),
+            false,
+            session_id,
+            SpawnFlag::Fresh,
+        );
+        assert_eq!(cmd[2], "--session-id");
+        assert_eq!(cmd[3], session_id.to_string());
+        assert!(
+            !cmd.iter().any(|a| a == "--resume"),
+            "Fresh spawns must not contain --resume",
+        );
+    }
+
+    /// The deterministic session UUID must be passed through verbatim.
+    /// Different work items / stages derive different UUIDs and each
+    /// must appear in the argv unchanged.
+    #[test]
+    fn build_claude_cmd_embeds_exact_session_uuid() {
+        let a = uuid::Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
+        let b = uuid::Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222);
+        let cmd_a = App::build_claude_cmd(
+            &WorkItemStatus::Implementing,
+            None,
+            false,
+            a,
+            SpawnFlag::Resume,
+        );
+        let cmd_b = App::build_claude_cmd(
+            &WorkItemStatus::Implementing,
+            None,
+            false,
+            b,
+            SpawnFlag::Resume,
+        );
+        assert!(
+            cmd_a.iter().any(|s| s == &a.to_string()),
+            "cmd for uuid a must contain a.to_string()",
+        );
+        assert!(
+            cmd_b.iter().any(|s| s == &b.to_string()),
+            "cmd for uuid b must contain b.to_string()",
+        );
+        assert_ne!(
+            cmd_a.iter().find(|s| *s == &a.to_string()),
+            cmd_b.iter().find(|s| *s == &a.to_string()),
+            "each build must embed its own uuid, not leak another run's",
         );
     }
 
@@ -13038,18 +14077,6 @@ mod tests {
             selection: None,
         });
 
-        // Pre-populate a real temp file as the MCP config path so we can
-        // verify teardown actually deletes the file from disk.
-        let temp_path = std::env::temp_dir().join(format!(
-            "workbridge-teardown-test-{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
-        assert!(temp_path.exists(), "precondition: temp file exists");
-        app.global_mcp_config_path = Some(temp_path.clone());
-
-        // Pre-populate buffered PTY keystrokes that must NOT leak into a
-        // freshly-spawned replacement session.
         app.pending_global_pty_bytes
             .extend_from_slice(b"stale-keys");
 
@@ -13064,17 +14091,9 @@ mod tests {
             "global_mcp_server must be cleared",
         );
         assert!(
-            app.global_mcp_config_path.is_none(),
-            "global_mcp_config_path must be cleared",
-        );
-        assert!(
             app.pending_global_pty_bytes.is_empty(),
             "pending_global_pty_bytes must be drained so stale keystrokes \
              don't leak into the next session",
-        );
-        assert!(
-            !temp_path.exists(),
-            "teardown must delete the temp MCP config file from disk",
         );
     }
 
@@ -13087,14 +14106,12 @@ mod tests {
     fn teardown_global_session_is_idempotent_on_empty_state() {
         let mut app = App::new();
         assert!(app.global_session.is_none());
-        assert!(app.global_mcp_config_path.is_none());
         assert!(app.pending_global_pty_bytes.is_empty());
 
         app.teardown_global_session();
 
         assert!(app.global_session.is_none());
         assert!(app.global_mcp_server.is_none());
-        assert!(app.global_mcp_config_path.is_none());
         assert!(app.pending_global_pty_bytes.is_empty());
     }
 
@@ -13106,7 +14123,6 @@ mod tests {
     fn toggle_global_drawer_close_tears_down_session() {
         let mut app = App::new();
 
-        // Simulate a drawer that is already open with live state.
         app.global_drawer_open = true;
         app.pre_drawer_focus = app.focus;
 
@@ -13118,16 +14134,8 @@ mod tests {
             scrollback_offset: 0,
             selection: None,
         });
-
-        let temp_path = std::env::temp_dir().join(format!(
-            "workbridge-toggle-close-test-{}.json",
-            std::process::id()
-        ));
-        std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
-        app.global_mcp_config_path = Some(temp_path.clone());
         app.pending_global_pty_bytes.extend_from_slice(b"leftover");
 
-        // Close branch: no spawn involved, so this is safe in any test env.
         app.toggle_global_drawer();
 
         assert!(!app.global_drawer_open, "drawer must be closed");
@@ -13140,16 +14148,8 @@ mod tests {
             "close must clear global_mcp_server",
         );
         assert!(
-            app.global_mcp_config_path.is_none(),
-            "close must clear global_mcp_config_path",
-        );
-        assert!(
             app.pending_global_pty_bytes.is_empty(),
             "close must drain pending_global_pty_bytes",
-        );
-        assert!(
-            !temp_path.exists(),
-            "close must delete the temp MCP config file",
         );
     }
 
@@ -13171,6 +14171,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -13203,6 +14204,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -13257,6 +14259,7 @@ mod tests {
                     git_state: None,
                 }],
                 errors: vec![],
+                stage_transition_count: 0,
             });
         }
 
@@ -13316,6 +14319,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         app.build_display_list();
@@ -13339,20 +14343,39 @@ mod tests {
     /// Blocked and Review sessions do NOT get an auto-start prompt.
     #[test]
     fn build_claude_cmd_blocked_review_no_prompt() {
+        let session_id = uuid::Uuid::nil();
         for status in [WorkItemStatus::Blocked, WorkItemStatus::Review] {
-            let cmd = App::build_claude_cmd(&status, Some("prompt"), false);
+            let cmd = App::build_claude_cmd(
+                &status,
+                Some("prompt"),
+                false,
+                session_id,
+                SpawnFlag::Resume,
+            );
             // Last arg should be the system prompt value, not a positional prompt.
             assert_eq!(cmd.last().unwrap(), "prompt");
         }
     }
 
-    /// Review sessions auto-start when force_auto_start is true (gate findings present).
+    /// Review sessions auto-start when force_auto_start is true (gate
+    /// findings present) AND the spawn is Fresh. On Resume the prior
+    /// transcript already contains the presented findings, so the
+    /// positional kickoff is suppressed - that case is covered by
+    /// `build_claude_cmd_resume_spawns_suppress_auto_start_prompt`.
     #[test]
     fn build_claude_cmd_review_force_auto_start() {
-        let cmd = App::build_claude_cmd(&WorkItemStatus::Review, Some("review prompt"), true);
+        let session_id = uuid::Uuid::nil();
+        let cmd = App::build_claude_cmd(
+            &WorkItemStatus::Review,
+            Some("review prompt"),
+            true,
+            session_id,
+            SpawnFlag::Fresh,
+        );
         assert!(
             cmd.last().unwrap().contains("review gate assessment"),
-            "review with force_auto_start should have gate-specific prompt",
+            "review with force_auto_start should have gate-specific \
+             prompt on a Fresh spawn",
         );
     }
 
@@ -13532,6 +14555,7 @@ mod tests {
             status_derived: false,
             repo_associations: repo_assoc,
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -14000,6 +15024,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         // Item B: MCP will request Review for this one.
@@ -14022,6 +15047,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         // Simulate gate running for item A.
@@ -14375,6 +15401,7 @@ mod tests {
                     }],
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -14530,6 +15557,7 @@ mod tests {
                     }],
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 }],
             }
         }
@@ -15130,6 +16158,7 @@ mod tests {
             }],
             plan: None,
             done_at,
+            stage_transition_count: 0,
         }
     }
 
@@ -15543,6 +16572,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
     }
 
@@ -15945,6 +16975,7 @@ mod tests {
                 }],
                 plan: None,
                 done_at: Some(0),
+                stage_transition_count: 0,
             },
         });
 
@@ -16147,6 +17178,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         let cwd = PathBuf::from("/tmp/p0-stage-prompt-worktree");
@@ -16171,6 +17203,16 @@ mod tests {
         // the filesystem read ran. This regression guard ensures the
         // read moves to the background thread driven by
         // `poll_session_opens` / `finish_session_open`.
+        //
+        // It also pins the post-Codex-review contract that the
+        // background worker - not `finish_session_open` - is the only
+        // place that derives the deterministic session UUID and runs
+        // the `session_id::session_exists_on_disk` filesystem probe.
+        // The `(stage, session_id, spawn_flag)` triple in the
+        // delivered `SessionOpenPlanResult` is the structural proof:
+        // if anyone moves the probe back to the UI thread, the
+        // populated `spawn_flag` field becomes redundant and any test
+        // that asserts on it will fail loudly.
         let backend = Arc::new(CountingPlanBackend::default());
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
@@ -16198,6 +17240,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         // Hold the gate so the background thread cannot call
@@ -16240,6 +17283,49 @@ mod tests {
             1,
             "background thread must have performed exactly one read_plan call",
         );
+        // The background worker must have captured the work item's
+        // stage on the UI thread and threaded it through the result.
+        // `finish_session_open` keys the `sessions` map by this
+        // stage, so a missing or wrong value would silently spawn the
+        // session under the wrong key.
+        assert_eq!(
+            result.stage,
+            WorkItemStatus::Implementing,
+            "background worker must propagate the captured stage",
+        );
+        // The background worker must have derived the deterministic
+        // session UUID from `(wi_id, stage)` so the UI thread does
+        // not have to recompute it - and so the
+        // `(session_id, spawn_flag)` pair is internally consistent.
+        let expected_id =
+            crate::session_id::session_id_for(&wi_id, WorkItemStatus::Implementing, 0);
+        assert_eq!(
+            result.session_id, expected_id,
+            "background worker must populate the deterministic session UUID",
+        );
+        // The background worker must have decided the spawn flag via
+        // `session_exists_on_disk`. Whether the test environment has
+        // a transcript file for `expected_id` under `~/.claude/projects`
+        // is unknown, so we only assert that the field has been
+        // populated to one of the two valid variants (or, for the
+        // indeterminate branch, that `probe_error` is populated
+        // instead). The structural point is that SOMETHING IS set -
+        // if anyone moved the disk probe back to
+        // `finish_session_open`, both fields would be redundant and
+        // this test would fail to compile.
+        match (result.spawn_flag, &result.probe_error) {
+            (Some(SpawnFlag::Resume), None) | (Some(SpawnFlag::Fresh), None) => {}
+            (None, Some(msg)) => {
+                assert!(
+                    !msg.is_empty(),
+                    "probe_error must carry a non-empty message on Indeterminate",
+                );
+            }
+            other => panic!(
+                "background worker must populate exactly one of (spawn_flag, probe_error); \
+                 got {other:?}",
+            ),
+        }
         // End the spinner activity since `poll_session_opens` was
         // bypassed by the manual drain above.
         app.end_activity(entry.activity);
@@ -16290,6 +17376,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         // Pre-queue a completed worktree-create result so Phase 5's
@@ -16398,6 +17485,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         // No spinner before the call.
@@ -16491,6 +17579,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         let cwd = PathBuf::from("/tmp/codex-stage-cancel-wt");
@@ -16523,6 +17612,674 @@ mod tests {
         assert!(
             app.current_activity().is_none(),
             "stage change must end the 'Opening session...' spinner",
+        );
+    }
+
+    /// Codex adversarial-review finding: `finish_session_open` must
+    /// drop a stale `SessionOpenPlanResult` if the work item's current
+    /// stage no longer matches the captured stage. Not every stage
+    /// drift goes through `apply_stage_change` (which cancels pending
+    /// opens via `drop_session_open_entry`) - in particular,
+    /// `reassemble_work_items` derives a freshly-merged PR's work
+    /// item to `Done` directly by setting `status_derived = true`,
+    /// without touching `session_open_rx`. Without this guard, a slow
+    /// background worker could land its result after the derive and
+    /// `finish_session_open` would still spawn `claude
+    /// --dangerously-skip-permissions` for an item that has just left
+    /// the Implementing stage. `check_liveness` may eventually reap
+    /// the orphan, but the auto-started process has already had a
+    /// chance to touch user state.
+    ///
+    /// This test pins the structural fix: feed a stale result for an
+    /// item whose current status has been derived to `Done` and
+    /// assert that no entry lands in `self.sessions`.
+    #[test]
+    fn finish_session_open_drops_result_when_current_stage_changed() {
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-stale-result.json"));
+        // Start the work item in the "current state" the user has
+        // already drifted into: a Done item that was derived from a
+        // merged PR (`status_derived = true`). The captured stage in
+        // the SessionOpenPlanResult below will be Implementing, so
+        // the guard MUST fire and drop the spawn.
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "codex-stale-result".into(),
+            description: None,
+            status: WorkItemStatus::Done,
+            status_derived: true,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/codex-stale-repo"),
+                branch: Some("feature/codex-stale".into()),
+                worktree_path: Some(PathBuf::from("/tmp/codex-stale-wt")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+            stage_transition_count: 0,
+        });
+
+        // Simulate the background worker's output for a pending open
+        // that started while the item was still Implementing.
+        let captured_stage = WorkItemStatus::Implementing;
+        let stale_result = SessionOpenPlanResult {
+            wi_id: wi_id.clone(),
+            cwd: PathBuf::from("/tmp/codex-stale-wt"),
+            stage: captured_stage,
+            plan_text: String::new(),
+            read_error: None,
+            session_id: crate::session_id::session_id_for(&wi_id, captured_stage, 0),
+            spawn_flag: Some(SpawnFlag::Fresh),
+            probe_error: None,
+        };
+
+        // Sanity: no sessions to start with.
+        assert!(app.sessions.is_empty());
+
+        app.finish_session_open(stale_result);
+
+        // The guard must have fired - no session entry under either
+        // the captured stage or the current (drifted) stage.
+        assert!(
+            app.sessions.is_empty(),
+            "finish_session_open must drop a stale result whose captured \
+             stage no longer matches the work item's current stage - \
+             otherwise a slow background probe race-spawns Claude for \
+             a Done-derived item, see Codex adversarial review",
+        );
+        assert!(
+            !app.sessions
+                .contains_key(&(wi_id.clone(), WorkItemStatus::Implementing)),
+            "no entry must be created under the captured Implementing stage",
+        );
+        assert!(
+            !app.sessions.contains_key(&(wi_id, WorkItemStatus::Done)),
+            "no entry must be created under the current Done stage either - \
+             Done is a no-session stage",
+        );
+    }
+
+    /// Defense-in-depth: even if some future caller accidentally
+    /// passes a `SessionOpenPlanResult` whose captured `stage` is a
+    /// no-session stage (Backlog / Done / Mergequeue),
+    /// `finish_session_open` must refuse to spawn. `spawn_session`
+    /// already filters these out before calling `begin_session_open`,
+    /// so this branch is purely a structural guard - but the cost of
+    /// missing it is a session entry keyed by a terminal stage,
+    /// exactly the cross-stage corruption the deterministic UUID
+    /// scheme was designed to prevent.
+    #[test]
+    fn finish_session_open_refuses_no_session_stage_even_if_consistent() {
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-no-session-stage.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "codex-no-session-stage".into(),
+            description: None,
+            status: WorkItemStatus::Mergequeue,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/codex-no-session-repo"),
+                branch: Some("feature/codex-no-session".into()),
+                worktree_path: Some(PathBuf::from("/tmp/codex-no-session-wt")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+            stage_transition_count: 0,
+        });
+
+        let captured_stage = WorkItemStatus::Mergequeue;
+        let result = SessionOpenPlanResult {
+            wi_id: wi_id.clone(),
+            cwd: PathBuf::from("/tmp/codex-no-session-wt"),
+            stage: captured_stage,
+            plan_text: String::new(),
+            read_error: None,
+            session_id: crate::session_id::session_id_for(&wi_id, captured_stage, 0),
+            spawn_flag: Some(SpawnFlag::Fresh),
+            probe_error: None,
+        };
+
+        app.finish_session_open(result);
+
+        assert!(
+            app.sessions.is_empty(),
+            "finish_session_open must refuse to spawn for a no-session \
+             stage even when the captured and current stages agree",
+        );
+    }
+
+    /// Codex adversarial-review finding: when the stage-drift or
+    /// work-item-deleted guard in `poll_session_spawns` fires AFTER
+    /// the background spawn worker has already produced an `Ok`
+    /// result, the UI thread must NOT drop the live `Session`
+    /// inline. `Session::Drop` calls `force_kill` (SIGTERM +
+    /// sleep + SIGKILL + `child.wait`) and joins the PTY reader
+    /// thread, and `McpSocketServer::Drop` runs an `unlink`
+    /// syscall - all of which is blocking. They have to be moved
+    /// onto the background teardown thread via
+    /// `teardown_session_async` so the tick path only does
+    /// in-memory map updates.
+    ///
+    /// This test drives a real `sleep` PTY through the stale path
+    /// and verifies that the UI thread returns promptly without
+    /// waiting for the child process to exit. The session never
+    /// lands in `self.sessions` and the teardown completes
+    /// asynchronously in the background.
+    #[test]
+    #[cfg(unix)]
+    fn poll_session_spawns_tears_down_stale_session_off_ui_thread() {
+        use crossbeam_channel::bounded;
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-stale-teardown.json"));
+        // Put the work item in Done so the stage drift guard
+        // fires and the spawn result is classified as stale even
+        // though the work item still exists.
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "codex-stale-teardown".into(),
+            description: None,
+            status: WorkItemStatus::Done,
+            status_derived: true,
+            repo_associations: vec![],
+            errors: vec![],
+            stage_transition_count: 0,
+        });
+
+        // Spawn a real `sleep` PTY. Using sleep instead of claude
+        // keeps the test self-contained and deterministic; the
+        // property under test is the teardown hop, not which
+        // binary sits behind the master fd.
+        let session = crate::session::Session::spawn(80, 24, None, &["sleep", "30"])
+            .expect("test PTY must spawn");
+
+        // Fake MCP socket server - put a real one next to the
+        // session so the teardown thread has something to drop.
+        // We use a short, unique socket path to stay under the
+        // SUN_LEN limit (~104 on macOS, ~108 on Linux) while
+        // still being collision-free across parallel test runs.
+        let (mcp_tx, _mcp_rx) = crossbeam_channel::unbounded();
+        let socket_path = std::env::temp_dir().join(format!("wb-td-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket_path);
+        let mcp_server = McpSocketServer::start(
+            socket_path,
+            "\"test\"".to_string(),
+            "Own".to_string(),
+            "{}".to_string(),
+            None,
+            mcp_tx,
+            false,
+        )
+        .expect("test MCP socket must bind");
+
+        // Pack an Ok result and install it directly in
+        // session_spawn_rx as if the background worker had just
+        // finished. Captured stage is Implementing; the work
+        // item is currently Done, so poll_session_spawns' stage
+        // drift guard must fire and route the Session into
+        // teardown_session_async.
+        let captured_stage = WorkItemStatus::Implementing;
+        let (tx, rx) = bounded(1);
+        tx.send(SessionSpawnResult {
+            wi_id: wi_id.clone(),
+            stage: captured_stage,
+            outcome: Ok(SessionSpawnOk {
+                session,
+                mcp_server,
+            }),
+        })
+        .expect("test channel send must succeed");
+        let activity = app.start_activity("Spawning Claude session...");
+        app.session_spawn_rx.insert(
+            wi_id.clone(),
+            SessionSpawnPending {
+                rx,
+                activity,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+
+        // Drive the poll. This is the UI-thread tick path under
+        // test. It must return quickly - the teardown is
+        // asynchronous, so poll_session_spawns itself should not
+        // block on `child.wait` (which would cost up to 50ms
+        // SIGTERM grace + reader join).
+        let before = std::time::Instant::now();
+        app.poll_session_spawns();
+        let elapsed = before.elapsed();
+
+        // The guard must have fired.
+        assert!(
+            app.sessions.is_empty(),
+            "stale Ok result must not land in sessions when the \
+             captured stage no longer matches",
+        );
+        assert!(
+            !app.session_spawn_rx.contains_key(&wi_id),
+            "pending spawn entry must be removed",
+        );
+        // The spinner must be ended (drop_session_spawn_entry
+        // handles this).
+        assert!(
+            app.current_activity().is_none(),
+            "stale teardown must end the 'Spawning Claude session...' spinner",
+        );
+        // Structural latency assertion: poll_session_spawns must
+        // return well under the SIGTERM grace window (50ms) plus
+        // reader-join time. We allow a generous 30ms budget to
+        // cover slow CI jitter while still being far below the
+        // inline-drop blocking cost.
+        assert!(
+            elapsed < std::time::Duration::from_millis(30),
+            "poll_session_spawns must not block on Session::Drop \
+             - inline drop would take at least the SIGTERM grace \
+             window (50ms). Elapsed: {elapsed:?}",
+        );
+    }
+
+    /// Codex adversarial-review finding: `apply_stage_change`
+    /// must NOT call `Session::kill` synchronously on the UI
+    /// thread. The kill does SIGTERM + 50ms grace sleep +
+    /// SIGKILL + `child.wait`, all blocking. Routing through
+    /// `teardown_live_session_async` keeps the sleep / wait off
+    /// the tick path.
+    ///
+    /// This test drives a real `sleep` PTY through the stage
+    /// transition path and measures the wall-clock time of
+    /// `apply_stage_change`. If the fix is in place, the function
+    /// returns well under the SIGTERM grace window (50ms); if
+    /// someone regresses and calls `session.kill()` inline again,
+    /// the elapsed time will blow past 50ms and the test will
+    /// fail loudly.
+    #[test]
+    #[cfg(unix)]
+    fn apply_stage_change_tears_down_live_session_off_ui_thread() {
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-stage-kill.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "codex-stage-kill".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/codex-stage-kill-repo"),
+                branch: Some("feature/codex-stage-kill".into()),
+                worktree_path: Some(PathBuf::from("/tmp/codex-stage-kill-wt")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+            stage_transition_count: 0,
+        });
+
+        // Spawn a real `sleep` PTY to stand in for Claude. The
+        // property under test is that the UI thread does not
+        // wait for it to exit, not which binary is behind the
+        // master fd.
+        let session = crate::session::Session::spawn(80, 24, None, &["sleep", "30"])
+            .expect("test PTY must spawn");
+        let parser = Arc::clone(&session.parser);
+        let entry = SessionEntry {
+            parser,
+            alive: true,
+            session: Some(session),
+            scrollback_offset: 0,
+            selection: None,
+        };
+        app.sessions
+            .insert((wi_id.clone(), WorkItemStatus::Implementing), entry);
+
+        // Hand a stub MCP server to the same work item so the
+        // teardown path exercises the "session + mcp_server"
+        // branch of `teardown_live_session_async`.
+        let (mcp_tx, _mcp_rx) = crossbeam_channel::unbounded();
+        let socket_path =
+            std::env::temp_dir().join(format!("wb-stage-kill-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket_path);
+        let mcp_server = McpSocketServer::start(
+            socket_path,
+            "\"test\"".to_string(),
+            "Own".to_string(),
+            "{}".to_string(),
+            None,
+            mcp_tx,
+            false,
+        )
+        .expect("test MCP socket must bind");
+        app.mcp_servers.insert(wi_id.clone(), mcp_server);
+
+        // Run the stage transition and time it. The helper
+        // should return promptly - far under the SIGTERM grace
+        // window - because the kill has been offloaded to a
+        // background thread.
+        //
+        // Transition Implementing -> Done so
+        // `apply_stage_change` kills the session AND the
+        // subsequent auto-spawn branch is skipped (Done is a
+        // no-session stage).
+        let before = std::time::Instant::now();
+        app.apply_stage_change(
+            &wi_id,
+            &WorkItemStatus::Implementing,
+            &WorkItemStatus::Done,
+            "pr_merge",
+        );
+        let elapsed = before.elapsed();
+
+        // The session MUST be gone from the map.
+        assert!(
+            !app.sessions
+                .contains_key(&(wi_id.clone(), WorkItemStatus::Implementing)),
+            "apply_stage_change must remove the old session entry",
+        );
+        // The MCP server MUST be gone from the map (routed
+        // through teardown_live_session_async along with the
+        // session).
+        assert!(
+            !app.mcp_servers.contains_key(&wi_id),
+            "apply_stage_change must remove the paired MCP server \
+             entry so it tears down on the same background thread",
+        );
+        // Structural latency assertion: apply_stage_change must
+        // return well under the SIGTERM grace window (50ms).
+        // Budget is 30ms to absorb slow CI jitter while staying
+        // below the inline-kill cost.
+        assert!(
+            elapsed < std::time::Duration::from_millis(30),
+            "apply_stage_change must not block on Session::kill - \
+             inline kill would take at least the SIGTERM grace \
+             window (50ms). Elapsed: {elapsed:?}",
+        );
+    }
+
+    /// Codex adversarial-review finding: `drop_session_spawn_entry`
+    /// MUST set the shared cancellation flag on the pending entry
+    /// before the Receiver falls out of scope. The flag is what
+    /// lets the background worker abort right before `Session::spawn`
+    /// and avoid forking a stale Claude process for a stage that
+    /// has already been advanced away from. Without this set, a
+    /// stage change fired during the worker's I/O tail would still
+    /// result in `claude --dangerously-skip-permissions <kickoff>`
+    /// being launched against the worktree.
+    ///
+    /// Structural test: construct a `SessionSpawnPending` with a
+    /// known `Arc<AtomicBool>`, install it under a work-item key,
+    /// hold a second Arc clone of the same flag, call
+    /// `drop_session_spawn_entry`, and assert the second clone
+    /// now reads `true`. The Receiver side of the pending entry
+    /// is drained empty so the function takes the "no buffered
+    /// result" branch.
+    #[test]
+    fn drop_session_spawn_entry_sets_cancel_flag() {
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-cancel-flag.json"));
+
+        // Make a closed channel so try_recv returns Empty (no
+        // buffered result) - the cancel flag should still be
+        // set regardless of whether anything is buffered.
+        let (_tx, rx) = crossbeam_channel::bounded::<SessionSpawnResult>(1);
+
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_witness = Arc::clone(&cancel);
+
+        let activity = app.start_activity("Spawning Claude session...");
+        app.session_spawn_rx.insert(
+            wi_id.clone(),
+            SessionSpawnPending {
+                rx,
+                activity,
+                cancel,
+            },
+        );
+
+        assert!(
+            !cancel_witness.load(std::sync::atomic::Ordering::Acquire),
+            "cancel flag starts false before drop_session_spawn_entry",
+        );
+
+        app.drop_session_spawn_entry(&wi_id);
+
+        assert!(
+            cancel_witness.load(std::sync::atomic::Ordering::Acquire),
+            "drop_session_spawn_entry must flip the cancel flag so \
+             the background worker aborts before Session::spawn - \
+             without this, a stale spawn can still launch claude \
+             --dangerously-skip-permissions for an advanced stage",
+        );
+        assert!(
+            !app.session_spawn_rx.contains_key(&wi_id),
+            "the pending entry must also be removed from the map",
+        );
+        assert!(
+            app.current_activity().is_none(),
+            "the 'Spawning Claude session...' spinner must be ended",
+        );
+    }
+
+    /// Codex adversarial-review finding: the session-open tail
+    /// (MCP socket bind, `.mcp.json` write, temp `--mcp-config`
+    /// write, `Session::spawn` PTY fork) is all filesystem / process
+    /// I/O and therefore MUST NOT run on the UI thread per
+    /// `docs/UI.md` "Blocking I/O Prohibition". The refactor moves
+    /// all of that into a background worker that
+    /// `begin_session_spawn` kicks off and `poll_session_spawns`
+    /// drains; `finish_session_open` on the UI thread only does
+    /// owned-data gathering and registers a pending receiver.
+    ///
+    /// This test pins the structural contract: after a synchronous
+    /// call to `finish_session_open` for a valid work item with a
+    /// populated (`Fresh`) spawn flag, the function must return
+    /// WITHOUT having inserted anything into `self.sessions` /
+    /// `self.mcp_servers` on the UI thread, and it must have
+    /// registered a pending entry in `session_spawn_rx` with an
+    /// active "Spawning Claude session..." activity spinner.
+    ///
+    /// The background worker itself may or may not successfully
+    /// complete by the time the test drops `app` (it depends on
+    /// whether `claude` is available in the test env). We do NOT
+    /// call `poll_session_spawns` here because that would block on
+    /// the actual PTY fork; we only verify the structural handoff.
+    /// The pending entry's receiver is dropped together with `app`,
+    /// which lets the background worker's `tx.send` fail cleanly
+    /// without blocking.
+    #[test]
+    fn finish_session_open_defers_spawn_to_background_worker() {
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-finish-session-open-bg.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "codex-finish-bg".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/codex-finish-bg-repo"),
+                branch: Some("feature/codex-finish-bg".into()),
+                worktree_path: Some(PathBuf::from("/tmp/codex-finish-bg-wt")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+            stage_transition_count: 0,
+        });
+
+        let captured_stage = WorkItemStatus::Implementing;
+        let plan_result = SessionOpenPlanResult {
+            wi_id: wi_id.clone(),
+            cwd: PathBuf::from("/tmp/codex-finish-bg-wt"),
+            stage: captured_stage,
+            plan_text: String::new(),
+            read_error: None,
+            session_id: crate::session_id::session_id_for(&wi_id, captured_stage, 0),
+            spawn_flag: Some(SpawnFlag::Fresh),
+            probe_error: None,
+        };
+
+        // Sanity: clean starting state.
+        assert!(app.sessions.is_empty());
+        assert!(app.session_spawn_rx.is_empty());
+        assert!(app.current_activity().is_none());
+
+        app.finish_session_open(plan_result);
+
+        // The UI-thread call must have enqueued a pending spawn
+        // and NOT synchronously inserted into `self.sessions`.
+        // If someone moves `Session::spawn` or the config writes
+        // back onto the UI thread, this assertion will fail
+        // because `self.sessions` would already contain the entry.
+        assert!(
+            app.sessions.is_empty(),
+            "finish_session_open must NOT synchronously spawn the PTY - \
+             Session::spawn is process I/O, forbidden on the UI thread \
+             (docs/UI.md 'Blocking I/O Prohibition')",
+        );
+        assert!(
+            app.mcp_servers.is_empty(),
+            "finish_session_open must NOT synchronously start the MCP \
+             socket server - UnixListener::bind is filesystem I/O",
+        );
+        assert!(
+            app.session_spawn_rx.contains_key(&wi_id),
+            "finish_session_open must register a pending spawn receiver \
+             in session_spawn_rx so poll_session_spawns can drain it on \
+             the next background tick",
+        );
+        let activity = app
+            .current_activity()
+            .expect("a 'Spawning Claude session...' spinner must be active");
+        assert_eq!(activity, "Spawning Claude session...");
+    }
+
+    /// Codex adversarial-review finding: when the disk probe returns
+    /// `SessionProbe::Indeterminate`, the background worker sets
+    /// `spawn_flag = None` and puts a human-readable error in
+    /// `probe_error`. `finish_session_open` MUST refuse to spawn in
+    /// this case and surface the error via `status_message` instead
+    /// of guessing `--session-id` and quietly losing the user's
+    /// prior conversation context. This test pins that contract.
+    ///
+    /// Construct a SessionOpenPlanResult that mirrors what the
+    /// background worker produces on an I/O-error probe, hand it to
+    /// `finish_session_open`, and assert that no session is created
+    /// and the status bar carries the probe error.
+    #[test]
+    fn finish_session_open_refuses_indeterminate_probe_and_surfaces_error() {
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-probe-error.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "codex-probe-error".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/codex-probe-error-repo"),
+                branch: Some("feature/codex-probe-error".into()),
+                worktree_path: Some(PathBuf::from("/tmp/codex-probe-error-wt")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+            stage_transition_count: 0,
+        });
+
+        let captured_stage = WorkItemStatus::Implementing;
+        let error_msg = "Could not probe Claude transcript store: Failed to read /home/test/.claude/projects: \
+             Permission denied (os error 13). Session will not open - fix the underlying \
+             filesystem condition and retry.";
+        let result = SessionOpenPlanResult {
+            wi_id: wi_id.clone(),
+            cwd: PathBuf::from("/tmp/codex-probe-error-wt"),
+            stage: captured_stage,
+            plan_text: String::new(),
+            read_error: None,
+            session_id: crate::session_id::session_id_for(&wi_id, captured_stage, 0),
+            spawn_flag: None,
+            probe_error: Some(error_msg.to_string()),
+        };
+
+        app.finish_session_open(result);
+
+        assert!(
+            app.sessions.is_empty(),
+            "finish_session_open must refuse to spawn when the background \
+             probe was indeterminate - guessing --session-id would silently \
+             lose prior conversation context on a degraded home directory",
+        );
+        let status = app
+            .status_message
+            .as_deref()
+            .expect("probe error must be surfaced via status_message");
+        assert!(
+            status.contains("transcript store") || status.contains("Permission denied"),
+            "status message must carry the probe_error context, got: {status}",
         );
     }
 
@@ -16785,6 +18542,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         let cwd = PathBuf::from("/tmp/r2f3-cleanup-wt");

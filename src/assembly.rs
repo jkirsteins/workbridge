@@ -397,6 +397,13 @@ pub fn reassemble(
             status_derived,
             repo_associations: assembled_associations,
             errors,
+            // Pass-through from the backend record. The counter is
+            // bumped by `WorkItemBackend::update_status` on every
+            // successful stage transition and is consumed by
+            // `session_id::session_id_for` to distinguish fresh
+            // visits to the same stage from restart-resumes of the
+            // same visit.
+            stage_transition_count: record.stage_transition_count,
         });
     }
 
@@ -561,6 +568,7 @@ mod tests {
             repo_associations: associations,
             plan: None,
             done_at: None,
+            stage_transition_count: 0,
         }
     }
 
@@ -1592,6 +1600,7 @@ mod tests {
                 }],
                 plan: None,
                 done_at: None,
+                stage_transition_count: 0,
             },
             WorkItemRecord {
                 display_id: None,
@@ -1611,6 +1620,7 @@ mod tests {
                 }],
                 plan: None,
                 done_at: None,
+                stage_transition_count: 0,
             },
             WorkItemRecord {
                 display_id: None,
@@ -1628,6 +1638,7 @@ mod tests {
                 }],
                 plan: None,
                 done_at: None,
+                stage_transition_count: 0,
             },
         ];
 

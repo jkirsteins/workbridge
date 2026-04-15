@@ -4084,6 +4084,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
@@ -4126,6 +4127,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
@@ -4158,6 +4160,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
@@ -4194,6 +4197,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
@@ -4249,6 +4253,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
@@ -4285,6 +4290,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
@@ -4309,11 +4315,11 @@ mod format_entry_tests {
     fn working_spinner_is_visible_on_highlighted_row() {
         use ratatui_core::style::Color;
         let wi = WorkItem {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
             title: "Working item".to_string(),
-            display_id: None,
             description: None,
             status: WorkItemStatus::Implementing,
             repo_associations: vec![RepoAssociation {
@@ -4326,6 +4332,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let id = wi.id.clone();
         let mut app = make_app_with_work_item(wi);
@@ -4357,11 +4364,11 @@ mod format_entry_tests {
     #[test]
     fn working_spinner_keeps_default_style_on_unselected_row() {
         let wi = WorkItem {
+            display_id: None,
             id: WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")),
             backend_type: BackendType::LocalFile,
             kind: crate::work_item::WorkItemKind::Own,
             title: "Working item".to_string(),
-            display_id: None,
             description: None,
             status: WorkItemStatus::Implementing,
             repo_associations: vec![RepoAssociation {
@@ -4374,6 +4381,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let id = wi.id.clone();
         let mut app = make_app_with_work_item(wi);
@@ -4878,6 +4886,7 @@ mod snapshot_tests {
             status_derived: false,
             repo_associations: associations,
             errors: Vec::new(),
+            stage_transition_count: 0,
         }
     }
 
@@ -5465,6 +5474,7 @@ mod snapshot_tests {
                     issue_number: 42,
                 },
             ],
+            stage_transition_count: 0,
         }];
         let mut app = app_with_items(items, vec![]);
         // Select the first selectable work item entry (skipping group headers).

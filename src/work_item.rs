@@ -186,6 +186,16 @@ pub struct WorkItem {
     pub status_derived: bool,
     pub repo_associations: Vec<RepoAssociation>,
     pub errors: Vec<WorkItemError>,
+    /// Monotonic counter bumped on every successful stage transition in
+    /// the backend. Passed through from `WorkItemRecord` unchanged by
+    /// the assembly layer and folded into the deterministic Claude Code
+    /// session UUID derivation so that cycling back to a previously-
+    /// used stage does not resume the prior transcript. See
+    /// `src/session_id.rs` for the derivation rule and
+    /// `docs/work-items.md` "Session identity and resumption" for the
+    /// cross-stage isolation argument. Defaults to `0` for records that
+    /// predate the field.
+    pub stage_transition_count: u64,
 }
 
 /// A repo associated with a work item, with derived metadata filled in

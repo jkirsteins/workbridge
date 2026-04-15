@@ -2567,11 +2567,11 @@ mod tests {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/tab-dead-terminal.json"));
         app.work_items.push(WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: WorkItemKind::Own,
             title: "Ctrl+\\ cycle test".into(),
-            display_id: None,
             description: None,
             status: WorkItemStatus::Implementing,
             status_derived: false,
@@ -2584,6 +2584,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -2642,11 +2643,11 @@ mod tests {
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/tab-dead-claude.json"));
         let wt_path = PathBuf::from("/tmp/tab-dead-claude-worktree");
         app.work_items.push(WorkItem {
+            display_id: None,
             id: wi_id.clone(),
             backend_type: BackendType::LocalFile,
             kind: WorkItemKind::Own,
             title: "Ctrl+\\ cycle test".into(),
-            display_id: None,
             description: None,
             status: WorkItemStatus::Implementing,
             status_derived: false,
@@ -2659,6 +2660,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
