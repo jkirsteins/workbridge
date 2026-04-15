@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -8953,13 +8954,31 @@ impl App {
             }
 
             // === Phase 2: git fetch origin <base> ===
+            //
+            // We use the explicit refspec
+            // `+<base>:refs/remotes/origin/<base>` instead of the
+            // shorthand `git fetch origin <base>` so the fetch is
+            // guaranteed to update the remote-tracking ref the
+            // harness and the verification below both consult. The
+            // shorthand form relies on git's "opportunistic
+            // remote-tracking branch update", which only fires when
+            // the remote's configured fetch refspec covers `<base>`;
+            // in repos cloned with `--single-branch` of a different
+            // branch, or with a customised `[remote "origin"] fetch`
+            // refspec that omits `<base>`, the shorthand would only
+            // update FETCH_HEAD and `origin/<base>` could stay
+            // stale, producing a false "Rebased onto origin/<base>"
+            // success even though the rebase landed on an old tip.
+            // The leading `+` enables non-fast-forward updates so a
+            // force-pushed base branch is also handled correctly.
+            let refspec = format!("+{base_branch}:refs/remotes/origin/{base_branch}");
             let _ = tx.send(RebaseGateMessage::Progress(format!(
                 "Fetching origin/{base_branch}..."
             )));
             match crate::worktree_service::git_command()
                 .arg("-C")
                 .arg(&worktree_path)
-                .args(["fetch", "origin", &base_branch])
+                .args(["fetch", "origin", &refspec])
                 .output()
             {
                 Ok(out) if out.status.success() => {}
@@ -9162,6 +9181,19 @@ impl App {
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped())
                         .current_dir(&worktree_path)
+                        // Put the harness in its OWN process group so
+                        // `drop_rebase_gate` can SIGKILL the entire
+                        // tree (claude + any `git rebase` / `git add`
+                        // subprocesses it has spawned). Without
+                        // `process_group(0)`, claude inherits
+                        // workbridge's process group and `killpg`
+                        // would either kill workbridge itself or
+                        // leave claude's git subprocesses orphaned
+                        // and still mutating the worktree. Mirrors
+                        // the pattern in `Session::spawn`, which
+                        // achieves the same isolation via
+                        // `libc::setsid` in `pre_exec`.
+                        .process_group(0)
                         .spawn();
                     let mut child = match spawn_result {
                         Ok(c) => c,
@@ -9174,10 +9206,19 @@ impl App {
                     // the gate was torn down between the parent
                     // thread's pre-spawn check and `Command::spawn`
                     // returning, we hold the only handle to a child
-                    // that nobody is going to wait on; kill and reap
-                    // it here so we do not leak a `claude` process.
+                    // that nobody is going to wait on; signal the
+                    // entire process group (not just the harness
+                    // PID) and reap so any subprocesses claude has
+                    // already started are also stopped.
                     if cancelled.load(Ordering::SeqCst) {
-                        let _ = child.kill();
+                        // SAFETY: `libc::killpg` is an FFI call into
+                        // a stable POSIX syscall; arguments are a
+                        // process-group id and a signal number. The
+                        // group leader is `child.id()` because we
+                        // passed `process_group(0)` above.
+                        unsafe {
+                            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                        }
                         let _ = child.wait();
                         return;
                     }
@@ -9466,17 +9507,30 @@ impl App {
             // lock. A `Some` here means the harness sub-thread has
             // populated the slot but `wait_with_output` has not yet
             // cleared it - i.e. the child either exists or finished
-            // microseconds ago. `libc::kill` on a freshly-reaped PID
-            // is a harmless `ESRCH` error rather than a wrong-process
-            // signal.
+            // microseconds ago. `libc::killpg` on a freshly-reaped
+            // PID is a harmless `ESRCH` error rather than a
+            // wrong-process signal.
+            //
+            // We use `killpg` rather than `kill` because the harness
+            // is spawned in its own process group via
+            // `Command::process_group(0)` (see `spawn_rebase_gate`):
+            // claude can run any number of `git rebase` / `git add`
+            // subprocesses while it works, and SIGKILLing only the
+            // claude PID would leave those subprocesses as orphans
+            // still mutating the worktree. Signalling the group
+            // takes the whole tree down at once, mirroring the
+            // pattern in `Session::force_kill`.
             let pid_to_kill = state.child_pid.lock().ok().and_then(|mut slot| slot.take());
             if let Some(pid) = pid_to_kill {
-                // SAFETY: `libc::kill` is an FFI call into a stable
-                // POSIX syscall. The arguments are a PID and a
-                // signal number, both plain integers; no Rust
-                // aliasing or lifetime invariants are at risk.
+                // SAFETY: `libc::killpg` is an FFI call into a
+                // stable POSIX syscall. The arguments are a process-
+                // group id and a signal number, both plain integers;
+                // no Rust aliasing or lifetime invariants are at
+                // risk. The harness's PID equals its process-group
+                // id because it was spawned with `process_group(0)`,
+                // which makes the child its own group leader.
                 unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
                 }
             }
             self.end_activity(state.activity);

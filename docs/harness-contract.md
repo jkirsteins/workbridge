@@ -577,16 +577,29 @@ entirely. The review gate runs `Command::output()` inside a
 background thread and has no cancel path - its lifecycle is
 governed by `Output` returning, and `poll_review_gate` drops the
 gate state once that arrives. The rebase gate is the opposite case:
-it runs `Command::spawn()` + `wait_with_output()` and stashes the
-child PID in `RebaseGateState::child_pid` (an `Arc<Mutex<Option<u32>>>`
-shared with the spawning sub-thread). `App::drop_rebase_gate` reads
-that slot and `libc::kill(pid, SIGKILL)`s the harness child, so
-work-item delete (`delete_work_item_by_id`) and force-quit
-(`force_kill_all`) can both stop an in-flight rebase before its
-write-side `git rebase` / `git add` calls race the worktree
-removal that follows on the cleanup thread. The PID is cleared by
-the sub-thread after `wait_with_output` returns, so a concurrent
-`drop_rebase_gate` can never SIGKILL a stale-PID slot.
+it runs `Command::spawn()` + `wait_with_output()` with
+`Command::process_group(0)` so the harness child becomes the
+leader of its own process group. The PID is stashed in
+`RebaseGateState::child_pid` (an `Arc<Mutex<Option<u32>>>` shared
+with the spawning sub-thread). `App::drop_rebase_gate` reads that
+slot and `libc::killpg(pid, SIGKILL)`s the **entire process
+group**, not just the harness PID, so claude AND any `git rebase`
+/ `git add` / `git rebase --continue` subprocesses it has started
+all die at once. Without `process_group(0)` the harness would
+inherit workbridge's process group, so a `kill(pid, SIGKILL)` on
+the claude PID alone would leave its `git` subprocesses orphaned
+and still mutating the worktree that `spawn_delete_cleanup` is
+about to remove. Mirrors the pattern in `Session::force_kill`,
+which uses `libc::killpg` for the same reason; `Session::spawn`
+gets the new group via `libc::setsid` in `pre_exec` while the
+rebase gate uses the simpler `Command::process_group(0)` because
+it does not need a controlling terminal. Work-item delete
+(`delete_work_item_by_id`) and force-quit (`force_kill_all`)
+both call `drop_rebase_gate` to stop in-flight rebases before
+their write-side calls race the worktree removal. The PID is
+cleared by the sub-thread after `wait_with_output` returns, so a
+concurrent `drop_rebase_gate` can never `killpg` a stale-PID
+slot.
 
 The pre-spawn window (default-branch resolution, `git fetch`, MCP
 server start, temp-config write) cannot rely on `child_pid`
@@ -754,7 +767,14 @@ spawns via `Command::spawn()` + `Child::wait_with_output()` rather
 than `Command::output()` so the harness child's PID can be stashed
 in `RebaseGateState::child_pid`; this is what lets
 `drop_rebase_gate` SIGKILL the harness on delete / force-quit (see
-C10). The rebase gate DOES pass `--dangerously-skip-permissions`
+C10). The spawn also passes `Command::process_group(0)` so the
+harness becomes the leader of its own process group; on
+cancellation `drop_rebase_gate` calls `libc::killpg` against that
+group so any `git rebase` / `git add` subprocesses claude has
+spawned die at the same time as claude itself. Without the new
+group, a `kill(pid, SIGKILL)` on the claude PID alone would leave
+those git subprocesses orphaned and still mutating the worktree.
+The rebase gate DOES pass `--dangerously-skip-permissions`
 because `claude --print` cannot display an interactive consent
 prompt and the rebase task requires write-side `git rebase` /
 `git add` calls. The rebase gate does NOT pass `--system-prompt`;
@@ -873,6 +893,21 @@ naming the ancestry mismatch, so a hallucinated envelope, a
 harness that ran the wrong command, or a stale stdout cannot
 produce a false "Rebased onto origin/<base>" status in the UI.
 This is the user-facing-claim verification mandated by CLAUDE.md.
+
+For the verification to be sound, `refs/remotes/origin/<base>`
+MUST point at the just-fetched tip. The phase 2 fetch therefore
+uses an explicit refspec
+`+<base>:refs/remotes/origin/<base>` instead of the shorthand
+`git fetch origin <base>`. The shorthand only updates the
+remote-tracking ref via git's "opportunistic remote-tracking
+branch update", which depends on the remote's configured fetch
+refspec covering `<base>`; in repos cloned with `--single-branch`
+of a different branch, or with a customised
+`[remote "origin"] fetch` refspec that omits `<base>`, the
+shorthand would only update FETCH_HEAD and the verification
+would silently compare against a stale ref. The leading `+`
+allows non-fast-forward updates so a force-pushed base branch is
+also handled.
 
 The rebase gate's audit trail (the "later session viewing this
 work item can see the rebase happened" record) is written on the
@@ -1177,6 +1212,30 @@ harness adapter is introduced, add a dated bullet here.
   `poll_rebase_gate` directly via `App.backend.append_activity` as
   a `rebase_completed` / `rebase_failed` activity log entry. RP6
   documents the new entry shape.
+- 2026-04-16: Third Codex pass on the rebase gate found two more
+  issues. (1) P1: The cancellation path was using `libc::kill`
+  against the claude PID alone, but claude was inheriting
+  workbridge's process group, so subprocesses claude spawned for
+  its shell tool (`git rebase`, `git add`, `git rebase --continue`)
+  would survive as orphans and keep mutating the worktree after
+  cancellation. The harness is now spawned with
+  `Command::process_group(0)` so it becomes the leader of its own
+  group, and `drop_rebase_gate` (plus the harness sub-thread's
+  post-spawn cancellation arm) calls `libc::killpg` against that
+  group, taking down claude and every git subprocess at once.
+  Mirrors the `Session::force_kill` pattern. (2) P1: The phase 2
+  fetch was using the shorthand `git fetch origin <base>`, which
+  only updates `refs/remotes/origin/<base>` via git's
+  "opportunistic remote-tracking branch update" - that depends on
+  the remote's configured fetch refspec covering `<base>`, so in
+  repos with `--single-branch` clones or customised refspecs it
+  would silently leave `origin/<base>` stale and make the
+  `merge-base --is-ancestor` verification check an old commit. The
+  fetch now uses an explicit `+<base>:refs/remotes/origin/<base>`
+  refspec so the remote-tracking ref is guaranteed to point at the
+  just-fetched tip. C10 (process-group cancellation), RP2b
+  (`process_group(0)`), and RP6 (explicit refspec rationale) all
+  updated.
 - 2026-04-16: Second Codex pass on the rebase gate uncovered three
   additional issues, all addressed in the same commit. (1) P0:
   The activity log append from the previous round was running on

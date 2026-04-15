@@ -1029,18 +1029,23 @@ lives in `src/ui.rs` immediately before the review-gate block and
 takes precedence over it). On completion, `poll_rebase_gate` drops
 the gate via `drop_rebase_gate` (which ends the status-bar activity,
 clears the user-action guard slot when the slot is owned by the
-work item being dropped, AND SIGKILLs the harness child via the
-`child_pid` slot if it is still alive) and surfaces a "Rebased
-onto origin/<main>" or "Rebase onto origin/<main> failed:
-<reason>" status message. `drop_rebase_gate` is also called from
-`delete_work_item_by_id` and `force_kill_all`, so deleting a work
-item or quitting workbridge while a rebase is in flight tears the
-gate down cleanly: the cancellation flag covers the pre-spawn
-window (default-branch resolution, `git fetch`, MCP server start,
-temp-config write) and the SIGKILL covers everything from
-`Command::spawn` onwards, so the harness can be stopped at any
-phase before the background `spawn_delete_cleanup` thread runs
-`git worktree remove` underneath it. The "Rebased" success status
+work item being dropped, AND `libc::killpg`s the harness's process
+group via the `child_pid` slot if it is still alive) and surfaces
+a "Rebased onto origin/<main>" or "Rebase onto origin/<main>
+failed: <reason>" status message. The harness is spawned with
+`Command::process_group(0)` so it becomes its own group leader;
+the `killpg` therefore takes down claude AND any `git rebase` /
+`git add` subprocesses claude has started, not just claude itself.
+`drop_rebase_gate` is also called from `delete_work_item_by_id`
+and `force_kill_all`, so deleting a work item or quitting
+workbridge while a rebase is in flight tears the gate down
+cleanly: the cancellation flag covers the pre-spawn window
+(default-branch resolution, `git fetch`, MCP server start, temp-
+config write) and the process-group SIGKILL covers everything
+from `Command::spawn` onwards, so the harness AND its in-flight
+git subprocesses can be stopped at any phase before the background
+`spawn_delete_cleanup` thread runs `git worktree remove`
+underneath it. The "Rebased" success status
 is gated on a local `git merge-base --is-ancestor origin/<main>
 HEAD` check that the spawning thread runs against the worktree
 before emitting `RebaseResult::Success`; if the check fails
