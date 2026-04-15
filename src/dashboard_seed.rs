@@ -337,6 +337,11 @@ fn write_item(
             } else {
                 None
             },
+            // Seed records are created from whole cloth without
+            // having gone through any stage transitions, so the
+            // counter starts at 0. The same default applies to
+            // pre-field records on disk via `#[serde(default)]`.
+            stage_transition_count: 0,
         };
         let json = serde_json::to_string_pretty(&record)?;
         fs::write(&json_path, json)?;

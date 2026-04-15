@@ -47,7 +47,19 @@ pub const WORKBRIDGE_SESSION_NAMESPACE: uuid::Uuid =
 /// surrounding quotes, guaranteeing the spelling matches exactly what the
 /// backend persists for each variant (`Planning`, `Implementing`, etc.)
 /// rather than being tied to `Debug` output which could drift.
-fn canonical_name(id: &WorkItemId, stage: WorkItemStatus) -> String {
+///
+/// `transition_count` is the backend's monotonic stage-transition
+/// counter. It is appended as a decimal suffix so that two visits to
+/// the same `(id, stage)` tuple at different counter values produce
+/// DIFFERENT UUIDs: this is the property that prevents a cycle like
+/// `Planning -> Implementing -> Planning` or `Review -> Implementing`
+/// rework from resuming a prior transcript. The counter is frozen
+/// into the hash in the same byte position for every record, so
+/// records that were written before the field existed deserialize
+/// with the serde default (`0`) and produce the same UUIDs they
+/// historically had - i.e. count=0 is backward compatible with the
+/// pre-field scheme.
+fn canonical_name(id: &WorkItemId, stage: WorkItemStatus, transition_count: u64) -> String {
     let id_part = match id {
         WorkItemId::LocalFile(path) => {
             let absolute = std::path::absolute(path).unwrap_or_else(|_| path.clone());
@@ -62,17 +74,32 @@ fn canonical_name(id: &WorkItemId, stage: WorkItemStatus) -> String {
     };
     let stage_json = serde_json::to_string(&stage).unwrap_or_default();
     let stage_part = stage_json.trim_matches('"');
-    format!("{id_part}:{stage_part}")
+    format!("{id_part}:{stage_part}:{transition_count}")
 }
 
 /// Compute the deterministic Claude Code session UUID for a given
-/// work item and workflow stage.
+/// work item, workflow stage, and stage-transition count.
 ///
 /// Same inputs always produce the same UUID. Different stages of the
 /// same work item yield different UUIDs, so each stage has its own
-/// isolated resumable history.
-pub fn session_id_for(id: &WorkItemId, stage: WorkItemStatus) -> uuid::Uuid {
-    let name = canonical_name(id, stage);
+/// isolated resumable history. Cycling back to a stage the work item
+/// has been at before yields a DIFFERENT UUID from the earlier visit
+/// because `transition_count` has advanced in the backend record,
+/// so e.g. `Review -> Implementing` rework and `Blocked -> Planning`
+/// retreat do NOT silently resume the old transcript - they start a
+/// fresh one under a fresh UUID, matching the intent of invariant 13
+/// "fresh session per stage transition".
+///
+/// Records that predate the `stage_transition_count` field
+/// deserialize with the serde default (`0`), which makes every
+/// pre-field record hash as if it had been written with count `0`
+/// from the start. There is no older on-disk derivation to stay
+/// byte-compatible with: the session-ID scheme was introduced on
+/// this feature branch and the transition-count nonce was added in
+/// the same branch before shipping, so users never ran workbridge
+/// against a scheme that omitted the count suffix.
+pub fn session_id_for(id: &WorkItemId, stage: WorkItemStatus, transition_count: u64) -> uuid::Uuid {
+    let name = canonical_name(id, stage, transition_count);
     uuid::Uuid::new_v5(&WORKBRIDGE_SESSION_NAMESPACE, name.as_bytes())
 }
 
@@ -279,20 +306,52 @@ mod tests {
     #[test]
     fn same_inputs_produce_same_uuid() {
         let id = WorkItemId::LocalFile(PathBuf::from("/tmp/foo.json"));
-        let a = session_id_for(&id, WorkItemStatus::Planning);
-        let b = session_id_for(&id, WorkItemStatus::Planning);
+        let a = session_id_for(&id, WorkItemStatus::Planning, 0);
+        let b = session_id_for(&id, WorkItemStatus::Planning, 0);
         assert_eq!(a, b, "deterministic derivation must be stable");
     }
 
     #[test]
     fn different_stages_produce_different_uuids() {
         let id = WorkItemId::LocalFile(PathBuf::from("/tmp/foo.json"));
-        let planning = session_id_for(&id, WorkItemStatus::Planning);
-        let implementing = session_id_for(&id, WorkItemStatus::Implementing);
-        let review = session_id_for(&id, WorkItemStatus::Review);
+        let planning = session_id_for(&id, WorkItemStatus::Planning, 0);
+        let implementing = session_id_for(&id, WorkItemStatus::Implementing, 1);
+        let review = session_id_for(&id, WorkItemStatus::Review, 2);
         assert_ne!(planning, implementing, "stage change must shift the UUID");
         assert_ne!(implementing, review, "stage change must shift the UUID");
         assert_ne!(planning, review, "stage change must shift the UUID");
+    }
+
+    /// Codex adversarial review finding: cycling back to a previously
+    /// used stage must yield a DIFFERENT UUID than the first visit so
+    /// the second visit creates a fresh session transcript instead of
+    /// resuming the prior one. The `stage_transition_count` nonce is
+    /// what makes this work: the second visit happens at a higher
+    /// count value, so `(id, Planning, 0)` and `(id, Planning, 2)`
+    /// hash to different UUIDs. This test pins that property for
+    /// both Planning-cycle-back and Review -> Implementing rework
+    /// scenarios.
+    #[test]
+    fn cycling_back_to_same_stage_produces_different_uuids() {
+        let id = WorkItemId::LocalFile(PathBuf::from("/tmp/cycle.json"));
+        // Planning -> Implementing -> Blocked -> Planning:
+        // counts 0, 1, 2, 3. The two Planning UUIDs MUST differ.
+        let first_planning = session_id_for(&id, WorkItemStatus::Planning, 0);
+        let second_planning = session_id_for(&id, WorkItemStatus::Planning, 3);
+        assert_ne!(
+            first_planning, second_planning,
+            "cycling back to Planning must not reuse the prior transcript",
+        );
+        // Review -> Implementing rework at count 4. The second
+        // Implementing visit MUST NOT collide with the first
+        // (count 1).
+        let first_implementing = session_id_for(&id, WorkItemStatus::Implementing, 1);
+        let rework_implementing = session_id_for(&id, WorkItemStatus::Implementing, 4);
+        assert_ne!(
+            first_implementing, rework_implementing,
+            "Review -> Implementing rework must not resume the prior \
+             Implementing transcript",
+        );
     }
 
     /// The variant tag prefix in `canonical_name` must prevent collisions
@@ -307,8 +366,8 @@ mod tests {
             repo: "repo".to_string(),
             number: 1,
         };
-        let a = session_id_for(&local, WorkItemStatus::Planning);
-        let b = session_id_for(&gh, WorkItemStatus::Planning);
+        let a = session_id_for(&local, WorkItemStatus::Planning, 0);
+        let b = session_id_for(&gh, WorkItemStatus::Planning, 0);
         assert_ne!(
             a, b,
             "variant tag prefix must keep LocalFile and GithubIssue disjoint",
@@ -322,8 +381,8 @@ mod tests {
             node_id: "owner/repo#1".to_string(),
         };
         let local = WorkItemId::LocalFile(PathBuf::from("owner/repo#1"));
-        let a = session_id_for(&project, WorkItemStatus::Planning);
-        let b = session_id_for(&local, WorkItemStatus::Planning);
+        let a = session_id_for(&project, WorkItemStatus::Planning, 0);
+        let b = session_id_for(&local, WorkItemStatus::Planning, 0);
         assert_ne!(
             a, b,
             "GithubProject must not collide with LocalFile for similar field strings",
@@ -333,7 +392,7 @@ mod tests {
     #[test]
     fn derived_uuids_are_v5() {
         let id = WorkItemId::LocalFile(PathBuf::from("/tmp/v5-check.json"));
-        let u = session_id_for(&id, WorkItemStatus::Planning);
+        let u = session_id_for(&id, WorkItemStatus::Planning, 0);
         assert_eq!(
             u.get_version(),
             Some(Version::Sha1),
@@ -514,6 +573,13 @@ mod tests {
     /// every derived UUID and break resume for existing work items.
     /// Update the expected strings here only after a deliberate migration
     /// plan for users already running workbridge.
+    ///
+    /// The frozen format is
+    /// `<backend-tag>:<id-fields>:<stage>:<transition_count>` where the
+    /// trailing `<transition_count>` is the persistent nonce added in
+    /// response to the Codex adversarial-review finding that cycling
+    /// stages reused prior transcripts. Count `0` is the canonical
+    /// default for records that predate the field.
     #[test]
     fn canonical_name_format_is_frozen() {
         let gh = WorkItemId::GithubIssue {
@@ -522,16 +588,23 @@ mod tests {
             number: 42,
         };
         assert_eq!(
-            canonical_name(&gh, WorkItemStatus::Implementing),
-            "github-issue:acme/widgets#42:Implementing",
+            canonical_name(&gh, WorkItemStatus::Implementing, 0),
+            "github-issue:acme/widgets#42:Implementing:0",
+        );
+        // A non-zero transition count must be reflected in the
+        // frozen string, so a cycle back to the same stage lands
+        // on a different UUID.
+        assert_eq!(
+            canonical_name(&gh, WorkItemStatus::Implementing, 7),
+            "github-issue:acme/widgets#42:Implementing:7",
         );
 
         let proj = WorkItemId::GithubProject {
             node_id: "PVT_kwDOABCDEF".to_string(),
         };
         assert_eq!(
-            canonical_name(&proj, WorkItemStatus::Review),
-            "github-project:PVT_kwDOABCDEF:Review",
+            canonical_name(&proj, WorkItemStatus::Review, 0),
+            "github-project:PVT_kwDOABCDEF:Review:0",
         );
     }
 }

@@ -2555,6 +2555,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -2630,6 +2631,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));

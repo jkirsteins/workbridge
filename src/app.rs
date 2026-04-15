@@ -3941,16 +3941,27 @@ impl App {
             self.status_message = Some("Opening session...".into());
             return;
         }
-        // Capture the work item's stage on the UI thread (cheap
-        // in-memory read) so the background worker can derive the
-        // deterministic session UUID for that exact stage. If the
-        // work item has been deleted between the caller's lookup and
-        // here, drop the open silently - there is nothing to spawn.
-        let Some(stage) = self
+        // Capture the work item's stage AND its current
+        // stage-transition count on the UI thread (cheap in-memory
+        // reads) so the background worker can derive the
+        // deterministic session UUID for that exact stage-instance.
+        // The transition count is the nonce that distinguishes a
+        // cycle-back visit to the same stage from a restart-resume
+        // of the same visit: `Review -> Implementing` rework and
+        // `Blocked -> Planning` retreat both advance the count, so
+        // the second visit lands on a fresh UUID and the second
+        // spawn is a fresh session instead of resuming the prior
+        // transcript. See `src/session_id.rs::session_id_for` and
+        // the Codex adversarial-review finding that the original
+        // `(WorkItemId, WorkItemStatus)` derivation collapsed
+        // repeated stage visits. If the work item has been
+        // deleted between the caller's lookup and here, drop the
+        // open silently - there is nothing to spawn.
+        let Some((stage, transition_count)) = self
             .work_items
             .iter()
             .find(|w| w.id == *work_item_id)
-            .map(|w| w.status)
+            .map(|w| (w.status, w.stage_transition_count))
         else {
             return;
         };
@@ -3992,7 +4003,8 @@ impl App {
             //   context on a degraded home directory, which is
             //   the exact failure mode Codex adversarial review
             //   flagged against the earlier `-> bool` helper.
-            let session_id = crate::session_id::session_id_for(&wi_id_clone, stage);
+            let session_id =
+                crate::session_id::session_id_for(&wi_id_clone, stage, transition_count);
             let (spawn_flag, probe_error) =
                 match crate::session_id::session_exists_on_disk(session_id) {
                     crate::session_id::SessionProbe::Exists => (Some(SpawnFlag::Resume), None),
@@ -4700,11 +4712,24 @@ impl App {
         flag: SpawnFlag,
     ) -> Vec<String> {
         let is_planning = *status == WorkItemStatus::Planning;
-        let auto_start = force_auto_start
-            || matches!(
-                status,
-                WorkItemStatus::Planning | WorkItemStatus::Implementing
-            );
+        // Codex adversarial review: the positional "Explain who
+        // you are and start working." (Planning / Implementing)
+        // and "Present the review gate assessment..." (Review with
+        // findings) prompts are one-shot kickoffs for a FRESH
+        // session. Appending them on a `--resume <uuid>` spawn
+        // would re-inject the kickoff text as a new user turn in
+        // an already-running transcript - Claude Code would
+        // resume the prior conversation AND see a brand-new
+        // "start working" instruction, which can make it restart
+        // or duplicate work. Gate the prompt on `SpawnFlag::Fresh`
+        // so resume spawns just reattach to the live transcript
+        // without any extra user input.
+        let auto_start = flag == SpawnFlag::Fresh
+            && (force_auto_start
+                || matches!(
+                    status,
+                    WorkItemStatus::Planning | WorkItemStatus::Implementing
+                ));
 
         let mut cmd: Vec<String> = vec!["claude".to_string()];
         cmd.push("--dangerously-skip-permissions".to_string());
@@ -9437,6 +9462,7 @@ mod tests {
                     }],
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -9459,6 +9485,7 @@ mod tests {
                     plan: None,
                     description: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -9581,6 +9608,7 @@ mod tests {
                     repo_associations: req.repo_associations,
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 })
             }
             fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
@@ -10079,6 +10107,7 @@ mod tests {
             }],
             plan: None,
             done_at: None,
+            stage_transition_count: 0,
         };
         let record_b = crate::work_item_backend::WorkItemRecord {
             display_id: None,
@@ -10094,6 +10123,7 @@ mod tests {
             }],
             plan: None,
             done_at: None,
+            stage_transition_count: 0,
         };
 
         // Start with order A, B.
@@ -10136,6 +10166,7 @@ mod tests {
                     git_state: None,
                 }],
                 errors: vec![],
+                stage_transition_count: 0,
             },
             crate::work_item::WorkItem {
                 display_id: None,
@@ -10155,6 +10186,7 @@ mod tests {
                     git_state: None,
                 }],
                 errors: vec![],
+                stage_transition_count: 0,
             },
         ];
         app.build_display_list();
@@ -10201,6 +10233,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         }
     }
 
@@ -10333,6 +10366,7 @@ mod tests {
                 }],
                 plan: None,
                 done_at: None,
+                stage_transition_count: 0,
             };
             let json = serde_json::to_string_pretty(&record).unwrap();
             std::fs::write(dir.join(name), json).unwrap();
@@ -10776,6 +10810,7 @@ mod tests {
                     }],
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -10798,6 +10833,7 @@ mod tests {
                     plan: None,
                     description: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -11053,6 +11089,7 @@ mod tests {
                     }],
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -11075,6 +11112,7 @@ mod tests {
                     plan: None,
                     description: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -11520,6 +11558,7 @@ mod tests {
                     }],
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -11542,6 +11581,7 @@ mod tests {
                     plan: None,
                     description: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -11685,6 +11725,7 @@ mod tests {
                     repo_associations: req.repo_associations,
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 Ok(record)
             }
@@ -11815,6 +11856,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         }
     }
 
@@ -12009,6 +12051,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -12042,6 +12085,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.execute_merge(&wi_id, "squash");
         let status = app
@@ -12077,6 +12121,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.execute_merge(&wi_id, "squash");
         let status = app
@@ -12112,6 +12157,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
         // No repo_data entry for /tmp/repo, so the cached github_remote
         // lookup returns None and execute_merge blocks the merge.
@@ -12142,6 +12188,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         let (tx, rx) = crossbeam_channel::bounded(1);
         tx.send(PrMergeResult {
@@ -12181,6 +12228,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         let (tx, rx) = crossbeam_channel::bounded(1);
         tx.send(PrMergeResult {
@@ -12225,6 +12273,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.mergequeue_watches.push(MergequeueWatch {
             wi_id: wi_id.clone(),
@@ -12294,6 +12343,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.mergequeue_watches.push(MergequeueWatch {
             wi_id: wi_id.clone(),
@@ -12359,6 +12409,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         // Watch starts with pr_number = None, as if reconstructed from a
         // backend record after an app restart where the open-PR fetch had
@@ -12430,6 +12481,7 @@ mod tests {
                 status_derived: false,
                 repo_associations: vec![],
                 errors: vec![],
+                stage_transition_count: 0,
             });
             app.mergequeue_watches.push(MergequeueWatch {
                 wi_id: id.clone(),
@@ -12513,6 +12565,7 @@ mod tests {
             }],
             plan: None,
             done_at: None,
+            stage_transition_count: 0,
         };
 
         let backend = ArchiveTestBackend {
@@ -12567,6 +12620,7 @@ mod tests {
             }],
             plan: None,
             done_at: None,
+            stage_transition_count: 0,
         };
 
         let backend = ArchiveTestBackend {
@@ -12602,6 +12656,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -12648,6 +12703,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -12677,6 +12733,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -13022,6 +13079,12 @@ mod tests {
     /// Regression: the positional prompt must come BEFORE --mcp-config
     /// in the argument list. If it comes after, Claude Code treats it as
     /// a config file path and exits with "MCP config file not found".
+    ///
+    /// This test covers the Fresh spawn path (the one that emits the
+    /// positional kickoff prompt at all). Resume spawns deliberately
+    /// suppress the prompt - see
+    /// `build_claude_cmd_resume_spawns_suppress_auto_start_prompt` for
+    /// that property.
     #[test]
     fn build_claude_cmd_prompt_before_mcp_config() {
         // Planning session: has --dangerously-skip-permissions, --settings hook, and positional prompt.
@@ -13031,11 +13094,11 @@ mod tests {
             Some("system prompt here"),
             false,
             session_id,
-            SpawnFlag::Resume,
+            SpawnFlag::Fresh,
         );
         assert_eq!(cmd[0], "claude");
         assert_eq!(cmd[1], "--dangerously-skip-permissions");
-        assert_eq!(cmd[2], "--resume");
+        assert_eq!(cmd[2], "--session-id");
         assert_eq!(cmd[3], session_id.to_string());
         assert_eq!(cmd[4], "--allowedTools");
         assert!(
@@ -13062,7 +13125,9 @@ mod tests {
         );
     }
 
-    /// Implementing sessions also get an auto-start prompt.
+    /// Implementing sessions also get an auto-start prompt on Fresh
+    /// spawns. Resume spawns suppress the prompt, see
+    /// `build_claude_cmd_resume_spawns_suppress_auto_start_prompt`.
     #[test]
     fn build_claude_cmd_implementing_has_prompt() {
         let session_id = uuid::Uuid::nil();
@@ -13071,11 +13136,11 @@ mod tests {
             Some("impl prompt"),
             false,
             session_id,
-            SpawnFlag::Resume,
+            SpawnFlag::Fresh,
         );
         assert_eq!(cmd[0], "claude");
         assert_eq!(cmd[1], "--dangerously-skip-permissions");
-        assert_eq!(cmd[2], "--resume");
+        assert_eq!(cmd[2], "--session-id");
         assert_eq!(cmd[3], session_id.to_string());
         assert_eq!(cmd[4], "--allowedTools");
         assert!(
@@ -13085,7 +13150,65 @@ mod tests {
         assert_eq!(cmd[6], "--system-prompt");
         assert!(
             cmd.last().unwrap().contains("start working"),
-            "implementing should have auto-start prompt",
+            "implementing should have auto-start prompt on a Fresh spawn",
+        );
+    }
+
+    /// Codex adversarial review finding: Resume spawns MUST NOT
+    /// append the positional kickoff prompt. `claude --resume <uuid>
+    /// "Explain who you are and start working."` would restore the
+    /// prior transcript AND inject the kickoff text as a new user
+    /// turn, which can make Claude restart or duplicate work. This
+    /// test pins the Fresh-only gate for all three prompt sites
+    /// (Planning, Implementing, and force_auto_start Review).
+    #[test]
+    fn build_claude_cmd_resume_spawns_suppress_auto_start_prompt() {
+        let session_id = uuid::Uuid::nil();
+
+        // Planning + Resume: no positional prompt.
+        let planning = App::build_claude_cmd(
+            &WorkItemStatus::Planning,
+            Some("planning prompt"),
+            false,
+            session_id,
+            SpawnFlag::Resume,
+        );
+        assert!(
+            !planning
+                .iter()
+                .any(|a| a.contains("start working") || a.contains("review gate assessment")),
+            "Resume Planning must not inject the fresh-session kickoff prompt",
+        );
+
+        // Implementing + Resume: no positional prompt.
+        let implementing = App::build_claude_cmd(
+            &WorkItemStatus::Implementing,
+            Some("impl prompt"),
+            false,
+            session_id,
+            SpawnFlag::Resume,
+        );
+        assert!(
+            !implementing.iter().any(|a| a.contains("start working")),
+            "Resume Implementing must not inject 'Explain who you are and start working.'",
+        );
+
+        // Review + force_auto_start + Resume: no positional prompt.
+        // The review-gate findings presentation is a one-shot
+        // instruction for a FRESH gate-triggered session; on resume
+        // the user has already seen the findings in the prior
+        // transcript, so re-injecting them is wrong.
+        let review = App::build_claude_cmd(
+            &WorkItemStatus::Review,
+            Some("review prompt"),
+            true,
+            session_id,
+            SpawnFlag::Resume,
+        );
+        assert!(
+            !review.iter().any(|a| a.contains("review gate assessment")),
+            "Resume Review with findings must not re-present the gate \
+             assessment - the prior transcript already contains it",
         );
     }
 
@@ -13304,6 +13427,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -13336,6 +13460,7 @@ mod tests {
             status_derived: false,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -13390,6 +13515,7 @@ mod tests {
                     git_state: None,
                 }],
                 errors: vec![],
+                stage_transition_count: 0,
             });
         }
 
@@ -13449,6 +13575,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         app.build_display_list();
@@ -13486,7 +13613,11 @@ mod tests {
         }
     }
 
-    /// Review sessions auto-start when force_auto_start is true (gate findings present).
+    /// Review sessions auto-start when force_auto_start is true (gate
+    /// findings present) AND the spawn is Fresh. On Resume the prior
+    /// transcript already contains the presented findings, so the
+    /// positional kickoff is suppressed - that case is covered by
+    /// `build_claude_cmd_resume_spawns_suppress_auto_start_prompt`.
     #[test]
     fn build_claude_cmd_review_force_auto_start() {
         let session_id = uuid::Uuid::nil();
@@ -13495,11 +13626,12 @@ mod tests {
             Some("review prompt"),
             true,
             session_id,
-            SpawnFlag::Resume,
+            SpawnFlag::Fresh,
         );
         assert!(
             cmd.last().unwrap().contains("review gate assessment"),
-            "review with force_auto_start should have gate-specific prompt",
+            "review with force_auto_start should have gate-specific \
+             prompt on a Fresh spawn",
         );
     }
 
@@ -13679,6 +13811,7 @@ mod tests {
             status_derived: false,
             repo_associations: repo_assoc,
             errors: vec![],
+            stage_transition_count: 0,
         });
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
@@ -14147,6 +14280,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         // Item B: MCP will request Review for this one.
@@ -14169,6 +14303,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         // Simulate gate running for item A.
@@ -14522,6 +14657,7 @@ mod tests {
                     }],
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 };
                 self.records.lock().unwrap().push(record.clone());
                 Ok(record)
@@ -14677,6 +14813,7 @@ mod tests {
                     }],
                     plan: None,
                     done_at: None,
+                    stage_transition_count: 0,
                 }],
             }
         }
@@ -15273,6 +15410,7 @@ mod tests {
             }],
             plan: None,
             done_at,
+            stage_transition_count: 0,
         }
     }
 
@@ -15684,6 +15822,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
     }
 
@@ -16086,6 +16225,7 @@ mod tests {
                 }],
                 plan: None,
                 done_at: Some(0),
+                stage_transition_count: 0,
             },
         });
 
@@ -16288,6 +16428,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         let cwd = PathBuf::from("/tmp/p0-stage-prompt-worktree");
@@ -16349,6 +16490,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         // Hold the gate so the background thread cannot call
@@ -16405,7 +16547,8 @@ mod tests {
         // session UUID from `(wi_id, stage)` so the UI thread does
         // not have to recompute it - and so the
         // `(session_id, spawn_flag)` pair is internally consistent.
-        let expected_id = crate::session_id::session_id_for(&wi_id, WorkItemStatus::Implementing);
+        let expected_id =
+            crate::session_id::session_id_for(&wi_id, WorkItemStatus::Implementing, 0);
         assert_eq!(
             result.session_id, expected_id,
             "background worker must populate the deterministic session UUID",
@@ -16483,6 +16626,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         // Pre-queue a completed worktree-create result so Phase 5's
@@ -16591,6 +16735,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         // No spinner before the call.
@@ -16684,6 +16829,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         let cwd = PathBuf::from("/tmp/codex-stage-cancel-wt");
@@ -16770,6 +16916,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         // Simulate the background worker's output for a pending open
@@ -16781,7 +16928,7 @@ mod tests {
             stage: captured_stage,
             plan_text: String::new(),
             read_error: None,
-            session_id: crate::session_id::session_id_for(&wi_id, captured_stage),
+            session_id: crate::session_id::session_id_for(&wi_id, captured_stage, 0),
             spawn_flag: Some(SpawnFlag::Fresh),
             probe_error: None,
         };
@@ -16849,6 +16996,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         let captured_stage = WorkItemStatus::Mergequeue;
@@ -16858,7 +17006,7 @@ mod tests {
             stage: captured_stage,
             plan_text: String::new(),
             read_error: None,
-            session_id: crate::session_id::session_id_for(&wi_id, captured_stage),
+            session_id: crate::session_id::session_id_for(&wi_id, captured_stage, 0),
             spawn_flag: Some(SpawnFlag::Fresh),
             probe_error: None,
         };
@@ -16915,6 +17063,7 @@ mod tests {
             status_derived: true,
             repo_associations: vec![],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         // Spawn a real `sleep` PTY. Using sleep instead of claude
@@ -17057,6 +17206,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         let captured_stage = WorkItemStatus::Implementing;
@@ -17066,7 +17216,7 @@ mod tests {
             stage: captured_stage,
             plan_text: String::new(),
             read_error: None,
-            session_id: crate::session_id::session_id_for(&wi_id, captured_stage),
+            session_id: crate::session_id::session_id_for(&wi_id, captured_stage, 0),
             spawn_flag: Some(SpawnFlag::Fresh),
             probe_error: None,
         };
@@ -17146,6 +17296,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         let captured_stage = WorkItemStatus::Implementing;
@@ -17158,7 +17309,7 @@ mod tests {
             stage: captured_stage,
             plan_text: String::new(),
             read_error: None,
-            session_id: crate::session_id::session_id_for(&wi_id, captured_stage),
+            session_id: crate::session_id::session_id_for(&wi_id, captured_stage, 0),
             spawn_flag: None,
             probe_error: Some(error_msg.to_string()),
         };
@@ -17440,6 +17591,7 @@ mod tests {
                 git_state: None,
             }],
             errors: vec![],
+            stage_transition_count: 0,
         });
 
         let cwd = PathBuf::from("/tmp/r2f3-cleanup-wt");

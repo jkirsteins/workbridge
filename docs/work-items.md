@@ -342,19 +342,49 @@ Only deleting the backend record destroys the work item.
 ### Session identity and resumption
 
 Each interactive Claude Code session spawned by workbridge is assigned a
-deterministic UUID v5 derived from the tuple `(work_item_id, stage)` and
-a workbridge-specific namespace constant defined in `src/session_id.rs`.
-The derivation is pure: nothing is persisted in the work item's backend
-record. The UUID is recomputed from first principles on every spawn, so
-the scheme survives workbridge restarts and is immune to backend format
+deterministic UUID v5 derived from the tuple
+`(work_item_id, stage, stage_transition_count)` and a
+workbridge-specific namespace constant defined in `src/session_id.rs`.
+`stage_transition_count` is a monotonic counter stored on the backend
+record (`WorkItemRecord::stage_transition_count`) and bumped by
+`WorkItemBackend::update_status` on every REAL stage transition
+(a no-op update to the same status does NOT bump the counter, so a
+redundant write cannot shift the UUID out from under a live session).
+The UUID is recomputed from first principles on every spawn, so the
+scheme survives workbridge restarts and is immune to backend format
 changes that do not touch the identifying fields.
 
-Stable `(work_item_id, stage) -> UUID` mapping means that re-entering a
-work item after quitting workbridge resumes the exact same Claude Code
-session via `claude --resume <uuid>`. The full prior conversation
-history is restored. Stage transitions deliberately change the UUID
-(because the tuple changes), so each stage keeps its own isolated
-resumable history and there is no cross-stage history bleed.
+Stable `(work_item_id, stage, count) -> UUID` mapping means that
+re-entering a work item after quitting workbridge resumes the exact
+same Claude Code session via `claude --resume <uuid>`. The full prior
+conversation history is restored. Stage transitions deliberately
+change the UUID because both the stage and the counter change, so
+each stage keeps its own isolated resumable history and there is no
+cross-stage history bleed.
+
+The counter also distinguishes repeated visits to the same stage
+name. Cycling `Planning -> Implementing -> Blocked -> Planning`
+advances the counter to 3 before the second Planning visit, so the
+second visit's UUID is
+`session_id_for(wi, Planning, 3)` - a DIFFERENT UUID from the first
+visit's `session_id_for(wi, Planning, 0)`. `Review -> Implementing`
+rework works the same way. Without the counter, cycling back would
+resume the prior transcript and leak stage context into the new
+phase, which Codex adversarial review flagged as a break of
+invariant 13 "fresh session per stage transition" (the rule applies
+per stage-instance, not per stage name).
+
+Resume spawns (`SpawnFlag::Resume`, emitted when
+`session_exists_on_disk` reports `Exists`) deliberately suppress the
+positional kickoff prompts that Fresh spawns use (`"Explain who you
+are and start working."` for Planning / Implementing,
+`"Present the review gate assessment..."` for Review with findings).
+A resume is meant to reattach the user to an already-running
+conversation; injecting the fresh-session kickoff text as a new user
+turn would re-trigger the first-run behaviour and duplicate work.
+See `App::build_claude_cmd` and the
+`build_claude_cmd_resume_spawns_suppress_auto_start_prompt`
+regression test.
 
 The spawn protocol chooses between `--resume <uuid>` and
 `--session-id <uuid>` up-front, before the process is spawned. The

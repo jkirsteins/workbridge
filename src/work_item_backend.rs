@@ -89,6 +89,28 @@ pub struct WorkItemRecord {
     /// Defaults to None for migration compatibility with existing records.
     #[serde(default)]
     pub done_at: Option<u64>,
+    /// Monotonic counter bumped on every successful stage transition.
+    /// Folded into the deterministic Claude Code session UUID derivation
+    /// alongside `(WorkItemId, WorkItemStatus)` so that cycling back to
+    /// a previously-used stage does NOT resume the prior transcript: a
+    /// `Planning -> Implementing -> Planning` or `Review -> Implementing`
+    /// rework path lands on a fresh UUID on the second visit because
+    /// the counter has advanced.
+    ///
+    /// Defaults to `0` for migration compatibility with records written
+    /// before this field existed; old records implicitly ran with
+    /// `stage_transition_count = 0`, so the backward-compatible default
+    /// produces the same UUIDs they were using.
+    ///
+    /// See `src/session_id.rs` for the derivation rule and
+    /// `docs/work-items.md` "Session identity and resumption" for the
+    /// cross-stage isolation argument. See `docs/invariants.md`
+    /// invariant 13 for why stage transitions MUST produce a new
+    /// session (`(WorkItemId, WorkItemStatus, stage_transition_count)`
+    /// is the tuple that makes "fresh per stage transition" work even
+    /// across cycles).
+    #[serde(default)]
+    pub stage_transition_count: u64,
 }
 
 /// An entry in a work item's append-only activity log.
@@ -656,6 +678,12 @@ impl WorkItemBackend for LocalFileBackend {
             repo_associations: request.repo_associations,
             plan: None,
             done_at: None,
+            // A freshly created work item has not yet undergone
+            // any stage transitions, so the counter starts at 0.
+            // Every subsequent `update_status` call bumps it, so
+            // the session-ID nonce advances in lock-step with the
+            // user's workflow movements.
+            stage_transition_count: 0,
         };
 
         let json = serde_json::to_string_pretty(&record)
@@ -729,6 +757,24 @@ impl WorkItemBackend for LocalFileBackend {
 
     fn update_status(&self, id: &WorkItemId, status: WorkItemStatus) -> Result<(), BackendError> {
         self.modify_record(id, |record| {
+            // Bump the stage transition counter on every real
+            // transition. Folded into the deterministic Claude
+            // Code session UUID so that cycling back to a
+            // previously-used stage (e.g. Review -> Implementing
+            // rework, Blocked -> Planning retreat) lands on a
+            // fresh UUID on the second visit instead of resuming
+            // the prior transcript. The counter intentionally
+            // skips no-op writes (status unchanged) so a
+            // redundant `update_status(..., same_status)` call
+            // does not shift the UUID and invalidate a live
+            // session that is still at the same stage.
+            //
+            // See `src/session_id.rs::session_id_for` and
+            // `docs/work-items.md` "Session identity and
+            // resumption" for the end-to-end contract.
+            if record.status != status {
+                record.stage_transition_count = record.stage_transition_count.saturating_add(1);
+            }
             record.status = status;
         })
     }
@@ -1296,6 +1342,110 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Codex adversarial review finding: the deterministic session
+    /// UUID scheme must distinguish repeated visits to the same
+    /// stage, not just different stage names. `update_status` is
+    /// the single point where every real stage transition passes
+    /// through, so bumping `stage_transition_count` here is what
+    /// threads the "new visit = new nonce = new UUID" property
+    /// through to `session_id::session_id_for`. This test pins the
+    /// bump-on-real-transition behaviour and the explicit
+    /// skip-on-no-op property that keeps a redundant
+    /// `update_status(..., same_status)` call from shifting the
+    /// UUID out from under a live session.
+    #[test]
+    fn update_status_bumps_stage_transition_count() {
+        let dir = temp_dir("update-status-counter");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Counter test".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                kind: WorkItemKind::Own,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repo"),
+                    branch: Some("counter-branch".into()),
+                    pr_identity: None,
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(
+            record.stage_transition_count, 0,
+            "freshly-created records must start the counter at 0",
+        );
+
+        // Real transition Backlog -> Planning: counter should bump.
+        backend
+            .update_status(&record.id, WorkItemStatus::Planning)
+            .unwrap();
+        let after_planning = backend.list().unwrap().records[0].clone();
+        assert_eq!(after_planning.status, WorkItemStatus::Planning);
+        assert_eq!(
+            after_planning.stage_transition_count, 1,
+            "first real transition must bump the counter to 1",
+        );
+
+        // No-op update (same status) must NOT bump the counter -
+        // otherwise a redundant `update_status(..., current)` call
+        // would shift the deterministic session UUID out from
+        // under a live session.
+        backend
+            .update_status(&record.id, WorkItemStatus::Planning)
+            .unwrap();
+        let after_noop = backend.list().unwrap().records[0].clone();
+        assert_eq!(
+            after_noop.stage_transition_count, 1,
+            "redundant update_status(..., same_status) must NOT \
+             bump the counter",
+        );
+
+        // Cycle through Implementing -> Blocked -> Planning:
+        // three real transitions, counter should advance to 4.
+        backend
+            .update_status(&record.id, WorkItemStatus::Implementing)
+            .unwrap();
+        backend
+            .update_status(&record.id, WorkItemStatus::Blocked)
+            .unwrap();
+        backend
+            .update_status(&record.id, WorkItemStatus::Planning)
+            .unwrap();
+        let after_cycle = backend.list().unwrap().records[0].clone();
+        assert_eq!(
+            after_cycle.status,
+            WorkItemStatus::Planning,
+            "final status is Planning after the cycle",
+        );
+        assert_eq!(
+            after_cycle.stage_transition_count, 4,
+            "each real stage transition bumps the counter: 1+3=4",
+        );
+
+        // Pin the session-ID impact: the second Planning visit
+        // must have a DIFFERENT UUID from the first. This is the
+        // whole point of the transition count.
+        let first_uuid = crate::session_id::session_id_for(
+            &record.id,
+            WorkItemStatus::Planning,
+            1, // after first real transition
+        );
+        let second_uuid = crate::session_id::session_id_for(
+            &record.id,
+            WorkItemStatus::Planning,
+            after_cycle.stage_transition_count,
+        );
+        assert_ne!(
+            first_uuid, second_uuid,
+            "cycling back to Planning must produce a fresh UUID \
+             under the new transition count",
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn update_status_not_found() {
         let dir = temp_dir("update-notfound");
@@ -1681,6 +1831,31 @@ mod tests {
         let json = r#"{"id":{"LocalFile":"/tmp/test.json"},"title":"Test","status":"Done","repo_associations":[],"done_at":1712345678}"#;
         let record: WorkItemRecord = serde_json::from_str(json).unwrap();
         assert_eq!(record.done_at, Some(1712345678));
+    }
+
+    /// Records written before `stage_transition_count` existed on the
+    /// struct must still deserialize cleanly, with the counter
+    /// defaulting to `0`. This is the migration contract that makes
+    /// the feature backward-compatible for users upgrading from a
+    /// workbridge build that never had the field.
+    #[test]
+    fn serde_migration_stage_transition_count_defaults_to_zero() {
+        let json = r#"{"id":{"LocalFile":"/tmp/test.json"},"title":"Test","status":"Planning","repo_associations":[]}"#;
+        let record: WorkItemRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            record.stage_transition_count, 0,
+            "pre-field records must deserialize with counter = 0",
+        );
+    }
+
+    /// A non-zero `stage_transition_count` must round-trip through
+    /// JSON unchanged so the backend's bump in `update_status`
+    /// survives a full write/read cycle.
+    #[test]
+    fn serde_stage_transition_count_roundtrip() {
+        let json = r#"{"id":{"LocalFile":"/tmp/test.json"},"title":"Test","status":"Implementing","repo_associations":[],"stage_transition_count":42}"#;
+        let record: WorkItemRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.stage_transition_count, 42);
     }
 
     #[test]

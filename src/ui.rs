@@ -3746,6 +3746,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
@@ -3788,6 +3789,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
@@ -3820,6 +3822,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
@@ -3856,6 +3859,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
@@ -3911,6 +3915,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
@@ -3947,6 +3952,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let app = make_app_with_work_item(wi);
         let theme = Theme::default_theme();
@@ -3988,6 +3994,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let id = wi.id.clone();
         let mut app = make_app_with_work_item(wi);
@@ -4036,6 +4043,7 @@ mod format_entry_tests {
             }],
             status_derived: false,
             errors: vec![],
+            stage_transition_count: 0,
         };
         let id = wi.id.clone();
         let mut app = make_app_with_work_item(wi);
@@ -4354,6 +4362,7 @@ mod snapshot_tests {
             status_derived: false,
             repo_associations: associations,
             errors: Vec::new(),
+            stage_transition_count: 0,
         }
     }
 
@@ -4778,6 +4787,7 @@ mod snapshot_tests {
                     issue_number: 42,
                 },
             ],
+            stage_transition_count: 0,
         }];
         let mut app = app_with_items(items, vec![]);
         // Select the first selectable work item entry (skipping group headers).
