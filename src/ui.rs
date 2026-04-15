@@ -1475,40 +1475,80 @@ fn format_review_request_item<'a>(
         return ListItem::new(Line::from(format!("{margin}R <invalid>")));
     };
 
+    // Right-column text: PR badge + optional draft marker + optional
+    // reviewer badge. Assembled into a single String first so the wrap
+    // helper can reserve enough width on the first line for the whole
+    // stack - the spans are rebuilt below once the title is wrapped.
     let pr_badge = format!("PR#{}", rr.pr.number);
-    let mut draft_suffix = String::new();
-    if rr.pr.is_draft {
-        draft_suffix.push_str(" draft");
-    }
-    let right = format!("{pr_badge}{draft_suffix}");
+    let draft_suffix = if rr.pr.is_draft { " draft" } else { "" };
+    let reviewer_badge = rr.reviewer_badge(app.current_user_login.as_deref());
+    let reviewer_suffix = reviewer_badge
+        .as_deref()
+        .map(|s| format!(" {s}"))
+        .unwrap_or_default();
+    let right = format!("{pr_badge}{draft_suffix}{reviewer_suffix}");
 
     let title = &rr.pr.title;
 
-    // Layout: "{margin}R title    PR#N [draft]"
+    // Layout mirrors `format_work_item_entry`: the first line shares
+    // horizontal space with the right-column stack, continuation lines
+    // get the full panel width (minus the "R " prefix indent). The row
+    // marker is a fixed 2-column prefix so both widths subtract it.
     let prefix = "R ";
-    let available = content_width
+    let first_width = content_width
         .saturating_sub(prefix.width())
         .saturating_sub(right.width())
-        .saturating_sub(1);
-    let truncated_title = truncate_str(title, available);
+        .saturating_sub(if right.is_empty() { 0 } else { 1 });
+    let rest_width = content_width.saturating_sub(prefix.width());
+    let title_lines = wrap_two_widths(title, first_width.max(1), rest_width.max(1));
+    let first_title = title_lines.first().cloned().unwrap_or_default();
 
     let padding =
-        content_width.saturating_sub(prefix.width() + truncated_title.width() + right.width());
+        content_width.saturating_sub(prefix.width() + first_title.width() + right.width());
     let pad_str: String = " ".repeat(padding);
 
-    let margin_style = if is_selected {
-        theme.style_tab_highlight()
-    } else {
-        ratatui_core::style::Style::default()
-    };
+    // When selected, the List widget only sets the background. We
+    // still apply the highlight foreground per-span so the title and
+    // badges get the inverted look that work-item rows already use.
+    let hl = theme.style_tab_highlight();
+    let (margin_style, marker_style, title_style, pr_badge_style, reviewer_badge_style) =
+        if is_selected {
+            (hl, hl, hl, hl, hl)
+        } else {
+            (
+                ratatui_core::style::Style::default(),
+                theme.style_review_request_marker(),
+                theme.style_text(),
+                theme.style_badge_pr(),
+                theme.style_badge_pr(),
+            )
+        };
 
-    ListItem::new(Line::from(vec![
-        Span::styled(margin, margin_style),
-        Span::styled(prefix.to_string(), theme.style_review_request_marker()),
-        Span::styled(truncated_title, theme.style_text()),
+    let mut line1_spans = vec![
+        Span::styled(margin.to_string(), margin_style),
+        Span::styled(prefix.to_string(), marker_style),
+        Span::styled(first_title, title_style),
         Span::raw(pad_str),
-        Span::styled(right, theme.style_badge_pr()),
-    ]))
+        Span::styled(format!("{pr_badge}{draft_suffix}"), pr_badge_style),
+    ];
+    if let Some(badge) = reviewer_badge.as_deref() {
+        line1_spans.push(Span::raw(" "));
+        line1_spans.push(Span::styled(badge.to_string(), reviewer_badge_style));
+    }
+
+    let mut lines = vec![Line::from(line1_spans)];
+    // Continuation lines: indent to align with the column after the
+    // "R " marker so wrapped title text sits flush with the first
+    // line's title start.
+    for title_cont in title_lines.iter().skip(1) {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::raw(" ".repeat(prefix.width())),
+            Span::styled(title_cont.clone(), title_style),
+        ]));
+    }
+
+    ListItem::new(lines)
 }
 
 /// Format an unlinked PR entry for the left panel list.
@@ -2240,6 +2280,13 @@ struct ImportablePrDetail<'a> {
     repo_path: &'a std::path::Path,
     branch: &'a str,
     hint: &'a str,
+    /// Optional authoritative reviewer-identity list for review-request
+    /// detail panels. Each element is a display string ready to join
+    /// with ", " ("you", "team-core", etc.). `None` for unlinked-PR
+    /// detail panels where the field is irrelevant; `Some` with at
+    /// least one entry for review-request detail panels. Names are
+    /// never truncated - the detail panel wraps naturally.
+    requested_from: Option<Vec<String>>,
 }
 
 /// Draw a structured detail view for an importable PR (unlinked or review request).
@@ -2297,7 +2344,16 @@ fn draw_importable_pr_detail(
         Line::from(""),
     ];
 
-    let fields: Vec<(&str, &str)> = vec![
+    // `Requested from:` joins the reviewer-identity list unmodified
+    // (no truncation). Built up-front so the `fields` slice can borrow
+    // a &str pointing into the owned String below.
+    let requested_from_joined = detail
+        .requested_from
+        .as_ref()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.join(", "));
+
+    let mut fields: Vec<(&str, &str)> = vec![
         ("PR", &pr_str),
         ("Repo", &repo_str),
         ("Branch", detail.branch),
@@ -2306,10 +2362,22 @@ fn draw_importable_pr_detail(
         ("Review", review_str),
         ("Checks", checks_str),
     ];
+    if let Some(ref joined) = requested_from_joined {
+        fields.push(("Requested from", joined.as_str()));
+    }
 
+    // Labels up to the historical 12-column width get the legacy
+    // fixed-width padding so the unlinked-PR detail panel (which has
+    // no long labels) renders byte-identically. "Requested from" and
+    // any future wider label fall back to a single trailing space.
     for (label, value) in &fields {
+        let label_str = if label.width() <= 12 {
+            format!("  {label:<12}")
+        } else {
+            format!("  {label} ")
+        };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {label:<12}"), label_style),
+            Span::styled(label_str, label_style),
             Span::styled(value.to_string(), val_style(value)),
         ]));
     }
@@ -2593,6 +2661,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                         repo_path: &unlinked.repo_path,
                         branch: &unlinked.branch,
                         hint: "Press Enter to import this PR as a work item.  Ctrl+D to close PR and delete branch.",
+                        requested_from: None,
                     },
                     theme,
                     block,
@@ -2612,6 +2681,42 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         }
         Some(DisplayEntry::ReviewRequestItem(rr_idx)) => {
             if let Some(rr) = app.review_requested_prs.get(*rr_idx) {
+                // Build the authoritative reviewer-identity list for
+                // the detail panel. "you" goes first when the current
+                // user is directly requested; every other directly-
+                // requested user follows (rendered as their literal
+                // login); then every team slug, prefixed with "team "
+                // so the row reads naturally even when the team name
+                // does not start with "team-". A PR can request
+                // multiple direct reviewers (e.g. `alice` + `bob` +
+                // you), so we must iterate `requested_reviewer_logins`
+                // rather than only emit "you" - otherwise alice and
+                // bob silently vanish from the list. When no
+                // reviewers are known (degenerate fetch data) pass
+                // None so the detail panel omits the row entirely
+                // rather than rendering an empty list.
+                let login = app.current_user_login.as_deref();
+                let mut requested_from: Vec<String> = Vec::new();
+                if rr.is_direct_request(login) {
+                    requested_from.push("you".to_string());
+                }
+                for reviewer_login in &rr.requested_reviewer_logins {
+                    // Skip the current user - already added as "you"
+                    // above. Every other directly-requested user is
+                    // rendered as their literal login.
+                    if login.is_some_and(|l| l == reviewer_login) {
+                        continue;
+                    }
+                    requested_from.push(reviewer_login.clone());
+                }
+                for slug in &rr.requested_team_slugs {
+                    requested_from.push(format!("team {slug}"));
+                }
+                let requested_from = if requested_from.is_empty() {
+                    None
+                } else {
+                    Some(requested_from)
+                };
                 draw_importable_pr_detail(
                     buf,
                     &ImportablePrDetail {
@@ -2619,6 +2724,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                         repo_path: &rr.repo_path,
                         branch: &rr.branch,
                         hint: "Press Enter to import this review request as a work item.",
+                        requested_from,
                     },
                     theme,
                     block,
@@ -4877,11 +4983,95 @@ mod snapshot_tests {
                     url: "https://github.com/o/r/pull/77".into(),
                 },
                 branch: "refactor-auth".into(),
+                requested_reviewer_logins: Vec::new(),
+                requested_team_slugs: Vec::new(),
             });
         app.build_display_list();
         // Select the review request item (index 1: header at 0, item at 1).
         app.selected_item = Some(1);
         insta::assert_snapshot!(render(&mut app, 80, 24));
+    }
+
+    /// Regression for a detail-panel bug where only "you" was added
+    /// to the "Requested from:" line, silently dropping every other
+    /// directly-requested user. A PR can request multiple direct
+    /// reviewers (e.g. `alice` + `bob` + you); the detail panel must
+    /// list every one of them, with "you" first, followed by the
+    /// other user logins, followed by team slugs prefixed with
+    /// "team ".
+    #[test]
+    fn review_request_pr_detail_lists_all_direct_reviewers() {
+        let mut app = App::new();
+        app.current_user_login = Some("bob".into());
+        app.review_requested_prs
+            .push(crate::work_item::ReviewRequestedPr {
+                repo_path: PathBuf::from("/repo/upstream"),
+                pr: PrInfo {
+                    number: 77,
+                    title: "Refactor auth middleware".into(),
+                    state: PrState::Open,
+                    is_draft: false,
+                    review_decision: ReviewDecision::Pending,
+                    checks: CheckStatus::Passing,
+                    mergeable: MergeableState::Unknown,
+                    url: "https://github.com/o/r/pull/77".into(),
+                },
+                branch: "refactor-auth".into(),
+                requested_reviewer_logins: vec!["alice".into(), "bob".into(), "carol".into()],
+                requested_team_slugs: vec!["frontend".into()],
+            });
+        app.build_display_list();
+        app.selected_item = Some(1);
+
+        // Use a wide terminal so the "Requested from:" line doesn't
+        // wrap and we can assert its full contents in one line.
+        let rendered = render(&mut app, 160, 24);
+
+        // "you" must come first, then the other direct reviewers in
+        // their original order, then teams prefixed with "team ".
+        // The detail panel uses ", " as the list separator.
+        assert!(
+            rendered.contains("Requested from you, alice, carol, team frontend"),
+            "detail panel must list every direct reviewer and every team; got:\n{rendered}",
+        );
+    }
+
+    /// When no current_user_login is known, the detail panel cannot
+    /// collapse any login to "you", so every directly-requested user
+    /// must be rendered as their literal login.
+    #[test]
+    fn review_request_pr_detail_renders_all_logins_when_login_unknown() {
+        let mut app = App::new();
+        app.current_user_login = None;
+        app.review_requested_prs
+            .push(crate::work_item::ReviewRequestedPr {
+                repo_path: PathBuf::from("/repo/upstream"),
+                pr: PrInfo {
+                    number: 77,
+                    title: "Refactor auth middleware".into(),
+                    state: PrState::Open,
+                    is_draft: false,
+                    review_decision: ReviewDecision::Pending,
+                    checks: CheckStatus::Passing,
+                    mergeable: MergeableState::Unknown,
+                    url: "https://github.com/o/r/pull/77".into(),
+                },
+                branch: "refactor-auth".into(),
+                requested_reviewer_logins: vec!["alice".into(), "bob".into()],
+                requested_team_slugs: Vec::new(),
+            });
+        app.build_display_list();
+        app.selected_item = Some(1);
+
+        let rendered = render(&mut app, 160, 24);
+        assert!(
+            rendered.contains("Requested from alice, bob"),
+            "detail panel must render every literal login when current user is unknown; got:\n{rendered}",
+        );
+        assert!(
+            !rendered.contains("Requested from you"),
+            "no 'you' should be promoted when current_user_login is None; got:\n{rendered}",
+        );
     }
 
     #[test]

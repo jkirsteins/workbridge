@@ -142,6 +142,39 @@ fn fetcher_loop(
             None => Ok(Vec::new()),
         };
 
+        // Step 3c: resolve the current user's GitHub login so the UI
+        // can classify review-request rows as direct-to-you vs. team.
+        //
+        // Why a dedicated call: `list_review_requested_prs` uses
+        // `--search review-requested:@me`, which filters server-side
+        // by the authenticated user but never echoes the login back
+        // in the response. `gh pr list --json` has no field that
+        // exposes the viewer's login (the `reviewRequests` array on
+        // each PR contains requested reviewer identities, not the
+        // caller's), and there is no `gh pr list` flag that adds one.
+        // Classifying a row as direct-to-you requires matching the
+        // literal login against `requested_reviewer_logins`, so the
+        // login has to come from somewhere - hence a dedicated
+        // `gh api user` call. `GhCliClient` caches the result after
+        // the first successful call, so repeated ticks cost nothing
+        // beyond the cache read.
+        //
+        // Failure is non-fatal for the fetch cycle (we still send the
+        // repo data so worktrees, PRs, and issues update on schedule)
+        // but it is NOT silent: we emit a `FetcherError` message so
+        // the status bar surfaces the problem instead of letting every
+        // review-request row degrade to "team" with no indication.
+        let current_user_login = match github_client.current_user_login() {
+            Ok(login) => Some(login),
+            Err(e) => {
+                let _ = tx.send(FetchMessage::FetcherError {
+                    repo_path: repo_path.clone(),
+                    error: format!("failed to look up current user login: {e}"),
+                });
+                None
+            }
+        };
+
         // Step 4: extract issue numbers from worktree branch names AND
         // extra branches (backend records without worktrees) and fetch each
         let mut issues = Vec::new();
@@ -188,6 +221,7 @@ fn fetcher_loop(
             prs,
             review_requested_prs,
             issues,
+            current_user_login,
         };
 
         if tx.send(FetchMessage::RepoData(result)).is_err() {
@@ -384,6 +418,8 @@ mod tests {
                 head_repo_owner: None,
                 author: None,
                 mergeable: String::new(),
+                requested_reviewer_logins: Vec::new(),
+                requested_team_slugs: Vec::new(),
             }],
             issues: vec![GithubIssue {
                 number: 42,
@@ -560,6 +596,111 @@ mod tests {
                 panic!("unexpected FetchStarted after recv_data");
             }
         }
+
+        handle.stop();
+    }
+
+    /// The fetcher must populate `current_user_login` from the
+    /// github client's lookup on every successful tick, so the UI
+    /// can classify review-request rows as direct-to-you vs. team.
+    #[test]
+    fn fetcher_populates_current_user_login() {
+        let ws = Arc::new(MockWorktreeService {
+            worktrees: vec![],
+            github_remote: Some(("owner".to_string(), "repo".to_string())),
+        });
+        let gc = Arc::new(MockGithubClient::new());
+
+        let (rx, handle) = start(
+            vec![PathBuf::from("/tmp/test-repo")],
+            ws,
+            gc,
+            r"^(\d+)-".to_string(),
+        );
+
+        match recv_data(&rx) {
+            FetchMessage::RepoData(result) => {
+                assert_eq!(
+                    result.current_user_login.as_deref(),
+                    Some("mock-user"),
+                    "fetcher should carry the resolved login through to RepoData",
+                );
+            }
+            FetchMessage::FetcherError { error, .. } => {
+                panic!("unexpected FetcherError: {error}");
+            }
+            FetchMessage::FetchStarted => {
+                panic!("unexpected FetchStarted after recv_data");
+            }
+        }
+
+        handle.stop();
+    }
+
+    /// Regression for a silent-failure bug: when the login lookup
+    /// fails the fetcher must emit a `FetcherError` so the status
+    /// bar surfaces the problem, instead of silently swallowing the
+    /// error with `.ok()` and degrading every review-request row to
+    /// "team" with no user-visible indication. The fetch cycle must
+    /// still complete (`RepoData` is sent) because worktrees, PRs,
+    /// and issues are independent of the login lookup.
+    #[test]
+    fn fetcher_emits_error_when_current_user_login_fails() {
+        let ws = Arc::new(MockWorktreeService {
+            worktrees: vec![],
+            github_remote: Some(("owner".to_string(), "repo".to_string())),
+        });
+        let gc = Arc::new(MockGithubClient {
+            prs: vec![],
+            review_requested_prs: vec![],
+            issues: vec![],
+            error: Some(crate::github_client::GithubError::ApiError(
+                "simulated login failure".into(),
+            )),
+        });
+
+        let (rx, handle) = start(
+            vec![PathBuf::from("/tmp/test-repo")],
+            ws,
+            gc,
+            r"^(\d+)-".to_string(),
+        );
+
+        // Collect every message from the first tick until we have
+        // seen both the login FetcherError and the RepoData, or the
+        // channel goes quiet. A single tick can emit multiple
+        // FetcherError messages (one per failed sub-step) so we keep
+        // draining instead of returning on the first match.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_login_error = false;
+        let mut saw_repo_data = false;
+        while std::time::Instant::now() < deadline && !(saw_login_error && saw_repo_data) {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(FetchMessage::FetchStarted) => continue,
+                Ok(FetchMessage::FetcherError { error, .. }) => {
+                    if error.contains("failed to look up current user login") {
+                        saw_login_error = true;
+                    }
+                }
+                Ok(FetchMessage::RepoData(result)) => {
+                    saw_repo_data = true;
+                    assert!(
+                        result.current_user_login.is_none(),
+                        "login should be None when the lookup failed",
+                    );
+                }
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            saw_login_error,
+            "fetcher must emit a FetcherError mentioning the login lookup failure",
+        );
+        assert!(
+            saw_repo_data,
+            "fetch cycle must still send RepoData despite the login failure",
+        );
 
         handle.stop();
     }

@@ -105,6 +105,46 @@ Pressing Enter on a review request imports it directly into the Review stage
 (not Backlog), since reviewing is the only meaningful action. A worktree is
 created for the reviewer to inspect the code.
 
+#### Reviewer identity display
+
+Each review-request row shows a compact reviewer badge at the right edge of
+the list row, after the `PR#N [draft]` stack:
+
+- `[you]` - the current GitHub user is directly listed in the PR's
+  requested reviewers. Direct request wins over team request: if the PR
+  also requested a team the user belongs to, the row still renders as
+  `[you]`.
+- `[team-slug]` - a single team was requested (no direct user request).
+- `[team-slug +N]` - multiple teams were requested. The first team is
+  named; N is the count of remaining teams.
+
+No badge renders when the fetch returned no reviewer identity at all
+(degenerate case - `gh` should never return such a row from the
+`review-requested:@me` search).
+
+The right-side detail panel for a review-request row shows an authoritative
+`Requested from:` line listing every reviewer identity in full - no
+truncation. Users appear as `you`, teams appear as `team <slug>`, joined
+with `, `. Unlinked-PR detail panels do not show this line.
+
+Direct-to-you rows sort to the top of the REVIEW REQUESTS block so the
+most actionable reviews are always surfaced first. Within each bucket
+(direct, then team) the order returned by `gh` is preserved via a stable
+sort.
+
+Title wrapping on review-request rows uses the same `wrap_two_widths`
+helper as regular work-item rows: the first line reserves space for the
+PR/draft/reviewer-badge stack; continuation lines wrap to the full panel
+width (minus the `R ` marker indent).
+
+The current user's GitHub login is resolved once per fetcher session via
+`gh api user` and cached inside `GhCliClient`. Every fetch tick reads the
+cache instead of re-shelling. When the lookup has not yet succeeded
+(first tick hasn't arrived, or `gh` is missing / unauthenticated), the UI
+degrades by classifying every row as team: no row is falsely promoted to
+`[you]`, the sort order falls back to the `gh` order, and the
+`Requested from:` line omits the `you` entry.
+
 Stage restrictions for ReviewRequest items:
 
 - **advance_stage**: All manual stage advancement is blocked. Review

@@ -515,6 +515,8 @@ fn collect_review_requested_prs(
                         repo_path: repo_path.clone(),
                         pr: convert_pr(pr),
                         branch: pr.head_branch.clone(),
+                        requested_reviewer_logins: pr.requested_reviewer_logins.clone(),
+                        requested_team_slugs: pr.requested_team_slugs.clone(),
                     });
                 }
             }
@@ -581,6 +583,8 @@ mod tests {
             head_repo_owner: None,
             author: Some("testuser".to_string()),
             mergeable: String::new(),
+            requested_reviewer_logins: Vec::new(),
+            requested_team_slugs: Vec::new(),
         }
     }
 
@@ -604,6 +608,8 @@ mod tests {
             head_repo_owner: owner.map(|s| s.to_string()),
             author: Some("testuser".to_string()),
             mergeable: String::new(),
+            requested_reviewer_logins: Vec::new(),
+            requested_team_slugs: Vec::new(),
         }
     }
 
@@ -641,6 +647,7 @@ mod tests {
             worktrees: Ok(worktrees),
             prs: Ok(prs),
             review_requested_prs: Ok(vec![]),
+            current_user_login: None,
             issues,
         };
         (path, fetch)

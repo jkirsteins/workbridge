@@ -1,5 +1,6 @@
 use std::fmt;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -55,6 +56,20 @@ pub struct GithubPr {
     /// "UNKNOWN", or empty). Indicates whether the PR has a merge conflict
     /// against its base branch.
     pub mergeable: String,
+    /// Logins of users the PR has explicitly requested for review.
+    /// Populated only by `list_review_requested_prs` (the open-PR and
+    /// merged-PR paths do not ask `gh` for this field and leave it
+    /// empty). Used to classify review-request rows as direct-to-you
+    /// vs. team-requested. `#[serde(default)]` lets legacy serialized
+    /// fetch results (persisted before this field existed) deserialize
+    /// with an empty vec instead of erroring.
+    #[serde(default)]
+    pub requested_reviewer_logins: Vec<String>,
+    /// Slugs of teams the PR has explicitly requested for review.
+    /// Populated only by `list_review_requested_prs`. Used to build the
+    /// reviewer badge and the "Requested from:" detail panel line.
+    #[serde(default)]
+    pub requested_team_slugs: Vec<String>,
 }
 
 /// A raw issue as returned by the GitHub API (via gh CLI).
@@ -88,6 +103,16 @@ pub trait GithubClient: Send + Sync {
     fn list_merged_prs(&self, owner: &str, repo: &str) -> Result<Vec<GithubPr>, GithubError> {
         let _ = (owner, repo);
         Ok(vec![])
+    }
+
+    /// Resolve the current GitHub user's login (e.g. `alice`). The
+    /// production `GhCliClient` caches the first successful result; the
+    /// default trait impl simply returns an error so test doubles that
+    /// do not need this information are not forced to stub it.
+    fn current_user_login(&self) -> Result<String, GithubError> {
+        Err(GithubError::ApiError(
+            "current_user_login not implemented for this client".into(),
+        ))
     }
 }
 
@@ -160,14 +185,47 @@ impl GithubClient for MockGithubClient {
             .cloned()
             .collect())
     }
+
+    /// Mock override. Returns the shared fixture error when `error`
+    /// is set (so tests can exercise the "lookup failed" branch of
+    /// the fetcher), otherwise returns a stable mock login so every
+    /// test that does not care about identity still gets a usable
+    /// value and the fetcher does not emit a spurious FetcherError.
+    fn current_user_login(&self) -> Result<String, GithubError> {
+        if let Some(ref err) = self.error {
+            return Err(err.clone());
+        }
+        Ok("mock-user".into())
+    }
 }
 
 /// GhCliClient shells out to the `gh` CLI to interact with the GitHub API.
-/// It is a unit struct with no fields - all state comes from the gh CLI's
-/// own authentication and configuration.
-pub struct GhCliClient;
+///
+/// Holds a single cached value - the authenticated user's login - resolved
+/// lazily on first call to `current_user_login()` via `gh api user`. Every
+/// other piece of state lives in `gh` itself (authentication, hosts, etc.).
+pub struct GhCliClient {
+    /// Cached `login` field from `gh api user`. Populated on the first
+    /// successful `current_user_login()` call and reused thereafter so
+    /// repeated fetch cycles do not re-shell for a value that does not
+    /// change during a session. If the first call fails (no network,
+    /// auth expired), the cache stays empty and the next call retries.
+    current_user_login_cache: OnceLock<String>,
+}
+
+impl Default for GhCliClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl GhCliClient {
+    pub fn new() -> Self {
+        Self {
+            current_user_login_cache: OnceLock::new(),
+        }
+    }
+
     /// Run a `gh` command and return its stdout on success.
     ///
     /// Returns GithubError::CliNotFound if the gh binary is not found,
@@ -226,7 +284,13 @@ impl GithubClient for GhCliClient {
         repo: &str,
     ) -> Result<Vec<GithubPr>, GithubError> {
         let repo_arg = format!("{owner}/{repo}");
-        let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner,author,mergeable";
+        // `reviewRequests` expands to the list of pending reviewer
+        // identities (users and teams) attached to each PR; the parser
+        // splits the mixed array into `requested_reviewer_logins` and
+        // `requested_team_slugs` on the returned GithubPr. `mergeable`
+        // is also requested so the review-request row can show the
+        // same conflict indicator as the user's own PRs.
+        let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner,author,mergeable,reviewRequests";
         let stdout = self.run_gh(&[
             "pr",
             "list",
@@ -246,6 +310,25 @@ impl GithubClient for GhCliClient {
             .map_err(|e| GithubError::ParseError(format!("failed to parse PR list JSON: {e}")))?;
 
         items.iter().map(parse_pr_from_value).collect()
+    }
+
+    fn current_user_login(&self) -> Result<String, GithubError> {
+        if let Some(cached) = self.current_user_login_cache.get() {
+            return Ok(cached.clone());
+        }
+        let stdout = self.run_gh(&["api", "user", "--jq", ".login"])?;
+        let login = stdout.trim().to_string();
+        if login.is_empty() {
+            return Err(GithubError::ParseError(
+                "gh api user returned an empty login".into(),
+            ));
+        }
+        // If two threads race to initialize, only one `set` wins; the
+        // loser silently ignores its attempt and both return the same
+        // (winning) value on the next read. Either way the caller gets
+        // the correct string this call.
+        let _ = self.current_user_login_cache.set(login.clone());
+        Ok(login)
     }
 
     fn get_issue(&self, owner: &str, repo: &str, number: u64) -> Result<GithubIssue, GithubError> {
@@ -353,6 +436,15 @@ fn parse_pr_from_value(v: &Value) -> Result<GithubPr, GithubError> {
         .unwrap_or("")
         .to_string();
 
+    // reviewRequests is a mixed array of user and team objects. gh
+    // returns user entries with a "login" field and team entries with
+    // a "slug" field (plus "__typename" on newer gh versions). We
+    // classify defensively - presence of a login makes it a user,
+    // presence of a slug without a login makes it a team - so the
+    // parser tolerates both current and future gh JSON shapes. When
+    // the field is absent (open-PR fetch path) both vecs end up empty.
+    let (requested_reviewer_logins, requested_team_slugs) = parse_review_requests(v);
+
     Ok(GithubPr {
         number,
         title,
@@ -365,7 +457,33 @@ fn parse_pr_from_value(v: &Value) -> Result<GithubPr, GithubError> {
         head_repo_owner,
         author,
         mergeable,
+        requested_reviewer_logins,
+        requested_team_slugs,
     })
+}
+
+/// Split the `reviewRequests` JSON array from `gh pr list --json` into
+/// user-login and team-slug vecs. See the comment in
+/// `parse_pr_from_value` for the classification rules.
+fn parse_review_requests(v: &Value) -> (Vec<String>, Vec<String>) {
+    let mut logins = Vec::new();
+    let mut slugs = Vec::new();
+    let Some(arr) = v.get("reviewRequests").and_then(|r| r.as_array()) else {
+        return (logins, slugs);
+    };
+    for entry in arr {
+        if let Some(login) = entry.get("login").and_then(|l| l.as_str()) {
+            logins.push(login.to_string());
+        } else if let Some(slug) = entry.get("slug").and_then(|s| s.as_str()) {
+            slugs.push(slug.to_string());
+        } else if let Some(name) = entry.get("name").and_then(|n| n.as_str()) {
+            // Some gh versions expose team identity under "name"
+            // instead of "slug". Fall through to capture the team
+            // name so the badge still renders something meaningful.
+            slugs.push(name.to_string());
+        }
+    }
+    (logins, slugs)
 }
 
 /// Parse a single issue JSON object (from gh issue view --json) into a GithubIssue.
@@ -584,6 +702,8 @@ mod tests {
                 head_repo_owner: None,
                 author: None,
                 mergeable: "MERGEABLE".into(),
+                requested_reviewer_logins: Vec::new(),
+                requested_team_slugs: Vec::new(),
             }],
             issues: Vec::new(),
             review_requested_prs: Vec::new(),
@@ -969,5 +1089,106 @@ mod tests {
         assert_eq!(prs[1].number, 2);
         assert!(prs[1].is_draft);
         assert_eq!(prs[1].status_check_rollup, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // reviewRequests parsing (user vs team split)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_pr_review_requests_absent_empty_vecs() {
+        let json = r#"{
+            "number": 1,
+            "title": "No review data",
+            "headRefName": "x",
+            "state": "OPEN",
+            "isDraft": false,
+            "url": "https://example.com/1"
+        }"#;
+        let v: Value = serde_json::from_str(json).unwrap();
+        let pr = parse_pr_from_value(&v).unwrap();
+        assert!(pr.requested_reviewer_logins.is_empty());
+        assert!(pr.requested_team_slugs.is_empty());
+    }
+
+    #[test]
+    fn parse_pr_review_requests_user_entries() {
+        let json = r#"{
+            "number": 2,
+            "title": "Two users requested",
+            "headRefName": "x",
+            "state": "OPEN",
+            "isDraft": false,
+            "url": "https://example.com/2",
+            "reviewRequests": [
+                {"__typename": "User", "login": "alice"},
+                {"__typename": "User", "login": "bob"}
+            ]
+        }"#;
+        let v: Value = serde_json::from_str(json).unwrap();
+        let pr = parse_pr_from_value(&v).unwrap();
+        assert_eq!(pr.requested_reviewer_logins, vec!["alice", "bob"]);
+        assert!(pr.requested_team_slugs.is_empty());
+    }
+
+    #[test]
+    fn parse_pr_review_requests_team_slug() {
+        let json = r#"{
+            "number": 3,
+            "title": "Team requested",
+            "headRefName": "x",
+            "state": "OPEN",
+            "isDraft": false,
+            "url": "https://example.com/3",
+            "reviewRequests": [
+                {"__typename": "Team", "slug": "core-team"}
+            ]
+        }"#;
+        let v: Value = serde_json::from_str(json).unwrap();
+        let pr = parse_pr_from_value(&v).unwrap();
+        assert!(pr.requested_reviewer_logins.is_empty());
+        assert_eq!(pr.requested_team_slugs, vec!["core-team"]);
+    }
+
+    #[test]
+    fn parse_pr_review_requests_team_name_fallback() {
+        // Some gh versions may expose the team under "name" instead of
+        // "slug". The parser should still capture it.
+        let json = r#"{
+            "number": 4,
+            "title": "Team requested (name)",
+            "headRefName": "x",
+            "state": "OPEN",
+            "isDraft": false,
+            "url": "https://example.com/4",
+            "reviewRequests": [
+                {"name": "backend-team"}
+            ]
+        }"#;
+        let v: Value = serde_json::from_str(json).unwrap();
+        let pr = parse_pr_from_value(&v).unwrap();
+        assert_eq!(pr.requested_team_slugs, vec!["backend-team"]);
+    }
+
+    #[test]
+    fn parse_pr_review_requests_mixed_users_and_teams() {
+        let json = r#"{
+            "number": 5,
+            "title": "Mixed",
+            "headRefName": "x",
+            "state": "OPEN",
+            "isDraft": false,
+            "url": "https://example.com/5",
+            "reviewRequests": [
+                {"__typename": "User", "login": "alice"},
+                {"__typename": "Team", "slug": "core-team"},
+                {"__typename": "User", "login": "bob"},
+                {"__typename": "Team", "slug": "frontend"}
+            ]
+        }"#;
+        let v: Value = serde_json::from_str(json).unwrap();
+        let pr = parse_pr_from_value(&v).unwrap();
+        assert_eq!(pr.requested_reviewer_logins, vec!["alice", "bob"]);
+        assert_eq!(pr.requested_team_slugs, vec!["core-team", "frontend"]);
     }
 }
