@@ -174,10 +174,28 @@ pub fn session_exists_on_disk(session_id: uuid::Uuid) -> SessionProbe {
 /// - `NotFound` on `projects_dir` itself -> `Missing` (Claude Code
 ///   has never written a transcript here, which is a clean "no
 ///   session" answer - spawn fresh).
-/// - `NotFound` on a candidate `<subdir>/<uuid>.jsonl` -> skip to
-///   the next subdirectory (this one simply has no match).
-/// - Any other error on any syscall -> `Indeterminate(...)` with a
-///   message that names the failing path.
+/// - An entry that is not a directory (regular file, broken
+///   symlink, device, etc.) is skipped silently. Claude Code only
+///   stores transcripts under per-project subdirectories, so
+///   anything else in the projects root is benign - typically
+///   `.DS_Store` on macOS, a README a user dropped in, or a tool-
+///   created marker file. An earlier version of this helper
+///   immediately `stat`ed `<entry>/<uuid>.jsonl` without
+///   filtering, which made a regular-file `.DS_Store` blow up
+///   with `NotADirectory` and globally block every session open
+///   via the `Indeterminate` path. The Codex adversarial review
+///   flagged that as a P0: one benign file in the user's projects
+///   directory must not be a fatal probe error.
+/// - `NotFound` on a candidate `<subdir>/<uuid>.jsonl` inside a
+///   confirmed project directory -> skip to the next subdirectory
+///   (this one simply has no match).
+/// - `NotFound` on `entry.path()` itself (race: a directory
+///   vanished between `read_dir` and the `metadata` call) ->
+///   skip silently. The clean-miss semantic is preserved.
+/// - Any other error on any syscall -> `Indeterminate(...)` with
+///   a message that names the failing path. This covers
+///   permission-denied, FUSE failures, and other real blockers
+///   the caller needs to surface to the user.
 ///
 /// We deliberately do NOT use `entries.flatten()` (which silently
 /// drops per-entry errors) or bare `Path::is_file()` (which
@@ -210,7 +228,33 @@ pub fn session_exists_in(projects_dir: &std::path::Path, session_id: uuid::Uuid)
                 ));
             }
         };
-        let candidate = entry.path().join(&target);
+        let entry_path = entry.path();
+        // Filter to real directories only. `std::fs::metadata`
+        // follows symlinks, so a symlink pointing at a valid
+        // project directory is still classified correctly. A
+        // symlink pointing at a regular file is correctly
+        // rejected by `is_dir()`. A broken symlink surfaces as
+        // `NotFound` from `metadata`, which we treat as a benign
+        // "not a project directory" and skip.
+        match std::fs::metadata(&entry_path) {
+            Ok(meta) if meta.is_dir() => { /* fall through to the
+                 * target probe below */
+            }
+            Ok(_) => continue, // regular file, socket, device, etc.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Broken symlink or race where the entry
+                // disappeared after `read_dir`. Not a probe
+                // failure - skip it.
+                continue;
+            }
+            Err(e) => {
+                return SessionProbe::Indeterminate(format!(
+                    "Failed to stat {}: {e}",
+                    entry_path.display()
+                ));
+            }
+        }
+        let candidate = entry_path.join(&target);
         match std::fs::metadata(&candidate) {
             Ok(meta) if meta.is_file() => return SessionProbe::Exists,
             Ok(_) => continue,
@@ -395,45 +439,74 @@ mod tests {
         }
     }
 
-    /// Codex adversarial review finding, variant: a stat error on a
-    /// candidate transcript file that is NOT `NotFound` must also
-    /// surface as `Indeterminate`. We simulate this by planting a
-    /// "project subdirectory" that is actually a dangling symlink -
-    /// the `read_dir` of the outer projects root succeeds, but the
-    /// subsequent `metadata(candidate)` call fails because the
-    /// symlink target does not exist (and on many platforms the
-    /// error kind is `NotFound`, which the helper treats as a clean
-    /// miss, so we specifically use a symlink into a path whose
-    /// component traversal fails, forcing a non-NotFound error).
-    ///
-    /// On systems where the test harness cannot create symlinks
-    /// (e.g. Windows without developer mode) this test is skipped
-    /// rather than marked failing - the property is still covered on
-    /// CI via the Linux/macOS runners.
+    /// Codex adversarial review finding: a regular file in the
+    /// projects root (e.g. macOS `.DS_Store`, a README a user
+    /// dropped in, a tool-created marker) must NOT cause the probe
+    /// to return `Indeterminate` - that would globally block every
+    /// session open. The earlier version `stat`ed
+    /// `<entry>/<uuid>.jsonl` without first checking that `<entry>`
+    /// was a directory, so a regular-file entry blew up with
+    /// `NotADirectory` and fell into the `Indeterminate` path. The
+    /// fixed version filters entries to directories first and
+    /// silently skips anything else. This test pins the skip
+    /// behaviour: a projects root containing nothing but a regular
+    /// file must return `Missing`, not `Indeterminate`, and a
+    /// projects root containing a regular file alongside a real
+    /// project directory with the transcript must return `Exists`.
+    #[test]
+    fn session_exists_in_skips_regular_files_in_projects_root() {
+        let tmp = tempfile::tempdir().expect("create temp projects root");
+        // Plant a `.DS_Store`-style regular file.
+        std::fs::write(tmp.path().join(".DS_Store"), b"\x00Mac\x00\x01").expect("write .DS_Store");
+        let id = uuid::Uuid::from_u128(0xcafe_f00d_0000_0000_0000_0000_0000_0003);
+
+        // 1. Projects root with ONLY a benign file -> Missing.
+        assert_eq!(
+            session_exists_in(tmp.path(), id),
+            SessionProbe::Missing,
+            "a regular file in the projects root must not block \
+             the probe - it must be skipped silently",
+        );
+
+        // 2. Same projects root plus a real project directory
+        // holding the target transcript -> Exists.
+        let project = tmp.path().join("-valid-project");
+        std::fs::create_dir_all(&project).expect("create project subdir");
+        std::fs::write(project.join(format!("{id}.jsonl")), b"{}\n")
+            .expect("write transcript stub");
+        assert_eq!(
+            session_exists_in(tmp.path(), id),
+            SessionProbe::Exists,
+            "a valid project directory must still be found when \
+             the projects root also contains benign regular files",
+        );
+    }
+
+    /// Broken symlinks in the projects root must also be skipped
+    /// silently. The probe follows symlinks via `metadata()`, so
+    /// a symlink pointing at a deleted target surfaces as
+    /// `NotFound` from `metadata(entry.path())`. That is classified
+    /// as a benign "not a project directory" case and should NOT
+    /// block session opens.
     #[test]
     #[cfg(unix)]
-    fn session_exists_in_returns_indeterminate_on_stat_error() {
+    fn session_exists_in_skips_broken_symlinks() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().expect("create temp projects root");
-        // Symlink a "project subdir" to a deeper path that DOES exist
-        // but whose terminal component is a regular file, so
-        // `metadata(candidate)` goes through a file-as-directory
-        // traversal that fails with `NotADirectory` (non-NotFound)
-        // on the candidate stat.
-        let blocker = tmp.path().join("i-am-a-file");
-        std::fs::write(&blocker, b"").expect("write blocker");
-        let fake_project = tmp.path().join("-project-via-file");
-        symlink(&blocker, &fake_project).expect("create blocker symlink");
-        let id = uuid::Uuid::from_u128(0xbad_c0de_0000_0000_0000_0000_0000_0002);
-        match session_exists_in(tmp.path(), id) {
-            SessionProbe::Indeterminate(msg) => {
-                assert!(
-                    msg.contains(&id.to_string()) || msg.contains("i-am-a-file"),
-                    "error message should name the failing candidate path, got: {msg}",
-                );
-            }
-            other => panic!("expected Indeterminate for stat-error candidate, got {other:?}"),
-        }
+        // Dangling symlink pointing at a path that was never
+        // created.
+        symlink(
+            tmp.path().join("this-target-never-existed"),
+            tmp.path().join("-dead-link"),
+        )
+        .expect("create dangling symlink");
+        let id = uuid::Uuid::from_u128(0xbad_c0de_0000_0000_0000_0000_0000_0004);
+        assert_eq!(
+            session_exists_in(tmp.path(), id),
+            SessionProbe::Missing,
+            "a broken symlink in the projects root must be skipped \
+             silently, not elevated to Indeterminate",
+        );
     }
 
     /// Sanity check: the canonical name format is frozen. If this test

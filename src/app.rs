@@ -4440,6 +4440,30 @@ impl App {
         });
     }
 
+    /// Move a live `McpSocketServer` onto a background thread
+    /// whose only job is to drop it.
+    ///
+    /// Mirror of [`teardown_session_async`] for code paths that
+    /// only hold an `McpSocketServer` (no paired `Session`). The
+    /// motivating case is the Codex adversarial review finding
+    /// that `poll_session_spawns`'s
+    /// `self.mcp_servers.insert(...)` can replace a pre-existing
+    /// server for the same work item: when a dead Claude session
+    /// is reopened, `open_session_for_selected` removes only the
+    /// dead `self.sessions` entry and leaves the old
+    /// `McpSocketServer` in `self.mcp_servers`. The subsequent
+    /// insert would then drop the old server on the UI thread,
+    /// and `McpSocketServer::Drop` runs `stop()` plus a
+    /// `std::fs::remove_file` syscall - blocking I/O that
+    /// `docs/UI.md` "Blocking I/O Prohibition" forbids on the
+    /// tick path. Routing the pre-existing entry through this
+    /// helper before the new insert keeps the UI thread free.
+    fn teardown_mcp_server_async(mcp_server: McpSocketServer) {
+        std::thread::spawn(move || {
+            drop(mcp_server);
+        });
+    }
+
     /// Remove a pending `session_spawn_rx` entry and end its
     /// spinner activity. Mirror of `drop_session_open_entry` so the
     /// two terminal paths (result delivered, background thread
@@ -4547,6 +4571,57 @@ impl App {
                     mcp_server,
                     warning,
                 }) => {
+                    // Codex adversarial review: a plain
+                    // `HashMap::insert` here can REPLACE a
+                    // pre-existing MCP server (and, defensively,
+                    // a pre-existing dead Session) for the same
+                    // work item, dropping the replaced value on
+                    // the UI thread. `open_session_for_selected`
+                    // removes only the dead `self.sessions`
+                    // entry when reopening a dead session and
+                    // leaves the old `self.mcp_servers` entry in
+                    // place; that old server would then be
+                    // dropped inline by the `mcp_servers.insert`
+                    // below, which calls
+                    // `McpSocketServer::Drop -> stop() +
+                    // std::fs::remove_file`. Route any
+                    // pre-existing entry through the async
+                    // teardown helper before the new insert so
+                    // the blocking `Drop` runs on a background
+                    // thread.
+                    let session_key = (result.wi_id.clone(), result.stage);
+                    if let Some(old_entry) = self.sessions.remove(&session_key) {
+                        if let Some(old_session) = old_entry.session {
+                            // The paired McpSocketServer for
+                            // this (wi, stage) may or may not
+                            // still be in `self.mcp_servers`;
+                            // remove it if present so the two
+                            // old resources tear down together.
+                            if let Some(old_mcp) = self.mcp_servers.remove(&result.wi_id) {
+                                Self::teardown_session_async(old_session, old_mcp);
+                            } else {
+                                // No matching old MCP server -
+                                // tear down the session by
+                                // itself by pairing it with a
+                                // drop of the new server's
+                                // placeholder is impossible, so
+                                // spawn a dedicated thread just
+                                // for the session via a one-off
+                                // closure.
+                                std::thread::spawn(move || {
+                                    drop(old_session);
+                                });
+                            }
+                        } else if let Some(old_mcp) = self.mcp_servers.remove(&result.wi_id) {
+                            Self::teardown_mcp_server_async(old_mcp);
+                        }
+                    } else if let Some(old_mcp) = self.mcp_servers.remove(&result.wi_id) {
+                        // No stale `self.sessions` entry, but
+                        // there IS a stale MCP server (the
+                        // dead-session reopen path). Route it
+                        // through the MCP-only teardown helper.
+                        Self::teardown_mcp_server_async(old_mcp);
+                    }
                     let parser = Arc::clone(&session.parser);
                     let entry = SessionEntry {
                         parser,
@@ -4555,8 +4630,7 @@ impl App {
                         scrollback_offset: 0,
                         selection: None,
                     };
-                    self.sessions
-                        .insert((result.wi_id.clone(), result.stage), entry);
+                    self.sessions.insert(session_key, entry);
                     self.mcp_servers.insert(result.wi_id, mcp_server);
                     self.focus = FocusPanel::Right;
                     // Prefer the warning (degraded state) over the
