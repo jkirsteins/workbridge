@@ -1708,6 +1708,15 @@ impl App {
         }
 
         // Kill sessions whose stage doesn't match the work item's current stage.
+        // Routed through `teardown_live_session_async` so the
+        // SIGTERM + grace sleep + SIGKILL + wait sequence runs
+        // on a background thread - `check_liveness` itself runs
+        // on the UI tick path and must not block. The paired
+        // MCP server (if any) is pulled out of `self.mcp_servers`
+        // and handed off to the same teardown thread so the
+        // socket cleanup happens alongside the session kill.
+        // Codex adversarial review P0 class, mirror of the
+        // `apply_stage_change` fix.
         let orphans: Vec<_> = self
             .sessions
             .keys()
@@ -1720,10 +1729,13 @@ impl App {
             .cloned()
             .collect();
         for key in orphans {
-            if let Some(mut entry) = self.sessions.remove(&key)
-                && let Some(mut session) = entry.session.take()
-            {
-                session.kill();
+            if let Some(entry) = self.sessions.remove(&key) {
+                let mcp_server = self.mcp_servers.remove(&key.0);
+                if let Some(session) = entry.session {
+                    Self::teardown_live_session_async(session, mcp_server);
+                } else if let Some(mcp) = mcp_server {
+                    Self::teardown_mcp_server_async(mcp);
+                }
             }
         }
 
@@ -4644,6 +4656,48 @@ impl App {
         });
     }
 
+    /// Gracefully kill a live `Session` (and optionally its paired
+    /// `McpSocketServer`) on a background thread.
+    ///
+    /// Differs from [`teardown_session_async`] in one important
+    /// way: it calls `Session::kill` on the background thread
+    /// BEFORE dropping, which sends SIGTERM, waits the
+    /// `SIGTERM_GRACE_MS` window (currently 50ms), escalates to
+    /// SIGKILL if needed, and reaps the child. The grace window
+    /// is a blocking sleep that Codex adversarial review flagged
+    /// as a P0 `docs/UI.md` "Blocking I/O Prohibition" violation
+    /// when it ran inline on the UI thread (via
+    /// `apply_stage_change` or `check_liveness` calling
+    /// `session.kill()` directly on a HashMap entry). Routing
+    /// through this helper preserves the graceful-shutdown
+    /// semantics while keeping the UI thread free.
+    ///
+    /// `mcp_server` is optional because not every call site has
+    /// a paired server to hand off in the same move. Callers
+    /// that DO have one must pass it here so the MCP socket is
+    /// torn down on the same background thread as the session,
+    /// avoiding a second UI-thread hop into
+    /// `teardown_mcp_server_async`.
+    fn teardown_live_session_async(
+        mut session: crate::session::Session,
+        mcp_server: Option<McpSocketServer>,
+    ) {
+        std::thread::spawn(move || {
+            // Graceful SIGTERM + grace + SIGKILL + reap. The
+            // child.wait() inside `Session::kill` is blocking,
+            // which is fine on this background thread.
+            session.kill();
+            // `Session::Drop` also force-kills any remaining
+            // child and joins the reader thread, so once kill()
+            // has run the drop is effectively cleanup-only.
+            drop(session);
+            // Drop the paired MCP server (stop() + remove_file)
+            // on the same thread so the socket cleanup and the
+            // session teardown happen together.
+            drop(mcp_server);
+        });
+    }
+
     /// Move a live `McpSocketServer` onto a background thread
     /// whose only job is to drop it.
     ///
@@ -6791,11 +6845,25 @@ impl App {
         // Previously relied on orphan cleanup in check_liveness, but that
         // leaves two sessions alive briefly and the old one can do work
         // (push, commit, etc.) in the gap.
+        //
+        // The kill has to run on a background thread: `Session::kill`
+        // does SIGTERM + 50ms grace sleep + SIGKILL + child.wait, all
+        // blocking, and `apply_stage_change` runs on the UI tick path.
+        // Route the live session + its paired MCP server to
+        // `teardown_live_session_async`; pull the MCP server out of
+        // the map first so the helper tears down BOTH on the same
+        // background thread and the subsequent
+        // `cleanup_session_state_for` call no longer finds it.
+        // Codex adversarial review flagged the inline `session.kill()`
+        // as a `docs/UI.md` "Blocking I/O Prohibition" P0.
         if let Some(old_key) = self.session_key_for(wi_id)
-            && let Some(mut entry) = self.sessions.remove(&old_key)
+            && let Some(entry) = self.sessions.remove(&old_key)
         {
-            if let Some(ref mut session) = entry.session {
-                session.kill();
+            let mcp_server = self.mcp_servers.remove(wi_id);
+            if let Some(session) = entry.session {
+                Self::teardown_live_session_async(session, mcp_server);
+            } else if let Some(mcp) = mcp_server {
+                Self::teardown_mcp_server_async(mcp);
             }
             self.cleanup_session_state_for(wi_id);
         }
@@ -17329,6 +17397,132 @@ mod tests {
             elapsed < std::time::Duration::from_millis(30),
             "poll_session_spawns must not block on Session::Drop \
              - inline drop would take at least the SIGTERM grace \
+             window (50ms). Elapsed: {elapsed:?}",
+        );
+    }
+
+    /// Codex adversarial-review finding: `apply_stage_change`
+    /// must NOT call `Session::kill` synchronously on the UI
+    /// thread. The kill does SIGTERM + 50ms grace sleep +
+    /// SIGKILL + `child.wait`, all blocking. Routing through
+    /// `teardown_live_session_async` keeps the sleep / wait off
+    /// the tick path.
+    ///
+    /// This test drives a real `sleep` PTY through the stage
+    /// transition path and measures the wall-clock time of
+    /// `apply_stage_change`. If the fix is in place, the function
+    /// returns well under the SIGTERM grace window (50ms); if
+    /// someone regresses and calls `session.kill()` inline again,
+    /// the elapsed time will blow past 50ms and the test will
+    /// fail loudly.
+    #[test]
+    #[cfg(unix)]
+    fn apply_stage_change_tears_down_live_session_off_ui_thread() {
+        let backend = Arc::new(CountingPlanBackend::default());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::clone(&backend) as Arc<dyn WorkItemBackend>,
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/codex-stage-kill.json"));
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "codex-stage-kill".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path: PathBuf::from("/tmp/codex-stage-kill-repo"),
+                branch: Some("feature/codex-stage-kill".into()),
+                worktree_path: Some(PathBuf::from("/tmp/codex-stage-kill-wt")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+            stage_transition_count: 0,
+        });
+
+        // Spawn a real `sleep` PTY to stand in for Claude. The
+        // property under test is that the UI thread does not
+        // wait for it to exit, not which binary is behind the
+        // master fd.
+        let session = crate::session::Session::spawn(80, 24, None, &["sleep", "30"])
+            .expect("test PTY must spawn");
+        let parser = Arc::clone(&session.parser);
+        let entry = SessionEntry {
+            parser,
+            alive: true,
+            session: Some(session),
+            scrollback_offset: 0,
+            selection: None,
+        };
+        app.sessions
+            .insert((wi_id.clone(), WorkItemStatus::Implementing), entry);
+
+        // Hand a stub MCP server to the same work item so the
+        // teardown path exercises the "session + mcp_server"
+        // branch of `teardown_live_session_async`.
+        let (mcp_tx, _mcp_rx) = crossbeam_channel::unbounded();
+        let socket_path =
+            std::env::temp_dir().join(format!("wb-stage-kill-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket_path);
+        let mcp_server = McpSocketServer::start(
+            socket_path,
+            "\"test\"".to_string(),
+            "Own".to_string(),
+            "{}".to_string(),
+            None,
+            mcp_tx,
+            false,
+        )
+        .expect("test MCP socket must bind");
+        app.mcp_servers.insert(wi_id.clone(), mcp_server);
+
+        // Run the stage transition and time it. The helper
+        // should return promptly - far under the SIGTERM grace
+        // window - because the kill has been offloaded to a
+        // background thread.
+        //
+        // Transition Implementing -> Done so
+        // `apply_stage_change` kills the session AND the
+        // subsequent auto-spawn branch is skipped (Done is a
+        // no-session stage).
+        let before = std::time::Instant::now();
+        app.apply_stage_change(
+            &wi_id,
+            &WorkItemStatus::Implementing,
+            &WorkItemStatus::Done,
+            "pr_merge",
+        );
+        let elapsed = before.elapsed();
+
+        // The session MUST be gone from the map.
+        assert!(
+            !app.sessions
+                .contains_key(&(wi_id.clone(), WorkItemStatus::Implementing)),
+            "apply_stage_change must remove the old session entry",
+        );
+        // The MCP server MUST be gone from the map (routed
+        // through teardown_live_session_async along with the
+        // session).
+        assert!(
+            !app.mcp_servers.contains_key(&wi_id),
+            "apply_stage_change must remove the paired MCP server \
+             entry so it tears down on the same background thread",
+        );
+        // Structural latency assertion: apply_stage_change must
+        // return well under the SIGTERM grace window (50ms).
+        // Budget is 30ms to absorb slow CI jitter while staying
+        // below the inline-kill cost.
+        assert!(
+            elapsed < std::time::Duration::from_millis(30),
+            "apply_stage_change must not block on Session::kill - \
+             inline kill would take at least the SIGTERM grace \
              window (50ms). Elapsed: {elapsed:?}",
         );
     }
