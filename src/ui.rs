@@ -2683,16 +2683,31 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
             if let Some(rr) = app.review_requested_prs.get(*rr_idx) {
                 // Build the authoritative reviewer-identity list for
                 // the detail panel. "you" goes first when the current
-                // user is directly requested; every team slug follows,
-                // prefixed with "team " so the row reads naturally
-                // even when the team name does not start with "team-".
-                // When no reviewers are known (degenerate fetch data)
-                // pass None so the detail panel omits the row entirely
+                // user is directly requested; every other directly-
+                // requested user follows (rendered as their literal
+                // login); then every team slug, prefixed with "team "
+                // so the row reads naturally even when the team name
+                // does not start with "team-". A PR can request
+                // multiple direct reviewers (e.g. `alice` + `bob` +
+                // you), so we must iterate `requested_reviewer_logins`
+                // rather than only emit "you" - otherwise alice and
+                // bob silently vanish from the list. When no
+                // reviewers are known (degenerate fetch data) pass
+                // None so the detail panel omits the row entirely
                 // rather than rendering an empty list.
                 let login = app.current_user_login.as_deref();
                 let mut requested_from: Vec<String> = Vec::new();
                 if rr.is_direct_request(login) {
                     requested_from.push("you".to_string());
+                }
+                for reviewer_login in &rr.requested_reviewer_logins {
+                    // Skip the current user - already added as "you"
+                    // above. Every other directly-requested user is
+                    // rendered as their literal login.
+                    if login.is_some_and(|l| l == reviewer_login) {
+                        continue;
+                    }
+                    requested_from.push(reviewer_login.clone());
                 }
                 for slug in &rr.requested_team_slugs {
                     requested_from.push(format!("team {slug}"));
@@ -4975,6 +4990,88 @@ mod snapshot_tests {
         // Select the review request item (index 1: header at 0, item at 1).
         app.selected_item = Some(1);
         insta::assert_snapshot!(render(&mut app, 80, 24));
+    }
+
+    /// Regression for a detail-panel bug where only "you" was added
+    /// to the "Requested from:" line, silently dropping every other
+    /// directly-requested user. A PR can request multiple direct
+    /// reviewers (e.g. `alice` + `bob` + you); the detail panel must
+    /// list every one of them, with "you" first, followed by the
+    /// other user logins, followed by team slugs prefixed with
+    /// "team ".
+    #[test]
+    fn review_request_pr_detail_lists_all_direct_reviewers() {
+        let mut app = App::new();
+        app.current_user_login = Some("bob".into());
+        app.review_requested_prs
+            .push(crate::work_item::ReviewRequestedPr {
+                repo_path: PathBuf::from("/repo/upstream"),
+                pr: PrInfo {
+                    number: 77,
+                    title: "Refactor auth middleware".into(),
+                    state: PrState::Open,
+                    is_draft: false,
+                    review_decision: ReviewDecision::Pending,
+                    checks: CheckStatus::Passing,
+                    mergeable: MergeableState::Unknown,
+                    url: "https://github.com/o/r/pull/77".into(),
+                },
+                branch: "refactor-auth".into(),
+                requested_reviewer_logins: vec!["alice".into(), "bob".into(), "carol".into()],
+                requested_team_slugs: vec!["frontend".into()],
+            });
+        app.build_display_list();
+        app.selected_item = Some(1);
+
+        // Use a wide terminal so the "Requested from:" line doesn't
+        // wrap and we can assert its full contents in one line.
+        let rendered = render(&mut app, 160, 24);
+
+        // "you" must come first, then the other direct reviewers in
+        // their original order, then teams prefixed with "team ".
+        // The detail panel uses ", " as the list separator.
+        assert!(
+            rendered.contains("Requested from you, alice, carol, team frontend"),
+            "detail panel must list every direct reviewer and every team; got:\n{rendered}",
+        );
+    }
+
+    /// When no current_user_login is known, the detail panel cannot
+    /// collapse any login to "you", so every directly-requested user
+    /// must be rendered as their literal login.
+    #[test]
+    fn review_request_pr_detail_renders_all_logins_when_login_unknown() {
+        let mut app = App::new();
+        app.current_user_login = None;
+        app.review_requested_prs
+            .push(crate::work_item::ReviewRequestedPr {
+                repo_path: PathBuf::from("/repo/upstream"),
+                pr: PrInfo {
+                    number: 77,
+                    title: "Refactor auth middleware".into(),
+                    state: PrState::Open,
+                    is_draft: false,
+                    review_decision: ReviewDecision::Pending,
+                    checks: CheckStatus::Passing,
+                    mergeable: MergeableState::Unknown,
+                    url: "https://github.com/o/r/pull/77".into(),
+                },
+                branch: "refactor-auth".into(),
+                requested_reviewer_logins: vec!["alice".into(), "bob".into()],
+                requested_team_slugs: Vec::new(),
+            });
+        app.build_display_list();
+        app.selected_item = Some(1);
+
+        let rendered = render(&mut app, 160, 24);
+        assert!(
+            rendered.contains("Requested from alice, bob"),
+            "detail panel must render every literal login when current user is unknown; got:\n{rendered}",
+        );
+        assert!(
+            !rendered.contains("Requested from you"),
+            "no 'you' should be promoted when current_user_login is None; got:\n{rendered}",
+        );
     }
 
     #[test]

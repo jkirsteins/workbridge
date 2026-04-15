@@ -185,6 +185,18 @@ impl GithubClient for MockGithubClient {
             .cloned()
             .collect())
     }
+
+    /// Mock override. Returns the shared fixture error when `error`
+    /// is set (so tests can exercise the "lookup failed" branch of
+    /// the fetcher), otherwise returns a stable mock login so every
+    /// test that does not care about identity still gets a usable
+    /// value and the fetcher does not emit a spurious FetcherError.
+    fn current_user_login(&self) -> Result<String, GithubError> {
+        if let Some(ref err) = self.error {
+            return Err(err.clone());
+        }
+        Ok("mock-user".into())
+    }
 }
 
 /// GhCliClient shells out to the `gh` CLI to interact with the GitHub API.

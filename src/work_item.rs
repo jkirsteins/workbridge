@@ -447,9 +447,12 @@ pub struct RepoFetchResult {
     /// once per fetch tick via `gh api user` (cached inside the
     /// github_client). None when the lookup has not yet succeeded -
     /// e.g. the gh CLI is missing, auth is expired, or the first call
-    /// happens to hit a transient error. The UI reads this to classify
-    /// review-request rows as direct-to-you vs. team-only; a None
-    /// value degrades gracefully by classifying every row as team.
+    /// happens to hit a transient error. Lookup failures are NOT
+    /// silent: the fetcher emits a `FetchMessage::FetcherError` on
+    /// the same channel so the status bar surfaces the problem. The
+    /// UI reads this to classify review-request rows as direct-to-you
+    /// vs. team-only; a None value degrades gracefully by classifying
+    /// every row as team.
     pub current_user_login: Option<String>,
 }
 
