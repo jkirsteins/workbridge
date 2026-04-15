@@ -1718,8 +1718,19 @@ impl App {
             } else {
                 entry.alive = false;
             }
-            if !entry.alive {
-                self.global_mcp_server = None;
+            if !entry.alive
+                && let Some(mcp_server) = self.global_mcp_server.take()
+            {
+                // Setting `self.global_mcp_server = None` would
+                // drop the `McpSocketServer` on the UI thread,
+                // running `McpSocketServer::Drop -> stop() +
+                // std::fs::remove_file` inline on the timer tick
+                // path. Route the takeout through the async
+                // teardown helper so the unlink runs on a
+                // background thread. Codex adversarial review
+                // P0 class, see `docs/UI.md` "Blocking I/O
+                // Prohibition".
+                Self::teardown_mcp_server_async(mcp_server);
             }
         }
 
@@ -1749,8 +1760,24 @@ impl App {
     }
 
     /// Stop MCP server and clear activity state for a work item.
+    ///
+    /// Called from `check_liveness` when a Claude session dies, and
+    /// from `apply_stage_change` + `delete_work_item_by_id` when
+    /// the work item's session should be torn down. All of those
+    /// call sites run on the UI thread / timer tick path, so this
+    /// helper MUST NOT drop `McpSocketServer` inline -
+    /// `McpSocketServer::Drop` calls `stop()` (cheap) plus
+    /// `std::fs::remove_file` (a real syscall). Codex adversarial
+    /// review flagged the earlier
+    /// `self.mcp_servers.remove(wi_id)` as a `docs/UI.md`
+    /// "Blocking I/O Prohibition" violation: a dying Claude
+    /// session triggered the inline unlink on the UI tick.
+    /// Route the removed server through `teardown_mcp_server_async`
+    /// so the `unlink` runs on a background thread.
     fn cleanup_session_state_for(&mut self, wi_id: &WorkItemId) {
-        self.mcp_servers.remove(wi_id);
+        if let Some(mcp_server) = self.mcp_servers.remove(wi_id) {
+            Self::teardown_mcp_server_async(mcp_server);
+        }
         self.claude_working.remove(wi_id);
         // Drop any pending background plan read and end its
         // "Opening session..." spinner. The thread will complete and
