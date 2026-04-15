@@ -1678,17 +1678,12 @@ fn format_unlinked_item<'a>(
     let pad_str: String = " ".repeat(padding);
 
     // Styling: when selected, the `List` widget applies highlight_bg; we set fg
-    // per-span so the highlight fg colors render correctly. Meta stays DarkGray
-    // on selection (matching `format_work_item_entry`).
+    // per-span so the highlight fg colors render correctly. Meta uses the
+    // theme-owned `style_meta_selected` on selection so the highlight bg and
+    // its paired meta fg live together in `Theme` and cannot drift apart.
     let (margin_style, marker_style, title_style, badge_style, meta_style) = if is_selected {
         let hl = theme.style_tab_highlight();
-        (
-            hl,
-            hl,
-            hl,
-            hl,
-            ratatui_core::style::Style::default().fg(ratatui_core::style::Color::DarkGray),
-        )
+        (hl, hl, hl, hl, theme.style_meta_selected())
     } else {
         (
             ratatui_core::style::Style::default(),
@@ -1720,14 +1715,16 @@ fn format_unlinked_item<'a>(
 
     // Meta line: repo directory name, 2-space indent, muted. Wrap defensively
     // in case of a very narrow pane or a pathologically long directory name.
+    // `wrap_text`'s budget is per-line content width (the prepended "  " is
+    // added on top), so pass `content_width` directly to match
+    // `format_work_item_entry`'s meta wrap convention.
     let repo_name: String = unlinked
         .repo_path
         .file_name()
         .and_then(|n| n.to_str())
         .map(str::to_string)
         .unwrap_or_else(|| "<unknown repo>".to_string());
-    let meta_budget = content_width.saturating_sub(2).max(1);
-    for wrapped in wrap_text(&repo_name, meta_budget) {
+    for wrapped in wrap_text(&repo_name, content_width.max(1)) {
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(wrapped, meta_style),
@@ -1900,15 +1897,12 @@ fn format_work_item_entry<'a>(
 
     // When selected, the List widget only sets bg (via style_tab_highlight_bg).
     // We apply fg per-span here so title+badge get the original highlight look
-    // (Black + BOLD) while branch metadata stays muted (DarkGray).
+    // (Black + BOLD) while branch metadata uses the theme-owned
+    // `style_meta_selected` (paired with `tab_highlight_bg` inside Theme so
+    // the fg+bg pair cannot drift when the highlight bg is retuned).
     let hl = theme.style_tab_highlight();
     let (title_style, badge_style, right_badge_style, meta_style) = if is_selected {
-        (
-            hl,
-            hl,
-            hl,
-            ratatui_core::style::Style::default().fg(ratatui_core::style::Color::DarkGray),
-        )
+        (hl, hl, hl, theme.style_meta_selected())
     } else {
         let ts = if wi.status == WorkItemStatus::Done {
             theme.style_done_item()

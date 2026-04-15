@@ -33,6 +33,11 @@ pub struct Theme {
     pub tab_highlight_fg: Color,
     /// Highlight bar: background.
     pub tab_highlight_bg: Color,
+    /// Meta-line foreground used on selected list rows. Paired with
+    /// `tab_highlight_bg`; must retain readable contrast against it.
+    /// Lives next to the highlight fields so any retune of the highlight
+    /// bg can adjust this in the same place.
+    pub meta_selected_fg: Color,
 
     // -- Text --
     /// Primary text (readable on any terminal background).
@@ -151,6 +156,7 @@ impl Theme {
 
             tab_highlight_fg: Color::Black,
             tab_highlight_bg: Color::Cyan,
+            meta_selected_fg: Color::DarkGray,
 
             text: Color::Reset,
             text_muted: Color::Reset,
@@ -260,6 +266,14 @@ impl Theme {
     /// a single color by Cell::set_style.
     pub fn style_tab_highlight_bg(&self) -> Style {
         Style::default().bg(self.tab_highlight_bg)
+    }
+
+    /// Meta-line style for selected list rows. Sets only fg (not bg) so
+    /// the List widget's `style_tab_highlight_bg` still owns the row
+    /// background. Use this in `ListItem` formatters for the muted
+    /// meta/detail line when the row is selected.
+    pub fn style_meta_selected(&self) -> Style {
+        Style::default().fg(self.meta_selected_fg)
     }
 
     pub fn style_text(&self) -> Style {
