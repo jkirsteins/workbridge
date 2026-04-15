@@ -313,25 +313,32 @@ the current Codex CLI surface).
 **Claude (reference)**: Interactive mode is produced by
 `App::spawn_session` -> `Session::spawn` in `src/session.rs:57`,
 which forks a `claude` process attached to a PTY slave fd. Headless
-mode is produced by the review gate at `src/app.rs:7954`, which runs
-`claude --print --output-format json --json-schema ...` via
-`std::process::Command::output()`.
+mode is produced by the review gate at `src/app.rs:8423` and the
+rebase gate at `src/app.rs:8696`, which run `claude --print
+--output-format json --json-schema ...` via
+`std::process::Command::output()`. The rebase gate also passes
+`--dangerously-skip-permissions` because `claude --print` runs
+non-interactively and any pre-flight tool the harness wants to
+execute (`git rebase`, `git add`, etc.) must succeed without an
+interactive consent prompt; the review gate omits the flag because
+its read-only MCP server forbids the only mutations that would
+otherwise need consent.
 
 **Codex (secondary, not implemented)**: **supported**. Interactive
 corresponds to plain `codex`; headless corresponds to `codex exec
 --json` (non-interactive mode with a newline-delimited event
-stream). The review gate would need a final-message extractor
-because Codex's JSON stream is a series of events rather than a
-single structured document, but that is parsing glue, not a clause
-violation.
+stream). The review and rebase gates would each need a final-message
+extractor because Codex's JSON stream is a series of events rather
+than a single structured document, but that is parsing glue, not a
+clause violation.
 
 ### C2 - Working directory
 
 **Claude (reference)**: `Session::spawn` at `src/session.rs:57`
 honours the `cwd` argument via `std::process::Command::current_dir`.
 `App::finish_session_open` passes the worktree path for work-item
-spawns at `src/app.rs:4101`. `spawn_global_session` at
-`src/app.rs:8483` passes a stable workbridge-owned scratch directory
+spawns at `src/app.rs:4636`. `spawn_global_session` at
+`src/app.rs:9384` passes a stable workbridge-owned scratch directory
 (`$TMPDIR/workbridge-global-assistant-cwd`, created idempotently by
 `std::fs::create_dir_all` just before the spawn). The scratch path
 is used instead of `$HOME` because Claude Code's workspace trust
@@ -343,7 +350,13 @@ reading or writing `~/.claude.json`. The review gate runs `git diff`
 inside the worktree on a background thread (not in the harness
 child) but the harness child for `claude --print` is spawned with
 the default cwd because the gate only needs MCP access to fetch the
-plan.
+plan. The rebase gate at `src/app.rs:8696` is the opposite case:
+the harness child needs to actually run `git rebase` against the
+worktree, so its `Command::new("claude").current_dir(&repo_path)`
+sets the cwd to the work-item's worktree path explicitly. The cwd
+is captured by destructuring a `RebaseTarget` produced by
+`App::selected_rebase_target` so the spawn site cannot drift from
+the work item the user pressed `m` on.
 
 **Codex (secondary, not implemented)**: **supported**. Codex accepts
 a `--cd <path>` flag as well as inheriting the parent's cwd; either
@@ -351,11 +364,18 @@ works. No clause violation.
 
 ### C3 - Permissions
 
-**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4137` and
-`spawn_global_session` at `src/app.rs:8404` both push
+**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4672` and
+`spawn_global_session` at `src/app.rs:9272` both push
 `--dangerously-skip-permissions` into argv unconditionally. The
-review gate at `src/app.rs:7954` does not need it because
-`claude --print` is non-interactive and never prompts.
+review gate at `src/app.rs:8423` does not need it because
+`claude --print` is non-interactive and the read-only MCP server
+forbids the only mutations a permission prompt would normally
+guard. The rebase gate at `src/app.rs:8696` DOES pass
+`--dangerously-skip-permissions` because its job is to run the
+write-side `git rebase` / `git add` / `git rebase --continue`
+sequence in the worktree; an interactive consent prompt in
+`claude --print` mode is unreachable, so without the flag the
+harness child would block on the first tool call and never exit.
 
 **Codex (secondary, not implemented)**: **supported**. Codex has
 `--full-auto` and `--ask-for-approval never` for the same role.
@@ -366,17 +386,27 @@ clause violation.
 
 **Claude (reference)**: `build_mcp_config` in `src/mcp.rs:1382`
 produces the JSON blob, and `McpSocketServer::start` at
-`src/mcp.rs:80` starts the accept loop. All three spawn sites
+`src/mcp.rs:80` starts the accept loop. All four spawn sites
 deliver the MCP config exclusively via `--mcp-config <tempfile>`
 under `std::env::temp_dir()` (workbridge-owned): work-item spawns
-at `src/app.rs:4089` (see `finish_session_open`), the review gate
-at `src/app.rs:7965`, and the global assistant at
-`src/app.rs:8455`. No spawn site drops `.mcp.json` or any other
-harness-state file into the worktree - doing so would violate the
-"file injection" invariant cross-referenced in C2 (CLAUDE.md
-severity overrides). The bridge process is the same workbridge
-binary re-invoked with `--mcp-bridge --socket <path>` (see
-`build_mcp_config`).
+at `src/app.rs:4624` (see `finish_session_open`), the review gate
+at `src/app.rs:8434`, the rebase gate at `src/app.rs:8706`, and the
+global assistant at `src/app.rs:9272`. No spawn site drops
+`.mcp.json` or any other harness-state file into the worktree -
+doing so would violate the "file injection" invariant
+cross-referenced in C2 (CLAUDE.md severity overrides). The bridge
+process is the same workbridge binary re-invoked with
+`--mcp-bridge --socket <path>` (see `build_mcp_config`). The
+rebase gate's MCP server is started with `read_only: false`
+because the harness must call `workbridge_set_status` and
+`workbridge_log_event` to persist the rebase outcome; the rebase
+gate's `Sender<McpEvent>` is a private channel owned by the
+spawning thread (NOT `App::mcp_tx`) so the gate's progress events
+do not pollute the main TUI dispatch loop. The thread translates
+incoming `McpEvent::ReviewGateProgress` and
+`McpEvent::LogEvent { event_type: "rebase_progress", .. }` calls
+into `RebaseGateMessage::Progress` updates, which the right-pane
+takeover in `src/ui.rs` renders into the spinner panel.
 
 **Codex (secondary, not implemented)**: **workaround**. Codex reads
 MCP server definitions from `~/.codex/config.toml` under
@@ -389,14 +419,22 @@ stdio transport) is still achievable.
 
 ### C5 - Tool allowlist by spawn type
 
-**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4151`
+**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4672`
 passes `--allowedTools` with a comma-separated list of the 15
 workbridge MCP tools for work-item profiles.
-`spawn_global_session` at `src/app.rs:8405` uses the same list.
+`spawn_global_session` at `src/app.rs:9272` uses the same list.
 The review gate does not pass `--allowedTools`; it relies entirely
 on the MCP server exposing only the 4 read-only tools (see
 `src/mcp.rs` `tools/list` handling and the
 `read_only_mode_exposes_only_read_tools` test at `src/mcp.rs:1510`).
+The rebase gate at `src/app.rs:8696` also does not pass
+`--allowedTools`: with `read_only: false` on its MCP server, the
+harness has access to the full work-item tool set, but in practice
+the rebase prompt only asks for `workbridge_log_event` (progress)
+and `workbridge_set_status` (final result) plus the harness's own
+shell tool to run `git rebase`. The "no allowlist" choice keeps the
+spawn site uniform with the review gate; the prompt's instructions
+are the upper bound on which tools actually get called.
 
 **Codex (secondary, not implemented)**: **workaround**. Codex does
 not expose a fine-grained MCP tool allowlist at the CLI level; its
@@ -418,8 +456,18 @@ builds the prompt by rendering a per-stage template
 `implementing_no_plan` / `blocked` / `review` /
 `review_with_findings`) from `src/prompts.rs`. The result is passed
 via `--system-prompt <string>` in `build_claude_cmd` at
-`src/app.rs:4180`. The review gate renders the `review_gate`
-template and passes it with the same flag at `src/app.rs:7959`.
+`src/app.rs:4672`. The review gate renders the `review_gate`
+template and passes it with the same flag at `src/app.rs:8423`.
+The rebase gate does NOT pass a separate `--system-prompt`; the
+prompt is delivered as the positional `-p` payload (an inline
+string built in `spawn_rebase_gate`) because the rebase task has no
+template variables to expand and no per-user customisation surface
+- the prompt enumerates the rebase steps verbatim, the JSON output
+shape, and the "do not push" prohibition, and never changes from
+spawn to spawn. The clause is satisfied because the harness still
+sees a per-spawn task definition before any user input could
+arrive; whether it lands in the system slot or the initial-user
+slot is the harness adapter's choice.
 
 **Codex (secondary, not implemented)**: **workaround**. Codex does
 not have a dedicated `--system-prompt` flag. The harness-neutral
@@ -431,13 +479,18 @@ injection at spawn time) is still met.
 
 ### C7 - Auto-start prompt
 
-**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4186`
+**Claude (reference)**: `build_claude_cmd` at `src/app.rs:4672`
 appends a literal positional prompt ("Explain who you are and start
 working." for Planning/Implementing, a review-gate-findings
 presentation prompt for Review) when `auto_start` is true. It is
 placed **before** `--mcp-config` because Claude Code otherwise
-treats it as an additional config file path (see the code comment
-at `src/app.rs:4183`).
+treats it as an additional config file path. The headless gates
+have their own initial prompts: the review gate passes the review
+skill as `-p <prompt>`, and the rebase gate passes its inlined
+rebase-task prompt as `-p <prompt>` at `src/app.rs:8696`. The
+clause is met for headless spawns the same way it is met for
+interactive spawns: the harness child has work to do before any
+human input could possibly arrive.
 
 **Codex (secondary, not implemented)**: **supported**. Codex accepts
 an initial prompt as a positional argument in interactive mode and
@@ -446,12 +499,17 @@ as the `-p` / stdin payload in `codex exec`. No clause violation.
 ### C8 - Stage reminders
 
 **Claude (reference)**: Planning sessions get a second-layer
-reminder via `--settings`, passed at `src/app.rs:4173` with a JSON
+reminder via `--settings`, passed at `src/app.rs:4672` with a JSON
 blob that installs a `PostToolUse` hook on `TodoWrite`. The hook
 greps the tool payload for `workbridge_set_plan`; if missing, it
 writes a reminder to stderr so Claude sees it on the next turn.
 Non-Planning stages use only the system-prompt-embedded reminder
-from the templates in `src/prompts.rs`.
+from the templates in `src/prompts.rs`. The headless gates do not
+need stage reminders: the review gate's only obligation is "emit
+JSON envelope", which the `--json-schema` enforces, and the rebase
+gate's only obligations are "do not push" and "emit JSON envelope",
+both stated verbatim in the inline rebase prompt. There is no
+multi-turn invariant a hook would need to re-fire for.
 
 **Codex (secondary, not implemented)**: **workaround**. Codex does
 not have a hook system matching Claude Code's `PostToolUse`
@@ -469,10 +527,14 @@ the first turn.
 (`src/session.rs:164`) loops on `libc::read` against a dup'd master
 fd and calls `vt100::Parser::process` on every chunk. The UI thread
 locks the parser and renders its screen (`App::render_*` paths).
-Headless capture lives at `src/app.rs:7968` - the review gate
-consumes stdout via `Command::output()` and parses the top-level
-JSON envelope, reaching into `envelope["structured_output"]` for the
-fields.
+Headless capture lives at `src/app.rs:8423` (review gate) and
+`src/app.rs:8696` (rebase gate) - both consume stdout via
+`Command::output()` and parse the top-level JSON envelope, reaching
+into `envelope["structured_output"]` for the fields. The rebase
+gate runs `Command::output()` inside a dedicated nested thread so
+the spawning thread can `crossbeam_channel::select!` between the
+output-completion channel and the gate's private MCP-event channel
+to forward live progress without blocking on the child.
 
 **Codex (secondary, not implemented)**: **supported**. Interactive
 mode produces a byte stream on the PTY exactly like any other CLI.
@@ -492,12 +554,18 @@ at `src/session.rs:304` is the SIGKILL-immediately path used in
 force-kills and joins the reader thread; slave-PTY close on child
 exit gives the reader its EOF. The global-assistant teardown adds
 one extra layer on top of `Session::kill`:
-`App::teardown_global_session` at `src/app.rs:8355` kills the
+`App::teardown_global_session` at `src/app.rs:9256` kills the
 child, drops the `SessionEntry` (which joins the reader via
 `Drop`), drops the MCP server, removes the temp MCP config file,
 and drains any buffered keystrokes - symmetric with the work-item
 cleanup path so new global-assistant state cannot leak across
-opens.
+opens. The headless gates (review and rebase) bypass `Session`
+entirely: each runs `Command::output()` inside a background thread,
+so lifecycle is governed by `Output` returning rather than by
+SIGTERM. There is no user-facing cancel path for an in-flight
+review or rebase gate today; the gate runs to completion or until
+its background channel disconnects, at which point `poll_*_gate`
+notices and drops the gate state.
 
 **Codex (secondary, not implemented)**: **supported**. The
 lifecycle contract is a POSIX process-group protocol, not a
@@ -508,14 +576,21 @@ behaviour), the existing `Session` struct handles it unchanged.
 ### C11 - Read-only sessions
 
 **Claude (reference)**: The review gate passes `read_only: true` to
-`McpSocketServer::start` at `src/app.rs:7906`. The server at
+`McpSocketServer::start` at `src/app.rs:8375`. The server at
 `src/mcp.rs:80` stores the flag into `SessionMcpConfig` and threads
 it through `handle_message`, which filters `tools/list` (see
 `src/mcp.rs` around line 439) and rejects mutating `tools/call`
 (line 608). The unit tests
 `read_only_mode_exposes_only_read_tools` and
 `read_only_mode_rejects_mutating_tool_calls` in `src/mcp.rs:1510`
-pin the contract.
+pin the contract. The rebase gate's `McpSocketServer::start` at
+`src/app.rs:8599` is intentionally NOT read-only:
+`read_only: false` is passed because the harness must call
+`workbridge_set_status` and `workbridge_log_event` to persist the
+rebase outcome and stream live progress. The rebase gate is the
+only headless spawn site that runs read-write; the read-only path
+remains the default for any future "this is an opinion, not a
+driver" gate.
 
 **Codex (secondary, not implemented)**: **supported**. Read-only
 enforcement is entirely inside the workbridge MCP server, which is
@@ -525,16 +600,23 @@ harness-agnostic. A Codex adapter just sets the same flag.
 
 **Claude (reference)**: Sessions are stored in `App::sessions` keyed
 by `(WorkItemId, WorkItemStatus)` and inserted at
-`src/app.rs:4111`. Stage transitions orphan old entries, which are
+`src/app.rs:4646`. Stage transitions orphan old entries, which are
 killed by the periodic liveness sweep. The poll handler in
-`poll_review_gate` at `src/app.rs:8041` explicitly kills the
+`poll_review_gate` at `src/app.rs:8846` explicitly kills the
 current session and respawns when a gate rejects or errors. The
 global assistant drawer uses a simpler identity rule: exactly one
 live session at a time, torn down on every drawer close and
 re-spawned fresh on every drawer open via
 `App::toggle_global_drawer` calling `teardown_global_session`
-(`src/app.rs:8355`) and `spawn_global_session` (`src/app.rs:8371`);
+(`src/app.rs:9256`) and `spawn_global_session` (`src/app.rs:9272`);
 see also `docs/UI.md` "Global assistant drawer session lifetime".
+The rebase gate's "session" is implicit: it is keyed by
+`WorkItemId` in `App.rebase_gates` and lives only as long as the
+background thread's `Command::output()` call. Each press of `m`
+spawns a fresh harness child; there is no resume. Single-flight
+admission via `UserActionKey::RebaseOnMain` (and the
+per-`WorkItemId` map check in `start_rebase_on_main`) prevents
+overlapping rebases on the same item.
 
 **Codex (secondary, not implemented)**: **supported**. Identity is
 owned by workbridge; the harness only needs to exit when signalled.
@@ -545,10 +627,10 @@ not bypassed.
 ### C13 - No env leakage
 
 **Claude (reference)**: Neither `build_claude_cmd`,
-`spawn_global_session`, nor the review gate spawn sets any harness-
-specific environment variable on the child. The child inherits the
-parent environment (so the user's `$PATH`, `$HOME`, etc. are
-visible) but workbridge adds nothing.
+`spawn_global_session`, the review gate spawn, nor the rebase gate
+spawn sets any harness-specific environment variable on the child.
+The child inherits the parent environment (so the user's `$PATH`,
+`$HOME`, etc. are visible) but workbridge adds nothing.
 
 **Codex (secondary, not implemented)**: **supported**. A Codex
 adapter that needs to point at a per-session MCP config would
@@ -595,11 +677,35 @@ claude
 ```
 
 Source: `std::process::Command::new("claude")` at
-`src/app.rs:7954`. Cwd: inherited (unspecified). The review gate
+`src/app.rs:8423`. Cwd: inherited (unspecified). The review gate
 does NOT pass `--dangerously-skip-permissions` because
 `--print` is non-interactive and never prompts. The review gate
 does NOT pass `--allowedTools`; it relies on the read-only MCP
 server to hide mutating tools.
+
+### RP2b - Headless rebase-gate argv
+
+```text
+claude
+  --print
+  --dangerously-skip-permissions
+  -p '<inline rebase prompt: rebase steps, do-not-push, JSON shape>'
+  --output-format json
+  --json-schema '{"type":"object","properties":{"success":{"type":"boolean"},"conflicts_resolved":{"type":"boolean"},"detail":{"type":"string"}},"required":["success","detail"]}'
+  --mcp-config /tmp/workbridge-rebase-mcp-<uuid>.json
+```
+
+Source: `std::process::Command::new("claude")` at
+`src/app.rs:8696`. Cwd: the work-item's worktree path (set
+explicitly via `Command::current_dir`). The rebase gate DOES pass
+`--dangerously-skip-permissions` because `claude --print` cannot
+display an interactive consent prompt and the rebase task requires
+write-side `git rebase` / `git add` calls. The rebase gate does
+NOT pass `--system-prompt`; the rebase task definition lives in
+the `-p` positional payload because it has no template variables
+to expand. The MCP server backing the rebase gate is started with
+`read_only: false` so the harness can call
+`workbridge_set_status` and `workbridge_log_event`.
 
 ### RP3 - MCP config JSON
 
@@ -666,12 +772,35 @@ The review gate parses the top-level JSON document emitted by
 }
 ```
 
-Source: `src/app.rs:7973` ("The structured output is in the
+Source: `src/app.rs:8442` ("The structured output is in the
 `structured_output` field."). The harness MUST produce an envelope
 whose structured body conforms to the `--json-schema` payload in
 RP2; workbridge uses `.as_bool()` and `.as_str()` with safe
 defaults, so absence of either field is interpreted as "not
 approved, empty detail".
+
+### RP6 - Rebase gate JSON envelope
+
+The rebase gate parses the same top-level envelope, reaching into
+the same `structured_output` field, but expects a different shape:
+
+```json
+{
+  "structured_output": {
+    "success": true,
+    "conflicts_resolved": false,
+    "detail": "rebased onto origin/main, fast-forward only"
+  }
+}
+```
+
+Source: `src/app.rs:8766`. `success` MUST be `true` if and only if
+the worktree is now rebased onto `origin/<base>`; the harness is
+expected to run `git rebase --abort` and report `success=false` on
+any give-up path. `conflicts_resolved` is informational and used
+only for the human-readable status summary. As with RP5,
+`.as_bool()` / `.as_str()` defaults treat a missing field as
+"failed, empty detail".
 
 ## Target Trait Sketch
 
@@ -832,17 +961,24 @@ update the Implementation Map section above.
 
 | File          | Line  | Mode        | Scope      | Cwd                                       |
 |---------------|-------|-------------|------------|-------------------------------------------|
-| `src/app.rs`  | 4101  | Interactive | WorkItem   | Work-item worktree                        |
-| `src/app.rs`  | 7954  | Headless    | ReviewGate | inherited                                 |
-| `src/app.rs`  | 8483  | Interactive | Global     | `$TMPDIR/workbridge-global-assistant-cwd` |
+| `src/app.rs`  | 4636  | Interactive | WorkItem   | Work-item worktree                        |
+| `src/app.rs`  | 8423  | Headless    | ReviewGate | inherited                                 |
+| `src/app.rs`  | 8696  | Headless    | RebaseGate | Work-item worktree                        |
+| `src/app.rs`  | 9384  | Interactive | Global     | `$TMPDIR/workbridge-global-assistant-cwd` |
 
-All three sites go through `src/session.rs:57` (`Session::spawn`) for
+All four sites go through `src/session.rs:57` (`Session::spawn`) for
 the interactive path or `std::process::Command::output()` directly
-for the headless path; argv is built in `App::build_claude_cmd` at
-`src/app.rs:4137` for the work-item path, inlined at
-`src/app.rs:7954` for the review gate, and inlined at
-`src/app.rs:8404` for the global assistant. Global assistant
-teardown lives at `src/app.rs:8355`
+for the headless paths; argv is built in `App::build_claude_cmd` at
+`src/app.rs:4672` for the work-item path, inlined at
+`src/app.rs:8423` for the review gate, inlined at `src/app.rs:8696`
+for the rebase gate, and inlined at `src/app.rs:9272`
+(`spawn_global_session`) for the global assistant. The rebase gate
+is the second headless spawn site: it runs `claude --print
+--dangerously-skip-permissions --output-format json --json-schema
+... --mcp-config <tempfile>` with cwd set to the work-item's
+worktree path so the harness can run `git rebase origin/<main>` in
+the right repo and resolve any conflicts in place. Global assistant
+teardown lives at `src/app.rs:9256`
 (`App::teardown_global_session`); see C10 and C12 for why each
 drawer open spawns a fresh session and each close fully tears it
 down.
@@ -897,3 +1033,24 @@ harness adapter is introduced, add a dated bullet here.
   Map are now byte-accurate against the current tree so the
   "table and Implementation Map must stay in sync with the code"
   rule holds in full.
+- 2026-04-15: Added the rebase-gate headless spawn site at
+  `src/app.rs:8696` for the new `m` keybinding (auto-rebase on
+  main). The rebase gate is the second headless `claude` spawn
+  site and the first one that runs read-write: it passes
+  `--dangerously-skip-permissions` (because the harness must run
+  `git rebase` / `git add` / `git rebase --continue`), sets
+  `read_only: false` on its `McpSocketServer::start`, and uses a
+  private `Sender<McpEvent>` for live progress streaming so its
+  events do not pollute the main TUI MCP dispatch loop. Updated
+  the Known Spawn Sites table from three to four entries; updated
+  C1, C2, C3, C4, C5, C6, C7, C8, C9, C10, C11, C12, C13 to call
+  out the rebase-gate-specific deltas; added RP2b (rebase-gate
+  argv) and RP6 (rebase-gate JSON envelope). Also bumped review
+  gate / global session line citations to match the current tree
+  after the rebase-gate insertion (review-gate `Command::new`
+  7954 -> 8423, global `Session::spawn` 8483 retained, work-item
+  `--mcp-config` append 4089 -> 4583, `build_claude_cmd` 4137 ->
+  4672, `stage_system_prompt` 4308 retained, `poll_review_gate`
+  8041 -> 8792, `teardown_global_session` 8355 -> 9256,
+  `spawn_global_session` 8371 -> 9272). The table and
+  Implementation Map remain in sync with the code.

@@ -104,6 +104,19 @@ pub struct Theme {
     /// render both chips without them visually merging. Yellow/orange
     /// to read as a warning without screaming "error".
     pub badge_worktree_unclean: Color,
+    /// Needs-push `!pushed` badge color. Shown when the local branch is
+    /// ahead of its upstream (unpushed commits). Cyan reads as
+    /// "informational, action available" without competing with the
+    /// red `!merge` / `fail` chips or the yellow `!cl` chip on the
+    /// same row.
+    pub badge_pushed: Color,
+    /// Needs-pull `!pulled` badge color. Shown when the local branch is
+    /// behind its upstream (the remote moved while we were working).
+    /// Magenta reads as "informational, action available" while
+    /// staying distinct from the cyan `!pushed` chip - a row that is
+    /// diverged in both directions renders `!pushed !pulled` with
+    /// clearly different foregrounds.
+    pub badge_pulled: Color,
     /// Unlinked item "?" marker color.
     pub unlinked_marker: Color,
     /// Review request "R" marker color (pre-import).
@@ -195,6 +208,14 @@ impl Theme {
             // A row that is both CI-failing and locally unclean renders
             // `fail !cl` with clearly separate foregrounds.
             badge_worktree_unclean: Color::LightYellow,
+            // Cyan reads as "informational, action available" and stays
+            // visually distinct from the red conflict chips and the
+            // yellow `!cl` chip on the same row.
+            badge_pushed: Color::Cyan,
+            // Magenta is the only remaining accent that does not collide
+            // with the green PR badge, the cyan `!pushed` chip, the
+            // yellow `!cl` chip, or the red conflict chips.
+            badge_pulled: Color::Magenta,
             unlinked_marker: Color::Yellow,
             review_request_marker: Color::Magenta,
             badge_review_request_kind: Color::Magenta,
@@ -384,6 +405,23 @@ impl Theme {
 
     pub fn style_badge_worktree_unclean(&self) -> Style {
         Style::default().fg(self.badge_worktree_unclean)
+    }
+
+    /// Style for the `!pushed` chip rendered when a worktree's branch is
+    /// ahead of its upstream (i.e. has unpushed commits). Pure
+    /// foreground style, mirroring the other chip helpers in this
+    /// section so callers can compose a row of chips without pulling
+    /// in modifiers.
+    pub fn style_badge_pushed(&self) -> Style {
+        Style::default().fg(self.badge_pushed)
+    }
+
+    /// Style for the `!pulled` chip rendered when a worktree's branch is
+    /// behind its upstream (the remote moved). Distinct foreground from
+    /// `!pushed` so the two chips render with different colours when a
+    /// branch is diverged in both directions.
+    pub fn style_badge_pulled(&self) -> Style {
+        Style::default().fg(self.badge_pulled)
     }
 
     pub fn style_badge_session_idle(&self) -> Style {

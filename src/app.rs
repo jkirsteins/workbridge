@@ -281,6 +281,15 @@ pub enum UserActionKey {
     /// Asynchronous delete-cleanup initiated from the delete modal or
     /// the MCP delete handler.
     DeleteCleanup,
+    /// Asynchronous rebase-onto-main initiated by the `m` keybinding.
+    /// Single-flight: while a rebase is running for any work item, a
+    /// second `m` press is silently coalesced. The matching payload
+    /// carries the `WorkItemId` so the gate state can be looked up by
+    /// owner. Per-item concurrency is intentionally out of scope: a
+    /// future change wanting parallel rebases across different
+    /// repos can re-key on `(RepoPath, Branch)` the same way the doc
+    /// for `WorktreeCreate` describes.
+    RebaseOnMain,
 }
 
 /// Payload stored inside `UserActionState` for each in-flight entry.
@@ -334,6 +343,9 @@ pub enum UserActionPayload {
     },
     DeleteCleanup {
         rx: crossbeam_channel::Receiver<CleanupResult>,
+    },
+    RebaseOnMain {
+        wi_id: WorkItemId,
     },
 }
 
@@ -414,6 +426,78 @@ pub enum ReviewGateOrigin {
     Mcp,
     Tui,
     Auto,
+}
+
+/// Resolved selection target for the rebase-onto-main flow. Produced
+/// by `App::selected_rebase_target` and consumed by
+/// `App::start_rebase_on_main` -> `App::spawn_rebase_gate`. Carries
+/// only the ids the spawn function needs, so the `m` key path stays
+/// trivially testable without standing up a full work item.
+pub struct RebaseTarget {
+    pub wi_id: WorkItemId,
+    pub repo_path: PathBuf,
+    pub branch: String,
+}
+
+/// Outcome of an attempted rebase-onto-main run, as reported by the
+/// background thread that drove `git fetch` + the headless harness call.
+///
+/// Mirrors the shape of `ReviewGateResult` so the poll loop can pattern-
+/// match on it without juggling tuples. `base_branch` is included on both
+/// arms so the status-bar summary can name the branch we rebased onto
+/// even on the failure path.
+pub enum RebaseResult {
+    /// The rebase finished cleanly. `conflicts_resolved` is `true` if
+    /// the harness had to resolve conflicts during the run; the
+    /// rebase-gate poll uses it only for the human-readable summary.
+    Success {
+        base_branch: String,
+        conflicts_resolved: bool,
+    },
+    /// The rebase failed - either `git fetch` did not return cleanly,
+    /// the harness child exited non-zero, the JSON envelope was
+    /// unparseable, or the harness gave up after attempting conflict
+    /// resolution. `conflicts_attempted` is `true` if the harness made
+    /// at least one resolution attempt before giving up; used only for
+    /// the summary text.
+    Failure {
+        base_branch: String,
+        reason: String,
+        conflicts_attempted: bool,
+    },
+}
+
+/// Messages sent from the rebase gate background thread to the main
+/// thread. Streams zero or more `Progress` updates followed by exactly
+/// one `Result`. Mirrors the streaming pattern documented in
+/// `docs/UI.md` "Streaming progress variant" and used by
+/// `ReviewGateMessage`.
+pub enum RebaseGateMessage {
+    Progress(String),
+    Result(RebaseResult),
+}
+
+/// Per-work-item state for an in-flight rebase-onto-main run. Owned by
+/// `App.rebase_gates: HashMap<WorkItemId, RebaseGateState>` so the
+/// state's lifetime is tied structurally to the work item it belongs
+/// to, per the structural-ownership rule in `CLAUDE.md`.
+///
+/// `activity` is the status-bar spinner started when the rebase
+/// admission succeeded. The structural-ownership rule makes this the
+/// single drop site for the spinner: every code path that removes an
+/// entry from `rebase_gates` must go through `drop_rebase_gate`, which
+/// ends the activity so the spinner can never leak.
+///
+/// The base branch is intentionally NOT cached here: it is unknown
+/// until the background thread resolves it via
+/// `WorktreeService::default_branch` (which shells out and would
+/// violate the blocking-I/O invariant if called on the UI thread), and
+/// the final `RebaseResult` carries it back through the channel for
+/// the status-bar summary.
+pub struct RebaseGateState {
+    pub rx: crossbeam_channel::Receiver<RebaseGateMessage>,
+    pub progress: Option<String>,
+    pub activity: ActivityId,
 }
 
 /// Per-work-item state for an in-flight review gate.
@@ -1043,6 +1127,14 @@ pub struct App {
     pub mcp_tx: crossbeam_channel::Sender<McpEvent>,
     /// Per-work-item review gate state. Multiple gates can run concurrently.
     pub review_gates: HashMap<WorkItemId, ReviewGateState>,
+    /// Per-work-item rebase-onto-main gate state. Owns the streaming
+    /// receiver, the status-bar activity, and the base branch name for
+    /// each rebase in flight, so `drop_rebase_gate` is the single drop
+    /// site for all three. Single-flight at the user-action layer
+    /// (`UserActionKey::RebaseOnMain`) means at most one entry exists
+    /// at a time today, but the map shape leaves room for a future
+    /// per-item key without rewriting the ownership story.
+    pub rebase_gates: HashMap<WorkItemId, RebaseGateState>,
 
     // -- Activity indicator --
     /// Monotonic counter for generating unique ActivityId values.
@@ -1750,6 +1842,7 @@ impl App {
             mcp_rx: Some(mcp_rx),
             mcp_tx,
             review_gates: HashMap::new(),
+            rebase_gates: HashMap::new(),
             activity_counter: 0,
             activities: Vec::new(),
             spinner_tick: 0,
@@ -1969,7 +2062,8 @@ impl App {
         match self.user_action_payload(key)? {
             UserActionPayload::PrCreate { wi_id, .. }
             | UserActionPayload::ReviewSubmit { wi_id, .. }
-            | UserActionPayload::WorktreeCreate { wi_id, .. } => Some(wi_id),
+            | UserActionPayload::WorktreeCreate { wi_id, .. }
+            | UserActionPayload::RebaseOnMain { wi_id, .. } => Some(wi_id),
             _ => None,
         }
     }
@@ -5747,6 +5841,66 @@ impl App {
         }
     }
 
+    /// Resolve the currently selected left-panel entry to a
+    /// `(WorkItemId, repo path, branch)` triple suitable for the
+    /// rebase-onto-main flow. Returns `None` if the selection is not a
+    /// work item, has no repo association with both a worktree and a
+    /// branch set, or is the only thing the caller could rebase
+    /// (group headers, unlinked items, review-request items).
+    ///
+    /// The default-branch comparison is intentionally NOT done here:
+    /// `default_branch` shells out to git, and this helper runs on the
+    /// UI thread. A "branch == default branch" rebase is a no-op that
+    /// the harness will detect on its own; gating it on the UI thread
+    /// would require an unconditional blocking call that we cannot
+    /// afford. The single-flight admission and the harness's idempotent
+    /// `git rebase` are sufficient defence-in-depth.
+    ///
+    /// Pure: does not spawn, does not shell out, does not mutate
+    /// `self`. Mirrors the shape of `selected_pr_target` so the
+    /// dispatch site reads the same way.
+    pub(crate) fn selected_rebase_target(&self) -> Option<RebaseTarget> {
+        let idx = self.selected_item?;
+        let entry = self.display_list.get(idx)?;
+        match entry {
+            DisplayEntry::WorkItemEntry(wi_idx) => {
+                let wi = self.work_items.get(*wi_idx)?;
+                let assoc = wi
+                    .repo_associations
+                    .iter()
+                    .find(|a| a.worktree_path.is_some() && a.branch.is_some())?;
+                Some(RebaseTarget {
+                    wi_id: wi.id.clone(),
+                    repo_path: assoc.repo_path.clone(),
+                    branch: assoc.branch.as_ref().cloned()?,
+                })
+            }
+            DisplayEntry::UnlinkedItem(_)
+            | DisplayEntry::ReviewRequestItem(_)
+            | DisplayEntry::GroupHeader { .. } => None,
+        }
+    }
+
+    /// Entry point for the `m` keybinding. Resolves the selected
+    /// rebase target and either spawns the rebase gate or sets a
+    /// "nothing to rebase" status message. Goes through
+    /// `spawn_rebase_gate` which itself routes through
+    /// `try_begin_user_action` for single-flight admission.
+    pub fn start_rebase_on_main(&mut self) {
+        let Some(target) = self.selected_rebase_target() else {
+            self.status_message = Some("No branch to rebase".into());
+            return;
+        };
+        // Reject a rebase on a work item that already has a rebase gate
+        // in flight before talking to the user-action guard, so the
+        // status message names the right cause.
+        if self.rebase_gates.contains_key(&target.wi_id) {
+            self.status_message = Some("Rebase already in progress for this item".into());
+            return;
+        }
+        self.spawn_rebase_gate(target);
+    }
+
     /// Spawn a background thread to fetch the branch and create a worktree
     /// for a freshly imported work item. If another worktree creation is
     /// already in flight, falls back to a status message instead of blocking.
@@ -8612,6 +8766,342 @@ impl App {
         }
     }
 
+    /// Spawn the async rebase-onto-main background gate for the given
+    /// work item. Modelled on `spawn_review_gate`: every blocking step
+    /// (`git fetch`, the headless harness child, default-branch
+    /// resolution) runs inside the spawned thread so the UI thread is
+    /// never blocked.
+    ///
+    /// Single-flight admission goes through `try_begin_user_action`
+    /// with `UserActionKey::RebaseOnMain` and a 500 ms debounce, so
+    /// rapid `m` presses are coalesced.
+    pub fn spawn_rebase_gate(&mut self, target: RebaseTarget) {
+        let RebaseTarget {
+            wi_id,
+            repo_path,
+            branch,
+        } = target;
+
+        // Single-flight admission. The 500 ms debounce matches
+        // `Ctrl+R`: rapid presses are intentionally coalesced.
+        let activity = match self.try_begin_user_action(
+            UserActionKey::RebaseOnMain,
+            Duration::from_millis(500),
+            "Rebasing onto upstream main",
+        ) {
+            Some(id) => id,
+            None => return,
+        };
+        // Attach the WorkItemId payload so any caller that consults
+        // `user_action_work_item(&RebaseOnMain)` can find the owning
+        // item without scanning the rebase_gates map.
+        self.attach_user_action_payload(
+            &UserActionKey::RebaseOnMain,
+            UserActionPayload::RebaseOnMain {
+                wi_id: wi_id.clone(),
+            },
+        );
+
+        let ws = Arc::clone(&self.worktree_service);
+        let (tx, rx) = crossbeam_channel::unbounded::<RebaseGateMessage>();
+        let wi_id_clone = wi_id.clone();
+
+        std::thread::spawn(move || {
+            // === Phase 1: resolve default branch (background only) ===
+            let base_branch = match ws.default_branch(&repo_path) {
+                Ok(b) => b,
+                Err(_) => "main".to_string(),
+            };
+
+            // === Phase 2: git fetch origin <base> ===
+            let _ = tx.send(RebaseGateMessage::Progress(format!(
+                "Fetching origin/{base_branch}..."
+            )));
+            match crate::worktree_service::git_command()
+                .arg("-C")
+                .arg(&repo_path)
+                .args(["fetch", "origin", &base_branch])
+                .output()
+            {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    let _ = tx.send(RebaseGateMessage::Result(RebaseResult::Failure {
+                        base_branch: base_branch.clone(),
+                        reason: format!("git fetch failed: {}", stderr.trim()),
+                        conflicts_attempted: false,
+                    }));
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(RebaseGateMessage::Result(RebaseResult::Failure {
+                        base_branch: base_branch.clone(),
+                        reason: format!("git fetch could not run: {e}"),
+                        conflicts_attempted: false,
+                    }));
+                    return;
+                }
+            }
+            let _ = tx.send(RebaseGateMessage::Progress(
+                "Fetched. Asking the assistant to rebase...".into(),
+            ));
+
+            // === Phase 3: launch headless harness with workbridge MCP ===
+            //
+            // The MCP server gets its OWN local sender/receiver pair so
+            // the spawning thread can drain `workbridge_log_event` /
+            // `workbridge_report_progress` calls in real time and
+            // translate them into `RebaseGateMessage::Progress`. The
+            // server's tx is intentionally NOT `self.mcp_tx` because
+            // routing the rebase gate's progress through the main
+            // dispatch loop would mix it with unrelated events and
+            // require new branches in the main `McpEvent` handler.
+            let (gate_mcp_tx, gate_mcp_rx) = crossbeam_channel::unbounded::<McpEvent>();
+            let gate_socket = crate::mcp::socket_path_for_session();
+            let gate_server = match crate::mcp::McpSocketServer::start(
+                gate_socket.clone(),
+                serde_json::to_string(&wi_id_clone).unwrap_or_default(),
+                String::new(),
+                serde_json::json!({
+                    "work_item_id": serde_json::to_string(&wi_id_clone).unwrap_or_default(),
+                    "repo_path": repo_path.display().to_string(),
+                    "branch": branch,
+                    "base_branch": base_branch,
+                })
+                .to_string(),
+                None,
+                gate_mcp_tx,
+                false, // read_only=false: harness must call workbridge_set_status / workbridge_log_event
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(RebaseGateMessage::Result(RebaseResult::Failure {
+                        base_branch: base_branch.clone(),
+                        reason: format!("rebase gate: could not start MCP server: {e}"),
+                        conflicts_attempted: false,
+                    }));
+                    return;
+                }
+            };
+
+            let exe_path = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    drop(gate_server);
+                    let _ = tx.send(RebaseGateMessage::Result(RebaseResult::Failure {
+                        base_branch: base_branch.clone(),
+                        reason: format!("rebase gate: could not resolve exe path: {e}"),
+                        conflicts_attempted: false,
+                    }));
+                    return;
+                }
+            };
+            let mcp_config = crate::mcp::build_mcp_config(&exe_path, &gate_socket, &[]);
+            let config_path = std::env::temp_dir().join(format!(
+                "workbridge-rebase-mcp-{}.json",
+                uuid::Uuid::new_v4()
+            ));
+            if let Err(e) = std::fs::write(&config_path, &mcp_config) {
+                drop(gate_server);
+                let _ = tx.send(RebaseGateMessage::Result(RebaseResult::Failure {
+                    base_branch: base_branch.clone(),
+                    reason: format!("rebase gate: could not write MCP config: {e}"),
+                    conflicts_attempted: false,
+                }));
+                return;
+            }
+
+            let prompt = format!(
+                "You are running inside a workbridge rebase gate. Your job is to rebase \
+                 the current branch (`{branch}`) onto `origin/{base_branch}` in this \
+                 working directory and resolve any conflicts that arise.\n\n\
+                 Steps:\n\
+                 1. Run `git rebase origin/{base_branch}`.\n\
+                 2. If conflicts appear, inspect the conflicted files, resolve them \
+                    in place (preferring the semantics of `{branch}` while keeping \
+                    upstream changes intact), `git add` the resolved files, and run \
+                    `git rebase --continue`. Repeat until the rebase completes.\n\
+                 3. If you cannot resolve the conflicts, run `git rebase --abort` so \
+                    the worktree is left clean.\n\
+                 4. Do NOT run `git push` under any circumstances. The user will \
+                    push manually.\n\n\
+                 As you work, call the `workbridge_log_event` MCP tool with \
+                 `event_type='rebase_progress'` and a `payload` object containing a \
+                 `message` field describing what you are about to do. This streams \
+                 progress to the workbridge UI.\n\n\
+                 When you finish, respond with a single JSON object on stdout (no \
+                 prose) of the shape:\n\
+                 {{\"success\": <bool>, \"conflicts_resolved\": <bool>, \"detail\": \
+                 <string>}}\n\n\
+                 - `success` = true if the branch is now rebased onto \
+                 `origin/{base_branch}`.\n\
+                 - `conflicts_resolved` = true if you had to resolve at least one \
+                 conflict before finishing.\n\
+                 - `detail` = a human-readable one-line summary.\n\n\
+                 Then call `workbridge_set_status` with status `Implementing` and a \
+                 `reason` describing the final outcome so a later session viewing \
+                 this work item can see the rebase happened."
+            );
+
+            let json_schema = r#"{"type":"object","properties":{"success":{"type":"boolean"},"conflicts_resolved":{"type":"boolean"},"detail":{"type":"string"}},"required":["success","detail"]}"#;
+
+            // Spawn the harness child in a sub-thread so we can drain
+            // gate_mcp_rx for live progress events while waiting for
+            // the child to exit.
+            let (output_tx, output_rx) =
+                crossbeam_channel::bounded::<std::io::Result<std::process::Output>>(1);
+            {
+                let config_path = config_path.clone();
+                let repo_path = repo_path.clone();
+                let prompt = prompt.clone();
+                std::thread::spawn(move || {
+                    let result = std::process::Command::new("claude")
+                        .args([
+                            "--print",
+                            "--dangerously-skip-permissions",
+                            "-p",
+                            &prompt,
+                            "--output-format",
+                            "json",
+                            "--json-schema",
+                            json_schema,
+                            "--mcp-config",
+                            &config_path.to_string_lossy(),
+                        ])
+                        .current_dir(&repo_path)
+                        .output();
+                    let _ = output_tx.send(result);
+                });
+            }
+
+            let mut conflicts_attempted_observed = false;
+            let final_output = loop {
+                crossbeam_channel::select! {
+                    recv(gate_mcp_rx) -> evt => {
+                        match evt {
+                            Ok(McpEvent::ReviewGateProgress { message, .. }) => {
+                                let _ = tx.send(RebaseGateMessage::Progress(message));
+                            }
+                            Ok(McpEvent::LogEvent { event_type, payload, .. }) => {
+                                if event_type == "rebase_progress" {
+                                    let msg = payload
+                                        .get("message")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("...")
+                                        .to_string();
+                                    if msg.to_lowercase().contains("conflict") {
+                                        conflicts_attempted_observed = true;
+                                    }
+                                    let _ = tx.send(RebaseGateMessage::Progress(msg));
+                                }
+                            }
+                            Ok(_) => {
+                                // Other MCP events (set_status, set_plan, ...) are
+                                // intentionally ignored: the rebase gate does not
+                                // act on them, only on the harness's structured
+                                // exit envelope below.
+                            }
+                            Err(_) => {
+                                // Channel disconnected - server gone. Continue
+                                // waiting for the child to exit; the output_rx
+                                // arm below will fire shortly.
+                            }
+                        }
+                    }
+                    recv(output_rx) -> output_result => {
+                        break output_result;
+                    }
+                }
+            };
+
+            // Clean up the MCP server and the temp config file before
+            // building the result so the temp-file rm is not skipped on
+            // any of the early-return arms below.
+            drop(gate_server);
+            let _ = std::fs::remove_file(&config_path);
+
+            let result = match final_output {
+                Ok(Ok(output)) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    match serde_json::from_str::<serde_json::Value>(&stdout) {
+                        Ok(envelope) => {
+                            let structured = &envelope["structured_output"];
+                            let success = structured["success"].as_bool().unwrap_or(false);
+                            let conflicts_resolved =
+                                structured["conflicts_resolved"].as_bool().unwrap_or(false);
+                            let detail = structured["detail"].as_str().unwrap_or("").to_string();
+                            if success {
+                                RebaseResult::Success {
+                                    base_branch: base_branch.clone(),
+                                    conflicts_resolved,
+                                }
+                            } else {
+                                RebaseResult::Failure {
+                                    base_branch: base_branch.clone(),
+                                    reason: if detail.is_empty() {
+                                        "harness reported failure".into()
+                                    } else {
+                                        detail
+                                    },
+                                    conflicts_attempted: conflicts_resolved
+                                        || conflicts_attempted_observed,
+                                }
+                            }
+                        }
+                        Err(e) => RebaseResult::Failure {
+                            base_branch: base_branch.clone(),
+                            reason: format!("rebase gate: invalid JSON envelope: {e}"),
+                            conflicts_attempted: conflicts_attempted_observed,
+                        },
+                    }
+                }
+                Ok(Ok(output)) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    RebaseResult::Failure {
+                        base_branch: base_branch.clone(),
+                        reason: format!("harness exited with error: {}", stderr.trim()),
+                        conflicts_attempted: conflicts_attempted_observed,
+                    }
+                }
+                Ok(Err(e)) => RebaseResult::Failure {
+                    base_branch: base_branch.clone(),
+                    reason: format!("could not run harness: {e}"),
+                    conflicts_attempted: conflicts_attempted_observed,
+                },
+                Err(e) => RebaseResult::Failure {
+                    base_branch: base_branch.clone(),
+                    reason: format!("rebase gate: harness thread disconnected: {e}"),
+                    conflicts_attempted: conflicts_attempted_observed,
+                },
+            };
+
+            let _ = tx.send(RebaseGateMessage::Result(result));
+        });
+
+        self.rebase_gates.insert(
+            wi_id.clone(),
+            RebaseGateState {
+                rx,
+                progress: Some("Resolving base branch...".to_string()),
+                activity,
+            },
+        );
+    }
+
+    /// Drop a rebase gate and end its status-bar activity. Mirrors
+    /// `drop_review_gate`: structural ownership of the
+    /// `ActivityId` lives inside `RebaseGateState`, so every site that
+    /// removes a `rebase_gates` entry MUST go through this helper to
+    /// avoid leaking a spinner. Also clears the user-action guard slot
+    /// so a follow-up `m` press can run without waiting for the
+    /// debounce window.
+    fn drop_rebase_gate(&mut self, wi_id: &WorkItemId) {
+        if let Some(state) = self.rebase_gates.remove(wi_id) {
+            self.end_activity(state.activity);
+        }
+        self.end_user_action(&UserActionKey::RebaseOnMain);
+    }
+
     /// Poll all async review gates for results. Called on each timer tick.
     /// If a gate has completed, processes the result: advances to Review
     /// if approved, stays in Implementing if rejected.
@@ -8863,6 +9353,102 @@ impl App {
                 }
                 self.cleanup_session_state_for(&wi_id);
                 self.spawn_session(&wi_id);
+            }
+        }
+    }
+
+    /// Poll all async rebase gates for results. Called on each timer
+    /// tick from `salsa.rs` next to `poll_review_gate`.
+    ///
+    /// On a final `Result`:
+    ///
+    /// - `Success` -> set a status message naming the base branch and
+    ///   drop the gate. `drop_rebase_gate` clears the user-action guard
+    ///   slot so a follow-up `m` press is admitted right away.
+    /// - `Failure` -> set a status message with the reason and drop
+    ///   the gate. The worktree is left in whatever state the harness
+    ///   leaves it; the harness is responsible for `git rebase --abort`
+    ///   on the give-up path. We do NOT shell out to `git status`
+    ///   here - the next fetcher tick will refresh the cached
+    ///   `git_state` and the indicators will re-render.
+    pub fn poll_rebase_gate(&mut self) {
+        if self.rebase_gates.is_empty() {
+            return;
+        }
+
+        let wi_ids: Vec<WorkItemId> = self.rebase_gates.keys().cloned().collect();
+
+        for wi_id in wi_ids {
+            let gate = match self.rebase_gates.get(&wi_id) {
+                Some(g) => g,
+                None => continue,
+            };
+
+            let mut last_progress: Option<String> = None;
+            let mut result: Option<RebaseResult> = None;
+            let mut disconnected = false;
+
+            loop {
+                match gate.rx.try_recv() {
+                    Ok(RebaseGateMessage::Progress(text)) => {
+                        last_progress = Some(text);
+                    }
+                    Ok(RebaseGateMessage::Result(r)) => {
+                        result = Some(r);
+                        break;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+
+            if let Some(progress) = last_progress
+                && let Some(gate) = self.rebase_gates.get_mut(&wi_id)
+            {
+                gate.progress = Some(progress);
+            }
+
+            if disconnected && result.is_none() {
+                self.drop_rebase_gate(&wi_id);
+                self.status_message =
+                    Some("Rebase gate: background thread exited unexpectedly".into());
+                continue;
+            }
+
+            let result = match result {
+                Some(r) => r,
+                None => continue,
+            };
+
+            self.drop_rebase_gate(&wi_id);
+
+            match result {
+                RebaseResult::Success {
+                    base_branch,
+                    conflicts_resolved,
+                } => {
+                    self.status_message = Some(if conflicts_resolved {
+                        format!("Rebased onto origin/{base_branch} (conflicts resolved by harness)")
+                    } else {
+                        format!("Rebased onto origin/{base_branch}")
+                    });
+                }
+                RebaseResult::Failure {
+                    base_branch,
+                    reason,
+                    conflicts_attempted,
+                } => {
+                    self.status_message = Some(if conflicts_attempted {
+                        format!(
+                            "Rebase onto origin/{base_branch} failed after conflict resolution: {reason}"
+                        )
+                    } else {
+                        format!("Rebase onto origin/{base_branch} failed: {reason}")
+                    });
+                }
             }
         }
     }
@@ -18937,6 +19523,150 @@ mod tests {
         app.selected_item = Some(0);
         app.open_selected_pr_in_browser();
         assert_eq!(app.status_message.as_deref(), Some("No PR to open"));
+    }
+
+    // -----------------------------------------------------------------------
+    // `selected_rebase_target` - resolves selection -> rebase target for `m`.
+    // The tests target the pure helper rather than `start_rebase_on_main`
+    // because the latter would call `spawn_rebase_gate`, which spawns a
+    // thread and shells out to `git fetch` / `claude`. Hermetic.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rebase_target_resolves_workitem_with_worktree_and_branch() {
+        use crate::work_item::RepoAssociation;
+        let mut app = App::new();
+        // First association has no worktree, second has both - asserts
+        // that the helper picks the first repo with a worktree AND a
+        // branch, so unresolved associations do not block.
+        app.work_items.push(WorkItem {
+            id: WorkItemId::LocalFile(PathBuf::from("/data/wi.json")),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            display_id: None,
+            title: "Work".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![
+                RepoAssociation {
+                    repo_path: PathBuf::from("/repo-a"),
+                    branch: Some("feat/a".into()),
+                    worktree_path: None,
+                    pr: None,
+                    issue: None,
+                    git_state: None,
+                },
+                RepoAssociation {
+                    repo_path: PathBuf::from("/repo-b"),
+                    branch: Some("feat/b".into()),
+                    worktree_path: Some(PathBuf::from("/repo-b/.worktrees/feat/b")),
+                    pr: None,
+                    issue: None,
+                    git_state: None,
+                },
+            ],
+            errors: vec![],
+        });
+        app.display_list.push(DisplayEntry::WorkItemEntry(0));
+        app.selected_item = Some(0);
+
+        let target = app
+            .selected_rebase_target()
+            .expect("workitem with a worktreed branch must produce a rebase target");
+        assert_eq!(target.repo_path, PathBuf::from("/repo-b"));
+        assert_eq!(target.branch, "feat/b");
+    }
+
+    #[test]
+    fn rebase_target_none_for_workitem_without_worktree() {
+        use crate::work_item::RepoAssociation;
+        let mut app = App::new();
+        app.work_items.push(WorkItem {
+            id: WorkItemId::LocalFile(PathBuf::from("/data/wi.json")),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            display_id: None,
+            title: "Work".into(),
+            description: None,
+            status: WorkItemStatus::Backlog,
+            status_derived: false,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/repo-a"),
+                branch: Some("feat/a".into()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+        app.display_list.push(DisplayEntry::WorkItemEntry(0));
+        app.selected_item = Some(0);
+
+        assert!(
+            app.selected_rebase_target().is_none(),
+            "no worktree => no rebase target",
+        );
+    }
+
+    #[test]
+    fn rebase_target_none_for_unlinked() {
+        let mut app = App::new();
+        app.unlinked_prs.push(crate::work_item::UnlinkedPr {
+            repo_path: PathBuf::from("/repo"),
+            pr: sample_pr_info(7, "https://github.com/o/r/pull/7"),
+            branch: "feat/y".into(),
+        });
+        app.display_list.push(DisplayEntry::UnlinkedItem(0));
+        app.selected_item = Some(0);
+        assert!(app.selected_rebase_target().is_none());
+    }
+
+    #[test]
+    fn rebase_target_none_for_review_request() {
+        let mut app = App::new();
+        app.review_requested_prs
+            .push(crate::work_item::ReviewRequestedPr {
+                repo_path: PathBuf::from("/repo"),
+                pr: sample_pr_info(42, "https://github.com/o/r/pull/42"),
+                branch: "feat/x".into(),
+                requested_reviewer_logins: Vec::new(),
+                requested_team_slugs: Vec::new(),
+            });
+        app.display_list.push(DisplayEntry::ReviewRequestItem(0));
+        app.selected_item = Some(0);
+        assert!(app.selected_rebase_target().is_none());
+    }
+
+    #[test]
+    fn rebase_target_none_for_group_header() {
+        let mut app = App::new();
+        app.display_list.push(DisplayEntry::GroupHeader {
+            label: "ACTIVE".into(),
+            count: 0,
+            kind: GroupHeaderKind::Normal,
+        });
+        app.selected_item = Some(0);
+        assert!(app.selected_rebase_target().is_none());
+    }
+
+    #[test]
+    fn start_rebase_on_main_sets_status_when_nothing_to_rebase() {
+        // Smoke test for `start_rebase_on_main` on the None path: the
+        // helper must surface a user-visible status message without
+        // spawning a thread or shelling out. The Some path is not
+        // exercised here because it spawns a background thread that
+        // calls `git fetch` and `claude`.
+        let mut app = App::new();
+        app.display_list.push(DisplayEntry::GroupHeader {
+            label: "ACTIVE".into(),
+            count: 0,
+            kind: GroupHeaderKind::Normal,
+        });
+        app.selected_item = Some(0);
+        app.start_rebase_on_main();
+        assert_eq!(app.status_message.as_deref(), Some("No branch to rebase"));
     }
 
     // -- Feature: ReviewRequest merge auto-close polling --

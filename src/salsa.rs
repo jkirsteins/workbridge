@@ -406,6 +406,13 @@ pub fn app_event(
                 // Poll async review gate result.
                 state.poll_review_gate();
 
+                // Poll async rebase gate result. Sits next to
+                // poll_review_gate because the two run on the same
+                // tick cadence and the rebase gate's right-pane
+                // takeover (`src/ui.rs`) reads from `app.rebase_gates`
+                // produced by this poll.
+                state.poll_rebase_gate();
+
                 // Poll async PR creation result.
                 state.poll_pr_creation();
 

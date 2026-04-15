@@ -871,6 +871,23 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 sync_layout(app);
             }
         }
+        // m - rebase the selected work item's branch onto the latest
+        // upstream main. Spawns a background thread that runs `git
+        // fetch origin <main>` and then a headless harness instance
+        // wired to the workbridge MCP, with cwd set to the work item's
+        // worktree, to perform the rebase and resolve any conflicts in
+        // place. Single-flight via `UserActionKey::RebaseOnMain` (500 ms
+        // debounce); a second `m` press while a rebase is in flight is
+        // silently coalesced. Not added to `handle_key_right` for the
+        // same reason as `o`: single keystrokes in the right panel are
+        // forwarded to the PTY.
+        (KeyModifiers::NONE, KeyCode::Char('m')) => {
+            let had_status = app.has_visible_status_bar();
+            app.start_rebase_on_main();
+            if app.has_visible_status_bar() != had_status {
+                sync_layout(app);
+            }
+        }
         _ => {}
     }
 }

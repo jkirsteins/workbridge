@@ -1835,23 +1835,51 @@ fn format_work_item_entry<'a>(
     }
 
     // Unclean-worktree chip. Rendered whenever ANY repo association has
-    // a derived `GitState` that reports uncommitted changes, unpushed
-    // commits, or a behind-remote delta. `git_state.dirty` is the union
-    // of modified-tracked-files and untracked-files (see `GitState`
-    // doc comment); the merge guard lives in `App::execute_merge` as a
-    // background `WorktreeService::list_worktrees` precheck and
-    // distinguishes the variants via
-    // `WorktreeCleanliness::from_worktree_info`. The chip render here
-    // is a pure cache read and cannot shell out, honouring the "no
-    // blocking I/O on the UI thread" invariant.
-    let is_unclean = wi.repo_associations.iter().any(|a| {
-        a.git_state
-            .as_ref()
-            .map(|gs| gs.dirty || gs.ahead > 0 || gs.behind > 0)
-            .unwrap_or(false)
-    });
+    // a derived `GitState` whose `dirty` flag is set. `git_state.dirty`
+    // is the union of modified-tracked-files and untracked-files (see
+    // `GitState` doc comment). The merge guard lives in
+    // `App::execute_merge` as a background
+    // `WorktreeService::list_worktrees` precheck and distinguishes the
+    // variants via `WorktreeCleanliness::from_worktree_info`. The chip
+    // render here is a pure cache read and cannot shell out,
+    // honouring the "no blocking I/O on the UI thread" invariant.
+    //
+    // Ahead/behind state is rendered via the dedicated `!pushed` /
+    // `!pulled` chips below; `!cl` is exclusively for "uncommitted
+    // changes in the worktree" so a clean-but-diverged branch no
+    // longer flags as unclean.
+    let is_unclean = wi
+        .repo_associations
+        .iter()
+        .any(|a| a.git_state.as_ref().map(|gs| gs.dirty).unwrap_or(false));
     if is_unclean {
         right_parts.push((" !cl".to_string(), theme.style_badge_worktree_unclean()));
+    }
+
+    // Needs-push chip: any repo association has unpushed commits.
+    // Rendered whenever `git_state.ahead > 0` for at least one
+    // association. Always derived from the same fetcher cache as
+    // `!cl`, so this is also a pure in-memory read.
+    let needs_push = wi
+        .repo_associations
+        .iter()
+        .any(|a| a.git_state.as_ref().map(|gs| gs.ahead > 0).unwrap_or(false));
+    if needs_push {
+        right_parts.push((" !pushed".to_string(), theme.style_badge_pushed()));
+    }
+
+    // Needs-pull chip: any repo association is behind its upstream.
+    // Rendered whenever `git_state.behind > 0` for at least one
+    // association. Coexists with `!cl` and `!pushed` on a row that is
+    // dirty AND diverged in both directions.
+    let needs_pull = wi.repo_associations.iter().any(|a| {
+        a.git_state
+            .as_ref()
+            .map(|gs| gs.behind > 0)
+            .unwrap_or(false)
+    });
+    if needs_pull {
+        right_parts.push((" !pulled".to_string(), theme.style_badge_pulled()));
     }
 
     // Multi-repo indicator.
@@ -2755,6 +2783,42 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
 
     match selected_entry {
         Some(DisplayEntry::WorkItemEntry(wi_idx)) => {
+            // Check if the rebase gate is running for this work item.
+            // Rebase gate render takes precedence over the review gate
+            // by explicit ordering; in practice they cannot both be in
+            // flight (the rebase gate goes through
+            // `UserActionKey::RebaseOnMain` and is started from the
+            // left panel only) but the deterministic order keeps the
+            // render path predictable.
+            let rebase_gate_active = app
+                .work_items
+                .get(*wi_idx)
+                .map(|wi| app.rebase_gates.contains_key(&wi.id))
+                .unwrap_or(false);
+
+            if rebase_gate_active {
+                let spinner_chars = [b'|', b'/', b'-', b'\\'];
+                let frame = app.spinner_tick % spinner_chars.len();
+                let spinner = spinner_chars[frame] as char;
+                let progress_text = app
+                    .work_items
+                    .get(*wi_idx)
+                    .and_then(|wi| app.rebase_gates.get(&wi.id))
+                    .and_then(|gate| gate.progress.as_deref())
+                    .unwrap_or("Rebasing onto upstream main...");
+                let text = Text::from(vec![
+                    Line::from(""),
+                    Line::from(format!("  {spinner} Running rebase gate...")),
+                    Line::from(""),
+                    Line::from(format!("  {progress_text}")),
+                ]);
+                let paragraph = Paragraph::new(text)
+                    .block(block)
+                    .style(theme.style_text_muted());
+                paragraph.render(area, buf);
+                return;
+            }
+
             // Check if the review gate is running for this work item.
             let review_gate_active = app
                 .work_items
