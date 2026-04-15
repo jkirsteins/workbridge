@@ -433,9 +433,17 @@ pub enum ReviewGateOrigin {
 /// `App::start_rebase_on_main` -> `App::spawn_rebase_gate`. Carries
 /// only the ids the spawn function needs, so the `m` key path stays
 /// trivially testable without standing up a full work item.
+///
+/// `worktree_path` is intentionally the work item's worktree, not the
+/// registered repo root. Each git worktree has its own HEAD, so any
+/// `git -C` or `Command::current_dir` call that wants to operate on
+/// `branch` MUST use the worktree path - otherwise it would shell out
+/// against whatever the main checkout currently has checked out (which
+/// is almost always `main` itself, and the rebase no-ops or, worse,
+/// rewrites an unrelated branch).
 pub struct RebaseTarget {
     pub wi_id: WorkItemId,
-    pub repo_path: PathBuf,
+    pub worktree_path: PathBuf,
     pub branch: String,
 }
 
@@ -5869,9 +5877,15 @@ impl App {
                     .repo_associations
                     .iter()
                     .find(|a| a.worktree_path.is_some() && a.branch.is_some())?;
+                // Carry the worktree path, not the registered repo path:
+                // each git worktree has its own HEAD, and the rebase MUST
+                // run against this work item's branch, not whatever the
+                // main checkout has checked out. The `.find` above already
+                // filtered out associations without a worktree, so the
+                // `as_ref()?` here is infallible defence-in-depth.
                 Some(RebaseTarget {
                     wi_id: wi.id.clone(),
-                    repo_path: assoc.repo_path.clone(),
+                    worktree_path: assoc.worktree_path.as_ref().cloned()?,
                     branch: assoc.branch.as_ref().cloned()?,
                 })
             }
@@ -8778,7 +8792,7 @@ impl App {
     pub fn spawn_rebase_gate(&mut self, target: RebaseTarget) {
         let RebaseTarget {
             wi_id,
-            repo_path,
+            worktree_path,
             branch,
         } = target;
 
@@ -8808,7 +8822,14 @@ impl App {
 
         std::thread::spawn(move || {
             // === Phase 1: resolve default branch (background only) ===
-            let base_branch = match ws.default_branch(&repo_path) {
+            //
+            // `default_branch` is queried against the worktree path
+            // because that is the git context every later phase will
+            // use; refs are shared across worktrees in the same repo, so
+            // the answer is identical to querying the main checkout, and
+            // keeping the path consistent avoids a second source of
+            // truth.
+            let base_branch = match ws.default_branch(&worktree_path) {
                 Ok(b) => b,
                 Err(_) => "main".to_string(),
             };
@@ -8819,7 +8840,7 @@ impl App {
             )));
             match crate::worktree_service::git_command()
                 .arg("-C")
-                .arg(&repo_path)
+                .arg(&worktree_path)
                 .args(["fetch", "origin", &base_branch])
                 .output()
             {
@@ -8864,7 +8885,7 @@ impl App {
                 String::new(),
                 serde_json::json!({
                     "work_item_id": serde_json::to_string(&wi_id_clone).unwrap_or_default(),
-                    "repo_path": repo_path.display().to_string(),
+                    "repo_path": worktree_path.display().to_string(),
                     "branch": branch,
                     "base_branch": base_branch,
                 })
@@ -8947,12 +8968,17 @@ impl App {
 
             // Spawn the harness child in a sub-thread so we can drain
             // gate_mcp_rx for live progress events while waiting for
-            // the child to exit.
+            // the child to exit. The `current_dir` MUST be the work
+            // item's worktree path: each git worktree has its own HEAD,
+            // and `git rebase` operates on whatever HEAD the cwd's git
+            // context resolves to. Pointing the child at the registered
+            // repo root would silently rebase the main checkout's
+            // branch instead of `branch`.
             let (output_tx, output_rx) =
                 crossbeam_channel::bounded::<std::io::Result<std::process::Output>>(1);
             {
                 let config_path = config_path.clone();
-                let repo_path = repo_path.clone();
+                let worktree_path = worktree_path.clone();
                 let prompt = prompt.clone();
                 std::thread::spawn(move || {
                     let result = std::process::Command::new("claude")
@@ -8968,7 +8994,7 @@ impl App {
                             "--mcp-config",
                             &config_path.to_string_lossy(),
                         ])
-                        .current_dir(&repo_path)
+                        .current_dir(&worktree_path)
                         .output();
                     let _ = output_tx.send(result);
                 });
@@ -9031,9 +9057,51 @@ impl App {
                                 structured["conflicts_resolved"].as_bool().unwrap_or(false);
                             let detail = structured["detail"].as_str().unwrap_or("").to_string();
                             if success {
-                                RebaseResult::Success {
-                                    base_branch: base_branch.clone(),
-                                    conflicts_resolved,
+                                // Verify the harness's success claim
+                                // against local git state before
+                                // surfacing it to the user. The harness
+                                // can hallucinate, run the wrong
+                                // command, or emit a stale envelope; in
+                                // any of those cases the worktree's
+                                // HEAD will not actually contain
+                                // `origin/<base_branch>`. The
+                                // user-facing-claim rule in CLAUDE.md
+                                // requires that any "it happened"
+                                // status that the code can verify
+                                // locally MUST be verified before
+                                // rendering. `git merge-base
+                                // --is-ancestor A B` exits 0 iff A is
+                                // an ancestor of B and 1 otherwise; any
+                                // other exit is an error and is also
+                                // treated as "did not land".
+                                let ancestry_ok = match crate::worktree_service::git_command()
+                                    .arg("-C")
+                                    .arg(&worktree_path)
+                                    .args([
+                                        "merge-base",
+                                        "--is-ancestor",
+                                        &format!("origin/{base_branch}"),
+                                        "HEAD",
+                                    ])
+                                    .output()
+                                {
+                                    Ok(o) => o.status.success(),
+                                    Err(_) => false,
+                                };
+                                if ancestry_ok {
+                                    RebaseResult::Success {
+                                        base_branch: base_branch.clone(),
+                                        conflicts_resolved,
+                                    }
+                                } else {
+                                    RebaseResult::Failure {
+                                        base_branch: base_branch.clone(),
+                                        reason: format!(
+                                            "harness reported success but origin/{base_branch} is not an ancestor of HEAD"
+                                        ),
+                                        conflicts_attempted: conflicts_resolved
+                                            || conflicts_attempted_observed,
+                                    }
                                 }
                             } else {
                                 RebaseResult::Failure {
@@ -19574,7 +19642,15 @@ mod tests {
         let target = app
             .selected_rebase_target()
             .expect("workitem with a worktreed branch must produce a rebase target");
-        assert_eq!(target.repo_path, PathBuf::from("/repo-b"));
+        // Critical: the target must carry the WORKTREE path, not the
+        // registered repo path. The rebase later runs `git -C <path>`
+        // and `Command::current_dir(<path>)` against this; if it were
+        // the repo path, the rebase would target whatever the main
+        // checkout had checked out instead of `feat/b`.
+        assert_eq!(
+            target.worktree_path,
+            PathBuf::from("/repo-b/.worktrees/feat/b")
+        );
         assert_eq!(target.branch, "feat/b");
     }
 

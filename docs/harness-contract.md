@@ -352,11 +352,20 @@ child) but the harness child for `claude --print` is spawned with
 the default cwd because the gate only needs MCP access to fetch the
 plan. The rebase gate at `src/app.rs:8696` is the opposite case:
 the harness child needs to actually run `git rebase` against the
-worktree, so its `Command::new("claude").current_dir(&repo_path)`
+worktree, so its `Command::new("claude").current_dir(&worktree_path)`
 sets the cwd to the work-item's worktree path explicitly. The cwd
 is captured by destructuring a `RebaseTarget` produced by
 `App::selected_rebase_target` so the spawn site cannot drift from
-the work item the user pressed `m` on.
+the work item the user pressed `m` on. The `worktree_path` field
+on `RebaseTarget` is intentionally the per-worktree directory, not
+the registered repo root: each git worktree has its own HEAD, so a
+rebase launched from the repo root would silently target whatever
+the main checkout has checked out (almost always `main` itself, so
+the rebase no-ops; or, if a different branch is checked out in the
+main checkout, it rewrites that unrelated branch). The same
+`worktree_path` is also used for the in-thread `git fetch origin
+<base>` and `git merge-base --is-ancestor` verification calls so
+every git context the gate touches lives inside the worktree.
 
 **Codex (secondary, not implemented)**: **supported**. Codex accepts
 a `--cd <path>` flag as well as inheriting the parent's cwd; either
@@ -801,6 +810,17 @@ any give-up path. `conflicts_resolved` is informational and used
 only for the human-readable status summary. As with RP5,
 `.as_bool()` / `.as_str()` defaults treat a missing field as
 "failed, empty detail".
+
+The rebase gate does NOT trust `success: true` blindly. Before
+emitting `RebaseResult::Success`, the spawning thread runs `git -C
+<worktree_path> merge-base --is-ancestor origin/<base> HEAD`
+against the same worktree the harness ran in. If that command
+exits non-zero (origin is not an ancestor of HEAD) the gate
+downgrades the result to `RebaseResult::Failure` with a reason
+naming the ancestry mismatch, so a hallucinated envelope, a
+harness that ran the wrong command, or a stale stdout cannot
+produce a false "Rebased onto origin/<base>" status in the UI.
+This is the user-facing-claim verification mandated by CLAUDE.md.
 
 ## Target Trait Sketch
 

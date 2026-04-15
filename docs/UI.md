@@ -1030,9 +1030,16 @@ takes precedence over it). On completion, `poll_rebase_gate` drops
 the gate via `drop_rebase_gate` (which ends the status-bar activity
 AND clears the user-action guard slot in one place) and surfaces a
 "Rebased onto origin/<main>" or "Rebase onto origin/<main> failed:
-<reason>" status message. No `git push` is performed - after a
-successful rebase the user sees `!pushed` (and likely `!pulled`) on
-the row and pushes manually.
+<reason>" status message. The "Rebased" success status is gated on
+a local `git merge-base --is-ancestor origin/<main> HEAD` check
+that the spawning thread runs against the worktree before emitting
+`RebaseResult::Success`; if the check fails (harness hallucinated,
+ran the wrong command, or emitted a stale envelope) the gate
+downgrades to a Failure status naming the ancestry mismatch. The
+UI never claims a rebase succeeded without local git verification.
+No `git push` is performed - after a successful rebase the user
+sees `!pushed` (and likely `!pulled`) on the row and pushes
+manually.
 
 #### Worktree-state chips
 
