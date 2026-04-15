@@ -10,8 +10,8 @@ expression: "render(&mut app, 80, 24)"
 │  Ctrl+N: quick start  ││  Ctrl+N    - Quick start session                    │
 │  Ctrl+B: backlog ticke││  Ctrl+B    - New backlog ticket                     │
 │                   ╭ Rework Reason ───────────────────────╮                   │
-│                   │                                      │t                  │
-│                   │ Why is rework needed?                │                   │
+│                   │                                      │                   │
+│                   │ Why is rework needed?                │t                  │
 │                   │                                      │                   │
 │                   │ needs more error handling            │                   │
 │                   │                                      │                   │

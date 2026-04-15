@@ -10,6 +10,33 @@ use crate::app::{
 use crate::create_dialog::CreateDialogFocus;
 use crate::layout;
 
+/// Returns true if `c` is the character that crossterm 0.28's legacy
+/// keyboard parser reports for `Ctrl+<symbol>`. Crossterm maps the raw
+/// control bytes 0x1C..=0x1F to KeyCode::Char('4'..='7') with CONTROL,
+/// so a Ctrl+\ press arrives either as the literal '\\' or as '4'
+/// depending on the host terminal. This helper centralises the
+/// translation so call sites do not need to rediscover the mapping.
+fn is_ctrl_symbol_char(c: char, symbol: char) -> bool {
+    let legacy = match symbol {
+        '\\' => Some('4'),
+        ']' => Some('5'),
+        '^' => Some('6'),
+        '_' => Some('7'),
+        _ => None,
+    };
+    c == symbol || Some(c) == legacy
+}
+
+/// Returns true if `key` is `Ctrl+<symbol>` regardless of whether
+/// crossterm delivered it as the literal symbol or via its legacy
+/// control-byte translation. Use this for any Ctrl+\ / Ctrl+] /
+/// Ctrl+^ / Ctrl+_ binding so we do not keep one-off matching the
+/// numeric form at every call site.
+fn is_ctrl_symbol(key: KeyEvent, symbol: char) -> bool {
+    key.modifiers == KeyModifiers::CONTROL
+        && matches!(key.code, KeyCode::Char(c) if is_ctrl_symbol_char(c, symbol))
+}
+
 /// Handle a key event by dispatching based on focus panel.
 /// Called from the rat-salsa event callback in salsa.rs.
 ///
@@ -441,7 +468,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // forwarded to the PTY for autocomplete). Does NOT change focus -
     // left panel stays focused if pressed from left, right panel stays
     // focused if pressed from right.
-    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('\\') {
+    //
+    // The match goes through `is_ctrl_symbol` so we accept both the
+    // literal Char('\\') and the Char('4') legacy mapping that some
+    // terminals emit for the Ctrl+\ control byte (0x1C). See
+    // `is_ctrl_symbol_char` for the full mapping table.
+    if is_ctrl_symbol(key, '\\') {
         cycle_right_panel_tab(app);
         return true;
     }
@@ -921,11 +953,12 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         // Ctrl+] returns focus to the left panel.
         //
-        // We match BOTH Char(']') and Char('5') with CONTROL because
-        // crossterm 0.28's legacy keyboard parser maps byte 0x1D (Ctrl+])
-        // to KeyCode::Char('5') with KeyModifiers::CONTROL.
-        KeyCode::Char(']') | KeyCode::Char('5')
-            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        // The guard goes through `is_ctrl_symbol_char` so we accept
+        // both the literal Char(']') and the Char('5') legacy mapping
+        // that some terminals emit for the Ctrl+] control byte (0x1D).
+        // See `is_ctrl_symbol_char` for the full mapping table.
+        KeyCode::Char(c)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && is_ctrl_symbol_char(c, ']') =>
         {
             app.flush_pty_buffers();
             app.focus = FocusPanel::Left;
@@ -1069,8 +1102,13 @@ fn handle_global_drawer_key(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         // Ctrl+] closes the drawer.
-        KeyCode::Char(']') | KeyCode::Char('5')
-            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        //
+        // The guard goes through `is_ctrl_symbol_char` so we accept
+        // both the literal Char(']') and the Char('5') legacy mapping
+        // that some terminals emit for the Ctrl+] control byte (0x1D).
+        // See `is_ctrl_symbol_char` for the full mapping table.
+        KeyCode::Char(c)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && is_ctrl_symbol_char(c, ']') =>
         {
             app.global_drawer_open = false;
             app.focus = app.pre_drawer_focus;
@@ -2432,6 +2470,32 @@ mod tests {
     use crate::salsa::ct::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
 
+    /// `is_ctrl_symbol_char` must accept both the literal symbol and
+    /// crossterm 0.28's legacy numeric form for every Ctrl+<symbol>
+    /// chord whose control byte sits in 0x1C..=0x1F.
+    #[test]
+    fn is_ctrl_symbol_char_covers_legacy_mapping() {
+        // Literal forms always match.
+        assert!(is_ctrl_symbol_char('\\', '\\'));
+        assert!(is_ctrl_symbol_char(']', ']'));
+        assert!(is_ctrl_symbol_char('^', '^'));
+        assert!(is_ctrl_symbol_char('_', '_'));
+
+        // Legacy numeric forms also match.
+        assert!(is_ctrl_symbol_char('4', '\\'));
+        assert!(is_ctrl_symbol_char('5', ']'));
+        assert!(is_ctrl_symbol_char('6', '^'));
+        assert!(is_ctrl_symbol_char('7', '_'));
+
+        // Cross-mapping is rejected.
+        assert!(!is_ctrl_symbol_char('5', '\\'));
+        assert!(!is_ctrl_symbol_char('4', ']'));
+
+        // Unmapped symbols never collide with the legacy table.
+        assert!(!is_ctrl_symbol_char('4', 'a'));
+        assert!(is_ctrl_symbol_char('a', 'a'));
+    }
+
     /// F-2: Create dialog is unreachable during shutdown.
     /// When shutting_down is true, handle_key must ignore all keys except
     /// Q (force quit). Even if the create dialog was open when shutdown
@@ -2770,22 +2834,36 @@ mod tests {
         app.focus = FocusPanel::Right;
 
         // Ctrl+\ should cycle to Claude Code, NOT redirect to the left panel.
-        let key = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
-        handle_key(&mut app, key);
+        // Crossterm 0.28 may deliver the chord either as the literal
+        // Char('\\') or as Char('4') (legacy 0x1C mapping); both forms
+        // must reach the dispatcher.
+        for key in [
+            KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL),
+        ] {
+            // Reset the tab/focus before each variant so the assertions
+            // exercise the actual transition rather than the second key
+            // being a no-op on an already-cycled state.
+            app.right_panel_tab = RightPanelTab::Terminal;
+            app.focus = FocusPanel::Right;
+            app.status_message = None;
 
-        assert!(
-            matches!(app.right_panel_tab, RightPanelTab::ClaudeCode),
-            "Ctrl+\\ must flip the dead-terminal tab to Claude Code",
-        );
-        assert!(
-            matches!(app.focus, FocusPanel::Right),
-            "focus must stay on the right panel after the Ctrl+\\ flip",
-        );
-        let status = app.status_message.as_deref().unwrap_or("");
-        assert!(
-            !status.contains("returned to work items"),
-            "status must not be the dead-session 'returned to work items' message, got: {status}",
-        );
+            handle_key(&mut app, key);
+
+            assert!(
+                matches!(app.right_panel_tab, RightPanelTab::ClaudeCode),
+                "Ctrl+\\ ({key:?}) must flip the dead-terminal tab to Claude Code",
+            );
+            assert!(
+                matches!(app.focus, FocusPanel::Right),
+                "focus must stay on the right panel after the Ctrl+\\ ({key:?}) flip",
+            );
+            let status = app.status_message.as_deref().unwrap_or("");
+            assert!(
+                !status.contains("returned to work items"),
+                "status must not be the dead-session 'returned to work items' message, got: {status}",
+            );
+        }
     }
 
     /// Symmetric regression: `Ctrl+\` on the Claude Code tab when the
@@ -2855,25 +2933,34 @@ mod tests {
             },
         );
 
-        app.right_panel_tab = RightPanelTab::ClaudeCode;
-        app.focus = FocusPanel::Right;
+        // Crossterm 0.28 may deliver the chord either as Char('\\') or
+        // Char('4') (legacy 0x1C mapping); both forms must reach the
+        // dispatcher. Reset the tab/focus before each variant so each
+        // assertion exercises a real transition.
+        for key in [
+            KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL),
+        ] {
+            app.right_panel_tab = RightPanelTab::ClaudeCode;
+            app.focus = FocusPanel::Right;
+            app.status_message = None;
 
-        let key = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
-        handle_key(&mut app, key);
+            handle_key(&mut app, key);
 
-        assert!(
-            matches!(app.right_panel_tab, RightPanelTab::Terminal),
-            "Ctrl+\\ must flip the dead Claude Code tab to Terminal",
-        );
-        assert!(
-            matches!(app.focus, FocusPanel::Right),
-            "focus must stay on the right panel after the Ctrl+\\ flip",
-        );
-        let status = app.status_message.as_deref().unwrap_or("");
-        assert!(
-            !status.contains("returned to work items"),
-            "status must not be the dead-session 'returned to work items' message, got: {status}",
-        );
+            assert!(
+                matches!(app.right_panel_tab, RightPanelTab::Terminal),
+                "Ctrl+\\ ({key:?}) must flip the dead Claude Code tab to Terminal",
+            );
+            assert!(
+                matches!(app.focus, FocusPanel::Right),
+                "focus must stay on the right panel after the Ctrl+\\ ({key:?}) flip",
+            );
+            let status = app.status_message.as_deref().unwrap_or("");
+            assert!(
+                !status.contains("returned to work items"),
+                "status must not be the dead-session 'returned to work items' message, got: {status}",
+            );
+        }
     }
 
     // -- Mouse scroll encoding tests --

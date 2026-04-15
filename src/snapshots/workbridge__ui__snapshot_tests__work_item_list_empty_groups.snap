@@ -1,7 +1,6 @@
 ---
 source: src/ui.rs
-assertion_line: 4527
-expression: "render(&app, 80, 24)"
+expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
 ┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
@@ -10,6 +9,7 @@ expression: "render(&app, 80, 24)"
 │                       ││                                                     │
 │  Ctrl+N: quick start  ││  Ctrl+N    - Quick start session                    │
 │  Ctrl+B: backlog ticke││  Ctrl+B    - New backlog ticket                     │
+│                       ││  Ctrl+R    - Refresh GitHub data                    │
 │                       ││  Up/Down   - Navigate items                         │
 │                       ││  Enter     - Open session / Import                  │
 │                       ││  o         - Open PR in browser                     │
@@ -18,7 +18,6 @@ expression: "render(&app, 80, 24)"
 │                       ││  Ctrl+D    - Delete work item                       │
 │                       ││  ?         - Settings                               │
 │                       ││  Q/Ctrl+Q  - Quit                                   │
-│                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

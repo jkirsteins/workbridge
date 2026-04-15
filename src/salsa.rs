@@ -409,6 +409,13 @@ pub fn app_event(
                 // Poll async PR creation result.
                 state.poll_pr_creation();
 
+                // Poll async live working-tree precheck. Runs at the
+                // same ~200ms cadence as `poll_pr_merge`; on Ready it
+                // hands off to the actual merge thread, on Blocked it
+                // surfaces the live worktree blocker as an alert. See
+                // `App::poll_merge_precheck`.
+                state.poll_merge_precheck();
+
                 // Poll async PR merge result.
                 state.poll_pr_merge();
 

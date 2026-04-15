@@ -206,10 +206,30 @@ read from the cache**. Concretely:
 - Worktree / branch metadata - read from
   `self.repo_data[repo_path].worktrees` (which carries
   `has_commits_ahead` so `branch_has_commits` is a pure cache lookup,
-  plus `dirty` / `untracked` / `unpushed` / `behind_remote` so
-  `App::worktree_cleanliness` can classify a worktree's local state
-  without shelling out - used by the `!cl` chip renderer and the
-  Review -> Done merge guard).
+  plus `dirty` / `untracked` / `unpushed` / `behind_remote` so the
+  `format_work_item_entry` `!cl` chip renderer can flag an unclean
+  worktree without shelling out). The Review -> Done **merge guard**
+  runs a live `WorktreeService::list_worktrees` precheck on a
+  background thread (`App::spawn_merge_precheck` /
+  `App::poll_merge_precheck`) before letting the actual `gh pr merge`
+  thread fire - the cache stays authoritative for the `!cl` chip but
+  is NEVER consulted for the irrevocable merge decision, because long
+  sessions can leave the cached `dirty: true` value stale long after
+  the user has committed and pushed. The classification is done via
+  `WorktreeCleanliness::from_worktree_info` against the live
+  `WorktreeInfo` so the precheck and the chip render share one
+  canonical priority ordering and wording. `App::advance_stage` does
+  NOT do its own cleanliness check on the Review -> Done branch: it
+  unconditionally opens the merge confirm modal, and the live
+  precheck inside `execute_merge` is the only authority. (The
+  earlier cached guard in `advance_stage` was the source of a stale-
+  cache regression where users could not merge after committing
+  because the fetcher cache had not refreshed yet.) The merge guard
+  reserves its `UserActionKey::PrMerge` slot in `execute_merge`
+  BEFORE spawning the precheck and only releases it on the Blocked /
+  disconnected branches of `poll_merge_precheck`, so the precheck
+  and the actual merge share one single-flight slot across both
+  phases.
 - Backend file reads (`read_plan`, `list`) - clone the `Arc<dyn
   WorkItemBackend>` into the background closure and run the read there.
 - `default_branch`, `github_remote`, `git diff` - clone the
@@ -737,7 +757,41 @@ Key semantics:
   spawn functions admit the helper entry and then immediately
   `end_activity(activity_id)` on the returned ID. The map entry stays
   alive so `is_user_action_in_flight` keeps reporting the true state;
-  only the visible spinner is suppressed.
+  only the visible spinner is suppressed. `execute_merge` follows the
+  same rule: the merge confirmation modal renders its own
+  "Checking working tree..." / "Merging pull request..." spinner from
+  the moment the user pressed merge, so the status-bar activity is
+  ended via `end_activity` immediately after `try_begin_user_action`
+  returns.
+- **Two-phase admission (PrMerge).** `execute_merge` admits the
+  `UserActionKey::PrMerge` slot BEFORE the live working-tree precheck
+  spawns, and the helper entry is held across both the precheck phase
+  (`spawn_merge_precheck` / `poll_merge_precheck`) AND the actual
+  `gh pr merge` phase (`perform_merge_after_precheck` /
+  `poll_pr_merge`). Only the Blocked / disconnected branches of
+  `poll_merge_precheck` and the terminal arms of `poll_pr_merge`
+  release the slot. `perform_merge_after_precheck` does NOT re-admit
+  the key; it only swaps the payload from
+  `UserActionPayload::PrMergePrecheck` to
+  `UserActionPayload::PrMerge` via `attach_user_action_payload`,
+  which drops the precheck receiver in the same step. This keeps
+  the helper's single-flight invariant intact across the
+  precheck-to-merge handoff while still letting the precheck thread
+  run on a background thread without blocking the UI.
+
+  Both phases own their receivers structurally inside the helper
+  slot's payload: the precheck rx lives in `PrMergePrecheck { rx }`
+  and the merge rx lives in `PrMerge { rx }`. There is no sibling
+  `Option<Receiver>` field on `App`. Every cancellation site that
+  calls `end_user_action(&UserActionKey::PrMerge)` (currently
+  `retreat_stage` and `delete_work_item_by_id`) drops the entire
+  helper entry, which drops whichever payload it held, which drops
+  the receiver - one structural step, no lockstep clears to forget.
+  This is the "structural ownership over manual correlation"
+  pattern from `CLAUDE.md` applied to the merge precheck. The UI
+  uses `App::is_merge_precheck_phase()` to switch the modal body
+  between "Checking working tree..." and "Merging pull request..."
+  by inspecting the payload variant directly.
 - **Caller-local rejection messages.** When `try_begin_user_action`
   returns `None`, the caller re-adds its existing alert / status
   string verbatim. `execute_merge` keeps `"PR merge already in

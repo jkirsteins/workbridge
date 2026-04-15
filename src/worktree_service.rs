@@ -49,8 +49,9 @@ pub struct WorktreeInfo {
     /// `list_worktrees` from `git status --porcelain -uall`. `None` means
     /// the check was not attempted or failed; UI-thread readers treat
     /// `None` as "unknown" and fall back to their safe default. See the
-    /// "Unclean worktree indicator + merge guard" flow for how this
-    /// feeds `App::worktree_cleanliness`.
+    /// "Unclean worktree indicator + merge guard" flow for how the
+    /// live precheck feeds this through
+    /// `WorktreeCleanliness::from_worktree_info`.
     pub dirty: Option<bool>,
     /// Cached answer to "does this worktree have any untracked files?" -
     /// populated by `list_worktrees` from the same
@@ -352,8 +353,9 @@ impl WorktreeService for GitWorktreeService {
         });
 
         // Populate cached per-worktree state for each non-main worktree so
-        // UI-thread code (`App::branch_has_commits`, `App::worktree_cleanliness`)
-        // can consult the cache instead of shelling out. Each populated
+        // UI-thread code (`App::branch_has_commits` and the unclean-chip
+        // renderer in `format_work_item_entry`) can consult the cache
+        // instead of shelling out. Each populated
         // field is documented on `WorktreeInfo` itself; we run three git
         // commands per worktree on the background fetcher thread:
         //

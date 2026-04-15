@@ -1,6 +1,6 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 24)"
+expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
 ┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
@@ -10,8 +10,8 @@ expression: "render(&app, 80, 24)"
 │  Ctrl+N: quick start  ││  Ctrl+N    - Quick start session                    │
 │  Ctrl+B: backlog t╭ Merge Strategy ──────────────────────╮                   │
 │                   │                                      │                   │
-│                   │ Merge PR?                            │t                  │
-│                   │                                      │                   │
+│                   │ Merge PR?                            │                   │
+│                   │                                      │t                  │
 │                   │ [s]  Squash (default)                │                   │
 │                   │ [m]  Merge                           │                   │
 │                   │ [p]  Poll (mergequeue)               │                   │
