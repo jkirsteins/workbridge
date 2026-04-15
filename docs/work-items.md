@@ -405,6 +405,19 @@ This means:
 - One branch can never have multiple worktrees on the same machine,
   because git prohibits two worktrees on the same branch.
 
+### Backward compatibility with records missing `id`
+
+Records created before the `id` field was added are accepted similarly
+to the `display_id` migration note below: on first load, the backend
+injects `id = LocalFile(<file path>)` (matching what
+`LocalFileBackend::create` would have produced for that path) and
+rewrites the file atomically so subsequent loads parse cleanly. Only a
+genuinely missing `id` key triggers the migration; records with a
+present-but-malformed `id` still surface as `CorruptRecord`, as do
+other parse failures (malformed JSON, missing `title`/`status`, etc.).
+The migration applies equally to `list()` and `read()`, so callers
+that skip past `list()` still recover legacy records transparently.
+
 ## Display IDs
 
 Every work item also carries a backend-provided `display_id: Option<String>`,

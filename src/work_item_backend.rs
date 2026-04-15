@@ -492,6 +492,12 @@ impl LocalFileBackend {
     }
 
     /// Read and deserialize a work item record from disk.
+    ///
+    /// Applies the same missing-`id` migration as `list()` so callers
+    /// who bypass `list()` (e.g. a direct `backend.read(&id)` after the
+    /// id is known) still recover legacy records transparently. In
+    /// practice `list()` runs first at startup, but handling it here
+    /// avoids a latent "migration only applies via list" trap.
     fn read_record(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
         match id {
             WorkItemId::LocalFile(path) => {
@@ -501,9 +507,33 @@ impl LocalFileBackend {
                 let contents = fs::read_to_string(path).map_err(|e| {
                     BackendError::Io(format!("failed to read {}: {e}", path.display()))
                 })?;
-                serde_json::from_str(&contents).map_err(|e| {
-                    BackendError::Io(format!("failed to parse {}: {e}", path.display()))
-                })
+                let (mut record, migrated) = deserialize_record_with_migration(&contents, path)
+                    .map_err(|e| {
+                        BackendError::Io(format!("failed to parse {}: {e}", path.display()))
+                    })?;
+                // The returned record's id must reflect the actual file
+                // path on disk, mirroring `list()`.
+                record.id = WorkItemId::LocalFile(path.clone());
+                if migrated {
+                    // Best-effort rewrite so the missing-field error
+                    // does not recur. Non-fatal: see `list()` for the
+                    // same rationale.
+                    match serde_json::to_string_pretty(&record) {
+                        Ok(json) => {
+                            if let Err(e) = atomic_write(path, json.as_bytes()) {
+                                eprintln!(
+                                    "workbridge: failed to persist id migration for {}: {e}",
+                                    path.display()
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "workbridge: failed to serialize migrated record for {}: {e}",
+                            path.display()
+                        ),
+                    }
+                }
+                Ok(record)
             }
             other => Err(BackendError::UnsupportedId(other.clone())),
         }
@@ -548,6 +578,66 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     fs::write(&tmp_path, data)?;
     fs::rename(&tmp_path, path)?;
     Ok(())
+}
+
+/// Deserialize a `WorkItemRecord` from on-disk JSON, tolerating v1 records
+/// that predate the `id` field. Returns `(record, migrated)`; when
+/// `migrated` is `true` the caller should persist the returned record back
+/// to disk so the "missing field `id`" error does not recur on the next
+/// load.
+///
+/// Strategy:
+/// 1. Try strict deserialization first. This is the zero-cost fast path
+///    for every record written by the current (or a future) build.
+/// 2. On failure, parse the contents as a generic `serde_json::Value`. If
+///    the top-level object is missing the `id` key, inject
+///    `WorkItemId::LocalFile(path)` and retry with `from_value`. This
+///    matches exactly what `LocalFileBackend::create` would have
+///    produced for a file at that path, so no UUID is regenerated and
+///    the filename stays the same.
+/// 3. If the object already has an `id` key (but strict parsing still
+///    failed), or if the retry also fails, the original strict-parse
+///    error is propagated so genuinely corrupt files still surface via
+///    `CorruptRecord`. The migration is narrowly scoped to "missing
+///    `id` field on an otherwise valid record".
+fn deserialize_record_with_migration(
+    contents: &str,
+    path: &Path,
+) -> Result<(WorkItemRecord, bool), serde_json::Error> {
+    // Fast path: strict deserialization. Anything written by a build
+    // that includes the `id` field lands here.
+    match serde_json::from_str::<WorkItemRecord>(contents) {
+        Ok(record) => Ok((record, false)),
+        Err(strict_err) => {
+            // Fallback: try to migrate a legacy record that is missing
+            // only the `id` key. Any other parse failure (malformed
+            // JSON, wrong shape for `title`/`status`, etc.) is surfaced
+            // unchanged by returning the original strict error.
+            let mut value: serde_json::Value = match serde_json::from_str(contents) {
+                Ok(v) => v,
+                Err(_) => return Err(strict_err),
+            };
+            let obj = match value.as_object_mut() {
+                Some(o) => o,
+                None => return Err(strict_err),
+            };
+            if obj.contains_key("id") {
+                // The `id` key is present but strict parsing failed for
+                // some other reason. Not our migration to handle.
+                return Err(strict_err);
+            }
+            let injected_id = match serde_json::to_value(WorkItemId::LocalFile(path.to_path_buf()))
+            {
+                Ok(v) => v,
+                Err(_) => return Err(strict_err),
+            };
+            obj.insert("id".to_string(), injected_id);
+            match serde_json::from_value::<WorkItemRecord>(value) {
+                Ok(record) => Ok((record, true)),
+                Err(_) => Err(strict_err),
+            }
+        }
+    }
 }
 
 impl WorkItemBackend for LocalFileBackend {
@@ -597,10 +687,31 @@ impl WorkItemBackend for LocalFileBackend {
                     continue;
                 }
             };
-            match serde_json::from_str::<WorkItemRecord>(&contents) {
-                Ok(mut record) => {
+            match deserialize_record_with_migration(&contents, &path) {
+                Ok((mut record, migrated)) => {
                     // Ensure the id reflects the actual file path on disk.
-                    record.id = WorkItemId::LocalFile(path);
+                    record.id = WorkItemId::LocalFile(path.clone());
+                    if migrated {
+                        // Persist the upgraded record so the missing-
+                        // field error does not recur on the next load.
+                        // A write failure here is non-fatal: the
+                        // in-memory record is still usable and only
+                        // future loads will re-run the migration.
+                        match serde_json::to_string_pretty(&record) {
+                            Ok(json) => {
+                                if let Err(e) = atomic_write(&path, json.as_bytes()) {
+                                    eprintln!(
+                                        "workbridge: failed to persist id migration for {}: {e}",
+                                        path.display()
+                                    );
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "workbridge: failed to serialize migrated record for {}: {e}",
+                                path.display()
+                            ),
+                        }
+                    }
                     records.push(record);
                 }
                 Err(e) => {
@@ -1978,6 +2089,173 @@ mod tests {
             result.corrupt
         );
         assert_eq!(result.records.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // Missing-`id` migration tests
+    //
+    // Work item files written before the `id` field was added must
+    // still load cleanly. `list()` and `read()` inject
+    // `WorkItemId::LocalFile(<path>)` (matching what `create` would
+    // have produced), rewrite the file so the migration does not
+    // recur, and never surface the legacy record as corrupt. Only a
+    // *genuinely* missing `id` key triggers the migration; other
+    // parse failures still report via `CorruptRecord`.
+    // -----------------------------------------------------------------
+
+    /// Legacy v1 JSON without the `id` field. `__SELF__` is replaced
+    /// with the target file path by callers.
+    const LEGACY_WITHOUT_ID: &str = r#"{
+        "title": "Legacy item",
+        "status": "Implementing",
+        "kind": "Own",
+        "repo_associations": [
+            {"repo_path": "/repos/foo", "branch": "feature/x"}
+        ]
+    }"#;
+
+    #[test]
+    fn legacy_record_missing_id_migrates_on_list() {
+        let dir = temp_dir("missing-id-list");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let legacy_path = dir.join("legacy-no-id.json");
+        fs::write(&legacy_path, LEGACY_WITHOUT_ID).unwrap();
+
+        // Precondition: the file really does not contain an `id` key.
+        let raw_before = fs::read_to_string(&legacy_path).unwrap();
+        assert!(
+            !raw_before.contains("\"id\""),
+            "precondition: legacy file must not contain an id field"
+        );
+
+        let result = backend.list().unwrap();
+        assert!(
+            result.corrupt.is_empty(),
+            "legacy record without id must not surface as corrupt: {:?}",
+            result.corrupt
+        );
+        assert_eq!(result.records.len(), 1);
+        let record = &result.records[0];
+        assert_eq!(record.title, "Legacy item");
+        assert_eq!(record.status, WorkItemStatus::Implementing);
+        // The injected id must be `LocalFile(<path of the file>)` -
+        // exactly what `create()` would have produced for that path.
+        assert_eq!(record.id, WorkItemId::LocalFile(legacy_path.clone()));
+
+        // The file on disk must now contain the `id` field so the
+        // migration does not recur on the next load.
+        let raw_after = fs::read_to_string(&legacy_path).unwrap();
+        assert!(
+            raw_after.contains("\"id\""),
+            "file on disk must contain id after migration, got: {raw_after}"
+        );
+
+        // A second list() must still be clean and must not re-enter
+        // the migration path. We cannot observe `migrated` directly
+        // from the public API, so we verify the corrupt list stays
+        // empty and the record still parses identically.
+        let result2 = backend.list().unwrap();
+        assert!(result2.corrupt.is_empty());
+        assert_eq!(result2.records.len(), 1);
+        assert_eq!(result2.records[0].id, WorkItemId::LocalFile(legacy_path));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_record_missing_id_migrates_on_read() {
+        let dir = temp_dir("missing-id-read");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let legacy_path = dir.join("legacy-read.json");
+        fs::write(&legacy_path, LEGACY_WITHOUT_ID).unwrap();
+
+        let record = backend
+            .read(&WorkItemId::LocalFile(legacy_path.clone()))
+            .expect("legacy record without id must read cleanly");
+        assert_eq!(record.title, "Legacy item");
+        assert_eq!(record.status, WorkItemStatus::Implementing);
+        assert_eq!(record.id, WorkItemId::LocalFile(legacy_path.clone()));
+
+        // The file on disk must now contain the `id` field so the
+        // migration does not recur.
+        let raw_after = fs::read_to_string(&legacy_path).unwrap();
+        assert!(
+            raw_after.contains("\"id\""),
+            "file on disk must contain id after read() migration"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_json_still_surfaces_in_corrupt_list() {
+        // Genuine corruption (malformed JSON) must NOT be swept up by
+        // the missing-id migration. It has to keep surfacing as a
+        // CorruptRecord with a "corrupt JSON" reason.
+        let dir = temp_dir("missing-id-still-corrupt");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        fs::write(dir.join("broken.json"), "{ this is not json").unwrap();
+
+        let result = backend.list().unwrap();
+        assert_eq!(result.records.len(), 0);
+        assert_eq!(result.corrupt.len(), 1);
+        assert!(
+            result.corrupt[0].reason.contains("corrupt JSON"),
+            "reason should still mention corrupt JSON, got: {}",
+            result.corrupt[0].reason
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_with_id_not_rewritten_by_list() {
+        // Guard against a future refactor accidentally taking the
+        // migration path on every load. A valid post-`id` record
+        // must NOT be rewritten by list() - its mtime must stay
+        // exactly what create() left it at.
+        let dir = temp_dir("missing-id-no-rewrite");
+        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+
+        let record = backend
+            .create(CreateWorkItem {
+                title: "Fresh record".into(),
+                description: None,
+                status: WorkItemStatus::Backlog,
+                kind: WorkItemKind::Own,
+                repo_associations: vec![RepoAssociationRecord {
+                    repo_path: PathBuf::from("/repos/foo"),
+                    branch: None,
+                    pr_identity: None,
+                }],
+            })
+            .unwrap();
+
+        let path = match &record.id {
+            WorkItemId::LocalFile(p) => p.clone(),
+            other => panic!("expected LocalFile id, got {other:?}"),
+        };
+        let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Sleep long enough that a rewrite would move the mtime on
+        // any sane filesystem. 20ms is the same order of magnitude
+        // used by other tests that probe mtime movement.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let result = backend.list().unwrap();
+        assert!(result.corrupt.is_empty());
+        assert_eq!(result.records.len(), 1);
+
+        let mtime_after = fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "list() must not rewrite a valid post-`id` record on the fast path"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
