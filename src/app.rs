@@ -5199,6 +5199,71 @@ impl App {
         }
     }
 
+    /// Resolve the currently selected left-panel entry to the PR URL (and a
+    /// short human-readable label) that should open when the user presses
+    /// `o`. Returns `None` if there is no selection, the entry is not
+    /// PR-bearing (e.g. a group header), or the selected work item has no
+    /// repo association with a PR attached.
+    ///
+    /// For work items with multiple repo associations, the first association
+    /// whose `pr` field is `Some(_)` wins. This is deterministic across
+    /// repeat presses because `repo_associations` preserves insertion order
+    /// through reassembly.
+    ///
+    /// Pure: does not spawn, does not shell out, does not mutate `self`.
+    /// Split out so the dispatch logic can be unit-tested without shelling
+    /// out to `open`.
+    pub(crate) fn selected_pr_target(&self) -> Option<(String, String)> {
+        let idx = self.selected_item?;
+        let entry = self.display_list.get(idx)?;
+        match entry {
+            DisplayEntry::WorkItemEntry(wi_idx) => {
+                let wi = self.work_items.get(*wi_idx)?;
+                let pr = wi.repo_associations.iter().find_map(|a| a.pr.as_ref())?;
+                Some((pr.url.clone(), format!("PR #{}", pr.number)))
+            }
+            DisplayEntry::UnlinkedItem(u_idx) => {
+                let ul = self.unlinked_prs.get(*u_idx)?;
+                Some((ul.pr.url.clone(), format!("PR #{}", ul.pr.number)))
+            }
+            DisplayEntry::ReviewRequestItem(r_idx) => {
+                let rr = self.review_requested_prs.get(*r_idx)?;
+                Some((rr.pr.url.clone(), format!("PR #{}", rr.pr.number)))
+            }
+            DisplayEntry::GroupHeader { .. } => None,
+        }
+    }
+
+    /// Open the currently selected entry's PR in the default browser via
+    /// the macOS `open` command. Sets a status message with the PR label on
+    /// success, or "No PR to open" when the selection has no PR.
+    ///
+    /// The subprocess is spawned on a background thread: even though
+    /// `open` is a local shell-out (not remote I/O), running it on the UI
+    /// thread would still violate the `[ABSOLUTE]` blocking-I/O invariant
+    /// in `docs/UI.md` as soon as `open` stalls for any reason (e.g. a
+    /// slow LaunchServices dispatch). The child's status and stderr are
+    /// intentionally discarded - this is a best-effort UX affordance and
+    /// surfacing `open` errors would add more noise than value.
+    ///
+    /// Not routed through `try_begin_user_action` because the user-action
+    /// guard is scoped to remote I/O (`gh`, network, `git fetch`/`push`/
+    /// `pull`) per `docs/UI.md` "User action guard", and `open` is none of
+    /// those.
+    pub fn open_selected_pr_in_browser(&mut self) {
+        match self.selected_pr_target() {
+            Some((url, label)) => {
+                std::thread::spawn(move || {
+                    let _ = std::process::Command::new("open").arg(&url).status();
+                });
+                self.status_message = Some(format!("Opening {label}"));
+            }
+            None => {
+                self.status_message = Some("No PR to open".into());
+            }
+        }
+    }
+
     /// Spawn a background thread to fetch the branch and create a worktree
     /// for a freshly imported work item. If another worktree creation is
     /// already in flight, falls back to a status message instead of blocking.
@@ -17347,5 +17412,170 @@ mod tests {
             app.activities.is_empty(),
             "structural_fetch_activity id must be removed from the activity list",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `selected_pr_target` - resolves selection -> PR URL for the `o` key.
+    // The tests target the pure helper rather than
+    // `open_selected_pr_in_browser` so the suite stays hermetic (no thread
+    // spawn, no shell-out to `open`).
+    // -----------------------------------------------------------------------
+
+    fn sample_pr_info(number: u64, url: &str) -> crate::work_item::PrInfo {
+        use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
+        PrInfo {
+            number,
+            title: format!("PR {number}"),
+            state: PrState::Open,
+            is_draft: false,
+            review_decision: ReviewDecision::None,
+            checks: CheckStatus::None,
+            mergeable: MergeableState::Unknown,
+            url: url.to_string(),
+        }
+    }
+
+    #[test]
+    fn open_pr_resolves_review_request_url() {
+        let mut app = App::new();
+        app.review_requested_prs
+            .push(crate::work_item::ReviewRequestedPr {
+                repo_path: PathBuf::from("/repo"),
+                pr: sample_pr_info(42, "https://github.com/o/r/pull/42"),
+                branch: "feat/x".into(),
+                requested_reviewer_logins: Vec::new(),
+                requested_team_slugs: Vec::new(),
+            });
+        app.display_list.push(DisplayEntry::ReviewRequestItem(0));
+        app.selected_item = Some(0);
+
+        let target = app.selected_pr_target();
+        assert_eq!(
+            target,
+            Some(("https://github.com/o/r/pull/42".into(), "PR #42".into())),
+        );
+    }
+
+    #[test]
+    fn open_pr_resolves_unlinked_url() {
+        let mut app = App::new();
+        app.unlinked_prs.push(crate::work_item::UnlinkedPr {
+            repo_path: PathBuf::from("/repo"),
+            pr: sample_pr_info(7, "https://github.com/o/r/pull/7"),
+            branch: "feat/y".into(),
+        });
+        app.display_list.push(DisplayEntry::UnlinkedItem(0));
+        app.selected_item = Some(0);
+
+        let target = app.selected_pr_target();
+        assert_eq!(
+            target,
+            Some(("https://github.com/o/r/pull/7".into(), "PR #7".into())),
+        );
+    }
+
+    #[test]
+    fn open_pr_resolves_workitem_with_pr() {
+        use crate::work_item::RepoAssociation;
+        let mut app = App::new();
+        // First association has no PR, second has one - asserts that the
+        // "first PR-bearing association wins" rule is deterministic and
+        // does NOT require the first association to be PR-bearing.
+        app.work_items.push(WorkItem {
+            id: WorkItemId::LocalFile(PathBuf::from("/data/wi.json")),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            display_id: None,
+            title: "Work".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![
+                RepoAssociation {
+                    repo_path: PathBuf::from("/repo-a"),
+                    branch: Some("feat/a".into()),
+                    worktree_path: None,
+                    pr: None,
+                    issue: None,
+                    git_state: None,
+                },
+                RepoAssociation {
+                    repo_path: PathBuf::from("/repo-b"),
+                    branch: Some("feat/b".into()),
+                    worktree_path: None,
+                    pr: Some(sample_pr_info(99, "https://github.com/o/r/pull/99")),
+                    issue: None,
+                    git_state: None,
+                },
+            ],
+            errors: vec![],
+        });
+        app.display_list.push(DisplayEntry::WorkItemEntry(0));
+        app.selected_item = Some(0);
+
+        let target = app.selected_pr_target();
+        assert_eq!(
+            target,
+            Some(("https://github.com/o/r/pull/99".into(), "PR #99".into())),
+        );
+    }
+
+    #[test]
+    fn open_pr_none_for_workitem_without_pr() {
+        use crate::work_item::RepoAssociation;
+        let mut app = App::new();
+        app.work_items.push(WorkItem {
+            id: WorkItemId::LocalFile(PathBuf::from("/data/wi.json")),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            display_id: None,
+            title: "Work".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/repo-a"),
+                branch: Some("feat/a".into()),
+                worktree_path: None,
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+        app.display_list.push(DisplayEntry::WorkItemEntry(0));
+        app.selected_item = Some(0);
+
+        assert_eq!(app.selected_pr_target(), None);
+    }
+
+    #[test]
+    fn open_pr_none_for_group_header() {
+        let mut app = App::new();
+        app.display_list.push(DisplayEntry::GroupHeader {
+            label: "ACTIVE".into(),
+            count: 0,
+            kind: GroupHeaderKind::Normal,
+        });
+        app.selected_item = Some(0);
+
+        assert_eq!(app.selected_pr_target(), None);
+    }
+
+    #[test]
+    fn open_pr_sets_no_pr_status_when_no_pr() {
+        // Smoke test for the `open_selected_pr_in_browser` wrapper on the
+        // None path: asserts that the user-visible status message is set
+        // without spawning the `open` subprocess. The Some path is not
+        // exercised here because it spawns a thread and shells out.
+        let mut app = App::new();
+        app.display_list.push(DisplayEntry::GroupHeader {
+            label: "ACTIVE".into(),
+            count: 0,
+            kind: GroupHeaderKind::Normal,
+        });
+        app.selected_item = Some(0);
+        app.open_selected_pr_in_browser();
+        assert_eq!(app.status_message.as_deref(), Some("No PR to open"));
     }
 }

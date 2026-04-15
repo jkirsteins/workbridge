@@ -826,6 +826,19 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
             app.show_settings = !app.show_settings;
         }
+        // o - open the selected item's PR in the default browser.
+        // Works on work items (first PR-bearing association), unlinked
+        // PRs, and review requests. No-op with a status message when the
+        // selection has no PR. Not added to `handle_key_right` because
+        // single keystrokes in the right panel are forwarded to the PTY
+        // session and hijacking `o` there would break typing into Claude.
+        (KeyModifiers::NONE, KeyCode::Char('o')) => {
+            let had_status = app.has_visible_status_bar();
+            app.open_selected_pr_in_browser();
+            if app.has_visible_status_bar() != had_status {
+                sync_layout(app);
+            }
+        }
         _ => {}
     }
 }
