@@ -207,9 +207,10 @@ the next GitHub fetch cycle.
 
 ## Quick-Start Flow
 
-Pressing Ctrl+N starts a quick-start session without showing any creation
-dialog. A Planning work item is created immediately with a placeholder title
-("Quick start") and a session is spawned at once.
+Pressing Ctrl+N starts a quick-start session. When exactly one managed repo
+is configured no dialog is shown at all - a Planning work item is created
+immediately with a placeholder title ("Quick start") and a session is
+spawned at once.
 
 The Claude agent running in this session uses the `planning_quickstart` system
 prompt, which instructs it to:
@@ -226,9 +227,15 @@ Ctrl+B opens the full creation dialog (title, description, repos, branch) and
 creates a Backlog item, matching the previous Ctrl+N behavior.
 
 Repo selection for quick-start follows this priority:
-1. The only managed repo with a git directory, if exactly one exists.
-2. Otherwise, the full creation dialog opens with the repo list focused so
-   the user can pick one explicitly.
+1. The only managed repo with a git directory, if exactly one exists - no
+   dialog is shown.
+2. Otherwise, a compact "Quick start - select repo" dialog opens. It
+   contains only the repo list (no Title, Description, or Branch fields):
+   focus lands directly on the list, Up/Down moves the cursor, Space
+   toggles selection, Enter creates the quick-start item with the same
+   placeholder title and auto-generated branch as the single-repo path,
+   and Esc cancels. The agent renames the title later via
+   `workbridge_set_title`, exactly as in the single-repo flow.
 
 The current working directory is deliberately not used to auto-select a
 repo: when more than one managed repo is configured there is a real choice

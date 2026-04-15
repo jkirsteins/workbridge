@@ -94,9 +94,15 @@ impl CreateDialog {
 
     /// Open in quick-start mode: the user only selects a repo. On submit,
     /// a Planning item is created and a Claude session spawns immediately.
+    ///
+    /// Focus is parked on the repo list (the only meaningful field) so the
+    /// user does not have to Tab past the now-hidden Title/Description/Branch
+    /// fields. The render path keys off `quickstart_mode` to draw a compact
+    /// dialog with only the repo list.
     pub fn open_quickstart(&mut self, active_repos: &[PathBuf]) {
         self.open(active_repos, None);
         self.quickstart_mode = true;
+        self.focus_field = CreateDialogFocus::Repos;
     }
 
     /// Close the dialog without creating anything.
@@ -105,7 +111,14 @@ impl CreateDialog {
     }
 
     /// Cycle focus to the next field (Title -> Description -> Repos -> Branch -> Title).
+    ///
+    /// In quick-start mode the only visible field is the repo list, so this
+    /// is a no-op: Tab/BackTab must not be able to sneak focus onto an
+    /// invisible Title/Description/Branch field.
     pub fn focus_next(&mut self) {
+        if self.quickstart_mode {
+            return;
+        }
         self.focus_field = match self.focus_field {
             CreateDialogFocus::Title => CreateDialogFocus::Description,
             CreateDialogFocus::Description => CreateDialogFocus::Repos,
@@ -115,7 +128,13 @@ impl CreateDialog {
     }
 
     /// Cycle focus to the previous field (Title -> Branch -> Repos -> Description -> Title).
+    ///
+    /// In quick-start mode this is a no-op for the same reason as
+    /// [`focus_next`].
     pub fn focus_prev(&mut self) {
+        if self.quickstart_mode {
+            return;
+        }
         self.focus_field = match self.focus_field {
             CreateDialogFocus::Title => CreateDialogFocus::Branch,
             CreateDialogFocus::Branch => CreateDialogFocus::Repos,
@@ -631,5 +650,42 @@ mod tests {
         dialog.branch_user_edited = true;
         dialog.open(&[PathBuf::from("/repo/a")], None);
         assert!(!dialog.branch_user_edited);
+    }
+
+    // -- quick-start mode tests --
+
+    #[test]
+    fn open_quickstart_focuses_repos_field() {
+        // With more than one repo, the quick-start dialog must land focus
+        // directly on the repo list and start with no repo pre-selected, so
+        // the user explicitly picks one.
+        let repos = vec![PathBuf::from("/repo/a"), PathBuf::from("/repo/b")];
+        let mut dialog = CreateDialog::new();
+        dialog.open_quickstart(&repos);
+
+        assert!(dialog.visible);
+        assert!(dialog.quickstart_mode);
+        assert_eq!(dialog.focus_field, CreateDialogFocus::Repos);
+        assert_eq!(dialog.repo_list.len(), 2);
+        assert!(
+            dialog.repo_list.iter().all(|(_, sel)| !*sel),
+            "no repo should be pre-selected in quick-start mode"
+        );
+    }
+
+    #[test]
+    fn focus_next_no_op_in_quickstart_mode() {
+        // Tab / BackTab must not move focus off the repo list while in
+        // quick-start mode - the other fields are not rendered, so any
+        // movement would land focus on an invisible field.
+        let repos = vec![PathBuf::from("/repo/a"), PathBuf::from("/repo/b")];
+        let mut dialog = CreateDialog::new();
+        dialog.open_quickstart(&repos);
+
+        dialog.focus_next();
+        assert_eq!(dialog.focus_field, CreateDialogFocus::Repos);
+
+        dialog.focus_prev();
+        assert_eq!(dialog.focus_field, CreateDialogFocus::Repos);
     }
 }
