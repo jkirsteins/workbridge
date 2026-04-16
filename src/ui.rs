@@ -320,7 +320,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
                         "",
                         "Uncommitted changes in the stale worktree will be lost.",
                     ),
-                    ("[r]", "Force-remove stale worktree & retry"),
+                    ("[Enter]", "Recover worktree"),
                     ("[Esc]", "Dismiss"),
                 ],
             },

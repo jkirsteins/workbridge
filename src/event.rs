@@ -200,7 +200,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         match (key.modifiers, key.code) {
-            (_, KeyCode::Char('r')) => {
+            (_, KeyCode::Enter) => {
                 let prompt = app.stale_worktree_prompt.take().unwrap();
                 app.spawn_stale_worktree_recovery(prompt);
             }
