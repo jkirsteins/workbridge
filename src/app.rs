@@ -2851,13 +2851,17 @@ impl App {
         // freeze the shutdown-wait UI otherwise. See `docs/UI.md`
         // "Blocking I/O Prohibition".
         //
-        // We collect paths from THREE sources so every in-flight
+        // We collect paths from FIVE sources so every in-flight
         // or live tempfile is caught:
         //   1. Live global assistant session (`global_mcp_config_path`)
         //   2. In-flight global preparation worker
         //      (`global_session_open_pending.config_path`)
         //   3. In-flight work-item preparation workers
         //      (`session_open_rx` entries' `mcp_config_path`)
+        //   4. In-flight Phase 2 PTY spawn workers
+        //      (`session_spawn_rx` entries)
+        //   5. Live work-item sessions
+        //      (`SessionEntry::agent_written_files`)
         //
         // For (2) and (3) we also flip each worker's `cancelled`
         // flag via `Ordering::Release` so workers that have not yet
@@ -2915,8 +2919,26 @@ impl App {
         let spawn_wi_ids: Vec<WorkItemId> = self.session_spawn_rx.keys().cloned().collect();
         for wi_id in spawn_wi_ids {
             if let Some(pending) = self.session_spawn_rx.remove(&wi_id) {
+                // Drain any queued result so its handles are
+                // disposed off the UI thread.
+                if let Ok(result) = pending.rx.try_recv() {
+                    if let Some(server) = result.mcp_server {
+                        self.drop_mcp_server_off_thread(server);
+                    }
+                    files_to_clean.extend(result.written_files);
+                    if let Some(session) = result.session {
+                        std::thread::spawn(move || drop(session));
+                    }
+                }
                 self.end_activity(pending.activity);
             }
+        }
+        // 5. Live work-item sessions: drain agent_written_files
+        //    so the --mcp-config tempfile is cleaned up even if
+        //    the user force-quits during the shutdown wait before
+        //    check_liveness observes the child exit.
+        for entry in self.sessions.values_mut() {
+            files_to_clean.extend(std::mem::take(&mut entry.agent_written_files));
         }
         self.spawn_agent_file_cleanup(files_to_clean);
     }
