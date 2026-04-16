@@ -3122,8 +3122,12 @@ impl App {
         }
 
         let issue_pattern = &self.config.defaults.branch_issue_pattern;
-        let (items, unlinked, review_requested, mut reopen_ids) =
-            assembly::reassemble(&list_result.records, &self.repo_data, issue_pattern);
+        let (items, unlinked, review_requested, mut reopen_ids) = assembly::reassemble(
+            &list_result.records,
+            &self.repo_data,
+            issue_pattern,
+            &self.config.defaults.worktree_dir,
+        );
         self.work_items = items;
         self.unlinked_prs = unlinked;
         self.review_requested_prs = review_requested;
@@ -3188,8 +3192,12 @@ impl App {
                 Ok(r) => r,
                 Err(_) => return,
             };
-            let (items, unlinked, review_requested, _) =
-                assembly::reassemble(&list_result.records, &self.repo_data, issue_pattern);
+            let (items, unlinked, review_requested, _) = assembly::reassemble(
+                &list_result.records,
+                &self.repo_data,
+                issue_pattern,
+                &self.config.defaults.worktree_dir,
+            );
             self.work_items = items;
             self.unlinked_prs = unlinked;
             self.review_requested_prs = review_requested;
@@ -3210,8 +3218,12 @@ impl App {
                     if kept.len() < pre_archive_count {
                         // Items were archived; reassemble to update display state.
                         let pattern = &self.config.defaults.branch_issue_pattern;
-                        let (items, unlinked, review_requested, _) =
-                            assembly::reassemble(&kept, &self.repo_data, pattern);
+                        let (items, unlinked, review_requested, _) = assembly::reassemble(
+                            &kept,
+                            &self.repo_data,
+                            pattern,
+                            &self.config.defaults.worktree_dir,
+                        );
                         self.work_items = items;
                         self.unlinked_prs = unlinked;
                         self.review_requested_prs = review_requested;
@@ -11916,6 +11928,7 @@ mod tests {
                     pr: None,
                     issue: None,
                     git_state: None,
+                    stale_worktree_path: None,
                 }],
                 errors: vec![],
             },
@@ -11935,6 +11948,7 @@ mod tests {
                     pr: None,
                     issue: None,
                     git_state: None,
+                    stale_worktree_path: None,
                 }],
                 errors: vec![],
             },
@@ -11981,6 +11995,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         }
@@ -13813,6 +13828,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         }
@@ -14189,6 +14205,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -14749,6 +14766,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -15224,6 +15242,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -15259,6 +15278,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -16462,6 +16482,7 @@ mod tests {
                     pr: None,
                     issue: None,
                     git_state: None,
+                    stale_worktree_path: None,
                 }],
                 errors: vec![],
             });
@@ -16521,6 +16542,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -16724,6 +16746,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }]
         } else {
             vec![]
@@ -17205,6 +17228,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -17227,6 +17251,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -18760,6 +18785,7 @@ mod tests {
                 }),
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -19381,6 +19407,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -19432,6 +19459,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -19591,6 +19619,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -19698,6 +19727,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -19807,6 +19837,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -19900,6 +19931,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -20200,6 +20232,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -20712,6 +20745,7 @@ mod tests {
                     pr: None,
                     issue: None,
                     git_state: None,
+                    stale_worktree_path: None,
                 },
                 RepoAssociation {
                     repo_path: PathBuf::from("/repo-b"),
@@ -20720,6 +20754,7 @@ mod tests {
                     pr: Some(sample_pr_info(99, "https://github.com/o/r/pull/99")),
                     issue: None,
                     git_state: None,
+                    stale_worktree_path: None,
                 },
             ],
             errors: vec![],
@@ -20754,6 +20789,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -20824,6 +20860,7 @@ mod tests {
                     pr: None,
                     issue: None,
                     git_state: None,
+                    stale_worktree_path: None,
                 },
                 RepoAssociation {
                     repo_path: PathBuf::from("/repo-b"),
@@ -20832,6 +20869,7 @@ mod tests {
                     pr: None,
                     issue: None,
                     git_state: None,
+                    stale_worktree_path: None,
                 },
             ],
             errors: vec![],
@@ -20874,6 +20912,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -20967,6 +21006,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -22132,6 +22172,7 @@ mod tests {
             &list.records,
             &app.repo_data,
             &Config::for_test().defaults.branch_issue_pattern,
+            &Config::for_test().defaults.worktree_dir,
         );
         let wi = items
             .iter()

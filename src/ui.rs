@@ -2569,7 +2569,17 @@ fn draw_work_item_detail(
         WorkItemStatus::Planning
         | WorkItemStatus::Implementing
         | WorkItemStatus::Blocked
-        | WorkItemStatus::Review => &["  Press Enter to start a session."],
+        | WorkItemStatus::Review => {
+            let has_stale = wi
+                .repo_associations
+                .iter()
+                .any(|a| a.stale_worktree_path.is_some());
+            if has_stale {
+                &["  Press Enter to recover worktree."]
+            } else {
+                &["  Press Enter to start a session."]
+            }
+        }
     };
     for hint in hint_lines {
         lines.push(Line::from(Span::styled(*hint, none_style)));
@@ -4547,6 +4557,7 @@ mod format_entry_tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             status_derived: false,
             errors: vec![],
@@ -4589,6 +4600,7 @@ mod format_entry_tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             status_derived: false,
             errors: vec![],
@@ -4621,6 +4633,7 @@ mod format_entry_tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             status_derived: false,
             errors: vec![],
@@ -4657,6 +4670,7 @@ mod format_entry_tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             status_derived: false,
             errors: vec![],
@@ -4712,6 +4726,7 @@ mod format_entry_tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             status_derived: false,
             errors: vec![],
@@ -4748,6 +4763,7 @@ mod format_entry_tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             status_derived: false,
             errors: vec![],
@@ -4789,6 +4805,7 @@ mod format_entry_tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             status_derived: false,
             errors: vec![],
@@ -4837,6 +4854,7 @@ mod format_entry_tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             status_derived: false,
             errors: vec![],
@@ -5331,6 +5349,7 @@ mod snapshot_tests {
                 pr: if i == 0 { pr.clone() } else { None },
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             });
         }
         WorkItem {
@@ -6027,6 +6046,7 @@ mod snapshot_tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![
                 WorkItemError::MultiplePrsForBranch {

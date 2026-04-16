@@ -202,6 +202,11 @@ pub struct RepoAssociation {
     /// to show the `!cl` unclean-worktree chip, and by tests. Will
     /// also feed future detail views (e.g., "3 ahead, 1 behind, dirty").
     pub git_state: Option<GitState>,
+    /// Set when a detached-HEAD worktree exists at the expected target
+    /// path for this branch (e.g. after an interrupted rebase). The
+    /// assembly layer detects this proactively so the UI can show
+    /// "Press Enter to recover worktree" instead of "start a session".
+    pub stale_worktree_path: Option<PathBuf>,
 }
 
 /// Local git state for a worktree. Fields are cache-projections of the

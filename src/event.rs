@@ -2865,6 +2865,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });
@@ -2954,6 +2955,7 @@ mod tests {
                 pr: None,
                 issue: None,
                 git_state: None,
+                stale_worktree_path: None,
             }],
             errors: vec![],
         });

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
@@ -101,6 +101,14 @@ fn find_worktree_by_branch<'a>(
         .find(|w| w.branch.as_deref() == Some(branch))
 }
 
+/// Compute the expected worktree target path for a branch. Must match
+/// `App::worktree_target_path` exactly so the stale-worktree detection
+/// in the assembly layer agrees with the creation path in `spawn_session`.
+fn worktree_target_path(repo_path: &Path, branch: &str, worktree_dir: &str) -> PathBuf {
+    let sanitized = branch.replace('/', "-");
+    repo_path.join(worktree_dir).join(sanitized)
+}
+
 /// Find all PRs matching the given branch in the repo's fetched PR list.
 ///
 /// When `repo_owner` is provided, fork PRs (where `head_repo_owner` differs
@@ -173,6 +181,7 @@ pub fn reassemble(
     backend_records: &[WorkItemRecord],
     repo_data: &HashMap<PathBuf, RepoFetchResult>,
     issue_pattern: &str,
+    worktree_dir: &str,
 ) -> (
     Vec<WorkItem>,
     Vec<UnlinkedPr>,
@@ -206,6 +215,7 @@ pub fn reassemble(
                         worktree_path: None,
                         pr: None,
                         issue: None,
+                        stale_worktree_path: None,
                         git_state: None,
                     });
                     continue;
@@ -225,11 +235,12 @@ pub fn reassemble(
             let mut worktree_path: Option<PathBuf> = None;
             let mut git_state: Option<GitState> = None;
 
-            // Detached worktrees (branch=None) simply don't match any
-            // work item by branch, so they are correctly excluded from
-            // associations. No explicit DetachedHead detection is needed
-            // because we cannot associate a detached worktree with a
-            // specific work item (there is no branch to match on).
+            // Detached worktrees (branch=None) don't match by branch,
+            // but if one sits at the expected target path it is a stale
+            // worktree left by an interrupted rebase. We detect this
+            // proactively so the UI can show "recover" instead of the
+            // normal "start a session" hint.
+            let mut stale_wt: Option<PathBuf> = None;
             if let Some(fetch) = fetch
                 && let Ok(worktrees) = &fetch.worktrees
                 && let Some(wt) = find_worktree_by_branch(worktrees, branch)
@@ -255,6 +266,18 @@ pub fn reassemble(
                     ahead: wt.unpushed.unwrap_or(0),
                     behind: wt.behind_remote.unwrap_or(0),
                 });
+            } else if let Some(fetch) = fetch
+                && let Ok(worktrees) = &fetch.worktrees
+            {
+                // No branch match - check for a detached-HEAD worktree
+                // at the expected target path (stale worktree detection).
+                let target = worktree_target_path(repo_path, branch, worktree_dir);
+                if let Some(wt) = worktrees
+                    .iter()
+                    .find(|w| w.branch.is_none() && !w.is_main && w.path == target)
+                {
+                    stale_wt = Some(wt.path.clone());
+                }
             }
 
             // --- PR matching ---
@@ -348,6 +371,7 @@ pub fn reassemble(
                 pr: pr_info,
                 issue: issue_info,
                 git_state,
+                stale_worktree_path: stale_wt,
             });
         }
 
@@ -701,7 +725,8 @@ mod tests {
             create_mock_repo_data(rp.clone(), vec![wt], vec![pr], vec![(42, Ok(issue))]);
         let repo_data: HashMap<PathBuf, RepoFetchResult> = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         assert_eq!(unlinked.len(), 0);
@@ -755,7 +780,8 @@ mod tests {
             let (rp_key, fetch) =
                 create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![(42, Ok(issue))]);
             let repo_data = HashMap::from([(rp_key, fetch)]);
-            let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            let (items, _, _, _) =
+                reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
             assert_eq!(items[0].title, "PR title");
         }
 
@@ -775,7 +801,8 @@ mod tests {
             let (rp_key, fetch) =
                 create_mock_repo_data(rp.clone(), vec![], vec![], vec![(42, Ok(issue))]);
             let repo_data = HashMap::from([(rp_key, fetch)]);
-            let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            let (items, _, _, _) =
+                reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
             assert_eq!(items[0].title, "Issue title");
         }
 
@@ -793,7 +820,8 @@ mod tests {
             );
             let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
             let repo_data = HashMap::from([(rp_key, fetch)]);
-            let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            let (items, _, _, _) =
+                reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
             assert_eq!(items[0].title, "Backend title");
         }
 
@@ -812,7 +840,7 @@ mod tests {
             let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
             let repo_data = HashMap::from([(rp_key, fetch)]);
             // Use a pattern that won't match "my-feature"
-            let (items, _, _, _) = reassemble(&[record], &repo_data, r"^(\d+)-");
+            let (items, _, _, _) = reassemble(&[record], &repo_data, r"^(\d+)-", ".worktrees");
             assert_eq!(items[0].title, "my-feature");
         }
 
@@ -829,7 +857,8 @@ mod tests {
                 }],
             );
             let repo_data = HashMap::new();
-            let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+            let (items, _, _, _) =
+                reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
             assert_eq!(items[0].title, "untitled");
         }
     }
@@ -857,7 +886,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr_a, pr_b], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         assert_eq!(unlinked.len(), 1);
@@ -897,7 +927,8 @@ mod tests {
         let (key_b, fetch_b) = create_mock_repo_data(rp_b.clone(), vec![], vec![pr_b], vec![]);
         let repo_data = HashMap::from([(key_a, fetch_a), (key_b, fetch_b)]);
 
-        let (items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         assert_eq!(unlinked.len(), 0);
@@ -951,7 +982,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         let assoc = &items[0].repo_associations[0];
@@ -989,7 +1021,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr1, pr2], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -1038,7 +1071,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt_detached], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -1064,7 +1098,8 @@ mod tests {
     #[test]
     fn empty_inputs() {
         let repo_data: HashMap<PathBuf, RepoFetchResult> = HashMap::new();
-        let (items, unlinked, _, _) = reassemble(&[], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) =
+            reassemble(&[], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
         assert!(items.is_empty());
         assert!(unlinked.is_empty());
     }
@@ -1105,7 +1140,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         let gs = items[0].repo_associations[0]
@@ -1148,7 +1184,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         let gs = items[0].repo_associations[0]
             .git_state
@@ -1185,7 +1222,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         let gs = items[0].repo_associations[0]
             .git_state
@@ -1219,7 +1257,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
         assert_eq!(items.len(), 1);
         assert_eq!(
             items[0].display_id.as_deref(),
@@ -1241,7 +1280,8 @@ mod tests {
         assert!(legacy.display_id.is_none());
         let (rp_key, fetch) = create_mock_repo_data(rp, vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
-        let (items, _, _, _) = reassemble(&[legacy], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[legacy], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
         assert_eq!(items[0].display_id, None);
     }
 
@@ -1267,7 +1307,7 @@ mod tests {
             create_mock_repo_data(rp.clone(), vec![], vec![], vec![(42, Ok(issue))]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, r"^(\d+)-");
+        let (items, _, _, _) = reassemble(&[record], &repo_data, r"^(\d+)-", ".worktrees");
 
         assert_eq!(items.len(), 1);
         let assoc = &items[0].repo_associations[0];
@@ -1306,7 +1346,8 @@ mod tests {
         );
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         assert!(
@@ -1345,7 +1386,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         assert!(
@@ -1376,7 +1418,8 @@ mod tests {
 
         // Empty repo_data - simulates startup before any fetch completes.
         let repo_data: HashMap<PathBuf, RepoFetchResult> = HashMap::new();
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         assert!(
@@ -1592,7 +1635,7 @@ mod tests {
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         // Invalid regex pattern should not panic - just skip issue extraction.
-        let (items, _, _, _) = reassemble(&[record], &repo_data, "[invalid(");
+        let (items, _, _, _) = reassemble(&[record], &repo_data, "[invalid(", ".worktrees");
         assert_eq!(items.len(), 1);
         assert!(items[0].repo_associations[0].issue.is_none());
         // No IssueNotFound error either, since extraction was skipped.
@@ -1614,7 +1657,8 @@ mod tests {
         let (key_b, fetch_b) = create_mock_repo_data(rp_b.clone(), vec![], vec![pr_b], vec![]);
         let repo_data = HashMap::from([(key_a, fetch_a), (key_b, fetch_b)]);
 
-        let (items, unlinked, _, _) = reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) =
+            reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert!(items.is_empty());
         assert_eq!(unlinked.len(), 2);
@@ -1646,7 +1690,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         let assoc = &items[0].repo_associations[0];
@@ -1687,6 +1732,7 @@ mod tests {
             &[todo_record, in_progress_record],
             &repo_data,
             DEFAULT_ISSUE_PATTERN,
+            ".worktrees",
         );
 
         assert_eq!(items.len(), 2);
@@ -1751,7 +1797,8 @@ mod tests {
         ];
 
         let repo_data = HashMap::new();
-        let (items, _, _, _) = reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&records, &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items[0].backend_type, BackendType::LocalFile);
         assert_eq!(items[1].backend_type, BackendType::GithubIssue);
@@ -1781,7 +1828,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1813,7 +1861,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1855,7 +1904,8 @@ mod tests {
         let (key_b, fetch_b) = create_mock_repo_data(rp_b, vec![], vec![pr_b], vec![]);
         let repo_data = HashMap::from([(key_a, fetch_a), (key_b, fetch_b)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1909,7 +1959,8 @@ mod tests {
             create_mock_repo_data(rp.clone(), vec![], vec![same_repo_pr, fork_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -1965,7 +2016,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         assert!(
@@ -2019,7 +2071,8 @@ mod tests {
             create_mock_repo_data(rp.clone(), vec![], vec![same_repo_pr, fork_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, unlinked, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         // The work item should have the same-repo PR matched.
         assert_eq!(items.len(), 1);
@@ -2071,7 +2124,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -2119,7 +2173,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![live_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         let assoc = &items[0].repo_associations[0];
@@ -2160,7 +2215,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (items, _, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (items, _, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         assert_eq!(items.len(), 1);
         let item = &items[0];
@@ -2219,7 +2275,8 @@ mod tests {
         let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![fork_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
-        let (_items, unlinked, _, _) = reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN);
+        let (_items, unlinked, _, _) =
+            reassemble(&[record], &repo_data, DEFAULT_ISSUE_PATTERN, ".worktrees");
 
         // The fork PR's branch is now claimed by the imported work item,
         // so it must NOT appear as unlinked.
