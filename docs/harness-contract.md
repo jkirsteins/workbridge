@@ -392,15 +392,18 @@ closure that reads the plan, starts the MCP server, writes the
 side-car files, writes the tempfile, and then sends a
 `SessionOpenPlanResult` back for `poll_session_opens` to consume.
 
-Work-item spawns call
-`ClaudeCodeBackend::write_session_files` **from the background
-worker inside `App::begin_session_open`** to write `.mcp.json` into
-the worktree root (for Claude Code's project discovery). The
-worker also writes a separate `/tmp/workbridge-mcp-config-<uuid>.json`
-tempfile and threads its path into `SpawnConfig::mcp_config_path`.
-Both paths are captured in `SessionEntry::agent_written_files` so
-`AgentBackend::cleanup_session_files` can reverse them on teardown
-/ `workbridge_delete`; the reverse path also runs on a detached
+Work-item spawns write a
+`/tmp/workbridge-mcp-config-<uuid>.json` tempfile from the
+background worker inside `App::begin_session_open` and thread its
+path into `SpawnConfig::mcp_config_path`.
+`ClaudeCodeBackend::write_session_files` returns an empty list -
+no side-car files are written into the worktree because
+`--mcp-config` handles MCP injection entirely via the CLI flag
+and writing into the worktree would pollute git state (prohibited
+by the file-injection review policy rule). The tempfile path is
+captured in `SessionEntry::agent_written_files` so
+`AgentBackend::cleanup_session_files` can reverse it on teardown
+/ `workbridge_delete`; the reverse path runs on a detached
 background thread via `App::spawn_agent_file_cleanup`. The backend
 appends `--mcp-config <tempfile>` in its own argv order
 (`ClaudeCodeBackend::build_command` places it AFTER the auto-start
@@ -571,9 +574,9 @@ detached background thread that calls
 `AgentBackend::cleanup_session_files` off the UI thread (see
 `docs/UI.md` "Blocking I/O Prohibition" - `std::fs::remove_file`
 blocks on the filesystem and must never run on the event loop), so
-Claude's `.mcp.json` and any future backend's side-car files are
-reversed when the work item is deleted without freezing the TUI
-on a slow or wedged filesystem. The global-assistant teardown adds one extra layer on top
+the `--mcp-config` tempfile and any future backend's side-car
+files are reversed when the work item is deleted without freezing
+the TUI on a slow or wedged filesystem. The global-assistant teardown adds one extra layer on top
 of `Session::kill`: `App::teardown_global_session` at
 `src/app.rs:8683` kills the child, drops the `SessionEntry` (which
 joins the reader via `Drop`), drops the MCP server, routes the
@@ -1011,15 +1014,18 @@ harness adapter is introduced, add a dated bullet here.
     pin the contract.
   - `SessionOpenPending` gained `committed_files: Arc<Mutex<Vec<PathBuf>>>`.
     The work-item session-open worker pushes each successfully
-    written side-car file (Claude's worktree `.mcp.json`) into
-    this shared list immediately after the write. On
-    cancellation, `cancel_session_open_entry` and `cleanup_all_mcp`
-    drain the mutex and feed the entries into
-    `spawn_agent_file_cleanup` alongside the
-    UI-thread-committed `mcp_config_path`. Without this list, a
-    cancellation race (worker writes `.mcp.json`, main thread
-    drops the receiver before the worker can `tx.send` the
-    `written_files` Vec) would orphan the file in the worktree
-    until the next merge / delete swept the directory. Regression
-    test `cancel_session_open_entry_cleans_committed_side_car_files`
-    pins the cleanup behaviour.
+    written side-car file into this shared list immediately after
+    the write. On cancellation, `cancel_session_open_entry` and
+    `cleanup_all_mcp` drain the mutex and feed the entries into
+    `spawn_agent_file_cleanup` alongside the UI-thread-committed
+    `mcp_config_path`. Without this list, a cancellation race
+    (worker writes a side-car file, main thread drops the receiver
+    before the worker can `tx.send` the `written_files` Vec) would
+    orphan the file until the next delete swept the directory.
+    Regression test
+    `cancel_session_open_entry_cleans_committed_side_car_files`
+    pins the cleanup behaviour. Note: `ClaudeCodeBackend` currently
+    returns no side-car files (MCP injection uses `--mcp-config`
+    only), so the `committed_files` machinery is exercised only by
+    future backends that need file-based config; the cancellation
+    test still validates the plumbing with a synthetic file list.

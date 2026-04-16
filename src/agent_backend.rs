@@ -139,10 +139,11 @@ pub struct ReviewGateVerdict {
 ///    touching any real spawn site.
 /// 2. Implement the trait. If a clause cannot be satisfied with flags
 ///    alone (e.g. Codex's `~/.codex/config.toml` for MCP injection),
-///    write the file inside `write_session_files` and return the path
-///    so the caller cleans it up - do NOT set environment variables
-///    (C13) and do NOT mutate the user's dotfiles (see the file-injection
-///    prohibition in the doc's C2 section).
+///    write the file inside `write_session_files` to a temp directory
+///    and return the path so the caller cleans it up - do NOT write
+///    into the worktree (pollutes git state), do NOT set environment
+///    variables (C13), and do NOT mutate the user's dotfiles (see the
+///    file-injection prohibition in the review policy).
 /// 3. Update `docs/harness-contract.md` "Implementation Map" with a new
 ///    per-clause entry for the backend, and the "Known Spawn Sites" line
 ///    numbers if any moved.
@@ -178,21 +179,24 @@ pub trait AgentBackend: Send + Sync {
     /// keep only the last relevant event before calling this function.
     fn parse_review_gate_stdout(&self, stdout: &str) -> ReviewGateVerdict;
 
-    /// Write backend-specific files required before spawn. For Claude this
-    /// writes `.mcp.json` into the work-item worktree so Claude Code's
-    /// project discovery picks it up in addition to `--mcp-config`. For
-    /// backends that route MCP injection through a different mechanism
-    /// (e.g. Codex's `config.toml`), this is where that file is written.
+    /// Write backend-specific temp files required before spawn. For
+    /// backends that route MCP injection through a mechanism other than
+    /// CLI flags (e.g. a config file), this is where that file is
+    /// written - but it MUST go into a temp directory, never into the
+    /// user's worktree. Writing into a worktree pollutes git state and
+    /// constitutes file injection (prohibited by the review policy).
+    /// Claude Code needs no side-car files: `--mcp-config` handles
+    /// MCP injection entirely via the CLI flag.
     ///
     /// Returns the list of paths the backend created. The caller MUST
     /// pass the same list back to `cleanup_session_files` when the
     /// session ends so nothing leaks.
     ///
-    /// `cwd` is the session's working directory (C2); the backend decides
-    /// whether to actually write anything there. Called only for spawn
-    /// sites that own a worktree-scoped cwd (work-item spawns today);
-    /// global-assistant and review-gate spawns skip this step because
-    /// they use scratch cwds that should not be polluted.
+    /// `cwd` is the session's working directory (C2); provided for
+    /// reference but backends MUST NOT write files into it. Called
+    /// only for spawn sites that own a worktree-scoped cwd (work-item
+    /// spawns today); global-assistant and review-gate spawns skip
+    /// this step because they use scratch cwds.
     fn write_session_files(&self, cwd: &Path, mcp_config_json: &str) -> io::Result<Vec<PathBuf>>;
 
     /// Remove the files returned by `write_session_files`. The default
@@ -209,8 +213,8 @@ pub trait AgentBackend: Send + Sync {
 /// Reference implementation: Anthropic Claude Code (`claude`) CLI.
 ///
 /// Every piece of Claude-specific knowledge in workbridge lives here:
-/// the binary name, every CLI flag, the `PostToolUse` planning hook, the
-/// `.mcp.json` convention, and the JSON envelope shape for headless
+/// the binary name, every CLI flag, the `PostToolUse` planning hook, and
+/// the JSON envelope shape for headless
 /// output. Nothing else in `src/` mentions these.
 pub struct ClaudeCodeBackend;
 
@@ -327,14 +331,14 @@ impl AgentBackend for ClaudeCodeBackend {
         }
     }
 
-    fn write_session_files(&self, cwd: &Path, mcp_config_json: &str) -> io::Result<Vec<PathBuf>> {
-        // Claude Code's project-discovery path reads `.mcp.json` from the
-        // worktree root. We write it in addition to `--mcp-config` so the
-        // discovery path has a known-good config if the flag is ever
-        // dropped. See `docs/harness-contract.md` C4 for the rationale.
-        let path = cwd.join(".mcp.json");
-        std::fs::write(&path, mcp_config_json)?;
-        Ok(vec![path])
+    fn write_session_files(&self, _cwd: &Path, _mcp_config_json: &str) -> io::Result<Vec<PathBuf>> {
+        // The `--mcp-config` flag already injects the MCP config
+        // into the session. Writing a redundant `.mcp.json` into
+        // the worktree would pollute the user's git state and
+        // constitutes file injection into a third-party workspace
+        // (prohibited by the review policy). No side-car files
+        // are needed for Claude Code.
+        Ok(vec![])
     }
 }
 

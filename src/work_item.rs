@@ -428,8 +428,9 @@ pub struct SessionEntry {
     pub scrollback_offset: usize,
     /// Active mouse text selection, if any.
     pub selection: Option<SelectionState>,
-    /// Side-car files the agent backend wrote before spawn (e.g. Claude's
-    /// worktree `.mcp.json`). Tracked here so the caller can hand them
+    /// Side-car files the agent backend wrote before spawn (e.g. temp
+    /// config files for future backends). Tracked here so the caller can
+    /// hand them
     /// back to `AgentBackend::cleanup_session_files` when the session
     /// dies or the work item is deleted. See `docs/harness-contract.md`
     /// C4 and the `AgentBackend::write_session_files` doc.

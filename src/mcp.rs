@@ -1370,9 +1370,8 @@ pub fn run_bridge(socket_path: PathBuf) {
 }
 
 /// Build MCP config JSON for passing to an agent backend (today:
-/// Claude Code via `--mcp-config`, or written into the worktree as
-/// `.mcp.json` for project discovery). Returns the JSON string; the
-/// caller chooses where to persist it.
+/// Claude Code via `--mcp-config`). Returns the JSON string; the
+/// caller writes it to a temp file and passes the path as a CLI flag.
 ///
 /// `extra_servers` are per-repo MCP servers from the user's config. The
 /// workbridge server is always inserted last so it wins over any user entry

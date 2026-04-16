@@ -1060,8 +1060,7 @@ pub struct SessionOpenPlanResult {
 /// cancellation flag was set.
 ///
 /// `committed_files` is the shared running list of side-car files
-/// the worker has actually written to disk (e.g. Claude's
-/// worktree `.mcp.json`, returned from
+/// the worker has actually written to disk (returned from
 /// `AgentBackend::write_session_files`). The worker pushes each
 /// successfully-written path into this `Mutex<Vec<PathBuf>>`
 /// immediately after the write returns; the main thread drains it
@@ -1435,7 +1434,7 @@ pub struct App {
     pub fetcher_handle: Option<FetcherHandle>,
     /// Pluggable LLM harness adapter that knows how to build argv for the
     /// three spawn profiles (work-item, review-gate, global) and write any
-    /// backend-specific side-car files (`.mcp.json`, `config.toml`, ...).
+    /// backend-specific side-car files (`config.toml`, etc.).
     /// Every place that previously hard-coded `claude` flags now goes
     /// through this trait object. See `src/agent_backend.rs` and
     /// `docs/harness-contract.md`.
@@ -1449,8 +1448,7 @@ pub struct App {
     /// Work item IDs where the agent has signaled it is actively working
     /// (via workbridge_set_activity). Cleared when the session dies.
     pub agent_working: std::collections::HashSet<WorkItemId>,
-    /// Paths to .mcp.json files written to worktrees, keyed by work item ID.
-    /// Tracked so they can be cleaned up when sessions die or work items are deleted.
+    /// Side-car file paths written by the agent backend, tracked for cleanup.
     /// Receiver for MCP events from all socket servers.
     pub mcp_rx: Option<crossbeam_channel::Receiver<McpEvent>>,
     /// Sender for MCP events (cloned for each socket server).
@@ -2619,7 +2617,7 @@ impl App {
     ///
     /// The reader threads handle PTY output continuously - no reading
     /// happens here. This only checks if child processes have exited.
-    /// Also cleans up MCP servers for dead sessions.
+    /// Also cleans up MCP servers and side-car files for dead sessions.
     pub fn check_liveness(&mut self) {
         let mut dead_ids: Vec<WorkItemId> = Vec::new();
         let mut dead_implementing: Vec<WorkItemId> = Vec::new();
@@ -2689,10 +2687,18 @@ impl App {
             .cloned()
             .collect();
         for key in orphans {
-            if let Some(mut entry) = self.sessions.remove(&key)
-                && let Some(mut session) = entry.session.take()
-            {
-                session.kill();
+            if let Some(mut entry) = self.sessions.remove(&key) {
+                // Drain side-car files before dropping the entry so
+                // the `--mcp-config` tempfile is
+                // cleaned up even when the session is removed as a
+                // stage-mismatch orphan.
+                let files = std::mem::take(&mut entry.agent_written_files);
+                if !files.is_empty() {
+                    self.spawn_agent_file_cleanup(files);
+                }
+                if let Some(mut session) = entry.session.take() {
+                    session.kill();
+                }
             }
         }
 
@@ -2747,6 +2753,24 @@ impl App {
     fn cleanup_session_state_for(&mut self, wi_id: &WorkItemId) {
         self.mcp_servers.remove(wi_id);
         self.agent_working.remove(wi_id);
+        // Drain agent-written side-car files from the live session
+        // entry (if any) so that natural session death (detected by
+        // `check_liveness`) removes the `--mcp-config` tempfile
+        // instead of leaking it. The
+        // delete path (`delete_work_item_by_id`) does its own
+        // `std::mem::take` after `sessions.remove`, so this is a
+        // no-op there - but here the entry stays in
+        // `self.sessions` (the session is dead, not deleted) and
+        // would otherwise silently drop its file list when the
+        // entry is later replaced by a reopened session.
+        if let Some(key) = self.session_key_for(wi_id)
+            && let Some(entry) = self.sessions.get_mut(&key)
+        {
+            let files = std::mem::take(&mut entry.agent_written_files);
+            if !files.is_empty() {
+                self.spawn_agent_file_cleanup(files);
+            }
+        }
         // Cancel any pending background session-open: signal the
         // worker to skip remaining file writes, route the committed
         // `mcp_config_path` through `spawn_agent_file_cleanup`, and
@@ -2800,8 +2824,8 @@ impl App {
             if let Some(entry) = self.session_open_rx.remove(&wi_id) {
                 entry.cancelled.store(true, Ordering::Release);
                 self.end_activity(entry.activity);
-                // Drain side-car files the worker already wrote
-                // (Claude's worktree `.mcp.json`, etc.). Symmetric
+                // Drain side-car files the worker already wrote.
+                // Symmetric
                 // with `cancel_session_open_entry`'s cleanup so
                 // shutdown does not leak them.
                 if let Ok(mut guard) = entry.committed_files.lock() {
@@ -3571,8 +3595,8 @@ impl App {
             && let Some(mut entry) = self.sessions.remove(&key)
         {
             // Hand the written-files list back to the backend so it can
-            // reverse any side-car files it wrote on spawn (Claude's
-            // `.mcp.json` in the worktree, the `--mcp-config` tempfile).
+            // reverse any side-car files it wrote on spawn (the
+            // `--mcp-config` tempfile, or future backend equivalents).
             // See `docs/harness-contract.md` C4 and
             // `AgentBackend::write_session_files`. The actual
             // `std::fs::remove_file` calls run on a dedicated
@@ -4162,8 +4186,8 @@ impl App {
     }
 
     /// Fire-and-forget background disposer for the side-car files the
-    /// `AgentBackend` wrote on spawn (Claude's worktree `.mcp.json`, the
-    /// `--mcp-config` tempfile, or any other backend's equivalent). See
+    /// `AgentBackend` wrote on spawn (the `--mcp-config` tempfile, or
+    /// any future backend's equivalent). See
     /// `docs/harness-contract.md` C4 and
     /// `AgentBackend::write_session_files`.
     ///
@@ -4884,12 +4908,10 @@ impl App {
     /// three conditions hold:
     ///
     /// 1. It is registered with git for the target `branch`.
-    /// 2. It is NOT the main worktree (`is_main = false`). The main
-    ///    worktree is pinned to the repo's default branch, and
-    ///    invariant #3 in `docs/invariants.md` forbids a work-item
-    ///    worktree on the default branch - reusing it would root the
-    ///    work item's session lifecycle inside the user's primary
-    ///    checkout and violate that invariant.
+    /// 2. It is NOT the main worktree (`is_main = false`). Reusing the
+    ///    user's primary repo checkout would spawn Claude sessions inside
+    ///    it and drop workbridge state there, violating
+    ///    invariant #3 in `docs/invariants.md`.
     /// 3. Its canonicalized path equals the canonicalized `wt_target` the
     ///    import/session-spawn flow would have created. This rules out
     ///    adopting unrelated worktrees the user made manually or that
@@ -5222,10 +5244,10 @@ impl App {
         // after each `write_session_files` / `std::fs::write` call;
         // drained by `cancel_session_open_entry` on cancellation
         // alongside `mcp_config_path`. This closes the leak window
-        // where the worker writes Claude's `.mcp.json` then loses
-        // the receiver to a cancellation race - the path would
+        // where the worker writes a side-car file then loses the
+        // receiver to a cancellation race - the path would
         // otherwise vanish along with the dropped result and
-        // orphan the file in the worktree.
+        // orphan the file.
         let committed_files: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
         let worker_committed_files = Arc::clone(&committed_files);
 
@@ -5348,8 +5370,8 @@ impl App {
                             &repo_mcp_servers,
                         );
 
-                        // Backend side-car files (Claude: the worktree
-                        // `.mcp.json` for project discovery). Push
+                        // Backend side-car files (future backends
+                        // may write temp config files here). Push
                         // each successfully-written path into the
                         // shared `worker_committed_files` list under
                         // the mutex BEFORE continuing, so a
@@ -5358,10 +5380,7 @@ impl App {
                         // can still find the path and clean it up
                         // via `cancel_session_open_entry`. Without
                         // this push, a cancelled work item would
-                        // orphan Claude's `.mcp.json` in the
-                        // worktree (the worktree usually goes
-                        // away on delete, but stage transitions
-                        // to no-session stages would leak it).
+                        // orphan the side-car file.
                         match agent_backend.write_session_files(&cwd_clone, &mcp_config) {
                             Ok(paths) => {
                                 if !paths.is_empty() {
@@ -5454,8 +5473,8 @@ impl App {
     /// `cancelled: Arc<AtomicBool>`), route the UI-thread-committed
     /// `mcp_config_path` AND any side-car files the worker has
     /// already written (via the shared `committed_files` mutex)
-    /// through `spawn_agent_file_cleanup` so neither the tempfile
-    /// nor Claude's worktree `.mcp.json` are leaked, and end the
+    /// through `spawn_agent_file_cleanup` so the tempfile and any
+    /// side-car files are not leaked, and end the
     /// spinner activity. Called from every abort path
     /// (`cleanup_session_state_for`, a dead-worker arm in
     /// `poll_session_opens`, the stage-transition respawn path, and
@@ -5516,8 +5535,8 @@ impl App {
                     Err(crossbeam_channel::TryRecvError::Empty) => continue,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         // Background thread died without sending - the
-                        // worker may have written its `.mcp.json` and
-                        // `--mcp-config` files before panicking, so
+                        // worker may have written its `--mcp-config`
+                        // and side-car files before panicking, so
                         // route the committed tempfile path through
                         // `spawn_agent_file_cleanup` via
                         // `cancel_session_open_entry` and end the
@@ -17254,11 +17273,10 @@ mod tests {
     /// Regression guard for the side-car file leak on cancellation.
     /// `cancel_session_open_entry` must drain the worker's
     /// `committed_files` mutex into the cleanup call so files the
-    /// worker already wrote (Claude's worktree `.mcp.json`, etc.)
-    /// are removed even when the worker's `tx.send(...)` is
-    /// silently dropped against a closed receiver. Pre-fix the
-    /// path was carried only via the `written_files` Vec inside
-    /// `SessionOpenPlanResult`, which got discarded along with
+    /// worker already wrote are removed even when the worker's
+    /// `tx.send(...)` is silently dropped against a closed receiver.
+    /// Pre-fix the path was carried only via the `written_files` Vec
+    /// inside `SessionOpenPlanResult`, which got discarded along with
     /// the result on a cancellation race.
     #[test]
     fn cancel_session_open_entry_cleans_committed_side_car_files() {
@@ -17273,18 +17291,18 @@ mod tests {
             "workbridge-cancel-test-mcp-{}.json",
             uuid::Uuid::new_v4()
         ));
-        let mcp_json_path = temp_dir.join(format!(
-            "workbridge-cancel-test-mcpjson-{}.json",
+        let side_car_path = temp_dir.join(format!(
+            "workbridge-cancel-test-sidecar-{}.json",
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&mcp_config_path, b"{}").expect("create mcp_config tempfile");
-        std::fs::write(&mcp_json_path, b"{}").expect("create mcp.json tempfile");
+        std::fs::write(&side_car_path, b"{}").expect("create side-car tempfile");
 
         // Synthesize a SessionOpenPending entry that looks like a
         // worker mid-flight after Phase C (side-car file written
         // and pushed into `committed_files`).
         let cancelled = Arc::new(AtomicBool::new(false));
-        let committed_files = Arc::new(Mutex::new(vec![mcp_json_path.clone()]));
+        let committed_files = Arc::new(Mutex::new(vec![side_car_path.clone()]));
         let (_tx, rx) = crossbeam_channel::bounded::<SessionOpenPlanResult>(1);
         let activity = app.start_activity("Opening session...");
         app.session_open_rx.insert(
@@ -17321,16 +17339,16 @@ mod tests {
         // The cleanup runs on a detached background thread; poll
         // until both files are gone or the bounded timeout elapses.
         wait_until_file_removed(&mcp_config_path, std::time::Duration::from_secs(5));
-        wait_until_file_removed(&mcp_json_path, std::time::Duration::from_secs(5));
+        wait_until_file_removed(&side_car_path, std::time::Duration::from_secs(5));
         assert!(
             !mcp_config_path.exists(),
             "spawn_agent_file_cleanup should have removed the temp \
              --mcp-config file",
         );
         assert!(
-            !mcp_json_path.exists(),
-            "spawn_agent_file_cleanup should have removed the worktree \
-             .mcp.json side-car file the worker pushed into committed_files",
+            !side_car_path.exists(),
+            "spawn_agent_file_cleanup should have removed the side-car \
+             file the worker pushed into committed_files",
         );
     }
 
