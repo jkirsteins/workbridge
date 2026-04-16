@@ -99,17 +99,35 @@ ignored.
 
 When a mouse event arrives, the priority check first consults
 `App::click_registry` - a per-frame table of rectangles pushed by the
-renderer. A registry hit routes the event by `ClickKind`:
+renderer. The registry stores `ClickTarget` values in two variants:
 
-- `ClickKind::WorkItemRow { index }` - emitted once per visible row in
-  the left-panel work item list. `Up(Left)` on the same row as the
+- `ClickTarget::WorkItemRow { index }` - emitted once per visible row
+  in the left-panel work item list. `Up(Left)` on the same row as the
   preceding `Down(Left)` selects the row.
-- `ClickKind::PrUrl | Branch | RepoPath | Title` - chrome labels in
-  the right panel. A Down-Up pair on the same target copies the value
-  to the clipboard.
+- `ClickTarget::Copy { kind, value }` (where `kind` is `PrUrl`,
+  `Branch`, `RepoPath`, or `Title`) - chrome labels in the right
+  panel. A Down-Up pair on the same target copies the value to the
+  clipboard.
 
-If the registry does not hit, `mouse_target()` classifies the cursor
-against terminal-absolute coordinates:
+Keeping row clicks and copy clicks in separate variants means
+`short_display` / `fire_chrome_copy` never have to handle a row-click
+payload, and `ClickKind` stays `Copy` / chrome-only.
+
+**Modality note.** Copy clicks fire through the priority check even
+when the global drawer is open, on the principle that labels "rendered
+anywhere in chrome stay clickable" (see
+`chrome_click_inside_global_drawer_still_fires`). Row clicks are
+**suppressed** while `global_drawer_open` is `true`, because selection
+has side effects (`selected_item`, `right_panel_tab`,
+`recenter_viewport_on_selection`) that the user cannot see while the
+drawer covers the list and would only discover after closing it. A
+suppressed row click falls through to `mouse_target()`, which routes
+the click to the drawer's own handler or to `MouseTarget::None` per
+the drawer-open classification below.
+
+If the registry does not hit (or the row-click is suppressed by the
+drawer gate), `mouse_target()` classifies the cursor against
+terminal-absolute coordinates:
 
 1. **Global drawer** - checked first because it overlays everything.
    When the drawer is open, coordinates outside its inner area return
@@ -159,11 +177,13 @@ locally in `handle_work_item_list_scroll`:
   `j` / `k` snaps the viewport back to the selection via the
   renderer's recenter pass.
 - Left-click on a visible row (dispatched via the
-  `ClickKind::WorkItemRow` priority path) sets `selected_item`, sets
-  `right_panel_tab = ClaudeCode`, arms
-  `recenter_viewport_on_selection`, and calls `sync_layout` when
-  the context-bar presence changes. Neither the wheel path nor the
-  click-to-select path triggers remote I/O, so
+  `ClickTarget::WorkItemRow` priority path) sets `selected_item`,
+  sets `right_panel_tab = ClaudeCode`, arms
+  `recenter_viewport_on_selection`, and calls `sync_layout` when the
+  context-bar presence changes. When `global_drawer_open` is true,
+  row-click dispatch is suppressed (see the modality note above) so
+  selection does not change silently behind the drawer. Neither the
+  wheel path nor the click-to-select path triggers remote I/O, so
   `App::try_begin_user_action` is not used here (the "User action
   guard" section below only applies to handlers that spawn
   `gh` / `git fetch` / network calls).
@@ -1020,7 +1040,7 @@ The render flow in `draw_work_item_list` (ui.rs):
    `style_tab_highlight_bg`). Letting ratatui own selection would
    re-introduce `get_items_bounds`'s auto-scroll-to-selection and
    defeat the decoupled viewport.
-7. Push a `ClickKind::WorkItemRow { index }` click target for each
+7. Push a `ClickTarget::WorkItemRow { index }` click target for each
    visible selectable row, so `handle_mouse` can route a left-click
    back to the row index without redoing layout math.
 8. Render the scrollbar as before; then overlay a single cyan

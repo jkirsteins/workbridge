@@ -7,7 +7,7 @@ use crate::app::{
     App, BOARD_COLUMNS, DashboardWindow, DisplayEntry, FocusPanel, RightPanelTab,
     SettingsListFocus, SettingsTab, UserActionKey, ViewMode,
 };
-use crate::click_targets::ClickKind;
+use crate::click_targets::ClickTarget;
 use crate::create_dialog::CreateDialogFocus;
 use crate::layout;
 
@@ -2018,7 +2018,7 @@ enum MouseTarget {
     /// Mouse is over the right panel's inner area.
     RightPanel { local_col: u16, local_row: u16 },
     /// Mouse is over the left-panel work item list's body area.
-    /// Row selection is routed through the `ClickKind::WorkItemRow`
+    /// Row selection is routed through the `ClickTarget::WorkItemRow`
     /// click-target registry (each visible row pushes a target each
     /// frame), so only the "is in the list body" signal is needed to
     /// dispatch wheel scrolls - there is no row payload on the
@@ -2108,8 +2108,8 @@ fn mouse_target_with_size(
     // cleared once the list is not drawn (e.g. behind a modal
     // overlay). A hit here dispatches wheel scrolls to the list's
     // `list_scroll_offset`; left-clicks are handled separately via
-    // the `ClickKind::WorkItemRow` entries in the click registry and
-    // take priority over this classification.
+    // the `ClickTarget::WorkItemRow` entries in the click registry
+    // and take priority over this classification.
     if let Some(rect) = app.work_item_list_body.get()
         && column >= rect.x
         && column < rect.x.saturating_add(rect.width)
@@ -2237,30 +2237,50 @@ fn handle_mouse_with_terminal_size(
     // cleared at the top of every frame and is populated by the
     // renderer with two kinds of targets:
     //
-    // - `ClickKind::WorkItemRow { index }` - one per visible row in
+    // - `ClickTarget::WorkItemRow { index }` - one per visible row in
     //   the left-panel work item list. A left-click release selects
     //   the row.
-    // - `ClickKind::PrUrl | Branch | RepoPath | Title` - one per
-    //   interactive chrome label. A down+up pair on the same target
-    //   copies the value to the clipboard.
+    // - `ClickTarget::Copy { kind, value }` - one per interactive
+    //   chrome label. A down+up pair on the same target copies the
+    //   value to the clipboard.
     //
     // Both take priority over the geometric PTY-area classification
     // because the classification would otherwise route right-panel
-    // labels into the text-selection branch. Routing work item row
-    // clicks through the same priority path is consistent: the row
-    // is drawn inside the left-panel chrome and the same "structural
-    // priority over PTY classification" reasoning applies.
+    // labels into the text-selection branch.
+    //
+    // **Drawer gate for row clicks only.** Chrome copies are
+    // intentionally allowed through the global drawer (see the
+    // `chrome_click_inside_global_drawer_still_fires` test): a copy
+    // is fire-and-forget and the user might reasonably want to copy
+    // a value drawn behind the drawer. Row selection, in contrast,
+    // has side effects (selected_item, right_panel_tab,
+    // recenter_viewport_on_selection) that the user cannot see while
+    // the drawer is open and would only discover after closing it,
+    // at which point the list has silently scrolled and a different
+    // item is highlighted. When the drawer is open we therefore
+    // short-circuit `WorkItemRow` hits: falling through lets
+    // `mouse_target_with_size` return `GlobalDrawer` / `None` as
+    // appropriate, and the drawer's own handler deals with the
+    // click.
     if matches!(action, MouseAction::SelectDown | MouseAction::SelectUp) {
-        let hit_kind = app
+        let dispatch = app
             .click_registry
             .try_borrow()
             .ok()
-            .and_then(|r| r.hit_test(mouse.column, mouse.row).map(|t| t.kind.clone()));
-        if let Some(kind) = hit_kind {
-            return match kind {
-                ClickKind::WorkItemRow { index } => handle_work_item_row_click(app, index, action),
-                _ => handle_chrome_click_fallback(app, mouse, action),
-            };
+            .and_then(|r| r.hit_test(mouse.column, mouse.row).cloned());
+        if let Some(target) = dispatch {
+            match target {
+                ClickTarget::WorkItemRow { index, .. } => {
+                    if !app.global_drawer_open {
+                        return handle_work_item_row_click(app, index, action);
+                    }
+                    // Fall through: drawer is open, let the geometric
+                    // classifier route the click to the drawer.
+                }
+                ClickTarget::Copy { .. } => {
+                    return handle_chrome_click_fallback(app, mouse, action);
+                }
+            }
         }
     }
 
@@ -2399,13 +2419,16 @@ fn handle_work_item_list_scroll(app: &mut App, scroll_up: bool) -> bool {
 /// Handle a left-click on a specific work item list row.
 ///
 /// Called from the click-registry priority path when a
-/// `ClickKind::WorkItemRow` is hit. Select-down is a no-op (we wait
-/// for the release so the user can abort by dragging off); select-up
-/// actually changes the selection, mirrors the keyboard handler's
-/// side effects (right panel tab, layout sync on context change), and
-/// arms a recenter so the next render centers the viewport on the
-/// clicked row. Scroll events never reach here (they are dispatched
-/// to `handle_work_item_list_scroll` via the `WorkItemList` arm).
+/// `ClickTarget::WorkItemRow` is hit and the global drawer is not
+/// open (the caller gates on `!app.global_drawer_open` to keep row
+/// selection from silently mutating behind the drawer). Select-down
+/// is a no-op (we wait for the release so the user can abort by
+/// dragging off); select-up actually changes the selection, mirrors
+/// the keyboard handler's side effects (right panel tab, layout sync
+/// on context change), and arms a recenter so the next render centers
+/// the viewport on the clicked row. Scroll events never reach here
+/// (they are dispatched to `handle_work_item_list_scroll` via the
+/// `WorkItemList` arm).
 fn handle_work_item_row_click(app: &mut App, index: usize, action: MouseAction) -> bool {
     match action {
         MouseAction::SelectDown => {
@@ -2475,11 +2498,12 @@ fn handle_chrome_click_fallback(app: &mut App, mouse: MouseEvent, action: MouseA
                 .try_borrow()
                 .ok()
                 .and_then(|r| r.hit_test(mouse.column, mouse.row).cloned());
-            if let Some(target) = hit {
-                app.pending_chrome_click =
-                    Some((mouse.column, mouse.row, target.kind, target.value));
+            if let Some(ClickTarget::Copy { kind, value, .. }) = hit {
+                app.pending_chrome_click = Some((mouse.column, mouse.row, kind, value));
                 true
             } else {
+                // Row targets are dispatched by the caller; anything
+                // else is a miss.
                 false
             }
         }
@@ -2495,9 +2519,10 @@ fn handle_chrome_click_fallback(app: &mut App, mouse: MouseEvent, action: MouseA
                 .ok()
                 .and_then(|r| r.hit_test(mouse.column, mouse.row).cloned());
             match (pending, hit) {
-                (Some((_, _, pending_kind, pending_value)), Some(target))
-                    if target.kind == pending_kind =>
-                {
+                (
+                    Some((_, _, pending_kind, pending_value)),
+                    Some(ClickTarget::Copy { kind, .. }),
+                ) if kind == pending_kind => {
                     app.fire_chrome_copy(pending_value, pending_kind);
                     true
                 }
@@ -3653,15 +3678,15 @@ mod tests {
         // Register a target that overlaps the right-panel inner area.
         {
             let mut reg = app.click_registry.borrow_mut();
-            reg.push(
+            reg.push_copy(
                 Rect {
                     x: 40,
                     y: 10,
                     width: 30,
                     height: 1,
                 },
-                "feat/my-branch".to_string(),
                 ClickKind::Branch,
+                "feat/my-branch".to_string(),
             );
         }
 
@@ -3711,15 +3736,15 @@ mod tests {
         let mut app = App::new();
         {
             let mut reg = app.click_registry.borrow_mut();
-            reg.push(
+            reg.push_copy(
                 Rect {
                     x: 40,
                     y: 10,
                     width: 30,
                     height: 1,
                 },
-                "https://example.com/pull/42".to_string(),
                 ClickKind::PrUrl,
+                "https://example.com/pull/42".to_string(),
             );
         }
 
@@ -3754,15 +3779,15 @@ mod tests {
         // the click coordinate.
         {
             let mut reg = app.click_registry.borrow_mut();
-            reg.push(
+            reg.push_copy(
                 Rect {
                     x: 80,
                     y: 10,
                     width: 10,
                     height: 1,
                 },
-                "never-copied".to_string(),
                 ClickKind::RepoPath,
+                "never-copied".to_string(),
             );
         }
 
@@ -3817,15 +3842,15 @@ mod tests {
 
         {
             let mut reg = app.click_registry.borrow_mut();
-            reg.push(
+            reg.push_copy(
                 Rect {
                     x: 5,
                     y: 30,
                     width: 20,
                     height: 1,
                 },
-                "workbridge".to_string(),
                 ClickKind::Title,
+                "workbridge".to_string(),
             );
         }
 
@@ -3867,15 +3892,15 @@ mod tests {
         let mut app = App::new();
         {
             let mut reg = app.click_registry.borrow_mut();
-            reg.push(
+            reg.push_copy(
                 Rect {
                     x: 40,
                     y: 10,
                     width: 30,
                     height: 1,
                 },
-                "feat/my-branch".to_string(),
                 ClickKind::Branch,
+                "feat/my-branch".to_string(),
             );
         }
 
@@ -4330,15 +4355,14 @@ mod tests {
         // Register one row target at y=5 covering the full body width.
         {
             let mut reg = app.click_registry.borrow_mut();
-            reg.push(
+            reg.push_work_item_row(
                 UiRect {
                     x: rect.x,
                     y: rect.y + 5,
                     width: rect.width,
                     height: 1,
                 },
-                String::new(),
-                ClickKind::WorkItemRow { index: 3 },
+                3,
             );
         }
         app.selected_item = Some(0);
@@ -4370,6 +4394,56 @@ mod tests {
         handle_mouse_with_terminal_size(&mut app, down, TEST_SIZE);
         handle_mouse_with_terminal_size(&mut app, up, TEST_SIZE);
         assert_eq!(app.selected_item, Some(0), "selection must not change");
+    }
+
+    /// Drawer-gate regression: when the global drawer is open and a
+    /// click falls over a registered `WorkItemRow` target (because
+    /// the drawer visually covers part of the list), the row must NOT
+    /// be selected. The click instead flows through the geometric
+    /// classifier to the drawer's own handler. This is the asymmetry
+    /// vs chrome copies: a fire-and-forget clipboard copy is fine to
+    /// resolve through the drawer, but silently changing
+    /// `selected_item` + `right_panel_tab` + viewport behind an open
+    /// modal surprises the user.
+    #[test]
+    fn drawer_open_suppresses_work_item_row_click() {
+        let mut app = App::new();
+        let rect = seed_work_item_list(&mut app, 20, 15);
+        {
+            let mut reg = app.click_registry.borrow_mut();
+            reg.push_work_item_row(
+                UiRect {
+                    x: rect.x,
+                    y: rect.y + 5,
+                    width: rect.width,
+                    height: 1,
+                },
+                3,
+            );
+        }
+        app.global_drawer_open = true;
+        app.selected_item = Some(0);
+        let initial_tab = app.right_panel_tab;
+        app.recenter_viewport_on_selection.set(false);
+
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 10, 5);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 10, 5);
+        handle_mouse_with_terminal_size(&mut app, down, TEST_SIZE);
+        handle_mouse_with_terminal_size(&mut app, up, TEST_SIZE);
+
+        assert_eq!(
+            app.selected_item,
+            Some(0),
+            "row click behind open drawer must not mutate selection",
+        );
+        assert!(
+            !app.recenter_viewport_on_selection.get(),
+            "row click behind open drawer must not arm recenter",
+        );
+        assert!(
+            app.right_panel_tab == initial_tab,
+            "row click behind open drawer must not change right_panel_tab",
+        );
     }
 
     #[test]

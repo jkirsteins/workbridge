@@ -1517,12 +1517,12 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     app.list_max_item_offset.set(max_item_offset);
     app.work_item_list_body.set(Some(body_area));
 
-    // Per-row click targets: push a `ClickKind::WorkItemRow` for each
-    // row that is at least partially visible so `handle_mouse` can map
-    // a left-click at `(x, y)` back to a display-list index without
-    // redoing the layout math. Offscreen rows are skipped - the
-    // registry hit-test is a linear scan, so keeping it small keeps the
-    // mouse path cheap.
+    // Per-row click targets: push a `ClickTarget::WorkItemRow` for
+    // each row that is at least partially visible so `handle_mouse`
+    // can map a left-click at `(x, y)` back to a display-list index
+    // without redoing the layout math. Offscreen rows are skipped -
+    // the registry hit-test is a linear scan, so keeping it small
+    // keeps the mouse path cheap.
     {
         let mut registry = app.click_registry.borrow_mut();
         let mut y = body_area.y;
@@ -1540,15 +1540,14 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
             // dispatch. The mouse handler falls through to the
             // GlobalDrawer / RightPanel / WorkItemList arms otherwise.
             if is_selectable(&app.display_list[i]) {
-                registry.push(
+                registry.push_work_item_row(
                     Rect {
                         x: body_area.x,
                         y,
                         width: body_area.width,
                         height: row_height,
                     },
-                    String::new(),
-                    ClickKind::WorkItemRow { index: i },
+                    i,
                 );
             }
             y = y.saturating_add(row_height);
@@ -2614,15 +2613,15 @@ fn draw_work_item_detail(
     } else {
         let title_value = wi.title.clone();
         let title_width = UnicodeWidthStr::width(title_value.as_str()) as u16;
-        registry.push(
+        registry.push_copy(
             Rect {
                 x: inner.x.saturating_add(LABEL_INDENT),
                 y: inner.y.saturating_add(1),
                 width: title_width,
                 height: 1,
             },
-            title_value.clone(),
             ClickKind::Title,
+            title_value.clone(),
         );
         lines.push(Line::from(vec![
             Span::styled("  ".to_string(), theme.style_text()),
@@ -2653,15 +2652,15 @@ fn draw_work_item_detail(
             lines.push(plain_row("Repo", &repo_str));
         } else {
             let value_width = UnicodeWidthStr::width(repo_str.as_str()) as u16;
-            registry.push(
+            registry.push_copy(
                 Rect {
                     x: inner.x.saturating_add(LABEL_INDENT + LABEL_WIDTH),
                     y: inner.y.saturating_add(line_index),
                     width: value_width,
                     height: 1,
                 },
-                repo_str.clone(),
                 ClickKind::RepoPath,
+                repo_str.clone(),
             );
             lines.push(Line::from(vec![
                 Span::styled(format!("  {:<12}", "Repo"), label_style),
@@ -2677,15 +2676,15 @@ fn draw_work_item_detail(
             lines.push(plain_row("Branch", branch_str));
         } else {
             let value_width = UnicodeWidthStr::width(branch_str) as u16;
-            registry.push(
+            registry.push_copy(
                 Rect {
                     x: inner.x.saturating_add(LABEL_INDENT + LABEL_WIDTH),
                     y: inner.y.saturating_add(line_index),
                     width: value_width,
                     height: 1,
                 },
-                branch_str.to_string(),
                 ClickKind::Branch,
+                branch_str.to_string(),
             );
             lines.push(Line::from(vec![
                 Span::styled(format!("  {:<12}", "Branch"), label_style),
@@ -2706,15 +2705,15 @@ fn draw_work_item_detail(
         let line_index = lines.len() as u16;
         let url_value = url.to_string();
         let url_width = UnicodeWidthStr::width(url_value.as_str()) as u16;
-        registry.push(
+        registry.push_copy(
             Rect {
                 x: inner.x.saturating_add(LABEL_INDENT),
                 y: inner.y.saturating_add(line_index),
                 width: url_width,
                 height: 1,
             },
-            url_value.clone(),
             ClickKind::PrUrl,
+            url_value.clone(),
         );
         lines.push(Line::from(vec![
             Span::styled("  ".to_string(), theme.style_text()),
@@ -6514,14 +6513,66 @@ mod snapshot_tests {
         insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
+    /// Render through `TestBackend` and return the raw buffer so
+    /// tests can inspect per-cell symbol + foreground color. The
+    /// string-returning `render()` helper drops style information;
+    /// tests that must distinguish the Cyan selection marker from
+    /// the Gray scrollbar thumb (both use `\u{2588}`) need the
+    /// buffer directly.
+    fn render_buffer(app: &mut App, width: u16, height: u16) -> ratatui_core::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default_theme();
+        terminal
+            .draw(|frame: &mut ratatui_core::terminal::Frame<'_>| {
+                draw_to_buffer(frame.area(), frame.buffer_mut(), app, &theme)
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Count cells in column `x` (across all rows of `buf`) whose
+    /// symbol is `\u{2588}` and whose foreground color matches
+    /// `fg`. Used to distinguish selection marker (Cyan) from
+    /// scrollbar thumb (Gray) in the same column.
+    fn count_block_cells_with_fg(
+        buf: &ratatui_core::buffer::Buffer,
+        x: u16,
+        fg: ratatui_core::style::Color,
+    ) -> usize {
+        let area = buf.area;
+        let mut n = 0;
+        for y in area.y..(area.y + area.height) {
+            if let Some(cell) = buf.cell((x, y))
+                && cell.symbol() == "\u{2588}"
+                && cell.fg == fg
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Scrollbar column for the left panel at the given terminal
+    /// width. Mirrors `draw_work_item_list`'s scrollbar geometry:
+    /// the track sits at `area.x + area.width - 1`, i.e. the last
+    /// column of the left panel's bordered block.
+    fn scrollbar_column(width: u16) -> u16 {
+        let pl = crate::layout::compute(width, 24, 0);
+        // The left panel occupies columns 0..pl.left_width, and the
+        // scrollbar is painted on its right border column.
+        pl.left_width - 1
+    }
+
     /// Offscreen-selection marker, selection above the viewport.
     ///
     /// With the decoupled viewport, a selection that has scrolled off
-    /// the top of the visible body is signalled by a single cyan
+    /// the top of the visible body is signalled by a single Cyan
     /// filled-block cell in the scrollbar column at the y-coordinate
     /// corresponding to the selection's position in the full list.
-    /// This test seeds an overflowing list, sets `list_scroll_offset`
-    /// past the selection, and asserts a marker is rendered.
+    /// We inspect the buffer directly because the Gray thumb uses
+    /// the same glyph - only the foreground color distinguishes the
+    /// marker from the thumb.
     #[test]
     fn offscreen_selection_marker_above_viewport() {
         let items: Vec<WorkItem> = (0..15)
@@ -6542,16 +6593,13 @@ mod snapshot_tests {
         app.selected_item = app.display_list.iter().position(is_selectable);
         app.list_scroll_offset.set(app.display_list.len() - 2);
         app.recenter_viewport_on_selection.set(false);
-        let rendered = render(&mut app, 80, 24);
-        // The marker block symbol must appear somewhere in the
-        // scrollbar column (col 24 of the left panel, x-index 0-based
-        // 24 is `left_width - 1`). We assert on the symbol presence
-        // because the buffer rendering preserves foreground style but
-        // the text conversion in `render` drops it - what we can test
-        // in text is the `\u{2588}` glyph.
-        assert!(
-            rendered.contains('\u{2588}'),
-            "scrollbar column should contain a marker or thumb block:\n{rendered}"
+
+        let buf = render_buffer(&mut app, 80, 24);
+        let x = scrollbar_column(80);
+        let cyan = count_block_cells_with_fg(&buf, x, ratatui_core::style::Color::Cyan);
+        assert_eq!(
+            cyan, 1,
+            "offscreen selection must paint exactly one Cyan block in the scrollbar column",
         );
     }
 
@@ -6575,16 +6623,22 @@ mod snapshot_tests {
         app.selected_item = app.display_list.iter().rposition(is_selectable);
         app.list_scroll_offset.set(0);
         app.recenter_viewport_on_selection.set(false);
-        let rendered = render(&mut app, 80, 24);
-        assert!(
-            rendered.contains('\u{2588}'),
-            "scrollbar column should contain a marker or thumb block:\n{rendered}"
+
+        let buf = render_buffer(&mut app, 80, 24);
+        let x = scrollbar_column(80);
+        let cyan = count_block_cells_with_fg(&buf, x, ratatui_core::style::Color::Cyan);
+        assert_eq!(
+            cyan, 1,
+            "offscreen selection must paint exactly one Cyan block in the scrollbar column",
         );
     }
 
     /// When the selection is inside the visible viewport, only the
     /// normal scrollbar thumb is rendered - the offscreen marker must
-    /// NOT double-paint on top of the thumb.
+    /// NOT double-paint on top of the thumb. Since the whole list
+    /// fits at this terminal size, neither the thumb nor the marker
+    /// is drawn, so the scrollbar column must contain no block cells
+    /// at all.
     #[test]
     fn selection_visible_no_extra_marker() {
         let items = vec![
@@ -6594,19 +6648,52 @@ mod snapshot_tests {
         ];
         let mut app = app_with_items(items, vec![]);
         app.selected_item = app.display_list.iter().position(is_selectable);
-        // At a tall viewport (24 rows) the whole list fits, no
-        // scrolling, no marker. This test documents that the feature
-        // is silent when there is nothing offscreen - a regression
-        // that paints a stray marker on a fully-visible list would
-        // show up as an extra `\u{2588}` outside any scrollbar track.
-        let rendered = render(&mut app, 80, 24);
-        // The scrollbar itself is not rendered because
-        // `total_rows <= body_height`, so there is no thumb and no
-        // marker. Every block glyph in the output would be a
-        // regression.
+
+        let buf = render_buffer(&mut app, 80, 24);
+        let x = scrollbar_column(80);
+        let cyan = count_block_cells_with_fg(&buf, x, ratatui_core::style::Color::Cyan);
+        let gray = count_block_cells_with_fg(&buf, x, ratatui_core::style::Color::Gray);
+        assert_eq!(
+            cyan, 0,
+            "fully-visible list must not paint the Cyan selection marker",
+        );
+        assert_eq!(
+            gray, 0,
+            "fully-visible list has no overflow so the scrollbar thumb must not draw",
+        );
+    }
+
+    /// Scrollbar-overflow companion: when the list overflows AND the
+    /// selection is onscreen, the Gray thumb paints but the Cyan
+    /// marker does NOT. Catches a regression where the marker might
+    /// double-paint on top of the thumb for visible selections.
+    #[test]
+    fn selection_onscreen_paints_thumb_but_no_marker() {
+        let items: Vec<WorkItem> = (0..15)
+            .map(|i| {
+                make_work_item(
+                    &format!("item-{i}"),
+                    &format!("Work item number {i}"),
+                    WorkItemStatus::Implementing,
+                    None,
+                    1,
+                )
+            })
+            .collect();
+        let mut app = app_with_items(items, vec![]);
+        // Select the first selectable item AND keep the viewport at
+        // the top via recenter so the selection is definitely visible.
+        app.selected_item = app.display_list.iter().position(is_selectable);
+        app.recenter_viewport_on_selection.set(true);
+
+        let buf = render_buffer(&mut app, 80, 24);
+        let x = scrollbar_column(80);
+        let cyan = count_block_cells_with_fg(&buf, x, ratatui_core::style::Color::Cyan);
+        let gray = count_block_cells_with_fg(&buf, x, ratatui_core::style::Color::Gray);
+        assert_eq!(cyan, 0, "onscreen selection must not paint the Cyan marker",);
         assert!(
-            !rendered.contains('\u{2588}'),
-            "fully-visible list should not render any scrollbar glyph:\n{rendered}"
+            gray > 0,
+            "overflowing list must paint at least one Gray thumb cell",
         );
     }
 

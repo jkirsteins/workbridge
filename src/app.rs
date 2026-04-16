@@ -48,7 +48,7 @@ pub struct Toast {
 ///   the last 40 chars if the URL has no recognizable tail.
 /// - `RepoPath`: show the basename only.
 /// - `Branch` / `Title`: truncate to 40 chars with an ellipsis marker.
-pub fn short_display(value: &str, kind: &ClickKind) -> String {
+pub fn short_display(value: &str, kind: ClickKind) -> String {
     const MAX: usize = 40;
     match kind {
         ClickKind::PrUrl => {
@@ -70,12 +70,6 @@ pub fn short_display(value: &str, kind: &ClickKind) -> String {
             .map(|s| s.to_string())
             .unwrap_or_else(|| truncate_tail(value, MAX)),
         ClickKind::Branch | ClickKind::Title => truncate_head(value, MAX),
-        // Work item row clicks never reach `short_display` - they are
-        // dispatched via the row-click path and do not fire a
-        // copy-to-clipboard toast. Fall back to a head-truncation so
-        // the function is still total if some future code path calls
-        // it with this variant.
-        ClickKind::WorkItemRow { .. } => truncate_head(value, MAX),
     }
 }
 
@@ -2341,7 +2335,7 @@ impl App {
     /// independent of the existing drag-select copy flow.
     pub fn fire_chrome_copy(&mut self, value: String, kind: ClickKind) {
         let ok = crate::clipboard::copy(&value);
-        let short = short_display(&value, &kind);
+        let short = short_display(&value, kind);
         let text = if ok {
             format!("Copied: {short}")
         } else {
