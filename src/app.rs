@@ -3419,8 +3419,7 @@ impl App {
             .map(|p| p.wi_id == *wi_id)
             .unwrap_or(false)
         {
-            self.stale_worktree_prompt = None;
-            self.stale_recovery_in_progress = false;
+            self.clear_stale_recovery();
         }
 
         Ok(())
@@ -5160,8 +5159,7 @@ impl App {
         // recovery modal. On success the prompt is dismissed; on failure
         // the error arm below will re-display the appropriate alert.
         if self.stale_recovery_in_progress {
-            self.stale_recovery_in_progress = false;
-            self.stale_worktree_prompt = None;
+            self.clear_stale_recovery();
         }
 
         let reused = result.reused;
@@ -5244,6 +5242,15 @@ impl App {
         }
     }
 
+    /// Clear both stale-worktree recovery fields atomically. These two
+    /// fields must always be cleared together; using this helper instead
+    /// of setting them individually prevents a future cleanup site from
+    /// clearing one but not the other (which would leave a stuck spinner).
+    fn clear_stale_recovery(&mut self) {
+        self.stale_worktree_prompt = None;
+        self.stale_recovery_in_progress = false;
+    }
+
     /// Spawn a background thread that force-removes a stale worktree,
     /// prunes git's worktree bookkeeping, and retries worktree creation.
     /// Called from the stale-worktree recovery dialog when the user
@@ -5251,15 +5258,16 @@ impl App {
     /// (`stale_recovery_in_progress`) that blocks all input until the
     /// result arrives via `poll_worktree_creation`.
     pub fn spawn_stale_worktree_recovery(&mut self, prompt: StaleWorktreePrompt) {
-        // Re-populate the prompt so the UI can render the spinner modal.
+        // Extract the fields the background thread needs before
+        // storing the prompt back for the spinner modal.
         let wi_id = prompt.wi_id.clone();
-        self.stale_worktree_prompt = Some(StaleWorktreePrompt {
-            wi_id: prompt.wi_id.clone(),
-            error: prompt.error.clone(),
-            stale_path: prompt.stale_path.clone(),
-            repo_path: prompt.repo_path.clone(),
-            branch: prompt.branch.clone(),
-        });
+        let wi_id_for_payload = wi_id.clone();
+        let repo_path = prompt.repo_path.clone();
+        let stale_path = prompt.stale_path.clone();
+        let branch = prompt.branch.clone();
+
+        // Re-populate the prompt so the UI can render the spinner modal.
+        self.stale_worktree_prompt = Some(prompt);
         self.stale_recovery_in_progress = true;
 
         if self
@@ -5270,8 +5278,7 @@ impl App {
             )
             .is_none()
         {
-            self.stale_recovery_in_progress = false;
-            self.stale_worktree_prompt = None;
+            self.clear_stale_recovery();
             self.status_message = Some("Worktree operation already in progress...".into());
             return;
         }
@@ -5285,38 +5292,31 @@ impl App {
             // doesn't exist on disk, `git worktree remove --force` still
             // cleans up the bookkeeping in .git/worktrees/.
             let _ = ws.remove_worktree(
-                &prompt.repo_path,
-                &prompt.stale_path,
+                &repo_path,
+                &stale_path,
                 false, // don't delete the branch - it has the user's work
                 true,  // force
             );
 
             // Step 2: Prune any remaining stale worktree entries.
-            let _ = ws.prune_worktrees(&prompt.repo_path);
+            let _ = ws.prune_worktrees(&repo_path);
 
             // Step 3: Retry worktree creation.
-            let wt_target = Self::worktree_target_path(&prompt.repo_path, &prompt.branch, &wt_dir);
+            let wt_target = Self::worktree_target_path(&repo_path, &branch, &wt_dir);
 
-            let reused_wt = Self::find_reusable_worktree(
-                ws.as_ref(),
-                &prompt.repo_path,
-                &prompt.branch,
-                &wt_target,
-            );
+            let reused_wt =
+                Self::find_reusable_worktree(ws.as_ref(), &repo_path, &branch, &wt_target);
             let (wt_result, reused) = match reused_wt {
                 Some(existing) => (Ok(existing), true),
-                None => (
-                    ws.create_worktree(&prompt.repo_path, &prompt.branch, &wt_target),
-                    false,
-                ),
+                None => (ws.create_worktree(&repo_path, &branch, &wt_target), false),
             };
 
             match wt_result {
                 Ok(wt_info) => {
                     let _ = tx.send(WorktreeCreateResult {
-                        wi_id: prompt.wi_id,
-                        repo_path: prompt.repo_path,
-                        branch: Some(prompt.branch),
+                        wi_id,
+                        repo_path,
+                        branch: Some(branch),
                         path: Some(wt_info.path),
                         error: None,
                         open_session: true,
@@ -5327,9 +5327,9 @@ impl App {
                 }
                 Err(e) => {
                     let _ = tx.send(WorktreeCreateResult {
-                        wi_id: prompt.wi_id,
-                        repo_path: prompt.repo_path,
-                        branch: Some(prompt.branch),
+                        wi_id,
+                        repo_path,
+                        branch: Some(branch),
                         path: None,
                         error: Some(format!("Recovery failed: {e}")),
                         open_session: true,
@@ -5343,7 +5343,10 @@ impl App {
 
         self.attach_user_action_payload(
             &UserActionKey::WorktreeCreate,
-            UserActionPayload::WorktreeCreate { rx, wi_id },
+            UserActionPayload::WorktreeCreate {
+                rx,
+                wi_id: wi_id_for_payload,
+            },
         );
     }
 
