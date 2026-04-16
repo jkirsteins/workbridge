@@ -6070,6 +6070,22 @@ impl App {
             self.status_message = Some("Rebase already in progress for this item".into());
             return;
         }
+        // Reject a rebase while the work item has a live interactive
+        // session. The rebase gate spawns a second headless Claude in
+        // the same worktree; if the interactive session is concurrently
+        // editing files or running git commands, the two processes will
+        // race on the index and working tree, producing
+        // nondeterministic rebase results or index-lock errors. Pure
+        // in-memory check (no I/O): reads session_key_for + the
+        // SessionEntry.alive flag populated by check_liveness.
+        if let Some(key) = self.session_key_for(&target.wi_id)
+            && let Some(entry) = self.sessions.get(&key)
+            && entry.alive
+        {
+            self.status_message =
+                Some("Cannot rebase while a session is active for this item".into());
+            return;
+        }
         self.spawn_rebase_gate(target);
     }
 
@@ -9472,13 +9488,31 @@ impl App {
                                         Ok(o) => o.status.success(),
                                         Err(_) => false,
                                     };
-                                    if ancestry_ok {
+                                    // Also check that no rebase is
+                                    // still in progress. During a
+                                    // conflicted rebase HEAD has
+                                    // already advanced past origin/
+                                    // <base> so the ancestry check
+                                    // passes, but REBASE_HEAD exists
+                                    // while git is waiting for
+                                    // conflict resolution. If the
+                                    // harness hallucinated success
+                                    // while leaving the worktree
+                                    // mid-rebase, this catches it.
+                                    let rebase_in_progress = crate::worktree_service::git_command()
+                                        .arg("-C")
+                                        .arg(&worktree_path)
+                                        .args(["rev-parse", "--verify", "--quiet", "REBASE_HEAD"])
+                                        .output()
+                                        .map(|o| o.status.success())
+                                        .unwrap_or(false);
+                                    if ancestry_ok && !rebase_in_progress {
                                         RebaseResult::Success {
                                             base_branch: base_branch.clone(),
                                             conflicts_resolved,
                                             activity_log_error: None,
                                         }
-                                    } else {
+                                    } else if !ancestry_ok {
                                         RebaseResult::Failure {
                                             base_branch: base_branch.clone(),
                                             reason: format!(
@@ -9486,6 +9520,18 @@ impl App {
                                             ),
                                             conflicts_attempted: conflicts_resolved
                                                 || conflicts_attempted_observed,
+                                            activity_log_error: None,
+                                        }
+                                    } else {
+                                        // ancestry_ok but rebase_in_progress:
+                                        // REBASE_HEAD exists, meaning git is
+                                        // waiting for conflict resolution.
+                                        // The harness left the worktree
+                                        // mid-rebase.
+                                        RebaseResult::Failure {
+                                            base_branch: base_branch.clone(),
+                                            reason: "harness reported success but a rebase is still in progress (REBASE_HEAD exists)".into(),
+                                            conflicts_attempted: true,
                                             activity_log_error: None,
                                         }
                                     }
