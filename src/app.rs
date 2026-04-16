@@ -11805,6 +11805,9 @@ impl App {
                     self.status_message = Some(err);
                     self.global_drawer_open = false;
                     self.focus = pending.pre_drawer_focus;
+                    // Clear buffered keystrokes so they do not leak
+                    // into the next successful open.
+                    self.pending_global_pty_bytes.clear();
                     return;
                 }
 
@@ -11839,6 +11842,7 @@ impl App {
                     Some("Global assistant: preparation worker exited unexpectedly".into());
                 self.global_drawer_open = false;
                 self.focus = pending.pre_drawer_focus;
+                self.pending_global_pty_bytes.clear();
             }
         }
     }

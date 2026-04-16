@@ -846,9 +846,9 @@ update the Implementation Map section above.
 
 | File          | Line  | Mode        | Scope      | Thread     | Cwd                                       |
 |---------------|-------|-------------|------------|------------|-------------------------------------------|
-| `src/app.rs`  | 4558  | Interactive | WorkItem   | Background | Work-item worktree                        |
-| `src/app.rs`  | 8292  | Headless    | ReviewGate | Background | inherited                                 |
-| `src/app.rs`  | 9068  | Interactive | Global     | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
+| `src/app.rs`  | 4671  | Interactive | WorkItem   | Background | Work-item worktree                        |
+| `src/app.rs`  | 8579  | Headless    | ReviewGate | Background | inherited                                 |
+| `src/app.rs`  | 9245  | Interactive | Global     | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
 
 The "Thread" column records which thread actually calls
 `Session::spawn` / `std::process::Command::output()`. All three
