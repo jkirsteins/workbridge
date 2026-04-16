@@ -1389,10 +1389,20 @@ pub fn handle_paste(app: &mut App, data: &str) -> bool {
 }
 
 /// Route a paste event to the focused text input inside whichever modal
-/// is currently up. The precedence mirrors `handle_key` exactly so paste
-/// and key events never diverge: if `handle_key` would type a character
-/// into field X for the given app state, `handle_paste` inserts the whole
-/// paste payload into field X.
+/// is currently up. The invariant is behavioral, not textual: for every
+/// reachable app state, paste lands in the same field `handle_key`
+/// would type into. This holds because all modal flags in
+/// `any_modal_visible` are mutually exclusive at runtime (set_branch,
+/// create_dialog, rework, cleanup, settings editing, merge, delete,
+/// branch-gone, stale-worktree, no-plan, alert, and in-progress
+/// spinners are each opened by flows that refuse to run while another
+/// modal is up), so the literal arm order in this function does not
+/// have to match `handle_key` - at most one condition is ever true.
+///
+/// When adding a new modal, verify it is mutually exclusive with every
+/// other modal (or extend both handlers to agree on the stacking
+/// precedence). Do NOT rely on arm order here as a correctness
+/// argument.
 ///
 /// Returns `true` when the paste was inserted into a text input (a
 /// re-render is needed), or `false` when the active modal has no text
@@ -1402,9 +1412,10 @@ pub fn handle_paste(app: &mut App, data: &str) -> bool {
 /// value reaches `salsa.rs`, where it suppresses the re-render and
 /// keeps the paste from leaking to any PTY - the modal swallows it.
 fn route_paste_to_modal_input(app: &mut App, data: &str) -> bool {
-    // Match the order in `handle_key` so new overlays do not drift the
-    // two handlers apart. Each arm either returns after consuming the
-    // paste or falls through to the "no text-input target" tail.
+    // Each arm checks one modal state. Because every modal in
+    // `any_modal_visible` is mutually exclusive with every other
+    // modal, at most one arm will match for any reachable app state -
+    // so the order below is not load-bearing for correctness.
 
     // 1. Set-branch recovery modal (single-line branch input).
     if let Some(dlg) = app.set_branch_dialog.as_mut() {
