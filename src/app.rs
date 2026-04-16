@@ -4259,6 +4259,16 @@ impl App {
     ///
     /// `Arc<dyn AgentBackend>` is `Send + Sync` by the trait bound, so
     /// cloning it into the thread is safe.
+    /// Drop an `McpSocketServer` on a background thread so its
+    /// `Drop` impl (which calls `std::fs::remove_file` on the
+    /// socket path) never blocks the UI thread. See `docs/UI.md`
+    /// "Blocking I/O Prohibition".
+    fn drop_mcp_server_off_thread(&self, server: McpSocketServer) {
+        std::thread::spawn(move || {
+            drop(server);
+        });
+    }
+
     fn spawn_agent_file_cleanup(&self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;
@@ -5259,11 +5269,16 @@ impl App {
     /// removes the entry as soon as the result arrives.
     fn begin_session_open(&mut self, work_item_id: &WorkItemId, cwd: &std::path::Path) {
         if self.session_open_rx.contains_key(work_item_id) {
-            // Already in flight - the pending worker will finish the open.
-            // Re-surface the spinner message so a repeat Enter press is
-            // not silent; the existing activity entry is still alive so
-            // the duplicate start below would otherwise stack.
+            // Phase 1 already in flight - the pending worker will
+            // finish the open. Re-surface the spinner message so a
+            // repeat Enter press is not silent.
             self.status_message = Some("Opening session...".into());
+            return;
+        }
+        if self.session_spawn_rx.contains_key(work_item_id) {
+            // Phase 2 PTY spawn already in flight - the pending
+            // `poll_session_spawns` tick will install the session.
+            self.status_message = Some("Spawning agent session...".into());
             return;
         }
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -5658,18 +5673,19 @@ impl App {
     ) {
         // Guard: the work item may have been deleted while the
         // background worker was in flight. In that case, do not spawn
-        // a session. The server (if any) is dropped here, which
-        // triggers its accept-loop shutdown via `Drop for
-        // McpSocketServer`; the side-car files are handed to
-        // `spawn_agent_file_cleanup` so their removal runs off the UI
-        // thread just like the normal delete path.
+        // a session. The server (if any) is dropped on a background
+        // thread so its `std::fs::remove_file` does not block the UI;
+        // the side-car files are handed to `spawn_agent_file_cleanup`
+        // for the same reason.
         let Some(work_item_status) = self
             .work_items
             .iter()
             .find(|w| w.id == *work_item_id)
             .map(|w| w.status)
         else {
-            drop(mcp_server);
+            if let Some(server) = mcp_server {
+                self.drop_mcp_server_off_thread(server);
+            }
             self.spawn_agent_file_cleanup(written_files);
             return;
         };
@@ -5715,7 +5731,19 @@ impl App {
                     written_files,
                 },
             };
-            let _ = tx.send(result);
+            if let Err(crossbeam_channel::SendError(result)) = tx.send(result) {
+                // Receiver was dropped (work item deleted or app
+                // shutting down while spawn was in flight). Session
+                // and MCP server Drops run here (background thread,
+                // so no UI-thread I/O). Clean up side-car files
+                // directly since we cannot reach
+                // `spawn_agent_file_cleanup` from here.
+                for path in &result.written_files {
+                    let _ = std::fs::remove_file(path);
+                }
+                // `result.session` and `result.mcp_server` drop
+                // here, killing the child and unlinking the socket.
+            }
         });
 
         let activity = self.start_activity("Spawning agent session...");
@@ -5791,21 +5819,27 @@ impl App {
                 (Some(_session), _) => {
                     // Work item was deleted or stage changed while
                     // the spawn was in flight. The session's Drop
-                    // kills the child; clean up MCP and side-car
-                    // files off the UI thread.
-                    drop(result.mcp_server);
+                    // kills the child; drop MCP server off the UI
+                    // thread so its socket unlink doesn't block.
+                    if let Some(server) = result.mcp_server {
+                        self.drop_mcp_server_off_thread(server);
+                    }
                     self.spawn_agent_file_cleanup(result.written_files);
                 }
                 (None, Some(e)) => {
-                    // Session spawn failed. Drop the MCP server and
-                    // clean up side-car files off the UI thread.
-                    drop(result.mcp_server);
+                    // Session spawn failed. Drop the MCP server off
+                    // the UI thread and clean up side-car files.
+                    if let Some(server) = result.mcp_server {
+                        self.drop_mcp_server_off_thread(server);
+                    }
                     self.spawn_agent_file_cleanup(result.written_files);
                     self.status_message = Some(e);
                 }
                 (None, None) => {
                     // Should not happen, but handle gracefully.
-                    drop(result.mcp_server);
+                    if let Some(server) = result.mcp_server {
+                        self.drop_mcp_server_off_thread(server);
+                    }
                     self.spawn_agent_file_cleanup(result.written_files);
                     self.status_message =
                         Some("Session spawn returned no session and no error".into());
