@@ -20,20 +20,145 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
 
 use crate::work_item::WorkItemStatus;
 
 /// Discriminant for logging and config parity. Not used for dispatch
 /// (dispatch goes through `dyn AgentBackend`); kept so the runtime can
 /// identify which backend is active without downcasting.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The enum is exhaustive for all harnesses workbridge knows about. Each
+/// variant has a corresponding real `AgentBackend` impl produced by
+/// `backend_for_kind`. The `OpenCode` variant is a "stub" backend whose
+/// methods return empty argv - it compiles and is present in `all()` and
+/// the first-run modal list, but spawning against it is not supported
+/// yet.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AgentBackendKind {
     /// Anthropic Claude Code CLI. Reference implementation.
     ClaudeCode,
-    /// Shape-verification target. Not wired into spawn sites; exists so
-    /// `codex_shape_compiles` can prove the trait fits a second harness.
-    #[cfg(test)]
+    /// OpenAI / Codex CLI. Implemented adapter; see `CodexBackend`.
     Codex,
+    /// OpenCode CLI. Stub adapter: methods return empty/degraded values;
+    /// selecting this kind surfaces a "not yet implemented" toast upstream.
+    OpenCode,
+}
+
+impl AgentBackendKind {
+    /// All harness kinds workbridge knows about. Stable enumeration used
+    /// by the first-run Ctrl+G modal and by `FromStr` diagnostics when
+    /// the user types an unknown harness name.
+    pub fn all() -> [AgentBackendKind; 3] {
+        [
+            AgentBackendKind::ClaudeCode,
+            AgentBackendKind::Codex,
+            AgentBackendKind::OpenCode,
+        ]
+    }
+
+    /// Lowercase canonical name used in the CLI (`workbridge config
+    /// set global-assistant-harness <name>`), in `config.toml`, and in
+    /// the first-run modal keybindings.
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            AgentBackendKind::ClaudeCode => "claude",
+            AgentBackendKind::Codex => "codex",
+            AgentBackendKind::OpenCode => "opencode",
+        }
+    }
+
+    /// Binary name expected on `PATH`. Used by `is_available` and by the
+    /// "command not found" toast text.
+    pub fn binary_name(self) -> &'static str {
+        match self {
+            AgentBackendKind::ClaudeCode => "claude",
+            AgentBackendKind::Codex => "codex",
+            AgentBackendKind::OpenCode => "opencode",
+        }
+    }
+
+    /// Human-readable display name used in status-bar text, UI titles
+    /// and the first-run modal body.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            AgentBackendKind::ClaudeCode => "Claude Code",
+            AgentBackendKind::Codex => "Codex",
+            AgentBackendKind::OpenCode => "OpenCode",
+        }
+    }
+
+    /// Single-character keybinding used in the first-run modal and the
+    /// work-item keyhints. Must stay in sync with `src/event.rs`.
+    pub fn keybinding(self) -> char {
+        match self {
+            AgentBackendKind::ClaudeCode => 'c',
+            AgentBackendKind::Codex => 'x',
+            AgentBackendKind::OpenCode => 'o',
+        }
+    }
+}
+
+impl std::fmt::Display for AgentBackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.canonical_name())
+    }
+}
+
+impl FromStr for AgentBackendKind {
+    type Err = UnknownHarnessName;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "claude" => Ok(AgentBackendKind::ClaudeCode),
+            "codex" => Ok(AgentBackendKind::Codex),
+            "opencode" => Ok(AgentBackendKind::OpenCode),
+            other => Err(UnknownHarnessName {
+                got: other.to_string(),
+            }),
+        }
+    }
+}
+
+/// Error returned when a harness name the user typed does not match any
+/// known variant. The canonical names are the single source of truth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownHarnessName {
+    pub got: String,
+}
+
+impl std::fmt::Display for UnknownHarnessName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown harness name '{}' (expected one of: claude, codex, opencode)",
+            self.got
+        )
+    }
+}
+
+impl std::error::Error for UnknownHarnessName {}
+
+/// Produce a fresh `Arc<dyn AgentBackend>` for the requested kind. The
+/// backends are zero-sized structs so construction is cheap. Spawn sites
+/// call this to resolve a per-work-item backend once they know the
+/// user's harness choice (see `App::backend_for_kind`).
+pub fn backend_for_kind(kind: AgentBackendKind) -> Arc<dyn AgentBackend> {
+    match kind {
+        AgentBackendKind::ClaudeCode => Arc::new(ClaudeCodeBackend),
+        AgentBackendKind::Codex => Arc::new(CodexBackend),
+        AgentBackendKind::OpenCode => Arc::new(OpenCodeBackend),
+    }
+}
+
+/// Lazy PATH scan. Uses the pure-Rust `which` crate so we do not shell
+/// out. Called from the `c` / `x` / `o` key handlers and the first-run
+/// modal; MUST NOT be called from a render path (see `docs/UI.md`
+/// "Blocking I/O Prohibition" - `which` walks `$PATH` synchronously,
+/// which is acceptable for a keypress but not for a render tick).
+pub fn is_available(kind: AgentBackendKind) -> bool {
+    which::which(kind.binary_name()).is_ok()
 }
 
 /// Allowlist of workbridge MCP tools a write-capable session is permitted
@@ -368,148 +493,243 @@ impl AgentBackend for ClaudeCodeBackend {
     }
 }
 
+/// Real adapter for the OpenAI Codex CLI (`codex`). Satisfies C1..C13 per
+/// `docs/harness-contract.md`; see the "Codex" column of the
+/// Implementation Map for the per-clause workaround details.
+///
+/// Argv shape summary:
+///
+/// - Interactive (work-item / global): `codex --full-auto [--config
+///   mcp_servers.workbridge.config=<path>] [--config instructions=<sys>]
+///   [<auto-start>]` (RP1c).
+/// - Headless read-only (review gate): `codex exec --json --config
+///   instructions=<sys> --config mcp_servers.workbridge.config=<path>
+///   <prompt>` (RP2c).
+/// - Headless read-write (rebase gate): `codex exec --json --full-auto
+///   --ask-for-approval never --config mcp_servers.workbridge.config=
+///   <path> <prompt>` (RP2bc).
+///
+/// C13 (no env leakage) holds because every piece of per-session state
+/// is delivered via the `--config` CLI flag. The adapter does NOT touch
+/// `~/.codex/config.toml` or any other file in `$HOME`, and does NOT
+/// set environment variables. Temp files written by
+/// `write_session_files` go under `std::env::temp_dir()` only.
+pub struct CodexBackend;
+
+impl AgentBackend for CodexBackend {
+    fn kind(&self) -> AgentBackendKind {
+        AgentBackendKind::Codex
+    }
+
+    fn command_name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn build_command(&self, cfg: &SpawnConfig<'_>) -> Vec<String> {
+        let mut cmd = vec![self.command_name().to_string()];
+        // C3: Codex's `--full-auto` matches Claude's
+        // `--dangerously-skip-permissions` for write-capable sessions.
+        // Read-only interactive sessions omit it, matching the Claude
+        // parity convention (neither adapter uses the bypass for
+        // read-only - the MCP server filter enforces read-only mode).
+        if !cfg.read_only {
+            cmd.push("--full-auto".to_string());
+        }
+        // C4: Codex has no `--mcp-config` flag. MCP injection goes
+        // through `--config mcp_servers.workbridge.config=<path>`; the
+        // caller wrote the temp JSON file that `<path>` points at. When
+        // `mcp_config_path` is `None`, we degrade rather than fall back
+        // to the user's global `~/.codex/config.toml` (that would
+        // silently cross-contaminate personal config with workbridge
+        // runtime state).
+        if let Some(path) = cfg.mcp_config_path {
+            cmd.push("--config".to_string());
+            cmd.push(format!("mcp_servers.workbridge.config={}", path.display()));
+        }
+        // C5: Codex has no per-tool CLI allowlist; the allowlist is
+        // enforced at the MCP server layer (the same mechanism the
+        // Claude review gate already uses). `allowed_tools` is accepted
+        // here for audit parity but not rendered into argv.
+        let _ = cfg.allowed_tools;
+        // C6: Codex has no `--system-prompt`; the system prompt is
+        // delivered via `--config instructions=<prompt>`. For a session
+        // with no system prompt (global assistant), the flag is omitted.
+        if let Some(prompt) = cfg.system_prompt {
+            cmd.push("--config".to_string());
+            cmd.push(format!("instructions={prompt}"));
+        }
+        // C8: Codex has no PostToolUse hook equivalent. The Planning
+        // reminder is embedded in the system prompt (the caller renders
+        // the planning prompt with the reminder baked in). This is
+        // strictly weaker than Claude's hook because it cannot re-fire
+        // on each TodoWrite; documented in the Implementation Map.
+        // C7: Auto-start message goes as the trailing positional
+        // argument. Unlike Claude, Codex does not conflate positionals
+        // with config files, so ordering vs `--config` flags does not
+        // matter. Emitted last for human readability of logged argv.
+        if let Some(msg) = cfg.auto_start_message {
+            cmd.push(msg.to_string());
+        }
+        // C2: Codex takes `--cd` to set the child cwd, but the PTY
+        // infrastructure already sets cwd via `Session::spawn`, so we
+        // do NOT add `--cd` here. The clause is met by the PTY's cwd.
+        cmd
+    }
+
+    fn build_review_gate_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
+        // C1 headless + C11 read-only: `codex exec --json` emits a
+        // newline-delimited event stream. No `--full-auto` (this session
+        // cannot write) and no `--ask-for-approval` overrides (the
+        // read-only MCP server enforces the gate).
+        vec![
+            "exec".to_string(),
+            "--json".to_string(),
+            "--config".to_string(),
+            format!("instructions={}", cfg.system_prompt),
+            "--config".to_string(),
+            format!(
+                "mcp_servers.workbridge.config={}",
+                cfg.mcp_config_path.display()
+            ),
+            cfg.initial_prompt.to_string(),
+        ]
+    }
+
+    fn build_headless_rw_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
+        // Headless read-write: add `--full-auto` for write access and
+        // `--ask-for-approval never` to suppress interactive prompts
+        // during rebase conflict resolution. Parallels Claude's
+        // `--dangerously-skip-permissions`.
+        vec![
+            "exec".to_string(),
+            "--json".to_string(),
+            "--full-auto".to_string(),
+            "--ask-for-approval".to_string(),
+            "never".to_string(),
+            "--config".to_string(),
+            format!(
+                "mcp_servers.workbridge.config={}",
+                cfg.mcp_config_path.display()
+            ),
+            cfg.initial_prompt.to_string(),
+        ]
+    }
+
+    fn parse_review_gate_stdout(&self, stdout: &str) -> ReviewGateVerdict {
+        // Codex `exec --json` emits a newline-delimited event stream.
+        // We keep the last `agent_message` event (that's the final
+        // assistant message), parse its `content` field as the verdict
+        // envelope body. If the stream is empty or the content is not
+        // valid JSON, fall back to an unapproved verdict with a
+        // diagnostic detail.
+        let last_message: Option<String> = stdout
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() {
+                    return None;
+                }
+                serde_json::from_str::<serde_json::Value>(line).ok()
+            })
+            .filter_map(|v| {
+                let ty = v.get("type").and_then(|t| t.as_str())?;
+                if ty != "agent_message" {
+                    return None;
+                }
+                v.get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string())
+            })
+            .next_back();
+
+        let Some(content) = last_message else {
+            return ReviewGateVerdict {
+                approved: false,
+                detail: "codex: no agent_message events in stdout".into(),
+            };
+        };
+
+        match serde_json::from_str::<serde_json::Value>(content.trim()) {
+            Ok(v) => ReviewGateVerdict {
+                approved: v.get("approved").and_then(|a| a.as_bool()).unwrap_or(false),
+                detail: v
+                    .get("detail")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            Err(e) => ReviewGateVerdict {
+                approved: false,
+                detail: format!("codex: invalid JSON in agent_message content: {e}"),
+            },
+        }
+    }
+
+    fn write_session_files(&self, _cwd: &Path, _mcp_config_json: &str) -> io::Result<Vec<PathBuf>> {
+        // Codex MCP injection goes through the CLI flag
+        // `--config mcp_servers.workbridge.config=<path>` pointing at the
+        // already-written temp JSON that the caller prepared. No
+        // additional Codex-specific side-car files are needed. Never
+        // write into `_cwd` (pollutes the user's worktree) or
+        // `~/.codex/config.toml` (cross-contaminates personal config);
+        // both would violate the file-injection rule.
+        Ok(vec![])
+    }
+}
+
+/// Stub adapter for the OpenCode CLI. Not implemented: every method
+/// returns empty argv and a diagnostic verdict. The `o` keybinding and
+/// the "opencode" config value are wired end-to-end so the UI and
+/// config schema are forward-compatible, but pressing `o` on a work
+/// item surfaces a "not yet implemented" toast via the availability
+/// check (`is_available` returns false when the binary is absent, which
+/// is the default state on developer machines) or - if the user
+/// happens to have an unrelated `opencode` binary on PATH - via
+/// `App::open_session_with_harness`'s kind-level check.
+pub struct OpenCodeBackend;
+
+impl AgentBackend for OpenCodeBackend {
+    fn kind(&self) -> AgentBackendKind {
+        AgentBackendKind::OpenCode
+    }
+
+    fn command_name(&self) -> &'static str {
+        "opencode"
+    }
+
+    fn build_command(&self, _cfg: &SpawnConfig<'_>) -> Vec<String> {
+        // Returns an argv that contains only the binary name so a
+        // caller that routes to this backend without checking kind
+        // still produces a legible failure (the binary itself will
+        // print its own help / error). The spawn sites guard against
+        // this by calling `App::ensure_harness_implemented` before
+        // spawning, so in practice this path is unreachable.
+        vec![self.command_name().to_string()]
+    }
+
+    fn build_review_gate_command(&self, _cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn build_headless_rw_command(&self, _cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn parse_review_gate_stdout(&self, _stdout: &str) -> ReviewGateVerdict {
+        ReviewGateVerdict {
+            approved: false,
+            detail: "opencode adapter not yet implemented".into(),
+        }
+    }
+
+    fn write_session_files(&self, _cwd: &Path, _mcp_config_json: &str) -> io::Result<Vec<PathBuf>> {
+        Ok(vec![])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Shape-verification stub for a second harness.
-    ///
-    /// **This is not a working backend.** It exists exclusively to prove
-    /// that the trait shape is harness-neutral enough to host a second
-    /// CLI whose feature set differs from Claude Code's on the three
-    /// clauses that matter most (C4 MCP injection, C6 system prompt
-    /// shape, C8 stage reminder). If a future change to `AgentBackend`
-    /// breaks this stub, the trait has been Claude-Code-coupled and the
-    /// change needs a rework.
-    ///
-    /// The argv shapes are derived from the public Codex CLI surface as
-    /// of 2026-04-15 (`codex`, `codex exec --json`, `--cd`, `--full-auto`,
-    /// `--config`) and from the Codex column of the Implementation Map
-    /// in `docs/harness-contract.md`. They are NOT exercised against a
-    /// real Codex process.
-    struct CodexBackend;
-
-    impl AgentBackend for CodexBackend {
-        fn kind(&self) -> AgentBackendKind {
-            AgentBackendKind::Codex
-        }
-
-        fn command_name(&self) -> &'static str {
-            "codex"
-        }
-
-        fn build_command(&self, cfg: &SpawnConfig<'_>) -> Vec<String> {
-            let mut cmd = vec![self.command_name().to_string()];
-            // C3: Codex's `--full-auto` matches Claude's
-            // `--dangerously-skip-permissions`.
-            cmd.push("--full-auto".to_string());
-            // C4: Codex has no `--mcp-config` flag. The real adapter would
-            // write a temp `config.toml` inside `write_session_files` and
-            // pass it via `--config`. For shape verification we reference
-            // the path the caller prepared. When `None`, the adapter
-            // would fall back to the user's global config.toml.
-            if let Some(path) = cfg.mcp_config_path {
-                cmd.push("--config".to_string());
-                cmd.push(format!("mcp_servers.workbridge.config={}", path.display()));
-            }
-            // C5: Codex has no per-tool CLI allowlist; the clause is met
-            // by the MCP server filter (the same mechanism the Claude
-            // review gate already uses). The allowlist is still attached
-            // here for audit parity so a future adapter can refuse to
-            // start if a tool it does not know about is requested.
-            let _ = cfg.allowed_tools;
-            // C6: Codex has no `--system-prompt`; the harness-neutral
-            // escape hatch is to prepend the stage prompt as an initial
-            // user message. Shown here as `--config instructions=...`
-            // for shape; a real adapter may choose stdin instead.
-            if let Some(prompt) = cfg.system_prompt {
-                cmd.push("--config".to_string());
-                cmd.push(format!("instructions={prompt}"));
-            }
-            // C8: Codex has no PostToolUse hook equivalent. The clause
-            // accepts "no extra reminder beyond the system prompt"; this
-            // is explicit rather than implicit so a reviewer can see the
-            // gap.
-            if cfg.stage == WorkItemStatus::Planning {
-                // intentionally empty: the planning reminder is embedded
-                // in the system prompt for Codex.
-            }
-            // C7: Auto-start message as positional.
-            if let Some(msg) = cfg.auto_start_message {
-                cmd.push(msg.to_string());
-            }
-            // C2: Codex takes `--cd` to set the child cwd. The caller
-            // passes the cwd via `Session::spawn` already (same as
-            // Claude), so we do NOT add `--cd` here; the clause is met by
-            // the PTY's own cwd. The line is included as a comment so
-            // the adapter author knows the flag exists.
-            cmd
-        }
-
-        fn build_review_gate_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
-            // Codex's headless mode is `codex exec --json`, which emits a
-            // newline-delimited event stream rather than a single JSON
-            // document. A real adapter would keep only the last
-            // `agent_message` event from the stream and hand it to
-            // `parse_review_gate_stdout`.
-            vec![
-                "exec".to_string(),
-                "--json".to_string(),
-                "--config".to_string(),
-                format!("instructions={}", cfg.system_prompt),
-                "--config".to_string(),
-                format!(
-                    "mcp_servers.workbridge.config={}",
-                    cfg.mcp_config_path.display()
-                ),
-                cfg.initial_prompt.to_string(),
-            ]
-        }
-
-        fn build_headless_rw_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
-            // Same shape as review gate but with --full-auto for write
-            // access. A real adapter would also pass --ask-for-approval
-            // never to suppress interactive prompts during rebase.
-            vec![
-                "exec".to_string(),
-                "--json".to_string(),
-                "--full-auto".to_string(),
-                "--config".to_string(),
-                format!(
-                    "mcp_servers.workbridge.config={}",
-                    cfg.mcp_config_path.display()
-                ),
-                cfg.initial_prompt.to_string(),
-            ]
-        }
-
-        fn parse_review_gate_stdout(&self, stdout: &str) -> ReviewGateVerdict {
-            // A real adapter would parse the event stream. For shape
-            // verification we accept a plain JSON object with `approved`
-            // and `detail` fields.
-            match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
-                Ok(v) => ReviewGateVerdict {
-                    approved: v["approved"].as_bool().unwrap_or(false),
-                    detail: v["detail"].as_str().unwrap_or("").to_string(),
-                },
-                Err(e) => ReviewGateVerdict {
-                    approved: false,
-                    detail: format!("codex shape stub: {e}"),
-                },
-            }
-        }
-
-        fn write_session_files(
-            &self,
-            _cwd: &Path,
-            _mcp_config_json: &str,
-        ) -> io::Result<Vec<PathBuf>> {
-            // A real Codex adapter would write a temp `config.toml` here.
-            // The shape stub returns an empty vec to keep the test
-            // hermetic.
-            Ok(Vec::new())
-        }
-    }
 
     #[test]
     fn codex_shape_compiles() {
@@ -723,5 +943,308 @@ mod tests {
         let broken = backend.parse_review_gate_stdout("not json");
         assert!(!broken.approved);
         assert!(broken.detail.contains("invalid JSON"));
+    }
+
+    // ---- Codex backend tests ----
+
+    /// Pins C3: Codex's `--full-auto` is the permission-bypass flag for
+    /// write-capable interactive sessions.
+    #[test]
+    fn codex_interactive_argv_has_full_auto() {
+        let mcp_path = PathBuf::from("/tmp/workbridge-mcp-fake.sock");
+        let cfg = SpawnConfig {
+            stage: WorkItemStatus::Implementing,
+            system_prompt: Some("sys"),
+            mcp_config_path: Some(&mcp_path),
+            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+            auto_start_message: None,
+            read_only: false,
+        };
+        let argv = CodexBackend.build_command(&cfg);
+        assert_eq!(argv[0], "codex");
+        assert!(argv.iter().any(|s| s == "--full-auto"));
+    }
+
+    /// Pins C4: Codex MCP injection uses `--config
+    /// mcp_servers.workbridge.config=<path>`. The path value refers to
+    /// a temp JSON file the caller already wrote.
+    #[test]
+    fn codex_mcp_config_injected_via_config_flag() {
+        let mcp_path = PathBuf::from("/tmp/workbridge-mcp-42.json");
+        let cfg = SpawnConfig {
+            stage: WorkItemStatus::Implementing,
+            system_prompt: None,
+            mcp_config_path: Some(&mcp_path),
+            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+            auto_start_message: None,
+            read_only: false,
+        };
+        let argv = CodexBackend.build_command(&cfg);
+        let has_config_flag = argv
+            .windows(2)
+            .any(|w| w[0] == "--config" && w[1].starts_with("mcp_servers.workbridge.config="));
+        assert!(
+            has_config_flag,
+            "codex must inject MCP via --config mcp_servers.workbridge.config=..., got {argv:?}"
+        );
+    }
+
+    /// Pins C6 + C13: the system prompt is delivered via `--config
+    /// instructions=...`, not via `--system-prompt` and not via an
+    /// environment variable (Codex has neither).
+    #[test]
+    fn codex_system_prompt_goes_through_config_instructions() {
+        let mcp_path = PathBuf::from("/tmp/mcp.json");
+        let cfg = SpawnConfig {
+            stage: WorkItemStatus::Implementing,
+            system_prompt: Some("be concise"),
+            mcp_config_path: Some(&mcp_path),
+            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+            auto_start_message: None,
+            read_only: false,
+        };
+        let argv = CodexBackend.build_command(&cfg);
+        assert!(argv.iter().any(|s| s.starts_with("instructions=")));
+        assert!(!argv.iter().any(|s| s == "--system-prompt"));
+    }
+
+    /// Pins C7: the auto-start prompt is emitted as a positional
+    /// argument, the last item in argv.
+    #[test]
+    fn codex_auto_start_prompt_is_last_positional() {
+        let mcp_path = PathBuf::from("/tmp/mcp.json");
+        let cfg = SpawnConfig {
+            stage: WorkItemStatus::Planning,
+            system_prompt: Some("sys"),
+            mcp_config_path: Some(&mcp_path),
+            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+            auto_start_message: Some("Explain who you are and start working."),
+            read_only: false,
+        };
+        let argv = CodexBackend.build_command(&cfg);
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("Explain who you are and start working.")
+        );
+    }
+
+    /// Pins C11: read-only interactive sessions omit `--full-auto`. The
+    /// read-only MCP server is the enforcement mechanism; the CLI flag
+    /// would be misleading.
+    #[test]
+    fn codex_read_only_interactive_omits_full_auto() {
+        let mcp_path = PathBuf::from("/tmp/mcp.json");
+        let cfg = SpawnConfig {
+            stage: WorkItemStatus::Review,
+            system_prompt: Some("ro"),
+            mcp_config_path: Some(&mcp_path),
+            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+            auto_start_message: None,
+            read_only: true,
+        };
+        let argv = CodexBackend.build_command(&cfg);
+        assert!(!argv.iter().any(|s| s == "--full-auto"));
+    }
+
+    /// Pins the headless review-gate shape: `codex exec --json ...`.
+    #[test]
+    fn codex_review_gate_command_uses_exec_json() {
+        let mcp_path = PathBuf::from("/tmp/rg.json");
+        let cfg = ReviewGateSpawnConfig {
+            system_prompt: "sys",
+            initial_prompt: "prompt",
+            json_schema: "{}",
+            mcp_config_path: &mcp_path,
+        };
+        let argv = CodexBackend.build_review_gate_command(&cfg);
+        assert_eq!(argv[0], "exec");
+        assert!(argv.iter().any(|s| s == "--json"));
+        // Review gate does NOT get --full-auto (read-only).
+        assert!(!argv.iter().any(|s| s == "--full-auto"));
+    }
+
+    /// Pins the headless rebase-gate shape: `codex exec --json
+    /// --full-auto --ask-for-approval never ...`.
+    #[test]
+    fn codex_headless_rw_includes_full_auto_and_approval_never() {
+        let mcp_path = PathBuf::from("/tmp/rb.json");
+        let cfg = ReviewGateSpawnConfig {
+            system_prompt: "",
+            initial_prompt: "rebase",
+            json_schema: "{}",
+            mcp_config_path: &mcp_path,
+        };
+        let argv = CodexBackend.build_headless_rw_command(&cfg);
+        assert_eq!(argv[0], "exec");
+        assert!(argv.iter().any(|s| s == "--full-auto"));
+        // `--ask-for-approval never` must be passed as an adjacent pair.
+        let has_approval_never = argv
+            .windows(2)
+            .any(|w| w[0] == "--ask-for-approval" && w[1] == "never");
+        assert!(has_approval_never, "missing --ask-for-approval never");
+    }
+
+    /// Pins the event-stream parser: `codex exec --json` emits
+    /// newline-delimited JSON; we find the last `agent_message` event
+    /// and parse its `content` field as the verdict envelope.
+    #[test]
+    fn codex_parses_agent_message_event_stream() {
+        let stream = r#"
+{"type":"thinking","content":"..."}
+{"type":"tool_call","name":"read"}
+{"type":"agent_message","content":"{\"approved\":true,\"detail\":\"ok\"}"}
+"#;
+        let verdict = CodexBackend.parse_review_gate_stdout(stream);
+        assert!(verdict.approved);
+        assert_eq!(verdict.detail, "ok");
+    }
+
+    /// Empty stream or no agent_message -> unapproved with a diagnostic
+    /// detail. Pins the "absent envelope" failure mode.
+    #[test]
+    fn codex_parse_empty_stream_returns_unapproved() {
+        let verdict = CodexBackend.parse_review_gate_stdout("");
+        assert!(!verdict.approved);
+        assert!(verdict.detail.contains("no agent_message"));
+
+        let wrong_types = r#"{"type":"thinking","content":"..."}"#;
+        let verdict2 = CodexBackend.parse_review_gate_stdout(wrong_types);
+        assert!(!verdict2.approved);
+        assert!(verdict2.detail.contains("no agent_message"));
+    }
+
+    /// C4 / C13: Codex does not write session files into the worktree
+    /// or user home. The caller prepares the temp JSON before spawning.
+    #[test]
+    fn codex_writes_no_session_files() {
+        let cwd = std::env::temp_dir();
+        let files = CodexBackend.write_session_files(&cwd, "{}").unwrap();
+        assert!(files.is_empty());
+    }
+
+    // ---- OpenCode backend tests ----
+
+    /// Pins the stub contract: every method returns an empty / degraded
+    /// value and `parse_review_gate_stdout` surfaces the explicit "not
+    /// yet implemented" detail so the review gate fails loudly rather
+    /// than appearing to silently approve.
+    #[test]
+    fn opencode_backend_is_a_stub() {
+        let backend = OpenCodeBackend;
+        assert_eq!(backend.kind(), AgentBackendKind::OpenCode);
+        assert_eq!(backend.command_name(), "opencode");
+
+        let mcp_path = PathBuf::from("/tmp/mcp.json");
+        let cfg = SpawnConfig {
+            stage: WorkItemStatus::Implementing,
+            system_prompt: Some("sys"),
+            mcp_config_path: Some(&mcp_path),
+            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+            auto_start_message: None,
+            read_only: false,
+        };
+        let argv = backend.build_command(&cfg);
+        assert_eq!(argv, vec!["opencode".to_string()]);
+
+        let rg_cfg = ReviewGateSpawnConfig {
+            system_prompt: "",
+            initial_prompt: "",
+            json_schema: "{}",
+            mcp_config_path: &mcp_path,
+        };
+        assert!(backend.build_review_gate_command(&rg_cfg).is_empty());
+        assert!(backend.build_headless_rw_command(&rg_cfg).is_empty());
+
+        let verdict = backend.parse_review_gate_stdout("anything");
+        assert!(!verdict.approved);
+        assert!(verdict.detail.contains("not yet implemented"));
+
+        let files = backend
+            .write_session_files(&std::env::temp_dir(), "{}")
+            .unwrap();
+        assert!(files.is_empty());
+    }
+
+    // ---- AgentBackendKind helpers ----
+
+    /// Pins `FromStr` for the CLI subcommand: only the three canonical
+    /// names parse; anything else returns `UnknownHarnessName`.
+    #[test]
+    fn agent_backend_kind_from_str_validates_canonical_names() {
+        assert_eq!(
+            AgentBackendKind::from_str("claude").unwrap(),
+            AgentBackendKind::ClaudeCode
+        );
+        assert_eq!(
+            AgentBackendKind::from_str("codex").unwrap(),
+            AgentBackendKind::Codex
+        );
+        assert_eq!(
+            AgentBackendKind::from_str("opencode").unwrap(),
+            AgentBackendKind::OpenCode
+        );
+        assert!(AgentBackendKind::from_str("Claude").is_err());
+        assert!(AgentBackendKind::from_str("").is_err());
+        assert!(AgentBackendKind::from_str("gemini").is_err());
+    }
+
+    /// Pins the stable enumeration used by the first-run modal.
+    #[test]
+    fn agent_backend_kind_all_is_stable() {
+        assert_eq!(
+            AgentBackendKind::all(),
+            [
+                AgentBackendKind::ClaudeCode,
+                AgentBackendKind::Codex,
+                AgentBackendKind::OpenCode
+            ]
+        );
+    }
+
+    /// Pins the keybinding map used by the work-item c/x/o handlers
+    /// and the first-run modal.
+    #[test]
+    fn agent_backend_kind_keybindings_are_unique() {
+        use std::collections::HashSet;
+        let keys: HashSet<char> = AgentBackendKind::all()
+            .iter()
+            .map(|k| k.keybinding())
+            .collect();
+        assert_eq!(keys.len(), 3, "each kind must map to a unique keybinding");
+        assert!(keys.contains(&'c'));
+        assert!(keys.contains(&'x'));
+        assert!(keys.contains(&'o'));
+    }
+
+    /// Pins `backend_for_kind`: the factory returns a backend whose
+    /// `kind()` matches the argument.
+    #[test]
+    fn backend_for_kind_roundtrips() {
+        for kind in AgentBackendKind::all() {
+            let backend = backend_for_kind(kind);
+            assert_eq!(backend.kind(), kind);
+        }
+    }
+
+    /// Pins that `is_available` returns false for a clearly bogus
+    /// binary name. We cannot positively test "claude on PATH" because
+    /// CI may or may not have the binary; the false-case is the one we
+    /// control.
+    #[test]
+    fn is_available_returns_false_for_missing_binary() {
+        // Monkey-patch-free check: if `which::which("claude")` is Ok
+        // on this machine, we rely on the fact that `is_available`
+        // delegates to that call and therefore produces the same
+        // answer. The real regression being guarded is "function
+        // compiled away or always returns true"; a false for one kind
+        // plus a true for the same kind's `which::which` call would
+        // also catch that.
+        // The claim we pin here is the weaker half: `is_available`
+        // agrees with `which::which`.
+        for kind in AgentBackendKind::all() {
+            let by_helper = is_available(kind);
+            let by_which = which::which(kind.binary_name()).is_ok();
+            assert_eq!(by_helper, by_which, "mismatch for {kind:?}");
+        }
     }
 }

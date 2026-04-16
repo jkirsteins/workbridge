@@ -2,13 +2,14 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::agent_backend::{
-    AgentBackend, AgentBackendKind, ClaudeCodeBackend, ReviewGateSpawnConfig, SpawnConfig,
+    self, AgentBackend, AgentBackendKind, ClaudeCodeBackend, ReviewGateSpawnConfig, SpawnConfig,
     WORK_ITEM_ALLOWED_TOOLS,
 };
 use crate::assembly;
@@ -36,6 +37,22 @@ use crate::worktree_service::WorktreeService;
 pub struct Toast {
     pub text: String,
     pub expires_at: Instant,
+}
+
+/// State for the first-run Ctrl+G modal that asks the user to choose a
+/// harness for the global assistant. Built lazily when Ctrl+G is pressed
+/// with `config.defaults.global_assistant_harness == None`; dismissed
+/// (and cleared from `App`) after a pick or Esc.
+///
+/// The list of available harnesses is frozen at modal-open time so the
+/// keybindings shown to the user cannot reshuffle mid-selection.
+#[derive(Clone, Debug)]
+pub struct FirstRunGlobalHarnessModal {
+    /// Harnesses currently on `PATH`, in canonical order
+    /// (`ClaudeCode`, `Codex`, `OpenCode`). Empty is never stored:
+    /// the opener shows a toast and returns without populating the
+    /// modal when the list would be empty.
+    pub available_harnesses: Vec<AgentBackendKind>,
 }
 
 /// Truncate a copy-target value for display in a toast so very long
@@ -1492,6 +1509,27 @@ pub struct App {
     /// through this trait object. See `src/agent_backend.rs` and
     /// `docs/harness-contract.md`.
     pub agent_backend: Arc<dyn AgentBackend>,
+    /// Per-work-item harness choice. Populated when the user presses
+    /// `c` / `x` / `o` on a work-item row (see
+    /// `App::open_session_with_harness`); read back by every spawn site
+    /// (work-item interactive, review gate, rebase gate). In-memory only:
+    /// the choice is deliberately not persisted across TUI restarts - the
+    /// acceptance criteria for the multi-harness selection explicitly
+    /// call this out. Absence of an entry means "no choice made yet";
+    /// spawn sites surface that as a toast rather than silently defaulting.
+    pub harness_choice: HashMap<WorkItemId, AgentBackendKind>,
+    /// Timestamped single-key state for the `kk` double-press that ends
+    /// a live session. `Some((id, when))` means the user pressed `k` on
+    /// work item `id` at `when`; a second `k` press on the same item
+    /// within ~1.5s kills the session. Any other key or a timeout
+    /// clears this (see `App::handle_k_press` and `App::clear_k_press`).
+    pub last_k_press: Option<(WorkItemId, Instant)>,
+    /// First-run Ctrl+G modal state. `Some(..)` means the modal is
+    /// visible; it lists the harnesses currently on PATH and asks the
+    /// user to pick one. The pick persists to
+    /// `config.defaults.global_assistant_harness` and then opens the
+    /// drawer immediately. `None` is the steady state.
+    pub first_run_global_harness_modal: Option<FirstRunGlobalHarnessModal>,
     /// MCP socket servers keyed by work item ID. Each server is created when
     /// an agent session is spawned and handles MCP communication via a Unix
     /// socket. "Agent" is the harness-neutral name; the reference
@@ -2242,6 +2280,9 @@ impl App {
             fetcher_disconnected: false,
             fetcher_handle: None,
             agent_backend: Arc::new(ClaudeCodeBackend),
+            harness_choice: HashMap::new(),
+            last_k_press: None,
+            first_run_global_harness_modal: None,
             mcp_servers: HashMap::new(),
             agent_working: std::collections::HashSet::new(),
             mcp_rx: Some(mcp_rx),
@@ -5100,10 +5141,12 @@ impl App {
 
     /// Open or focus a session for the currently selected work item.
     ///
-    /// If a session already exists for this work item, focuses the right panel.
-    /// If no session exists, spawns a new one in the first worktree directory
-    /// found in the work item's repo associations. If no worktree path exists,
-    /// shows a status message instead.
+    /// If a session already exists for this work item, focuses the
+    /// right panel. If no session exists, the caller must have already
+    /// recorded a harness choice via `c` / `x` / `o`; otherwise this
+    /// method pushes a hint toast and does nothing. This is the
+    /// breaking behaviour-change from the v1 plan (Milestone 3): Enter
+    /// no longer spawns a session without an explicit harness pick.
     pub fn open_session_for_selected(&mut self) {
         let Some(idx) = self.selected_item else {
             return;
@@ -5130,6 +5173,18 @@ impl App {
                 return;
             }
             self.sessions.remove(&existing_key);
+        }
+
+        // Breaking change from the v1 plan (Milestone 3): Enter on a
+        // work-item row with no live session is now a no-op unless a
+        // harness has been picked (via `c` / `x` / `o`). The hint
+        // teaches the new keybinding without taking a silent-default
+        // action the user did not request.
+        if !self.harness_choice.contains_key(&work_item_id) {
+            self.push_toast(
+                "press c / x / o to open this work item with a specific harness".into(),
+            );
+            return;
         }
 
         self.spawn_session(&work_item_id);
@@ -5376,7 +5431,16 @@ impl App {
         }
         let (tx, rx) = crossbeam_channel::bounded(1);
         let backend = Arc::clone(&self.backend);
-        let agent_backend = Arc::clone(&self.agent_backend);
+        // Resolve the per-work-item harness backend for the Phase 1
+        // worker. `harness_choice` must have an entry at this point
+        // because `open_session_for_selected` refuses to call
+        // `spawn_session` without one; keep a defensive fallback to
+        // `self.agent_backend` for the hypothetical non-c/x/o entry
+        // points (e.g. tests or future automation paths) so we never
+        // silently crash in the worker.
+        let agent_backend = self
+            .backend_for_work_item(work_item_id)
+            .unwrap_or_else(|| Arc::clone(&self.agent_backend));
         let wi_id_clone = work_item_id.clone();
         let cwd_clone = cwd.to_path_buf();
 
@@ -5811,7 +5875,14 @@ impl App {
         let has_gate_findings = self.review_gate_findings.contains_key(work_item_id);
         let system_prompt = self.stage_system_prompt(work_item_id, cwd, plan_text);
 
-        let cmd = self.build_agent_cmd(
+        // Use the per-work-item harness choice (recorded by c/x/o)
+        // when present, falling back to the App-level default for the
+        // rare call sites that bypass `open_session_with_harness`.
+        let wi_backend = self
+            .backend_for_work_item(work_item_id)
+            .unwrap_or_else(|| Arc::clone(&self.agent_backend));
+        let cmd = self.build_agent_cmd_with(
+            wi_backend.as_ref(),
             work_item_status,
             system_prompt.as_deref(),
             mcp_config_path.as_deref(),
@@ -5972,20 +6043,230 @@ impl App {
     /// `src/ui.rs`. The mapping is centralised here so a new backend is
     /// a one-line addition. See `docs/harness-contract.md` glossary.
     pub fn agent_backend_display_name(&self) -> &'static str {
-        match self.agent_backend.kind() {
-            AgentBackendKind::ClaudeCode => "Claude Code",
-            #[cfg(test)]
-            AgentBackendKind::Codex => "Codex",
+        self.agent_backend.kind().display_name()
+    }
+
+    /// Resolve the harness-specific backend for a work-item spawn.
+    /// Returns `Some` only if the user has already pressed `c` / `x` /
+    /// `o` for this item (i.e. there is a `harness_choice` entry). The
+    /// spawn sites surface the `None` case as a toast and bail rather
+    /// than silently defaulting to `self.agent_backend` - that was the
+    /// "abort rather than default to claude" rule pinned by the plan
+    /// (Milestone 3, review/rebase-gate bullet). See also
+    /// `docs/harness-contract.md` Change Log 2026-04-16.
+    pub fn backend_for_work_item(
+        &self,
+        work_item_id: &WorkItemId,
+    ) -> Option<Arc<dyn AgentBackend>> {
+        let kind = self.harness_choice.get(work_item_id).copied()?;
+        Some(agent_backend::backend_for_kind(kind))
+    }
+
+    /// Record the user's per-work-item harness choice and open the
+    /// session using it. Called from the `c` / `x` / `o` keybindings.
+    /// Performs a lazy availability check first (via
+    /// `agent_backend::is_available`); missing-binary shows a toast
+    /// and does not overwrite an existing choice. If a live session
+    /// already exists for this item, shows a "press kk to end first"
+    /// toast and returns - the user must terminate before respawning.
+    pub fn open_session_with_harness(&mut self, kind: AgentBackendKind) {
+        // Kind-level "implemented?" guard. OpenCode has no spawn
+        // implementation yet; press-through shows a diagnostic rather
+        // than pushing an unusable session onto the user.
+        if kind == AgentBackendKind::OpenCode {
+            self.push_toast(
+                "opencode: adapter not yet implemented - only the keybinding is wired".into(),
+            );
+            return;
+        }
+        // PATH availability check before recording the choice. A failed
+        // press must NOT silently clobber a valid previous selection.
+        if !agent_backend::is_available(kind) {
+            self.push_toast(format!("{}: command not found", kind.binary_name()));
+            return;
+        }
+
+        let Some(work_item_id) = self.selected_work_item_id() else {
+            return;
+        };
+
+        // If a live session already exists, we must refuse to spawn.
+        // The user loses scrollback and activity state otherwise.
+        if let Some(existing_key) = self.session_key_for(&work_item_id) {
+            let is_alive = self
+                .sessions
+                .get(&existing_key)
+                .is_some_and(|entry| entry.alive);
+            if is_alive {
+                self.push_toast("session already running - press kk to end first".into());
+                return;
+            }
+        }
+
+        // Record the choice and delegate to the existing spawn path.
+        // `finish_session_open` reads back the choice via
+        // `backend_for_work_item`.
+        self.harness_choice.insert(work_item_id, kind);
+        self.open_session_for_selected();
+    }
+
+    /// Handle a `k` keypress on a work-item row. First press within the
+    /// window arms a toast hint; a second press within ~1.5s SIGTERMs
+    /// the session (by dropping the `SessionEntry`, which triggers the
+    /// `Drop for Session` path - SIGTERM, then SIGKILL after 50ms -
+    /// per C10). Press outside the window on a different item resets.
+    pub fn handle_k_press(&mut self) {
+        const WINDOW: Duration = Duration::from_millis(1500);
+        let Some(work_item_id) = self.selected_work_item_id() else {
+            return;
+        };
+        // Only react if a live session exists. `k` is otherwise unused
+        // in this context and an arming toast would be confusing.
+        let has_live_session = self
+            .session_key_for(&work_item_id)
+            .and_then(|k| self.sessions.get(&k))
+            .is_some_and(|entry| entry.alive);
+        if !has_live_session {
+            return;
+        }
+
+        let now = Instant::now();
+        let armed = matches!(
+            self.last_k_press.as_ref(),
+            Some((id, t)) if id == &work_item_id
+                && now.saturating_duration_since(*t) < WINDOW
+        );
+
+        if armed {
+            // Second press within the window - kill.
+            if let Some(key) = self.session_key_for(&work_item_id) {
+                self.sessions.remove(&key);
+            }
+            // Note: harness_choice is NOT cleared here. A subsequent
+            // c/x/o overwrites it, and keeping the last choice around
+            // is harmless. See the Milestone 3 acceptance-criteria
+            // notes.
+            self.last_k_press = None;
+            self.push_toast("session ended".into());
+        } else {
+            self.last_k_press = Some((work_item_id, now));
+            self.push_toast("press k again within 1.5s to end session".into());
         }
     }
 
-    /// Build the argv for an interactive work-item session via the
-    /// configured agent backend (C1/C6/C7/C8 per `docs/harness-
-    /// contract.md`). Thin wrapper around
-    /// `self.agent_backend.build_command` that also computes the C7
-    /// auto-start message from the stage and the gate-findings flag.
+    /// Clear an expired `last_k_press` entry. Called from the per-tick
+    /// hook so the hint clears after ~1.5s even if the user walks
+    /// away without pressing any other key.
+    pub fn prune_k_press(&mut self) {
+        const WINDOW: Duration = Duration::from_millis(1500);
+        if let Some((_, t)) = &self.last_k_press
+            && Instant::now().saturating_duration_since(*t) >= WINDOW
+        {
+            self.last_k_press = None;
+        }
+    }
+
+    /// Clear the `last_k_press` flag. Called from `handle_key` on any
+    /// key that isn't `k` so the double-press window dies on unrelated
+    /// keystrokes rather than arming two sessions apart in time.
+    pub fn clear_k_press(&mut self) {
+        self.last_k_press = None;
+    }
+
+    /// Resolve the harness kind for the Ctrl+G global assistant.
+    /// Returns the configured kind if one is set, otherwise `None`
+    /// to signal "show the first-run modal".
+    pub fn global_assistant_harness_kind(&self) -> Option<AgentBackendKind> {
+        let name = self.config.defaults.global_assistant_harness.as_deref()?;
+        AgentBackendKind::from_str(name).ok()
+    }
+
+    /// Handle a Ctrl+G keypress. If the config already has a chosen
+    /// harness, toggle the drawer as before. Otherwise open the
+    /// first-run modal that lists harnesses on PATH. If no harness is
+    /// on PATH, show a toast and do nothing.
+    pub fn handle_ctrl_g(&mut self) {
+        // Fast path: harness already configured.
+        if self.global_assistant_harness_kind().is_some() {
+            self.toggle_global_drawer();
+            return;
+        }
+
+        let available: Vec<AgentBackendKind> = AgentBackendKind::all()
+            .into_iter()
+            .filter(|k| {
+                // OpenCode is wired as a stub only; do not offer it as
+                // the global-assistant pick because selecting it would
+                // produce a non-functional drawer session.
+                *k != AgentBackendKind::OpenCode && agent_backend::is_available(*k)
+            })
+            .collect();
+
+        if available.is_empty() {
+            self.push_toast(
+                "no supported harnesses on PATH - install claude or codex to use Ctrl+G".into(),
+            );
+            return;
+        }
+
+        self.first_run_global_harness_modal = Some(FirstRunGlobalHarnessModal {
+            available_harnesses: available,
+        });
+    }
+
+    /// Finish the first-run modal: persist the pick to config and
+    /// open the drawer immediately. Called from the modal's key
+    /// handler in `event.rs` when the user presses one of the
+    /// harness keybindings inside the modal.
+    pub fn finish_first_run_global_pick(&mut self, kind: AgentBackendKind) {
+        self.first_run_global_harness_modal = None;
+        self.config.defaults.global_assistant_harness = Some(kind.canonical_name().into());
+        // Persist via the configured provider. The helper swallows
+        // errors as toasts so a read-only config dir does not take
+        // down the UI; the in-memory value still reflects the pick
+        // for this TUI session.
+        if let Err(e) = self.config_provider.save(&self.config) {
+            self.push_toast(format!("could not save config: {e}"));
+        }
+        self.toggle_global_drawer();
+    }
+
+    /// Dismiss the first-run modal without a pick. Config stays at its
+    /// previous (None) state; the drawer does not open.
+    pub fn cancel_first_run_global_pick(&mut self) {
+        self.first_run_global_harness_modal = None;
+    }
+
+    /// Test-only thin wrapper over `build_agent_cmd_with(self.agent_backend, ...)`.
+    /// Exists so legacy tests can assert argv-shape without stitching
+    /// a per-work-item backend; new production call sites use
+    /// `build_agent_cmd_with` directly so the per-work-item harness
+    /// choice is honored.
+    #[cfg(test)]
     fn build_agent_cmd(
         &self,
+        status: WorkItemStatus,
+        system_prompt: Option<&str>,
+        mcp_config_path: Option<&std::path::Path>,
+        force_auto_start: bool,
+    ) -> Vec<String> {
+        self.build_agent_cmd_with(
+            self.agent_backend.as_ref(),
+            status,
+            system_prompt,
+            mcp_config_path,
+            force_auto_start,
+        )
+    }
+
+    /// Build the argv using a specific backend. Thin wrapper around
+    /// `backend.build_command` that also computes the C7 auto-start
+    /// message from the stage and the gate-findings flag. Called from
+    /// `finish_session_open` so the per-work-item harness choice
+    /// (recorded in `App::harness_choice`) is honored.
+    fn build_agent_cmd_with(
+        &self,
+        backend: &dyn AgentBackend,
         status: WorkItemStatus,
         system_prompt: Option<&str>,
         mcp_config_path: Option<&std::path::Path>,
@@ -6000,7 +6281,7 @@ impl App {
             auto_start_message: auto_start_message.as_deref(),
             read_only: false,
         };
-        self.agent_backend.build_command(&cfg)
+        backend.build_command(&cfg)
     }
 
     /// Resolve the C7 auto-start user message for a given stage.
@@ -9712,6 +9993,24 @@ impl App {
             )
         };
 
+        // Resolve the per-work-item harness BEFORE starting any
+        // activity or background work. The plan's Milestone 3
+        // acceptance-criteria rule is "abort rather than default to
+        // claude" - review gates only run after an interactive session
+        // has existed (the c/x/o entry point records the choice), so a
+        // missing `harness_choice` entry is a user-facing error, not a
+        // silent default. See `docs/harness-contract.md` Change Log
+        // 2026-04-16 and the
+        // `harness_choice_applied_to_review_gate_spawn` test.
+        let agent_backend = match self.backend_for_work_item(wi_id) {
+            Some(b) => b,
+            None => {
+                return ReviewGateSpawn::Blocked(
+                    "Cannot run review gate: no harness chosen for this work item. Press c / x to pick one and re-open the session first.".into(),
+                );
+            }
+        };
+
         // Status-bar activity for the review gate. Per `docs/UI.md`
         // "Activity indicator placement", review gates are
         // system-initiated background work and must own a status-bar
@@ -9723,10 +10022,6 @@ impl App {
         // and `read_plan()` (filesystem read) execute off the main UI thread.
         let ws = Arc::clone(&self.worktree_service);
         let backend = Arc::clone(&self.backend);
-        // Clone the agent backend so the review-gate argv is built through
-        // the harness-neutral trait instead of hard-coding `claude` flags
-        // in this closure. See `docs/harness-contract.md` C1 / C11 / RP2.
-        let agent_backend = Arc::clone(&self.agent_backend);
 
         // Spawn the review gate in a background thread with three phases:
         // 1. PR existence check (if GitHub remote exists)
@@ -10103,6 +10398,26 @@ impl App {
             branch,
         } = target;
 
+        // Resolve the per-work-item harness BEFORE admitting the user
+        // action. The plan's Milestone 3 rule is "abort rather than
+        // default to claude" - the rebase gate only runs after an
+        // interactive session has existed, so a missing harness choice
+        // is a user-facing error rather than a silent default. See
+        // `docs/harness-contract.md` Change Log 2026-04-16 and the
+        // `harness_choice_applied_to_rebase_gate_spawn` test. We bail
+        // BEFORE `try_begin_user_action` so the 500 ms debounce does
+        // not eat a repeat press - this way the user can press `c` to
+        // pick a harness and immediately retry.
+        let agent_backend = match self.backend_for_work_item(&wi_id) {
+            Some(b) => b,
+            None => {
+                self.status_message = Some(
+                    "Cannot rebase: no harness chosen for this work item. Press c / x to pick one first.".into(),
+                );
+                return;
+            }
+        };
+
         // Single-flight admission. The 500 ms debounce matches
         // `Ctrl+R`: rapid presses are intentionally coalesced.
         let activity = match self.try_begin_user_action(
@@ -10165,7 +10480,9 @@ impl App {
             },
         );
 
-        let agent_backend = Arc::clone(&self.agent_backend);
+        // `agent_backend` was resolved at the top of this function
+        // from `harness_choice`; reuse it here rather than reading
+        // `self.agent_backend` again.
         std::thread::spawn(move || {
             // Cancellation check at the very start of the thread.
             // If `drop_rebase_gate` ran between the insert above and
@@ -11500,10 +11817,20 @@ impl App {
         // caveat.
         let cancelled = Arc::new(AtomicBool::new(false));
 
+        // Resolve the global-assistant harness from config. If unset,
+        // we should never have reached this function - `handle_ctrl_g`
+        // opens the first-run modal in that case and only calls
+        // `toggle_global_drawer` after a pick. Keep a defensive
+        // fallback to `self.agent_backend` so a hypothetical bypass
+        // never produces a crash in the background worker.
+        let agent_backend: Arc<dyn AgentBackend> = match self.global_assistant_harness_kind() {
+            Some(kind) => agent_backend::backend_for_kind(kind),
+            None => Arc::clone(&self.agent_backend),
+        };
+
         // Capture everything the worker needs. All Send + Sync.
         let mcp_context_shared = Arc::clone(&self.global_mcp_context);
         let mcp_tx = self.mcp_tx.clone();
-        let agent_backend = Arc::clone(&self.agent_backend);
         let pane_cols = self.global_pane_cols;
         let pane_rows = self.global_pane_rows;
         let pre_drawer_focus = self.pre_drawer_focus;
@@ -18041,6 +18368,15 @@ mod tests {
         app.display_list
             .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
         app.selected_item = Some(app.display_list.len() - 1);
+        // Pre-populate the per-work-item harness choice with Claude so
+        // gate-spawn tests reach their actual pre-conditions rather
+        // than short-circuiting at the "no harness chosen" abort.
+        // Tests that exercise the abort itself use explicit setup
+        // instead of this fixture. See
+        // `harness_choice_applied_to_review_gate_spawn` for the
+        // abort-path test.
+        app.harness_choice
+            .insert(wi_id.clone(), AgentBackendKind::ClaudeCode);
         (app, wi_id)
     }
 
@@ -18531,6 +18867,16 @@ mod tests {
             }],
             errors: vec![],
         });
+
+        // Pre-populate the per-work-item harness choice for both items
+        // so the review-gate spawn reaches its real pre-conditions
+        // rather than short-circuiting at the "no harness chosen"
+        // abort. Tests that exercise the abort itself use explicit
+        // setup (`harness_choice_applied_to_review_gate_spawn`).
+        app.harness_choice
+            .insert(wi_id_a.clone(), AgentBackendKind::ClaudeCode);
+        app.harness_choice
+            .insert(wi_id_b.clone(), AgentBackendKind::ClaudeCode);
 
         // Simulate gate running for item A.
         let (_dummy_tx, dummy_rx) = crossbeam_channel::unbounded();
@@ -20174,6 +20520,13 @@ mod tests {
             "feature/gate",
             WorkItemStatus::Implementing,
         );
+        // Pre-populate the per-work-item harness choice so the gate
+        // reaches its real pre-conditions rather than short-circuiting
+        // at "no harness chosen" (Milestone 3 rule; see
+        // `harness_choice_applied_to_review_gate_spawn` for the
+        // abort-path test).
+        app.harness_choice
+            .insert(wi_id.clone(), AgentBackendKind::ClaudeCode);
 
         // Hold the gate mutex so the background thread (which WILL
         // call `default_branch` / `github_remote` as soon as it wakes)

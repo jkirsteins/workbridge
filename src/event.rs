@@ -45,6 +45,20 @@ fn is_ctrl_symbol(key: KeyEvent, symbol: char) -> bool {
 /// Returns `false` when the key was only forwarded to a PTY session
 /// (the 8ms timer tick will render the PTY echo within one frame).
 pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
+    // Clear the `kk` double-press window on any key that isn't the
+    // second `k` for the same work item. `handle_k_press` itself
+    // re-arms on the second press, and the per-tick `prune_k_press`
+    // expires it independently; this clear catches "user pressed k,
+    // then pressed some unrelated key" so the arm cannot survive
+    // across contexts. Only a bare `k` on the left panel can arm or
+    // trigger the kill, so clearing on any other key is safe.
+    if !matches!(
+        (key.modifiers, key.code),
+        (KeyModifiers::NONE, KeyCode::Char('k'))
+    ) {
+        app.clear_k_press();
+    }
+
     // During shutdown, only Q triggers force quit. All other keys are ignored.
     // Check this before the create dialog so users cannot create work items
     // while sessions are winding down.
@@ -63,6 +77,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             app.force_kill_all();
             app.should_quit = true;
         }
+        return true;
+    }
+
+    // When the first-run global-harness modal is visible, intercept
+    // keys before the usual dispatch so c/x/o/esc route to the modal
+    // and do not trigger work-item or drawer handlers below. This must
+    // come before `global_drawer_open` because the modal is shown as
+    // a precondition to the drawer opening for the first time.
+    if app.first_run_global_harness_modal.is_some() {
+        handle_first_run_global_harness_modal(app, key);
         return true;
     }
 
@@ -883,9 +907,11 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 sync_layout(app);
             }
         }
-        // Ctrl+G - toggle global assistant drawer
+        // Ctrl+G - toggle global assistant drawer (or show the
+        // first-run harness picker modal if no harness has been
+        // configured yet). See `docs/UI.md` "First-run Ctrl+G modal".
         (KeyModifiers::CONTROL, KeyCode::Char('g')) => {
-            app.toggle_global_drawer();
+            app.handle_ctrl_g();
         }
         // Tab - toggle to board view
         (KeyModifiers::NONE, KeyCode::Tab) => {
@@ -895,15 +921,63 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
             app.show_settings = !app.show_settings;
         }
-        // o - open the selected item's PR in the default browser.
-        // Works on work items (first PR-bearing association), unlinked
-        // PRs, and review requests. No-op with a status message when the
-        // selection has no PR. Not added to `handle_key_right` because
-        // single keystrokes in the right panel are forwarded to the PTY
-        // session and hijacking `o` there would break typing into Claude.
+        // c / x - open a session on the selected work item using the
+        // chosen harness. `c` is Claude, `x` is Codex. On a work-item
+        // row with no live session, each key sets the per-work-item
+        // harness and spawns. See `App::open_session_with_harness`.
+        // The keybindings are documented in `docs/UI.md`.
+        (KeyModifiers::NONE, KeyCode::Char('c')) => {
+            let had_status = app.has_visible_status_bar();
+            if app.selected_work_item_id().is_some() {
+                app.open_session_with_harness(crate::agent_backend::AgentBackendKind::ClaudeCode);
+            }
+            if app.has_visible_status_bar() != had_status {
+                sync_layout(app);
+            }
+        }
+        (KeyModifiers::NONE, KeyCode::Char('x')) => {
+            let had_status = app.has_visible_status_bar();
+            if app.selected_work_item_id().is_some() {
+                app.open_session_with_harness(crate::agent_backend::AgentBackendKind::Codex);
+            }
+            if app.has_visible_status_bar() != had_status {
+                sync_layout(app);
+            }
+        }
+        // k - double-press to end a live session. First press arms a
+        // toast hint; a second `k` within ~1.5s SIGTERMs the session.
+        // See `App::handle_k_press` for the FSM.
+        (KeyModifiers::NONE, KeyCode::Char('k')) => {
+            let had_status = app.has_visible_status_bar();
+            app.handle_k_press();
+            if app.has_visible_status_bar() != had_status {
+                sync_layout(app);
+            }
+        }
+        // o - dual purpose:
+        //   (1) On a work-item row with no live session: open the
+        //       session using the `opencode` harness (currently a
+        //       stub, so this surfaces a "not yet implemented" toast).
+        //   (2) Otherwise (work item with a live session, unlinked
+        //       PR, or review request): open the PR in the default
+        //       browser, preserving the pre-existing behaviour.
+        // Not added to `handle_key_right` because single keystrokes
+        // in the right panel are forwarded to the PTY session and
+        // hijacking `o` there would break typing into the agent.
         (KeyModifiers::NONE, KeyCode::Char('o')) => {
             let had_status = app.has_visible_status_bar();
-            app.open_selected_pr_in_browser();
+            let work_item_without_session = match app.selected_work_item_id() {
+                Some(id) => match app.session_key_for(&id) {
+                    Some(k) => !app.sessions.get(&k).is_some_and(|e| e.alive),
+                    None => true,
+                },
+                None => false,
+            };
+            if work_item_without_session {
+                app.open_session_with_harness(crate::agent_backend::AgentBackendKind::OpenCode);
+            } else {
+                app.open_selected_pr_in_browser();
+            }
             if app.has_visible_status_bar() != had_status {
                 sync_layout(app);
             }
@@ -2783,6 +2857,36 @@ fn normalize_selection(sel: &SelectionState) -> (u16, u16, u16, u16) {
 pub(crate) fn sync_layout(app: &mut App) {
     if let Ok((cols, rows)) = ratatui_crossterm::crossterm::terminal::size() {
         handle_resize(app, cols, rows);
+    }
+}
+
+/// Route keypresses to the first-run Ctrl+G modal. Only the harnesses
+/// listed in `modal.available_harnesses` are accepted; unknown keys are
+/// ignored (the modal stays up). See `App::handle_ctrl_g` for the
+/// modal-open path and `App::finish_first_run_global_pick` for the
+/// persistence path.
+fn handle_first_run_global_harness_modal(app: &mut App, key: KeyEvent) {
+    // Snapshot the list so we do not hold a borrow while we mutate
+    // `app` inside the match arm.
+    let available: Vec<crate::agent_backend::AgentBackendKind> = app
+        .first_run_global_harness_modal
+        .as_ref()
+        .map(|m| m.available_harnesses.clone())
+        .unwrap_or_default();
+
+    match (key.modifiers, key.code) {
+        (KeyModifiers::NONE, KeyCode::Esc) => {
+            app.cancel_first_run_global_pick();
+        }
+        (KeyModifiers::NONE, KeyCode::Char(c)) => {
+            if let Some(kind) = available.iter().copied().find(|k| k.keybinding() == c) {
+                app.finish_first_run_global_pick(kind);
+            }
+            // Unknown key while the modal is up: ignore. The modal
+            // stays visible. This matches the pattern for the alert
+            // modal (`alert_message` handling above).
+        }
+        _ => {}
     }
 }
 
