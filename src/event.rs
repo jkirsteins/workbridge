@@ -176,6 +176,42 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
+    // Stale-worktree recovery dialog: user can force-remove + retry, or dismiss.
+    if app.stale_worktree_prompt.is_some() {
+        // While recovery is in progress, swallow all keys (modal spinner).
+        // Q/Ctrl+Q still triggers force-quit so a hung recovery never traps
+        // the user.
+        if app.stale_recovery_in_progress {
+            if matches!(
+                (key.modifiers, key.code),
+                (
+                    KeyModifiers::NONE | KeyModifiers::SHIFT,
+                    KeyCode::Char('q' | 'Q')
+                ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
+            ) {
+                if !app.has_any_session() || app.confirm_quit {
+                    app.should_quit = true;
+                } else {
+                    app.confirm_quit = true;
+                    app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                    sync_layout(app);
+                }
+            }
+            return true;
+        }
+        match (key.modifiers, key.code) {
+            (_, KeyCode::Char('r')) => {
+                let prompt = app.stale_worktree_prompt.take().unwrap();
+                app.spawn_stale_worktree_recovery(prompt);
+            }
+            (_, KeyCode::Esc) => {
+                app.stale_worktree_prompt = None;
+            }
+            _ => {}
+        }
+        return true;
+    }
+
     // In-progress guard: while the delete background thread is running,
     // swallow all keys (including Claude session input) so the modal
     // cannot be dismissed and the PTY panel cannot receive keystrokes.
@@ -1286,6 +1322,8 @@ fn any_modal_visible(app: &App) -> bool {
         || app.rework_prompt_visible
         || app.no_plan_prompt_visible
         || app.branch_gone_prompt.is_some()
+        || app.stale_worktree_prompt.is_some()
+        || app.stale_recovery_in_progress
         || app.confirm_merge
         || app.cleanup_prompt_visible
         || app.is_user_action_in_flight(&UserActionKey::UnlinkedCleanup)

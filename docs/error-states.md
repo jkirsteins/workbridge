@@ -55,6 +55,29 @@ the assembly layer does not produce it.
 invalid record. In v1, the LocalFileBackend skips corrupt files entirely
 rather than producing this error.
 
+### BranchLockedToWorktree (implemented)
+
+**Detection**: `git worktree add` fails with "is already used by worktree at"
+error. This happens when a previous worktree was left in a corrupt state
+(typically after an interrupted rebase via the "m" key) - the branch is still
+registered as checked out in git's bookkeeping but the worktree has a detached
+HEAD mid-rebase, so `find_reusable_worktree` does not match it.
+
+**Presentation**: Modal dialog titled "Stale Worktree". Shows the branch name,
+the stale worktree path, and the explanation. Offers [r] Force-remove stale
+worktree & retry, or [Esc] Dismiss. During recovery, the dialog switches to a
+spinner modal ("Recovering Worktree") with no key options.
+
+**Recovery**: Force-removes the stale worktree entry (`git worktree remove
+--force`), prunes git's bookkeeping (`git worktree prune`), then retries
+`git worktree add`. All three operations run on a background thread. The
+branch is preserved (not deleted) since it contains the user's work. On
+success, the worktree is created and the session opens normally. On failure,
+a generic alert is shown with the error details.
+
+**Severity**: Error with recovery. The work item is unusable until the stale
+worktree is cleaned up, but the recovery is automated once the user confirms.
+
 ### WorktreeGone (defined, not currently produced)
 
 **Detection**: Would fire when a work item references a worktree path that
