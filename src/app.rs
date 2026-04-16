@@ -9652,6 +9652,30 @@ impl App {
                 None => return,
             };
 
+            // If the result is a Failure, clean up any in-progress
+            // rebase the harness may have left behind. The harness
+            // is instructed to `git rebase --abort` on give-up, but
+            // if it crashed, was killed, or hallucinated success
+            // while REBASE_HEAD still exists, the worktree is left
+            // mid-rebase with conflict markers and a locked index.
+            // Running `git rebase --abort` here is idempotent: if
+            // no rebase is in progress it exits non-zero with "No
+            // rebase in progress?" and does nothing. The abort goes
+            // through `run_cancellable` so it is also killable if
+            // the gate is torn down while the abort is in flight
+            // (the worktree is about to be removed anyway in that
+            // case, so a partial abort is harmless).
+            if matches!(&result, RebaseResult::Failure { .. }) {
+                let _ = run_cancellable(
+                    crate::worktree_service::git_command()
+                        .arg("-C")
+                        .arg(&worktree_path)
+                        .args(["rebase", "--abort"]),
+                    &child_pid,
+                    &cancelled,
+                );
+            }
+
             // Early-out on cancellation: skip the append entirely
             // and do not send the result. This is a fast-path
             // optimization - the structural guarantee that a
