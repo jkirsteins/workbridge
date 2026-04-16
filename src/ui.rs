@@ -1164,7 +1164,7 @@ fn format_board_item<'a>(
 
     // Session activity indicator.
     let has_session = app.session_key_for(&wi.id).is_some();
-    let is_working = app.claude_working.contains(&wi.id);
+    let is_working = app.agent_working.contains(&wi.id);
     if is_working {
         let frame = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
         indicators.push(Span::styled(
@@ -1811,7 +1811,7 @@ fn format_work_item_entry<'a>(
     // as an explicit `[RG]` badge alongside the state badge below, so
     // the user can tell at a glance without opening the right panel.
     let at_review_gate = app.review_gates.contains_key(&wi.id);
-    let is_working = app.claude_working.contains(&wi.id) || at_review_gate;
+    let is_working = app.agent_working.contains(&wi.id) || at_review_gate;
     let (margin_text, margin_style): (String, ratatui_core::style::Style) = if is_working {
         let frame = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
         // On a highlighted row the list's bg is already Cyan, so a Cyan
@@ -2766,15 +2766,16 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 theme.style_view_mode_tab_active(),
             ),
         };
+        let backend_tab = format!(" {} ", app.agent_backend_display_name());
         Line::from(vec![
             Span::raw(" "),
-            Span::styled(" Claude Code ", cc_style),
+            Span::styled(backend_tab, cc_style),
             Span::styled(" | ", theme.style_title()),
             Span::styled(" Terminal ", term_style),
             Span::styled(input_suffix, theme.style_title()),
         ])
     } else {
-        let title_text = format!(" Claude Code{input_suffix}");
+        let title_text = format!(" {}{input_suffix}", app.agent_backend_display_name());
         Line::from(Span::styled(title_text, theme.style_title()))
     };
 
@@ -2807,7 +2808,10 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     Line::from(""),
                     Line::from("  Terminal session has ended."),
                     Line::from(""),
-                    Line::from("  Press Ctrl+\\ to switch back to Claude Code."),
+                    Line::from(format!(
+                        "  Press Ctrl+\\ to switch back to {}.",
+                        app.agent_backend_display_name()
+                    )),
                 ]);
                 let paragraph = Paragraph::new(text).block(block).style(theme.style_error());
                 paragraph.render(area, buf);
@@ -4812,7 +4816,7 @@ mod format_entry_tests {
         };
         let id = wi.id.clone();
         let mut app = make_app_with_work_item(wi);
-        app.claude_working.insert(id);
+        app.agent_working.insert(id);
         let theme = Theme::default_theme();
 
         let item = format_work_item_entry(&app, 0, 40, &theme, true);
@@ -4861,7 +4865,7 @@ mod format_entry_tests {
         };
         let id = wi.id.clone();
         let mut app = make_app_with_work_item(wi);
-        app.claude_working.insert(id);
+        app.agent_working.insert(id);
         let theme = Theme::default_theme();
 
         let item = format_work_item_entry(&app, 0, 40, &theme, false);

@@ -1,5 +1,19 @@
 # Cleanup and Shutdown Behavior
 
+For the agent-backend-specific side-car files written on spawn (e.g.
+the `--mcp-config` tempfile, or future backend config files) and
+how they are reversed via `AgentBackend::cleanup_session_files` on
+work-item deletion, see `docs/harness-contract.md` C4 and the C10
+lifecycle section. This file only covers the OS-level signal dance
+and the work-item resource cleanup phases that sit above the harness
+contract. Note that `cleanup_session_files` itself performs
+`std::fs::remove_file` and therefore must NOT run on the UI thread:
+`delete_work_item_by_id()` routes the file list to
+`spawn_agent_file_cleanup()`, a dedicated fire-and-forget background
+thread, per `docs/UI.md` "Blocking I/O Prohibition". Every delete
+path (manual Ctrl+D, MCP `workbridge_delete`, auto-archive) inherits
+this routing.
+
 ## Normal quit (Q twice)
 
 1. First Q press shows a confirmation prompt.

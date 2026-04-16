@@ -143,6 +143,21 @@ mod tests {
         assert!(prompts.contains_key("review_with_findings"));
         assert!(prompts.contains_key("review_gate"));
         assert!(prompts.contains_key("global_assistant"));
+        // Auto-start messages (C7 in docs/harness-contract.md) live in
+        // the same JSON so they can be edited without recompiling.
+        assert!(prompts.contains_key("auto_start_default"));
+        assert!(prompts.contains_key("auto_start_review"));
+    }
+
+    /// Auto-start messages (`auto_start_*` keys) are short literal user
+    /// prompts, not system prompts. The git-* prohibitions belong in the
+    /// system prompt (which already carries them for every stage via
+    /// `stage_system_prompt`), so the auto-start keys are deliberately
+    /// excluded from the prohibition checks below. This matches the
+    /// harness contract: auto-start is C7 (initial user message), the
+    /// prohibitions are part of C6 (system prompt content).
+    fn is_auto_start_key(key: &str) -> bool {
+        key.starts_with("auto_start_")
     }
 
     #[test]
@@ -150,6 +165,9 @@ mod tests {
         let prompts: HashMap<String, PromptEntry> = serde_json::from_str(PROMPTS_JSON).unwrap();
         let prohibition = "NEVER run 'git config' to set any values";
         for (key, entry) in &prompts {
+            if is_auto_start_key(key) {
+                continue;
+            }
             assert!(
                 entry.template.contains(prohibition),
                 "prompt '{}' is missing git config prohibition",
@@ -163,6 +181,9 @@ mod tests {
         let prompts: HashMap<String, PromptEntry> = serde_json::from_str(PROMPTS_JSON).unwrap();
         let prohibition = "NEVER run 'git checkout'";
         for (key, entry) in &prompts {
+            if is_auto_start_key(key) {
+                continue;
+            }
             assert!(
                 entry.template.contains(prohibition),
                 "prompt '{}' is missing git checkout prohibition",

@@ -3,11 +3,19 @@
 Date: 2026-04-03
 Status: Draft - captured from design interview
 
+> **Note (2026-04-15)**: This draft uses "Claude" as shorthand for the
+> running coding agent because that was the only adapter at the time of
+> writing. The actual wiring is now pluggable via the `AgentBackend`
+> trait in `src/agent_backend.rs`; the authoritative contract lives in
+> `docs/harness-contract.md`. Read "Claude" in this draft as "the
+> configured agent backend" - today that's `ClaudeCodeBackend`, but a
+> second adapter (e.g. Codex) would inherit the same workflow.
+
 ---
 
 ## 1. Overview
 
-Workbridge work items represent pieces of work inside one or more repos. Work progresses through multiple stages (like a Jira board), with deep Claude Code integration at each stage. The TUI hosts an MCP server that serves as the communication backbone between Claude sessions and the application.
+Workbridge work items represent pieces of work inside one or more repos. Work progresses through multiple stages (like a Jira board), with deep agent (Claude Code) integration at each stage. The TUI hosts an MCP server that serves as the communication backbone between agent sessions and the application.
 
 ---
 
@@ -24,14 +32,14 @@ Backlog --> Planning --> Implementing --> Review --> Done
 ### 2.1 Backlog
 
 - Raw idea. Keywords/title only, no plan fleshed out.
-- No Claude session.
+- No agent session.
 - User creates items manually (no auto-import from GitHub for MVP).
 - Must have 1+ repo association from creation (data model invariant).
 
 ### 2.2 Planning
 
 - Refine the plan by discussing with Claude interactively.
-- User opens a Claude session (presses Enter) and drives the conversation.
+- User opens a agent session (presses Enter) and drives the conversation.
 - Claude logs decisions and reasoning to the activity log via MCP.
 - Plan is passed to the backend for storage. Backend decides where to store:
   - Local backend: stored in work item JSON
@@ -42,7 +50,7 @@ Backlog --> Planning --> Implementing --> Review --> Done
 ### 2.3 Implementing
 
 - Claude works autonomously from the approved plan.
-- When user approves plan and advances to Implementing, the system auto-spawns a Claude session with the plan as context.
+- When user approves plan and advances to Implementing, the system auto-spawns a agent session with the plan as context.
 - User can watch live PTY output (current model).
 - User can type directly into the PTY to give guidance mid-work (current model).
 - Concurrency: 1 actively implementing item at a time (default). Configurable limit. Queued items show position: `[IM:Q1]`, `[IM:Q2]`.
@@ -59,7 +67,7 @@ Backlog --> Planning --> Implementing --> Review --> Done
 ### 2.5 Review
 
 - Claude signals it is done implementing and requests review via MCP. The TUI handles PR creation as part of the transition. The PR is incidental to the stage change - what matters is Claude signaling it finished.
-- A fresh Claude session is available for the user to:
+- A fresh agent session is available for the user to:
   - Address review feedback interactively
   - Run review skills (e.g. adversarial-review, review-loop)
   - Ask for a summary of what happened in prior stages
@@ -70,7 +78,7 @@ Backlog --> Planning --> Implementing --> Review --> Done
 ### 2.6 Done
 
 - Work complete, PR merged.
-- No active Claude session.
+- No active agent session.
 - Item visible for a configurable period (e.g. 7 days), then auto-archived.
 
 ---
@@ -117,7 +125,7 @@ New: `Backlog`, `Planning`, `Implementing`, `Blocked`, `Review`, `Done`
 11. Only N items can be actively implementing at a time (default N=1, configurable). Remaining items are queued with visible position.
 12. Done items are visible for a configurable period, then auto-archived.
 13. Activity log entries are immutable once written (append-only).
-14. Every Claude session identifies itself to the MCP server with a work item ID.
+14. Every agent session identifies itself to the MCP server with a work item ID.
 
 ### 4.3 Activity Log (new)
 
@@ -147,7 +155,7 @@ Stored by the backend (e.g. local backend: `session-{uuid}.json` alongside work 
 
 ## 5. MCP Server
 
-The TUI hosts an MCP server. Claude sessions connect to it. Each session identifies itself with a work item ID.
+The TUI hosts an MCP server. agent sessions connect to it. Each session identifies itself with a work item ID.
 
 ### 5.1 Tools
 
@@ -165,7 +173,7 @@ The TUI hosts an MCP server. Claude sessions connect to it. Each session identif
 
 ### 5.2 Session Model: Fresh Per Stage
 
-Each stage transition that involves Claude spawns a fresh Claude session. Rationale:
+Each stage transition that involves Claude spawns a fresh agent session. Rationale:
 
 - The plan is the handoff contract between stages - forces completeness
 - Resilient to crashes - fresh session can pick up from persisted state
@@ -192,7 +200,7 @@ The MCP server keeps track of EVERYTHING happening per work item:
 
 - All tool calls, stage changes, PR events, CI updates, notes
 - Stored persistently by the backend (local backend uses a session JSON file with UUID tied to the work item)
-- New Claude sessions can resume work fresh by querying this log
+- New agent sessions can resume work fresh by querying this log
 - This is the "memory" that bridges fresh sessions across stages
 
 ---
@@ -227,7 +235,7 @@ Toggled via a global keybind (e.g. Tab) at the root work item overview level.
 - BLOCKED items highlighted distinctly (e.g. red/yellow badge)
 - PR badge, CI badge, multi-repo indicator (existing) still shown
 - Shift+Right / Shift+Left to advance/retreat stages
-- Enter to open/focus Claude session (spawns if needed for the current stage)
+- Enter to open/focus agent session (spawns if needed for the current stage)
 
 #### B) Board View (Kanban columns)
 
@@ -255,7 +263,7 @@ Toggled via a global keybind (e.g. Tab) at the root work item overview level.
 
 ### 6.2 Right Panel (consistent across views)
 
-- Always shows PTY output from the Claude session for the selected work item
+- Always shows PTY output from the agent session for the selected work item
 - User can type directly into it (forwarded to PTY stdin)
 - Shows placeholder when no session is active
 
@@ -266,7 +274,7 @@ Toggled via a global keybind (e.g. Tab) at the root work item overview level.
 | Tab | Root overview | Toggle flat list / board view |
 | Shift+Right | Item selected | Advance to next stage |
 | Shift+Left | Item selected | Retreat to previous stage |
-| Enter | Item selected | Focus right panel, spawn Claude session if needed |
+| Enter | Item selected | Focus right panel, spawn agent session if needed |
 | Ctrl+] | Right panel focused | Return to left panel / board view |
 | Ctrl+N | Left panel | Quick-start: create Planning item and spawn Claude immediately |
 | Ctrl+B | Left panel | Create new backlog work item |
@@ -280,7 +288,7 @@ Toggled via a global keybind (e.g. Tab) at the root work item overview level.
 ### 7.1 Happy Path: Idea to Done
 
 1. User presses Ctrl+N to quick-start a new session.
-2. Item appears with [PL] badge and a Claude session spawns immediately in Planning mode.
+2. Item appears with [PL] badge and a agent session spawns immediately in Planning mode.
 3. Claude asks the user what they want to work on, and sets the title/description via MCP.
 4. User discusses approach with Claude: "We should use Redis with a 5min TTL..."
 5. Claude logs decisions to activity log via MCP.
@@ -309,7 +317,7 @@ Toggled via a global keybind (e.g. Tab) at the root work item overview level.
 ### 7.3 Review Rework
 
 1. Item in [RV], PR has "changes requested".
-2. User sees review badge, opens Claude session.
+2. User sees review badge, opens agent session.
 3. User: "Address the reviewer's comments about error handling"
 4. Claude queries review comments via MCP, makes changes, pushes.
 5. User monitors for re-review.
@@ -334,7 +342,7 @@ Toggled via a global keybind (e.g. Tab) at the root work item overview level.
 
 ### 7.6 Asking Claude for Context/History
 
-1. Item is in [RV], new Claude session was just spawned.
+1. Item is in [RV], new agent session was just spawned.
 2. User: "What decisions were made during planning?"
 3. Claude calls `query_log(item_id, { event_type: "note", stage: "Planning" })` via MCP.
 4. Claude summarizes the planning decisions for the user.
@@ -345,7 +353,7 @@ Toggled via a global keybind (e.g. Tab) at the root work item overview level.
 
 ### What the system automates (MVP):
 
-- Spawning Claude session with correct context when entering Implementing
+- Spawning agent session with correct context when entering Implementing
 - PR creation when transitioning from Implementing to Review
 - Activity log maintenance (all system events logged automatically)
 - Queue management for concurrent implementation limit

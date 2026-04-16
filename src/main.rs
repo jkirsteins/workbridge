@@ -1,3 +1,4 @@
+mod agent_backend;
 mod app;
 mod assembly;
 mod click_targets;

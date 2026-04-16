@@ -1369,12 +1369,9 @@ pub fn run_bridge(socket_path: PathBuf) {
     let _ = stdout_thread.join();
 }
 
-/// Build MCP config JSON for passing to the claude CLI.
-/// Returns the JSON string, which workbridge always writes to a temp
-/// file under `std::env::temp_dir()` and passes via `--mcp-config`.
-/// Workbridge never drops this file into a user worktree; see the
-/// "file injection" rule in CLAUDE.md and the C4 clause in
-/// `docs/harness-contract.md`.
+/// Build MCP config JSON for passing to an agent backend (today:
+/// Claude Code via `--mcp-config`). Returns the JSON string; the
+/// caller writes it to a temp file and passes the path as a CLI flag.
 ///
 /// `extra_servers` are per-repo MCP servers from the user's config. The
 /// workbridge server is always inserted last so it wins over any user entry
@@ -1472,7 +1469,7 @@ mod tests {
             "method": "initialize",
             "params": {
                 "protocolVersion": "2024-11-05",
-                "clientInfo": {"name": "claude", "version": "1.0"}
+                "clientInfo": {"name": "workbridge-test-agent", "version": "1.0"}
             }
         });
         let resp = handle_message(&msg, "test-id", "", "{}", None, &tx, false).unwrap();
