@@ -24096,4 +24096,305 @@ mod tests {
             other => panic!("selected entry should be the work item, got {other:?}"),
         }
     }
+
+    // ---- Milestone 5: harness-selection tests ----
+
+    /// Pins that `spawn_review_gate` honors `App::harness_choice` for
+    /// the per-work-item harness and aborts when the entry is missing
+    /// (the plan's "abort rather than default to claude" rule).
+    /// Exercises both halves in one test so a regression that flips
+    /// either direction is flagged.
+    #[test]
+    fn harness_choice_applied_to_review_gate_spawn() {
+        // --- Half 1: no harness chosen -> gate aborts with a
+        // user-facing "Cannot run review gate" reason, does NOT start
+        // a background thread, and does NOT insert a gate entry. ---
+        let mut app = App::new();
+        let repo = PathBuf::from("/tmp/harness-choice-review-repo");
+        install_cached_repo(&mut app, &repo, Some("feature/a"), Some(true));
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/harness-choice-review.json"));
+        push_review_work_item(
+            &mut app,
+            &wi_id,
+            &repo,
+            "feature/a",
+            WorkItemStatus::Implementing,
+        );
+        // Deliberately do NOT populate `harness_choice`.
+        let result = app.spawn_review_gate(&wi_id, ReviewGateOrigin::Mcp);
+        match result {
+            ReviewGateSpawn::Blocked(reason) => {
+                assert!(
+                    reason.contains("no harness chosen"),
+                    "abort reason must name the missing harness choice, got: {reason}"
+                );
+            }
+            ReviewGateSpawn::Spawned => {
+                panic!("review gate must abort when no harness is chosen, got Spawned")
+            }
+        }
+        assert!(
+            app.review_gates.is_empty(),
+            "aborted review gate must not insert a gate entry"
+        );
+
+        // --- Half 2: harness chosen -> the gate reaches the branch
+        // that inspects the repo state (we assert it gets past the
+        // harness check by hitting later branches; `spawn_review_gate`
+        // has additional guards for branch / assoc that may still
+        // reject, but they fire AFTER our check, so confirming we no
+        // longer see "no harness chosen" is enough.) ---
+        app.harness_choice
+            .insert(wi_id.clone(), AgentBackendKind::Codex);
+        let result2 = app.spawn_review_gate(&wi_id, ReviewGateOrigin::Mcp);
+        match result2 {
+            ReviewGateSpawn::Blocked(reason) => {
+                assert!(
+                    !reason.contains("no harness chosen"),
+                    "with a chosen harness, the reason must not be the no-harness abort, got: {reason}"
+                );
+            }
+            ReviewGateSpawn::Spawned => {
+                // Also acceptable: the gate progressed all the way to
+                // spawning the background thread.
+            }
+        }
+    }
+
+    /// Mirror of `harness_choice_applied_to_review_gate_spawn` for the
+    /// rebase gate (`App::spawn_rebase_gate`).
+    #[test]
+    fn harness_choice_applied_to_rebase_gate_spawn() {
+        let mut app = App::new();
+        let repo = PathBuf::from("/tmp/harness-choice-rebase-repo");
+        install_cached_repo(&mut app, &repo, Some("feature/r"), Some(true));
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/harness-choice-rebase.json"));
+        push_review_work_item(
+            &mut app,
+            &wi_id,
+            &repo,
+            "feature/r",
+            WorkItemStatus::Implementing,
+        );
+
+        // Half 1: no harness chosen. `spawn_rebase_gate` returns
+        // quietly and populates `status_message` with the no-harness
+        // reason; it must NOT admit a user action.
+        app.spawn_rebase_gate(RebaseTarget {
+            wi_id: wi_id.clone(),
+            worktree_path: repo.join(".worktrees/feature/r"),
+            branch: "feature/r".to_string(),
+        });
+        let msg = app
+            .status_message
+            .clone()
+            .expect("no-harness abort must surface a status message");
+        assert!(
+            msg.contains("no harness chosen"),
+            "rebase gate abort reason must name the missing harness, got: {msg}"
+        );
+        assert!(
+            !app.rebase_gates.contains_key(&wi_id),
+            "aborted rebase must not insert a gate entry"
+        );
+
+        // Half 2: populate harness_choice; the gate progresses past
+        // the harness check (we verify by the absence of the abort
+        // reason; further branches may still reject on worktree state
+        // but they fire after the harness check).
+        app.harness_choice
+            .insert(wi_id.clone(), AgentBackendKind::Codex);
+        app.status_message = None;
+        app.spawn_rebase_gate(RebaseTarget {
+            wi_id: wi_id.clone(),
+            worktree_path: repo.join(".worktrees/feature/r"),
+            branch: "feature/r".to_string(),
+        });
+        let post_msg = app.status_message.clone().unwrap_or_default();
+        assert!(
+            !post_msg.contains("no harness chosen"),
+            "with a chosen harness, the abort reason must not appear, got: {post_msg}"
+        );
+    }
+
+    /// Pins that the first-run Ctrl+G modal opens when the config
+    /// harness is unset AND at least one harness is on PATH, and
+    /// that it does NOT open otherwise (configured harness or no
+    /// available binary).
+    #[test]
+    fn ctrl_g_with_unset_harness_opens_first_run_modal_when_available() {
+        let mut app = App::new();
+        // Precondition: config has no global_assistant_harness.
+        assert!(app.config.defaults.global_assistant_harness.is_none());
+
+        app.handle_ctrl_g();
+
+        // If any harness is on PATH, the modal opens. If none is
+        // on PATH, a toast surfaces the "no supported harnesses"
+        // hint. Either way, the drawer must NOT open directly.
+        assert!(
+            !app.global_drawer_open,
+            "Ctrl+G with unset harness must not open the drawer directly"
+        );
+        let any_available = AgentBackendKind::all()
+            .iter()
+            .any(|k| crate::agent_backend::is_available(*k));
+        if any_available {
+            assert!(
+                app.first_run_global_harness_modal.is_some(),
+                "Ctrl+G with unset harness + any harness on PATH must open the first-run modal"
+            );
+        } else {
+            assert!(
+                app.first_run_global_harness_modal.is_none(),
+                "no modal when there is nothing on PATH to pick"
+            );
+            assert!(
+                !app.toasts.is_empty(),
+                "a no-harnesses-on-PATH toast must be shown"
+            );
+        }
+    }
+
+    /// Pins the configured-harness fast path: Ctrl+G with a set
+    /// harness opens the drawer directly (no modal).
+    #[test]
+    fn ctrl_g_with_set_harness_opens_drawer_directly() {
+        let mut app = App::new();
+        app.config.defaults.global_assistant_harness = Some("claude".into());
+
+        assert!(!app.global_drawer_open);
+        app.handle_ctrl_g();
+
+        assert!(
+            app.first_run_global_harness_modal.is_none(),
+            "configured harness must not open the modal"
+        );
+        assert!(
+            app.global_drawer_open,
+            "configured harness must open the drawer directly"
+        );
+    }
+
+    /// Pins the first-run modal persistence path: picking a harness
+    /// saves the canonical name to the config provider and opens the
+    /// drawer.
+    #[test]
+    fn first_run_modal_pick_persists_to_config_provider() {
+        // Start with an in-memory config provider so we can reload
+        // and verify persistence without touching disk.
+        let provider = Box::new(crate::config::InMemoryConfigProvider::new());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(StubBackend),
+            Arc::new(crate::worktree_service::GitWorktreeService),
+            provider,
+        );
+
+        // Arm the modal directly (bypassing handle_ctrl_g so the
+        // test does not depend on PATH).
+        app.first_run_global_harness_modal = Some(FirstRunGlobalHarnessModal {
+            available_harnesses: vec![AgentBackendKind::ClaudeCode],
+        });
+
+        app.finish_first_run_global_pick(AgentBackendKind::ClaudeCode);
+
+        // Modal closed; drawer open.
+        assert!(app.first_run_global_harness_modal.is_none());
+        assert!(app.global_drawer_open);
+        // Config has the canonical name.
+        assert_eq!(
+            app.config.defaults.global_assistant_harness.as_deref(),
+            Some("claude")
+        );
+        // Reload via the provider to confirm it was persisted.
+        let reloaded = app.config_provider.load().unwrap();
+        assert_eq!(
+            reloaded.defaults.global_assistant_harness.as_deref(),
+            Some("claude")
+        );
+    }
+
+    /// Pins the modal-cancel path: Esc closes the modal without
+    /// mutating the config and without opening the drawer.
+    #[test]
+    fn first_run_modal_esc_does_not_persist() {
+        let provider = Box::new(crate::config::InMemoryConfigProvider::new());
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(StubBackend),
+            Arc::new(crate::worktree_service::GitWorktreeService),
+            provider,
+        );
+
+        app.first_run_global_harness_modal = Some(FirstRunGlobalHarnessModal {
+            available_harnesses: vec![AgentBackendKind::ClaudeCode],
+        });
+
+        app.cancel_first_run_global_pick();
+
+        assert!(app.first_run_global_harness_modal.is_none());
+        assert!(!app.global_drawer_open);
+        assert!(app.config.defaults.global_assistant_harness.is_none());
+        let reloaded = app.config_provider.load().unwrap();
+        assert!(reloaded.defaults.global_assistant_harness.is_none());
+    }
+
+    /// Pins the kk double-press kill FSM happy path: two `k` presses
+    /// within the 1.5s window end the session.
+    #[test]
+    fn double_k_within_window_kills_session() {
+        let (mut app, wi_id) =
+            app_with_work_item(WorkItemStatus::Implementing, Some("f"), Some("/tmp/r"));
+        // Insert a fake alive session for the work item so the FSM
+        // has something to kill. No PTY / Session child - the
+        // `session: None` branch is specifically supported to keep
+        // unit tests hermetic.
+        let session_key = (wi_id.clone(), WorkItemStatus::Implementing);
+        app.sessions.insert(
+            session_key.clone(),
+            crate::work_item::SessionEntry {
+                parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
+                alive: true,
+                session: None,
+                scrollback_offset: 0,
+                selection: None,
+                agent_written_files: Vec::new(),
+            },
+        );
+
+        // First press arms the hint.
+        app.handle_k_press();
+        assert!(app.last_k_press.is_some(), "first k must arm");
+        assert!(
+            app.sessions.contains_key(&session_key),
+            "first k must not kill"
+        );
+
+        // Second press within the window kills.
+        app.handle_k_press();
+        assert!(app.last_k_press.is_none(), "second k must clear the arm");
+        assert!(
+            !app.sessions.contains_key(&session_key),
+            "second k must drop the session"
+        );
+    }
+
+    /// Pins that a bare `k` press on a row with no live session is a
+    /// silent no-op (no toast, no state change).
+    #[test]
+    fn k_on_work_item_without_session_does_nothing() {
+        let (mut app, _wi_id) =
+            app_with_work_item(WorkItemStatus::Implementing, Some("f"), Some("/tmp/r"));
+        assert!(app.sessions.is_empty());
+        app.handle_k_press();
+        assert!(
+            app.last_k_press.is_none(),
+            "k on no-session row must not arm"
+        );
+        assert!(
+            app.toasts.is_empty(),
+            "k on no-session row must not push a toast"
+        );
+    }
 }

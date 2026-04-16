@@ -521,6 +521,20 @@ and board views but not inside open dialogs or overlays.
   means the tab switcher can't live on Tab itself. The
   `ClaudeCode -> Terminal` transition is a no-op if the selected work
   item has no worktree.
+- Ctrl+G: toggle the global assistant drawer. The harness is resolved
+  from `config.defaults.global_assistant_harness`. If that field is
+  `None` (never set), the first Ctrl+G press opens a **first-run
+  harness picker modal** instead of opening the drawer: the modal
+  lists the harnesses currently on PATH (via
+  `agent_backend::is_available`, which uses the `which` crate) with
+  their single-letter keybindings. Picking a harness persists the
+  canonical name to `config.toml` via `App::config_provider.save`
+  and opens the drawer immediately. Esc dismisses the modal without
+  mutating config. Subsequent Ctrl+G presses use the persisted value
+  directly. The same field is settable non-interactively via
+  `workbridge config set global-assistant-harness <name>`. See
+  `docs/harness-contract.md` Change Log 2026-04-16 for the rationale
+  and the Codex reference payloads.
 
 ## Focus Model
 
@@ -531,19 +545,55 @@ right panel (PTY session) has focus. This is NOT managed by rat-focus
 because the right panel forwards almost all keys to the PTY, which is
 incompatible with rat-focus's widget navigation model.
 
-- Enter on a work item: focus right panel
+- Enter on a work item: focus the right panel if a session already
+  exists. On a row without a live session, Enter is a no-op with a
+  hint toast "press c / x / o to open this work item with a specific
+  harness" - v1 made session-open an explicit-harness-pick action so
+  the user consciously chooses which LLM CLI runs against their code.
+- c (left panel only, on a work item with no live session): record
+  the user's choice of `claude` for this work item and spawn the
+  session. The choice lives in `App::harness_choice:
+  HashMap<WorkItemId, AgentBackendKind>` - in-memory only, not
+  persisted across TUI restarts. Subsequent spawns for the same item
+  (work-item interactive re-spawn, review gate, rebase gate) read
+  this field to decide which `AgentBackend` to use. A lazy
+  availability check via `agent_backend::is_available` runs before
+  the choice is recorded; a missing binary shows a "command not
+  found" toast and does not overwrite a previous choice.
+- x (left panel only, on a work item with no live session): same as
+  `c` but for `codex` (`AgentBackendKind::Codex`).
+- o (left panel only): dual purpose.
+  - On a **work-item row with no live session**: record OpenCode as
+    the harness. Currently the adapter is a stub, so the availability
+    check usually fails with "opencode: command not found"; even if
+    the binary is on PATH, a kind-level guard surfaces "opencode
+    adapter not yet implemented" rather than spawning.
+  - On **any other selection** (work item with a live session,
+    unlinked PR, or review request): open the PR in the default
+    browser via `open`. Works on work items (first repo association
+    with a PR wins), unlinked PRs, and review requests. Sets a "No
+    PR to open" status message on selections that have no PR. Not
+    bound on the right panel because single keystrokes there forward
+    to the PTY. The `open` subprocess is spawned on a background
+    thread so a stalled launch cannot block the UI event loop (see
+    "Blocking I/O Prohibition" below).
+- k (left panel only, on a work item with a live session): **double-
+  press to end the session**. The first `k` arms a toast hint
+  ("press k again within 1.5s to end session") and sets
+  `App::last_k_press = Some((id, Instant::now()))`. A second `k`
+  press on the same item within the 1.5s window SIGTERMs the session
+  (by dropping the `SessionEntry`, which triggers `Drop for Session`
+  - SIGTERM + 50ms + SIGKILL per the C10 cancellation contract),
+  leaving the work item's stage, plan, and activity log intact. Any
+  other keypress clears the arm (via the `clear_k_press` call at the
+  top of `handle_key`) and the per-tick `prune_k_press` call expires
+  the arm after 1.5s even if the user walks away. `k` on a row with
+  no live session is a silent no-op. After a kill, `c` / `x` / `o`
+  respawns against the same stage.
 - Ctrl+\\: cycle between Claude Code and Terminal tabs (global, does
   not change focus - see "Global Shortcuts" above)
 - Ctrl+]: return to left panel
 - Ctrl+D / Delete: delete selected work item (modal confirmation)
-- o (left panel only): open the selected entry's PR in the default
-  browser via `open`. Works on work items (first repo association with
-  a PR wins), unlinked PRs, and review requests. Sets a "No PR to open"
-  status message on selections that have no PR (group headers, work
-  items with no PR yet). Not bound on the right panel because single
-  keystrokes there forward to the PTY. The `open` subprocess is
-  spawned on a background thread so a stalled launch cannot block the
-  UI event loop (see "Blocking I/O Prohibition" below).
 - m (left panel only): rebase the selected work item's branch onto
   the latest upstream main. Spawns a background thread that runs
   `git fetch origin <main>` and then a headless harness instance

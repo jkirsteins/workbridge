@@ -1052,3 +1052,130 @@ harness adapter is introduced, add a dated bullet here.
   `poll_session_spawns`) handles the `Session::spawn` fork+exec.
   All three spawn sites (work-item, review-gate, global) are now
   fully off the UI thread. Known Spawn Sites table updated.
+- 2026-04-16: Codex adapter + per-work-item harness selection +
+  first-run Ctrl+G modal. `AgentBackendKind::Codex` promoted out
+  of `#[cfg(test)]` and `CodexBackend` is now a real adapter
+  satisfying C1..C13 with these workarounds, all pinned by unit
+  tests in `src/agent_backend.rs::tests::codex_*`:
+  - C1: `codex` (interactive) / `codex exec --json` (headless).
+  - C2: PTY sets cwd (same mechanism as Claude); `--cd` flag is
+    available but not used.
+  - C3: `--full-auto` is the permission-bypass flag; omitted for
+    read-only spawns per parity with Claude's
+    `--dangerously-skip-permissions` convention.
+  - C4: MCP injection via `--config
+    mcp_servers.workbridge.config=<path>`, where `<path>` is the
+    temp JSON file the caller already wrote. No
+    `~/.codex/config.toml` mutation (file-injection rule).
+  - C5: no CLI allowlist; enforced at the MCP server layer
+    (same mechanism as Claude's review gate).
+  - C6: `--config instructions=<prompt>` (Codex has no
+    `--system-prompt`).
+  - C7: auto-start prompt as the last positional argument.
+  - C8: **workaround** - Codex has no `PostToolUse` hook; the
+    Planning reminder is embedded in the system prompt. Strictly
+    weaker than Claude's hook because it cannot re-fire on
+    subsequent turns.
+  - C9 / C10 / C11 / C12: unchanged from the shared
+    infrastructure (PTY / `run_cancellable` / MCP filter /
+    fresh-per-open).
+  - C13: no env vars, no `$HOME` writes.
+  `OpenCodeBackend` added as a stub: `build_command` returns just
+  `["opencode"]`, `build_review_gate_command` /
+  `build_headless_rw_command` return empty argv, and
+  `parse_review_gate_stdout` returns a diagnostic "not yet
+  implemented" verdict. The `o` keybinding and the "opencode"
+  config value are wired end-to-end so the UI and config schema
+  stay forward-compatible, but pressing `o` on a work item
+  surfaces a "not yet implemented" toast.
+  Per-work-item selection: new `App::harness_choice:
+  HashMap<WorkItemId, AgentBackendKind>` stores the user's pick
+  from c (Claude) / x (Codex) / o (OpenCode). Spawn sites
+  (`finish_session_open`, `spawn_review_gate`,
+  `spawn_rebase_gate`) look up the choice via
+  `App::backend_for_work_item`. Review and rebase gates abort
+  with a surfaced error when the choice is missing - "abort
+  rather than default to claude", per the plan. Enter on a
+  work-item row without a prior c/x/o press is now a no-op with
+  a hint toast (breaking keybinding change from the v1 scope).
+  Double-press `k` within 1.5s ends the session (SIGTERM / 50ms
+  / SIGKILL via the shared `Drop for Session` path).
+  Global assistant: `spawn_global_session` resolves its backend
+  from `config.defaults.global_assistant_harness` rather than
+  the App singleton; when the field is unset, Ctrl+G opens a
+  first-run modal (`FirstRunGlobalHarnessModal`) that lists
+  harnesses on PATH and persists the pick to `config.toml` on
+  selection. New CLI: `workbridge config set
+  global-assistant-harness <name>` sets the same field non-
+  interactively via `apply_config_set` (split into a testable
+  core + `ConfigSetOutcome` enum so unit tests can assert
+  branch-taken without shelling out).
+  New dep: `which = "6"` for lazy PATH scans via
+  `agent_backend::is_available`. Known Spawn Sites table
+  unchanged (the three sites still exist at the same call
+  sites; the trait-object used is now per-work-item rather than
+  singleton).
+
+## Reference Payloads (Codex)
+
+These are the per-harness equivalents of RP1 / RP2 / RP2b for
+Codex. They are the argv that `CodexBackend::build_command` /
+`::build_review_gate_command` / `::build_headless_rw_command`
+produce for a typical Planning / review-gate / rebase-gate spawn.
+Pinned by the `codex_*` tests in `src/agent_backend.rs`.
+
+### RP1c - Codex interactive work-item argv
+
+```
+codex
+  --full-auto
+  --config mcp_servers.workbridge.config=/tmp/workbridge-mcp-config-<uuid>.json
+  --config instructions=<stage system prompt>
+  <auto-start user prompt (if any)>
+```
+
+Differences from Claude's RP1:
+- `--full-auto` instead of `--dangerously-skip-permissions`.
+- `--config mcp_servers.workbridge.config=<path>` instead of
+  `--mcp-config <path>`.
+- `--config instructions=<prompt>` instead of `--system-prompt
+  <prompt>`.
+- No `--allowedTools` flag (allowlist enforced at MCP server).
+- No `--settings` flag for the planning hook (C8 workaround:
+  embed reminder in system prompt).
+- Auto-start is the trailing positional; ordering relative to
+  the `--config` flags does NOT matter (unlike Claude where the
+  positional must precede `--mcp-config`).
+
+### RP2c - Codex headless review-gate argv
+
+```
+exec
+  --json
+  --config instructions=<review gate system prompt>
+  --config mcp_servers.workbridge.config=/tmp/workbridge-mcp-config-<uuid>.json
+  <review skill prompt (e.g. /claude-adversarial-review)>
+```
+
+The first positional is `exec` (not `--print`) - Codex's headless
+mode is a separate subcommand. `--json` switches the event stream
+to newline-delimited JSON;
+`CodexBackend::parse_review_gate_stdout` keeps only the last
+`agent_message` event's `content` field and parses it as the
+verdict envelope body.
+
+### RP2bc - Codex headless rebase-gate argv
+
+```
+exec
+  --json
+  --full-auto
+  --ask-for-approval never
+  --config mcp_servers.workbridge.config=/tmp/workbridge-mcp-config-<uuid>.json
+  <rebase instruction prompt>
+```
+
+Adds `--full-auto` (write access) and `--ask-for-approval never`
+(suppress interactive prompts during conflict resolution). The
+latter has no direct Claude equivalent because
+`--dangerously-skip-permissions` already implies it.
