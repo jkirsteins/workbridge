@@ -29,33 +29,38 @@ use crate::work_item::WorkItemStatus;
 /// (dispatch goes through `dyn AgentBackend`); kept so the runtime can
 /// identify which backend is active without downcasting.
 ///
-/// The enum is exhaustive for all harnesses workbridge knows about. Each
-/// variant has a corresponding real `AgentBackend` impl produced by
-/// `backend_for_kind`. The `OpenCode` variant is a "stub" backend whose
-/// methods return empty argv - it compiles and is present in `all()` and
-/// the first-run modal list, but spawning against it is not supported
-/// yet.
+/// The enum lists every harness the codebase knows about, including
+/// future-work stubs. The `OpenCode` variant is internal scaffolding
+/// for a future adapter: it has a zero-sized `OpenCodeBackend` impl
+/// reachable via `backend_for_kind` (so a future wiring change does
+/// not have to reintroduce the enum + struct at the same time), but
+/// there is no user-facing path to select it. It is intentionally
+/// excluded from `all()`, rejected by `FromStr`, and not bound to
+/// any keystroke; see the first-run modal and the `c`/`x` handlers
+/// in `src/event.rs`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AgentBackendKind {
     /// Anthropic Claude Code CLI. Reference implementation.
     ClaudeCode,
     /// OpenAI / Codex CLI. Implemented adapter; see `CodexBackend`.
     Codex,
-    /// OpenCode CLI. Stub adapter: methods return empty/degraded values;
-    /// selecting this kind surfaces a "not yet implemented" toast upstream.
+    /// OpenCode CLI. Future-work stub: `OpenCodeBackend` exists and
+    /// `backend_for_kind` returns it, but the variant is not exposed
+    /// through `all()`, `FromStr`, or any keybinding, so there is no
+    /// user-facing path to produce this value. The scaffolding is kept
+    /// so a future adapter can land without reintroducing both the
+    /// struct and the enum variant in the same change.
     OpenCode,
 }
 
 impl AgentBackendKind {
-    /// All harness kinds workbridge knows about. Stable enumeration used
-    /// by the first-run Ctrl+G modal and by `FromStr` diagnostics when
-    /// the user types an unknown harness name.
-    pub fn all() -> [AgentBackendKind; 3] {
-        [
-            AgentBackendKind::ClaudeCode,
-            AgentBackendKind::Codex,
-            AgentBackendKind::OpenCode,
-        ]
+    /// User-selectable harness kinds. Drives the first-run Ctrl+G
+    /// modal list and any iteration that represents "choices the
+    /// user can make". Deliberately excludes `OpenCode` because that
+    /// variant has no user-facing spawn path; see the type-level
+    /// comment above.
+    pub fn all() -> [AgentBackendKind; 2] {
+        [AgentBackendKind::ClaudeCode, AgentBackendKind::Codex]
     }
 
     /// Lowercase canonical name used in the CLI (`workbridge config
@@ -90,12 +95,16 @@ impl AgentBackendKind {
     }
 
     /// Single-character keybinding used in the first-run modal and the
-    /// work-item keyhints. Must stay in sync with `src/event.rs`.
+    /// work-item keyhints for user-selectable kinds. Must stay in sync
+    /// with `src/event.rs`. The `OpenCode` mapping is nominal - that
+    /// variant is not user-selectable (absent from `all()`) so the
+    /// value is never rendered or read; it is kept only so the match
+    /// remains exhaustive.
     pub fn keybinding(self) -> char {
         match self {
             AgentBackendKind::ClaudeCode => 'c',
             AgentBackendKind::Codex => 'x',
-            AgentBackendKind::OpenCode => 'o',
+            AgentBackendKind::OpenCode => '\0',
         }
     }
 }
@@ -110,10 +119,15 @@ impl FromStr for AgentBackendKind {
     type Err = UnknownHarnessName;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // `OpenCode` is intentionally NOT parsed here. The CLI
+        // (`workbridge config set global-assistant-harness <name>`)
+        // and any other textual surface must reject "opencode" so the
+        // user cannot configure a non-functional harness. See the
+        // type-level comment on `AgentBackendKind` for why the variant
+        // still exists internally.
         match s {
             "claude" => Ok(AgentBackendKind::ClaudeCode),
             "codex" => Ok(AgentBackendKind::Codex),
-            "opencode" => Ok(AgentBackendKind::OpenCode),
             other => Err(UnknownHarnessName {
                 got: other.to_string(),
             }),
@@ -132,7 +146,7 @@ impl std::fmt::Display for UnknownHarnessName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unknown harness name '{}' (expected one of: claude, codex, opencode)",
+            "unknown harness name '{}' (expected one of: claude, codex)",
             self.got
         )
     }
@@ -677,15 +691,16 @@ impl AgentBackend for CodexBackend {
     }
 }
 
-/// Stub adapter for the OpenCode CLI. Not implemented: every method
-/// returns empty argv and a diagnostic verdict. The `o` keybinding and
-/// the "opencode" config value are wired end-to-end so the UI and
-/// config schema are forward-compatible, but pressing `o` on a work
-/// item surfaces a "not yet implemented" toast via the availability
-/// check (`is_available` returns false when the binary is absent, which
-/// is the default state on developer machines) or - if the user
-/// happens to have an unrelated `opencode` binary on PATH - via
-/// `App::open_session_with_harness`'s kind-level check.
+/// Future-work stub adapter for the OpenCode CLI. Not implemented:
+/// every method returns empty argv and a diagnostic verdict. No
+/// user-facing path currently reaches this backend - the `AgentBackendKind::OpenCode`
+/// variant is not exposed through `AgentBackendKind::all()`, not
+/// accepted by `FromStr`, and not bound to any keybinding. The struct
+/// and `backend_for_kind` wiring are retained as scaffolding so a
+/// future real adapter can land without reintroducing both the type
+/// and the dispatch arm at the same time. The tests in this file
+/// pin the stub's "returns nothing functional" contract so accidental
+/// invocation would fail loudly rather than appear to succeed.
 pub struct OpenCodeBackend;
 
 impl AgentBackend for OpenCodeBackend {
@@ -1167,8 +1182,12 @@ mod tests {
 
     // ---- AgentBackendKind helpers ----
 
-    /// Pins `FromStr` for the CLI subcommand: only the three canonical
-    /// names parse; anything else returns `UnknownHarnessName`.
+    /// Pins `FromStr` for the CLI subcommand: only the two user-
+    /// selectable canonical names parse; "opencode" and anything else
+    /// return `UnknownHarnessName`. The "opencode" rejection is load-
+    /// bearing: the `AgentBackendKind::OpenCode` variant exists as
+    /// internal scaffolding but the user must not be able to set it
+    /// via `workbridge config set global-assistant-harness opencode`.
     #[test]
     fn agent_backend_kind_from_str_validates_canonical_names() {
         assert_eq!(
@@ -1179,9 +1198,20 @@ mod tests {
             AgentBackendKind::from_str("codex").unwrap(),
             AgentBackendKind::Codex
         );
-        assert_eq!(
-            AgentBackendKind::from_str("opencode").unwrap(),
-            AgentBackendKind::OpenCode
+        // OpenCode is not user-selectable: from_str MUST reject it.
+        let err = AgentBackendKind::from_str("opencode").unwrap_err();
+        assert_eq!(err.got, "opencode");
+        // Error message lists only user-selectable names. The input
+        // string is quoted back in the message, so we only assert
+        // the "expected one of" list does not advertise opencode.
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expected one of: claude, codex"),
+            "expected error to advertise only user-selectable names, got: {msg}"
+        );
+        assert!(
+            !msg.contains("expected one of: claude, codex, opencode"),
+            "expected one-of list must not include opencode, got: {msg}"
         );
         assert!(AgentBackendKind::from_str("Claude").is_err());
         assert!(AgentBackendKind::from_str("").is_err());
@@ -1189,20 +1219,19 @@ mod tests {
     }
 
     /// Pins the stable enumeration used by the first-run modal.
+    /// `all()` lists user-selectable kinds only; `OpenCode` is excluded
+    /// because it has no user-facing spawn path.
     #[test]
     fn agent_backend_kind_all_is_stable() {
         assert_eq!(
             AgentBackendKind::all(),
-            [
-                AgentBackendKind::ClaudeCode,
-                AgentBackendKind::Codex,
-                AgentBackendKind::OpenCode
-            ]
+            [AgentBackendKind::ClaudeCode, AgentBackendKind::Codex]
         );
     }
 
-    /// Pins the keybinding map used by the work-item c/x/o handlers
-    /// and the first-run modal.
+    /// Pins the keybinding map used by the work-item c/x handlers
+    /// and the first-run modal. Only user-selectable kinds are listed
+    /// by `all()`, so this test covers `c` and `x` only.
     #[test]
     fn agent_backend_kind_keybindings_are_unique() {
         use std::collections::HashSet;
@@ -1210,20 +1239,25 @@ mod tests {
             .iter()
             .map(|k| k.keybinding())
             .collect();
-        assert_eq!(keys.len(), 3, "each kind must map to a unique keybinding");
+        assert_eq!(keys.len(), 2, "each kind must map to a unique keybinding");
         assert!(keys.contains(&'c'));
         assert!(keys.contains(&'x'));
-        assert!(keys.contains(&'o'));
     }
 
     /// Pins `backend_for_kind`: the factory returns a backend whose
-    /// `kind()` matches the argument.
+    /// `kind()` matches the argument, including for the internal-only
+    /// `OpenCode` variant so the dispatch arm does not rot.
     #[test]
     fn backend_for_kind_roundtrips() {
         for kind in AgentBackendKind::all() {
             let backend = backend_for_kind(kind);
             assert_eq!(backend.kind(), kind);
         }
+        // OpenCode is not in `all()` but the factory must still
+        // produce a backend for it so a future wiring change does not
+        // have to reintroduce the arm.
+        let opencode = backend_for_kind(AgentBackendKind::OpenCode);
+        assert_eq!(opencode.kind(), AgentBackendKind::OpenCode);
     }
 
     /// Pins that `is_available` returns false for a clearly bogus

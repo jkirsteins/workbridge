@@ -40,7 +40,7 @@ Out of scope:
 ## Glossary
 
 - **Harness**: the external LLM coding CLI that workbridge spawns
-  (today: `claude`; future candidates: `codex`, `opencode`).
+  (today: `claude`, `codex`; future candidate: `opencode`).
 - **Harness session**: one spawned child process running the harness
   against a single work item + stage. Session identity is owned by
   workbridge, not the harness (see C12).
@@ -1080,23 +1080,28 @@ harness adapter is introduced, add a dated bullet here.
     infrastructure (PTY / `run_cancellable` / MCP filter /
     fresh-per-open).
   - C13: no env vars, no `$HOME` writes.
-  `OpenCodeBackend` added as a stub: `build_command` returns just
-  `["opencode"]`, `build_review_gate_command` /
-  `build_headless_rw_command` return empty argv, and
-  `parse_review_gate_stdout` returns a diagnostic "not yet
-  implemented" verdict. The `o` keybinding and the "opencode"
-  config value are wired end-to-end so the UI and config schema
-  stay forward-compatible, but pressing `o` on a work item
-  surfaces a "not yet implemented" toast.
+  `OpenCodeBackend` added as future-work scaffolding only:
+  `build_command` returns just `["opencode"]`,
+  `build_review_gate_command` / `build_headless_rw_command` return
+  empty argv, and `parse_review_gate_stdout` returns a diagnostic
+  "not yet implemented" verdict. The backend is NOT user-
+  selectable: `AgentBackendKind::OpenCode` is excluded from
+  `AgentBackendKind::all()`, rejected by `AgentBackendKind::from_str`
+  so `workbridge config set global-assistant-harness opencode`
+  fails, and is not bound to any keystroke. The enum variant and
+  the `backend_for_kind` arm are kept so a future real adapter can
+  land without reintroducing the type at the same time. The `o`
+  keybinding is reserved for "open PR in browser" (its pre-
+  existing meaning); there is no harness picker on `o`.
   Per-work-item selection: new `App::harness_choice:
   HashMap<WorkItemId, AgentBackendKind>` stores the user's pick
-  from c (Claude) / x (Codex) / o (OpenCode). Spawn sites
+  from c (Claude) / x (Codex). Spawn sites
   (`finish_session_open`, `spawn_review_gate`,
   `spawn_rebase_gate`) look up the choice via
   `App::backend_for_work_item`. Review and rebase gates abort
   with a surfaced error when the choice is missing - "abort
   rather than default to claude", per the plan. Enter on a
-  work-item row without a prior c/x/o press is now a no-op with
+  work-item row without a prior c/x press is now a no-op with
   a hint toast (breaking keybinding change from the v1 scope).
   Double-press `k` within 1.5s ends the session (SIGTERM / 50ms
   / SIGKILL via the shared `Drop for Session` path).

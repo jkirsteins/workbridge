@@ -547,7 +547,7 @@ incompatible with rat-focus's widget navigation model.
 
 - Enter on a work item: focus the right panel if a session already
   exists. On a row without a live session, Enter is a no-op with a
-  hint toast "press c / x / o to open this work item with a specific
+  hint toast "press c / x to open this work item with a specific
   harness" - v1 made session-open an explicit-harness-pick action so
   the user consciously chooses which LLM CLI runs against their code.
 - c (left panel only, on a work item with no live session): record
@@ -562,21 +562,17 @@ incompatible with rat-focus's widget navigation model.
   found" toast and does not overwrite a previous choice.
 - x (left panel only, on a work item with no live session): same as
   `c` but for `codex` (`AgentBackendKind::Codex`).
-- o (left panel only): dual purpose.
-  - On a **work-item row with no live session**: record OpenCode as
-    the harness. Currently the adapter is a stub, so the availability
-    check usually fails with "opencode: command not found"; even if
-    the binary is on PATH, a kind-level guard surfaces "opencode
-    adapter not yet implemented" rather than spawning.
-  - On **any other selection** (work item with a live session,
-    unlinked PR, or review request): open the PR in the default
-    browser via `open`. Works on work items (first repo association
-    with a PR wins), unlinked PRs, and review requests. Sets a "No
-    PR to open" status message on selections that have no PR. Not
-    bound on the right panel because single keystrokes there forward
-    to the PTY. The `open` subprocess is spawned on a background
-    thread so a stalled launch cannot block the UI event loop (see
-    "Blocking I/O Prohibition" below).
+- o (left panel only): open the selected row's PR in the default
+  browser via `open`. Works on work items (first repo association
+  with a PR wins), unlinked PRs, and review requests. Sets a "No
+  PR to open" status message on selections that have no PR. Not
+  bound on the right panel because single keystrokes there forward
+  to the PTY. The `open` subprocess is spawned on a background
+  thread so a stalled launch cannot block the UI event loop (see
+  "Blocking I/O Prohibition" below). `o` is never a harness picker:
+  the `AgentBackendKind::OpenCode` variant is internal scaffolding
+  for a future adapter and is deliberately not reachable from any
+  keystroke or CLI value.
 - k (left panel only, on a work item with a live session): **double-
   press to end the session**. The first `k` arms a toast hint
   ("press k again within 1.5s to end session") and sets
@@ -588,7 +584,7 @@ incompatible with rat-focus's widget navigation model.
   other keypress clears the arm (via the `clear_k_press` call at the
   top of `handle_key`) and the per-tick `prune_k_press` call expires
   the arm after 1.5s even if the user walks away. `k` on a row with
-  no live session is a silent no-op. After a kill, `c` / `x` / `o`
+  no live session is a silent no-op. After a kill, `c` / `x`
   respawns against the same stage.
 - Ctrl+\\: cycle between Claude Code and Terminal tabs (global, does
   not change focus - see "Global Shortcuts" above)

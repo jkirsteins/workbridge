@@ -81,7 +81,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // When the first-run global-harness modal is visible, intercept
-    // keys before the usual dispatch so c/x/o/esc route to the modal
+    // keys before the usual dispatch so c/x/esc route to the modal
     // and do not trigger work-item or drawer handlers below. This must
     // come before `global_drawer_open` because the modal is shown as
     // a precondition to the drawer opening for the first time.
@@ -954,30 +954,16 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                 sync_layout(app);
             }
         }
-        // o - dual purpose:
-        //   (1) On a work-item row with no live session: open the
-        //       session using the `opencode` harness (currently a
-        //       stub, so this surfaces a "not yet implemented" toast).
-        //   (2) Otherwise (work item with a live session, unlinked
-        //       PR, or review request): open the PR in the default
-        //       browser, preserving the pre-existing behaviour.
-        // Not added to `handle_key_right` because single keystrokes
-        // in the right panel are forwarded to the PTY session and
-        // hijacking `o` there would break typing into the agent.
+        // o - open the selected row's PR in the default browser. Works
+        // on work items (first repo association with a PR wins),
+        // unlinked PRs, and review requests. Sets a "No PR to open"
+        // status message on selections that have no PR. Not bound on
+        // the right panel because single keystrokes there forward to
+        // the PTY, and hijacking `o` there would break typing into
+        // the agent.
         (KeyModifiers::NONE, KeyCode::Char('o')) => {
             let had_status = app.has_visible_status_bar();
-            let work_item_without_session = match app.selected_work_item_id() {
-                Some(id) => match app.session_key_for(&id) {
-                    Some(k) => !app.sessions.get(&k).is_some_and(|e| e.alive),
-                    None => true,
-                },
-                None => false,
-            };
-            if work_item_without_session {
-                app.open_session_with_harness(crate::agent_backend::AgentBackendKind::OpenCode);
-            } else {
-                app.open_selected_pr_in_browser();
-            }
+            app.open_selected_pr_in_browser();
             if app.has_visible_status_bar() != had_status {
                 sync_layout(app);
             }

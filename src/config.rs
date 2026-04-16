@@ -152,12 +152,14 @@ pub struct Defaults {
     /// Set to 0 to disable auto-archival (items stay forever).
     #[serde(default = "default_archive_after_days")]
     pub archive_after_days: u64,
-    /// Canonical name (`"claude"` / `"codex"` / `"opencode"`) of the
-    /// harness the Ctrl+G global assistant should spawn. `None` means
-    /// "not yet chosen": the first Ctrl+G press opens a modal that
-    /// lists the harnesses on PATH and persists the pick here.
-    /// Settable non-interactively via `workbridge config set
-    /// global-assistant-harness <name>`.
+    /// Canonical name (`"claude"` / `"codex"`) of the harness the
+    /// Ctrl+G global assistant should spawn. `None` means "not yet
+    /// chosen": the first Ctrl+G press opens a modal that lists the
+    /// harnesses on PATH and persists the pick here. Settable non-
+    /// interactively via `workbridge config set global-assistant-
+    /// harness <name>`. "opencode" is not a valid value: the stub
+    /// adapter for OpenCode exists only as internal scaffolding and
+    /// is not user-selectable (rejected by `AgentBackendKind::from_str`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_assistant_harness: Option<String>,
 }

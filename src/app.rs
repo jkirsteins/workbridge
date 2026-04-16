@@ -49,9 +49,11 @@ pub struct Toast {
 #[derive(Clone, Debug)]
 pub struct FirstRunGlobalHarnessModal {
     /// Harnesses currently on `PATH`, in canonical order
-    /// (`ClaudeCode`, `Codex`, `OpenCode`). Empty is never stored:
-    /// the opener shows a toast and returns without populating the
-    /// modal when the list would be empty.
+    /// (`ClaudeCode`, `Codex`). Only user-selectable kinds are
+    /// considered: `AgentBackendKind::OpenCode` is not surfaced here
+    /// because its adapter is a future-work stub. Empty is never
+    /// stored: the opener shows a toast and returns without populating
+    /// the modal when the list would be empty.
     pub available_harnesses: Vec<AgentBackendKind>,
 }
 
@@ -5177,13 +5179,11 @@ impl App {
 
         // Breaking change from the v1 plan (Milestone 3): Enter on a
         // work-item row with no live session is now a no-op unless a
-        // harness has been picked (via `c` / `x` / `o`). The hint
-        // teaches the new keybinding without taking a silent-default
-        // action the user did not request.
+        // harness has been picked (via `c` / `x`). The hint teaches
+        // the new keybinding without taking a silent-default action
+        // the user did not request.
         if !self.harness_choice.contains_key(&work_item_id) {
-            self.push_toast(
-                "press c / x / o to open this work item with a specific harness".into(),
-            );
+            self.push_toast("press c / x to open this work item with a specific harness".into());
             return;
         }
 
@@ -5435,7 +5435,7 @@ impl App {
         // worker. `harness_choice` must have an entry at this point
         // because `open_session_for_selected` refuses to call
         // `spawn_session` without one; keep a defensive fallback to
-        // `self.agent_backend` for the hypothetical non-c/x/o entry
+        // `self.agent_backend` for the hypothetical non-c/x entry
         // points (e.g. tests or future automation paths) so we never
         // silently crash in the worker.
         let agent_backend = self
@@ -5875,7 +5875,7 @@ impl App {
         let has_gate_findings = self.review_gate_findings.contains_key(work_item_id);
         let system_prompt = self.stage_system_prompt(work_item_id, cwd, plan_text);
 
-        // Use the per-work-item harness choice (recorded by c/x/o)
+        // Use the per-work-item harness choice (recorded by c/x)
         // when present, falling back to the App-level default for the
         // rare call sites that bypass `open_session_with_harness`.
         let wi_backend = self
@@ -6063,22 +6063,15 @@ impl App {
     }
 
     /// Record the user's per-work-item harness choice and open the
-    /// session using it. Called from the `c` / `x` / `o` keybindings.
+    /// session using it. Called from the `c` / `x` keybindings (the
+    /// `o` key is reserved for "open PR in browser" and does not
+    /// route here).
     /// Performs a lazy availability check first (via
     /// `agent_backend::is_available`); missing-binary shows a toast
     /// and does not overwrite an existing choice. If a live session
     /// already exists for this item, shows a "press kk to end first"
     /// toast and returns - the user must terminate before respawning.
     pub fn open_session_with_harness(&mut self, kind: AgentBackendKind) {
-        // Kind-level "implemented?" guard. OpenCode has no spawn
-        // implementation yet; press-through shows a diagnostic rather
-        // than pushing an unusable session onto the user.
-        if kind == AgentBackendKind::OpenCode {
-            self.push_toast(
-                "opencode: adapter not yet implemented - only the keybinding is wired".into(),
-            );
-            return;
-        }
         // PATH availability check before recording the choice. A failed
         // press must NOT silently clobber a valid previous selection.
         if !agent_backend::is_available(kind) {
@@ -6143,7 +6136,7 @@ impl App {
                 self.sessions.remove(&key);
             }
             // Note: harness_choice is NOT cleared here. A subsequent
-            // c/x/o overwrites it, and keeping the last choice around
+            // c/x overwrites it, and keeping the last choice around
             // is harmless. See the Milestone 3 acceptance-criteria
             // notes.
             self.last_k_press = None;
@@ -6194,12 +6187,7 @@ impl App {
 
         let available: Vec<AgentBackendKind> = AgentBackendKind::all()
             .into_iter()
-            .filter(|k| {
-                // OpenCode is wired as a stub only; do not offer it as
-                // the global-assistant pick because selecting it would
-                // produce a non-functional drawer session.
-                *k != AgentBackendKind::OpenCode && agent_backend::is_available(*k)
-            })
+            .filter(|k| agent_backend::is_available(*k))
             .collect();
 
         if available.is_empty() {
@@ -9997,7 +9985,7 @@ impl App {
         // activity or background work. The plan's Milestone 3
         // acceptance-criteria rule is "abort rather than default to
         // claude" - review gates only run after an interactive session
-        // has existed (the c/x/o entry point records the choice), so a
+        // has existed (the c/x entry point records the choice), so a
         // missing `harness_choice` entry is a user-facing error, not a
         // silent default. See `docs/harness-contract.md` Change Log
         // 2026-04-16 and the
