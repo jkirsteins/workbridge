@@ -6424,125 +6424,6 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// Start an MCP socket server for a work item session.
-    /// MCP config is passed to Claude via --mcp-config CLI flag, not written
-    /// to disk. Returns (server, unused_path) on success, or an error message
-    /// on failure.
-    fn start_mcp_for_session(
-        &self,
-        worktree_path: &std::path::Path,
-        work_item_id: &WorkItemId,
-    ) -> Result<(McpSocketServer, PathBuf), String> {
-        let socket_path = crate::mcp::socket_path_for_session();
-
-        // Serialize the work item ID for the MCP server.
-        let wi_id_str = serde_json::to_string(work_item_id)
-            .map_err(|e| format!("MCP unavailable: could not serialize work item ID: {e}"))?;
-
-        // Build context JSON for get_context tool.
-        // Uses the worktree path (not the main repo) so Claude operates in
-        // the correct working directory.
-        let context_json = {
-            let wi = self.work_items.iter().find(|w| w.id == *work_item_id);
-            if let Some(wi) = wi {
-                let pr_url = wi
-                    .repo_associations
-                    .first()
-                    .and_then(|a| a.pr.as_ref())
-                    .map(|pr| pr.url.as_str())
-                    .unwrap_or("");
-                serde_json::json!({
-                    "work_item_id": wi_id_str,
-                    "stage": format!("{:?}", wi.status),
-                    "title": wi.title,
-                    "description": wi.description,
-                    "repo": worktree_path.display().to_string(),
-                    "pr_url": pr_url,
-                })
-                .to_string()
-            } else {
-                "{}".to_string()
-            }
-        };
-
-        // Compute the activity log path for the query_log MCP tool.
-        let activity_log_path = self.backend.activity_path_for(work_item_id);
-
-        // Determine work item kind for conditional MCP tool exposure.
-        let wi_kind = self
-            .work_items
-            .iter()
-            .find(|w| w.id == *work_item_id)
-            .map(|w| format!("{:?}", w.kind))
-            .unwrap_or_default();
-
-        // Start the socket server.
-        let server = McpSocketServer::start(
-            socket_path,
-            wi_id_str,
-            wi_kind,
-            context_json,
-            activity_log_path,
-            self.mcp_tx.clone(),
-            false, // read_only: interactive sessions need full tool access
-        )
-        .map_err(|e| format!("MCP unavailable: failed to start socket server: {e}"))?;
-
-        Ok((server, PathBuf::new()))
-    }
-
-    /// Classify a worktree's local state for the unclean-worktree
-    /// indicator and the Review -> Done merge guard. Pure cache lookup
-    /// from `self.repo_data[repo_path].worktrees` - must NOT shell out
-    /// on the UI thread. See `docs/UI.md` "Blocking I/O Prohibition".
-    ///
-    /// Priority order when multiple conditions are present:
-    ///   Dirty > Untracked > Unpushed > BehindOnly > Clean
-    ///
-    /// Dirty is highest because a user with both uncommitted changes
-    /// and untracked files almost always means "I haven't committed
-    /// yet" - the tracked-change wording is the more actionable
-    /// message. BehindOnly is lowest because it is the only variant
-    /// that does not block merging.
-    ///
-    /// Missing cache (first fetch in flight, repo never fetched, no
-    /// matching worktree, missing branch) collapses to `Clean`: the
-    /// safe default that allows the merge flow to proceed. Once the
-    /// fetcher populates real state, subsequent calls return the
-    /// correct classification.
-    pub fn worktree_cleanliness(
-        &self,
-        repo_path: &std::path::Path,
-        branch: &str,
-    ) -> WorktreeCleanliness {
-        let Some(wt) = self
-            .repo_data
-            .get(repo_path)
-            .and_then(|rd| rd.worktrees.as_ref().ok())
-            .and_then(|wts| wts.iter().find(|wt| wt.branch.as_deref() == Some(branch)))
-        else {
-            return WorktreeCleanliness::Clean;
-        };
-
-        if wt.dirty.unwrap_or(false) {
-            return WorktreeCleanliness::Dirty;
-        }
-        if wt.untracked.unwrap_or(false) {
-            return WorktreeCleanliness::Untracked;
-        }
-        if let Some(ahead) = wt.unpushed
-            && ahead > 0
-        {
-            return WorktreeCleanliness::Unpushed(ahead);
-        }
-        if let Some(behind) = wt.behind_remote
-            && behind > 0
-        {
-            return WorktreeCleanliness::BehindOnly(behind);
-        }
-        WorktreeCleanliness::Clean
-    }
-
     /// Drain MCP events from the crossbeam channel.
     /// Called on the 200ms timer tick. Processes status updates, log events,
     /// and plan updates from all active MCP socket servers.
@@ -20995,7 +20876,14 @@ mod tests {
         // message (from either the MCP config temp-write or the
         // downstream `Session::spawn` outcome) is irrelevant to the
         // sentinel assertion below.
-        app.finish_session_open(&result.wi_id, &result.cwd, result.plan_text);
+        app.finish_session_open(
+            &result.wi_id,
+            &result.cwd,
+            result.plan_text,
+            None,
+            Vec::new(),
+            None,
+        );
 
         // Force-tear-down any session `finish_session_open` inserted.
         // On a host with `claude` on `$PATH`, `Session::spawn` has
@@ -22387,6 +22275,7 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
+                agent_written_files: Vec::new(),
             },
         );
         app.start_rebase_on_main();
@@ -22414,6 +22303,7 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
+                agent_written_files: Vec::new(),
             },
         );
         app.start_rebase_on_main();
@@ -22442,6 +22332,7 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
+                agent_written_files: Vec::new(),
             },
         );
         // Insert a dead terminal session.
@@ -22453,6 +22344,7 @@ mod tests {
                 session: None,
                 scrollback_offset: 0,
                 selection: None,
+                agent_written_files: Vec::new(),
             },
         );
         app.start_rebase_on_main();
