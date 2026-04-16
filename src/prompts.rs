@@ -314,6 +314,41 @@ mod tests {
     }
 
     #[test]
+    fn all_interactive_prompts_have_interaction_policy() {
+        let prompts: HashMap<String, PromptEntry> = serde_json::from_str(PROMPTS_JSON).unwrap();
+        let sentinel = "INTERACTION POLICY";
+        let interactive = [
+            "planning_quickstart",
+            "planning",
+            "planning_retroactive",
+            "implementing_with_plan",
+            "implementing_no_plan",
+            "implementing_rework",
+            "blocked",
+            "review",
+            "review_with_findings",
+            "global_assistant",
+        ];
+        for key in interactive {
+            let entry = prompts
+                .get(key)
+                .unwrap_or_else(|| panic!("missing prompt key: {key}"));
+            assert!(
+                entry.template.contains(sentinel),
+                "prompt '{key}' is missing the INTERACTION POLICY block"
+            );
+        }
+        // review_gate is headless; the policy would be misleading there.
+        let gate = prompts
+            .get("review_gate")
+            .expect("review_gate prompt must exist");
+        assert!(
+            !gate.template.contains(sentinel),
+            "review_gate must NOT reference INTERACTION POLICY (it is headless)"
+        );
+    }
+
+    #[test]
     fn description_with_template_markers_not_expanded() {
         // User-supplied description containing {plan} must not cause plan variable injection
         let mut vars = HashMap::new();
