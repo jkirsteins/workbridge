@@ -6071,17 +6071,23 @@ impl App {
             return;
         }
         // Reject a rebase while the work item has a live interactive
-        // session. The rebase gate spawns a second headless Claude in
-        // the same worktree; if the interactive session is concurrently
-        // editing files or running git commands, the two processes will
-        // race on the index and working tree, producing
-        // nondeterministic rebase results or index-lock errors. Pure
-        // in-memory check (no I/O): reads session_key_for + the
-        // SessionEntry.alive flag populated by check_liveness.
-        if let Some(key) = self.session_key_for(&target.wi_id)
-            && let Some(entry) = self.sessions.get(&key)
-            && entry.alive
-        {
+        // session OR a live terminal tab. The rebase gate spawns a
+        // headless Claude in the same worktree; if the interactive
+        // session or the user's shell is concurrently editing files or
+        // running git commands, the two processes will race on the
+        // index and working tree, producing nondeterministic rebase
+        // results or index-lock errors. Pure in-memory check (no I/O):
+        // reads session_key_for + the SessionEntry.alive flag populated
+        // by check_liveness, and terminal_sessions for the Terminal tab.
+        let has_live_session = self
+            .session_key_for(&target.wi_id)
+            .and_then(|key| self.sessions.get(&key))
+            .is_some_and(|entry| entry.alive);
+        let has_live_terminal = self
+            .terminal_sessions
+            .get(&target.wi_id)
+            .is_some_and(|entry| entry.alive);
+        if has_live_session || has_live_terminal {
             self.status_message =
                 Some("Cannot rebase while a session is active for this item".into());
             return;
@@ -9104,12 +9110,39 @@ impl App {
                 let _ = tx.send(RebaseGateMessage::Progress(format!(
                     "Fetching origin/{base_branch}..."
                 )));
-                match crate::worktree_service::git_command()
+                // The fetch is spawned via `spawn()` +
+                // `wait_with_output()` in its own process group so
+                // `Drop for RebaseGateState` can killpg it if the
+                // gate is torn down while the fetch is blocked on the
+                // network. Without this, the fetch subprocess would
+                // survive cancellation and hold git locks against the
+                // worktree while `spawn_delete_cleanup` tries to run
+                // `git worktree remove`. The fetch PID is stashed in
+                // the same `child_pid` slot the harness sub-thread
+                // uses later; the slot is cleared after the fetch
+                // completes so the harness sub-thread starts with a
+                // clean None and stashes its own PID on top.
+                let fetch_result = match crate::worktree_service::git_command()
                     .arg("-C")
                     .arg(&worktree_path)
                     .args(["fetch", "origin", &refspec])
-                    .output()
+                    .process_group(0)
+                    .spawn()
                 {
+                    Ok(fetch_child) => {
+                        let fetch_pid = fetch_child.id();
+                        if let Ok(mut slot) = child_pid.lock() {
+                            *slot = Some(fetch_pid);
+                        }
+                        let result = fetch_child.wait_with_output();
+                        if let Ok(mut slot) = child_pid.lock() {
+                            *slot = None;
+                        }
+                        result
+                    }
+                    Err(e) => Err(e),
+                };
+                match fetch_result {
                     Ok(out) if out.status.success() => {}
                     Ok(out) => {
                         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -20406,6 +20439,137 @@ mod tests {
         app.selected_item = Some(0);
         app.start_rebase_on_main();
         assert_eq!(app.status_message.as_deref(), Some("No branch to rebase"));
+    }
+
+    /// Helper: insert a work item with a worktree+branch into `app` and
+    /// select it, returning the `WorkItemId`. For use by tests that need
+    /// a rebase-eligible item without actually spawning a gate.
+    fn setup_rebase_eligible_work_item(app: &mut App) -> WorkItemId {
+        use crate::work_item::RepoAssociation;
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/session-guard.json"));
+        app.work_items.push(WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            display_id: None,
+            title: "session guard test".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/repo"),
+                branch: Some("feat/x".into()),
+                worktree_path: Some(PathBuf::from("/repo/.worktrees/feat-x")),
+                pr: None,
+                issue: None,
+                git_state: None,
+            }],
+            errors: vec![],
+        });
+        app.display_list
+            .push(DisplayEntry::WorkItemEntry(app.work_items.len() - 1));
+        app.selected_item = Some(app.display_list.len() - 1);
+        wi_id
+    }
+
+    #[test]
+    fn start_rebase_blocked_while_claude_session_alive() {
+        // Pressing `m` while the work item has a live Claude session
+        // must be rejected: the rebase gate spawns a headless Claude
+        // in the same worktree, and two processes racing on the
+        // index and working tree produce nondeterministic results.
+        let mut app = App::new();
+        let wi_id = setup_rebase_eligible_work_item(&mut app);
+        // Insert a live session for this work item.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let key = (wi_id.clone(), WorkItemStatus::Implementing);
+        app.sessions.insert(
+            key,
+            SessionEntry {
+                parser,
+                alive: true,
+                session: None,
+                scrollback_offset: 0,
+                selection: None,
+            },
+        );
+        app.start_rebase_on_main();
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Cannot rebase while a session is active for this item"),
+            "rebase must be blocked while a Claude session is alive",
+        );
+    }
+
+    #[test]
+    fn start_rebase_blocked_while_terminal_session_alive() {
+        // Same guard but for the Terminal tab: a user's shell in the
+        // same worktree can race with `git rebase` the same way an
+        // interactive Claude session can.
+        let mut app = App::new();
+        let wi_id = setup_rebase_eligible_work_item(&mut app);
+        // Insert a live terminal session for this work item.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        app.terminal_sessions.insert(
+            wi_id.clone(),
+            SessionEntry {
+                parser,
+                alive: true,
+                session: None,
+                scrollback_offset: 0,
+                selection: None,
+            },
+        );
+        app.start_rebase_on_main();
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Cannot rebase while a session is active for this item"),
+            "rebase must be blocked while a terminal session is alive",
+        );
+    }
+
+    #[test]
+    fn start_rebase_allowed_with_dead_sessions() {
+        // A dead session (alive=false) should NOT block the rebase.
+        // This ensures the guard doesn't over-block after a session
+        // has exited but before the entry is removed from the map.
+        let mut app = App::new();
+        let wi_id = setup_rebase_eligible_work_item(&mut app);
+        // Insert a dead Claude session.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let key = (wi_id.clone(), WorkItemStatus::Implementing);
+        app.sessions.insert(
+            key,
+            SessionEntry {
+                parser: Arc::clone(&parser),
+                alive: false,
+                session: None,
+                scrollback_offset: 0,
+                selection: None,
+            },
+        );
+        // Insert a dead terminal session.
+        app.terminal_sessions.insert(
+            wi_id.clone(),
+            SessionEntry {
+                parser,
+                alive: false,
+                session: None,
+                scrollback_offset: 0,
+                selection: None,
+            },
+        );
+        app.start_rebase_on_main();
+        // The rebase will proceed to spawn_rebase_gate which will
+        // try to acquire the user-action slot and fail (no real
+        // infrastructure), but the point is that it was NOT blocked
+        // by the dead session guard. The status message should NOT
+        // be the "Cannot rebase while a session is active" message.
+        assert_ne!(
+            app.status_message.as_deref(),
+            Some("Cannot rebase while a session is active for this item"),
+            "dead sessions must NOT block the rebase",
+        );
     }
 
     // -----------------------------------------------------------------------
