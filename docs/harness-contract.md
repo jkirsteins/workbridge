@@ -844,14 +844,15 @@ These are the only places in `src/` that launch an LLM harness child
 process today. Any new spawn site MUST update this table **and**
 update the Implementation Map section above.
 
-| File          | Line  | Mode        | Scope      | Thread     | Cwd                                       |
-|---------------|-------|-------------|------------|------------|-------------------------------------------|
-| `src/app.rs`  | 4671  | Interactive | WorkItem   | Background | Work-item worktree                        |
-| `src/app.rs`  | 8579  | Headless    | ReviewGate | Background | inherited                                 |
-| `src/app.rs`  | 9245  | Interactive | Global     | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
+| File          | Line   | Mode        | Scope       | Thread     | Cwd                                       |
+|---------------|--------|-------------|-------------|------------|-------------------------------------------|
+| `src/app.rs`  | 5792   | Interactive | WorkItem    | Background | Work-item worktree                        |
+| `src/app.rs`  | 9990   | Headless RO | ReviewGate  | Background | inherited                                 |
+| `src/app.rs`  | 10397  | Headless RW | RebaseGate  | Background | Work-item worktree                        |
+| `src/app.rs`  | 11608  | Interactive | Global      | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
 
 The "Thread" column records which thread actually calls
-`Session::spawn` / `std::process::Command::output()`. All three
+`Session::spawn` / `std::process::Command::output()`. All four
 sites are fully off the UI thread. Every blocking operation on
 every spawn path - the backend's `write_session_files` call, the
 `--mcp-config` tempfile, the global assistant's scratch

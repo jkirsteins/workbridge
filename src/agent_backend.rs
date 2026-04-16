@@ -172,6 +172,14 @@ pub trait AgentBackend: Send + Sync {
     /// `std::process::Command::new(...).args(...)`.
     fn build_review_gate_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String>;
 
+    /// Build the argv for a headless read-write spawn (rebase gate).
+    /// Similar to `build_review_gate_command` but the session needs
+    /// write access (file edits, git operations) so the backend MUST
+    /// include its permission-bypass flag (Claude: `--dangerously-skip-
+    /// permissions`; Codex: `--full-auto`). The returned vec goes
+    /// directly into `std::process::Command::new(...).args(...)`.
+    fn build_headless_rw_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String>;
+
     /// Parse the verdict envelope produced by a headless review-gate
     /// session. Backends that emit a single JSON document (Claude's
     /// `--output-format json`) reach into the envelope's structured body
@@ -313,6 +321,24 @@ impl AgentBackend for ClaudeCodeBackend {
         ]
     }
 
+    fn build_headless_rw_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
+        // Headless read-write: same shape as the review gate but with
+        // --dangerously-skip-permissions so the session can write files
+        // and run git commands (e.g. conflict resolution during rebase).
+        vec![
+            "--print".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "-p".to_string(),
+            cfg.initial_prompt.to_string(),
+            "--output-format".to_string(),
+            "json".to_string(),
+            "--json-schema".to_string(),
+            cfg.json_schema.to_string(),
+            "--mcp-config".to_string(),
+            cfg.mcp_config_path.to_string_lossy().into_owned(),
+        ]
+    }
+
     fn parse_review_gate_stdout(&self, stdout: &str) -> ReviewGateVerdict {
         // Claude Code's `--output-format json` wraps the schema-validated
         // body in a `structured_output` field. Missing fields degrade to
@@ -440,6 +466,23 @@ mod tests {
             ]
         }
 
+        fn build_headless_rw_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
+            // Same shape as review gate but with --full-auto for write
+            // access. A real adapter would also pass --ask-for-approval
+            // never to suppress interactive prompts during rebase.
+            vec![
+                "exec".to_string(),
+                "--json".to_string(),
+                "--full-auto".to_string(),
+                "--config".to_string(),
+                format!(
+                    "mcp_servers.workbridge.config={}",
+                    cfg.mcp_config_path.display()
+                ),
+                cfg.initial_prompt.to_string(),
+            ]
+        }
+
         fn parse_review_gate_stdout(&self, stdout: &str) -> ReviewGateVerdict {
             // A real adapter would parse the event stream. For shape
             // verification we accept a plain JSON object with `approved`
@@ -503,6 +546,20 @@ mod tests {
         let rg_argv = backend.build_review_gate_command(&rg_cfg);
         assert_eq!(rg_argv.first().map(String::as_str), Some("exec"));
         assert!(rg_argv.iter().any(|s| s == "--json"));
+
+        // Headless read-write (rebase gate) shape.
+        let rw_cfg = ReviewGateSpawnConfig {
+            system_prompt: "rebase gate prompt",
+            initial_prompt: "rebase onto main",
+            json_schema: r#"{"type":"object"}"#,
+            mcp_config_path: &mcp_path,
+        };
+        let rw_argv = backend.build_headless_rw_command(&rw_cfg);
+        assert_eq!(rw_argv.first().map(String::as_str), Some("exec"));
+        assert!(
+            rw_argv.iter().any(|s| s == "--full-auto"),
+            "headless rw must include Codex's write-access flag"
+        );
 
         // C4: Codex writes no session files by default in the stub.
         let cwd = std::env::temp_dir();
@@ -629,6 +686,26 @@ mod tests {
         // --allowedTools (C3 and C5 per RP2).
         assert!(!argv.iter().any(|s| s == "--dangerously-skip-permissions"));
         assert!(!argv.iter().any(|s| s == "--allowedTools"));
+    }
+
+    #[test]
+    fn claude_headless_rw_argv_includes_permission_bypass() {
+        let backend = ClaudeCodeBackend;
+        let mcp_path = PathBuf::from("/tmp/workbridge-mcp-config-abc.json");
+        let cfg = ReviewGateSpawnConfig {
+            system_prompt: "",
+            initial_prompt: "rebase onto origin/main",
+            json_schema: r#"{"type":"object"}"#,
+            mcp_config_path: &mcp_path,
+        };
+        let argv = backend.build_headless_rw_command(&cfg);
+        assert!(
+            argv.iter().any(|s| s == "--dangerously-skip-permissions"),
+            "headless rw must include --dangerously-skip-permissions"
+        );
+        assert!(argv.iter().any(|s| s == "--print"));
+        assert!(argv.iter().any(|s| s == "--mcp-config"));
+        assert!(argv.iter().any(|s| s == "--json-schema"));
     }
 
     #[test]

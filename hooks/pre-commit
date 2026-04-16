@@ -25,3 +25,28 @@ if [ -n "$bare_git_files" ]; then
     exit 1
 fi
 echo "Git env check OK."
+
+echo "=== pre-commit: checking for bare agent binary spawns ==="
+# Every LLM CLI spawn must go through the AgentBackend trait in
+# src/agent_backend.rs. Hard-coding Command::new("claude") (or any
+# future agent binary) elsewhere bypasses the trait and will not
+# work when a second backend is wired. Same enforcement pattern as
+# the Command::new("git") check above.
+bare_agent_files=""
+for f in $(git diff --cached --name-only -- '*.rs'); do
+    # agent_backend.rs is the ONLY file allowed to mention the binary name.
+    if [ "$(basename "$f")" = "agent_backend.rs" ]; then
+        continue
+    fi
+    if [ -f "$f" ] && grep -qE 'Command::new\("(claude|codex)"' "$f"; then
+        bare_agent_files="$bare_agent_files $f"
+    fi
+done
+if [ -n "$bare_agent_files" ]; then
+    echo "ERROR: These files spawn an agent binary directly:"
+    echo "$bare_agent_files"
+    echo "Use agent_backend.command_name() and a build_*_command() trait method instead."
+    echo "See src/agent_backend.rs and docs/harness-contract.md."
+    exit 1
+fi
+echo "Agent spawn check OK."

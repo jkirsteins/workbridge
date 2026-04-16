@@ -10124,6 +10124,7 @@ impl App {
             },
         );
 
+        let agent_backend = Arc::clone(&self.agent_backend);
         std::thread::spawn(move || {
             // Cancellation check at the very start of the thread.
             // If `drop_rebase_gate` ran between the insert above and
@@ -10384,23 +10385,20 @@ impl App {
                     let prompt = prompt.clone();
                     let child_pid = Arc::clone(&child_pid);
                     let cancelled = Arc::clone(&cancelled);
+                    let agent_backend = Arc::clone(&agent_backend);
                     std::thread::spawn(move || {
-                        let mut cmd = std::process::Command::new("claude");
-                        cmd.args([
-                            "--print",
-                            "--dangerously-skip-permissions",
-                            "-p",
-                            &prompt,
-                            "--output-format",
-                            "json",
-                            "--json-schema",
+                        let rw_cfg = crate::agent_backend::ReviewGateSpawnConfig {
+                            system_prompt: "",
+                            initial_prompt: &prompt,
                             json_schema,
-                            "--mcp-config",
-                            &config_path.to_string_lossy(),
-                        ])
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .current_dir(&worktree_path);
+                            mcp_config_path: &config_path,
+                        };
+                        let argv = agent_backend.build_headless_rw_command(&rw_cfg);
+                        let mut cmd = std::process::Command::new(agent_backend.command_name());
+                        cmd.args(&argv)
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .current_dir(&worktree_path);
 
                         match run_cancellable(&mut cmd, &child_pid, &cancelled) {
                             Ok(outcome) => {
@@ -10415,7 +10413,11 @@ impl App {
                                     std::process::Output {
                                         status: std::process::ExitStatus::default(),
                                         stdout: Vec::new(),
-                                        stderr: format!("could not run claude: {e}").into_bytes(),
+                                        stderr: format!(
+                                            "could not run {}: {e}",
+                                            agent_backend.command_name()
+                                        )
+                                        .into_bytes(),
                                     },
                                 ));
                             }
