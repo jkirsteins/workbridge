@@ -595,6 +595,81 @@ impl Drop for RebaseGateState {
     }
 }
 
+/// Outcome of a subprocess run through `run_cancellable`.
+/// Distinguishes "completed normally" from "gate was torn down
+/// while the subprocess was running." Callers match on this to
+/// decide whether to process the output or bail out of the gate.
+pub enum SubprocessOutcome {
+    /// The subprocess exited (successfully or not). Inspect
+    /// `Output.status` to determine success/failure.
+    Completed(std::process::Output),
+    /// The `cancelled` flag was set while the subprocess was alive.
+    /// The helper already SIGKILLed the process group and reaped
+    /// the child; the caller should exit the gate cleanly.
+    Cancelled,
+}
+
+/// Run a subprocess in a cancellable way. Encapsulates the full
+/// "spawn in own process group, stash PID, check cancelled,
+/// killpg if cancelled" dance so each call site in the rebase
+/// gate's background thread does not have to reimplement the
+/// ordering contract manually.
+///
+/// The ordering contract (the reason this helper exists):
+///
+///   **Stash the PID FIRST, then check `cancelled` SECOND.**
+///
+/// The `cancelled` flag is sticky (once set, never cleared). By
+/// stashing the PID before reading the flag, we guarantee that
+/// for every interleaving with `drop_rebase_gate` on the main
+/// thread, either the drop path sees the PID and `killpg`s it,
+/// or we see the flag and `killpg` the group ourselves. The
+/// inverse ordering (check then stash) has a race window where
+/// the drop path fires between check and stash, finds None in
+/// the slot, and silently fails to kill the subprocess.
+///
+/// This bug was introduced twice (once for the harness child,
+/// once for the fetch) before the pattern was extracted into this
+/// helper. The helper makes the class of bug impossible to
+/// reintroduce at new call sites because the ordering is baked
+/// into one place rather than replicated.
+pub fn run_cancellable(
+    cmd: &mut std::process::Command,
+    pid_slot: &Arc<Mutex<Option<u32>>>,
+    cancelled: &AtomicBool,
+) -> Result<SubprocessOutcome, std::io::Error> {
+    let mut child = cmd.process_group(0).spawn()?;
+    let pid = child.id();
+
+    // Stash FIRST.
+    if let Ok(mut slot) = pid_slot.lock() {
+        *slot = Some(pid);
+    }
+
+    // Check SECOND. Sticky flag: if true, it was true before we
+    // stashed and will stay true forever, so the ordering is safe.
+    if cancelled.load(Ordering::SeqCst) {
+        if let Ok(mut slot) = pid_slot.lock() {
+            *slot = None;
+        }
+        // SAFETY: `libc::killpg` is an FFI call into a stable
+        // POSIX syscall. The child was spawned with
+        // `process_group(0)` so its PID equals its process-group
+        // id. `ESRCH` after a freshly-reaped group is harmless.
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = child.wait();
+        return Ok(SubprocessOutcome::Cancelled);
+    }
+
+    let output = child.wait_with_output()?;
+    if let Ok(mut slot) = pid_slot.lock() {
+        *slot = None;
+    }
+    Ok(SubprocessOutcome::Completed(output))
+}
+
 /// Per-work-item state for an in-flight review gate.
 pub struct ReviewGateState {
     pub rx: crossbeam_channel::Receiver<ReviewGateMessage>,
@@ -9110,41 +9185,21 @@ impl App {
                 let _ = tx.send(RebaseGateMessage::Progress(format!(
                     "Fetching origin/{base_branch}..."
                 )));
-                // The fetch is spawned via `spawn()` +
-                // `wait_with_output()` in its own process group so
-                // `Drop for RebaseGateState` can killpg it if the
-                // gate is torn down while the fetch is blocked on the
-                // network. Without this, the fetch subprocess would
-                // survive cancellation and hold git locks against the
-                // worktree while `spawn_delete_cleanup` tries to run
-                // `git worktree remove`. The fetch PID is stashed in
-                // the same `child_pid` slot the harness sub-thread
-                // uses later; the slot is cleared after the fetch
-                // completes so the harness sub-thread starts with a
-                // clean None and stashes its own PID on top.
-                let fetch_result = match crate::worktree_service::git_command()
-                    .arg("-C")
-                    .arg(&worktree_path)
-                    .args(["fetch", "origin", &refspec])
-                    .process_group(0)
-                    .spawn()
-                {
-                    Ok(fetch_child) => {
-                        let fetch_pid = fetch_child.id();
-                        if let Ok(mut slot) = child_pid.lock() {
-                            *slot = Some(fetch_pid);
-                        }
-                        let result = fetch_child.wait_with_output();
-                        if let Ok(mut slot) = child_pid.lock() {
-                            *slot = None;
-                        }
-                        result
-                    }
-                    Err(e) => Err(e),
-                };
-                match fetch_result {
-                    Ok(out) if out.status.success() => {}
-                    Ok(out) => {
+                // The fetch goes through `run_cancellable` so it
+                // runs in its own process group and the PID slot is
+                // managed with the correct "stash first, check
+                // second" ordering. See `run_cancellable` for the
+                // contract and why the ordering matters.
+                match run_cancellable(
+                    crate::worktree_service::git_command()
+                        .arg("-C")
+                        .arg(&worktree_path)
+                        .args(["fetch", "origin", &refspec]),
+                    &child_pid,
+                    &cancelled,
+                ) {
+                    Ok(SubprocessOutcome::Completed(out)) if out.status.success() => {}
+                    Ok(SubprocessOutcome::Completed(out)) => {
                         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
                         break 'compute Some(RebaseResult::Failure {
                             base_branch: base_branch.clone(),
@@ -9152,6 +9207,9 @@ impl App {
                             conflicts_attempted: false,
                             activity_log_error: None,
                         });
+                    }
+                    Ok(SubprocessOutcome::Cancelled) => {
+                        break 'compute None;
                     }
                     Err(e) => {
                         break 'compute Some(RebaseResult::Failure {
@@ -9296,30 +9354,17 @@ impl App {
 
                 let json_schema = r#"{"type":"object","properties":{"success":{"type":"boolean"},"conflicts_resolved":{"type":"boolean"},"detail":{"type":"string"}},"required":["success","detail"]}"#;
 
-                // Spawn the harness child in a sub-thread so we can drain
-                // gate_mcp_rx for live progress events while waiting for
-                // the child to exit. The `current_dir` MUST be the work
-                // item's worktree path: each git worktree has its own HEAD,
-                // and `git rebase` operates on whatever HEAD the cwd's git
-                // context resolves to. Pointing the child at the registered
-                // repo root would silently rebase the main checkout's
-                // branch instead of `branch`.
-                //
-                // We use `spawn()` + `wait_with_output()` instead of the
-                // simpler `output()` so the PID can be stashed in
-                // `child_pid` immediately after spawning. The main thread
-                // reads that PID from `drop_rebase_gate` and SIGKILLs the
-                // child if the gate is torn down (delete, force-quit). The
-                // PID is cleared after the child is reaped so the main
-                // thread does not signal a stale entry.
-                let (output_tx, output_rx) =
-                    crossbeam_channel::bounded::<std::io::Result<std::process::Output>>(1);
+                // Spawn the harness child in a sub-thread so we can
+                // drain gate_mcp_rx for live progress events while
+                // waiting for the child to exit. The `current_dir`
+                // MUST be the work item's worktree path (each git
+                // worktree has its own HEAD). The sub-thread uses
+                // `run_cancellable` which handles process-group
+                // isolation, PID stashing, and the "stash first,
+                // check second" ordering contract; see the helper's
+                // doc comment for the full rationale.
+                let (output_tx, output_rx) = crossbeam_channel::bounded::<SubprocessOutcome>(1);
                 {
-                    // `config_path` is wrapped in `Option<PathBuf>` outside
-                    // the labeled block so post-block cleanup can remove it
-                    // uniformly. `expect` is infallible here because the
-                    // only path to this point in the labeled block sets
-                    // `config_path = Some(path)` immediately above.
                     let config_path = config_path
                         .as_ref()
                         .expect("config_path was set just above")
@@ -9329,93 +9374,41 @@ impl App {
                     let child_pid = Arc::clone(&child_pid);
                     let cancelled = Arc::clone(&cancelled);
                     std::thread::spawn(move || {
-                        let spawn_result = std::process::Command::new("claude")
-                            .args([
-                                "--print",
-                                "--dangerously-skip-permissions",
-                                "-p",
-                                &prompt,
-                                "--output-format",
-                                "json",
-                                "--json-schema",
-                                json_schema,
-                                "--mcp-config",
-                                &config_path.to_string_lossy(),
-                            ])
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::piped())
-                            .current_dir(&worktree_path)
-                            // Put the harness in its OWN process group so
-                            // `drop_rebase_gate` can SIGKILL the entire
-                            // tree (claude + any `git rebase` / `git add`
-                            // subprocesses it has spawned). Without
-                            // `process_group(0)`, claude inherits
-                            // workbridge's process group and `killpg`
-                            // would either kill workbridge itself or
-                            // leave claude's git subprocesses orphaned
-                            // and still mutating the worktree. Mirrors
-                            // the pattern in `Session::spawn`, which
-                            // achieves the same isolation via
-                            // `libc::setsid` in `pre_exec`.
-                            .process_group(0)
-                            .spawn();
-                        let mut child = match spawn_result {
-                            Ok(c) => c,
+                        let mut cmd = std::process::Command::new("claude");
+                        cmd.args([
+                            "--print",
+                            "--dangerously-skip-permissions",
+                            "-p",
+                            &prompt,
+                            "--output-format",
+                            "json",
+                            "--json-schema",
+                            json_schema,
+                            "--mcp-config",
+                            &config_path.to_string_lossy(),
+                        ])
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .current_dir(&worktree_path);
+
+                        match run_cancellable(&mut cmd, &child_pid, &cancelled) {
+                            Ok(outcome) => {
+                                let _ = output_tx.send(outcome);
+                            }
                             Err(e) => {
-                                let _ = output_tx.send(Err(e));
-                                return;
+                                // Spawn or wait failed; wrap in the
+                                // Completed variant with a failed output
+                                // so the outer thread sees it as a
+                                // harness error.
+                                let _ = output_tx.send(SubprocessOutcome::Completed(
+                                    std::process::Output {
+                                        status: std::process::ExitStatus::default(),
+                                        stdout: Vec::new(),
+                                        stderr: format!("could not run claude: {e}").into_bytes(),
+                                    },
+                                ));
                             }
-                        };
-                        // Stash the PID FIRST, then check cancellation.
-                        // The previous ordering (check then stash) had a
-                        // race window: if `drop_rebase_gate` ran between
-                        // the cancellation check and the stash, it would
-                        // set `cancelled = true`, find `None` in the
-                        // PID slot, and silently fail to killpg the
-                        // group; the sub-thread would then continue past
-                        // the (already-passed) check, stash the PID, and
-                        // call `wait_with_output` against a child
-                        // nobody was going to kill. By stashing first
-                        // and checking second we guarantee one of two
-                        // outcomes for every interleaving: either the
-                        // drop path sees the PID and killpgs it for us,
-                        // or we see the cancellation flag (which is
-                        // sticky once set) and killpg the group
-                        // ourselves below. The flag's stickiness is the
-                        // load-bearing property here.
-                        let pid = child.id();
-                        if let Ok(mut slot) = child_pid.lock() {
-                            *slot = Some(pid);
                         }
-                        if cancelled.load(Ordering::SeqCst) {
-                            // Clear the slot first so `drop_rebase_gate`
-                            // does not also try to killpg this PID
-                            // (double kill would be `ESRCH` after the
-                            // first one reaped, which is harmless but
-                            // pointless).
-                            if let Ok(mut slot) = child_pid.lock() {
-                                *slot = None;
-                            }
-                            // SAFETY: `libc::killpg` is an FFI call into
-                            // a stable POSIX syscall; arguments are a
-                            // process-group id and a signal number. The
-                            // group leader is `pid` because we passed
-                            // `process_group(0)` above. Calling killpg
-                            // on a freshly-reaped group is a harmless
-                            // ESRCH error rather than a wrong-process
-                            // signal, so racing with `drop_rebase_gate`
-                            // having already killpg'd is safe.
-                            unsafe {
-                                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-                            }
-                            let _ = child.wait();
-                            return;
-                        }
-                        let result = child.wait_with_output();
-                        if let Ok(mut slot) = child_pid.lock() {
-                            *slot = None;
-                        }
-                        let _ = output_tx.send(result);
                     });
                 }
 
@@ -9478,8 +9471,20 @@ impl App {
                 // values above; cancellation paths break with `None`.
                 // Cleanup of `gate_server` and `config_path` happens
                 // AFTER the block, uniformly for every break path.
-                Some(match final_output {
-                    Ok(Ok(output)) if output.status.success() => {
+                // Handle the Cancelled variant from the harness
+                // sub-thread: if the gate was torn down while the
+                // harness was running, `run_cancellable` already
+                // killed the process group and returned Cancelled.
+                // Break with None so the post-block code skips the
+                // audit append and result send.
+                let harness_output = match final_output {
+                    Ok(SubprocessOutcome::Cancelled) => break 'compute None,
+                    Ok(SubprocessOutcome::Completed(output)) => Ok(output),
+                    Err(e) => Err(e),
+                };
+
+                Some(match harness_output {
+                    Ok(output) if output.status.success() => {
                         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                         match serde_json::from_str::<serde_json::Value>(&stdout) {
                             Ok(envelope) => {
@@ -9590,7 +9595,7 @@ impl App {
                             },
                         }
                     }
-                    Ok(Ok(output)) => {
+                    Ok(output) => {
                         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                         RebaseResult::Failure {
                             base_branch: base_branch.clone(),
@@ -9599,12 +9604,6 @@ impl App {
                             activity_log_error: None,
                         }
                     }
-                    Ok(Err(e)) => RebaseResult::Failure {
-                        base_branch: base_branch.clone(),
-                        reason: format!("could not run harness: {e}"),
-                        conflicts_attempted: conflicts_attempted_observed,
-                        activity_log_error: None,
-                    },
                     Err(e) => RebaseResult::Failure {
                         base_branch: base_branch.clone(),
                         reason: format!("rebase gate: harness thread disconnected: {e}"),
