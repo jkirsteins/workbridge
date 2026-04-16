@@ -1071,6 +1071,10 @@ pub struct StaleWorktreePrompt {
     pub stale_path: PathBuf,
     pub repo_path: PathBuf,
     pub branch: String,
+    /// Whether a Claude session should be opened after successful recovery.
+    /// `true` for the normal Enter-to-open path, `false` for import paths
+    /// that only need a worktree without spawning a session.
+    pub open_session: bool,
 }
 
 /// App holds the entire application state.
@@ -5223,6 +5227,7 @@ impl App {
                         stale_path,
                         repo_path: result.repo_path.clone(),
                         branch: result.branch.clone().unwrap_or_default(),
+                        open_session: result.open_session,
                     });
                 } else {
                     // Generic worktree error (permissions, disk, path
@@ -5265,6 +5270,7 @@ impl App {
         let repo_path = prompt.repo_path.clone();
         let stale_path = prompt.stale_path.clone();
         let branch = prompt.branch.clone();
+        let open_session = prompt.open_session;
 
         // Re-populate the prompt so the UI can render the spinner modal.
         self.stale_worktree_prompt = Some(prompt);
@@ -5288,18 +5294,24 @@ impl App {
         let (tx, rx) = crossbeam_channel::bounded(1);
 
         std::thread::spawn(move || {
+            let mut cleanup_errors: Vec<String> = Vec::new();
+
             // Step 1: Force-remove the stale worktree. If the path
             // doesn't exist on disk, `git worktree remove --force` still
             // cleans up the bookkeeping in .git/worktrees/.
-            let _ = ws.remove_worktree(
+            if let Err(e) = ws.remove_worktree(
                 &repo_path,
                 &stale_path,
                 false, // don't delete the branch - it has the user's work
                 true,  // force
-            );
+            ) {
+                cleanup_errors.push(format!("force-remove: {e}"));
+            }
 
             // Step 2: Prune any remaining stale worktree entries.
-            let _ = ws.prune_worktrees(&repo_path);
+            if let Err(e) = ws.prune_worktrees(&repo_path) {
+                cleanup_errors.push(format!("prune: {e}"));
+            }
 
             // Step 3: Retry worktree creation.
             let wt_target = Self::worktree_target_path(&repo_path, &branch, &wt_dir);
@@ -5319,20 +5331,27 @@ impl App {
                         branch: Some(branch),
                         path: Some(wt_info.path),
                         error: None,
-                        open_session: true,
+                        open_session,
                         branch_gone: false,
                         reused,
                         stale_worktree_path: None,
                     });
                 }
                 Err(e) => {
+                    let mut msg = format!("Recovery failed: {e}");
+                    if !cleanup_errors.is_empty() {
+                        msg.push_str(&format!(
+                            " (cleanup also failed: {})",
+                            cleanup_errors.join("; ")
+                        ));
+                    }
                     let _ = tx.send(WorktreeCreateResult {
                         wi_id,
                         repo_path,
                         branch: Some(branch),
                         path: None,
-                        error: Some(format!("Recovery failed: {e}")),
-                        open_session: true,
+                        error: Some(msg),
+                        open_session,
                         branch_gone: false,
                         reused: false,
                         stale_worktree_path: None,
@@ -13230,6 +13249,7 @@ mod tests {
             stale_path: PathBuf::from("/tmp/stale"),
             repo_path: PathBuf::from("/repos/myrepo"),
             branch: "feature/recover".into(),
+            open_session: true,
         });
 
         // Add a work item so the success path doesn't trip the
@@ -13301,6 +13321,7 @@ mod tests {
             stale_path: PathBuf::from("/tmp/stale"),
             repo_path: PathBuf::from("/repos/myrepo"),
             branch: "feature/fail".into(),
+            open_session: true,
         });
 
         let (tx, rx) = crossbeam_channel::bounded(1);

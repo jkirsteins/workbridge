@@ -179,7 +179,24 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // Stale-worktree recovery dialog: user can force-remove + retry, or dismiss.
     if app.stale_worktree_prompt.is_some() {
         // While recovery is in progress, swallow all keys (modal spinner).
+        // Q/Ctrl+Q still triggers force-quit so a hung recovery never traps
+        // the user.
         if app.stale_recovery_in_progress {
+            if matches!(
+                (key.modifiers, key.code),
+                (
+                    KeyModifiers::NONE | KeyModifiers::SHIFT,
+                    KeyCode::Char('q' | 'Q')
+                ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
+            ) {
+                if !app.has_any_session() || app.confirm_quit {
+                    app.should_quit = true;
+                } else {
+                    app.confirm_quit = true;
+                    app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                    sync_layout(app);
+                }
+            }
             return true;
         }
         match (key.modifiers, key.code) {
@@ -1306,6 +1323,7 @@ fn any_modal_visible(app: &App) -> bool {
         || app.no_plan_prompt_visible
         || app.branch_gone_prompt.is_some()
         || app.stale_worktree_prompt.is_some()
+        || app.stale_recovery_in_progress
         || app.confirm_merge
         || app.cleanup_prompt_visible
         || app.is_user_action_in_flight(&UserActionKey::UnlinkedCleanup)
