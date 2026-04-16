@@ -167,7 +167,7 @@ pub fn backend_for_kind(kind: AgentBackendKind) -> Arc<dyn AgentBackend> {
 }
 
 /// Lazy PATH scan. Uses the pure-Rust `which` crate so we do not shell
-/// out. Called from the `c` / `x` / `o` key handlers and the first-run
+/// out. Called from the `c` / `x` key handlers and the first-run
 /// modal; MUST NOT be called from a render path (see `docs/UI.md`
 /// "Blocking I/O Prohibition" - `which` walks `$PATH` synchronously,
 /// which is acceptable for a keypress but not for a render tick).
@@ -197,6 +197,62 @@ pub const WORK_ITEM_ALLOWED_TOOLS: &[&str] = &[
     "mcp__workbridge__workbridge_repo_info",
 ];
 
+/// Render a string value as a TOML basic string literal (double-quoted,
+/// with `\`, `"`, and control characters escaped). Used to build the
+/// `value` half of Codex's `-c key=value` overrides so prompts and
+/// paths with special characters (quotes, newlines, backslashes,
+/// equals signs) survive Codex's TOML parser as a literal string
+/// rather than being interpreted as structured TOML. JSON strings
+/// are a subset of TOML basic strings for the characters we care
+/// about, so `serde_json::to_string` produces a valid TOML literal.
+fn toml_quote_string(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""))
+}
+
+/// Render a slice of strings as a TOML inline array of quoted strings
+/// (e.g. `["--mcp-bridge","--socket","/tmp/s"]`). Used for the
+/// `args` field of Codex's `mcp_servers.<name>` overrides.
+fn toml_quote_string_array(items: &[String]) -> String {
+    let mut out = String::from("[");
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&toml_quote_string(item));
+    }
+    out.push(']');
+    out
+}
+
+/// Direct specification of the workbridge MCP bridge stdio server
+/// (command + args). Emitted alongside `mcp_config_path` because some
+/// harnesses (notably Codex) register MCP servers via structured CLI
+/// overrides that need the raw `command` and `args` fields rather than
+/// a pointer to an external JSON file.
+///
+/// Codex's `-c mcp_servers.<name>.*` flag writes TOML overrides that
+/// populate `~/.codex/config.toml`-shaped state in memory, where each
+/// MCP server entry requires `command` (string) and `args` (array of
+/// strings) directly. There is no `config` sub-field that reads an
+/// external JSON, and the JSON schema of the `--mcp-config` file is
+/// Claude's, not Codex's - so passing the JSON path to Codex is a
+/// silent no-op that spawns the session with no MCP server.
+///
+/// Claude does not need this struct - its `--mcp-config <file>` flag
+/// reads the JSON directly - but the struct is populated for both
+/// backends at every spawn site so a future backend with the same
+/// "structured override" requirement is a one-line addition to the
+/// relevant `build_command` and does not need a new plumbing pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpBridgeSpec {
+    /// Absolute path to the binary that acts as the MCP bridge (today
+    /// the workbridge executable re-invoked with `--mcp-bridge`).
+    pub command: PathBuf,
+    /// Argument vector for the bridge binary, including `--mcp-bridge`
+    /// and `--socket <path>` in the order the bridge expects.
+    pub args: Vec<String>,
+}
+
 /// Config for an interactive spawn (work-item or global-assistant).
 ///
 /// Passed by value borrowing into `AgentBackend::build_command`. Every
@@ -220,6 +276,13 @@ pub struct SpawnConfig<'a> {
     /// the user see and dismiss the session rather than silently
     /// blocking it.
     pub mcp_config_path: Option<&'a Path>,
+    /// Structured bridge spec (command + args) for harnesses that
+    /// register MCP servers via per-field CLI overrides instead of an
+    /// external JSON file. See `McpBridgeSpec`. `None` degrades the
+    /// session in the same way `mcp_config_path: None` does - the
+    /// agent cannot reach the workbridge MCP server, but the session
+    /// is still visible so the user can dismiss it.
+    pub mcp_bridge: Option<&'a McpBridgeSpec>,
     /// Tool allowlist (C5). For Claude this is passed as a comma-joined
     /// argument to `--allowedTools`; the review-gate spawn path does NOT
     /// go through this struct, so this list is never empty in practice.
@@ -247,6 +310,12 @@ pub struct ReviewGateSpawnConfig<'a> {
     pub json_schema: &'a str,
     /// Path to the MCP-config JSON file the caller already wrote.
     pub mcp_config_path: &'a Path,
+    /// Structured MCP bridge spec for harnesses that need per-field
+    /// CLI overrides. Mirrors `SpawnConfig::mcp_bridge`. Required
+    /// rather than optional on this struct because the review / rebase
+    /// gate paths always have exe + socket in hand when they build the
+    /// config; a backend that doesn't need the spec simply ignores it.
+    pub mcp_bridge: &'a McpBridgeSpec,
 }
 
 /// Verdict parsed from a headless review-gate session's stdout (RP5).
@@ -513,15 +582,26 @@ impl AgentBackend for ClaudeCodeBackend {
 ///
 /// Argv shape summary:
 ///
-/// - Interactive (work-item / global): `codex --full-auto [--config
-///   mcp_servers.workbridge.config=<path>] [--config instructions=<sys>]
-///   [<auto-start>]` (RP1c).
-/// - Headless read-only (review gate): `codex exec --json --config
-///   instructions=<sys> --config mcp_servers.workbridge.config=<path>
-///   <prompt>` (RP2c).
+/// - Interactive (work-item / global): `codex --full-auto
+///   --config mcp_servers.workbridge.command="<exe>"
+///   --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<sock>"]
+///   [--config instructions="<sys>"] [<auto-start>]` (RP1c).
+/// - Headless read-only (review gate): `codex exec --json
+///   --config instructions="<sys>"
+///   --config mcp_servers.workbridge.command="<exe>"
+///   --config mcp_servers.workbridge.args=[...] <prompt>` (RP2c).
 /// - Headless read-write (rebase gate): `codex exec --json --full-auto
-///   --ask-for-approval never --config mcp_servers.workbridge.config=
-///   <path> <prompt>` (RP2bc).
+///   --ask-for-approval never
+///   --config mcp_servers.workbridge.command="<exe>"
+///   --config mcp_servers.workbridge.args=[...] <prompt>` (RP2bc).
+///
+/// C4 note: earlier drafts used `mcp_servers.workbridge.config=<path>`
+/// pointing at the Claude-shaped JSON file. That shape is syntactically
+/// accepted by Codex but rejected at configuration load time with
+/// "invalid transport in `mcp_servers.workbridge`" - Codex's TOML
+/// schema requires `command` (string) and `args` (array of strings)
+/// directly, and has no `config` sub-field. The current shape emits
+/// the per-field overrides built from `McpBridgeSpec`.
 ///
 /// C13 (no env leakage) holds because every piece of per-session state
 /// is delivered via the `--config` CLI flag. The adapter does NOT touch
@@ -529,6 +609,31 @@ impl AgentBackend for ClaudeCodeBackend {
 /// set environment variables. Temp files written by
 /// `write_session_files` go under `std::env::temp_dir()` only.
 pub struct CodexBackend;
+
+impl CodexBackend {
+    /// Emit `--config mcp_servers.workbridge.*` overrides for the
+    /// workbridge MCP stdio bridge. Codex requires `command` (string)
+    /// and `args` (array of strings) at this path; there is no `config`
+    /// sub-field that reads an external JSON (the pattern used by
+    /// `--mcp-config` on the Claude side). Passing `None` silently
+    /// skips the flag so callers that are in a degraded-spawn path
+    /// (e.g. MCP socket bind failed) still produce a non-broken argv.
+    fn extend_mcp_bridge_argv(cmd: &mut Vec<String>, bridge: Option<&McpBridgeSpec>) {
+        let Some(bridge) = bridge else {
+            return;
+        };
+        cmd.push("--config".to_string());
+        cmd.push(format!(
+            "mcp_servers.workbridge.command={}",
+            toml_quote_string(&bridge.command.to_string_lossy())
+        ));
+        cmd.push("--config".to_string());
+        cmd.push(format!(
+            "mcp_servers.workbridge.args={}",
+            toml_quote_string_array(&bridge.args)
+        ));
+    }
+}
 
 impl AgentBackend for CodexBackend {
     fn kind(&self) -> AgentBackendKind {
@@ -549,17 +654,24 @@ impl AgentBackend for CodexBackend {
         if !cfg.read_only {
             cmd.push("--full-auto".to_string());
         }
-        // C4: Codex has no `--mcp-config` flag. MCP injection goes
-        // through `--config mcp_servers.workbridge.config=<path>`; the
-        // caller wrote the temp JSON file that `<path>` points at. When
-        // `mcp_config_path` is `None`, we degrade rather than fall back
-        // to the user's global `~/.codex/config.toml` (that would
-        // silently cross-contaminate personal config with workbridge
-        // runtime state).
-        if let Some(path) = cfg.mcp_config_path {
-            cmd.push("--config".to_string());
-            cmd.push(format!("mcp_servers.workbridge.config={}", path.display()));
-        }
+        // C4: Codex has no `--mcp-config` flag and no `mcp_servers.*.config`
+        // sub-field that reads an external JSON (that path is what the
+        // earlier implementation used; verified to be rejected by
+        // `codex mcp list` with "invalid transport"). Instead, Codex's
+        // TOML schema for `mcp_servers.<name>` requires `command`
+        // (string) and `args` (array of strings) directly - so we emit
+        // per-field `--config` overrides from `McpBridgeSpec`.
+        //
+        // The caller still writes the Claude-shaped JSON to
+        // `mcp_config_path` (it is consumed by Claude's adapter and by
+        // the MCP-config on-disk contract for parity logging), but we
+        // do NOT reference that path in Codex's argv - only the
+        // structured `mcp_bridge` spec is used. Missing `mcp_bridge`
+        // degrades rather than falling back to `~/.codex/config.toml`
+        // (which would silently cross-contaminate personal config with
+        // workbridge runtime state).
+        let _ = cfg.mcp_config_path;
+        Self::extend_mcp_bridge_argv(&mut cmd, cfg.mcp_bridge);
         // C5: Codex has no per-tool CLI allowlist; the allowlist is
         // enforced at the MCP server layer (the same mechanism the
         // Claude review gate already uses). `allowed_tools` is accepted
@@ -568,9 +680,11 @@ impl AgentBackend for CodexBackend {
         // C6: Codex has no `--system-prompt`; the system prompt is
         // delivered via `--config instructions=<prompt>`. For a session
         // with no system prompt (global assistant), the flag is omitted.
+        // The value is TOML-quoted so prompts with special characters
+        // (quotes, newlines, equals signs) survive Codex's TOML parser.
         if let Some(prompt) = cfg.system_prompt {
             cmd.push("--config".to_string());
-            cmd.push(format!("instructions={prompt}"));
+            cmd.push(format!("instructions={}", toml_quote_string(prompt)));
         }
         // C8: Codex has no PostToolUse hook equivalent. The Planning
         // reminder is embedded in the system prompt (the caller renders
@@ -595,18 +709,15 @@ impl AgentBackend for CodexBackend {
         // newline-delimited event stream. No `--full-auto` (this session
         // cannot write) and no `--ask-for-approval` overrides (the
         // read-only MCP server enforces the gate).
-        vec![
+        let mut cmd = vec![
             "exec".to_string(),
             "--json".to_string(),
             "--config".to_string(),
-            format!("instructions={}", cfg.system_prompt),
-            "--config".to_string(),
-            format!(
-                "mcp_servers.workbridge.config={}",
-                cfg.mcp_config_path.display()
-            ),
-            cfg.initial_prompt.to_string(),
-        ]
+            format!("instructions={}", toml_quote_string(cfg.system_prompt)),
+        ];
+        Self::extend_mcp_bridge_argv(&mut cmd, Some(cfg.mcp_bridge));
+        cmd.push(cfg.initial_prompt.to_string());
+        cmd
     }
 
     fn build_headless_rw_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
@@ -614,19 +725,16 @@ impl AgentBackend for CodexBackend {
         // `--ask-for-approval never` to suppress interactive prompts
         // during rebase conflict resolution. Parallels Claude's
         // `--dangerously-skip-permissions`.
-        vec![
+        let mut cmd = vec![
             "exec".to_string(),
             "--json".to_string(),
             "--full-auto".to_string(),
             "--ask-for-approval".to_string(),
             "never".to_string(),
-            "--config".to_string(),
-            format!(
-                "mcp_servers.workbridge.config={}",
-                cfg.mcp_config_path.display()
-            ),
-            cfg.initial_prompt.to_string(),
-        ]
+        ];
+        Self::extend_mcp_bridge_argv(&mut cmd, Some(cfg.mcp_bridge));
+        cmd.push(cfg.initial_prompt.to_string());
+        cmd
     }
 
     fn parse_review_gate_stdout(&self, stdout: &str) -> ReviewGateVerdict {
@@ -746,6 +854,17 @@ impl AgentBackend for OpenCodeBackend {
 mod tests {
     use super::*;
 
+    fn fake_bridge() -> McpBridgeSpec {
+        McpBridgeSpec {
+            command: PathBuf::from("/opt/workbridge"),
+            args: vec![
+                "--mcp-bridge".to_string(),
+                "--socket".to_string(),
+                "/tmp/workbridge-mcp-fake.sock".to_string(),
+            ],
+        }
+    }
+
     #[test]
     fn codex_shape_compiles() {
         let backend: Box<dyn AgentBackend> = Box::new(CodexBackend);
@@ -753,10 +872,12 @@ mod tests {
         assert_eq!(backend.command_name(), "codex");
 
         let mcp_path = PathBuf::from("/tmp/workbridge-mcp-fake.sock");
+        let bridge = fake_bridge();
         let cfg = SpawnConfig {
             stage: WorkItemStatus::Planning,
             system_prompt: Some("be helpful"),
             mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: Some("Explain who you are and start working."),
             read_only: false,
@@ -777,6 +898,7 @@ mod tests {
             initial_prompt: "/claude-adversarial-review",
             json_schema: "{}",
             mcp_config_path: &mcp_path,
+            mcp_bridge: &bridge,
         };
         let rg_argv = backend.build_review_gate_command(&rg_cfg);
         assert_eq!(rg_argv.first().map(String::as_str), Some("exec"));
@@ -788,6 +910,7 @@ mod tests {
             initial_prompt: "rebase onto main",
             json_schema: r#"{"type":"object"}"#,
             mcp_config_path: &mcp_path,
+            mcp_bridge: &bridge,
         };
         let rw_argv = backend.build_headless_rw_command(&rw_cfg);
         assert_eq!(rw_argv.first().map(String::as_str), Some("exec"));
@@ -808,10 +931,12 @@ mod tests {
     fn claude_interactive_argv_for_planning() {
         let backend = ClaudeCodeBackend;
         let mcp_path = PathBuf::from("/tmp/workbridge-mcp-config-abc.json");
+        let bridge = fake_bridge();
         let cfg = SpawnConfig {
             stage: WorkItemStatus::Planning,
             system_prompt: Some("system prompt here"),
             mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: Some("Explain who you are and start working."),
             read_only: false,
@@ -843,10 +968,12 @@ mod tests {
     fn claude_interactive_argv_for_blocked_no_auto_start() {
         let backend = ClaudeCodeBackend;
         let mcp_path = PathBuf::from("/tmp/mcp.json");
+        let bridge = fake_bridge();
         let cfg = SpawnConfig {
             stage: WorkItemStatus::Blocked,
             system_prompt: Some("blocked prompt"),
             mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: false,
@@ -869,6 +996,7 @@ mod tests {
             stage: WorkItemStatus::Implementing,
             system_prompt: Some("prompt"),
             mcp_config_path: None,
+            mcp_bridge: None,
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: Some("Explain who you are and start working."),
             read_only: false,
@@ -888,10 +1016,12 @@ mod tests {
         // how the review gate (headless read-only) behaves.
         let backend = ClaudeCodeBackend;
         let mcp_path = PathBuf::from("/tmp/ro.json");
+        let bridge = fake_bridge();
         let cfg = SpawnConfig {
             stage: WorkItemStatus::Review,
             system_prompt: Some("ro prompt"),
             mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: true,
@@ -906,11 +1036,13 @@ mod tests {
     fn claude_review_gate_argv_shape() {
         let backend = ClaudeCodeBackend;
         let mcp_path = PathBuf::from("/tmp/rg.json");
+        let bridge = fake_bridge();
         let cfg = ReviewGateSpawnConfig {
             system_prompt: "review gate system prompt",
             initial_prompt: "/claude-adversarial-review",
             json_schema: r#"{"type":"object"}"#,
             mcp_config_path: &mcp_path,
+            mcp_bridge: &bridge,
         };
         let argv = backend.build_review_gate_command(&cfg);
         assert_eq!(argv[0], "--print");
@@ -927,11 +1059,13 @@ mod tests {
     fn claude_headless_rw_argv_includes_permission_bypass() {
         let backend = ClaudeCodeBackend;
         let mcp_path = PathBuf::from("/tmp/workbridge-mcp-config-abc.json");
+        let bridge = fake_bridge();
         let cfg = ReviewGateSpawnConfig {
             system_prompt: "",
             initial_prompt: "rebase onto origin/main",
             json_schema: r#"{"type":"object"}"#,
             mcp_config_path: &mcp_path,
+            mcp_bridge: &bridge,
         };
         let argv = backend.build_headless_rw_command(&cfg);
         assert!(
@@ -967,10 +1101,12 @@ mod tests {
     #[test]
     fn codex_interactive_argv_has_full_auto() {
         let mcp_path = PathBuf::from("/tmp/workbridge-mcp-fake.sock");
+        let bridge = fake_bridge();
         let cfg = SpawnConfig {
             stage: WorkItemStatus::Implementing,
             system_prompt: Some("sys"),
             mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: false,
@@ -980,27 +1116,103 @@ mod tests {
         assert!(argv.iter().any(|s| s == "--full-auto"));
     }
 
-    /// Pins C4: Codex MCP injection uses `--config
-    /// mcp_servers.workbridge.config=<path>`. The path value refers to
-    /// a temp JSON file the caller already wrote.
+    /// Pins C4: Codex MCP injection uses per-field `--config
+    /// mcp_servers.workbridge.command=...` and `mcp_servers.workbridge.args=[...]`.
+    /// The earlier `mcp_servers.workbridge.config=<path>` shape is
+    /// rejected by Codex at config load time with "invalid transport"
+    /// and MUST NOT be emitted. Verified against the live `codex` CLI
+    /// on 2026-04-16.
     #[test]
     fn codex_mcp_config_injected_via_config_flag() {
         let mcp_path = PathBuf::from("/tmp/workbridge-mcp-42.json");
+        let bridge = fake_bridge();
         let cfg = SpawnConfig {
             stage: WorkItemStatus::Implementing,
             system_prompt: None,
             mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: false,
         };
         let argv = CodexBackend.build_command(&cfg);
-        let has_config_flag = argv
+
+        // The old broken shape must NOT appear.
+        let has_broken_config = argv
             .windows(2)
             .any(|w| w[0] == "--config" && w[1].starts_with("mcp_servers.workbridge.config="));
         assert!(
-            has_config_flag,
-            "codex must inject MCP via --config mcp_servers.workbridge.config=..., got {argv:?}"
+            !has_broken_config,
+            "codex must NOT emit mcp_servers.workbridge.config=... \
+             (rejected by codex as invalid transport); got {argv:?}"
+        );
+
+        // The correct shape: per-field command + args overrides.
+        let has_command_flag = argv
+            .windows(2)
+            .any(|w| w[0] == "--config" && w[1].starts_with("mcp_servers.workbridge.command="));
+        let has_args_flag = argv
+            .windows(2)
+            .any(|w| w[0] == "--config" && w[1].starts_with("mcp_servers.workbridge.args="));
+        assert!(
+            has_command_flag,
+            "codex must inject MCP command via --config \
+             mcp_servers.workbridge.command=\"...\", got {argv:?}"
+        );
+        assert!(
+            has_args_flag,
+            "codex must inject MCP args via --config \
+             mcp_servers.workbridge.args=[...], got {argv:?}"
+        );
+
+        // The emitted command must be the TOML-quoted absolute path of
+        // the workbridge bridge binary, and the args must be a TOML
+        // inline array of quoted strings.
+        let command_value = argv
+            .windows(2)
+            .find(|w| w[0] == "--config" && w[1].starts_with("mcp_servers.workbridge.command="))
+            .map(|w| w[1].clone())
+            .unwrap();
+        assert!(
+            command_value.ends_with(r#""/opt/workbridge""#),
+            "command override must quote the path as a TOML basic string, \
+             got {command_value:?}"
+        );
+        let args_value = argv
+            .windows(2)
+            .find(|w| w[0] == "--config" && w[1].starts_with("mcp_servers.workbridge.args="))
+            .map(|w| w[1].clone())
+            .unwrap();
+        assert!(
+            args_value.contains(r#"["--mcp-bridge","--socket","#),
+            "args override must be a TOML inline array of quoted strings, \
+             got {args_value:?}"
+        );
+    }
+
+    /// Regression test: if the caller cannot build a bridge spec (e.g.
+    /// MCP socket bind failed), Codex omits the workbridge server
+    /// overrides entirely rather than falling back to the user's
+    /// `~/.codex/config.toml`. This degrades cleanly rather than
+    /// silently contaminating personal config.
+    #[test]
+    fn codex_mcp_bridge_none_omits_workbridge_overrides() {
+        let mcp_path = PathBuf::from("/tmp/workbridge-mcp-42.json");
+        let cfg = SpawnConfig {
+            stage: WorkItemStatus::Implementing,
+            system_prompt: None,
+            mcp_config_path: Some(&mcp_path),
+            mcp_bridge: None,
+            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+            auto_start_message: None,
+            read_only: false,
+        };
+        let argv = CodexBackend.build_command(&cfg);
+        assert!(
+            !argv
+                .iter()
+                .any(|s| s.starts_with("mcp_servers.workbridge.")),
+            "missing mcp_bridge must skip all workbridge overrides, got {argv:?}"
         );
     }
 
@@ -1010,10 +1222,12 @@ mod tests {
     #[test]
     fn codex_system_prompt_goes_through_config_instructions() {
         let mcp_path = PathBuf::from("/tmp/mcp.json");
+        let bridge = fake_bridge();
         let cfg = SpawnConfig {
             stage: WorkItemStatus::Implementing,
             system_prompt: Some("be concise"),
             mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: false,
@@ -1028,10 +1242,12 @@ mod tests {
     #[test]
     fn codex_auto_start_prompt_is_last_positional() {
         let mcp_path = PathBuf::from("/tmp/mcp.json");
+        let bridge = fake_bridge();
         let cfg = SpawnConfig {
             stage: WorkItemStatus::Planning,
             system_prompt: Some("sys"),
             mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: Some("Explain who you are and start working."),
             read_only: false,
@@ -1049,10 +1265,12 @@ mod tests {
     #[test]
     fn codex_read_only_interactive_omits_full_auto() {
         let mcp_path = PathBuf::from("/tmp/mcp.json");
+        let bridge = fake_bridge();
         let cfg = SpawnConfig {
             stage: WorkItemStatus::Review,
             system_prompt: Some("ro"),
             mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: true,
@@ -1061,33 +1279,57 @@ mod tests {
         assert!(!argv.iter().any(|s| s == "--full-auto"));
     }
 
-    /// Pins the headless review-gate shape: `codex exec --json ...`.
+    /// Pins the headless review-gate shape: `codex exec --json ...` with
+    /// per-field workbridge MCP overrides.
     #[test]
     fn codex_review_gate_command_uses_exec_json() {
         let mcp_path = PathBuf::from("/tmp/rg.json");
+        let bridge = fake_bridge();
         let cfg = ReviewGateSpawnConfig {
             system_prompt: "sys",
             initial_prompt: "prompt",
             json_schema: "{}",
             mcp_config_path: &mcp_path,
+            mcp_bridge: &bridge,
         };
         let argv = CodexBackend.build_review_gate_command(&cfg);
         assert_eq!(argv[0], "exec");
         assert!(argv.iter().any(|s| s == "--json"));
         // Review gate does NOT get --full-auto (read-only).
         assert!(!argv.iter().any(|s| s == "--full-auto"));
+        // Per-field MCP overrides must be present.
+        assert!(
+            argv.iter()
+                .any(|s| s.starts_with("mcp_servers.workbridge.command=")),
+            "review gate argv must include mcp_servers.workbridge.command override, got {argv:?}"
+        );
+        assert!(
+            argv.iter()
+                .any(|s| s.starts_with("mcp_servers.workbridge.args=")),
+            "review gate argv must include mcp_servers.workbridge.args override, got {argv:?}"
+        );
+        // The old broken shape must not appear.
+        assert!(
+            !argv
+                .iter()
+                .any(|s| s.starts_with("mcp_servers.workbridge.config=")),
+            "review gate must not emit the deprecated .config=<path> shape, got {argv:?}"
+        );
     }
 
     /// Pins the headless rebase-gate shape: `codex exec --json
-    /// --full-auto --ask-for-approval never ...`.
+    /// --full-auto --ask-for-approval never ...` with per-field
+    /// workbridge MCP overrides.
     #[test]
     fn codex_headless_rw_includes_full_auto_and_approval_never() {
         let mcp_path = PathBuf::from("/tmp/rb.json");
+        let bridge = fake_bridge();
         let cfg = ReviewGateSpawnConfig {
             system_prompt: "",
             initial_prompt: "rebase",
             json_schema: "{}",
             mcp_config_path: &mcp_path,
+            mcp_bridge: &bridge,
         };
         let argv = CodexBackend.build_headless_rw_command(&cfg);
         assert_eq!(argv[0], "exec");
@@ -1097,6 +1339,16 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--ask-for-approval" && w[1] == "never");
         assert!(has_approval_never, "missing --ask-for-approval never");
+        assert!(
+            argv.iter()
+                .any(|s| s.starts_with("mcp_servers.workbridge.command=")),
+            "rebase gate argv must include mcp_servers.workbridge.command override, got {argv:?}"
+        );
+        assert!(
+            argv.iter()
+                .any(|s| s.starts_with("mcp_servers.workbridge.args=")),
+            "rebase gate argv must include mcp_servers.workbridge.args override, got {argv:?}"
+        );
     }
 
     /// Pins the event-stream parser: `codex exec --json` emits
@@ -1150,10 +1402,12 @@ mod tests {
         assert_eq!(backend.command_name(), "opencode");
 
         let mcp_path = PathBuf::from("/tmp/mcp.json");
+        let bridge = fake_bridge();
         let cfg = SpawnConfig {
             stage: WorkItemStatus::Implementing,
             system_prompt: Some("sys"),
             mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: false,
@@ -1166,6 +1420,7 @@ mod tests {
             initial_prompt: "",
             json_schema: "{}",
             mcp_config_path: &mcp_path,
+            mcp_bridge: &bridge,
         };
         assert!(backend.build_review_gate_command(&rg_cfg).is_empty());
         assert!(backend.build_headless_rw_command(&rg_cfg).is_empty());

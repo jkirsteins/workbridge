@@ -430,14 +430,37 @@ disk, binds a socket, or spawns a subprocess from the UI thread.
 The bridge process is the same workbridge binary re-invoked with
 `--mcp-bridge --socket <path>` (see `build_mcp_config`).
 
-**Codex (secondary, not implemented)**: **workaround**. Codex reads
-MCP server definitions from `~/.codex/config.toml` under
-`[mcp_servers.*]`. There is no per-invocation `--mcp-config` flag
-equivalent. A Codex adapter would have to either write a temporary
-`config.toml` and point Codex at it via its config-override flag, or
-use `--config mcp_servers.workbridge=...` overrides. Both are shim-
-level work; the clause itself (per-session MCP injection with
-stdio transport) is still achievable.
+**Codex**: **workaround (implemented)**. Codex reads MCP server
+definitions from `~/.codex/config.toml` under `[mcp_servers.*]` and
+exposes the same shape via `--config key=value` (alias `-c`)
+overrides. There is no `[mcp_servers.<name>].config = "<path>"`
+sub-field that reads an external JSON - verified against the live
+CLI with `codex -c 'mcp_servers.workbridge.config="/tmp/fake.json"'
+mcp list`, which fails with "invalid transport in
+`mcp_servers.workbridge`".
+
+`CodexBackend` in `src/agent_backend.rs` therefore emits per-field
+overrides built from a structured `McpBridgeSpec` (command +
+args): `-c mcp_servers.workbridge.command="<exe>"` and `-c
+mcp_servers.workbridge.args=["--mcp-bridge","--socket","<sock>"]`.
+The helper `CodexBackend::extend_mcp_bridge_argv` renders the TOML
+values using a small `toml_quote_string` / `toml_quote_string_array`
+helper so paths and prompts with special characters (quotes,
+backslashes, newlines, equals signs) survive Codex's TOML parser
+as literal strings.
+
+The caller still writes the Claude-shaped JSON to
+`mcp_config_path` (it is used by Claude's adapter and by the
+on-disk config parity logging), but for Codex that path is
+deliberately NOT referenced in argv - only the structured
+`SpawnConfig::mcp_bridge` field is. Missing `mcp_bridge` (e.g.
+MCP socket bind failed) causes Codex to omit the overrides
+entirely, rather than falling back to `~/.codex/config.toml`
+(which would silently cross-contaminate personal config with
+workbridge runtime state). Pinned by the
+`codex_mcp_config_injected_via_config_flag` and
+`codex_mcp_bridge_none_omits_workbridge_overrides` tests; verified
+live against the real CLI on 2026-04-16.
 
 ### C5 - Tool allowlist by spawn type
 
@@ -638,11 +661,23 @@ sets any harness-specific environment variable on the child. The
 child inherits the parent environment (so the user's `$PATH`,
 `$HOME`, etc. are visible) but workbridge adds nothing.
 
-**Codex (secondary, not implemented)**: **supported**. A Codex
-adapter that needs to point at a per-session MCP config would
-either use a CLI flag (preferred) or write to a config file (see
-C4). Setting an env var like `CODEX_MCP_CONFIG` would violate C13
-and MUST be avoided.
+**Codex**: **supported (implemented)**. `CodexBackend` delivers the
+full per-session payload (system prompt, MCP server definition,
+write-access flag) exclusively through `--config key=value`
+overrides on the CLI argv. No harness-specific environment
+variable is set on the child, and `write_session_files` returns
+an empty list (no side-car writes). Specifically:
+- system prompt -> `-c instructions="<prompt>"`
+- MCP bridge command -> `-c mcp_servers.workbridge.command="<exe>"`
+- MCP bridge args -> `-c mcp_servers.workbridge.args=[...]`
+- permissions -> `--full-auto` (interactive work-capable +
+  rebase gate) or omitted (review gate)
+
+No `CODEX_MCP_CONFIG`, `CODEX_CONFIG_FILE`, `CODEX_HOME`, or any
+other env var is touched. The only filesystem writes workbridge
+performs for a Codex session are under `std::env::temp_dir()`
+(the MCP config JSON, used by the on-disk parity path and by
+future harnesses; Codex itself does not read it).
 
 ## Reference Payloads (Claude)
 
@@ -843,10 +878,10 @@ update the Implementation Map section above.
 
 | File          | Line   | Mode        | Scope       | Thread     | Cwd                                       |
 |---------------|--------|-------------|-------------|------------|-------------------------------------------|
-| `src/app.rs`  | 5792   | Interactive | WorkItem    | Background | Work-item worktree                        |
-| `src/app.rs`  | 9990   | Headless RO | ReviewGate  | Background | inherited                                 |
-| `src/app.rs`  | 10397  | Headless RW | RebaseGate  | Background | Work-item worktree                        |
-| `src/app.rs`  | 11608  | Interactive | Global      | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
+| `src/app.rs`  | 5915   | Interactive | WorkItem    | Background | Work-item worktree                        |
+| `src/app.rs`  | 10337  | Headless RO | ReviewGate  | Background | inherited                                 |
+| `src/app.rs`  | 10779  | Headless RW | RebaseGate  | Background | Work-item worktree                        |
+| `src/app.rs`  | 12018  | Interactive | Global      | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
 
 The "Thread" column records which thread actually calls
 `Session::spawn` / `std::process::Command::output()`. All four
@@ -1120,6 +1155,37 @@ harness adapter is introduced, add a dated bullet here.
   unchanged (the three sites still exist at the same call
   sites; the trait-object used is now per-work-item rather than
   singleton).
+- 2026-04-16: Codex MCP injection fix + silent-fallback removal.
+  C4: the previous Codex shape `-c mcp_servers.workbridge.config=<path>`
+  is syntactically accepted by Codex but rejected at configuration
+  load time with "invalid transport in `mcp_servers.workbridge`"
+  (verified against the live `codex` CLI). Replaced with per-field
+  overrides built from a new `McpBridgeSpec` (command + args):
+  `-c mcp_servers.workbridge.command="<exe>"` and
+  `-c mcp_servers.workbridge.args=[...]`. RP1c / RP2c / RP2bc
+  updated. `SpawnConfig` and `ReviewGateSpawnConfig` grew a
+  `mcp_bridge` field so the structured spec flows from the
+  session-open worker (where `std::env::current_exe` already runs)
+  to the backend without round-tripping through JSON. Claude
+  ignores it and continues to consume `--mcp-config <path>`. New
+  test `codex_mcp_bridge_none_omits_workbridge_overrides` pins
+  the "degrade, do not fall back to `~/.codex/config.toml`"
+  contract. F-2: the `finish_session_open` and `begin_session_open`
+  paths previously resolved the per-work-item backend via
+  `backend_for_work_item(id).unwrap_or_else(|| self.agent_backend)`
+  which silently ran Claude even when the user had picked Codex
+  and restarted. CLAUDE.md grew an `[ABSOLUTE]` rule forbidding
+  that; the fallback was removed at both sites and at the global-
+  assistant path. Missing `harness_choice` now produces a user-
+  visible toast ("Cannot open session: no harness chosen...") and
+  aborts the spawn, matching `spawn_review_gate` / `spawn_rebase_gate`.
+  Regression test `stage_transition_without_harness_choice_surfaces_error`.
+  `finish_session_open` signature collapsed from 8 positional
+  arguments to a single `SessionOpenPlanResult` (clippy
+  too-many-arguments threshold). Known Spawn Sites table line
+  numbers refreshed: 5792 -> 5915 (work-item interactive),
+  9990 -> 10337 (review gate), 10397 -> 10779 (rebase gate),
+  11608 -> 12018 (global assistant).
 
 ## Reference Payloads (Codex)
 
@@ -1134,17 +1200,23 @@ Pinned by the `codex_*` tests in `src/agent_backend.rs`.
 ```
 codex
   --full-auto
-  --config mcp_servers.workbridge.config=/tmp/workbridge-mcp-config-<uuid>.json
-  --config instructions=<stage system prompt>
+  --config mcp_servers.workbridge.command="<workbridge exe path>"
+  --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<socket path>"]
+  --config instructions="<stage system prompt>"
   <auto-start user prompt (if any)>
 ```
 
 Differences from Claude's RP1:
 - `--full-auto` instead of `--dangerously-skip-permissions`.
-- `--config mcp_servers.workbridge.config=<path>` instead of
-  `--mcp-config <path>`.
-- `--config instructions=<prompt>` instead of `--system-prompt
-  <prompt>`.
+- Per-field MCP overrides instead of `--mcp-config <path>`: Codex's
+  TOML schema for `mcp_servers.<name>` requires `command` (string)
+  and `args` (array of strings) directly. There is no `.config=<path>`
+  sub-field that reads an external JSON - verified by running
+  `codex -c 'mcp_servers.workbridge.config="/tmp/fake.json"' mcp list`,
+  which fails with "invalid transport in `mcp_servers.workbridge`".
+- `--config instructions="<prompt>"` instead of `--system-prompt
+  <prompt>`; value is TOML-quoted so prompts containing quotes,
+  newlines, or equals signs survive the TOML parser.
 - No `--allowedTools` flag (allowlist enforced at MCP server).
 - No `--settings` flag for the planning hook (C8 workaround:
   embed reminder in system prompt).
@@ -1152,13 +1224,24 @@ Differences from Claude's RP1:
   the `--config` flags does NOT matter (unlike Claude where the
   positional must precede `--mcp-config`).
 
+Implementation note: the `mcp_config_path` field on `SpawnConfig`
+is still populated by the caller (it is consumed by Claude and by
+the on-disk config parity logging), but it is intentionally NOT
+referenced in Codex's argv - only the structured
+`SpawnConfig::mcp_bridge` field is. Callers that fail to start the
+MCP server (e.g. socket bind error) pass `mcp_bridge: None`; Codex
+then omits the `mcp_servers.workbridge.*` overrides entirely rather
+than falling back to `~/.codex/config.toml`, which would
+silently cross-contaminate the user's personal config.
+
 ### RP2c - Codex headless review-gate argv
 
 ```
 exec
   --json
-  --config instructions=<review gate system prompt>
-  --config mcp_servers.workbridge.config=/tmp/workbridge-mcp-config-<uuid>.json
+  --config instructions="<review gate system prompt>"
+  --config mcp_servers.workbridge.command="<workbridge exe path>"
+  --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<socket path>"]
   <review skill prompt (e.g. /claude-adversarial-review)>
 ```
 
@@ -1167,7 +1250,9 @@ mode is a separate subcommand. `--json` switches the event stream
 to newline-delimited JSON;
 `CodexBackend::parse_review_gate_stdout` keeps only the last
 `agent_message` event's `content` field and parses it as the
-verdict envelope body.
+verdict envelope body. The workbridge MCP bridge is registered via
+the per-field `mcp_servers.workbridge.command` / `.args` overrides
+(same rationale as RP1c).
 
 ### RP2bc - Codex headless rebase-gate argv
 
@@ -1176,11 +1261,14 @@ exec
   --json
   --full-auto
   --ask-for-approval never
-  --config mcp_servers.workbridge.config=/tmp/workbridge-mcp-config-<uuid>.json
+  --config mcp_servers.workbridge.command="<workbridge exe path>"
+  --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<socket path>"]
   <rebase instruction prompt>
 ```
 
 Adds `--full-auto` (write access) and `--ask-for-approval never`
 (suppress interactive prompts during conflict resolution). The
 latter has no direct Claude equivalent because
-`--dangerously-skip-permissions` already implies it.
+`--dangerously-skip-permissions` already implies it. The
+workbridge MCP bridge uses the per-field override shape as in
+RP1c / RP2c.
