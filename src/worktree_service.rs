@@ -509,15 +509,31 @@ impl WorktreeService for GitWorktreeService {
             Self::run_git(repo_path, &["worktree", "add", target_str, "-b", branch])
         };
 
-        if let Err(WorktreeError::GitError(ref msg)) = result
-            && msg.contains("is already used by worktree at")
-        {
-            let locked_at =
-                Self::parse_locked_worktree_path(msg).unwrap_or_else(|| PathBuf::from("(unknown)"));
-            return Err(WorktreeError::BranchLockedToWorktree {
-                branch: branch.to_string(),
-                locked_at,
-            });
+        // Detect two forms of "branch locked to existing worktree":
+        // 1. Target path already exists (stale worktree at the expected
+        //    location): "fatal: '<path>' already exists"
+        // 2. Branch checked out at a different path: "fatal: '<branch>'
+        //    is already used by worktree at '<path>'"
+        // Both mean a stale worktree is blocking creation. Case 1 is the
+        // common case (create_worktree always targets the canonical path,
+        // which is where the stale worktree sits).
+        if let Err(WorktreeError::GitError(ref msg)) = result {
+            let is_locked = msg.contains("is already used by worktree at");
+            let target_exists = msg.contains("already exists");
+            if is_locked || target_exists {
+                let locked_at = if is_locked {
+                    Self::parse_locked_worktree_path(msg)
+                } else {
+                    // "already exists" means the target dir itself is
+                    // the stale worktree.
+                    Some(target_dir.to_path_buf())
+                }
+                .unwrap_or_else(|| PathBuf::from("(unknown)"));
+                return Err(WorktreeError::BranchLockedToWorktree {
+                    branch: branch.to_string(),
+                    locked_at,
+                });
+            }
         }
         result?;
 
