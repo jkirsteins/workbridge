@@ -75,6 +75,38 @@ background thread or merely reused, and skip destructive
 `remove_worktree` calls on reused paths - they never owned that
 worktree in the first place.
 
+### Recovery from stale worktree (BranchLockedToWorktree)
+
+When `git worktree add` fails with "is already used by worktree at",
+the branch is locked to a worktree that `find_reusable_worktree` did
+not match. The most common cause is an interrupted rebase: the worktree
+is left mid-rebase with a detached HEAD, so its `branch` field in
+`git worktree list --porcelain` is absent and the reuse check skips it.
+
+When this error is detected, `create_worktree` returns a
+`BranchLockedToWorktree` variant containing the branch name and the
+path where git says the branch is locked. The caller routes this to a
+"Stale Worktree" modal dialog instead of the generic error alert.
+
+The dialog offers two choices:
+
+- **[r] Force-remove stale worktree & retry**: spawns a background
+  thread that runs `git worktree remove --force` on the stale path
+  (preserving the branch - only the worktree directory and git
+  bookkeeping are removed), then `git worktree prune`, then retries
+  `git worktree add`. A modal spinner blocks all input during recovery.
+  Uncommitted changes in the stale worktree are lost - the dialog warns
+  about this. Cleanup errors from the force-remove and prune steps are
+  collected and surfaced in the failure message if the retry also fails.
+- **[Esc] Dismiss**: closes the dialog, leaving the work item without a
+  worktree. The user can retry later.
+
+The recovery reuses `UserActionKey::WorktreeCreate` and
+`poll_worktree_creation`, so the same single-flight guard and polling
+infrastructure handles results. The `open_session` flag is carried
+through from the original request so import-triggered recoveries do not
+spuriously open a Claude session.
+
 ### Auto-create on session spawn
 
 When a session is spawned for a work item that has a branch but no worktree,

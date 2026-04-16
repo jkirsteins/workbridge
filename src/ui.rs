@@ -308,18 +308,18 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
             },
         );
     } else if let Some(ref prompt) = app.stale_worktree_prompt {
-        let body = format!(
-            "{}\n\nWarning: uncommitted changes in the stale worktree will be lost.",
-            prompt.error
-        );
         draw_prompt_dialog(
             buf,
             theme,
             area,
             PromptDialogKind::KeyChoice {
                 title: "Stale Worktree",
-                body: &body,
+                body: &prompt.error,
                 options: &[
+                    (
+                        "",
+                        "Uncommitted changes in the stale worktree will be lost.",
+                    ),
                     ("[r]", "Force-remove stale worktree & retry"),
                     ("[Esc]", "Dismiss"),
                 ],
