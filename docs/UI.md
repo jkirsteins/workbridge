@@ -34,6 +34,62 @@ Event handlers return `Control<AppEvent>`:
 - `Control::Changed` - trigger a re-render
 - `Control::Quit` - exit the application
 
+### Paste handling
+
+`crossterm::event::Event::Paste` is delivered by the terminal when
+bracketed paste is enabled. Modern terminal emulators (macOS
+Terminal.app / iTerm2 / WezTerm / Ghostty, Windows Terminal, Linux
+GNOME Terminal / Konsole / Alacritty / kitty) enable it by default.
+The terminal emulator owns the Cmd+V / Ctrl+V / Ctrl+Shift+V keyboard
+mapping, as well as drag-and-drop, "Paste" context menu items, and OSC
+52 injection; workbridge never sees the modifier+key chord itself,
+only the resulting `Event::Paste` payload.
+
+`event::handle_paste` (`src/event.rs`) decides where the payload lands
+based on modal state:
+
+1. If the app is `shutting_down`, the paste is dropped (returns
+   `false`).
+2. If any modal overlay is up (`any_modal_visible` returns `true`),
+   the paste is routed to the focused text input inside that modal
+   via `route_paste_to_modal_input`. The precedence order mirrors
+   `handle_key` exactly so paste and key events never diverge:
+   set-branch dialog -> rework prompt -> cleanup reason input ->
+   settings review-skill input (editing mode only) -> create dialog
+   per-focus (Title / Description / Branch / Repos).
+3. If no modal is up, the payload is wrapped in the bracketed-paste
+   markers `\x1b[200~...\x1b[201~` and written to the focused PTY
+   (global drawer PTY when the drawer is open, otherwise the right
+   panel's active tab).
+
+For every single-line `rat_widget::text_input::TextInputState` target
+the payload is first passed through `flatten_paste_for_single_line`,
+which replaces `\r\n`, `\n`, and `\r` with a single space each (CRLF
+is collapsed first so a CRLF does not produce two spaces). The
+Description field is a multi-line `rat_widget::textarea::TextAreaState`
+and receives the payload verbatim, so newlines in a pasted payload
+land as real line breaks.
+
+Pasting into the Branch field also sets
+`create_dialog.branch_user_edited = true`, matching the typing
+behavior, so a subsequent Tab off Title cannot overwrite the pasted
+branch via `auto_fill_branch`. Pasting into Title does NOT auto-fill
+Branch on its own; auto-fill only runs on Tab off Title. Pasting into
+a modal focus that has no text input (the Repos checkbox area in the
+create dialog, the merge-strategy / delete / no-plan / branch-gone /
+stale-worktree / cleanup confirmation prompts, in-progress spinners,
+alert messages) is a silent no-op: the paste is dropped and no leak
+reaches the PTY.
+
+Returning `true` from `handle_paste` triggers a re-render (see
+`src/salsa.rs` paste arm); returning `false` skips it.
+
+Adding or modifying a TUI text input without wiring it into
+`route_paste_to_modal_input`, or removing paste support from an
+existing input, is a P1 (default-overridable) review finding - see
+`CLAUDE.md` "Severity overrides". A session authorization naming the
+specific field and rationale is required to ship an exception.
+
 ### Mouse Events
 
 Mouse capture is enabled so the terminal forwards mouse events to the
