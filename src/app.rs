@@ -2820,6 +2820,20 @@ impl App {
         // session. Removing the pending entry here ends the
         // "Spawning agent session..." spinner immediately.
         if let Some(pending) = self.session_spawn_rx.remove(wi_id) {
+            // If the Phase 2 worker already sent a result, drain it
+            // so Session::Drop and McpSocketServer::Drop do not run
+            // on the UI thread when the receiver is dropped.
+            if let Ok(result) = pending.rx.try_recv() {
+                if let Some(server) = result.mcp_server {
+                    self.drop_mcp_server_off_thread(server);
+                }
+                self.spawn_agent_file_cleanup(result.written_files);
+                // Session::Drop must also run off the UI thread -
+                // it kills/joins the child process.
+                if let Some(session) = result.session {
+                    std::thread::spawn(move || drop(session));
+                }
+            }
             self.end_activity(pending.activity);
         }
     }
@@ -2858,6 +2872,16 @@ impl App {
         }
         if let Some(pending) = self.global_session_open_pending.take() {
             pending.cancelled.store(true, Ordering::Release);
+            // Drain any queued result so its handles are disposed
+            // off the UI thread.
+            if let Ok(result) = pending.rx.try_recv() {
+                if let Some(server) = result.mcp_server {
+                    self.drop_mcp_server_off_thread(server);
+                }
+                if let Some(session) = result.session {
+                    std::thread::spawn(move || drop(session));
+                }
+            }
             self.end_activity(pending.activity);
             files_to_clean.push(pending.config_path);
         }
@@ -2865,11 +2889,17 @@ impl App {
         for wi_id in pending_wi_ids {
             if let Some(entry) = self.session_open_rx.remove(&wi_id) {
                 entry.cancelled.store(true, Ordering::Release);
+                // Drain any queued result so its MCP server is
+                // disposed off the UI thread.
+                if let Ok(result) = entry.rx.try_recv()
+                    && let Some(server) = result.server
+                {
+                    self.drop_mcp_server_off_thread(server);
+                }
                 self.end_activity(entry.activity);
                 // Drain side-car files the worker already wrote.
-                // Symmetric
-                // with `cancel_session_open_entry`'s cleanup so
-                // shutdown does not leak them.
+                // Symmetric with `cancel_session_open_entry`'s
+                // cleanup so shutdown does not leak them.
                 if let Ok(mut guard) = entry.committed_files.lock() {
                     files_to_clean.extend(guard.drain(..));
                 }
@@ -5571,6 +5601,15 @@ impl App {
     fn cancel_session_open_entry(&mut self, wi_id: &WorkItemId) {
         if let Some(entry) = self.session_open_rx.remove(wi_id) {
             entry.cancelled.store(true, Ordering::Release);
+            // If the worker already sent a result before we set
+            // cancelled, drain it so the MCP server's Drop (which
+            // calls std::fs::remove_file) does not run on the UI
+            // thread when the receiver is dropped.
+            if let Ok(result) = entry.rx.try_recv()
+                && let Some(server) = result.server
+            {
+                self.drop_mcp_server_off_thread(server);
+            }
             // Drain any side-car files the worker has already
             // committed to disk. The lock is held briefly inside
             // `Mutex::lock().unwrap()` - effectively wait-free
@@ -11384,6 +11423,17 @@ impl App {
         let mut files_to_clean: Vec<PathBuf> = Vec::new();
         if let Some(pending) = self.global_session_open_pending.take() {
             pending.cancelled.store(true, Ordering::Release);
+            // If the worker already sent a result, drain it so
+            // Session::Drop and McpSocketServer::Drop do not run
+            // on the UI thread when the receiver is dropped.
+            if let Ok(result) = pending.rx.try_recv() {
+                if let Some(server) = result.mcp_server {
+                    self.drop_mcp_server_off_thread(server);
+                }
+                if let Some(session) = result.session {
+                    std::thread::spawn(move || drop(session));
+                }
+            }
             self.end_activity(pending.activity);
             files_to_clean.push(pending.config_path);
         }
@@ -11393,8 +11443,16 @@ impl App {
         {
             session.kill();
         }
-        self.global_session = None;
-        self.global_mcp_server = None;
+        // Drop Session off the UI thread: its Drop can join the
+        // reader thread and kill the child.
+        if let Some(entry) = self.global_session.take() {
+            std::thread::spawn(move || drop(entry));
+        }
+        // Drop MCP server off the UI thread: its Drop unlinks the
+        // socket file.
+        if let Some(server) = self.global_mcp_server.take() {
+            self.drop_mcp_server_off_thread(server);
+        }
         if let Some(path) = self.global_mcp_config_path.take() {
             files_to_clean.push(path);
         }
@@ -11688,16 +11746,16 @@ impl App {
         match recv_result {
             Ok(result) => {
                 if let Some(err) = result.error {
-                    // Worker reported a fatal error. Any handles it
-                    // created (mcp_server) are dropped here, which
-                    // triggers their shutdown sequences. The config
-                    // path committed on the UI thread may or may
-                    // not have been written before the failure;
-                    // route it through `spawn_agent_file_cleanup`
-                    // which tolerates ENOENT so both arms are
-                    // symmetric.
-                    drop(result.mcp_server);
-                    drop(result.session);
+                    // Worker reported a fatal error. Drop MCP server
+                    // and session off the UI thread so their
+                    // destructors (socket unlink, child kill/join)
+                    // do not block the event loop.
+                    if let Some(server) = result.mcp_server {
+                        self.drop_mcp_server_off_thread(server);
+                    }
+                    if let Some(session) = result.session {
+                        std::thread::spawn(move || drop(session));
+                    }
                     self.spawn_agent_file_cleanup(vec![pending.config_path]);
                     self.status_message = Some(err);
                     self.global_drawer_open = false;
