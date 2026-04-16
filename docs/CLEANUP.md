@@ -1,7 +1,7 @@
 # Cleanup and Shutdown Behavior
 
 For the agent-backend-specific side-car files written on spawn (e.g.
-Claude Code's worktree `.mcp.json`, the `--mcp-config` tempfile) and
+the `--mcp-config` tempfile, or future backend config files) and
 how they are reversed via `AgentBackend::cleanup_session_files` on
 work-item deletion, see `docs/harness-contract.md` C4 and the C10
 lifecycle section. This file only covers the OS-level signal dance
