@@ -5547,7 +5547,7 @@ impl App {
                 }
             }
 
-            let _ = tx.send(SessionOpenPlanResult {
+            let result = SessionOpenPlanResult {
                 wi_id: wi_id_clone,
                 cwd: cwd_clone,
                 plan_text,
@@ -5557,7 +5557,22 @@ impl App {
                 written_files,
                 mcp_config_path: mcp_config_path_out,
                 mcp_config_error,
-            });
+            };
+            if let Err(crossbeam_channel::SendError(result)) = tx.send(result) {
+                // Receiver was dropped (work item deleted or app
+                // shutting down). The main thread's cancellation
+                // cleanup may have run before we wrote the config,
+                // so the file might still be on disk. Clean up
+                // directly since we're already on a background
+                // thread.
+                for path in &result.written_files {
+                    let _ = std::fs::remove_file(path);
+                }
+                if let Some(path) = &result.mcp_config_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                // MCP server Drop runs here (background thread).
+            }
         });
         // Surface immediate feedback so a slow background phase does
         // not make the TUI look hung between the Enter keypress and
@@ -5877,11 +5892,13 @@ impl App {
                     self.status_message =
                         Some("Right panel focused - press Ctrl+] to return".into());
                 }
-                (Some(_session), _) => {
+                (Some(session), _) => {
                     // Work item was deleted or stage changed while
-                    // the spawn was in flight. The session's Drop
-                    // kills the child; drop MCP server off the UI
-                    // thread so its socket unlink doesn't block.
+                    // the spawn was in flight. Drop both the session
+                    // and MCP server off the UI thread: Session::Drop
+                    // kills/joins the child, McpSocketServer::Drop
+                    // unlinks the socket.
+                    std::thread::spawn(move || drop(session));
                     if let Some(server) = result.mcp_server {
                         self.drop_mcp_server_off_thread(server);
                     }
@@ -11659,6 +11676,11 @@ impl App {
             // is idempotent and handles the case where the OS tmp
             // cleaner has wiped the directory since the last spawn.
             if worker_cancelled.load(Ordering::Acquire) {
+                // The main thread's cleanup may have already run
+                // (and found a non-existent file) before we wrote
+                // the config. Remove it here so the file is not
+                // orphaned.
+                let _ = std::fs::remove_file(&worker_config_path);
                 drop(mcp_server);
                 return;
             }
@@ -11696,6 +11718,7 @@ impl App {
             // thread. Last cancellation check: skip the fork+exec
             // if the drawer was closed while we were in Phase C/D.
             if worker_cancelled.load(Ordering::Acquire) {
+                let _ = std::fs::remove_file(&worker_config_path);
                 drop(mcp_server);
                 return;
             }
