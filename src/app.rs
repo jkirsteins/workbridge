@@ -1015,6 +1015,36 @@ pub(crate) struct DeleteCleanupInfo {
 /// `Session::spawn` fork+exec off to a Phase 2 background thread (see
 /// `SessionSpawnResult` / `poll_session_spawns`). See `docs/UI.md`
 /// "Blocking I/O Prohibition" and `docs/harness-contract.md` C4 / C10.
+/// Bundle of MCP-injection inputs threaded through
+/// `App::build_agent_cmd_with`. Bundling keeps that helper's argument
+/// count below clippy's `too_many_arguments` cap and lets every caller
+/// see the three MCP fields together (instead of as three sibling
+/// positional arguments that are easy to swap by mistake).
+///
+/// All three fields are borrows because the helper is a pure function
+/// of its inputs and writes nothing into `App`. The `'a` lifetime is
+/// the shorter of every borrowed view; in practice all three borrows
+/// come from the same `SessionOpenPlanResult`-derived local state in
+/// `finish_session_open`.
+pub struct McpInjection<'a> {
+    /// Path to the temp `--mcp-config` JSON the worker thread wrote.
+    /// `None` when the worker could not stage the file (server start
+    /// failed, exe-path resolution failed, write failed); the backend
+    /// degrades cleanly and skips the flag.
+    pub config_path: Option<&'a std::path::Path>,
+    /// Structured spec for the workbridge MCP bridge (used by Codex
+    /// per-key `-c` overrides). Mirrors `config_path` for harnesses
+    /// that consume it via JSON; `None` when degraded.
+    pub primary_bridge: Option<&'a crate::agent_backend::McpBridgeSpec>,
+    /// Per-repo user-configured MCP servers from
+    /// `Config::mcp_servers_for_repo`, already converted into
+    /// `McpBridgeSpec` shape. Codex emits one `-c
+    /// mcp_servers.<name>.*` pair per entry; Claude consumes them via
+    /// the JSON file at `config_path`. Empty when the work item is not
+    /// associated with a repo, or the repo has no extra servers.
+    pub extra_bridges: &'a [crate::agent_backend::McpBridgeSpec],
+}
+
 pub struct SessionOpenPlanResult {
     /// The work item the session is being opened for.
     pub wi_id: WorkItemId,
@@ -1055,6 +1085,18 @@ pub struct SessionOpenPlanResult {
     /// to start or `std::env::current_exe` failed. See
     /// `agent_backend::McpBridgeSpec` for the shape and rationale.
     pub mcp_bridge: Option<crate::agent_backend::McpBridgeSpec>,
+    /// Per-repo user-configured MCP servers (from
+    /// `Config::mcp_servers_for_repo`), already converted into
+    /// `McpBridgeSpec` shape so Codex can emit one `-c
+    /// mcp_servers.<name>.command` / `mcp_servers.<name>.args` pair
+    /// per entry. Claude consumes the same list via the JSON written
+    /// to `mcp_config_path` (workbridge already passes
+    /// `repo_mcp_servers` into `crate::mcp::build_mcp_config`); the
+    /// structured copy here is what makes per-repo MCP servers
+    /// visible to Codex sessions, which have no `--mcp-config` flag.
+    /// HTTP-transport entries (Codex has no `mcp_servers.<name>.url`
+    /// schema) are filtered out at construction time.
+    pub extra_mcp_bridges: Vec<crate::agent_backend::McpBridgeSpec>,
     /// Non-fatal MCP config / side-car file write error. Surfaced to
     /// the user via the status bar but does not abort the spawn.
     pub mcp_config_error: Option<String>,
@@ -5599,6 +5641,29 @@ impl App {
             let mut written_files: Vec<PathBuf> = Vec::new();
             let mut mcp_config_path_out: Option<PathBuf> = None;
             let mut mcp_bridge_out: Option<crate::agent_backend::McpBridgeSpec> = None;
+            // Convert each per-repo `McpServerEntry` into an
+            // `McpBridgeSpec` so Codex can emit one `-c
+            // mcp_servers.<name>.*` pair per entry. Skip HTTP-transport
+            // entries: Codex's `mcp_servers.<name>` schema requires
+            // command + args (no `url` sub-field), so an HTTP entry
+            // would produce a malformed override. Claude still sees
+            // HTTP entries via the JSON written into `mcp_config_path`.
+            // Skip stdio entries with no `command` (defensive against
+            // hand-edited config); they cannot spawn anything.
+            let extra_mcp_bridges: Vec<crate::agent_backend::McpBridgeSpec> = repo_mcp_servers
+                .iter()
+                .filter(|entry| entry.server_type != "http")
+                .filter_map(|entry| {
+                    entry
+                        .command
+                        .as_ref()
+                        .map(|cmd| crate::agent_backend::McpBridgeSpec {
+                            name: entry.name.clone(),
+                            command: PathBuf::from(cmd),
+                            args: entry.args.clone(),
+                        })
+                })
+                .collect();
             let mut mcp_config_error: Option<String> = None;
             if let Some(ref server) = server
                 && !worker_cancelled.load(Ordering::Acquire)
@@ -5618,6 +5683,7 @@ impl App {
                         // `crate::mcp::build_mcp_config` writes into
                         // the `workbridge` key of the JSON.
                         mcp_bridge_out = Some(crate::agent_backend::McpBridgeSpec {
+                            name: "workbridge".to_string(),
                             command: exe.clone(),
                             args: vec![
                                 "--mcp-bridge".to_string(),
@@ -5690,6 +5756,7 @@ impl App {
                 written_files,
                 mcp_config_path: mcp_config_path_out,
                 mcp_bridge: mcp_bridge_out,
+                extra_mcp_bridges,
                 mcp_config_error,
             };
             if let Err(crossbeam_channel::SendError(result)) = tx.send(result) {
@@ -5874,6 +5941,7 @@ impl App {
             written_files,
             mcp_config_path,
             mcp_bridge,
+            extra_mcp_bridges,
             // The callers of `finish_session_open` surface these
             // three to the status bar before this function runs, so
             // we deliberately do not re-read them here.
@@ -5936,8 +6004,11 @@ impl App {
             wi_backend.as_ref(),
             work_item_status,
             system_prompt.as_deref(),
-            mcp_config_path.as_deref(),
-            mcp_bridge.as_ref(),
+            McpInjection {
+                config_path: mcp_config_path.as_deref(),
+                primary_bridge: mcp_bridge.as_ref(),
+                extra_bridges: &extra_mcp_bridges,
+            },
             has_gate_findings,
         );
 
@@ -6294,8 +6365,11 @@ impl App {
             self.agent_backend.as_ref(),
             status,
             system_prompt,
-            mcp_config_path,
-            None,
+            McpInjection {
+                config_path: mcp_config_path,
+                primary_bridge: None,
+                extra_bridges: &[],
+            },
             force_auto_start,
         )
     }
@@ -6310,16 +6384,16 @@ impl App {
         backend: &dyn AgentBackend,
         status: WorkItemStatus,
         system_prompt: Option<&str>,
-        mcp_config_path: Option<&std::path::Path>,
-        mcp_bridge: Option<&crate::agent_backend::McpBridgeSpec>,
+        mcp: McpInjection<'_>,
         force_auto_start: bool,
     ) -> Vec<String> {
         let auto_start_message = self.auto_start_message_for_stage(status, force_auto_start);
         let cfg = SpawnConfig {
             stage: status,
             system_prompt,
-            mcp_config_path,
-            mcp_bridge,
+            mcp_config_path: mcp.config_path,
+            mcp_bridge: mcp.primary_bridge,
+            extra_bridges: mcp.extra_bridges,
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: auto_start_message.as_deref(),
             read_only: false,
@@ -10054,6 +10128,30 @@ impl App {
             }
         };
 
+        // Resolve per-repo MCP servers up-front (UI thread) and convert
+        // them into `McpBridgeSpec` so the headless review gate can pass
+        // them through to Codex via per-key `-c` overrides alongside the
+        // workbridge bridge. HTTP entries are skipped because Codex's
+        // `mcp_servers.<name>` schema requires command + args.
+        let review_extra_bridges: Vec<crate::agent_backend::McpBridgeSpec> = {
+            let repo_display = crate::config::collapse_home(&repo_path);
+            self.config
+                .mcp_servers_for_repo(&repo_display)
+                .into_iter()
+                .filter(|entry| entry.server_type != "http")
+                .filter_map(|entry| {
+                    entry
+                        .command
+                        .as_ref()
+                        .map(|cmd| crate::agent_backend::McpBridgeSpec {
+                            name: entry.name.clone(),
+                            command: PathBuf::from(cmd),
+                            args: entry.args.clone(),
+                        })
+                })
+                .collect()
+        };
+
         // Status-bar activity for the review gate. Per `docs/UI.md`
         // "Activity indicator placement", review gates are
         // system-initiated background work and must own a status-bar
@@ -10353,6 +10451,7 @@ impl App {
                 return;
             }
             let rg_bridge = crate::agent_backend::McpBridgeSpec {
+                name: "workbridge".to_string(),
                 command: exe_path.clone(),
                 args: vec![
                     "--mcp-bridge".to_string(),
@@ -10372,6 +10471,7 @@ impl App {
                 json_schema,
                 mcp_config_path: &config_path,
                 mcp_bridge: &rg_bridge,
+                extra_bridges: &review_extra_bridges,
             };
             let rg_argv = agent_backend.build_review_gate_command(&rg_cfg);
 
@@ -10469,6 +10569,39 @@ impl App {
                 return;
             }
         };
+
+        // Resolve per-repo MCP servers up-front (UI thread) and convert
+        // them into `McpBridgeSpec` so the background harness sub-thread
+        // can pass them through to Codex via per-key `-c` overrides
+        // alongside the workbridge bridge. Computing here (rather than
+        // inside the thread) keeps `self.config` reads on the UI thread,
+        // matching how `begin_session_open` does it. HTTP entries are
+        // skipped: Codex's `mcp_servers.<name>` schema requires command
+        // + args. See `agent_backend::McpBridgeSpec`.
+        let rebase_extra_bridges: Vec<crate::agent_backend::McpBridgeSpec> = self
+            .work_items
+            .iter()
+            .find(|w| w.id == wi_id)
+            .and_then(|w| w.repo_associations.first())
+            .map(|assoc| {
+                let repo_display = crate::config::collapse_home(&assoc.repo_path);
+                self.config
+                    .mcp_servers_for_repo(&repo_display)
+                    .into_iter()
+                    .filter(|entry| entry.server_type != "http")
+                    .filter_map(|entry| {
+                        entry
+                            .command
+                            .as_ref()
+                            .map(|cmd| crate::agent_backend::McpBridgeSpec {
+                                name: entry.name.clone(),
+                                command: PathBuf::from(cmd),
+                                args: entry.args.clone(),
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Single-flight admission. The 500 ms debounce matches
         // `Ctrl+R`: rapid presses are intentionally coalesced.
@@ -10732,6 +10865,7 @@ impl App {
                 // overrides. Claude ignores it; see
                 // `agent_backend::McpBridgeSpec`.
                 let rebase_bridge = crate::agent_backend::McpBridgeSpec {
+                    name: "workbridge".to_string(),
                     command: exe_path.clone(),
                     args: vec![
                         "--mcp-bridge".to_string(),
@@ -10808,6 +10942,7 @@ impl App {
                     let cancelled = Arc::clone(&cancelled);
                     let agent_backend = Arc::clone(&agent_backend);
                     let bridge = rebase_bridge.clone();
+                    let extra_bridges = rebase_extra_bridges.clone();
                     std::thread::spawn(move || {
                         let rw_cfg = crate::agent_backend::ReviewGateSpawnConfig {
                             system_prompt: "",
@@ -10815,6 +10950,7 @@ impl App {
                             json_schema,
                             mcp_config_path: &config_path,
                             mcp_bridge: &bridge,
+                            extra_bridges: &extra_bridges,
                         };
                         let argv = agent_backend.build_headless_rw_command(&rw_cfg);
                         let mut cmd = std::process::Command::new(agent_backend.command_name());
@@ -11963,6 +12099,7 @@ impl App {
             };
             let mcp_config = crate::mcp::build_mcp_config(&exe, &mcp_server.socket_path, &[]);
             let global_bridge = crate::agent_backend::McpBridgeSpec {
+                name: "workbridge".to_string(),
                 command: exe.clone(),
                 args: vec![
                     "--mcp-bridge".to_string(),
@@ -12039,6 +12176,9 @@ impl App {
                 system_prompt: system_prompt.as_deref(),
                 mcp_config_path: Some(&worker_config_path),
                 mcp_bridge: Some(&global_bridge),
+                // Global assistant has no per-repo context, so no
+                // user-configured per-repo MCP servers to forward.
+                extra_bridges: &[],
                 allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
                 auto_start_message: None,
                 read_only: false,
@@ -21382,6 +21522,7 @@ mod tests {
             written_files: Vec::new(),
             mcp_config_path: None,
             mcp_bridge: None,
+            extra_mcp_bridges: Vec::new(),
             mcp_config_error: None,
         });
 

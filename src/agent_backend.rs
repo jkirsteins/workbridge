@@ -224,11 +224,11 @@ fn toml_quote_string_array(items: &[String]) -> String {
     out
 }
 
-/// Direct specification of the workbridge MCP bridge stdio server
-/// (command + args). Emitted alongside `mcp_config_path` because some
-/// harnesses (notably Codex) register MCP servers via structured CLI
-/// overrides that need the raw `command` and `args` fields rather than
-/// a pointer to an external JSON file.
+/// Direct specification of an MCP stdio server (name + command + args).
+/// Emitted alongside `mcp_config_path` because some harnesses (notably
+/// Codex) register MCP servers via structured CLI overrides that need
+/// the raw `command` and `args` fields rather than a pointer to an
+/// external JSON file.
 ///
 /// Codex's `-c mcp_servers.<name>.*` flag writes TOML overrides that
 /// populate `~/.codex/config.toml`-shaped state in memory, where each
@@ -238,6 +238,12 @@ fn toml_quote_string_array(items: &[String]) -> String {
 /// Claude's, not Codex's - so passing the JSON path to Codex is a
 /// silent no-op that spawns the session with no MCP server.
 ///
+/// The `name` field is the key under `mcp_servers.<name>` in the
+/// emitted overrides. The primary `mcp_bridge` always uses the
+/// reserved name `workbridge` (the workbridge MCP server itself);
+/// each entry in `extra_bridges` uses the user-configured server name
+/// from the per-repo MCP server list (`config.mcp_servers_for_repo`).
+///
 /// Claude does not need this struct - its `--mcp-config <file>` flag
 /// reads the JSON directly - but the struct is populated for both
 /// backends at every spawn site so a future backend with the same
@@ -245,11 +251,17 @@ fn toml_quote_string_array(items: &[String]) -> String {
 /// relevant `build_command` and does not need a new plumbing pass.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpBridgeSpec {
-    /// Absolute path to the binary that acts as the MCP bridge (today
-    /// the workbridge executable re-invoked with `--mcp-bridge`).
+    /// Server name under `mcp_servers.<name>` in the emitted Codex
+    /// override. The primary bridge uses `"workbridge"`; per-repo
+    /// extras use the user's configured name (`McpServerEntry::name`).
+    pub name: String,
+    /// Absolute path to the binary that acts as the MCP bridge (for
+    /// the primary bridge: the workbridge executable re-invoked with
+    /// `--mcp-bridge`; for extras: the user's configured `command`).
     pub command: PathBuf,
-    /// Argument vector for the bridge binary, including `--mcp-bridge`
-    /// and `--socket <path>` in the order the bridge expects.
+    /// Argument vector for the bridge binary. For the primary bridge:
+    /// `--mcp-bridge`, `--socket <path>` in the order the bridge
+    /// expects. For extras: the user-configured args.
     pub args: Vec<String>,
 }
 
@@ -283,6 +295,16 @@ pub struct SpawnConfig<'a> {
     /// agent cannot reach the workbridge MCP server, but the session
     /// is still visible so the user can dismiss it.
     pub mcp_bridge: Option<&'a McpBridgeSpec>,
+    /// Per-repo user-configured MCP servers (from
+    /// `Config::mcp_servers_for_repo`). Claude consumes these via the
+    /// `mcp_config_path` JSON file; Codex emits one set of per-field
+    /// `-c mcp_servers.<name>.*` overrides per entry, in addition to
+    /// the primary `mcp_bridge`. Empty when the work item is not
+    /// associated with a repo or the repo has no extra MCP servers
+    /// configured. HTTP-transport entries are filtered out by the
+    /// caller for Codex (Codex's `mcp_servers.<name>` schema requires
+    /// command + args; there is no `url` sub-field).
+    pub extra_bridges: &'a [McpBridgeSpec],
     /// Tool allowlist (C5). For Claude this is passed as a comma-joined
     /// argument to `--allowedTools`; the review-gate spawn path does NOT
     /// go through this struct, so this list is never empty in practice.
@@ -316,6 +338,12 @@ pub struct ReviewGateSpawnConfig<'a> {
     /// gate paths always have exe + socket in hand when they build the
     /// config; a backend that doesn't need the spec simply ignores it.
     pub mcp_bridge: &'a McpBridgeSpec,
+    /// Per-repo user-configured MCP servers (from
+    /// `Config::mcp_servers_for_repo`). Same semantics as
+    /// `SpawnConfig::extra_bridges`. Defaults to an empty slice for
+    /// gate spawns whose caller does not have a per-repo context
+    /// (e.g. global-assistant or unscoped review).
+    pub extra_bridges: &'a [McpBridgeSpec],
 }
 
 /// Verdict parsed from a headless review-gate session's stdout (RP5).
@@ -590,10 +618,13 @@ impl AgentBackend for ClaudeCodeBackend {
 ///   --config instructions="<sys>"
 ///   --config mcp_servers.workbridge.command="<exe>"
 ///   --config mcp_servers.workbridge.args=[...] <prompt>` (RP2c).
-/// - Headless read-write (rebase gate): `codex exec --json --full-auto
-///   --ask-for-approval never
+/// - Headless read-write (rebase gate): `codex --ask-for-approval never
+///   exec --json --full-auto
 ///   --config mcp_servers.workbridge.command="<exe>"
 ///   --config mcp_servers.workbridge.args=[...] <prompt>` (RP2bc).
+///   `--ask-for-approval` is a TOP-LEVEL flag and MUST precede `exec`
+///   (clap rejects it inside the `exec` subcommand). `--full-auto`
+///   stays inside `exec`.
 ///
 /// C4 note: earlier drafts used `mcp_servers.workbridge.config=<path>`
 /// pointing at the Claude-shaped JSON file. That shape is syntactically
@@ -611,27 +642,45 @@ impl AgentBackend for ClaudeCodeBackend {
 pub struct CodexBackend;
 
 impl CodexBackend {
-    /// Emit `--config mcp_servers.workbridge.*` overrides for the
-    /// workbridge MCP stdio bridge. Codex requires `command` (string)
-    /// and `args` (array of strings) at this path; there is no `config`
-    /// sub-field that reads an external JSON (the pattern used by
-    /// `--mcp-config` on the Claude side). Passing `None` silently
-    /// skips the flag so callers that are in a degraded-spawn path
-    /// (e.g. MCP socket bind failed) still produce a non-broken argv.
-    fn extend_mcp_bridge_argv(cmd: &mut Vec<String>, bridge: Option<&McpBridgeSpec>) {
-        let Some(bridge) = bridge else {
-            return;
-        };
+    /// Emit `--config mcp_servers.<name>.*` overrides for one MCP
+    /// stdio bridge (the workbridge primary or a per-repo extra).
+    /// Codex requires `command` (string) and `args` (array of strings)
+    /// at this path; there is no `config` sub-field that reads an
+    /// external JSON (the pattern used by `--mcp-config` on the Claude
+    /// side).
+    fn extend_one_mcp_bridge(cmd: &mut Vec<String>, bridge: &McpBridgeSpec) {
         cmd.push("--config".to_string());
         cmd.push(format!(
-            "mcp_servers.workbridge.command={}",
+            "mcp_servers.{}.command={}",
+            bridge.name,
             toml_quote_string(&bridge.command.to_string_lossy())
         ));
         cmd.push("--config".to_string());
         cmd.push(format!(
-            "mcp_servers.workbridge.args={}",
+            "mcp_servers.{}.args={}",
+            bridge.name,
             toml_quote_string_array(&bridge.args)
         ));
+    }
+
+    /// Emit overrides for the primary workbridge bridge (when present)
+    /// followed by every per-repo extra bridge in order. Passing
+    /// `primary: None` silently skips the workbridge overrides so
+    /// callers in a degraded-spawn path (e.g. MCP socket bind failed)
+    /// still produce a non-broken argv; extras are still emitted in
+    /// that case so user-configured per-repo servers remain available
+    /// even when the workbridge bridge itself is unavailable.
+    fn extend_mcp_bridge_argv(
+        cmd: &mut Vec<String>,
+        primary: Option<&McpBridgeSpec>,
+        extras: &[McpBridgeSpec],
+    ) {
+        if let Some(bridge) = primary {
+            Self::extend_one_mcp_bridge(cmd, bridge);
+        }
+        for extra in extras {
+            Self::extend_one_mcp_bridge(cmd, extra);
+        }
     }
 }
 
@@ -671,7 +720,7 @@ impl AgentBackend for CodexBackend {
         // (which would silently cross-contaminate personal config with
         // workbridge runtime state).
         let _ = cfg.mcp_config_path;
-        Self::extend_mcp_bridge_argv(&mut cmd, cfg.mcp_bridge);
+        Self::extend_mcp_bridge_argv(&mut cmd, cfg.mcp_bridge, cfg.extra_bridges);
         // C5: Codex has no per-tool CLI allowlist; the allowlist is
         // enforced at the MCP server layer (the same mechanism the
         // Claude review gate already uses). `allowed_tools` is accepted
@@ -715,24 +764,33 @@ impl AgentBackend for CodexBackend {
             "--config".to_string(),
             format!("instructions={}", toml_quote_string(cfg.system_prompt)),
         ];
-        Self::extend_mcp_bridge_argv(&mut cmd, Some(cfg.mcp_bridge));
+        Self::extend_mcp_bridge_argv(&mut cmd, Some(cfg.mcp_bridge), cfg.extra_bridges);
         cmd.push(cfg.initial_prompt.to_string());
         cmd
     }
 
     fn build_headless_rw_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
-        // Headless read-write: add `--full-auto` for write access and
-        // `--ask-for-approval never` to suppress interactive prompts
-        // during rebase conflict resolution. Parallels Claude's
-        // `--dangerously-skip-permissions`.
+        // Headless read-write: `--ask-for-approval never` is a TOP-LEVEL
+        // codex flag - it MUST come BEFORE the `exec` subcommand, or
+        // clap rejects the argv with "unexpected argument
+        // '--ask-for-approval' found" and the rebase gate fails before
+        // a single child token is produced. Verified live on
+        // 2026-04-16: `codex --ask-for-approval never exec --json
+        // --full-auto --skip-git-repo-check "echo hi"` produces a valid
+        // event stream, while `codex exec --json --full-auto
+        // --ask-for-approval never "echo hi"` fails immediately.
+        // `--full-auto` (write access) IS an `exec` subcommand flag and
+        // stays after `exec`. The combination parallels Claude's
+        // `--dangerously-skip-permissions` (which already implies "no
+        // approval prompts").
         let mut cmd = vec![
+            "--ask-for-approval".to_string(),
+            "never".to_string(),
             "exec".to_string(),
             "--json".to_string(),
             "--full-auto".to_string(),
-            "--ask-for-approval".to_string(),
-            "never".to_string(),
         ];
-        Self::extend_mcp_bridge_argv(&mut cmd, Some(cfg.mcp_bridge));
+        Self::extend_mcp_bridge_argv(&mut cmd, Some(cfg.mcp_bridge), cfg.extra_bridges);
         cmd.push(cfg.initial_prompt.to_string());
         cmd
     }
@@ -856,6 +914,7 @@ mod tests {
 
     fn fake_bridge() -> McpBridgeSpec {
         McpBridgeSpec {
+            name: "workbridge".to_string(),
             command: PathBuf::from("/opt/workbridge"),
             args: vec![
                 "--mcp-bridge".to_string(),
@@ -878,6 +937,7 @@ mod tests {
             system_prompt: Some("be helpful"),
             mcp_config_path: Some(&mcp_path),
             mcp_bridge: Some(&bridge),
+            extra_bridges: &[],
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: Some("Explain who you are and start working."),
             read_only: false,
@@ -899,6 +959,7 @@ mod tests {
             json_schema: "{}",
             mcp_config_path: &mcp_path,
             mcp_bridge: &bridge,
+            extra_bridges: &[],
         };
         let rg_argv = backend.build_review_gate_command(&rg_cfg);
         assert_eq!(rg_argv.first().map(String::as_str), Some("exec"));
@@ -911,9 +972,18 @@ mod tests {
             json_schema: r#"{"type":"object"}"#,
             mcp_config_path: &mcp_path,
             mcp_bridge: &bridge,
+            extra_bridges: &[],
         };
         let rw_argv = backend.build_headless_rw_command(&rw_cfg);
-        assert_eq!(rw_argv.first().map(String::as_str), Some("exec"));
+        // `--ask-for-approval` is a TOP-LEVEL Codex flag and MUST come
+        // before the `exec` subcommand; verifying first() covers both
+        // halves of the placement bug (RP2bc was previously emitting
+        // `exec --json --full-auto --ask-for-approval never ...` which
+        // codex rejects with "unexpected argument '--ask-for-approval'").
+        assert_eq!(
+            rw_argv.first().map(String::as_str),
+            Some("--ask-for-approval")
+        );
         assert!(
             rw_argv.iter().any(|s| s == "--full-auto"),
             "headless rw must include Codex's write-access flag"
@@ -937,6 +1007,7 @@ mod tests {
             system_prompt: Some("system prompt here"),
             mcp_config_path: Some(&mcp_path),
             mcp_bridge: Some(&bridge),
+            extra_bridges: &[],
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: Some("Explain who you are and start working."),
             read_only: false,
@@ -974,6 +1045,7 @@ mod tests {
             system_prompt: Some("blocked prompt"),
             mcp_config_path: Some(&mcp_path),
             mcp_bridge: Some(&bridge),
+            extra_bridges: &[],
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: false,
@@ -997,6 +1069,7 @@ mod tests {
             system_prompt: Some("prompt"),
             mcp_config_path: None,
             mcp_bridge: None,
+            extra_bridges: &[],
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: Some("Explain who you are and start working."),
             read_only: false,
@@ -1022,6 +1095,7 @@ mod tests {
             system_prompt: Some("ro prompt"),
             mcp_config_path: Some(&mcp_path),
             mcp_bridge: Some(&bridge),
+            extra_bridges: &[],
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: true,
@@ -1043,6 +1117,7 @@ mod tests {
             json_schema: r#"{"type":"object"}"#,
             mcp_config_path: &mcp_path,
             mcp_bridge: &bridge,
+            extra_bridges: &[],
         };
         let argv = backend.build_review_gate_command(&cfg);
         assert_eq!(argv[0], "--print");
@@ -1066,6 +1141,7 @@ mod tests {
             json_schema: r#"{"type":"object"}"#,
             mcp_config_path: &mcp_path,
             mcp_bridge: &bridge,
+            extra_bridges: &[],
         };
         let argv = backend.build_headless_rw_command(&cfg);
         assert!(
@@ -1107,6 +1183,7 @@ mod tests {
             system_prompt: Some("sys"),
             mcp_config_path: Some(&mcp_path),
             mcp_bridge: Some(&bridge),
+            extra_bridges: &[],
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: false,
@@ -1131,6 +1208,7 @@ mod tests {
             system_prompt: None,
             mcp_config_path: Some(&mcp_path),
             mcp_bridge: Some(&bridge),
+            extra_bridges: &[],
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: false,
@@ -1203,6 +1281,7 @@ mod tests {
             system_prompt: None,
             mcp_config_path: Some(&mcp_path),
             mcp_bridge: None,
+            extra_bridges: &[],
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: false,
@@ -1228,6 +1307,7 @@ mod tests {
             system_prompt: Some("be concise"),
             mcp_config_path: Some(&mcp_path),
             mcp_bridge: Some(&bridge),
+            extra_bridges: &[],
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: false,
@@ -1248,6 +1328,7 @@ mod tests {
             system_prompt: Some("sys"),
             mcp_config_path: Some(&mcp_path),
             mcp_bridge: Some(&bridge),
+            extra_bridges: &[],
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: Some("Explain who you are and start working."),
             read_only: false,
@@ -1271,6 +1352,7 @@ mod tests {
             system_prompt: Some("ro"),
             mcp_config_path: Some(&mcp_path),
             mcp_bridge: Some(&bridge),
+            extra_bridges: &[],
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: true,
@@ -1291,6 +1373,7 @@ mod tests {
             json_schema: "{}",
             mcp_config_path: &mcp_path,
             mcp_bridge: &bridge,
+            extra_bridges: &[],
         };
         let argv = CodexBackend.build_review_gate_command(&cfg);
         assert_eq!(argv[0], "exec");
@@ -1317,9 +1400,16 @@ mod tests {
         );
     }
 
-    /// Pins the headless rebase-gate shape: `codex exec --json
-    /// --full-auto --ask-for-approval never ...` with per-field
-    /// workbridge MCP overrides.
+    /// Pins the headless rebase-gate shape: `codex --ask-for-approval
+    /// never exec --json --full-auto ...` with per-field workbridge MCP
+    /// overrides. `--ask-for-approval` is a TOP-LEVEL codex flag and
+    /// MUST come BEFORE the `exec` subcommand; the live CLI rejects the
+    /// argv with "unexpected argument '--ask-for-approval' found" if
+    /// the flag appears after `exec`. `--full-auto` is an `exec`
+    /// subcommand flag and stays after `exec`. Verified live on
+    /// 2026-04-16 via `codex --ask-for-approval never exec --json
+    /// --full-auto --skip-git-repo-check "echo hi"`, which produced a
+    /// valid event stream.
     #[test]
     fn codex_headless_rw_includes_full_auto_and_approval_never() {
         let mcp_path = PathBuf::from("/tmp/rb.json");
@@ -1330,15 +1420,44 @@ mod tests {
             json_schema: "{}",
             mcp_config_path: &mcp_path,
             mcp_bridge: &bridge,
+            extra_bridges: &[],
         };
         let argv = CodexBackend.build_headless_rw_command(&cfg);
-        assert_eq!(argv[0], "exec");
-        assert!(argv.iter().any(|s| s == "--full-auto"));
-        // `--ask-for-approval never` must be passed as an adjacent pair.
-        let has_approval_never = argv
-            .windows(2)
-            .any(|w| w[0] == "--ask-for-approval" && w[1] == "never");
-        assert!(has_approval_never, "missing --ask-for-approval never");
+
+        // R2-F-1 regression: `--ask-for-approval` is parsed as a
+        // top-level flag by clap; placing it after `exec` is rejected.
+        let exec_idx = argv
+            .iter()
+            .position(|s| s == "exec")
+            .expect("exec subcommand must be present");
+        let approval_idx = argv
+            .iter()
+            .position(|s| s == "--ask-for-approval")
+            .expect("--ask-for-approval must be present");
+        assert!(
+            approval_idx < exec_idx,
+            "--ask-for-approval must come BEFORE the `exec` subcommand \
+             (codex rejects it as a subcommand flag); got {argv:?}"
+        );
+        // `--ask-for-approval never` must still be an adjacent pair.
+        assert_eq!(
+            argv.get(approval_idx + 1).map(String::as_str),
+            Some("never")
+        );
+
+        // `--full-auto` is an exec subcommand flag and MUST stay after
+        // `exec`. The reverse placement (top-level) is silently
+        // accepted by some codex builds but documented to belong to
+        // exec; keeping it inside exec preserves parity with RP1c.
+        let full_auto_idx = argv
+            .iter()
+            .position(|s| s == "--full-auto")
+            .expect("--full-auto must be present");
+        assert!(
+            full_auto_idx > exec_idx,
+            "--full-auto must come AFTER `exec`; got {argv:?}"
+        );
+
         assert!(
             argv.iter()
                 .any(|s| s.starts_with("mcp_servers.workbridge.command=")),
@@ -1349,6 +1468,110 @@ mod tests {
                 .any(|s| s.starts_with("mcp_servers.workbridge.args=")),
             "rebase gate argv must include mcp_servers.workbridge.args override, got {argv:?}"
         );
+    }
+
+    /// R2-F-2 regression: per-repo user-configured MCP servers
+    /// (`SpawnConfig::extra_bridges` / `ReviewGateSpawnConfig::extra_bridges`)
+    /// must be emitted as their own `--config mcp_servers.<name>.command`
+    /// / `mcp_servers.<name>.args` pair, in addition to the primary
+    /// workbridge bridge. Without this, Codex sessions silently lose
+    /// every per-repo MCP server the user has configured (Claude
+    /// sessions still see them via the `--mcp-config` JSON file). The
+    /// primary `workbridge` overrides MUST still be present.
+    #[test]
+    fn codex_mcp_bridge_extras_emit_per_key_overrides() {
+        let mcp_path = PathBuf::from("/tmp/extras.json");
+        let bridge = fake_bridge();
+        let extras = vec![
+            McpBridgeSpec {
+                name: "datadog".to_string(),
+                command: PathBuf::from("/usr/local/bin/datadog-mcp"),
+                args: vec!["--api-key".to_string(), "REDACTED".to_string()],
+            },
+            McpBridgeSpec {
+                name: "filesystem".to_string(),
+                command: PathBuf::from("npx"),
+                args: vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-filesystem".to_string(),
+                    "/tmp".to_string(),
+                ],
+            },
+        ];
+
+        // Interactive spawn: extras + primary all visible in argv.
+        let cfg = SpawnConfig {
+            stage: WorkItemStatus::Implementing,
+            system_prompt: Some("sys"),
+            mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
+            extra_bridges: &extras,
+            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+            auto_start_message: None,
+            read_only: false,
+        };
+        let argv = CodexBackend.build_command(&cfg);
+        for name in ["workbridge", "datadog", "filesystem"] {
+            let cmd_key = format!("mcp_servers.{name}.command=");
+            let args_key = format!("mcp_servers.{name}.args=");
+            assert!(
+                argv.iter().any(|s| s.starts_with(&cmd_key)),
+                "missing {cmd_key} override; got {argv:?}"
+            );
+            assert!(
+                argv.iter().any(|s| s.starts_with(&args_key)),
+                "missing {args_key} override; got {argv:?}"
+            );
+        }
+        // The datadog command override must quote the configured
+        // command path as a TOML basic string so values with special
+        // characters survive Codex's TOML parser.
+        let datadog_cmd = argv
+            .iter()
+            .find(|s| s.starts_with("mcp_servers.datadog.command="))
+            .unwrap();
+        assert!(
+            datadog_cmd.ends_with(r#""/usr/local/bin/datadog-mcp""#),
+            "datadog command override must be TOML-quoted, got {datadog_cmd:?}"
+        );
+
+        // Headless review gate also forwards extras (so adversarial
+        // reviews can call out to per-repo MCP servers like datadog).
+        let rg_cfg = ReviewGateSpawnConfig {
+            system_prompt: "sys",
+            initial_prompt: "/review",
+            json_schema: "{}",
+            mcp_config_path: &mcp_path,
+            mcp_bridge: &bridge,
+            extra_bridges: &extras,
+        };
+        let rg_argv = CodexBackend.build_review_gate_command(&rg_cfg);
+        for name in ["workbridge", "datadog", "filesystem"] {
+            let cmd_key = format!("mcp_servers.{name}.command=");
+            assert!(
+                rg_argv.iter().any(|s| s.starts_with(&cmd_key)),
+                "review gate missing {cmd_key}; got {rg_argv:?}"
+            );
+        }
+
+        // Headless rebase gate also forwards extras (rebase fixers may
+        // need per-repo tools).
+        let rw_cfg = ReviewGateSpawnConfig {
+            system_prompt: "",
+            initial_prompt: "rebase",
+            json_schema: "{}",
+            mcp_config_path: &mcp_path,
+            mcp_bridge: &bridge,
+            extra_bridges: &extras,
+        };
+        let rw_argv = CodexBackend.build_headless_rw_command(&rw_cfg);
+        for name in ["workbridge", "datadog", "filesystem"] {
+            let cmd_key = format!("mcp_servers.{name}.command=");
+            assert!(
+                rw_argv.iter().any(|s| s.starts_with(&cmd_key)),
+                "rebase gate missing {cmd_key}; got {rw_argv:?}"
+            );
+        }
     }
 
     /// Pins the event-stream parser: `codex exec --json` emits
@@ -1408,6 +1631,7 @@ mod tests {
             system_prompt: Some("sys"),
             mcp_config_path: Some(&mcp_path),
             mcp_bridge: Some(&bridge),
+            extra_bridges: &[],
             allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
             auto_start_message: None,
             read_only: false,
@@ -1421,6 +1645,7 @@ mod tests {
             json_schema: "{}",
             mcp_config_path: &mcp_path,
             mcp_bridge: &bridge,
+            extra_bridges: &[],
         };
         assert!(backend.build_review_gate_command(&rg_cfg).is_empty());
         assert!(backend.build_headless_rw_command(&rg_cfg).is_empty());

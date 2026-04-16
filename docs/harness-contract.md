@@ -878,10 +878,10 @@ update the Implementation Map section above.
 
 | File          | Line   | Mode        | Scope       | Thread     | Cwd                                       |
 |---------------|--------|-------------|-------------|------------|-------------------------------------------|
-| `src/app.rs`  | 5915   | Interactive | WorkItem    | Background | Work-item worktree                        |
-| `src/app.rs`  | 10337  | Headless RO | ReviewGate  | Background | inherited                                 |
-| `src/app.rs`  | 10779  | Headless RW | RebaseGate  | Background | Work-item worktree                        |
-| `src/app.rs`  | 12018  | Interactive | Global      | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
+| `src/app.rs`  | 5962   | Interactive | WorkItem    | Background | Work-item worktree                        |
+| `src/app.rs`  | 10435  | Headless RO | ReviewGate  | Background | inherited                                 |
+| `src/app.rs`  | 10914  | Headless RW | RebaseGate  | Background | Work-item worktree                        |
+| `src/app.rs`  | 12145  | Interactive | Global      | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
 
 The "Thread" column records which thread actually calls
 `Session::spawn` / `std::process::Command::output()`. All four
@@ -1098,9 +1098,15 @@ harness adapter is introduced, add a dated bullet here.
   - C3: `--full-auto` is the permission-bypass flag; omitted for
     read-only spawns per parity with Claude's
     `--dangerously-skip-permissions` convention.
-  - C4: MCP injection via `--config
-    mcp_servers.workbridge.config=<path>`, where `<path>` is the
-    temp JSON file the caller already wrote. No
+  - C4: MCP injection via per-field `--config
+    mcp_servers.workbridge.command="<exe>"` plus
+    `--config mcp_servers.workbridge.args=[...]`. Per-repo extras
+    from `Config::mcp_servers_for_repo` are forwarded as additional
+    `mcp_servers.<name>.{command,args}` pairs (one set per entry,
+    threaded through `SpawnConfig::extra_bridges` /
+    `ReviewGateSpawnConfig::extra_bridges`). HTTP-transport entries
+    are filtered out at the spawn site because Codex's TOML schema
+    has no `mcp_servers.<name>.url` field. No
     `~/.codex/config.toml` mutation (file-injection rule).
   - C5: no CLI allowlist; enforced at the MCP server layer
     (same mechanism as Claude's review gate).
@@ -1186,6 +1192,33 @@ harness adapter is introduced, add a dated bullet here.
   numbers refreshed: 5792 -> 5915 (work-item interactive),
   9990 -> 10337 (review gate), 10397 -> 10779 (rebase gate),
   11608 -> 12018 (global assistant).
+- 2026-04-16 (round 2): Codex rebase-gate argv placement fix +
+  per-repo MCP server parity. RP2bc previously emitted
+  `exec --json --full-auto --ask-for-approval never ...`, which
+  the `codex` CLI rejects with `error: unexpected argument
+  '--ask-for-approval' found` (verified live). The flag is parsed
+  as a TOP-LEVEL `codex` flag and MUST come BEFORE the `exec`
+  subcommand; `--full-auto` is an `exec`-subcommand flag and stays
+  inside `exec`. `build_headless_rw_command` rearranged accordingly;
+  `codex_headless_rw_includes_full_auto_and_approval_never` updated
+  to assert the new placement; RP2bc updated. The interactive path
+  (`build_command`) and review-gate path (`build_review_gate_command`)
+  do not use `--ask-for-approval` and were unaffected. Per-repo
+  MCP servers from `Config::mcp_servers_for_repo` were silently
+  dropped for Codex sessions in round 1 (Claude consumed them via
+  `--mcp-config <file>`, but Codex's argv only emitted the workbridge
+  primary). `McpBridgeSpec` grew a `name` field and
+  `SpawnConfig` / `ReviewGateSpawnConfig` grew an
+  `extra_bridges: &[McpBridgeSpec]` field. The work-item, review-
+  gate, and rebase-gate spawn sites now resolve per-repo MCP servers
+  on the UI thread, filter out HTTP-transport entries (Codex has no
+  `mcp_servers.<name>.url` schema), and forward the rest. RP1c /
+  RP2c / RP2bc updated with `[--config mcp_servers.<extra>.*]`
+  placeholders. Regression test
+  `codex_mcp_bridge_extras_emit_per_key_overrides`. Function arg
+  count of `build_agent_cmd_with` collapsed via a new
+  `McpInjection<'a>` bundle struct (config_path + primary_bridge +
+  extra_bridges) to stay under the clippy threshold.
 
 ## Reference Payloads (Codex)
 
@@ -1202,6 +1235,8 @@ codex
   --full-auto
   --config mcp_servers.workbridge.command="<workbridge exe path>"
   --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<socket path>"]
+  [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
+  [--config mcp_servers.<extra>.args=[...]      ]
   --config instructions="<stage system prompt>"
   <auto-start user prompt (if any)>
 ```
@@ -1242,6 +1277,8 @@ exec
   --config instructions="<review gate system prompt>"
   --config mcp_servers.workbridge.command="<workbridge exe path>"
   --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<socket path>"]
+  [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
+  [--config mcp_servers.<extra>.args=[...]      ]
   <review skill prompt (e.g. /claude-adversarial-review)>
 ```
 
@@ -1257,18 +1294,41 @@ the per-field `mcp_servers.workbridge.command` / `.args` overrides
 ### RP2bc - Codex headless rebase-gate argv
 
 ```
+--ask-for-approval never
 exec
   --json
   --full-auto
-  --ask-for-approval never
   --config mcp_servers.workbridge.command="<workbridge exe path>"
   --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<socket path>"]
+  [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
+  [--config mcp_servers.<extra>.args=[...]      ]
   <rebase instruction prompt>
 ```
 
-Adds `--full-auto` (write access) and `--ask-for-approval never`
-(suppress interactive prompts during conflict resolution). The
-latter has no direct Claude equivalent because
-`--dangerously-skip-permissions` already implies it. The
-workbridge MCP bridge uses the per-field override shape as in
-RP1c / RP2c.
+`--ask-for-approval` is a TOP-LEVEL `codex` flag and MUST come BEFORE
+the `exec` subcommand. Verified live on 2026-04-16 by running each
+shape against the installed `codex` CLI:
+
+- `codex --ask-for-approval never exec --json --full-auto
+  --skip-git-repo-check "echo hi"` -> valid event stream.
+- `codex exec --json --full-auto --ask-for-approval never "echo hi"`
+  -> `error: unexpected argument '--ask-for-approval' found`.
+
+This pinning lives in `codex_headless_rw_includes_full_auto_and_approval_never`
+in `src/agent_backend.rs`.
+
+`--full-auto` (write access) IS an `exec` subcommand flag and stays
+inside `exec`. The combination parallels Claude's
+`--dangerously-skip-permissions`, which already implies "no approval
+prompts" so Claude needs no separate flag.
+
+Each `mcp_servers.<extra>.*` pair is rendered for one entry of
+`SpawnConfig::extra_bridges` / `ReviewGateSpawnConfig::extra_bridges`
+in addition to the workbridge primary. The list is populated from
+`Config::mcp_servers_for_repo` at the spawn site (see
+`begin_session_open` and `spawn_rebase_gate` / `spawn_review_gate`),
+mirroring the `extra_servers` slice that the Claude side already
+threads into `crate::mcp::build_mcp_config`. HTTP-transport entries
+are filtered out because Codex's `mcp_servers.<name>` schema requires
+command + args (no `url` sub-field). Missing extras render as zero
+overrides; the workbridge primary is unaffected.
