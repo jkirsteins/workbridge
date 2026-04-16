@@ -209,6 +209,41 @@ fn toml_quote_string(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""))
 }
 
+/// Render a TOML key fragment so that names containing characters
+/// outside the bare-key alphabet do not break Codex's TOML parser.
+///
+/// Codex's `-c key=value` flag interprets the LHS as a sequence of
+/// dot-separated TOML key fragments (e.g. `mcp_servers.workbridge.command`).
+/// TOML bare keys are restricted to `A-Z a-z 0-9 _ -`; any other
+/// character (including `.`, space, quote, bracket, non-ASCII)
+/// either re-splits the key under a different path (the dot case)
+/// or aborts the parse outright. The `mcp import` path
+/// (`workbridge mcp import`, see `src/main.rs`) takes server names
+/// from JSON object keys verbatim with no validation, so an
+/// arbitrary string can reach this code.
+///
+/// If `name` is non-empty and consists entirely of bare-key
+/// characters, return it as-is so the rendered argv stays
+/// human-readable. Otherwise emit a TOML quoted key (double-quoted,
+/// with `"`, `\`, and control characters escaped per TOML's basic
+/// string rules). Empty names always quote (TOML rejects empty
+/// bare keys).
+fn toml_quote_key(name: &str) -> String {
+    let bare_safe = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if bare_safe {
+        return name.to_string();
+    }
+    // Quoted keys share TOML basic-string escape rules with quoted
+    // values, so the existing `toml_quote_string` helper produces a
+    // valid quoted key (it returns a JSON-encoded string, which is a
+    // subset of TOML basic strings for the characters we care about
+    // here: `"` -> `\"`, `\` -> `\\`, control characters as `\uXXXX`).
+    toml_quote_string(name)
+}
+
 /// Render a slice of strings as a TOML inline array of quoted strings
 /// (e.g. `["--mcp-bridge","--socket","/tmp/s"]`). Used for the
 /// `args` field of Codex's `mcp_servers.<name>` overrides.
@@ -649,37 +684,55 @@ impl CodexBackend {
     /// external JSON (the pattern used by `--mcp-config` on the Claude
     /// side).
     fn extend_one_mcp_bridge(cmd: &mut Vec<String>, bridge: &McpBridgeSpec) {
+        // Render `bridge.name` as a TOML key fragment. Codex's
+        // `-c <dotted.key>=<value>` parses the LHS as TOML key
+        // fragments; names containing `.`, space, quote, bracket, or
+        // non-ASCII either misregister under a different path or
+        // abort the TOML parse. `toml_quote_key` returns the bare
+        // name when safe and a quoted key otherwise, so `my.server`
+        // becomes `mcp_servers."my.server".command` instead of
+        // mistakenly nesting under `mcp_servers.my.server.command`.
+        let key = toml_quote_key(&bridge.name);
         cmd.push("--config".to_string());
         cmd.push(format!(
-            "mcp_servers.{}.command={}",
-            bridge.name,
+            "mcp_servers.{key}.command={}",
             toml_quote_string(&bridge.command.to_string_lossy())
         ));
         cmd.push("--config".to_string());
         cmd.push(format!(
-            "mcp_servers.{}.args={}",
-            bridge.name,
+            "mcp_servers.{key}.args={}",
             toml_quote_string_array(&bridge.args)
         ));
     }
 
-    /// Emit overrides for the primary workbridge bridge (when present)
-    /// followed by every per-repo extra bridge in order. Passing
-    /// `primary: None` silently skips the workbridge overrides so
-    /// callers in a degraded-spawn path (e.g. MCP socket bind failed)
-    /// still produce a non-broken argv; extras are still emitted in
-    /// that case so user-configured per-repo servers remain available
-    /// even when the workbridge bridge itself is unavailable.
+    /// Emit overrides for every per-repo extra bridge in order, then
+    /// the primary workbridge bridge LAST. Passing `primary: None`
+    /// silently skips the workbridge overrides so callers in a
+    /// degraded-spawn path (e.g. MCP socket bind failed) still produce
+    /// a non-broken argv; extras are still emitted in that case so
+    /// user-configured per-repo servers remain available even when the
+    /// workbridge bridge itself is unavailable.
+    ///
+    /// Ordering invariant: the primary `workbridge` overrides MUST be
+    /// emitted AFTER every extra. Codex's `-c key=value` overrides are
+    /// last-write-wins, so this ordering structurally guarantees that
+    /// no per-repo extra (whether named `workbridge` accidentally or
+    /// maliciously) can clobber the workbridge MCP bridge entry that
+    /// the session needs to talk to workbridge itself. This mirrors
+    /// `crate::mcp::build_mcp_config`, which inserts the workbridge
+    /// server into the JSON map last for the same reason; see the
+    /// `codex_extras_cannot_override_workbridge_primary` regression
+    /// test and `build_mcp_config_workbridge_key_always_wins`.
     fn extend_mcp_bridge_argv(
         cmd: &mut Vec<String>,
         primary: Option<&McpBridgeSpec>,
         extras: &[McpBridgeSpec],
     ) {
-        if let Some(bridge) = primary {
-            Self::extend_one_mcp_bridge(cmd, bridge);
-        }
         for extra in extras {
             Self::extend_one_mcp_bridge(cmd, extra);
+        }
+        if let Some(bridge) = primary {
+            Self::extend_one_mcp_bridge(cmd, bridge);
         }
     }
 }
@@ -1572,6 +1625,201 @@ mod tests {
                 "rebase gate missing {cmd_key}; got {rw_argv:?}"
             );
         }
+    }
+
+    /// R3-F-1 regression: Codex's `-c key=value` overrides are
+    /// last-write-wins. The workbridge primary MUST be emitted AFTER
+    /// every per-repo extra so a maliciously- or accidentally-named
+    /// extra (e.g. a per-repo MCP server literally named `workbridge`)
+    /// cannot override the workbridge bridge entry that the session
+    /// needs to talk to workbridge itself. Mirrors
+    /// `crate::mcp::build_mcp_config`'s
+    /// `build_mcp_config_workbridge_key_always_wins` test.
+    #[test]
+    fn codex_extras_cannot_override_workbridge_primary() {
+        let primary = McpBridgeSpec {
+            name: "workbridge".to_string(),
+            command: PathBuf::from("/opt/workbridge"),
+            args: vec![
+                "--mcp-bridge".to_string(),
+                "--socket".to_string(),
+                "/tmp/real.sock".to_string(),
+            ],
+        };
+        let extras = vec![McpBridgeSpec {
+            // Extra deliberately named the same as the primary -
+            // simulates a user (or hand-edited config) registering a
+            // per-repo server under the reserved `workbridge` name.
+            name: "workbridge".to_string(),
+            command: PathBuf::from("/bin/false"),
+            args: vec!["adversarial".to_string()],
+        }];
+
+        // Interactive spawn: argv must contain TWO command flags for
+        // `mcp_servers.workbridge.command=`, and the LAST one must be
+        // the genuine workbridge binary path (not the adversarial one).
+        let mcp_path = PathBuf::from("/tmp/mcp.json");
+        let cfg = SpawnConfig {
+            stage: WorkItemStatus::Implementing,
+            system_prompt: Some("sys"),
+            mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&primary),
+            extra_bridges: &extras,
+            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+            auto_start_message: None,
+            read_only: false,
+        };
+        let argv = CodexBackend.build_command(&cfg);
+        let cmd_overrides: Vec<&String> = argv
+            .iter()
+            .filter(|s| s.starts_with("mcp_servers.workbridge.command="))
+            .collect();
+        assert_eq!(
+            cmd_overrides.len(),
+            2,
+            "expected 2 mcp_servers.workbridge.command overrides (one extra + one primary), got {argv:?}"
+        );
+        assert!(
+            cmd_overrides.last().unwrap().contains("/opt/workbridge"),
+            "primary workbridge override must come LAST so codex's last-write-wins \
+             keeps the genuine bridge; got {argv:?}"
+        );
+        assert!(
+            !cmd_overrides.last().unwrap().contains("/bin/false"),
+            "adversarial extra must NOT be the last write; got {argv:?}"
+        );
+
+        // Headless review gate must enforce the same ordering.
+        let rg_cfg = ReviewGateSpawnConfig {
+            system_prompt: "sys",
+            initial_prompt: "/review",
+            json_schema: "{}",
+            mcp_config_path: &mcp_path,
+            mcp_bridge: &primary,
+            extra_bridges: &extras,
+        };
+        let rg_argv = CodexBackend.build_review_gate_command(&rg_cfg);
+        let rg_cmd_overrides: Vec<&String> = rg_argv
+            .iter()
+            .filter(|s| s.starts_with("mcp_servers.workbridge.command="))
+            .collect();
+        assert_eq!(rg_cmd_overrides.len(), 2);
+        assert!(rg_cmd_overrides.last().unwrap().contains("/opt/workbridge"));
+
+        // Headless rebase gate must enforce the same ordering.
+        let rw_cfg = ReviewGateSpawnConfig {
+            system_prompt: "",
+            initial_prompt: "rebase",
+            json_schema: "{}",
+            mcp_config_path: &mcp_path,
+            mcp_bridge: &primary,
+            extra_bridges: &extras,
+        };
+        let rw_argv = CodexBackend.build_headless_rw_command(&rw_cfg);
+        let rw_cmd_overrides: Vec<&String> = rw_argv
+            .iter()
+            .filter(|s| s.starts_with("mcp_servers.workbridge.command="))
+            .collect();
+        assert_eq!(rw_cmd_overrides.len(), 2);
+        assert!(rw_cmd_overrides.last().unwrap().contains("/opt/workbridge"));
+    }
+
+    /// R3-F-2: TOML key fragments containing only bare-key characters
+    /// pass through unchanged so the rendered argv stays readable.
+    #[test]
+    fn toml_quote_key_bare_passes_through() {
+        assert_eq!(toml_quote_key("foo"), "foo");
+        assert_eq!(toml_quote_key("workbridge"), "workbridge");
+        assert_eq!(toml_quote_key("my-server_1"), "my-server_1");
+        assert_eq!(toml_quote_key("ABC123"), "ABC123");
+    }
+
+    /// R3-F-2: A name containing `.` would split a single TOML key
+    /// fragment into multiple, misregistering the override under a
+    /// different path. The helper must quote it as a single fragment.
+    #[test]
+    fn toml_quote_key_dotted_is_quoted() {
+        assert_eq!(toml_quote_key("my.server"), r#""my.server""#);
+        assert_eq!(toml_quote_key("a.b.c"), r#""a.b.c""#);
+    }
+
+    /// R3-F-2: spaces are not allowed in TOML bare keys; the helper
+    /// must produce a quoted key.
+    #[test]
+    fn toml_quote_key_spaced_is_quoted() {
+        assert_eq!(toml_quote_key("my server"), r#""my server""#);
+    }
+
+    /// R3-F-2: a name containing a literal `"` must escape it inside
+    /// the quoted key form so the TOML parser sees one continuous
+    /// string rather than two halves separated by a stray quote.
+    #[test]
+    fn toml_quote_key_with_quote_escapes() {
+        // `serde_json::to_string("my\"name")` produces `"my\"name"`,
+        // which is the exact TOML basic-string form the helper emits.
+        assert_eq!(toml_quote_key("my\"name"), r#""my\"name""#);
+    }
+
+    /// R3-F-2: empty names must always be quoted (TOML rejects empty
+    /// bare keys). The empty bare key `mcp_servers..command=` would
+    /// abort Codex's TOML parser at config load time.
+    #[test]
+    fn toml_quote_key_empty_is_quoted() {
+        assert_eq!(toml_quote_key(""), r#""""#);
+    }
+
+    /// R3-F-2 argv shape: a `McpBridgeSpec` whose `name` contains a
+    /// dot must produce `mcp_servers."my.server".command=...` (key
+    /// quoted as one TOML fragment) rather than
+    /// `mcp_servers.my.server.command=...` (which would misregister
+    /// the server under `mcp_servers.my.server.command` as a leaf
+    /// rather than under the intended `mcp_servers.my.server` table).
+    #[test]
+    fn codex_extra_bridge_with_dotted_name_emits_quoted_key() {
+        let primary = fake_bridge();
+        let extras = vec![McpBridgeSpec {
+            name: "my.server".to_string(),
+            command: PathBuf::from("/usr/local/bin/my-server"),
+            args: vec!["--port".to_string(), "8080".to_string()],
+        }];
+        let mcp_path = PathBuf::from("/tmp/mcp.json");
+        let cfg = SpawnConfig {
+            stage: WorkItemStatus::Implementing,
+            system_prompt: Some("sys"),
+            mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&primary),
+            extra_bridges: &extras,
+            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+            auto_start_message: None,
+            read_only: false,
+        };
+        let argv = CodexBackend.build_command(&cfg);
+        assert!(
+            argv.iter()
+                .any(|s| s.starts_with(r#"mcp_servers."my.server".command="#)),
+            "dotted server name must produce a quoted key fragment; got {argv:?}"
+        );
+        assert!(
+            argv.iter()
+                .any(|s| s.starts_with(r#"mcp_servers."my.server".args="#)),
+            "dotted server name must produce a quoted args key fragment; got {argv:?}"
+        );
+        // The malformed bare-key shape (which would silently
+        // misregister under `mcp_servers.my.server.command`) must NOT
+        // appear in the argv.
+        assert!(
+            !argv
+                .iter()
+                .any(|s| s.starts_with("mcp_servers.my.server.command=")),
+            "bare-key emission for a dotted name re-splits the TOML path; got {argv:?}"
+        );
+        // Plain server names still emit bare keys (no regression in
+        // readability for the common case).
+        assert!(
+            argv.iter()
+                .any(|s| s.starts_with("mcp_servers.workbridge.command=")),
+            "plain name 'workbridge' must still emit a bare key; got {argv:?}"
+        );
     }
 
     /// Pins the event-stream parser: `codex exec --json` emits

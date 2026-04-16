@@ -1220,6 +1220,31 @@ harness adapter is introduced, add a dated bullet here.
   `McpInjection<'a>` bundle struct (config_path + primary_bridge +
   extra_bridges) to stay under the clippy threshold.
 
+- 2026-04-16 (round 3): Three Codex argv-builder hardening fixes.
+  (R3-F-1) `extend_mcp_bridge_argv` now emits per-repo extras FIRST
+  and the workbridge primary LAST so Codex's last-write-wins
+  semantics structurally protect the workbridge bridge entry from
+  being clobbered by an extra named `workbridge`. Mirrors the
+  Claude-side `build_mcp_config_workbridge_key_always_wins` invariant.
+  (R3-F-2) `extend_one_mcp_bridge` now routes `bridge.name` through
+  a new `toml_quote_key` helper: bare-key-safe names
+  (`A-Za-z0-9_-`) emit unchanged for readability, anything else
+  (dots, spaces, quotes, non-ASCII, empty) renders as a TOML
+  quoted key fragment so `mcp_servers."my.server".command=...`
+  reaches Codex as a single fragment instead of misregistering
+  under `mcp_servers.my.server.command`. (R3-F-3) The three Codex
+  spawn sites in `src/app.rs` (`begin_session_open`,
+  `spawn_review_gate`, `spawn_rebase_gate`) now push a one-shot
+  toast when one or more HTTP-transport per-repo MCP servers were
+  filtered out, so users with HTTP MCP servers see why those
+  servers are missing from a Codex session vs. their Claude
+  session. Regression tests:
+  `codex_extras_cannot_override_workbridge_primary`,
+  `toml_quote_key_*` (5 tests), and
+  `codex_extra_bridge_with_dotted_name_emits_quoted_key`. RP1c /
+  RP2c / RP2bc updated to show extras-first / workbridge-last
+  ordering.
+
 ## Reference Payloads (Codex)
 
 These are the per-harness equivalents of RP1 / RP2 / RP2b for
@@ -1233,13 +1258,30 @@ Pinned by the `codex_*` tests in `src/agent_backend.rs`.
 ```
 codex
   --full-auto
+  [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
+  [--config mcp_servers.<extra>.args=[...]      ]   # (emitted FIRST)
   --config mcp_servers.workbridge.command="<workbridge exe path>"
   --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<socket path>"]
-  [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
-  [--config mcp_servers.<extra>.args=[...]      ]
   --config instructions="<stage system prompt>"
   <auto-start user prompt (if any)>
 ```
+
+Ordering invariant (R3-F-1): the workbridge primary's `--config
+mcp_servers.workbridge.*` overrides MUST be emitted AFTER every
+per-repo extra. Codex's `-c key=value` overrides are last-write-wins,
+so this ordering structurally guarantees that no extra (whether
+named `workbridge` accidentally or maliciously) can clobber the
+workbridge bridge entry. Mirrors `crate::mcp::build_mcp_config`,
+which inserts the `workbridge` key into the JSON map last for the
+same reason. Pinned by `codex_extras_cannot_override_workbridge_primary`
+in `src/agent_backend.rs::tests`.
+
+Key-quoting (R3-F-2): each `<extra>` is rendered through
+`toml_quote_key` so server names containing characters outside
+TOML's bare-key alphabet (`A-Za-z0-9_-`) emit a quoted key fragment
+(`mcp_servers."my.server".command=...`) instead of a bare key that
+would mis-split the TOML path. Pinned by `toml_quote_key_*` and
+`codex_extra_bridge_with_dotted_name_emits_quoted_key`.
 
 Differences from Claude's RP1:
 - `--full-auto` instead of `--dangerously-skip-permissions`.
@@ -1275,12 +1317,14 @@ silently cross-contaminate the user's personal config.
 exec
   --json
   --config instructions="<review gate system prompt>"
+  [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
+  [--config mcp_servers.<extra>.args=[...]      ]   # (emitted FIRST)
   --config mcp_servers.workbridge.command="<workbridge exe path>"
   --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<socket path>"]
-  [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
-  [--config mcp_servers.<extra>.args=[...]      ]
   <review skill prompt (e.g. /claude-adversarial-review)>
 ```
+
+Same workbridge-last ordering invariant as RP1c.
 
 The first positional is `exec` (not `--print`) - Codex's headless
 mode is a separate subcommand. `--json` switches the event stream
@@ -1298,12 +1342,14 @@ the per-field `mcp_servers.workbridge.command` / `.args` overrides
 exec
   --json
   --full-auto
+  [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
+  [--config mcp_servers.<extra>.args=[...]      ]   # (emitted FIRST)
   --config mcp_servers.workbridge.command="<workbridge exe path>"
   --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<socket path>"]
-  [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
-  [--config mcp_servers.<extra>.args=[...]      ]
   <rebase instruction prompt>
 ```
+
+Same workbridge-last ordering invariant as RP1c.
 
 `--ask-for-approval` is a TOP-LEVEL `codex` flag and MUST come BEFORE
 the `exec` subcommand. Verified live on 2026-04-16 by running each

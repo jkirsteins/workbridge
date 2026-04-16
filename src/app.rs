@@ -5575,6 +5575,29 @@ impl App {
                 .unwrap_or_default();
             (wi_kind, context_json, repo_mcp_servers)
         };
+        // R3-F-3: surface to the user that HTTP-transport MCP servers
+        // are silently dropped from the Codex argv builder (Codex's
+        // `mcp_servers.<name>` schema requires command + args; there
+        // is no `url` sub-field). Without this toast, a user with
+        // HTTP MCP entries who switched a work item to Codex would
+        // silently lose those servers vs. their Claude session and
+        // have no clue why a tool they expected to be available is
+        // missing. Only emit for Codex sessions; the Claude argv
+        // builder consumes HTTP entries via the `--mcp-config` JSON.
+        // Emitted once per session-open keypress (this function is
+        // gated by the `session_open_rx.contains_key` early-return
+        // above, so rapid Enter presses do not fire repeated toasts).
+        if agent_backend.kind() == AgentBackendKind::Codex {
+            let http_skipped = repo_mcp_servers
+                .iter()
+                .filter(|e| e.server_type == "http")
+                .count();
+            if http_skipped > 0 {
+                self.push_toast(format!(
+                    "Codex: {http_skipped} HTTP MCP server(s) skipped (Codex requires stdio)"
+                ));
+            }
+        }
         // `activity_path_for` is a pure in-memory path computation in
         // `LocalFileBackend` (no filesystem I/O); kept here on the UI
         // thread to avoid cloning the whole `Arc<dyn WorkItemBackend>`
@@ -10132,11 +10155,18 @@ impl App {
         // them into `McpBridgeSpec` so the headless review gate can pass
         // them through to Codex via per-key `-c` overrides alongside the
         // workbridge bridge. HTTP entries are skipped because Codex's
-        // `mcp_servers.<name>` schema requires command + args.
-        let review_extra_bridges: Vec<crate::agent_backend::McpBridgeSpec> = {
+        // `mcp_servers.<name>` schema requires command + args. R3-F-3:
+        // surface the skip via a toast so the user knows why an HTTP
+        // MCP server they configured is not visible to the Codex review
+        // gate (would otherwise be a silent feature gap vs. Claude).
+        let (review_extra_bridges, http_skipped_for_review): (
+            Vec<crate::agent_backend::McpBridgeSpec>,
+            usize,
+        ) = {
             let repo_display = crate::config::collapse_home(&repo_path);
-            self.config
-                .mcp_servers_for_repo(&repo_display)
+            let entries = self.config.mcp_servers_for_repo(&repo_display);
+            let http_count = entries.iter().filter(|e| e.server_type == "http").count();
+            let bridges: Vec<crate::agent_backend::McpBridgeSpec> = entries
                 .into_iter()
                 .filter(|entry| entry.server_type != "http")
                 .filter_map(|entry| {
@@ -10149,8 +10179,14 @@ impl App {
                             args: entry.args.clone(),
                         })
                 })
-                .collect()
+                .collect();
+            (bridges, http_count)
         };
+        if agent_backend.kind() == AgentBackendKind::Codex && http_skipped_for_review > 0 {
+            self.push_toast(format!(
+                "Codex: {http_skipped_for_review} HTTP MCP server(s) skipped (Codex requires stdio)"
+            ));
+        }
 
         // Status-bar activity for the review gate. Per `docs/UI.md`
         // "Activity indicator placement", review gates are
@@ -10577,16 +10613,23 @@ impl App {
         // inside the thread) keeps `self.config` reads on the UI thread,
         // matching how `begin_session_open` does it. HTTP entries are
         // skipped: Codex's `mcp_servers.<name>` schema requires command
-        // + args. See `agent_backend::McpBridgeSpec`.
-        let rebase_extra_bridges: Vec<crate::agent_backend::McpBridgeSpec> = self
+        // + args. See `agent_backend::McpBridgeSpec`. R3-F-3: count the
+        // skipped HTTP entries so we can surface a toast (silent skip
+        // is a feature gap vs Claude, where HTTP entries are still
+        // visible via the `--mcp-config` JSON).
+        let (rebase_extra_bridges, http_skipped_for_rebase): (
+            Vec<crate::agent_backend::McpBridgeSpec>,
+            usize,
+        ) = self
             .work_items
             .iter()
             .find(|w| w.id == wi_id)
             .and_then(|w| w.repo_associations.first())
             .map(|assoc| {
                 let repo_display = crate::config::collapse_home(&assoc.repo_path);
-                self.config
-                    .mcp_servers_for_repo(&repo_display)
+                let entries = self.config.mcp_servers_for_repo(&repo_display);
+                let http_count = entries.iter().filter(|e| e.server_type == "http").count();
+                let bridges: Vec<crate::agent_backend::McpBridgeSpec> = entries
                     .into_iter()
                     .filter(|entry| entry.server_type != "http")
                     .filter_map(|entry| {
@@ -10599,9 +10642,15 @@ impl App {
                                 args: entry.args.clone(),
                             })
                     })
-                    .collect()
+                    .collect();
+                (bridges, http_count)
             })
             .unwrap_or_default();
+        if agent_backend.kind() == AgentBackendKind::Codex && http_skipped_for_rebase > 0 {
+            self.push_toast(format!(
+                "Codex: {http_skipped_for_rebase} HTTP MCP server(s) skipped (Codex requires stdio)"
+            ));
+        }
 
         // Single-flight admission. The 500 ms debounce matches
         // `Ctrl+R`: rapid presses are intentionally coalesced.
