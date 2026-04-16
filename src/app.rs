@@ -984,15 +984,18 @@ pub(crate) struct DeleteCleanupInfo {
     github_remote: Option<(String, String)>,
 }
 
-/// Result from the asynchronous session-open preparation thread.
+/// Result from the Phase 1 asynchronous session-open preparation
+/// thread.
 ///
 /// The UI thread must never touch the filesystem or spawn subprocesses
 /// directly on the session-open path; this struct is the handoff point
-/// where a background worker returns ALL the preparation work (plan
-/// read, MCP socket bind, side-car file writes, temp `--mcp-config`
-/// file write) so `finish_session_open` only has to do pure-CPU work
-/// plus `Session::spawn`. See `docs/UI.md` "Blocking I/O Prohibition"
-/// and `docs/harness-contract.md` C4 / C10.
+/// where a Phase 1 background worker returns ALL the preparation work
+/// (plan read, MCP socket bind, side-car file writes, temp
+/// `--mcp-config` file write) so `finish_session_open` only has to do
+/// pure-CPU work (system prompt + command building) before handing the
+/// `Session::spawn` fork+exec off to a Phase 2 background thread (see
+/// `SessionSpawnResult` / `poll_session_spawns`). See `docs/UI.md`
+/// "Blocking I/O Prohibition" and `docs/harness-contract.md` C4 / C10.
 pub struct SessionOpenPlanResult {
     /// The work item the session is being opened for.
     pub wi_id: WorkItemId,
@@ -1077,6 +1080,29 @@ pub struct SessionOpenPending {
     pub cancelled: Arc<AtomicBool>,
     pub mcp_config_path: PathBuf,
     pub committed_files: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+/// Result from the Phase 2 PTY spawn thread. `finish_session_open`
+/// builds the command on the UI thread (pure CPU), then hands the
+/// fork+exec off to a background thread so `Session::spawn` never
+/// runs on the event loop. See `docs/UI.md` "Blocking I/O
+/// Prohibition".
+pub struct SessionSpawnResult {
+    pub wi_id: WorkItemId,
+    pub session_key: (WorkItemId, WorkItemStatus),
+    pub session: Option<Session>,
+    pub error: Option<String>,
+    pub mcp_server: Option<McpSocketServer>,
+    pub written_files: Vec<PathBuf>,
+}
+
+/// In-flight Phase 2 PTY spawn for a work-item session. Tracked so
+/// `poll_session_spawns` can drain the result and the activity
+/// spinner can be ended. Keyed by `WorkItemId` in
+/// `App::session_spawn_rx`.
+pub struct SessionSpawnPending {
+    pub rx: crossbeam_channel::Receiver<SessionSpawnResult>,
+    pub activity: ActivityId,
 }
 
 /// Fully-prepared global assistant session, produced entirely on a
@@ -1569,6 +1595,12 @@ pub struct App {
     /// "Blocking I/O Prohibition" requires the backend read to live on
     /// a background thread; this map is how the result flows back.
     pub session_open_rx: HashMap<WorkItemId, SessionOpenPending>,
+    /// Phase 2 PTY spawn results. `finish_session_open` hands the
+    /// `Session::spawn` call off to a background thread; the result
+    /// flows back here and is drained by `poll_session_spawns` on the
+    /// next timer tick. Keyed by work item so concurrent spawns for
+    /// different items do not collide.
+    pub session_spawn_rx: HashMap<WorkItemId, SessionSpawnPending>,
 
     /// Sender for completion messages from `spawn_orphan_worktree_cleanup`
     /// background threads. Cloned into each spawned closure. The closure
@@ -2203,6 +2235,7 @@ impl App {
             pr_identity_backfill_rx: None,
             pr_identity_backfill_activity: None,
             session_open_rx: HashMap::new(),
+            session_spawn_rx: HashMap::new(),
             orphan_cleanup_finished_tx,
             orphan_cleanup_finished_rx,
             global_drawer_open: false,
@@ -5186,12 +5219,14 @@ impl App {
 
     /// Begin the async preparation stage of opening an agent session.
     ///
-    /// Spawns a background thread that performs ALL of the blocking
-    /// work the session-open path needs (plan read, MCP socket bind,
-    /// backend side-car file writes, temp `--mcp-config` file write)
-    /// and then hands the result back to `poll_session_opens`, which
-    /// finishes the session on the UI thread by only doing pure-CPU
-    /// work plus `Session::spawn`. Running any of these I/O operations
+    /// Spawns a Phase 1 background thread that performs ALL of the
+    /// blocking I/O the session-open path needs (plan read, MCP socket
+    /// bind, backend side-car file writes, temp `--mcp-config` file
+    /// write) and then hands the result back to `poll_session_opens`,
+    /// which finishes the session on the UI thread by doing pure-CPU
+    /// work (system prompt + command building) and then handing the
+    /// `Session::spawn` fork+exec to a Phase 2 background thread (see
+    /// `poll_session_spawns`). Running any of these I/O operations
     /// on the caller (a UI-thread entry point such as `spawn_session`
     /// / `poll_worktree_creation` / `poll_review_gate`) would freeze
     /// the event loop - see `docs/UI.md` "Blocking I/O Prohibition"
@@ -5514,12 +5549,14 @@ impl App {
         }
     }
 
-    /// Poll pending session-open preparation workers. Called from the
+    /// Poll Phase 1 session-open preparation workers. Called from the
     /// background-work tick in `salsa.rs`. Each completed receiver
     /// hands a fully-prepared `SessionOpenPlanResult` (plan text, MCP
     /// server handle, written side-car files, temp config path) to
-    /// `finish_session_open`, which then only has to do pure-CPU work
-    /// plus `Session::spawn`. No filesystem I/O happens here.
+    /// `finish_session_open`, which does pure-CPU work (system prompt
+    /// and command building) then hands the `Session::spawn` fork+exec
+    /// to a Phase 2 background thread. No filesystem I/O or subprocess
+    /// spawns happen here.
     pub fn poll_session_opens(&mut self) {
         if self.session_open_rx.is_empty() {
             return;
@@ -5584,9 +5621,11 @@ impl App {
     /// background worker: this function calls `stage_system_prompt`
     /// which consumes `rework_reasons` / `review_gate_findings` state,
     /// so calling it twice for the same work item would discard user
-    /// state. It is also explicitly free of filesystem I/O - every
-    /// `std::fs::*` call lives in the background worker in
-    /// `begin_session_open`.
+    /// state. It is also explicitly free of filesystem I/O and
+    /// subprocess spawns - every `std::fs::*` call lives in the
+    /// Phase 1 worker in `begin_session_open`, and the `Session::spawn`
+    /// fork+exec is handed off to a Phase 2 background thread whose
+    /// result is drained by `poll_session_spawns`.
     fn finish_session_open(
         &mut self,
         work_item_id: &WorkItemId,
@@ -5624,38 +5663,113 @@ impl App {
             mcp_config_path.as_deref(),
             has_gate_findings,
         );
-        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
 
-        match Session::spawn(self.pane_cols, self.pane_rows, Some(cwd), &cmd_refs) {
-            Ok(session) => {
-                let parser = Arc::clone(&session.parser);
-                let entry = SessionEntry {
-                    parser,
-                    alive: true,
+        // Phase 2: hand the fork+exec off to a background thread so
+        // `Session::spawn` never runs on the event loop. The result
+        // flows back through `session_spawn_rx` and is drained by
+        // `poll_session_spawns` on the next timer tick.
+        let (tx, rx) = crossbeam_channel::bounded::<SessionSpawnResult>(1);
+        let pane_cols = self.pane_cols;
+        let pane_rows = self.pane_rows;
+        let cwd_owned = cwd.to_path_buf();
+        let wi_id_clone = work_item_id.clone();
+        let session_key_clone = session_key.clone();
+        std::thread::spawn(move || {
+            let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+            let result = match Session::spawn(pane_cols, pane_rows, Some(&cwd_owned), &cmd_refs) {
+                Ok(session) => SessionSpawnResult {
+                    wi_id: wi_id_clone,
+                    session_key: session_key_clone,
                     session: Some(session),
-                    scrollback_offset: 0,
-                    selection: None,
-                    // Hand the written-files list to the session so its
-                    // death path can call `cleanup_session_files` on the
-                    // backend, per `docs/harness-contract.md` C4.
-                    agent_written_files: written_files,
-                };
-                self.sessions.insert(session_key.clone(), entry);
-                if let Some(server) = mcp_server {
-                    self.mcp_servers.insert(work_item_id.clone(), server);
+                    error: None,
+                    mcp_server,
+                    written_files,
+                },
+                Err(e) => SessionSpawnResult {
+                    wi_id: wi_id_clone,
+                    session_key: session_key_clone,
+                    session: None,
+                    error: Some(format!("Error spawning session: {e}")),
+                    mcp_server,
+                    written_files,
+                },
+            };
+            let _ = tx.send(result);
+        });
+
+        let activity = self.start_activity("Spawning agent session...");
+        self.session_spawn_rx
+            .insert(work_item_id.clone(), SessionSpawnPending { rx, activity });
+    }
+
+    /// Drain Phase 2 PTY spawn results. Called on each timer tick.
+    /// Installs the `Session` into `self.sessions` on success, or
+    /// cleans up MCP resources on failure. Symmetric with
+    /// `poll_session_opens` (Phase 1) and `poll_global_session_open`.
+    pub fn poll_session_spawns(&mut self) {
+        if self.session_spawn_rx.is_empty() {
+            return;
+        }
+        let keys: Vec<WorkItemId> = self.session_spawn_rx.keys().cloned().collect();
+        for wi_id in keys {
+            let pending = match self.session_spawn_rx.get(&wi_id) {
+                Some(p) => p,
+                None => continue,
+            };
+            let result = match pending.rx.try_recv() {
+                Ok(r) => r,
+                Err(crossbeam_channel::TryRecvError::Empty) => continue,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // Worker thread died without sending.
+                    if let Some(pending) = self.session_spawn_rx.remove(&wi_id) {
+                        self.end_activity(pending.activity);
+                    }
+                    self.status_message =
+                        Some("Session spawn: background thread exited unexpectedly".into());
+                    continue;
                 }
-                self.focus = FocusPanel::Right;
-                self.status_message = Some("Right panel focused - press Ctrl+] to return".into());
+            };
+            if let Some(pending) = self.session_spawn_rx.remove(&wi_id) {
+                self.end_activity(pending.activity);
             }
-            Err(e) => {
-                // Session spawn failed. The MCP server and side-car
-                // files are already live on disk; drop the server so
-                // its accept-loop exits and hand the written files to
-                // the background cleanup helper so nothing is removed
-                // on the UI thread.
-                drop(mcp_server);
-                self.spawn_agent_file_cleanup(written_files);
-                self.status_message = Some(format!("Error spawning session: {e}"));
+
+            match (result.session, result.error) {
+                (Some(session), _) => {
+                    let parser = Arc::clone(&session.parser);
+                    let entry = SessionEntry {
+                        parser,
+                        alive: true,
+                        session: Some(session),
+                        scrollback_offset: 0,
+                        selection: None,
+                        // Hand the written-files list to the session so
+                        // its death path can call
+                        // `cleanup_session_files` on the backend, per
+                        // `docs/harness-contract.md` C4.
+                        agent_written_files: result.written_files,
+                    };
+                    self.sessions.insert(result.session_key, entry);
+                    if let Some(server) = result.mcp_server {
+                        self.mcp_servers.insert(result.wi_id.clone(), server);
+                    }
+                    self.focus = FocusPanel::Right;
+                    self.status_message =
+                        Some("Right panel focused - press Ctrl+] to return".into());
+                }
+                (None, Some(e)) => {
+                    // Session spawn failed. Drop the MCP server and
+                    // clean up side-car files off the UI thread.
+                    drop(result.mcp_server);
+                    self.spawn_agent_file_cleanup(result.written_files);
+                    self.status_message = Some(e);
+                }
+                (None, None) => {
+                    // Should not happen, but handle gracefully.
+                    drop(result.mcp_server);
+                    self.spawn_agent_file_cleanup(result.written_files);
+                    self.status_message =
+                        Some("Session spawn returned no session and no error".into());
+                }
             }
         }
     }

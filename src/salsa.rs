@@ -452,6 +452,12 @@ pub fn app_event(
                 // "Blocking I/O Prohibition".
                 state.poll_session_opens();
 
+                // Phase 2: drain PTY spawn results from the
+                // background threads started by `finish_session_open`.
+                // The fork+exec runs off the UI thread so
+                // `Session::spawn` never blocks the event loop.
+                state.poll_session_spawns();
+
                 // Drain the global assistant preparation worker.
                 // Every blocking step (MCP socket bind, temp config
                 // write, scratch dir create, PTY fork+exec) runs on

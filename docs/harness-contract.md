@@ -846,28 +846,29 @@ update the Implementation Map section above.
 
 | File          | Line  | Mode        | Scope      | Thread     | Cwd                                       |
 |---------------|-------|-------------|------------|------------|-------------------------------------------|
-| `src/app.rs`  | 4487  | Interactive | WorkItem   | UI thread  | Work-item worktree                        |
+| `src/app.rs`  | 4558  | Interactive | WorkItem   | Background | Work-item worktree                        |
 | `src/app.rs`  | 8292  | Headless    | ReviewGate | Background | inherited                                 |
-| `src/app.rs`  | 8933  | Interactive | Global     | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
+| `src/app.rs`  | 9068  | Interactive | Global     | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
 
 The "Thread" column records which thread actually calls
-`Session::spawn` / `std::process::Command::output()`. Two of the
-three sites are fully off the UI thread; the work-item site still
-does its `Session::spawn` on the UI thread for historical reasons
-(the pre-refactor code did the same, and the fork+exec is typically
-sub-millisecond). Every **filesystem** side effect on every spawn
-path - the backend's `write_session_files` call, the
+`Session::spawn` / `std::process::Command::output()`. All three
+sites are fully off the UI thread. Every blocking operation on
+every spawn path - the backend's `write_session_files` call, the
 `--mcp-config` tempfile, the global assistant's scratch
-`create_dir_all`, and the review gate's temporary `--mcp-config`
-file - runs on a background worker thread per `docs/UI.md`
-"Blocking I/O Prohibition". The work-item worker is
-`App::begin_session_open` at `src/app.rs:4059` (drained by
-`poll_session_opens` at 4381, which hands the prepared
-`SessionOpenPlanResult` to `finish_session_open` at 4448). The
-global worker is `App::spawn_global_session` at `src/app.rs:8735`
-(drained by `poll_global_session_open`). The review gate worker is
-`App::spawn_review_gate` at `src/app.rs:7928` (its own closure at
-`src/app.rs:8003`).
+`create_dir_all`, the review gate's temporary `--mcp-config`
+file, and the `Session::spawn` fork+exec itself - runs on a
+background worker thread per `docs/UI.md` "Blocking I/O
+Prohibition". The work-item path uses a two-phase pipeline:
+Phase 1 (`App::begin_session_open`, drained by
+`poll_session_opens` which hands the prepared
+`SessionOpenPlanResult` to `finish_session_open`) does plan read,
+MCP socket bind, side-car file writes, and temp config write;
+Phase 2 (`finish_session_open` spawns a thread, drained by
+`poll_session_spawns`) does the `Session::spawn` fork+exec after
+the UI thread builds the command (pure CPU). The global worker is
+`App::spawn_global_session` (drained by
+`poll_global_session_open`). The review gate worker is
+`App::spawn_review_gate` (its own closure).
 
 All three sites go through `src/session.rs:57` (`Session::spawn`) for
 the interactive path or `std::process::Command::output()` directly
@@ -950,9 +951,9 @@ harness adapter is introduced, add a dated bullet here.
   `SessionOpenPlanResult` grew `server` / `written_files` /
   `mcp_config_path` / `server_error` / `mcp_config_error` fields
   which `poll_session_opens` drains on the next tick.
-  `finish_session_open` is now pure-CPU plus `Session::spawn`
-  (which stays on the UI thread for the work-item path because
-  it was already there pre-refactor and fork+exec is sub-ms).
+  `finish_session_open` is now pure-CPU; `Session::spawn` was
+  later moved off the UI thread in a follow-up (see the
+  2026-04-16 changelog entry).
   `start_mcp_for_session` was removed since its only caller is
   gone. Global assistant: `App::spawn_global_session` now runs
   `McpSocketServer::start_global`, both `std::fs::write` calls,
@@ -1029,3 +1030,27 @@ harness adapter is introduced, add a dated bullet here.
     only), so the `committed_files` machinery is exercised only by
     future backends that need file-based config; the cancellation
     test still validates the plumbing with a synthetic file list.
+- 2026-04-16: Remove worktree .mcp.json injection + move
+  Session::spawn off UI thread (same PR, follow-up to Codex review).
+  `ClaudeCodeBackend::write_session_files` now returns an empty
+  list - the `--mcp-config` flag is sufficient and writing
+  `.mcp.json` into the user's worktree pollutes git state
+  (prohibited by the file-injection review policy rule). The
+  `AgentBackend::write_session_files` trait doc now explicitly
+  prohibits writing into the worktree; backends MUST use temp
+  directories for any config files they need to write.
+  `cleanup_session_state_for` now drains `agent_written_files`
+  from live session entries so natural session death (detected by
+  `check_liveness`) and orphan removal clean up the `--mcp-config`
+  tempfile instead of leaking it. The orphan removal loop in
+  `check_liveness` also drains `agent_written_files` before
+  dropping removed entries.
+  Work-item `Session::spawn` moved off the UI thread: the
+  `finish_session_open` path now uses a two-phase pipeline where
+  Phase 1 (`begin_session_open` worker, drained by
+  `poll_session_opens`) handles plan read, MCP socket bind,
+  side-car file writes, and temp config write, and Phase 2
+  (`finish_session_open` spawns a thread, drained by
+  `poll_session_spawns`) handles the `Session::spawn` fork+exec.
+  All three spawn sites (work-item, review-gate, global) are now
+  fully off the UI thread. Known Spawn Sites table updated.
