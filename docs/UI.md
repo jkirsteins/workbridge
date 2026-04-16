@@ -207,10 +207,15 @@ read from the cache**. Concretely:
   `self.repo_data[repo_path].worktrees` (which carries
   `has_commits_ahead` so `branch_has_commits` is a pure cache lookup,
   plus `dirty` / `untracked` / `unpushed` / `behind_remote` so the
-  `format_work_item_entry` `!cl` chip renderer can flag an unclean
-  worktree without shelling out). The Review -> Done **merge guard**
-  runs a live `WorktreeService::list_worktrees` precheck on a
-  background thread (`App::spawn_merge_precheck` /
+  `format_work_item_entry` `!cl`, `!pushed`, and `!pulled` chip
+  renderers can flag an unclean or out-of-sync worktree without
+  shelling out). `!cl` is exclusively for "uncommitted changes in
+  the worktree" (a clean-but-diverged branch no longer triggers
+  it); `!pushed` fires on `git_state.ahead > 0` and `!pulled` fires
+  on `git_state.behind > 0`, so a dirty + diverged row renders all
+  three chips alongside each other. The Review -> Done **merge
+  guard** runs a live `WorktreeService::list_worktrees` precheck on
+  a background thread (`App::spawn_merge_precheck` /
   `App::poll_merge_precheck`) before letting the actual `gh pr merge`
   thread fire - the cache stays authoritative for the `!cl` chip but
   is NEVER consulted for the irrevocable merge decision, because long
@@ -401,6 +406,20 @@ incompatible with rat-focus's widget navigation model.
   keystrokes there forward to the PTY. The `open` subprocess is
   spawned on a background thread so a stalled launch cannot block the
   UI event loop (see "Blocking I/O Prohibition" below).
+- m (left panel only): rebase the selected work item's branch onto
+  the latest upstream main. Spawns a background thread that runs
+  `git fetch origin <main>` and then a headless harness instance
+  (cwd = the work item's worktree, MCP injected) which runs
+  `git rebase origin/<main>` and resolves any conflicts in place. The
+  user is never asked anything; on a give-up the harness aborts the
+  rebase and the UI surfaces the failure reason. No `git push` is
+  performed - after a successful rebase the user will see `!pushed`
+  (and likely `!pulled`) and pushes manually. Single-flight via
+  `UserActionKey::RebaseOnMain` with a 500 ms debounce, so rapid `m`
+  presses are coalesced. No-op with a "No branch to rebase" status
+  message on selections that are not work items, are unlinked PRs /
+  review requests, or have no worktree association. Not bound on the
+  right panel because single keystrokes there forward to the PTY.
 - Dead session: auto-return to left panel
 - Up/Down in left panel: reset right panel tab to Claude Code
 
@@ -993,6 +1012,87 @@ badge as `[RR][IM][RG]`. The presence-only `[RG]` badge is what makes
 "Claude actively coding" distinguishable from "gate running in the
 background" in the list, because both share the same cyan braille
 spinner in the left margin.
+
+#### Rebase gate
+
+Pressing `m` on a work item with a worktree spawns a **rebase gate**:
+a background `git fetch origin <main>` followed by a headless harness
+instance (cwd = the work item's worktree, MCP injected, see
+`docs/harness-contract.md` "Known Spawn Sites") that runs
+`git rebase origin/<main>` and resolves any conflicts in place.
+Single-flight via `UserActionKey::RebaseOnMain` (500 ms debounce); per-
+item state lives in `App.rebase_gates: HashMap<WorkItemId,
+RebaseGateState>` per the structural-ownership rule, mirroring
+`review_gates`. The right pane is taken over by a spinner + progress
+text view while a rebase is in flight (the rebase-gate render block
+lives in `src/ui.rs` immediately before the review-gate block and
+takes precedence over it). On completion, `poll_rebase_gate` drops
+the gate via `drop_rebase_gate` (which ends the status-bar activity,
+clears the user-action guard slot when the slot is owned by the
+work item being dropped, AND `libc::killpg`s the harness's process
+group via the `child_pid` slot if it is still alive) and surfaces
+a "Rebased onto origin/<main>" or "Rebase onto origin/<main>
+failed: <reason>" status message. The harness is spawned with
+`Command::process_group(0)` so it becomes its own group leader;
+the `killpg` therefore takes down claude AND any `git rebase` /
+`git add` subprocesses claude has started, not just claude itself.
+`drop_rebase_gate` is also called from `delete_work_item_by_id`
+and `force_kill_all`, so deleting a work item or quitting
+workbridge while a rebase is in flight tears the gate down
+cleanly: the cancellation flag covers the pre-spawn window
+(default-branch resolution, `git fetch`, MCP server start, temp-
+config write) and the process-group SIGKILL covers everything
+from `Command::spawn` onwards, so the harness AND its in-flight
+git subprocesses can be stopped at any phase before the background
+`spawn_delete_cleanup` thread runs `git worktree remove`
+underneath it. The "Rebased" success status
+is gated on a local `git merge-base --is-ancestor origin/<main>
+HEAD` check that the spawning thread runs against the worktree
+before emitting `RebaseResult::Success`; if the check fails
+(harness hallucinated, ran the wrong command, or emitted a stale
+envelope) the gate downgrades to a Failure status naming the
+ancestry mismatch. The UI never claims a rebase succeeded without
+local git verification. The audit trail (so a later session
+viewing this work item can see the rebase happened) is written by
+the background thread via
+`App.backend.append_activity_existing_only` (NOT the UI thread,
+per the absolute blocking-I/O invariant), using a backend Arc
+cloned at `spawn_rebase_gate` setup time. The `_existing_only`
+variant - not `append_activity` - is the structural orphan-log
+defense: it opens with `OpenOptions::create(false)`, so a racing
+`backend.delete` that already archived the active log cannot be
+silently reverted by a post-cancellation append. See
+`docs/harness-contract.md` C10 / C11 for the full POSIX
+explanation. Any append error is surfaced as a suffix on the
+status message rather than silently dropped. The harness is explicitly told NOT to call
+`workbridge_set_status` for this purpose because that would be a
+no-op `Implementing -> Implementing` transition.
+No `git push` is performed - after a successful rebase the user
+sees `!pushed` (and likely `!pulled`) on the row and pushes
+manually.
+
+#### Worktree-state chips
+
+Three chips report the local git state of a work item's worktree.
+All three are pure cache reads off `RepoAssociation.git_state`
+(populated by the background fetcher in `src/assembly.rs` /
+`src/worktree_service.rs`) and therefore safe to render on the UI
+thread:
+
+- `!cl` - the worktree has uncommitted changes (`git_state.dirty`).
+  Yellow. The chip is exclusively for "the working copy is dirty";
+  ahead/behind state has its own chips below. A clean-but-diverged
+  branch no longer shows `!cl`.
+- `!pushed` - the local branch has commits its upstream does not
+  (`git_state.ahead > 0`). Cyan. "Action available: push."
+- `!pulled` - the upstream has commits the local branch does not
+  (`git_state.behind > 0`). Magenta. "Action available: pull (or
+  rebase via `m`)."
+
+The three chips coexist on the same line: a dirty, diverged branch
+renders `!cl !pushed !pulled` with three distinct foregrounds so
+they remain distinguishable. Both new chips are rendered alongside
+`!cl` in `format_work_item_entry` (`src/ui.rs`).
 
 Stage transitions: Shift+Right to advance, Shift+Left to retreat.
 

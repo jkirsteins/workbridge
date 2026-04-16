@@ -224,6 +224,66 @@ pub trait WorkItemBackend: Send + Sync {
     /// Append an activity entry to a work item's activity log.
     fn append_activity(&self, id: &WorkItemId, entry: &ActivityEntry) -> Result<(), BackendError>;
 
+    /// Append an activity entry **only if the active activity log
+    /// already exists**. Returns `Ok(true)` if the entry was written,
+    /// `Ok(false)` if the active log was missing (e.g. the work item
+    /// was deleted and its log was archived while the caller was
+    /// preparing the entry). The invariant the caller cares about is
+    /// "do not resurrect the active log file for a deleted item" -
+    /// implementations MUST NOT create the active log file if it
+    /// does not already exist.
+    ///
+    /// This is the load-bearing primitive for background threads that
+    /// write to the activity log AFTER the main thread may have
+    /// already called `delete` on the same work item (today, the
+    /// rebase gate: `App::spawn_rebase_gate` -> `append_activity`
+    /// runs on a dedicated background thread and can race a main-
+    /// thread `backend.delete` + `archive_activity_log`). If the
+    /// background thread used `append_activity` instead, the
+    /// `LocalFileBackend` implementation's `OpenOptions::create(true)`
+    /// would silently recreate the active log file for an already-
+    /// deleted item, leaving an orphan `activity-*.jsonl` in the
+    /// active directory that the metrics aggregator would then count
+    /// as a phantom work item.
+    ///
+    /// POSIX semantics make this race-free without additional
+    /// locking: if the caller opens the file (existing) just before
+    /// the main thread's `fs::rename(active -> archive/...)`, the
+    /// open file descriptor still points at the renamed inode, so
+    /// the caller's write lands in the archived file rather than an
+    /// orphan. If the rename happens first, the caller's open fails
+    /// with `ENOENT` and this method returns `Ok(false)`.
+    ///
+    /// The default implementation returns
+    /// `Err(BackendError::Validation(...))` so that any future
+    /// backend impl that forgets to override this method fails
+    /// loudly at the first call site instead of silently
+    /// delegating to `append_activity` (which is the orphan-
+    /// creating call this primitive exists to replace). The
+    /// reference `LocalFileBackend` overrides it with the actual
+    /// `create(false)` open. Test stubs that genuinely have no
+    /// create-on-append hazard (every in-memory backend in the
+    /// test suite) MUST opt in explicitly by either overriding
+    /// the method themselves or never being driven through a
+    /// code path that calls it. See the "cancellation must
+    /// precede destruction" architectural rule in
+    /// `docs/harness-contract.md` C10 for the full context, and
+    /// the discussion in the round 2 review log entry for the
+    /// PR #104 rebase gate cleanup for why this is "default Err"
+    /// rather than "default delegate".
+    fn append_activity_existing_only(
+        &self,
+        id: &WorkItemId,
+        _entry: &ActivityEntry,
+    ) -> Result<bool, BackendError> {
+        Err(BackendError::Validation(format!(
+            "append_activity_existing_only is not implemented for this \
+             backend (work item id: {id:?}); see WorkItemBackend trait \
+             docs and docs/harness-contract.md C10 for the orphan-log \
+             contract this primitive enforces"
+        )))
+    }
+
     /// Update the title of a work item.
     ///
     /// Default implementation returns an unsupported error. Override in
@@ -851,6 +911,52 @@ impl WorkItemBackend for LocalFileBackend {
             ))
         })?;
         Ok(())
+    }
+
+    /// Override that uses `OpenOptions::create(false)` so a delete
+    /// racing the append cannot recreate an orphan active log for a
+    /// deleted item. `ErrorKind::NotFound` maps to `Ok(false)`; any
+    /// other open error propagates as `BackendError::Io`. This is the
+    /// structural fix for the orphan-active-log race in the rebase
+    /// gate's background thread - see the trait-level docstring for
+    /// `append_activity_existing_only` and C10 in
+    /// `docs/harness-contract.md`.
+    fn append_activity_existing_only(
+        &self,
+        id: &WorkItemId,
+        entry: &ActivityEntry,
+    ) -> Result<bool, BackendError> {
+        let activity_path = self.activity_path(id)?;
+        let mut line =
+            serde_json::to_string(entry).map_err(|e| BackendError::Serialize(format!("{e}")))?;
+        line.push('\n');
+
+        use std::io::Write;
+        let mut file = match std::fs::OpenOptions::new()
+            .create(false)
+            .append(true)
+            .open(&activity_path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(BackendError::Io(format!(
+                    "failed to open activity log {}: {e}",
+                    activity_path.display()
+                )));
+            }
+        };
+        // POSIX: a concurrent `fs::rename(active -> archive/...)` on
+        // the main thread leaves this fd pointing at the same inode,
+        // so the write below lands in the archived file rather than
+        // an orphan active log.
+        file.write_all(line.as_bytes()).map_err(|e| {
+            BackendError::Io(format!(
+                "failed to write activity log {}: {e}",
+                activity_path.display()
+            ))
+        })?;
+        Ok(true)
     }
 
     fn update_plan(&self, id: &WorkItemId, plan: &str) -> Result<(), BackendError> {
