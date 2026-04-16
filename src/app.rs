@@ -2813,6 +2813,15 @@ impl App {
         // `finish_session_open` also has its own deleted-work-item
         // guard as a second line of defence.
         self.cancel_session_open_entry(wi_id);
+        // Cancel any pending Phase 2 PTY spawn. The worker's
+        // Session::spawn may already be in flight; when it
+        // completes, `poll_session_spawns` will see that the item
+        // no longer exists (or the stage mismatches) and drop the
+        // session. Removing the pending entry here ends the
+        // "Spawning agent session..." spinner immediately.
+        if let Some(pending) = self.session_spawn_rx.remove(wi_id) {
+            self.end_activity(pending.activity);
+        }
     }
 
     /// Stop all MCP servers, clear activity state, and remove temp config files.
@@ -2865,6 +2874,18 @@ impl App {
                     files_to_clean.extend(guard.drain(..));
                 }
                 files_to_clean.push(entry.mcp_config_path);
+            }
+        }
+        // 4. In-flight Phase 2 PTY spawn workers
+        //    (`session_spawn_rx` entries). The worker's
+        //    `Session::spawn` may still be in flight; when it
+        //    completes the `tx.send` will fail (receiver dropped)
+        //    and the Session + MCP server Drops will run. We just
+        //    end the activity spinner here.
+        let spawn_wi_ids: Vec<WorkItemId> = self.session_spawn_rx.keys().cloned().collect();
+        for wi_id in spawn_wi_ids {
+            if let Some(pending) = self.session_spawn_rx.remove(&wi_id) {
+                self.end_activity(pending.activity);
             }
         }
         self.spawn_agent_file_cleanup(files_to_clean);
@@ -5733,8 +5754,19 @@ impl App {
                 self.end_activity(pending.activity);
             }
 
+            // Guard: the work item may have been deleted or
+            // transitioned to another stage while the Phase 2
+            // worker was in flight. If the owning work item no
+            // longer exists or its status no longer matches the
+            // session key, drop the session and clean up.
+            let item_valid = self
+                .work_items
+                .iter()
+                .find(|w| w.id == result.wi_id)
+                .is_some_and(|w| w.status == result.session_key.1);
+
             match (result.session, result.error) {
-                (Some(session), _) => {
+                (Some(session), _) if item_valid => {
                     let parser = Arc::clone(&session.parser);
                     let entry = SessionEntry {
                         parser,
@@ -5755,6 +5787,14 @@ impl App {
                     self.focus = FocusPanel::Right;
                     self.status_message =
                         Some("Right panel focused - press Ctrl+] to return".into());
+                }
+                (Some(_session), _) => {
+                    // Work item was deleted or stage changed while
+                    // the spawn was in flight. The session's Drop
+                    // kills the child; clean up MCP and side-car
+                    // files off the UI thread.
+                    drop(result.mcp_server);
+                    self.spawn_agent_file_cleanup(result.written_files);
                 }
                 (None, Some(e)) => {
                     // Session spawn failed. Drop the MCP server and
