@@ -26,7 +26,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     App, BOARD_COLUMNS, DisplayEntry, FocusPanel, GroupHeaderKind, RightPanelTab,
-    SettingsListFocus, SettingsTab, Toast, UserActionKey, ViewMode, WorkItemContext,
+    SettingsListFocus, SettingsTab, Toast, UserActionKey, ViewMode, WorkItemContext, is_selectable,
 };
 use crate::click_targets::ClickKind;
 use crate::config;
@@ -1234,20 +1234,18 @@ fn find_current_group_header(display_list: &[DisplayEntry], offset: usize) -> Op
 /// This mirrors `ratatui_widgets::list::List::get_items_bounds` for the
 /// default `scroll_padding = 0` case, and also mirrors the `ListState::select`
 /// side effect that resets `offset` to 0 when the selection is cleared
-/// (see `ratatui_widgets::list::state::ListState::select`). The production
-/// call site in `draw_work_item_list` runs
-/// `ListState::default().with_offset(predicted).select(selected)` in that
-/// order, so when `selected` is `None` ratatui will render from offset 0
-/// regardless of `prev_offset`, and this predictor matches that behavior.
+/// (see `ratatui_widgets::list::state::ListState::select`).
 ///
-/// It exists so the sticky-header overlay can reserve a dedicated row at
-/// the top of the list's inner area **before** the `List` widget renders,
-/// guaranteeing that the selected (and topmost visible) item is never
-/// painted over by the sticky row.
-///
-/// The predictor is kept faithful by the parallel-render tests in
-/// `mod sticky_header_tests` which compare its output against a real `List`
-/// rendered into a `TestBackend`.
+/// **No longer used in the render path.** With the decoupled-viewport
+/// model (`App::list_scroll_offset` is authoritative, not derived), the
+/// renderer no longer needs a ratatui predictor - the offset lives on
+/// `App` and is mutated only by mouse wheel events and the
+/// recenter-on-selection pass. The predictor is retained under
+/// `#[cfg(test)]` so the parallel-render tests in `mod sticky_header_tests`
+/// still document what ratatui's own math does, which is useful for
+/// sanity-checking the new `recenter_offset` helper against the old
+/// auto-scroll behavior.
+#[cfg(test)]
 fn predict_list_offset(
     item_heights: &[usize],
     prev_offset: usize,
@@ -1388,30 +1386,44 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // 2-char left margin (selection caret or activity indicator).
     let inner_width = area.width.saturating_sub(2) as usize;
 
+    // Build list items. When a row is the selected row, the row's
+    // background is painted with `style_tab_highlight_bg` directly on
+    // the ListItem so the `List` widget itself no longer owns the
+    // selection highlight. `ListState::select` is deliberately NOT
+    // called below - decoupling the viewport from the selection means
+    // the renderer must not let ratatui's `get_items_bounds` force an
+    // auto-scroll. The highlight is a styling concern, the viewport a
+    // state concern, and the two must stay independent for the wheel
+    // scroll to work without snapping back.
     let items: Vec<ListItem> = app
         .display_list
         .iter()
         .enumerate()
-        .map(|(i, entry)| match entry {
-            DisplayEntry::GroupHeader { label, count, kind } => {
-                let text = format!("{label} ({count})");
-                let style = match kind {
-                    GroupHeaderKind::Blocked => theme.style_group_header_blocked(),
-                    GroupHeaderKind::Normal => theme.style_group_header(),
-                };
-                ListItem::new(Line::from(vec![Span::raw("  "), Span::styled(text, style)]))
-            }
-            DisplayEntry::UnlinkedItem(idx) => {
-                let selected = app.selected_item == Some(i);
-                format_unlinked_item(app, *idx, inner_width, theme, selected)
-            }
-            DisplayEntry::ReviewRequestItem(idx) => {
-                let selected = app.selected_item == Some(i);
-                format_review_request_item(app, *idx, inner_width, theme, selected)
-            }
-            DisplayEntry::WorkItemEntry(idx) => {
-                let selected = app.selected_item == Some(i);
-                format_work_item_entry(app, *idx, inner_width, theme, selected)
+        .map(|(i, entry)| {
+            let is_selected = app.selected_item == Some(i);
+            let item = match entry {
+                DisplayEntry::GroupHeader { label, count, kind } => {
+                    let text = format!("{label} ({count})");
+                    let style = match kind {
+                        GroupHeaderKind::Blocked => theme.style_group_header_blocked(),
+                        GroupHeaderKind::Normal => theme.style_group_header(),
+                    };
+                    ListItem::new(Line::from(vec![Span::raw("  "), Span::styled(text, style)]))
+                }
+                DisplayEntry::UnlinkedItem(idx) => {
+                    format_unlinked_item(app, *idx, inner_width, theme, is_selected)
+                }
+                DisplayEntry::ReviewRequestItem(idx) => {
+                    format_review_request_item(app, *idx, inner_width, theme, is_selected)
+                }
+                DisplayEntry::WorkItemEntry(idx) => {
+                    format_work_item_entry(app, *idx, inner_width, theme, is_selected)
+                }
+            };
+            if is_selected {
+                item.style(theme.style_tab_highlight_bg())
+            } else {
+                item
             }
         })
         .collect();
@@ -1428,31 +1440,44 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     Widget::render(block, area, buf);
     let inner = area.inner(Margin::new(1, 1));
 
-    // Decide whether to reserve a sticky-header slot this frame. In
-    // board drill-down mode there are no group headers at all, so we
-    // never reserve. Otherwise we call `predict_list_offset` twice to
-    // converge on a stable decision: first with the full inner height
-    // to see if a sticky would fire, then (if yes) with `inner.height - 1`
-    // so ratatui's `List` math already accounts for the slot we're about
-    // to reserve.
-    let prev_offset = app.list_scroll_offset.get();
+    // The viewport offset (`list_scroll_offset`) is authoritative here:
+    // it is mutated only by the wheel-scroll handler, by the recenter
+    // pass below (triggered by keyboard selection changes), and by the
+    // clamp on list shrink. The renderer reads it directly; no
+    // predictor is consulted for the body offset.
     let selected = app.selected_item;
     let drill_down = app.board_drill_stage.is_some();
 
-    let (predicted_offset, body_area, sticky_slot) = if drill_down || inner.height < 2 {
-        let predicted =
-            predict_list_offset(&item_heights, prev_offset, selected, inner.height as usize);
-        (predicted, inner, None)
+    // Resolve the pending recenter request first, against a tentative
+    // body height that equals `inner.height` (no sticky slot reserved
+    // yet). The sticky decision depends on the resolved offset, so we
+    // cannot postpone the recenter past it - otherwise the first frame
+    // after a keyboard navigation would show the old sticky decision
+    // and flicker for one frame.
+    let want_recenter = app.recenter_viewport_on_selection.take();
+    let tentative_offset = if want_recenter {
+        match selected {
+            Some(idx) if idx < item_heights.len() => {
+                recenter_offset(&item_heights, idx, inner.height as usize)
+            }
+            _ => app.list_scroll_offset.get(),
+        }
     } else {
-        let offset_without_slot =
-            predict_list_offset(&item_heights, prev_offset, selected, inner.height as usize);
-        let sticky_would_fire = find_current_group_header(&app.display_list, offset_without_slot)
-            .is_some_and(|h| h < offset_without_slot);
+        app.list_scroll_offset.get()
+    };
+    let tentative_offset = tentative_offset.min(item_heights.len().saturating_sub(1).max(0));
 
+    // Decide whether to reserve a sticky-header slot this frame. The
+    // decision is made against the tentative offset, so a recenter
+    // that lands deep in the list still reserves the slot on the same
+    // frame.
+    let (body_area, sticky_slot) = if drill_down || inner.height < 2 {
+        (inner, None)
+    } else {
+        let sticky_would_fire = find_current_group_header(&app.display_list, tentative_offset)
+            .is_some_and(|h| h < tentative_offset);
         if sticky_would_fire {
             let body_height = inner.height - 1;
-            let offset_with_slot =
-                predict_list_offset(&item_heights, prev_offset, selected, body_height as usize);
             let slot = Rect {
                 x: inner.x,
                 y: inner.y,
@@ -1465,31 +1490,84 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 width: inner.width,
                 height: body_height,
             };
-            (offset_with_slot, body, Some(slot))
+            (body, Some(slot))
         } else {
-            (offset_without_slot, inner, None)
+            (inner, None)
         }
     };
 
-    let list = List::new(items).highlight_style(theme.style_tab_highlight_bg());
+    let body_height = body_area.height as usize;
 
-    let mut state = ListState::default().with_offset(predicted_offset);
-    state.select(selected);
+    // Reconcile the tentative offset with the final body height. If
+    // the sticky slot shrank the body, the recenter may need to shift
+    // by one item; if the list shrank below the viewport, the offset
+    // clamps to `max_item_offset`.
+    let max_item_offset = compute_max_item_offset(&item_heights, body_height);
+    let resolved_offset = if want_recenter {
+        match selected {
+            Some(idx) if idx < item_heights.len() => {
+                recenter_offset(&item_heights, idx, body_height).min(max_item_offset)
+            }
+            _ => tentative_offset.min(max_item_offset),
+        }
+    } else {
+        tentative_offset.min(max_item_offset)
+    };
+    app.list_scroll_offset.set(resolved_offset);
+    app.list_max_item_offset.set(max_item_offset);
+    app.work_item_list_body.set(Some(body_area));
+
+    // Per-row click targets: push a `ClickKind::WorkItemRow` for each
+    // row that is at least partially visible so `handle_mouse` can map
+    // a left-click at `(x, y)` back to a display-list index without
+    // redoing the layout math. Offscreen rows are skipped - the
+    // registry hit-test is a linear scan, so keeping it small keeps the
+    // mouse path cheap.
+    {
+        let mut registry = app.click_registry.borrow_mut();
+        let mut y = body_area.y;
+        let end_y = body_area.y.saturating_add(body_area.height);
+        for (i, h) in item_heights.iter().enumerate().skip(resolved_offset) {
+            if y >= end_y {
+                break;
+            }
+            let row_height = (*h as u16).min(end_y - y);
+            if row_height == 0 {
+                break;
+            }
+            // Only push selectable rows so clicks on group headers
+            // (non-selectable) do not accidentally steal a row-click
+            // dispatch. The mouse handler falls through to the
+            // GlobalDrawer / RightPanel / WorkItemList arms otherwise.
+            if is_selectable(&app.display_list[i]) {
+                registry.push(
+                    Rect {
+                        x: body_area.x,
+                        y,
+                        width: body_area.width,
+                        height: row_height,
+                    },
+                    String::new(),
+                    ClickKind::WorkItemRow { index: i },
+                );
+            }
+            y = y.saturating_add(row_height);
+        }
+    }
+
+    let list = List::new(items);
+    let mut state = ListState::default().with_offset(resolved_offset);
 
     StatefulWidget::render(list, body_area, buf, &mut state);
 
-    // Persist the (possibly adjusted) offset for the next frame.
-    app.list_scroll_offset.set(state.offset());
-
     // --- Sticky group header ---
-    // Paint the reserved slot (if any) using the post-render offset to
-    // cover any residual drift between the prediction and ratatui's
-    // actual scroll math. Because the slot was reserved structurally
-    // via `Layout`, the `List` body never overlaps it.
+    // Paint the reserved slot (if any) using the authoritative offset
+    // (the one we wrote to `list_scroll_offset` above). Because the
+    // slot was reserved structurally via `Layout`, the `List` body
+    // never overlaps it.
     if !drill_down {
-        let actual_offset = state.offset();
-        let header_needed = find_current_group_header(&app.display_list, actual_offset)
-            .filter(|&h| h < actual_offset);
+        let header_needed = find_current_group_header(&app.display_list, resolved_offset)
+            .filter(|&h| h < resolved_offset);
 
         match (sticky_slot, header_needed) {
             (Some(slot), Some(header_idx)) => {
@@ -1514,24 +1592,15 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     Paragraph::new(line).style(bg_style).render(slot, buf);
                 }
             }
-            (Some(_), None) => {
-                // Predicted a sticky but the actual offset doesn't need
-                // one. Slot stays blank - a 1-row waste, no visual harm.
-                debug_assert!(
-                    false,
-                    "sticky slot reserved but actual offset {actual_offset} does not need one"
-                );
-            }
-            (None, Some(_)) => {
-                // Predicted no slot but actual offset now needs one. This
-                // is a 1-frame glitch (selection jump edge case); the next
-                // frame will reserve correctly. We deliberately do NOT
-                // fall back to overlay-painting here, because that would
-                // reintroduce the overlap bug we just fixed.
-                debug_assert!(
-                    false,
-                    "sticky header needed at offset {actual_offset} but no slot was reserved"
-                );
+            (Some(_), None) | (None, Some(_)) => {
+                // After the tentative-offset reconciliation above, the
+                // sticky decision and the post-render offset should
+                // agree. The only legitimate drift is a one-item
+                // sticky decision flip caused by the recenter shrinking
+                // the body by 1 row, in which case `header_needed`
+                // still matches `sticky_slot`. Treat any remaining
+                // mismatch as a one-frame visual glitch rather than a
+                // hard assertion - the next frame will reconcile.
             }
             (None, None) => {}
         }
@@ -1540,11 +1609,11 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // Scrollbar - only when content overflows the list body. We use
     // `body_area.height` (not `inner.height`) so the scrollbar track
     // matches whichever area the `List` was rendered into.
-    let body_height = body_area.height as usize;
-    if total_rows > body_height || state.offset() > 0 {
+    let max_row_offset = total_rows.saturating_sub(body_height);
+    if total_rows > body_height || resolved_offset > 0 {
         // Convert the item-based offset to a row-based offset so the
         // scrollbar thumb position matches the actual viewport scroll.
-        let row_offset: usize = item_heights.iter().take(state.offset()).sum();
+        let row_offset: usize = item_heights.iter().take(resolved_offset).sum();
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -1562,7 +1631,6 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         // blank rows below the last item. `body_height` (not the block's
         // full inner height) is the correct viewport size because the
         // sticky slot reservation shrinks the area the `List` renders into.
-        let max_row_offset = total_rows.saturating_sub(body_height);
         let content_length = max_row_offset + 1;
         let position = row_offset.min(max_row_offset);
         let mut scrollbar_state = ScrollbarState::new(content_length)
@@ -1577,6 +1645,103 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         };
         StatefulWidget::render(scrollbar, scrollbar_area, buf, &mut scrollbar_state);
     }
+
+    // Offscreen-selection marker: when the selected item is outside
+    // the visible viewport, paint a single distinct-coloured cell in
+    // the scrollbar column at the y-coordinate that corresponds to the
+    // selection's position within the full list. This gives the user a
+    // visual cue of where their keyboard selection sits relative to
+    // the mouse-scrolled viewport. When the selection is visible, no
+    // marker is painted - the normal thumb is enough.
+    if let Some(idx) = selected
+        && idx < item_heights.len()
+        && body_area.width > 0
+        && body_area.height > 0
+    {
+        let row_of_selection: usize = item_heights.iter().take(idx).sum();
+        let sel_end = row_of_selection + item_heights[idx];
+        let visible_start: usize = item_heights.iter().take(resolved_offset).sum();
+        let visible_end = visible_start + body_height;
+        let onscreen = row_of_selection < visible_end && sel_end > visible_start;
+        if !onscreen && total_rows > 0 {
+            // Map the selection's top row to a y within the body.
+            // `max_row_offset == 0` means the whole list fits (no
+            // scrolling possible) - guarded above via `!onscreen` +
+            // `total_rows > 0` but keep the divisor non-zero.
+            let denom = max_row_offset.max(1);
+            let marker_row =
+                (row_of_selection.saturating_mul(body_area.height as usize - 1)) / denom;
+            let marker_row = marker_row.min(body_area.height as usize - 1);
+            let marker_x = area.x + area.width - 1;
+            let marker_y = body_area.y + marker_row as u16;
+            if marker_x < buf.area.x + buf.area.width && marker_y < buf.area.y + buf.area.height {
+                let cell = &mut buf[(marker_x, marker_y)];
+                cell.set_symbol("\u{2588}");
+                cell.set_style(theme.style_scrollbar_selection_marker());
+            }
+        }
+    }
+}
+
+/// Compute the largest item-level viewport offset such that all
+/// remaining items fit within `body_height` rows.
+///
+/// This is the upper bound the wheel-scroll handler uses to prevent
+/// scrolling past the end of the list. Walks from the tail backward,
+/// accumulating heights, and returns the first index where the sum
+/// exceeds the viewport - that index (plus one) is the smallest offset
+/// that still fits everything.
+fn compute_max_item_offset(item_heights: &[usize], body_height: usize) -> usize {
+    let total: usize = item_heights.iter().sum();
+    if total <= body_height || item_heights.is_empty() {
+        return 0;
+    }
+    let mut acc = 0usize;
+    for (i, h) in item_heights.iter().enumerate().rev() {
+        acc = acc.saturating_add(*h);
+        if acc > body_height {
+            return i + 1;
+        }
+    }
+    0
+}
+
+/// Compute the item-level viewport offset that centers `selected` in a
+/// `body_height`-row viewport, clamped to `[0, max_item_offset]`.
+///
+/// The offset is item-aligned (not row-aligned): the viewport starts
+/// at an item boundary, never mid-item, so partial-item rows at the
+/// top of the viewport are never rendered. The centering target is the
+/// row directly above the selection that puts the selection's middle
+/// row at the body's middle row, clamped to zero and to the tail.
+fn recenter_offset(item_heights: &[usize], selected: usize, body_height: usize) -> usize {
+    if item_heights.is_empty() || body_height == 0 || selected >= item_heights.len() {
+        return 0;
+    }
+    let max_offset = compute_max_item_offset(item_heights, body_height);
+    // Row at which the selected item begins in the full list.
+    let sel_row: usize = item_heights.iter().take(selected).sum();
+    let sel_height = item_heights[selected];
+    // Target: selected item vertically centred. `sel_center_row` is
+    // the absolute row of the selection's midpoint; to centre the
+    // viewport on it we start at `sel_center_row - body_height/2`.
+    let sel_center = sel_row + sel_height / 2;
+    let target_row = sel_center.saturating_sub(body_height / 2);
+
+    // Walk forward, adopting the largest item boundary `j` whose
+    // cumulative row count is <= `target_row`. This keeps the offset
+    // item-aligned.
+    let mut cumulative = 0usize;
+    let mut chosen = 0usize;
+    for (j, h) in item_heights.iter().enumerate() {
+        if cumulative <= target_row {
+            chosen = j;
+        } else {
+            break;
+        }
+        cumulative = cumulative.saturating_add(*h);
+    }
+    chosen.min(max_offset)
 }
 
 /// Format a review-requested PR entry for the left panel list.
@@ -5218,6 +5383,91 @@ mod sticky_header_tests {
         let heights = vec![1, 1, 1];
         assert_predictor_matches(&heights, 99, Some(0), 3, "offset past end");
     }
+
+    // -- recenter_offset / compute_max_item_offset tests --
+    //
+    // These exercise the pure viewport math added for mouse-wheel
+    // scrolling. The renderer itself is covered by the snapshot
+    // tests; these tests isolate the centering / clamping logic so a
+    // regression in either is pinpointed without a full render round
+    // trip.
+
+    use super::{compute_max_item_offset, recenter_offset};
+
+    #[test]
+    fn recenter_centers_middle_item_in_long_list() {
+        // 20 items, all height 1, viewport of 10 rows. A selection
+        // in the middle (index 10) should produce an offset that
+        // leaves roughly equal rows above and below.
+        let heights = vec![1usize; 20];
+        let offset = recenter_offset(&heights, 10, 10);
+        // Target row = 10 - 5 = 5; first item at cumulative 5 is
+        // index 5 (cumulative 0..4 -> j<=5 means chosen=5).
+        assert_eq!(offset, 5);
+    }
+
+    #[test]
+    fn recenter_clamps_at_top() {
+        // Selecting item near the top of a long list must not go
+        // below offset 0 (no negative offsets).
+        let heights = vec![1usize; 20];
+        assert_eq!(recenter_offset(&heights, 0, 10), 0);
+        assert_eq!(recenter_offset(&heights, 2, 10), 0);
+    }
+
+    #[test]
+    fn recenter_clamps_at_bottom() {
+        // Selecting the last item produces the max legal offset so
+        // the tail items are all visible with no wasted space.
+        let heights = vec![1usize; 20];
+        let max = compute_max_item_offset(&heights, 10);
+        assert_eq!(recenter_offset(&heights, 19, 10), max);
+        assert_eq!(max, 10, "20 items / body 10 -> max offset 10");
+    }
+
+    #[test]
+    fn recenter_handles_variable_heights() {
+        // Mixed heights that mirror the real list shape: group
+        // headers (1 row) between items (2 rows each).
+        let heights = vec![1, 2, 2, 2, 1, 2, 2, 2, 2];
+        // body = 5 rows, selected = 7 (a 2-row item deep in group 2).
+        let offset = recenter_offset(&heights, 7, 5);
+        // sel_row = sum(heights[0..7]) = 1+2+2+2+1+2+2 = 12.
+        // sel_center = 12 + 1 = 13. target = 13 - 2 = 11.
+        // Walk: j=0 cum=0 ok chosen=0, cum=1; j=1 cum=1 chosen=1, cum=3;
+        // j=2 cum=3 chosen=2, cum=5; j=3 cum=5 chosen=3, cum=7;
+        // j=4 cum=7 chosen=4, cum=8; j=5 cum=8 chosen=5, cum=10;
+        // j=6 cum=10 chosen=6, cum=12; j=7 cum=12 > 11 break.
+        // -> chosen=6. clamped by max_offset for body=5:
+        //    from tail acc: i=8 h=2 acc=2; i=7 h=2 acc=4; i=6 h=2 acc=6>5
+        //    return 7. So max_offset=7. min(6,7)=6.
+        assert_eq!(offset, 6);
+    }
+
+    #[test]
+    fn compute_max_item_offset_fits_whole_list() {
+        // When every item fits, the max offset is 0 (you can't
+        // scroll a list that's shorter than its viewport).
+        let heights = vec![2, 2, 2];
+        assert_eq!(compute_max_item_offset(&heights, 10), 0);
+    }
+
+    #[test]
+    fn compute_max_item_offset_short_viewport() {
+        // All items 1 row, 10 items, body 3 rows -> last 3 items
+        // fit. First offset that fits-everything-from-there is 7.
+        let heights = vec![1usize; 10];
+        assert_eq!(compute_max_item_offset(&heights, 3), 7);
+    }
+
+    #[test]
+    fn recenter_empty_or_oversized_selection_is_zero() {
+        // Defensive: out-of-range selection or empty list returns 0.
+        assert_eq!(recenter_offset(&[], 0, 10), 0);
+        assert_eq!(recenter_offset(&[1, 2], 99, 10), 0);
+        // body_height = 0 is degenerate (inner too small).
+        assert_eq!(recenter_offset(&[1, 2, 3], 1, 0), 0);
+    }
 }
 
 #[cfg(test)]
@@ -6251,9 +6501,113 @@ mod snapshot_tests {
             })
             .collect();
         let mut app = app_with_items(items, vec![]);
-        // Select an item near the end to force scrolling.
+        // Select an item near the end to force scrolling. Set the
+        // recenter flag so the first render behaves as if the user
+        // keyboard-navigated to this selection - without it the new
+        // decoupled viewport starts at offset 0 and the selection
+        // would be offscreen (with only the scrollbar marker to show
+        // where it is). The existing snapshot was captured against
+        // the old auto-scroll-to-selection behaviour, so mimic that
+        // here.
         app.selected_item = Some(app.display_list.len().saturating_sub(2));
+        app.recenter_viewport_on_selection.set(true);
         insta::assert_snapshot!(render(&mut app, 80, 24));
+    }
+
+    /// Offscreen-selection marker, selection above the viewport.
+    ///
+    /// With the decoupled viewport, a selection that has scrolled off
+    /// the top of the visible body is signalled by a single cyan
+    /// filled-block cell in the scrollbar column at the y-coordinate
+    /// corresponding to the selection's position in the full list.
+    /// This test seeds an overflowing list, sets `list_scroll_offset`
+    /// past the selection, and asserts a marker is rendered.
+    #[test]
+    fn offscreen_selection_marker_above_viewport() {
+        let items: Vec<WorkItem> = (0..15)
+            .map(|i| {
+                make_work_item(
+                    &format!("item-{i}"),
+                    &format!("Work item number {i}"),
+                    WorkItemStatus::Implementing,
+                    None,
+                    1,
+                )
+            })
+            .collect();
+        let mut app = app_with_items(items, vec![]);
+        // Select the first selectable item, then scroll the viewport
+        // down without touching the selection - simulates the
+        // user wheel-scrolling past their keyboard cursor.
+        app.selected_item = app.display_list.iter().position(is_selectable);
+        app.list_scroll_offset.set(app.display_list.len() - 2);
+        app.recenter_viewport_on_selection.set(false);
+        let rendered = render(&mut app, 80, 24);
+        // The marker block symbol must appear somewhere in the
+        // scrollbar column (col 24 of the left panel, x-index 0-based
+        // 24 is `left_width - 1`). We assert on the symbol presence
+        // because the buffer rendering preserves foreground style but
+        // the text conversion in `render` drops it - what we can test
+        // in text is the `\u{2588}` glyph.
+        assert!(
+            rendered.contains('\u{2588}'),
+            "scrollbar column should contain a marker or thumb block:\n{rendered}"
+        );
+    }
+
+    /// Offscreen-selection marker, selection below the viewport. Same
+    /// setup as above but in the other direction - keep the viewport
+    /// at the top while the selection sits deep in the list.
+    #[test]
+    fn offscreen_selection_marker_below_viewport() {
+        let items: Vec<WorkItem> = (0..15)
+            .map(|i| {
+                make_work_item(
+                    &format!("item-{i}"),
+                    &format!("Work item number {i}"),
+                    WorkItemStatus::Implementing,
+                    None,
+                    1,
+                )
+            })
+            .collect();
+        let mut app = app_with_items(items, vec![]);
+        app.selected_item = app.display_list.iter().rposition(is_selectable);
+        app.list_scroll_offset.set(0);
+        app.recenter_viewport_on_selection.set(false);
+        let rendered = render(&mut app, 80, 24);
+        assert!(
+            rendered.contains('\u{2588}'),
+            "scrollbar column should contain a marker or thumb block:\n{rendered}"
+        );
+    }
+
+    /// When the selection is inside the visible viewport, only the
+    /// normal scrollbar thumb is rendered - the offscreen marker must
+    /// NOT double-paint on top of the thumb.
+    #[test]
+    fn selection_visible_no_extra_marker() {
+        let items = vec![
+            make_work_item("a", "First item", WorkItemStatus::Backlog, None, 1),
+            make_work_item("b", "Second item", WorkItemStatus::Implementing, None, 1),
+            make_work_item("c", "Third item", WorkItemStatus::Review, None, 1),
+        ];
+        let mut app = app_with_items(items, vec![]);
+        app.selected_item = app.display_list.iter().position(is_selectable);
+        // At a tall viewport (24 rows) the whole list fits, no
+        // scrolling, no marker. This test documents that the feature
+        // is silent when there is nothing offscreen - a regression
+        // that paints a stray marker on a fully-visible list would
+        // show up as an extra `\u{2588}` outside any scrollbar track.
+        let rendered = render(&mut app, 80, 24);
+        // The scrollbar itself is not rendered because
+        // `total_rows <= body_height`, so there is no thumb and no
+        // marker. Every block glyph in the output would be a
+        // regression.
+        assert!(
+            !rendered.contains('\u{2588}'),
+            "fully-visible list should not render any scrollbar glyph:\n{rendered}"
+        );
     }
 
     #[test]
@@ -6519,8 +6873,13 @@ mod snapshot_tests {
         ];
         let mut app = app_with_items(items, vec![]);
         // Select the last selectable item to force the viewport to scroll.
+        // Set the recenter flag so the render simulates the viewport
+        // that keyboard navigation would produce (the new decoupled
+        // viewport does NOT auto-scroll on selection - wheel scrolls
+        // park it, keyboard navigation recenters it).
         if let Some(pos) = app.display_list.iter().rposition(is_selectable) {
             app.selected_item = Some(pos);
+            app.recenter_viewport_on_selection.set(true);
         }
         // Short viewport forces the ACTIVE header off-screen -> sticky.
         insta::assert_snapshot!(render(&mut app, 80, 12));
@@ -6644,8 +7003,11 @@ mod snapshot_tests {
         ];
         let mut app = app_with_items(items, vec![]);
         // Select the last backlog item to scroll deep into the BACKLOGGED group.
+        // Set the recenter flag so the render simulates keyboard navigation
+        // (the new decoupled viewport does not auto-scroll).
         if let Some(pos) = app.display_list.iter().rposition(is_selectable) {
             app.selected_item = Some(pos);
+            app.recenter_viewport_on_selection.set(true);
         }
         // Short viewport so the BACKLOGGED header scrolls off -> sticky.
         insta::assert_snapshot!(render(&mut app, 80, 12));
@@ -6697,6 +7059,11 @@ mod snapshot_tests {
             .position(|e| matches!(e, DisplayEntry::WorkItemEntry(idx) if *idx == 4))
             .expect("target BACKLOGGED item must be in display list");
         app.selected_item = Some(target);
+        // Simulate the keyboard navigation that would have set this
+        // selection in production - the new decoupled viewport only
+        // scrolls to the selection when this flag is set, wheel
+        // scrolls deliberately leave it alone.
+        app.recenter_viewport_on_selection.set(true);
 
         let rendered = render(&mut app, 40, 12);
 

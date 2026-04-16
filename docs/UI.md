@@ -93,21 +93,37 @@ specific field and rationale is required to ship an exception.
 ### Mouse Events
 
 Mouse capture is enabled so the terminal forwards mouse events to the
-application. Currently only ScrollUp and ScrollDown are handled; all
-other mouse events are ignored.
+application. The handler processes ScrollUp / ScrollDown,
+Down(Left) / Up(Left) / Drag(Left); all other mouse events are
+ignored.
 
-When a scroll event arrives, `mouse_target()` performs hit-testing
-against terminal-absolute coordinates to determine which PTY area (if
-any) the cursor is over:
+When a mouse event arrives, the priority check first consults
+`App::click_registry` - a per-frame table of rectangles pushed by the
+renderer. A registry hit routes the event by `ClickKind`:
+
+- `ClickKind::WorkItemRow { index }` - emitted once per visible row in
+  the left-panel work item list. `Up(Left)` on the same row as the
+  preceding `Down(Left)` selects the row.
+- `ClickKind::PrUrl | Branch | RepoPath | Title` - chrome labels in
+  the right panel. A Down-Up pair on the same target copies the value
+  to the clipboard.
+
+If the registry does not hit, `mouse_target()` classifies the cursor
+against terminal-absolute coordinates:
 
 1. **Global drawer** - checked first because it overlays everything.
    When the drawer is open, coordinates outside its inner area return
    `MouseTarget::None` so the dimmed background does not receive events.
 2. **Right panel** - the per-work-item PTY session area (Claude Code
    or Terminal tab, depending on `right_panel_tab`).
+3. **Work item list** - the left-panel list body. Wheel scrolls over
+   this area drive the authoritative viewport offset
+   (`App::list_scroll_offset`) without moving the selection. The body
+   rect is stored on `App::work_item_list_body` each render and
+   cleared implicitly when the renderer does not draw the list.
 
-Scroll events drive a local scrollback viewport rather than being
-forwarded directly to the child process:
+Scroll events over **PTY areas** drive a local scrollback viewport
+rather than being forwarded directly to the child process:
 
 - **Scroll-up** always enters or advances local scrollback mode. The
   viewport shifts into the scrollback buffer. Due to a limitation in
@@ -128,6 +144,29 @@ forwarded directly to the child process:
 
 When scrollback mode is active, the panel title shows a [SCROLLBACK]
 indicator so the user knows they are viewing history.
+
+Scroll events over the **work item list** body are handled entirely
+locally in `handle_work_item_list_scroll`:
+
+- Wheel ticks move `App::list_scroll_offset` by 3 rows per tick (the
+  same step size as the PTY scrollback helper), clamped to
+  `[0, App::list_max_item_offset]`.
+- Neither `App::selected_item` nor
+  `App::recenter_viewport_on_selection` is touched. The viewport and
+  the keyboard selection are deliberately decoupled: the user can
+  wheel the viewport anywhere without losing their cursor, and can
+  resume keyboard navigation at any time. The next `Up` / `Down` /
+  `j` / `k` snaps the viewport back to the selection via the
+  renderer's recenter pass.
+- Left-click on a visible row (dispatched via the
+  `ClickKind::WorkItemRow` priority path) sets `selected_item`, sets
+  `right_panel_tab = ClaudeCode`, arms
+  `recenter_viewport_on_selection`, and calls `sync_layout` when
+  the context-bar presence changes. Neither the wheel path nor the
+  click-to-select path triggers remote I/O, so
+  `App::try_begin_user_action` is not used here (the "User action
+  guard" section below only applies to handlers that spawn
+  `gh` / `git fetch` / network calls).
 
 ### Mouse Text Selection
 
@@ -927,34 +966,72 @@ All rendering is Buffer-based (not Frame-based). Widgets use the
 `StatefulWidget::render(widget, area, buf, &mut state)` patterns from
 ratatui-core.
 
-### Scroll Offset Persistence
+### List / viewport / scrollbar
 
-The left-panel work item list persists its scroll offset between render
-frames via `App::list_scroll_offset`, a `Cell<usize>`. This field uses
-interior mutability (`Cell`) because rendering takes `&App` (immutable),
-but the offset must be written back after each render so the viewport
-stays stable during keyboard navigation.
+The left-panel work item list uses a **decoupled viewport model**:
+`App::list_scroll_offset` (a `Cell<usize>` for interior mutability
+during render) is **authoritative** for the viewport position, not
+derived from the selection. This is what makes mouse-wheel scrolling
+possible without the viewport snapping back to the selection on
+every frame.
+
+Three inputs can mutate the offset:
+
+1. **Mouse wheel** over the list body - `handle_work_item_list_scroll`
+   adds / subtracts 3 rows per tick, clamped to
+   `[0, App::list_max_item_offset]`. Selection is not touched.
+2. **Keyboard navigation** - `select_next_item` / `select_prev_item`
+   (and any future selection mover) sets
+   `App::recenter_viewport_on_selection` to `true`. The next render
+   consumes the flag and computes an offset that centers the
+   selection in the visible body, clamped at both ends of the list.
+3. **List-length clamp** - each render computes
+   `max_item_offset = compute_max_item_offset(item_heights,
+   body_height)` and clamps the read offset so a list that just
+   shrank below the current offset rolls back to the tail without a
+   dangling gap.
+
+The offset is also reset to 0 in `build_display_list()` whenever the
+display list is rebuilt (view mode toggle, drill-down, item deletion,
+fetch cycle). This prevents stale offsets from a previous list shape
+carrying over into a structurally different list.
 
 The render flow in `draw_work_item_list` (ui.rs):
 
-1. Create a `ListState` seeded with the persisted offset:
-   `ListState::default().with_offset(app.list_scroll_offset.get())`
-2. Set the selected item: `state.select(app.selected_item)`
-3. Render via `StatefulWidget::render` - ratatui's `get_items_bounds()`
-   checks whether the selected item falls within the visible range and
-   only adjusts the offset when it does not
-4. Write the (possibly adjusted) offset back:
-   `app.list_scroll_offset.set(state.offset())`
-
-This means the highlight moves freely within the visible viewport. The
-viewport only scrolls when the highlight reaches a border (top or
-bottom edge).
-
-The offset is reset to 0 in `build_display_list()` whenever the display
-list is rebuilt (view mode toggle, drill-down, item deletion, fetch
-cycle). This prevents stale offsets from a previous list shape carrying
-over into a structurally different list. ratatui re-clamps the offset
-on the next render frame based on the selected item position.
+1. Compute per-item `item_heights` for the current display list.
+2. If `recenter_viewport_on_selection.take()` returned `true` and
+   there is a selection, compute a tentative offset via
+   `recenter_offset(&item_heights, selected, inner.height)`. Otherwise
+   read `list_scroll_offset.get()` directly.
+3. Decide whether to reserve a sticky-header slot based on the
+   tentative offset (so the sticky fires on the same frame the
+   recenter takes effect).
+4. Reconcile the offset against the final `body_height` (which may
+   be `inner.height - 1` if the sticky slot was reserved). If
+   `want_recenter` is true, recompute with the smaller height; in all
+   cases clamp to `max_item_offset`.
+5. Write the final offset back to `App::list_scroll_offset`; write
+   the body rect to `App::work_item_list_body` (for mouse routing)
+   and the max offset to `App::list_max_item_offset` (for the
+   wheel-scroll handler's clamp).
+6. Build the `List` widget, but DO NOT call `ListState::select(...)`.
+   The selection highlight is applied per-item in the `ListItem`
+   construction (the selected row's background is set to
+   `style_tab_highlight_bg`). Letting ratatui own selection would
+   re-introduce `get_items_bounds`'s auto-scroll-to-selection and
+   defeat the decoupled viewport.
+7. Push a `ClickKind::WorkItemRow { index }` click target for each
+   visible selectable row, so `handle_mouse` can route a left-click
+   back to the row index without redoing layout math.
+8. Render the scrollbar as before; then overlay a single cyan
+   filled-block cell in the scrollbar column at the y-coordinate
+   corresponding to `selected_item`'s row within the full list, but
+   **only when the selection is outside the visible viewport**. This
+   is the "your keyboard selection is here" affordance that tells the
+   user where they parked their cursor while they wheel-scroll the
+   viewport elsewhere. The marker uses
+   `theme.scrollbar_selection_marker` (Cyan by default) to stay
+   distinct from the gray scrollbar thumb.
 
 ### ACTIVE Group Intra-Stage Ordering
 
@@ -987,17 +1064,21 @@ topmost visible work item (including the selected item) is never
 painted over by the sticky header, fixing the overlap bug where the
 selected item's first wrapped line was clobbered.
 
-The "will a sticky fire this frame?" decision is made before rendering
-by `predict_list_offset()`, a faithful mirror of
-`ratatui_widgets::list::List::get_items_bounds` for the default
-`scroll_padding = 0` case. The predictor runs twice when necessary:
-first with the full `inner.height` to see if the sticky would fire,
-then (if yes) with `inner.height - 1` so that ratatui's internal
-scroll math already accounts for the slot we are about to reserve. The
-predictor is covered by parallel-render tests in
-`mod sticky_header_tests` that compare its output to a real `List`
-rendered into a `TestBackend`, so any future drift with ratatui is
-caught immediately.
+The "will a sticky fire this frame?" decision is made against the
+authoritative `list_scroll_offset` (after any pending recenter has
+been applied to produce a tentative offset): if
+`find_current_group_header(display_list, tentative_offset)` returns
+`Some(h)` with `h < tentative_offset`, the first group header is off
+the top of the viewport and the sticky slot is reserved. The slot
+reservation shrinks `body_area` by one row; the recenter then runs
+again against the smaller body so the centered-selection position
+matches the final layout.
+
+`predict_list_offset` is retained under `#[cfg(test)]` only - it is
+no longer called from the render path but still documents what
+ratatui's own `get_items_bounds` auto-scroll math does, which is
+useful for sanity-checking the recenter math against the old
+selection-driven auto-scroll behavior.
 
 The sticky row uses a DarkGray background
 (`style_sticky_header()` / `style_sticky_header_blocked()`) to visually

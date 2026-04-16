@@ -16,7 +16,14 @@ use ratatui_core::layout::Rect;
 /// Which field a click target represents. Used to pick short-display
 /// formatting for the toast and (in tests) to disambiguate which of
 /// several equally sized rects was hit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Copy` cannot be derived because `WorkItemRow` carries a `usize`
+/// payload - the pure-chrome variants above it would still be trivially
+/// `Copy`, but the enum-level derive must agree on every variant. All
+/// call sites pass `ClickKind` by value (via `.clone()`) or compare by
+/// reference / value equality, so dropping `Copy` has no impact on
+/// callers.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClickKind {
     /// The pull request URL value in the work item detail view.
     PrUrl,
@@ -26,6 +33,12 @@ pub enum ClickKind {
     RepoPath,
     /// The work item title in the work item detail view.
     Title,
+    /// A row in the left-panel work item list. Emitted once per
+    /// visible row each frame, with `index` pointing into
+    /// `App::display_list`. Left-click selects the row; the kind is
+    /// dispatched separately from the chrome-copy targets above so
+    /// `fire_chrome_copy` never sees it.
+    WorkItemRow { index: usize },
 }
 
 /// A single registered click target: a rect in absolute frame
