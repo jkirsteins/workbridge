@@ -1040,6 +1040,11 @@ pub struct WorktreeCreateResult {
     /// `remove_worktree` on reused worktrees because the thread never owned
     /// them (the worktree was already registered with git when we found it).
     pub reused: bool,
+    /// When the failure was because the branch is locked to a stale worktree
+    /// (e.g. after an interrupted rebase). Holds the path where git says the
+    /// branch is locked, so the recovery dialog can show it and offer to
+    /// force-remove it.
+    pub stale_worktree_path: Option<PathBuf>,
 }
 
 /// An orphaned worktree captured from an in-flight worktree-create
@@ -1054,6 +1059,18 @@ pub(crate) struct OrphanWorktree {
     pub repo_path: PathBuf,
     pub worktree_path: PathBuf,
     pub branch: Option<String>,
+}
+
+/// State for the stale-worktree recovery dialog. Shown when worktree
+/// creation fails because the branch is already locked to a stale/corrupt
+/// worktree (e.g. after an interrupted rebase). The user can force-remove
+/// the stale worktree and retry, or dismiss.
+pub struct StaleWorktreePrompt {
+    pub wi_id: WorkItemId,
+    pub error: String,
+    pub stale_path: PathBuf,
+    pub repo_path: PathBuf,
+    pub branch: String,
 }
 
 /// App holds the entire application state.
@@ -1141,6 +1158,13 @@ pub struct App {
     /// work item's branch no longer exists. Holds (work_item_id, error_message).
     /// The user can choose to delete the work item or dismiss.
     pub branch_gone_prompt: Option<(WorkItemId, String)>,
+    /// Stale-worktree recovery dialog. Shown when worktree creation fails
+    /// because the branch is locked to a stale/corrupt worktree.
+    pub stale_worktree_prompt: Option<StaleWorktreePrompt>,
+    /// True while the background recovery thread is running (force-remove,
+    /// prune, recreate). The dialog switches to a spinner with no key
+    /// options so the user cannot interact until recovery completes.
+    pub stale_recovery_in_progress: bool,
     /// True when the no-plan prompt is visible (offered when Claude blocks
     /// because no implementation plan exists).
     pub no_plan_prompt_visible: bool,
@@ -1956,6 +1980,8 @@ impl App {
             cleanup_evicted_branches: Vec::new(),
             alert_message: None,
             branch_gone_prompt: None,
+            stale_worktree_prompt: None,
+            stale_recovery_in_progress: false,
             no_plan_prompt_visible: false,
             no_plan_prompt_queue: VecDeque::new(),
             shutting_down: false,
@@ -3011,7 +3037,7 @@ impl App {
                     if let Some(login) = result.current_user_login.clone() {
                         self.current_user_login = Some(login);
                     }
-                    self.repo_data.insert(result.repo_path.clone(), result);
+                    self.repo_data.insert(result.repo_path.clone(), *result);
                     // Clear re-open suppression only after ALL repos have
                     // reported back.  In multi-repo setups, clearing on every
                     // single RepoData arrival lets an early repo's stale data
@@ -3386,6 +3412,15 @@ impl App {
             .unwrap_or(false)
         {
             self.branch_gone_prompt = None;
+        }
+        if self
+            .stale_worktree_prompt
+            .as_ref()
+            .map(|p| p.wi_id == *wi_id)
+            .unwrap_or(false)
+        {
+            self.stale_worktree_prompt = None;
+            self.stale_recovery_in_progress = false;
         }
 
         Ok(())
@@ -4708,6 +4743,7 @@ impl App {
                                     open_session: true,
                                     branch_gone: true,
                                     reused: false,
+                                    stale_worktree_path: None,
                                 });
                                 return;
                             }
@@ -4742,6 +4778,30 @@ impl App {
                                         open_session: true,
                                         branch_gone: false,
                                         reused,
+                                        stale_worktree_path: None,
+                                    });
+                                }
+                                Err(
+                                    crate::worktree_service::WorktreeError::BranchLockedToWorktree {
+                                        ref locked_at,
+                                        ..
+                                    },
+                                ) => {
+                                    let _ = tx.send(WorktreeCreateResult {
+                                        wi_id: wi_id_clone,
+                                        repo_path,
+                                        branch: Some(branch.clone()),
+                                        path: None,
+                                        error: Some(format!(
+                                            "Branch '{}' is locked to a stale worktree at '{}'\n\
+                                             (likely from an interrupted rebase).",
+                                            branch,
+                                            locked_at.display(),
+                                        )),
+                                        open_session: true,
+                                        branch_gone: false,
+                                        reused: false,
+                                        stale_worktree_path: Some(locked_at.clone()),
                                     });
                                 }
                                 Err(e) => {
@@ -4757,6 +4817,7 @@ impl App {
                                         open_session: true,
                                         branch_gone: false,
                                         reused: false,
+                                        stale_worktree_path: None,
                                     });
                                 }
                             }
@@ -5095,6 +5156,14 @@ impl App {
 
         self.end_user_action(&UserActionKey::WorktreeCreate);
 
+        // If this result came from a stale-worktree recovery, clear the
+        // recovery modal. On success the prompt is dismissed; on failure
+        // the error arm below will re-display the appropriate alert.
+        if self.stale_recovery_in_progress {
+            self.stale_recovery_in_progress = false;
+            self.stale_worktree_prompt = None;
+        }
+
         let reused = result.reused;
         match (result.path, result.error) {
             (Some(path), _) => {
@@ -5147,6 +5216,16 @@ impl App {
                     // Branch no longer exists. Show a dialog so the user
                     // can delete the orphaned work item or dismiss.
                     self.branch_gone_prompt = Some((result.wi_id.clone(), error));
+                } else if let Some(stale_path) = result.stale_worktree_path {
+                    // Branch is locked to a stale worktree. Show
+                    // recovery dialog instead of a generic alert.
+                    self.stale_worktree_prompt = Some(StaleWorktreePrompt {
+                        wi_id: result.wi_id.clone(),
+                        error,
+                        stale_path,
+                        repo_path: result.repo_path.clone(),
+                        branch: result.branch.clone().unwrap_or_default(),
+                    });
                 } else {
                     // Generic worktree error (permissions, disk, path
                     // conflict) or import fetch failure. Use alert for
@@ -5163,6 +5242,109 @@ impl App {
                 self.status_message = Some("Worktree creation completed with no result".into());
             }
         }
+    }
+
+    /// Spawn a background thread that force-removes a stale worktree,
+    /// prunes git's worktree bookkeeping, and retries worktree creation.
+    /// Called from the stale-worktree recovery dialog when the user
+    /// presses [r]. The dialog switches to a spinner modal
+    /// (`stale_recovery_in_progress`) that blocks all input until the
+    /// result arrives via `poll_worktree_creation`.
+    pub fn spawn_stale_worktree_recovery(&mut self, prompt: StaleWorktreePrompt) {
+        // Re-populate the prompt so the UI can render the spinner modal.
+        let wi_id = prompt.wi_id.clone();
+        self.stale_worktree_prompt = Some(StaleWorktreePrompt {
+            wi_id: prompt.wi_id.clone(),
+            error: prompt.error.clone(),
+            stale_path: prompt.stale_path.clone(),
+            repo_path: prompt.repo_path.clone(),
+            branch: prompt.branch.clone(),
+        });
+        self.stale_recovery_in_progress = true;
+
+        if self
+            .try_begin_user_action(
+                UserActionKey::WorktreeCreate,
+                Duration::ZERO,
+                "Recovering stale worktree...",
+            )
+            .is_none()
+        {
+            self.stale_recovery_in_progress = false;
+            self.stale_worktree_prompt = None;
+            self.status_message = Some("Worktree operation already in progress...".into());
+            return;
+        }
+
+        let ws = Arc::clone(&self.worktree_service);
+        let wt_dir = self.config.defaults.worktree_dir.clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        std::thread::spawn(move || {
+            // Step 1: Force-remove the stale worktree. If the path
+            // doesn't exist on disk, `git worktree remove --force` still
+            // cleans up the bookkeeping in .git/worktrees/.
+            let _ = ws.remove_worktree(
+                &prompt.repo_path,
+                &prompt.stale_path,
+                false, // don't delete the branch - it has the user's work
+                true,  // force
+            );
+
+            // Step 2: Prune any remaining stale worktree entries.
+            let _ = ws.prune_worktrees(&prompt.repo_path);
+
+            // Step 3: Retry worktree creation.
+            let wt_target = Self::worktree_target_path(&prompt.repo_path, &prompt.branch, &wt_dir);
+
+            let reused_wt = Self::find_reusable_worktree(
+                ws.as_ref(),
+                &prompt.repo_path,
+                &prompt.branch,
+                &wt_target,
+            );
+            let (wt_result, reused) = match reused_wt {
+                Some(existing) => (Ok(existing), true),
+                None => (
+                    ws.create_worktree(&prompt.repo_path, &prompt.branch, &wt_target),
+                    false,
+                ),
+            };
+
+            match wt_result {
+                Ok(wt_info) => {
+                    let _ = tx.send(WorktreeCreateResult {
+                        wi_id: prompt.wi_id,
+                        repo_path: prompt.repo_path,
+                        branch: Some(prompt.branch),
+                        path: Some(wt_info.path),
+                        error: None,
+                        open_session: true,
+                        branch_gone: false,
+                        reused,
+                        stale_worktree_path: None,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(WorktreeCreateResult {
+                        wi_id: prompt.wi_id,
+                        repo_path: prompt.repo_path,
+                        branch: Some(prompt.branch),
+                        path: None,
+                        error: Some(format!("Recovery failed: {e}")),
+                        open_session: true,
+                        branch_gone: false,
+                        reused: false,
+                        stale_worktree_path: None,
+                    });
+                }
+            }
+        });
+
+        self.attach_user_action_payload(
+            &UserActionKey::WorktreeCreate,
+            UserActionPayload::WorktreeCreate { rx, wi_id },
+        );
     }
 
     /// Build a stage-specific system prompt for the Claude session.
@@ -6230,6 +6412,7 @@ impl App {
                     open_session: false,
                     branch_gone: false,
                     reused: false,
+                    stale_worktree_path: None,
                 });
                 return;
             }
@@ -6254,6 +6437,27 @@ impl App {
                         open_session: false,
                         branch_gone: false,
                         reused,
+                        stale_worktree_path: None,
+                    });
+                }
+                Err(crate::worktree_service::WorktreeError::BranchLockedToWorktree {
+                    ref locked_at,
+                    ..
+                }) => {
+                    let _ = tx.send(WorktreeCreateResult {
+                        wi_id: wi_id_clone,
+                        repo_path,
+                        branch: Some(branch),
+                        path: None,
+                        error: Some(format!(
+                            "Imported: {title} - branch is locked to a stale worktree at '{}'\n\
+                             (likely from an interrupted rebase).",
+                            locked_at.display(),
+                        )),
+                        open_session: false,
+                        branch_gone: false,
+                        reused: false,
+                        stale_worktree_path: Some(locked_at.clone()),
                     });
                 }
                 Err(e) => {
@@ -6266,6 +6470,7 @@ impl App {
                         open_session: false,
                         branch_gone: false,
                         reused: false,
+                        stale_worktree_path: None,
                     });
                 }
             }
@@ -10707,6 +10912,13 @@ impl WorktreeService for StubWorktreeService {
     ) -> Result<(), crate::worktree_service::WorktreeError> {
         Ok(())
     }
+
+    fn prune_worktrees(
+        &self,
+        _repo_path: &std::path::Path,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
 }
 
 /// A stub backend that stores nothing. Used in tests when no backend
@@ -11240,7 +11452,7 @@ mod tests {
         assert!(app.current_activity().is_some());
 
         // Sending RepoData should clear the activity.
-        tx.send(FetchMessage::RepoData(RepoFetchResult {
+        tx.send(FetchMessage::RepoData(Box::new(RepoFetchResult {
             repo_path: PathBuf::from("/repo"),
             github_remote: None,
             worktrees: Ok(vec![]),
@@ -11248,7 +11460,7 @@ mod tests {
             review_requested_prs: Ok(vec![]),
             current_user_login: None,
             issues: vec![],
-        }))
+        })))
         .unwrap();
 
         app.drain_fetch_results();
@@ -11304,7 +11516,7 @@ mod tests {
         assert!(app.structural_fetch_activity.is_some());
 
         // First repo finishes - spinner should persist.
-        tx.send(FetchMessage::RepoData(RepoFetchResult {
+        tx.send(FetchMessage::RepoData(Box::new(RepoFetchResult {
             repo_path: PathBuf::from("/repo-a"),
             github_remote: None,
             worktrees: Ok(vec![]),
@@ -11312,7 +11524,7 @@ mod tests {
             review_requested_prs: Ok(vec![]),
             current_user_login: None,
             issues: vec![],
-        }))
+        })))
         .unwrap();
         app.drain_fetch_results();
         assert!(
@@ -11321,7 +11533,7 @@ mod tests {
         );
 
         // Second repo finishes - now spinner should clear.
-        tx.send(FetchMessage::RepoData(RepoFetchResult {
+        tx.send(FetchMessage::RepoData(Box::new(RepoFetchResult {
             repo_path: PathBuf::from("/repo-b"),
             github_remote: None,
             worktrees: Ok(vec![]),
@@ -11329,7 +11541,7 @@ mod tests {
             review_requested_prs: Ok(vec![]),
             current_user_login: None,
             issues: vec![],
-        }))
+        })))
         .unwrap();
         app.drain_fetch_results();
         assert!(app.structural_fetch_activity.is_none());
@@ -11469,15 +11681,17 @@ mod tests {
         app.fetch_rx = Some(rx);
 
         let repo_path = PathBuf::from("/repos/broken");
-        tx.send(FetchMessage::RepoData(crate::work_item::RepoFetchResult {
-            repo_path: repo_path.clone(),
-            github_remote: None,
-            worktrees: Err(WorktreeError::GitError("not a git repository".into())),
-            prs: Ok(vec![]),
-            review_requested_prs: Ok(vec![]),
-            current_user_login: None,
-            issues: vec![],
-        }))
+        tx.send(FetchMessage::RepoData(Box::new(
+            crate::work_item::RepoFetchResult {
+                repo_path: repo_path.clone(),
+                github_remote: None,
+                worktrees: Err(WorktreeError::GitError("not a git repository".into())),
+                prs: Ok(vec![]),
+                review_requested_prs: Ok(vec![]),
+                current_user_login: None,
+                issues: vec![],
+            },
+        )))
         .unwrap();
 
         let received = app.drain_fetch_results();
@@ -11499,15 +11713,17 @@ mod tests {
         // Sending a second error for the same repo should NOT overwrite
         // the status message.
         app.status_message = Some("other message".into());
-        tx.send(FetchMessage::RepoData(crate::work_item::RepoFetchResult {
-            repo_path: repo_path.clone(),
-            github_remote: None,
-            worktrees: Err(WorktreeError::GitError("still broken".into())),
-            prs: Ok(vec![]),
-            review_requested_prs: Ok(vec![]),
-            current_user_login: None,
-            issues: vec![],
-        }))
+        tx.send(FetchMessage::RepoData(Box::new(
+            crate::work_item::RepoFetchResult {
+                repo_path: repo_path.clone(),
+                github_remote: None,
+                worktrees: Err(WorktreeError::GitError("still broken".into())),
+                prs: Ok(vec![]),
+                review_requested_prs: Ok(vec![]),
+                current_user_login: None,
+                issues: vec![],
+            },
+        )))
         .unwrap();
         app.drain_fetch_results();
         assert_eq!(
@@ -11961,17 +12177,19 @@ mod tests {
         app.fetch_rx = Some(rx);
 
         // Send a repo data result with a non-CliNotFound/AuthRequired error.
-        tx.send(FetchMessage::RepoData(crate::work_item::RepoFetchResult {
-            repo_path: PathBuf::from("/repo"),
-            github_remote: None,
-            worktrees: Ok(vec![]),
-            prs: Err(crate::github_client::GithubError::ApiError(
-                "rate limited".into(),
-            )),
-            review_requested_prs: Ok(vec![]),
-            current_user_login: None,
-            issues: vec![],
-        }))
+        tx.send(FetchMessage::RepoData(Box::new(
+            crate::work_item::RepoFetchResult {
+                repo_path: PathBuf::from("/repo"),
+                github_remote: None,
+                worktrees: Ok(vec![]),
+                prs: Err(crate::github_client::GithubError::ApiError(
+                    "rate limited".into(),
+                )),
+                review_requested_prs: Ok(vec![]),
+                current_user_login: None,
+                issues: vec![],
+            },
+        )))
         .unwrap();
 
         app.drain_fetch_results();
@@ -12261,6 +12479,10 @@ mod tests {
             ) -> Result<(), WorktreeError> {
                 Ok(())
             }
+
+            fn prune_worktrees(&self, _repo_path: &std::path::Path) -> Result<(), WorktreeError> {
+                Ok(())
+            }
         }
 
         /// Test backend that supports import.
@@ -12537,6 +12759,10 @@ mod tests {
                 _repo_path: &std::path::Path,
                 _branch: &str,
             ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+
+            fn prune_worktrees(&self, _repo_path: &std::path::Path) -> Result<(), WorktreeError> {
                 Ok(())
             }
         }
@@ -12820,6 +13046,9 @@ mod tests {
             ) -> Result<(), WorktreeError> {
                 Ok(())
             }
+            fn prune_worktrees(&self, _repo_path: &std::path::Path) -> Result<(), WorktreeError> {
+                Ok(())
+            }
         }
 
         // find_reusable_worktree canonicalizes both paths, so they must
@@ -12918,6 +13147,202 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    // -----------------------------------------------------------------------
+    // Stale worktree recovery regression tests
+    // -----------------------------------------------------------------------
+
+    /// When `poll_worktree_creation` receives a result with
+    /// `stale_worktree_path: Some(...)`, it must populate
+    /// `stale_worktree_prompt` instead of falling through to the generic
+    /// alert path.
+    #[test]
+    fn poll_worktree_creation_routes_stale_to_prompt() {
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(StubBackend),
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/stale-test.json"));
+
+        tx.send(WorktreeCreateResult {
+            wi_id: wi_id.clone(),
+            repo_path: PathBuf::from("/repos/myrepo"),
+            branch: Some("feature/stale".into()),
+            path: None,
+            error: Some("Branch locked to stale worktree".into()),
+            open_session: true,
+            branch_gone: false,
+            reused: false,
+            stale_worktree_path: Some(PathBuf::from("/repos/myrepo/.worktrees/feature-stale")),
+        })
+        .unwrap();
+
+        app.try_begin_user_action(UserActionKey::WorktreeCreate, Duration::ZERO, "test");
+        app.attach_user_action_payload(
+            &UserActionKey::WorktreeCreate,
+            UserActionPayload::WorktreeCreate {
+                rx,
+                wi_id: wi_id.clone(),
+            },
+        );
+
+        app.poll_worktree_creation();
+
+        assert!(
+            app.stale_worktree_prompt.is_some(),
+            "stale_worktree_path should route to stale_worktree_prompt",
+        );
+        assert!(
+            app.alert_message.is_none(),
+            "stale worktree error should NOT fall through to generic alert",
+        );
+        let prompt = app.stale_worktree_prompt.as_ref().unwrap();
+        assert_eq!(prompt.wi_id, wi_id);
+        assert_eq!(
+            prompt.stale_path,
+            PathBuf::from("/repos/myrepo/.worktrees/feature-stale"),
+        );
+        assert_eq!(prompt.branch, "feature/stale");
+    }
+
+    /// When a recovery result arrives (stale_recovery_in_progress = true)
+    /// and succeeds, both the recovery flag and prompt must be cleared.
+    #[test]
+    fn poll_worktree_creation_clears_stale_recovery_on_success() {
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(StubBackend),
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/recovery-test.json"));
+        app.stale_recovery_in_progress = true;
+        app.stale_worktree_prompt = Some(StaleWorktreePrompt {
+            wi_id: wi_id.clone(),
+            error: "test error".into(),
+            stale_path: PathBuf::from("/tmp/stale"),
+            repo_path: PathBuf::from("/repos/myrepo"),
+            branch: "feature/recover".into(),
+        });
+
+        // Add a work item so the success path doesn't trip the
+        // "work item deleted during creation" branch.
+        app.work_items.push(crate::work_item::WorkItem {
+            display_id: None,
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "recovery test".into(),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![],
+            errors: vec![],
+        });
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(WorktreeCreateResult {
+            wi_id: wi_id.clone(),
+            repo_path: PathBuf::from("/repos/myrepo"),
+            branch: Some("feature/recover".into()),
+            path: Some(PathBuf::from("/repos/myrepo/.worktrees/feature-recover")),
+            error: None,
+            open_session: true,
+            branch_gone: false,
+            reused: false,
+            stale_worktree_path: None,
+        })
+        .unwrap();
+
+        app.try_begin_user_action(UserActionKey::WorktreeCreate, Duration::ZERO, "test");
+        app.attach_user_action_payload(
+            &UserActionKey::WorktreeCreate,
+            UserActionPayload::WorktreeCreate {
+                rx,
+                wi_id: wi_id.clone(),
+            },
+        );
+
+        app.poll_worktree_creation();
+
+        assert!(
+            !app.stale_recovery_in_progress,
+            "stale_recovery_in_progress must be cleared after successful recovery",
+        );
+        assert!(
+            app.stale_worktree_prompt.is_none(),
+            "stale_worktree_prompt must be cleared after successful recovery",
+        );
+    }
+
+    /// When recovery fails, the recovery flag is cleared and the error is
+    /// shown via alert_message (not back through the stale prompt).
+    #[test]
+    fn poll_worktree_creation_shows_alert_on_recovery_failure() {
+        let mut app = App::with_config_and_worktree_service(
+            Config::default(),
+            Arc::new(StubBackend),
+            Arc::new(StubWorktreeService),
+            Box::new(crate::config::InMemoryConfigProvider::new()),
+        );
+
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/recovery-fail.json"));
+        app.stale_recovery_in_progress = true;
+        app.stale_worktree_prompt = Some(StaleWorktreePrompt {
+            wi_id: wi_id.clone(),
+            error: "original error".into(),
+            stale_path: PathBuf::from("/tmp/stale"),
+            repo_path: PathBuf::from("/repos/myrepo"),
+            branch: "feature/fail".into(),
+        });
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(WorktreeCreateResult {
+            wi_id: wi_id.clone(),
+            repo_path: PathBuf::from("/repos/myrepo"),
+            branch: Some("feature/fail".into()),
+            path: None,
+            error: Some("Recovery failed: permission denied".into()),
+            open_session: true,
+            branch_gone: false,
+            reused: false,
+            stale_worktree_path: None, // no re-detection on retry failure
+        })
+        .unwrap();
+
+        app.try_begin_user_action(UserActionKey::WorktreeCreate, Duration::ZERO, "test");
+        app.attach_user_action_payload(
+            &UserActionKey::WorktreeCreate,
+            UserActionPayload::WorktreeCreate {
+                rx,
+                wi_id: wi_id.clone(),
+            },
+        );
+
+        app.poll_worktree_creation();
+
+        assert!(
+            !app.stale_recovery_in_progress,
+            "stale_recovery_in_progress must be cleared after failed recovery",
+        );
+        assert!(
+            app.stale_worktree_prompt.is_none(),
+            "stale_worktree_prompt must be cleared after failed recovery",
+        );
+        assert!(
+            app.alert_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("Recovery failed"),
+            "alert should show the recovery failure error, got: {:?}",
+            app.alert_message,
+        );
+    }
+
     /// F-2 regression: import_selected_unlinked creates the worktree under
     /// repo_path/worktree_dir/branch, not repo_path.parent()/<repo>-wt-<branch>.
     #[test]
@@ -13005,6 +13430,10 @@ mod tests {
                 _repo_path: &std::path::Path,
                 _branch: &str,
             ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+
+            fn prune_worktrees(&self, _repo_path: &std::path::Path) -> Result<(), WorktreeError> {
                 Ok(())
             }
         }
@@ -14418,6 +14847,9 @@ mod tests {
             fn create_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
                 Ok(())
             }
+            fn prune_worktrees(&self, _: &std::path::Path) -> Result<(), WorktreeError> {
+                Ok(())
+            }
         }
 
         let repo = PathBuf::from("/tmp/exec-merge-live-clean");
@@ -14539,6 +14971,9 @@ mod tests {
             fn create_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
                 Ok(())
             }
+            fn prune_worktrees(&self, _: &std::path::Path) -> Result<(), WorktreeError> {
+                Ok(())
+            }
         }
 
         let repo = PathBuf::from("/tmp/exec-merge-live-error");
@@ -14652,6 +15087,9 @@ mod tests {
                 Ok(())
             }
             fn create_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn prune_worktrees(&self, _: &std::path::Path) -> Result<(), WorktreeError> {
                 Ok(())
             }
         }
@@ -17436,6 +17874,12 @@ mod tests {
         ) -> Result<(), crate::worktree_service::WorktreeError> {
             Ok(())
         }
+        fn prune_worktrees(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            Ok(())
+        }
     }
 
     /// open_delete_prompt must NOT call any blocking worktree check on
@@ -18202,6 +18646,12 @@ mod tests {
             _branch: &str,
         ) -> Result<(), crate::worktree_service::WorktreeError> {
             self.gated_bump();
+            Ok(())
+        }
+        fn prune_worktrees(
+            &self,
+            _repo_path: &std::path::Path,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
             Ok(())
         }
     }
@@ -19240,6 +19690,7 @@ mod tests {
             open_session: true,
             branch_gone: false,
             reused: false,
+            stale_worktree_path: None,
         })
         .unwrap();
         app.try_begin_user_action(
@@ -19542,6 +19993,12 @@ mod tests {
             &self,
             _repo_path: &std::path::Path,
             _branch: &str,
+        ) -> Result<(), crate::worktree_service::WorktreeError> {
+            Ok(())
+        }
+        fn prune_worktrees(
+            &self,
+            _repo_path: &std::path::Path,
         ) -> Result<(), crate::worktree_service::WorktreeError> {
             Ok(())
         }

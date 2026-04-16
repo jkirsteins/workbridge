@@ -224,7 +224,7 @@ fn fetcher_loop(
             current_user_login,
         };
 
-        if tx.send(FetchMessage::RepoData(result)).is_err() {
+        if tx.send(FetchMessage::RepoData(Box::new(result))).is_err() {
             // Receiver dropped - main thread no longer listening
             break;
         }
@@ -339,6 +339,10 @@ mod tests {
         }
 
         fn create_branch(&self, _repo_path: &Path, _branch: &str) -> Result<(), WorktreeError> {
+            Ok(())
+        }
+
+        fn prune_worktrees(&self, _repo_path: &Path) -> Result<(), WorktreeError> {
             Ok(())
         }
     }

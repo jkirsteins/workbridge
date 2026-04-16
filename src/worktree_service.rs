@@ -13,6 +13,11 @@ pub enum WorktreeError {
     Io(String),
     /// The repo path does not exist or is not a git repo.
     InvalidRepo(PathBuf),
+    /// The branch is already locked to another worktree (e.g. after an
+    /// interrupted rebase leaves the worktree mid-rebase with a detached
+    /// HEAD). Fields: branch name, path where git says the branch is
+    /// locked, full git error message.
+    BranchLockedToWorktree { branch: String, locked_at: PathBuf },
 }
 
 impl fmt::Display for WorktreeError {
@@ -22,6 +27,14 @@ impl fmt::Display for WorktreeError {
             WorktreeError::Io(msg) => write!(f, "worktree I/O error: {msg}"),
             WorktreeError::InvalidRepo(path) => {
                 write!(f, "invalid git repo: {}", path.display())
+            }
+            WorktreeError::BranchLockedToWorktree { branch, locked_at } => {
+                write!(
+                    f,
+                    "branch '{}' is locked to worktree at '{}'",
+                    branch,
+                    locked_at.display()
+                )
             }
         }
     }
@@ -123,6 +136,11 @@ pub trait WorktreeService: Send + Sync {
     /// Used as a fallback when fetch_branch fails (e.g., the branch does
     /// not exist on origin yet).
     fn create_branch(&self, repo_path: &Path, branch: &str) -> Result<(), WorktreeError>;
+
+    /// Prune stale worktree bookkeeping entries. Equivalent to
+    /// `git worktree prune`. Used during recovery after a stale
+    /// worktree is force-removed.
+    fn prune_worktrees(&self, repo_path: &Path) -> Result<(), WorktreeError>;
 }
 
 /// Build a `Command::new("git")` with inherited git env vars cleared.
@@ -169,11 +187,20 @@ impl GitWorktreeService {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            // Combine both streams so no git diagnostic is lost. Some git
+            // commands put progress text on one stream and the fatal error
+            // on the other depending on the git version.
+            let combined = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+                (true, _) => stderr,
+                (_, true) => stdout,
+                (false, false) => format!("{stderr}\n{stdout}"),
+            };
             // Detect invalid repo from common git error messages.
-            if stderr.contains("not a git repository") {
+            if combined.contains("not a git repository") {
                 return Err(WorktreeError::InvalidRepo(repo_path.to_path_buf()));
             }
-            return Err(WorktreeError::GitError(stderr));
+            return Err(WorktreeError::GitError(combined));
         }
 
         String::from_utf8(output.stdout)
@@ -308,6 +335,18 @@ impl GitWorktreeService {
             return None;
         }
         Some((left, right))
+    }
+
+    /// Extract the worktree path from git's "already used by worktree at"
+    /// error message. Git formats this as:
+    ///   fatal: 'branch' is already used by worktree at '/path/to/wt'
+    /// Returns `None` if the pattern is not found or the path cannot be
+    /// extracted.
+    fn parse_locked_worktree_path(msg: &str) -> Option<PathBuf> {
+        let marker = "is already used by worktree at '";
+        let start = msg.find(marker)? + marker.len();
+        let end = msg[start..].find('\'')?;
+        Some(PathBuf::from(&msg[start..start + end]))
     }
 
     /// Find the branch name for a worktree at the given path by looking
@@ -470,6 +509,16 @@ impl WorktreeService for GitWorktreeService {
             Self::run_git(repo_path, &["worktree", "add", target_str, "-b", branch])
         };
 
+        if let Err(WorktreeError::GitError(ref msg)) = result
+            && msg.contains("is already used by worktree at")
+        {
+            let locked_at =
+                Self::parse_locked_worktree_path(msg).unwrap_or_else(|| PathBuf::from("(unknown)"));
+            return Err(WorktreeError::BranchLockedToWorktree {
+                branch: branch.to_string(),
+                locked_at,
+            });
+        }
         result?;
 
         Ok(WorktreeInfo {
@@ -620,6 +669,11 @@ impl WorktreeService for GitWorktreeService {
         // dirty state is irrelevant here. See commit 9b25497 for the
         // historical false-positive check that used to live here.
         Self::run_git(repo_path, &["branch", branch, &base])?;
+        Ok(())
+    }
+
+    fn prune_worktrees(&self, repo_path: &Path) -> Result<(), WorktreeError> {
+        Self::run_git(repo_path, &["worktree", "prune"])?;
         Ok(())
     }
 }
@@ -857,6 +911,44 @@ mod tests {
     #[test]
     fn parse_rev_list_left_right_single_number_rejected() {
         assert_eq!(GitWorktreeService::parse_rev_list_left_right("5\n"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_locked_worktree_path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_locked_worktree_path_extracts_path() {
+        let msg = "fatal: 'my-branch' is already used by worktree at '/repos/myrepo/.worktrees/my-branch'";
+        assert_eq!(
+            GitWorktreeService::parse_locked_worktree_path(msg),
+            Some(PathBuf::from("/repos/myrepo/.worktrees/my-branch")),
+        );
+    }
+
+    #[test]
+    fn parse_locked_worktree_path_multiline() {
+        let msg = "Preparing worktree (checking out 'b')\n\
+                   fatal: 'b' is already used by worktree at '/p'";
+        assert_eq!(
+            GitWorktreeService::parse_locked_worktree_path(msg),
+            Some(PathBuf::from("/p")),
+        );
+    }
+
+    #[test]
+    fn parse_locked_worktree_path_unrelated_error() {
+        assert_eq!(
+            GitWorktreeService::parse_locked_worktree_path("some other error"),
+            None,
+        );
+    }
+
+    #[test]
+    fn parse_locked_worktree_path_no_trailing_quote() {
+        // Marker present but no closing quote -> None.
+        let msg = "is already used by worktree at '";
+        assert_eq!(GitWorktreeService::parse_locked_worktree_path(msg), None,);
     }
 }
 

@@ -459,7 +459,7 @@ pub struct RepoFetchResult {
 
 /// Messages sent from background fetcher threads to the main thread.
 pub enum FetchMessage {
-    RepoData(RepoFetchResult),
+    RepoData(Box<RepoFetchResult>),
     FetcherError {
         repo_path: PathBuf,
         error: String,

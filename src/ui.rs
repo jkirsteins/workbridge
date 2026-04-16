@@ -294,6 +294,33 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
                 options: &[("[d]", "Delete work item"), ("[Esc]", "Dismiss")],
             },
         );
+    } else if app.stale_recovery_in_progress {
+        // Recovery in flight - show spinner, no key options.
+        let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::KeyChoice {
+                title: "Recovering Worktree",
+                body: &format!("{spinner} Removing stale worktree and recreating..."),
+                options: &[],
+            },
+        );
+    } else if let Some(ref prompt) = app.stale_worktree_prompt {
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::KeyChoice {
+                title: "Stale Worktree",
+                body: &prompt.error,
+                options: &[
+                    ("[r]", "Force-remove stale worktree & retry"),
+                    ("[Esc]", "Dismiss"),
+                ],
+            },
+        );
     } else if app.delete_prompt_visible {
         if app.delete_in_progress {
             let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
