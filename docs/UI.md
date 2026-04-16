@@ -1107,15 +1107,17 @@ thread:
   ahead/behind state has its own chips below. A clean-but-diverged
   branch no longer shows `!cl`.
 - `!pushed` - the local branch has commits its upstream does not
-  (`git_state.ahead > 0`). Cyan. "Action available: push."
+  (`git_state.ahead > 0`). Magenta. "Action available: push."
 - `!pulled` - the upstream has commits the local branch does not
   (`git_state.behind > 0`). Magenta. "Action available: pull (or
   rebase via `m`)."
 
 The three chips coexist on the same line: a dirty, diverged branch
-renders `!cl !pushed !pulled` with three distinct foregrounds so
-they remain distinguishable. Both new chips are rendered alongside
-`!cl` in `format_work_item_entry` (`src/ui.rs`).
+renders `!cl !pushed !pulled` with `!cl` in LightYellow and both
+divergence chips in Magenta. The chip labels (not the colors)
+distinguish push-direction from pull-direction, while `!cl` stays
+visually distinct from both. Both divergence chips are rendered
+alongside `!cl` in `format_work_item_entry` (`src/ui.rs`).
 
 Stage transitions: Shift+Right to advance, Shift+Left to retreat.
 

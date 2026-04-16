@@ -105,17 +105,21 @@ pub struct Theme {
     /// to read as a warning without screaming "error".
     pub badge_worktree_unclean: Color,
     /// Needs-push `!pushed` badge color. Shown when the local branch is
-    /// ahead of its upstream (unpushed commits). Cyan reads as
-    /// "informational, action available" without competing with the
-    /// red `!merge` / `fail` chips or the yellow `!cl` chip on the
-    /// same row.
+    /// ahead of its upstream (unpushed commits). Magenta, shared with
+    /// `!pulled`, because both chips represent the same semantic
+    /// category - the local branch has diverged from its upstream -
+    /// and the chip label (`!pushed` vs `!pulled`) already carries
+    /// the direction. Distinctness is preserved against the red
+    /// `!merge` / `fail` chips and the yellow `!cl` chip on the same
+    /// row.
     pub badge_pushed: Color,
     /// Needs-pull `!pulled` badge color. Shown when the local branch is
     /// behind its upstream (the remote moved while we were working).
-    /// Magenta reads as "informational, action available" while
-    /// staying distinct from the cyan `!pushed` chip - a row that is
-    /// diverged in both directions renders `!pushed !pulled` with
-    /// clearly different foregrounds.
+    /// Magenta, shared with `!pushed`, because both chips represent
+    /// upstream divergence and the chip label carries the direction.
+    /// A row that is diverged in both directions renders
+    /// `!pushed !pulled` in the same Magenta; the labels, not the
+    /// colors, distinguish the two directions.
     pub badge_pulled: Color,
     /// Unlinked item "?" marker color.
     pub unlinked_marker: Color,
@@ -208,13 +212,16 @@ impl Theme {
             // A row that is both CI-failing and locally unclean renders
             // `fail !cl` with clearly separate foregrounds.
             badge_worktree_unclean: Color::LightYellow,
-            // Cyan reads as "informational, action available" and stays
-            // visually distinct from the red conflict chips and the
-            // yellow `!cl` chip on the same row.
-            badge_pushed: Color::Cyan,
-            // Magenta is the only remaining accent that does not collide
-            // with the green PR badge, the cyan `!pushed` chip, the
-            // yellow `!cl` chip, or the red conflict chips.
+            // Both `!pushed` and `!pulled` share Magenta because
+            // divergence in either direction is one semantic category;
+            // the chip label carries the direction. Distinctness is
+            // preserved against `!cl` (LightYellow) and `!merge` /
+            // `fail` (Red) on the same row.
+            badge_pushed: Color::Magenta,
+            // Magenta matches `!pushed` intentionally - both chips
+            // signal upstream divergence as a single category - and
+            // stays distinct from the green PR badge, the yellow
+            // `!cl` chip, and the red conflict chips.
             badge_pulled: Color::Magenta,
             unlinked_marker: Color::Yellow,
             review_request_marker: Color::Magenta,
@@ -417,9 +424,10 @@ impl Theme {
     }
 
     /// Style for the `!pulled` chip rendered when a worktree's branch is
-    /// behind its upstream (the remote moved). Distinct foreground from
-    /// `!pushed` so the two chips render with different colours when a
-    /// branch is diverged in both directions.
+    /// behind its upstream (the remote moved). The foreground
+    /// intentionally matches `!pushed` - both chips signal upstream
+    /// divergence as a single category, and the labels (not the
+    /// colors) distinguish the two directions.
     pub fn style_badge_pulled(&self) -> Style {
         Style::default().fg(self.badge_pulled)
     }
