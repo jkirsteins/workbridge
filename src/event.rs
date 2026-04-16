@@ -7,6 +7,7 @@ use crate::app::{
     App, BOARD_COLUMNS, DashboardWindow, DisplayEntry, FocusPanel, RightPanelTab,
     SettingsListFocus, SettingsTab, UserActionKey, ViewMode,
 };
+use crate::click_targets::ClickTarget;
 use crate::create_dialog::CreateDialogFocus;
 use crate::layout;
 
@@ -2016,6 +2017,13 @@ enum MouseTarget {
     GlobalDrawer { local_col: u16, local_row: u16 },
     /// Mouse is over the right panel's inner area.
     RightPanel { local_col: u16, local_row: u16 },
+    /// Mouse is over the left-panel work item list's body area.
+    /// Row selection is routed through the `ClickTarget::WorkItemRow`
+    /// click-target registry (each visible row pushes a target each
+    /// frame), so only the "is in the list body" signal is needed to
+    /// dispatch wheel scrolls - there is no row payload on the
+    /// variant itself.
+    WorkItemList,
     /// Mouse is not over any PTY area.
     None,
 }
@@ -2093,6 +2101,22 @@ fn mouse_target_with_size(
             local_col: column - inner_x,
             local_row: row - inner_y,
         };
+    }
+
+    // Left-panel work item list. The body rect is stored by the
+    // renderer in absolute frame coordinates on every frame and
+    // cleared once the list is not drawn (e.g. behind a modal
+    // overlay). A hit here dispatches wheel scrolls to the list's
+    // `list_scroll_offset`; left-clicks are handled separately via
+    // the `ClickTarget::WorkItemRow` entries in the click registry
+    // and take priority over this classification.
+    if let Some(rect) = app.work_item_list_body.get()
+        && column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+    {
+        return MouseTarget::WorkItemList;
     }
 
     MouseTarget::None
@@ -2208,29 +2232,55 @@ fn handle_mouse_with_terminal_size(
         app.pending_chrome_click = None;
     }
 
-    // Interactive labels (click-to-copy) take priority over the
-    // geometric PTY-area classification. The `ClickRegistry` is
-    // cleared at the top of every frame and is only populated by
-    // renderers that draw interactive labels, so a hit here is an
-    // unambiguous signal that the click belongs to chrome rather than
-    // to a PTY. Without this shortcut, clicks on labels drawn inside
-    // the right panel (`draw_work_item_detail`, the no-session detail
-    // view) would be classified as `MouseTarget::RightPanel` and the
-    // text-selection branch would swallow them: `Down(Left)` would
-    // try to attach a selection to `active_session_entry_mut_for_tab`,
-    // find `None`, and still return `true`. The advertised
-    // click-to-copy behavior would silently no-op. Keeping the check
-    // structural (before classification) means new callers that draw
-    // interactive labels anywhere - right panel, global drawer,
-    // future overlays - stay clickable without touching this function.
+    // Interactive labels (click-to-copy) and work item row clicks both
+    // flow through the per-frame `ClickRegistry`. The registry is
+    // cleared at the top of every frame and is populated by the
+    // renderer with two kinds of targets:
+    //
+    // - `ClickTarget::WorkItemRow { index }` - one per visible row in
+    //   the left-panel work item list. A left-click release selects
+    //   the row.
+    // - `ClickTarget::Copy { kind, value }` - one per interactive
+    //   chrome label. A down+up pair on the same target copies the
+    //   value to the clipboard.
+    //
+    // Both take priority over the geometric PTY-area classification
+    // because the classification would otherwise route right-panel
+    // labels into the text-selection branch.
+    //
+    // **Drawer gate for row clicks only.** Chrome copies are
+    // intentionally allowed through the global drawer (see the
+    // `chrome_click_inside_global_drawer_still_fires` test): a copy
+    // is fire-and-forget and the user might reasonably want to copy
+    // a value drawn behind the drawer. Row selection, in contrast,
+    // has side effects (selected_item, right_panel_tab,
+    // recenter_viewport_on_selection) that the user cannot see while
+    // the drawer is open and would only discover after closing it,
+    // at which point the list has silently scrolled and a different
+    // item is highlighted. When the drawer is open we therefore
+    // short-circuit `WorkItemRow` hits: falling through lets
+    // `mouse_target_with_size` return `GlobalDrawer` / `None` as
+    // appropriate, and the drawer's own handler deals with the
+    // click.
     if matches!(action, MouseAction::SelectDown | MouseAction::SelectUp) {
-        let hits_registry = app
+        let dispatch = app
             .click_registry
             .try_borrow()
             .ok()
-            .is_some_and(|r| r.hit_test(mouse.column, mouse.row).is_some());
-        if hits_registry {
-            return handle_chrome_click_fallback(app, mouse, action);
+            .and_then(|r| r.hit_test(mouse.column, mouse.row).cloned());
+        if let Some(target) = dispatch {
+            match target {
+                ClickTarget::WorkItemRow { index, .. } => {
+                    if !app.global_drawer_open {
+                        return handle_work_item_row_click(app, index, action);
+                    }
+                    // Fall through: drawer is open, let the geometric
+                    // classifier route the click to the drawer.
+                }
+                ClickTarget::Copy { .. } => {
+                    return handle_chrome_click_fallback(app, mouse, action);
+                }
+            }
         }
     }
 
@@ -2328,7 +2378,93 @@ fn handle_mouse_with_terminal_size(
             }
             MouseAction::SelectUp => handle_selection_up_right(app, local_row, local_col),
         },
+        MouseTarget::WorkItemList => match action {
+            MouseAction::Scroll { up: scroll_up } => handle_work_item_list_scroll(app, scroll_up),
+            // `SelectDown` / `SelectUp` on the list body only matters
+            // if a row click hit-tested in the priority path above.
+            // If we reach here with a select action, the click landed
+            // between rows (e.g. on a group header) and should be a
+            // no-op rather than bleed into the right-panel selection
+            // branch.
+            MouseAction::SelectDown | MouseAction::SelectUp | MouseAction::SelectDrag => false,
+        },
         MouseTarget::None => handle_chrome_click_fallback(app, mouse, action),
+    }
+}
+
+/// Handle a wheel scroll over the work item list body.
+///
+/// Wheel scrolls mutate the authoritative viewport offset
+/// (`App::list_scroll_offset`) directly and deliberately do NOT touch
+/// `selected_item` or `recenter_viewport_on_selection`: the decoupled
+/// viewport model means wheel scrolls leave the keyboard selection in
+/// place so the user can scroll away, scroll back, and still land on
+/// the same selection. Step size is 3 rows per tick to match the PTY
+/// scrollback step.
+fn handle_work_item_list_scroll(app: &mut App, scroll_up: bool) -> bool {
+    let current = app.list_scroll_offset.get();
+    let max = app.list_max_item_offset.get();
+    let next = if scroll_up {
+        current.saturating_sub(3)
+    } else {
+        current.saturating_add(3).min(max)
+    };
+    if next == current {
+        return false;
+    }
+    app.list_scroll_offset.set(next);
+    true
+}
+
+/// Handle a left-click on a specific work item list row.
+///
+/// Called from the click-registry priority path when a
+/// `ClickTarget::WorkItemRow` is hit and the global drawer is not
+/// open (the caller gates on `!app.global_drawer_open` to keep row
+/// selection from silently mutating behind the drawer). Select-down
+/// is a no-op (we wait for the release so the user can abort by
+/// dragging off); select-up actually changes the selection, mirrors
+/// the keyboard handler's side effects (right panel tab, layout sync
+/// on context change), and arms a recenter so the next render centers
+/// the viewport on the clicked row. Scroll events never reach here
+/// (they are dispatched to `handle_work_item_list_scroll` via the
+/// `WorkItemList` arm).
+fn handle_work_item_row_click(app: &mut App, index: usize, action: MouseAction) -> bool {
+    match action {
+        MouseAction::SelectDown => {
+            // Arm a pending row click so that a `SelectUp` on the
+            // same row (no intervening drag off the list) is what
+            // actually performs the selection. We reuse the same
+            // lossy-release safeguard as the chrome-copy path: any
+            // drag or off-target release clears this automatically.
+            // Returning `true` so the event is consumed and the
+            // geometric classifier cannot route this down-click into
+            // a PTY text-selection start (which would harmlessly no-op
+            // on the left panel but still look noisy in trace logs).
+            true
+        }
+        MouseAction::SelectUp => {
+            if index >= app.display_list.len() {
+                return false;
+            }
+            if !crate::app::is_selectable(&app.display_list[index]) {
+                return false;
+            }
+            let had_context = app.selected_work_item_context().is_some();
+            app.selected_item = Some(index);
+            app.sync_selection_identity();
+            app.right_panel_tab = RightPanelTab::ClaudeCode;
+            // Recenter the viewport on the newly-selected row so the
+            // next keyboard navigation starts from a known layout.
+            // This matches the keyboard navigation contract and keeps
+            // click-to-select + keyboard navigation composable.
+            app.recenter_viewport_on_selection.set(true);
+            if app.selected_work_item_context().is_some() != had_context {
+                sync_layout(app);
+            }
+            true
+        }
+        MouseAction::SelectDrag | MouseAction::Scroll { .. } => false,
     }
 }
 
@@ -2362,11 +2498,12 @@ fn handle_chrome_click_fallback(app: &mut App, mouse: MouseEvent, action: MouseA
                 .try_borrow()
                 .ok()
                 .and_then(|r| r.hit_test(mouse.column, mouse.row).cloned());
-            if let Some(target) = hit {
-                app.pending_chrome_click =
-                    Some((mouse.column, mouse.row, target.kind, target.value));
+            if let Some(ClickTarget::Copy { kind, value, .. }) = hit {
+                app.pending_chrome_click = Some((mouse.column, mouse.row, kind, value));
                 true
             } else {
+                // Row targets are dispatched by the caller; anything
+                // else is a miss.
                 false
             }
         }
@@ -2382,9 +2519,10 @@ fn handle_chrome_click_fallback(app: &mut App, mouse: MouseEvent, action: MouseA
                 .ok()
                 .and_then(|r| r.hit_test(mouse.column, mouse.row).cloned());
             match (pending, hit) {
-                (Some((_, _, pending_kind, pending_value)), Some(target))
-                    if target.kind == pending_kind =>
-                {
+                (
+                    Some((_, _, pending_kind, pending_value)),
+                    Some(ClickTarget::Copy { kind, .. }),
+                ) if kind == pending_kind => {
                     app.fire_chrome_copy(pending_value, pending_kind);
                     true
                 }
@@ -3540,15 +3678,15 @@ mod tests {
         // Register a target that overlaps the right-panel inner area.
         {
             let mut reg = app.click_registry.borrow_mut();
-            reg.push(
+            reg.push_copy(
                 Rect {
                     x: 40,
                     y: 10,
                     width: 30,
                     height: 1,
                 },
-                "feat/my-branch".to_string(),
                 ClickKind::Branch,
+                "feat/my-branch".to_string(),
             );
         }
 
@@ -3598,15 +3736,15 @@ mod tests {
         let mut app = App::new();
         {
             let mut reg = app.click_registry.borrow_mut();
-            reg.push(
+            reg.push_copy(
                 Rect {
                     x: 40,
                     y: 10,
                     width: 30,
                     height: 1,
                 },
-                "https://example.com/pull/42".to_string(),
                 ClickKind::PrUrl,
+                "https://example.com/pull/42".to_string(),
             );
         }
 
@@ -3641,15 +3779,15 @@ mod tests {
         // the click coordinate.
         {
             let mut reg = app.click_registry.borrow_mut();
-            reg.push(
+            reg.push_copy(
                 Rect {
                     x: 80,
                     y: 10,
                     width: 10,
                     height: 1,
                 },
-                "never-copied".to_string(),
                 ClickKind::RepoPath,
+                "never-copied".to_string(),
             );
         }
 
@@ -3704,15 +3842,15 @@ mod tests {
 
         {
             let mut reg = app.click_registry.borrow_mut();
-            reg.push(
+            reg.push_copy(
                 Rect {
                     x: 5,
                     y: 30,
                     width: 20,
                     height: 1,
                 },
-                "workbridge".to_string(),
                 ClickKind::Title,
+                "workbridge".to_string(),
             );
         }
 
@@ -3754,15 +3892,15 @@ mod tests {
         let mut app = App::new();
         {
             let mut reg = app.click_registry.borrow_mut();
-            reg.push(
+            reg.push_copy(
                 Rect {
                     x: 40,
                     y: 10,
                     width: 30,
                     height: 1,
                 },
-                "feat/my-branch".to_string(),
                 ClickKind::Branch,
+                "feat/my-branch".to_string(),
             );
         }
 
@@ -4090,6 +4228,233 @@ mod tests {
             app.create_dialog.title_input.text(),
             "",
             "shutdown must short-circuit before any text input insert",
+        );
+    }
+
+    // -- Work item list wheel-scroll / click-to-select tests --
+    //
+    // These exercise `handle_work_item_list_scroll` and
+    // `handle_work_item_row_click` indirectly via
+    // `handle_mouse_with_terminal_size`, with the left-panel body rect
+    // pre-populated on the `App` (the renderer normally sets it, but
+    // these tests bypass rendering so they can control the rect
+    // exactly).
+
+    use ratatui_core::layout::Rect as UiRect;
+
+    /// Install a synthetic left-panel body rect, a populated display
+    /// list, and a wheel-scroll clamp. Returns the rect so tests can
+    /// compute hit coordinates. The body is at `(0, 0, 30, 20)` so
+    /// any column/row in that rect classifies as `WorkItemList`.
+    fn seed_work_item_list(app: &mut App, row_count: usize, max_item_offset: usize) -> UiRect {
+        // Populate the display list with `row_count` unlinked-PR
+        // entries, which are selectable without any backend setup.
+        app.unlinked_prs.clear();
+        for i in 0..row_count {
+            app.unlinked_prs.push(crate::work_item::UnlinkedPr {
+                repo_path: std::path::PathBuf::from(format!("/repo/{i}")),
+                branch: format!("branch-{i}"),
+                pr: crate::work_item::PrInfo {
+                    number: i as u64,
+                    title: format!("PR {i}"),
+                    state: crate::work_item::PrState::Open,
+                    is_draft: false,
+                    review_decision: crate::work_item::ReviewDecision::None,
+                    checks: crate::work_item::CheckStatus::None,
+                    mergeable: crate::work_item::MergeableState::Unknown,
+                    url: String::new(),
+                },
+            });
+        }
+        app.display_list = app
+            .unlinked_prs
+            .iter()
+            .enumerate()
+            .map(|(i, _)| crate::app::DisplayEntry::UnlinkedItem(i))
+            .collect();
+
+        let rect = UiRect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 20,
+        };
+        app.work_item_list_body.set(Some(rect));
+        app.list_max_item_offset.set(max_item_offset);
+        app.list_scroll_offset.set(0);
+        rect
+    }
+
+    #[test]
+    fn wheel_down_advances_offset_by_3() {
+        let mut app = App::new();
+        seed_work_item_list(&mut app, 20, 15);
+        let ev = mouse(MouseEventKind::ScrollDown, 10, 5);
+        assert!(handle_mouse_with_terminal_size(&mut app, ev, TEST_SIZE));
+        assert_eq!(app.list_scroll_offset.get(), 3);
+    }
+
+    #[test]
+    fn wheel_up_retreats_offset_by_3() {
+        let mut app = App::new();
+        seed_work_item_list(&mut app, 20, 15);
+        app.list_scroll_offset.set(10);
+        let ev = mouse(MouseEventKind::ScrollUp, 10, 5);
+        assert!(handle_mouse_with_terminal_size(&mut app, ev, TEST_SIZE));
+        assert_eq!(app.list_scroll_offset.get(), 7);
+    }
+
+    #[test]
+    fn wheel_clamps_at_top() {
+        let mut app = App::new();
+        seed_work_item_list(&mut app, 20, 15);
+        app.list_scroll_offset.set(1);
+        let ev = mouse(MouseEventKind::ScrollUp, 10, 5);
+        assert!(handle_mouse_with_terminal_size(&mut app, ev, TEST_SIZE));
+        assert_eq!(app.list_scroll_offset.get(), 0);
+        // Another scroll-up at offset 0 is a no-op (returns false).
+        let ev = mouse(MouseEventKind::ScrollUp, 10, 5);
+        assert!(!handle_mouse_with_terminal_size(&mut app, ev, TEST_SIZE));
+        assert_eq!(app.list_scroll_offset.get(), 0);
+    }
+
+    #[test]
+    fn wheel_clamps_at_bottom() {
+        let mut app = App::new();
+        seed_work_item_list(&mut app, 20, 15);
+        app.list_scroll_offset.set(14);
+        let ev = mouse(MouseEventKind::ScrollDown, 10, 5);
+        assert!(handle_mouse_with_terminal_size(&mut app, ev, TEST_SIZE));
+        // 14 + 3 = 17, clamped to max_item_offset = 15.
+        assert_eq!(app.list_scroll_offset.get(), 15);
+        // Another scroll-down at max is a no-op.
+        let ev = mouse(MouseEventKind::ScrollDown, 10, 5);
+        assert!(!handle_mouse_with_terminal_size(&mut app, ev, TEST_SIZE));
+        assert_eq!(app.list_scroll_offset.get(), 15);
+    }
+
+    #[test]
+    fn wheel_does_not_move_selection_or_arm_recenter() {
+        let mut app = App::new();
+        seed_work_item_list(&mut app, 20, 15);
+        app.selected_item = Some(0);
+        app.recenter_viewport_on_selection.set(false);
+        let ev = mouse(MouseEventKind::ScrollDown, 10, 5);
+        handle_mouse_with_terminal_size(&mut app, ev, TEST_SIZE);
+        assert_eq!(app.selected_item, Some(0), "wheel must not move selection");
+        assert!(
+            !app.recenter_viewport_on_selection.get(),
+            "wheel must not arm the recenter flag - that is keyboard-only",
+        );
+    }
+
+    #[test]
+    fn left_click_on_row_selects_it() {
+        let mut app = App::new();
+        let rect = seed_work_item_list(&mut app, 20, 15);
+        // Register one row target at y=5 covering the full body width.
+        {
+            let mut reg = app.click_registry.borrow_mut();
+            reg.push_work_item_row(
+                UiRect {
+                    x: rect.x,
+                    y: rect.y + 5,
+                    width: rect.width,
+                    height: 1,
+                },
+                3,
+            );
+        }
+        app.selected_item = Some(0);
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 10, 5);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 10, 5);
+        assert!(handle_mouse_with_terminal_size(&mut app, down, TEST_SIZE));
+        // Selection does not change on SelectDown - only on SelectUp.
+        assert_eq!(app.selected_item, Some(0));
+        assert!(handle_mouse_with_terminal_size(&mut app, up, TEST_SIZE));
+        assert_eq!(app.selected_item, Some(3));
+        assert!(
+            app.recenter_viewport_on_selection.get(),
+            "click-to-select must arm recenter so the next frame centers \
+             on the clicked row",
+        );
+        assert!(matches!(app.right_panel_tab, RightPanelTab::ClaudeCode));
+    }
+
+    #[test]
+    fn left_click_outside_list_does_not_select() {
+        let mut app = App::new();
+        seed_work_item_list(&mut app, 20, 15);
+        app.selected_item = Some(0);
+        // Coordinate outside the list body (x=100 is beyond width=30)
+        // and also outside the right-panel classification for this
+        // terminal size. No registry entry at this location.
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 100, 10);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 100, 10);
+        handle_mouse_with_terminal_size(&mut app, down, TEST_SIZE);
+        handle_mouse_with_terminal_size(&mut app, up, TEST_SIZE);
+        assert_eq!(app.selected_item, Some(0), "selection must not change");
+    }
+
+    /// Drawer-gate regression: when the global drawer is open and a
+    /// click falls over a registered `WorkItemRow` target (because
+    /// the drawer visually covers part of the list), the row must NOT
+    /// be selected. The click instead flows through the geometric
+    /// classifier to the drawer's own handler. This is the asymmetry
+    /// vs chrome copies: a fire-and-forget clipboard copy is fine to
+    /// resolve through the drawer, but silently changing
+    /// `selected_item` + `right_panel_tab` + viewport behind an open
+    /// modal surprises the user.
+    #[test]
+    fn drawer_open_suppresses_work_item_row_click() {
+        let mut app = App::new();
+        let rect = seed_work_item_list(&mut app, 20, 15);
+        {
+            let mut reg = app.click_registry.borrow_mut();
+            reg.push_work_item_row(
+                UiRect {
+                    x: rect.x,
+                    y: rect.y + 5,
+                    width: rect.width,
+                    height: 1,
+                },
+                3,
+            );
+        }
+        app.global_drawer_open = true;
+        app.selected_item = Some(0);
+        let initial_tab = app.right_panel_tab;
+        app.recenter_viewport_on_selection.set(false);
+
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 10, 5);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 10, 5);
+        handle_mouse_with_terminal_size(&mut app, down, TEST_SIZE);
+        handle_mouse_with_terminal_size(&mut app, up, TEST_SIZE);
+
+        assert_eq!(
+            app.selected_item,
+            Some(0),
+            "row click behind open drawer must not mutate selection",
+        );
+        assert!(
+            !app.recenter_viewport_on_selection.get(),
+            "row click behind open drawer must not arm recenter",
+        );
+        assert!(
+            app.right_panel_tab == initial_tab,
+            "row click behind open drawer must not change right_panel_tab",
+        );
+    }
+
+    #[test]
+    fn mouse_target_classifies_work_item_list() {
+        let mut app = App::new();
+        let rect = seed_work_item_list(&mut app, 20, 15);
+        let target = mouse_target_with_size(&app, rect.x + 5, rect.y + 5, (TEST_COLS, TEST_ROWS));
+        assert!(
+            matches!(target, MouseTarget::WorkItemList),
+            "point inside body rect must classify as WorkItemList, got {:?}",
+            target,
         );
     }
 }

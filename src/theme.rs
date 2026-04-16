@@ -27,6 +27,13 @@ pub struct Theme {
     pub scrollbar_thumb: Color,
     /// Scrollbar track (the gutter).
     pub scrollbar_track: Color,
+    /// Scrollbar overlay marker showing the offscreen selection
+    /// position in the full list. Painted as a single filled cell on
+    /// top of the normal track/thumb whenever the viewport has scrolled
+    /// past (or before) the selected row. Cyan by default so it reads
+    /// as the "your selection is here" affordance without colliding
+    /// with the gray thumb.
+    pub scrollbar_selection_marker: Color,
 
     // -- Tab list --
     /// Highlight bar: foreground.
@@ -170,6 +177,10 @@ impl Theme {
 
             scrollbar_thumb: Color::Gray,
             scrollbar_track: Color::Reset,
+            // Matches the `tab_highlight_bg` accent so the offscreen
+            // selection marker reads as "the selected row is here" and
+            // stays visibly distinct from the Gray thumb.
+            scrollbar_selection_marker: Color::Cyan,
 
             tab_highlight_fg: Color::Black,
             tab_highlight_bg: Color::Cyan,
@@ -279,6 +290,13 @@ impl Theme {
 
     pub fn style_scrollbar_track(&self) -> Style {
         Style::default().fg(self.scrollbar_track)
+    }
+
+    /// Style for the offscreen-selection marker painted into the
+    /// scrollbar column. Pure foreground (no background) so it layers
+    /// cleanly on top of the already-rendered track / thumb cells.
+    pub fn style_scrollbar_selection_marker(&self) -> Style {
+        Style::default().fg(self.scrollbar_selection_marker)
     }
 
     pub fn style_tab_highlight(&self) -> Style {

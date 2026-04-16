@@ -1409,7 +1409,34 @@ pub struct App {
     /// Scroll offset for the left-panel work item list. Persisted between
     /// render frames so the viewport stays stable during navigation.
     /// Uses `Cell` for interior mutability since rendering takes `&App`.
+    ///
+    /// Authoritative for the viewport position: mutated by (a) mouse
+    /// wheel events, (b) the keyboard-triggered recenter pass when
+    /// `recenter_viewport_on_selection` is set, and (c) a clamp at
+    /// render time when the list shrinks beneath the current offset.
+    /// See `docs/UI.md` "List/viewport/scrollbar".
     pub list_scroll_offset: Cell<usize>,
+    /// When `true`, the next render of the work item list centers the
+    /// viewport on the current selection (clamped against the list's
+    /// top / bottom). Keyboard navigation (`select_next_item` /
+    /// `select_prev_item`) sets this so that selection-moving keys
+    /// always snap the viewport back; mouse wheel and click-to-select
+    /// deliberately do NOT set it, leaving the viewport where the user
+    /// parked it. The flag is consumed (`take()`) by the renderer each
+    /// frame, so a single selection change schedules exactly one
+    /// recenter.
+    pub recenter_viewport_on_selection: Cell<bool>,
+    /// Inner body rect (absolute frame coordinates) of the work item
+    /// list. Written each render, read by `handle_mouse` so wheel
+    /// events and row clicks can be classified without re-doing the
+    /// layout math. `None` before the first render.
+    pub work_item_list_body: Cell<Option<ratatui_core::layout::Rect>>,
+    /// Maximum item-level offset the renderer will accept next frame
+    /// (i.e. `display_list.len().saturating_sub(visible_items)`).
+    /// Written each render, read by the wheel-scroll handler to clamp
+    /// the new offset without having to recompute layout. `0` before
+    /// the first render.
+    pub list_max_item_offset: Cell<usize>,
     /// Flat display list for the left panel.
     pub display_list: Vec<DisplayEntry>,
     /// Which view mode the root overview is in.
@@ -2193,6 +2220,9 @@ impl App {
             worktree_errors_shown: std::collections::HashSet::new(),
             selected_item: None,
             list_scroll_offset: Cell::new(0),
+            recenter_viewport_on_selection: Cell::new(false),
+            work_item_list_body: Cell::new(None),
+            list_max_item_offset: Cell::new(0),
             display_list: Vec::new(),
             view_mode: ViewMode::FlatList,
             board_cursor: BoardCursor {
@@ -4814,7 +4844,7 @@ impl App {
     /// Sync the identity trackers (selected_work_item, selected_unlinked_branch)
     /// from the current selected_item index. Called after any navigation that
     /// changes selected_item so that reassembly can restore the correct entry.
-    fn sync_selection_identity(&mut self) {
+    pub(crate) fn sync_selection_identity(&mut self) {
         self.selected_work_item = None;
         self.selected_unlinked_branch = None;
         self.selected_review_request_branch = None;
@@ -4845,6 +4875,11 @@ impl App {
     // -- Navigation helpers --
 
     /// Move selection to the next selectable item in the display list.
+    ///
+    /// Sets `recenter_viewport_on_selection` on a successful move so the
+    /// next render re-centers the viewport on the new selection. The
+    /// flag is deliberately NOT set on the "no further selectable item"
+    /// branch, since the selection and viewport both stay put.
     pub fn select_next_item(&mut self) {
         let start = match self.selected_item {
             Some(idx) => idx + 1,
@@ -4854,6 +4889,7 @@ impl App {
             if is_selectable(&self.display_list[i]) {
                 self.selected_item = Some(i);
                 self.sync_selection_identity();
+                self.recenter_viewport_on_selection.set(true);
                 return;
             }
         }
@@ -4861,6 +4897,9 @@ impl App {
     }
 
     /// Move selection to the previous selectable item in the display list.
+    ///
+    /// Sets `recenter_viewport_on_selection` on a successful move so the
+    /// next render re-centers the viewport on the new selection.
     pub fn select_prev_item(&mut self) {
         let start = match self.selected_item {
             Some(idx) if idx > 0 => idx - 1,
@@ -4870,6 +4909,7 @@ impl App {
                 if let Some(pos) = self.display_list.iter().rposition(is_selectable) {
                     self.selected_item = Some(pos);
                     self.sync_selection_identity();
+                    self.recenter_viewport_on_selection.set(true);
                 }
                 return;
             }
@@ -4878,6 +4918,7 @@ impl App {
             if is_selectable(&self.display_list[i]) {
                 self.selected_item = Some(i);
                 self.sync_selection_identity();
+                self.recenter_viewport_on_selection.set(true);
                 return;
             }
         }

@@ -1,21 +1,30 @@
-//! Click target registry for click-to-copy UI labels.
+//! Click target registry for click-to-copy UI labels and left-panel
+//! row selection.
 //!
-//! Each frame, renderers that draw an interactive label push a
-//! `ClickTarget` describing the absolute rect and the value that should
-//! be copied when that rect is clicked. `handle_mouse` consults the
-//! registry as a fallback after PTY classification: if a left-click
-//! lands inside any registered rect, the associated value is copied to
-//! the clipboard and a toast is shown.
+//! Each frame, renderers that draw an interactive chrome label push a
+//! `ClickTarget::Copy` describing the absolute rect and the value to
+//! copy when that rect is clicked. The work item list renderer pushes
+//! `ClickTarget::WorkItemRow` once per visible selectable row.
+//! `handle_mouse` consults the registry as a priority check before
+//! falling back to geometric PTY classification: a `Copy` hit copies
+//! the value and shows a toast; a `WorkItemRow` hit selects that row.
 //!
 //! The registry is cleared at the top of `draw_to_buffer` so stale
 //! targets from the previous frame never leak. See
-//! `docs/UI.md` "Interactive labels" for the user-facing convention.
+//! `docs/UI.md` "Interactive labels" and "Mouse Events" for the
+//! user-facing conventions.
 
 use ratatui_core::layout::Rect;
 
-/// Which field a click target represents. Used to pick short-display
-/// formatting for the toast and (in tests) to disambiguate which of
-/// several equally sized rects was hit.
+/// Which chrome field a copy click target represents. Used to pick
+/// short-display formatting for the toast and (in tests) to
+/// disambiguate which of several equally sized rects was hit.
+///
+/// This enum is deliberately chrome-copy-only. The structural "row
+/// click" kind lives as a separate variant on `ClickTarget` so the
+/// type system prevents a row-click payload from reaching code paths
+/// (like `short_display` / `fire_chrome_copy`) that only make sense
+/// for copyable labels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClickKind {
     /// The pull request URL value in the work item detail view.
@@ -28,16 +37,39 @@ pub enum ClickKind {
     Title,
 }
 
-/// A single registered click target: a rect in absolute frame
-/// coordinates plus the untruncated value to copy when it is hit.
+/// A single registered click target in absolute frame coordinates.
+///
+/// Two shapes: a copyable chrome label (rect + kind + value) and a
+/// selectable work item list row (rect + display-list index). Keeping
+/// them in separate variants lets the mouse handler dispatch on the
+/// variant directly - no defensive `unreachable!` branches, no empty
+/// placeholder `value` strings for row targets.
 #[derive(Clone, Debug)]
-pub struct ClickTarget {
-    pub rect: Rect,
-    pub value: String,
-    pub kind: ClickKind,
+pub enum ClickTarget {
+    /// A chrome label that copies `value` to the clipboard when
+    /// clicked (down-up on the same target).
+    Copy {
+        rect: Rect,
+        kind: ClickKind,
+        value: String,
+    },
+    /// A row in the left-panel work item list. `index` points into
+    /// `App::display_list`. A left-click releases the selection onto
+    /// this index.
+    WorkItemRow { rect: Rect, index: usize },
 }
 
-/// Per-frame registry of click-to-copy targets. Populated during draw,
+impl ClickTarget {
+    /// Rect in absolute frame coordinates, regardless of variant.
+    pub fn rect(&self) -> Rect {
+        match self {
+            Self::Copy { rect, .. } => *rect,
+            Self::WorkItemRow { rect, .. } => *rect,
+        }
+    }
+}
+
+/// Per-frame registry of click targets. Populated during draw,
 /// consumed (read-only) during `handle_mouse`. Cleared at the start of
 /// every frame.
 #[derive(Default)]
@@ -52,18 +84,23 @@ impl ClickRegistry {
         self.targets.clear();
     }
 
-    /// Register a new click target at the given rect with the given
-    /// copy value. The rect must be in absolute frame coordinates - the
-    /// same coordinate system `MouseEvent::column` / `row` uses.
-    pub fn push(&mut self, rect: Rect, value: String, kind: ClickKind) {
-        self.targets.push(ClickTarget { rect, value, kind });
+    /// Register a copyable chrome label. `rect` must be in absolute
+    /// frame coordinates.
+    pub fn push_copy(&mut self, rect: Rect, kind: ClickKind, value: String) {
+        self.targets.push(ClickTarget::Copy { rect, kind, value });
+    }
+
+    /// Register a selectable work item list row. `rect` must be in
+    /// absolute frame coordinates; `index` is a display-list index.
+    pub fn push_work_item_row(&mut self, rect: Rect, index: usize) {
+        self.targets.push(ClickTarget::WorkItemRow { rect, index });
     }
 
     /// Find the first registered target whose rect contains `(x, y)`.
-    /// Linear scan - `N` is at most ~4 per frame in practice. Returns
-    /// `None` if no target matches.
+    /// Linear scan - `N` is at most the visible row count plus a
+    /// handful of chrome labels. Returns `None` if no target matches.
     pub fn hit_test(&self, x: u16, y: u16) -> Option<&ClickTarget> {
-        self.targets.iter().find(|t| rect_contains(t.rect, x, y))
+        self.targets.iter().find(|t| rect_contains(t.rect(), x, y))
     }
 }
 
@@ -97,17 +134,28 @@ mod tests {
         // Two non-overlapping rects:
         //   A: cols 10..20 (width 10), row 5 (height 1)
         //   B: cols 30..40 (width 10), rows 8..10 (height 2)
-        reg.push(rect(10, 5, 10, 1), "url".into(), ClickKind::PrUrl);
-        reg.push(rect(30, 8, 10, 2), "branch".into(), ClickKind::Branch);
+        reg.push_copy(rect(10, 5, 10, 1), ClickKind::PrUrl, "url".into());
+        reg.push_copy(rect(30, 8, 10, 2), ClickKind::Branch, "branch".into());
 
         // Inside A.
         let hit = reg.hit_test(15, 5).expect("inside A");
-        assert_eq!(hit.kind, ClickKind::PrUrl);
-        assert_eq!(hit.value, "url");
+        match hit {
+            ClickTarget::Copy { kind, value, .. } => {
+                assert_eq!(*kind, ClickKind::PrUrl);
+                assert_eq!(value, "url");
+            }
+            other => panic!("expected Copy, got {other:?}"),
+        }
 
         // Left boundary of A is inclusive.
         let hit = reg.hit_test(10, 5).expect("left edge A");
-        assert_eq!(hit.kind, ClickKind::PrUrl);
+        assert!(matches!(
+            hit,
+            ClickTarget::Copy {
+                kind: ClickKind::PrUrl,
+                ..
+            }
+        ));
 
         // Right boundary of A is exclusive: col 20 is the first column
         // outside the rect.
@@ -115,9 +163,21 @@ mod tests {
 
         // Top boundary of B inclusive, bottom exclusive.
         let hit = reg.hit_test(35, 8).expect("top edge B");
-        assert_eq!(hit.kind, ClickKind::Branch);
+        assert!(matches!(
+            hit,
+            ClickTarget::Copy {
+                kind: ClickKind::Branch,
+                ..
+            }
+        ));
         let hit = reg.hit_test(35, 9).expect("middle row B");
-        assert_eq!(hit.kind, ClickKind::Branch);
+        assert!(matches!(
+            hit,
+            ClickTarget::Copy {
+                kind: ClickKind::Branch,
+                ..
+            }
+        ));
         assert!(reg.hit_test(35, 10).is_none(), "bottom edge exclusive");
 
         // Between the two rects: no hit.
@@ -130,11 +190,26 @@ mod tests {
     }
 
     #[test]
+    fn work_item_row_hit_test() {
+        let mut reg = ClickRegistry::default();
+        reg.push_work_item_row(rect(0, 5, 30, 1), 7);
+        let hit = reg.hit_test(15, 5).expect("inside row rect");
+        match hit {
+            ClickTarget::WorkItemRow { index, .. } => assert_eq!(*index, 7),
+            other => panic!("expected WorkItemRow, got {other:?}"),
+        }
+        assert!(reg.hit_test(15, 6).is_none(), "row is height 1");
+    }
+
+    #[test]
     fn clear_drops_all_targets() {
         let mut reg = ClickRegistry::default();
-        reg.push(rect(0, 0, 5, 1), "x".into(), ClickKind::Title);
+        reg.push_copy(rect(0, 0, 5, 1), ClickKind::Title, "x".into());
+        reg.push_work_item_row(rect(0, 1, 5, 1), 0);
         assert!(reg.hit_test(2, 0).is_some());
+        assert!(reg.hit_test(2, 1).is_some());
         reg.clear();
         assert!(reg.hit_test(2, 0).is_none());
+        assert!(reg.hit_test(2, 1).is_none());
     }
 }

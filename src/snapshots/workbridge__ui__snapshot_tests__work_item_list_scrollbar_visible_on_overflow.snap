@@ -4,25 +4,25 @@ expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
 ┌ Work Items (15) ──────┐┌ Claude Code ────────────────────────────────────────┐
-│  ACTIVE (0) (10)      ││                                                     │
-│  [RV] Work item       ││  Work item number 10                                │
-│  number 14            ││                                                     │
-│  branch-item-14 [no   ││  Status      Backlog                                │
-│      wt]              ││  Backend     Local file                             │
-│  BACKLOGGED (0) (5)   ││  Repo        /repo/item-10/0                        │
-│  [BL] Work item       ││  Branch      branch-item-10                         │
-│  number 1             ││  Worktree    (none)                                 │
-│  branch-item-1 [no wt]││  PR          (none)                                 │
-│  [BL] Work item       ││  Issue       (none)                                 │
-│  number 4             ││  Errors      (none)                                 │
-│  branch-item-4 [no wt]││                                                     │
-│  [BL] Work item       █│  Press Shift+Right to move to Planning.             │
-│  number 7             █│                                                     │
-│  branch-item-7 [no wt]█│                                                     │
-│> [BL] Work item       █│                                                     │
-│  number 10            █│                                                     │
-│  branch-item-10 [no   █│                                                     │
+│  BACKLOGGED (0) (5)   ││                                                     │
+│  [BL] Work item       ││  Work item number 10                                │
+│  number 1             ││                                                     │
+│  branch-item-1 [no wt]││  Status      Backlog                                │
+│  [BL] Work item       ││  Backend     Local file                             │
+│  number 4             ││  Repo        /repo/item-10/0                        │
+│  branch-item-4 [no wt]││  Branch      branch-item-10                         │
+│  [BL] Work item       ││  Worktree    (none)                                 │
+│  number 7             ││  PR          (none)                                 │
+│  branch-item-7 [no wt]││  Issue       (none)                                 │
+│> [BL] Work item       ││  Errors      (none)                                 │
+│  number 10            ││                                                     │
+│  branch-item-10 [no   █│  Press Shift+Right to move to Planning.             │
 │      wt]              █│                                                     │
-│                       ││                                                     │
+│  [BL] Work item       █│                                                     │
+│  number 13            █│                                                     │
+│  branch-item-13 [no   █│                                                     │
+│      wt]              █│                                                     │
+│                       █│                                                     │
+│                       █│                                                     │
 └───────────────────────┘└─────────────────────────────────────────────────────┘
 Work item number 10 | [Backlog] | 0
