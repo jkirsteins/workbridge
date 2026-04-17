@@ -1218,6 +1218,12 @@ fn format_board_item<'a>(
 
     let mut lines: Vec<Line<'a>> = Vec::new();
 
+    // Compute session presence once so it can gate both the title-prefix
+    // badge styling (Blocked / Mergequeue status prefix) and the status
+    // indicator line below. The "dim = no session" rule applies to every
+    // badge on the row uniformly.
+    let has_session = app.session_key_for(&wi.id).is_some();
+
     // Title line(s) -- wrap, never truncate.
     let title_prefix = if wi.status == WorkItemStatus::Blocked {
         "[BK] "
@@ -1230,9 +1236,15 @@ fn format_board_item<'a>(
     let wrapped = wrap_text(&title_text, max_width);
     for (i, wl) in wrapped.into_iter().enumerate() {
         let style = if wi.status == WorkItemStatus::Blocked {
-            theme.style_stage_badge(&WorkItemStatus::Blocked)
+            dim_badge_style(
+                theme.style_stage_badge(&WorkItemStatus::Blocked),
+                has_session,
+            )
         } else if wi.status == WorkItemStatus::Mergequeue {
-            theme.style_stage_badge(&WorkItemStatus::Mergequeue)
+            dim_badge_style(
+                theme.style_stage_badge(&WorkItemStatus::Mergequeue),
+                has_session,
+            )
         } else if i == 0 {
             theme.style_text()
         } else {
@@ -1243,9 +1255,6 @@ fn format_board_item<'a>(
 
     // Status indicators on a second line (PR badge, session status).
     let mut indicators: Vec<Span<'a>> = Vec::new();
-
-    // Session activity indicator.
-    let has_session = app.session_key_for(&wi.id).is_some();
     let is_working = app.agent_working.contains(&wi.id);
     if is_working {
         let frame = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
@@ -1267,21 +1276,36 @@ fn format_board_item<'a>(
             indicators.push(Span::raw(" "));
         }
         let pr_text = format!("PR#{}", pr.number);
-        indicators.push(Span::styled(pr_text, theme.style_badge_pr()));
+        indicators.push(Span::styled(
+            pr_text,
+            dim_badge_style(theme.style_badge_pr(), has_session),
+        ));
         match &pr.checks {
             CheckStatus::Passing => {
-                indicators.push(Span::styled(" ok", theme.style_badge_ci_pass()));
+                indicators.push(Span::styled(
+                    " ok",
+                    dim_badge_style(theme.style_badge_ci_pass(), has_session),
+                ));
             }
             CheckStatus::Failing => {
-                indicators.push(Span::styled(" fail", theme.style_badge_ci_fail()));
+                indicators.push(Span::styled(
+                    " fail",
+                    dim_badge_style(theme.style_badge_ci_fail(), has_session),
+                ));
             }
             CheckStatus::Pending => {
-                indicators.push(Span::styled(" ...", theme.style_badge_ci_pending()));
+                indicators.push(Span::styled(
+                    " ...",
+                    dim_badge_style(theme.style_badge_ci_pending(), has_session),
+                ));
             }
             CheckStatus::None | CheckStatus::Unknown => {}
         }
         if matches!(pr.mergeable, MergeableState::Conflicting) {
-            indicators.push(Span::styled(" !merge", theme.style_badge_merge_conflict()));
+            indicators.push(Span::styled(
+                " !merge",
+                dim_badge_style(theme.style_badge_merge_conflict(), has_session),
+            ));
         }
     }
     if !indicators.is_empty() {
@@ -2165,6 +2189,15 @@ fn format_work_item_entry<'a>(
         right_parts.push((format!(" [{repo_count} repos]"), theme.style_text_muted()));
     }
 
+    // Dim every right-side badge style in one pass when the work item has
+    // no live Claude PTY session attached. Doing it here, after the block
+    // that populates `right_parts` and before the width-budget loop that
+    // decides which badges to keep, avoids having to wrap each individual
+    // `push` site above and guarantees no badge escapes the rule.
+    for (_, style) in right_parts.iter_mut() {
+        *style = dim_badge_style(*style, has_session);
+    }
+
     // Stage badge + optional [RR] kind indicator + optional [RG]
     // review-gate substate + title. Done items omit the badge since the
     // DONE group header already communicates their status; the review
@@ -2227,7 +2260,16 @@ fn format_work_item_entry<'a>(
     // the fg+bg pair cannot drift when the highlight bg is retuned).
     let hl = theme.style_tab_highlight();
     let (title_style, badge_style, right_badge_style, meta_style) = if is_selected {
-        (hl, hl, hl, theme.style_meta_selected())
+        // Dim the badge styles even on a selected row - "dim = no session"
+        // is the single unambiguous encoding and must not be masked by the
+        // highlight bar. Title style stays unchanged because title text
+        // colour is orthogonal to the badge rule.
+        (
+            hl,
+            dim_badge_style(hl, has_session),
+            dim_badge_style(hl, has_session),
+            theme.style_meta_selected(),
+        )
     } else {
         let ts = if wi.status == WorkItemStatus::Done {
             theme.style_done_item()
@@ -2236,7 +2278,7 @@ fn format_work_item_entry<'a>(
         };
         (
             ts,
-            theme.style_stage_badge(&wi.status),
+            dim_badge_style(theme.style_stage_badge(&wi.status), has_session),
             ratatui_core::style::Style::default(), // right badges have their own per-part styles
             theme.style_text_muted(),
         )
@@ -2270,7 +2312,10 @@ fn format_work_item_entry<'a>(
     if wi.kind == WorkItemKind::ReviewRequest {
         line1_spans.insert(
             1,
-            Span::styled("[RR]".to_string(), theme.style_badge_review_request_kind()),
+            Span::styled(
+                "[RR]".to_string(),
+                dim_badge_style(theme.style_badge_review_request_kind(), has_session),
+            ),
         );
     }
     // Insert [RG] badge immediately after the state badge for items
@@ -2291,7 +2336,10 @@ fn format_work_item_entry<'a>(
         };
         line1_spans.insert(
             insert_idx,
-            Span::styled("[RG]".to_string(), theme.style_badge_review_gate()),
+            Span::styled(
+                "[RG]".to_string(),
+                dim_badge_style(theme.style_badge_review_gate(), has_session),
+            ),
         );
     }
     for (text, style) in &right_parts[..visible_badge_count] {
@@ -4293,6 +4341,30 @@ fn dim_background(buf: &mut Buffer, area: Rect) {
     }
 }
 
+/// Apply the "no active session" dim treatment to a single badge style.
+///
+/// Mirrors `dim_background`'s approach at the style level: adds
+/// `Modifier::DIM` and forces foreground to `Color::DarkGray`. The
+/// DarkGray override is load-bearing - on some terminals DIM alone
+/// is indistinguishable from normal, and DarkGray collapses all
+/// per-badge hues to a single neutral so the dim reads consistently
+/// across themes.
+///
+/// Returns `style` unchanged when `has_session` is true, so callers
+/// can wrap every badge style unconditionally without branching.
+fn dim_badge_style(
+    style: ratatui_core::style::Style,
+    has_session: bool,
+) -> ratatui_core::style::Style {
+    if has_session {
+        style
+    } else {
+        style
+            .add_modifier(Modifier::DIM)
+            .fg(ratatui_core::style::Color::DarkGray)
+    }
+}
+
 /// Content variants for prompt dialogs.
 ///
 /// `KeyChoice` presents a question with labelled key options.
@@ -5120,6 +5192,124 @@ mod format_entry_tests {
         assert_eq!(
             cell.fg, theme.badge_session_working,
             "spinner fg on unselected row should remain badge_session_working"
+        );
+    }
+
+    /// Build a minimal Review-state work item with no session attached.
+    /// The state badge `[RV]` is the first thing to the right of the
+    /// 2-column left margin, so its cells sit at columns 2..=5 on row 0.
+    fn review_state_work_item() -> WorkItem {
+        WorkItem {
+            display_id: None,
+            id: WorkItemId::LocalFile(PathBuf::from("/tmp/dim-badge-test.json")),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "Pending review".to_string(),
+            description: None,
+            status: WorkItemStatus::Review,
+            repo_associations: vec![RepoAssociation {
+                repo_path: PathBuf::from("/Projects/myrepo"),
+                branch: Some("feature".to_string()),
+                worktree_path: Some(PathBuf::from("/Projects/myrepo/.worktrees/feature")),
+                pr: None,
+                issue: None,
+                git_state: None,
+                stale_worktree_path: None,
+            }],
+            status_derived: false,
+            errors: vec![],
+        }
+    }
+
+    /// With no attached PTY session, the `[RV]` state badge must render
+    /// with `Modifier::DIM` and a `DarkGray` foreground - matching the
+    /// `dim_badge_style` helper's contract. Verifying the first cell
+    /// of the badge (column 2, row 0) is sufficient because the helper
+    /// applies uniformly to every cell of the span.
+    #[test]
+    fn work_item_badge_dims_when_no_session() {
+        use ratatui_core::style::{Color, Modifier};
+
+        let wi = review_state_work_item();
+        let app = make_app_with_work_item(wi);
+        let theme = Theme::default_theme();
+
+        let item = format_work_item_entry(&app, 0, 40, &theme, false);
+        let buf = render_list_item_to_buffer(item, 40, false);
+
+        // Sanity-check the layout: cell (2,0) is the `[` of `[RV]`.
+        let badge_cell = buf.cell((2, 0)).expect("badge cell exists");
+        assert_eq!(
+            badge_cell.symbol(),
+            "[",
+            "expected `[` at column 2, got {:?}",
+            badge_cell.symbol()
+        );
+
+        assert!(
+            badge_cell.modifier.contains(Modifier::DIM),
+            "badge cell should carry Modifier::DIM when no session is attached; modifier={:?}",
+            badge_cell.modifier
+        );
+        assert_eq!(
+            badge_cell.fg,
+            Color::DarkGray,
+            "badge cell fg should be DarkGray when no session is attached, got {:?}",
+            badge_cell.fg
+        );
+    }
+
+    /// With a live session registered for the work item, the badge must
+    /// render in its normal theme style - `dim_badge_style` is a no-op
+    /// and the helper must not leak DIM or DarkGray into the output.
+    #[test]
+    fn work_item_badge_undimmed_when_session_attached() {
+        use crate::work_item::SessionEntry;
+        use ratatui_core::style::{Color, Modifier};
+        use std::sync::{Arc, Mutex};
+
+        let wi = review_state_work_item();
+        let id = wi.id.clone();
+        let status = wi.status;
+        let mut app = make_app_with_work_item(wi);
+
+        // Register a minimal fake SessionEntry under the work item's
+        // current stage, mirroring the pattern used by
+        // `session_lookup_requires_correct_stage` in app.rs.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        app.sessions.insert(
+            (id, status),
+            SessionEntry {
+                parser,
+                alive: true,
+                session: None,
+                scrollback_offset: 0,
+                selection: None,
+                agent_written_files: Vec::new(),
+            },
+        );
+
+        let theme = Theme::default_theme();
+        let item = format_work_item_entry(&app, 0, 40, &theme, false);
+        let buf = render_list_item_to_buffer(item, 40, false);
+
+        let badge_cell = buf.cell((2, 0)).expect("badge cell exists");
+        assert_eq!(
+            badge_cell.symbol(),
+            "[",
+            "expected `[` at column 2, got {:?}",
+            badge_cell.symbol()
+        );
+
+        assert!(
+            !badge_cell.modifier.contains(Modifier::DIM),
+            "badge cell must NOT carry Modifier::DIM when a session is attached; modifier={:?}",
+            badge_cell.modifier
+        );
+        assert_ne!(
+            badge_cell.fg,
+            Color::DarkGray,
+            "badge cell fg must NOT collapse to DarkGray when a session is attached",
         );
     }
 }
