@@ -1,9 +1,9 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 24)"
+expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
-┌ Work Items (0) ───────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Work Items (0) ───────┐┌ Session ────────────────────────────────────────────┐
 │  REVIEW REQUESTS (1)  ││                                                     │
 │> R Refactor      PR#77││  Refactor auth middleware                           │
 │    auth middleware    ││                                                     │

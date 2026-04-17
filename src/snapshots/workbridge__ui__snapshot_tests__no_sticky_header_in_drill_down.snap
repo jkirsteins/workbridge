@@ -1,9 +1,9 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 12)"
+expression: "render(&mut app, 80, 12)"
 ---
   List    Board    Dashboard                                   Tab: switch view
-┌ Implementing (3) ─────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Implementing (3) ─────┐┌ Session ────────────────────────────────────────────┐
 │  [IM] Item A          ││                                                     │
 │  branch-a [no wt]     ││  Item C                                             │
 │  [IM] Item B          ││                                                     │

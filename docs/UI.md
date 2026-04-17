@@ -513,13 +513,13 @@ and board views but not inside open dialogs or overlays.
   triggering an immediate fetch cycle. The status bar shows the
   "Refreshing GitHub data" spinner during the fetch, using the same
   code path as the periodic 120-second auto-refresh.
-- Ctrl+\\: cycle the right-panel tab between Claude Code and Terminal.
-  Works from both panels without changing focus, so the user can flip
-  the right panel without leaving the work item list and (more
-  importantly) can flip the tab from inside the PTY - plain Tab is
-  forwarded to the PTY so Claude Code's autocomplete works, which
-  means the tab switcher can't live on Tab itself. The
-  `ClaudeCode -> Terminal` transition is a no-op if the selected work
+- Ctrl+\\: cycle the right-panel tab between the Session tab and the
+  Terminal tab. Works from both panels without changing focus, so the
+  user can flip the right panel without leaving the work item list
+  and (more importantly) can flip the tab from inside the PTY - plain
+  Tab is forwarded to the PTY so the running harness's autocomplete
+  works, which means the tab switcher can't live on Tab itself. The
+  `Session -> Terminal` transition is a no-op if the selected work
   item has no worktree.
 - Ctrl+G: toggle the global assistant drawer. The harness is resolved
   from `config.defaults.global_assistant_harness`. If that field is
@@ -596,16 +596,10 @@ incompatible with rat-focus's widget navigation model.
   the arm after 1.5s even if the user walks away. `k` on a row with
   no live session is a silent no-op. After a kill, `c` / `x`
   respawns against the same stage.
-- Ctrl+\\: cycle between the active harness tab and the Terminal tab
+- Ctrl+\\: cycle between the Session tab and the Terminal tab
   (global, does not change focus - see "Global Shortcuts" above).
-  The harness-tab title reflects the per-work-item harness choice:
-  "Claude Code" when the selected item uses `claude`, "Codex" when
-  it uses `codex`, "Claude Code" as the default for selections
-  without a harness choice yet. Rendered via
-  `App::agent_backend_display_name` which reads `harness_choice`
-  for the currently selected work item, the global-assistant
-  harness when the Ctrl+G drawer is open, and falls back to the
-  static `self.agent_backend` otherwise.
+  See "Session tab title" below for how the Session tab's label is
+  resolved.
 - Ctrl+]: return to left panel
 - Ctrl+D / Delete: delete selected work item (modal confirmation)
 - m (left panel only): rebase the selected work item's branch onto
@@ -623,7 +617,38 @@ incompatible with rat-focus's widget navigation model.
   review requests, or have no worktree association. Not bound on the
   right panel because single keystrokes there forward to the PTY.
 - Dead session: auto-return to left panel
-- Up/Down in left panel: reset right panel tab to Claude Code
+- Up/Down in left panel: reset right panel tab to the Session tab
+
+### Session tab title
+
+The right-panel Session tab's title is a downstream reflection of
+which harness is actually running (or committed to run) in the
+current context. It is NEVER a hardcoded vendor default. The
+resolution order, implemented in `App::agent_backend_display_name`:
+
+1. **Per-work-item `harness_choice`**: when a work item is selected
+   and the user has pressed `c` or `x` for that item, the title
+   shows that harness's `display_name()` ("Claude Code" or "Codex").
+   This applies whether the session is alive, dead, or still
+   spawning - the title reflects which harness is committed, not
+   just which one is currently alive.
+2. **Global-assistant harness**: when the Ctrl+G drawer is open and
+   `config.defaults.global_assistant_harness` is set, the title
+   shows that harness's display name.
+3. **Neutral placeholder**: when no harness is committed to the
+   current context (no selection, selection with no `harness_choice`
+   and no configured global harness), the title renders
+   `App::SESSION_TITLE_NONE` (`"Session"`). This is the ONLY safe
+   thing to show - rendering "Claude Code" as a default would be a
+   user-facing lie if the user has explicitly chosen Codex but not
+   yet spawned the session, or if no session is running at all.
+
+This is an `[ABSOLUTE]` Review Policy rule (see CLAUDE.md
+"Session titles downstream of live harness state"). Adding a new
+harness adapter does not change the rule: display names come from
+the live adapter's `display_name()`, which is the single source of
+truth for UI titles. Adapters MUST NOT inject their vendor name
+into any UI string outside the live-session rendering path.
 
 ### Board Mode Navigation
 

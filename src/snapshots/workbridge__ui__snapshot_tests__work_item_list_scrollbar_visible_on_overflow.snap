@@ -3,7 +3,7 @@ source: src/ui.rs
 expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
-┌ Work Items (15) ──────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Work Items (15) ──────┐┌ Session ────────────────────────────────────────────┐
 │  BACKLOGGED (0) (5)   ││                                                     │
 │  [BL] Work item       ││  Work item number 10                                │
 │  number 1             ││                                                     │

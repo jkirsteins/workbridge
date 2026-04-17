@@ -6184,20 +6184,41 @@ impl App {
         }
     }
 
-    /// Human-readable name of the active agent backend, used in UI
-    /// titles and status messages so the string is not duplicated across
-    /// `src/ui.rs`. The mapping is centralised here so a new backend is
-    /// a one-line addition. See `docs/harness-contract.md` glossary.
+    /// Neutral placeholder shown in the right-panel tab title when no
+    /// harness has been committed to the current context (no selected
+    /// work item, or a selected item with no `harness_choice` and no
+    /// live session). Rendering a vendor name ("Claude Code", "Codex")
+    /// in this state would lie: the pane contains no session, so no
+    /// specific harness is running. The placeholder is exported so
+    /// snapshot tests and docs can reference the single canonical
+    /// string instead of duplicating it.
+    pub const SESSION_TITLE_NONE: &'static str = "Session";
+
+    /// Human-readable name of the agent backend actually driving the
+    /// current context's session. Used for the right-panel tab title,
+    /// the dead-session placeholder, and any other UI text that names
+    /// which LLM CLI is running. Centralised here so a new backend is
+    /// a one-line addition. See `docs/harness-contract.md` glossary
+    /// and `docs/UI.md` "Session tab title".
     ///
-    /// Resolution order: (1) the per-work-item `harness_choice` for the
-    /// currently selected work item, if any - this is the harness actually
-    /// driving that item's session; (2) the global-assistant harness if
-    /// the Ctrl+G drawer is open; (3) the static `self.agent_backend`
-    /// fallback (Claude, the reference implementation) for unit tests and
-    /// for selections that have no session/harness state. This avoids the
-    /// lying-UI failure where the tab title reads "Claude Code" while a
-    /// Codex session is actually running in the pane (see CLAUDE.md
-    /// "user-facing claim" severity override).
+    /// **Architectural principle** (CLAUDE.md `[ABSOLUTE]` "session
+    /// title is downstream of live harness state"): this function is
+    /// forbidden from falling back to a hardcoded vendor default. If
+    /// no harness is committed for the current context, it returns
+    /// the neutral `SESSION_TITLE_NONE` placeholder. Returning
+    /// `self.agent_backend.kind().display_name()` as a fallback would
+    /// mean the tab title reads "Claude Code" for a user who has
+    /// picked Codex but not yet spawned the session - a user-facing
+    /// lie because no harness is running in the pane at all.
+    ///
+    /// Resolution order:
+    /// 1. Per-work-item `harness_choice` for the currently selected
+    ///    work item: this is the harness actually driving (or about
+    ///    to drive) that item's session, and is set only after the
+    ///    user explicitly pressed `c` / `x`.
+    /// 2. Global-assistant harness if the Ctrl+G drawer is open and
+    ///    the user has configured one.
+    /// 3. `SESSION_TITLE_NONE` placeholder - never a vendor default.
     pub fn agent_backend_display_name(&self) -> &'static str {
         if let Some(id) = self.selected_work_item_id()
             && let Some(kind) = self.harness_choice.get(&id)
@@ -6209,7 +6230,7 @@ impl App {
         {
             return kind.display_name();
         }
-        self.agent_backend.kind().display_name()
+        Self::SESSION_TITLE_NONE
     }
 
     /// Resolve the harness-specific backend for a work-item spawn.
@@ -24668,6 +24689,86 @@ mod tests {
         assert!(
             !post_msg.contains("no harness chosen"),
             "with a chosen harness, the abort reason must not appear, got: {post_msg}"
+        );
+    }
+
+    /// Pins C14 (harness-contract.md): `agent_backend_display_name`
+    /// returns the neutral `SESSION_TITLE_NONE` placeholder when no
+    /// harness is committed to the current context. The UI tab
+    /// title previously fell through to `self.agent_backend.kind()`
+    /// which is hardcoded `ClaudeCodeBackend`, causing the tab to
+    /// read "Claude Code" for users who had picked Codex (or no
+    /// harness at all). That was a user-facing lie; the rule is
+    /// now `[ABSOLUTE]` in CLAUDE.md.
+    #[test]
+    fn agent_backend_display_name_is_neutral_without_committed_harness() {
+        let app = App::new();
+        // Preconditions: no selected work item, no harness choice,
+        // no global drawer, no global-assistant harness configured.
+        assert!(app.selected_work_item_id().is_none());
+        assert!(app.harness_choice.is_empty());
+        assert!(!app.global_drawer_open);
+        assert!(app.config.defaults.global_assistant_harness.is_none());
+
+        assert_eq!(
+            app.agent_backend_display_name(),
+            App::SESSION_TITLE_NONE,
+            "uncommitted context must return the neutral placeholder, not a vendor name"
+        );
+        assert_eq!(
+            App::SESSION_TITLE_NONE,
+            "Session",
+            "the neutral placeholder's literal value is load-bearing for snapshot tests"
+        );
+        // Must NOT equal any known harness display name.
+        for kind in AgentBackendKind::all() {
+            assert_ne!(
+                app.agent_backend_display_name(),
+                kind.display_name(),
+                "neutral placeholder must not collide with a vendor display name ({})",
+                kind.display_name()
+            );
+        }
+    }
+
+    /// Pins that once a harness choice is committed, the display
+    /// name follows that choice (not the static `self.agent_backend`).
+    #[test]
+    fn agent_backend_display_name_follows_harness_choice() {
+        let mut app = App::new();
+        // Seed a selected work item + a harness_choice entry for Codex.
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/wb-display-name.json"));
+        app.work_items.push(WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: WorkItemKind::Own,
+            title: "display-name-test".into(),
+            display_id: Some("test-1".into()),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![],
+            errors: vec![],
+        });
+        app.build_display_list();
+        app.selected_item = app
+            .display_list
+            .iter()
+            .position(|e| matches!(e, DisplayEntry::WorkItemEntry(_)));
+        app.harness_choice
+            .insert(wi_id.clone(), AgentBackendKind::Codex);
+
+        assert_eq!(
+            app.agent_backend_display_name(),
+            AgentBackendKind::Codex.display_name(),
+            "display name must follow the per-work-item harness_choice"
+        );
+        // Swap to Claude and re-check.
+        app.harness_choice
+            .insert(wi_id, AgentBackendKind::ClaudeCode);
+        assert_eq!(
+            app.agent_backend_display_name(),
+            AgentBackendKind::ClaudeCode.display_name()
         );
     }
 

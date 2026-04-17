@@ -59,6 +59,13 @@ Out of scope:
 - **Reference payload**: a copy-pasteable example (argv, MCP config
   JSON, hook body, etc.) of what the current `claude` reference
   implementation produces. See the RP section.
+- **Display name**: the human-readable vendor label returned by
+  `AgentBackendKind::display_name()` (e.g. `"Claude Code"`,
+  `"Codex"`). The display name is used ONLY in UI text that
+  identifies the harness actually running in a live session (C14,
+  below). It is NEVER used as a default when no harness is
+  committed - the UI renders the neutral placeholder
+  `App::SESSION_TITLE_NONE` (`"Session"`) in that case.
 
 ## Contract Clauses
 
@@ -298,6 +305,48 @@ The reason is twofold: env vars are inherited by grandchildren
 (where they can leak credentials into user-spawned subshells), and
 they are invisible to the review gate, which cannot tell from a live
 process whether a variable was set by workbridge or by the user.
+
+### C14 - Display name is downstream of live session state
+
+Adapters advertise a display name via
+`AgentBackendKind::display_name()`. Workbridge uses that display
+name ONLY to render UI text that identifies the harness actually
+running (or committed to run) in a live session: the right-panel
+Session tab title, the dead-session placeholder, and the Ctrl+\\
+toggle hint. The display name MUST NOT leak into UI strings
+outside that live-session context.
+
+Specifically, when no harness is committed to the current context
+(no `harness_choice` entry for the selected work item, no
+configured global-assistant harness), the UI renders the neutral
+`App::SESSION_TITLE_NONE` placeholder (`"Session"`) - NOT the
+display name of the workbridge-wide default. Falling back to any
+vendor display name in the absence of a live harness is a
+user-facing claim about state that the code can locally verify
+and is therefore a P0 violation of the Review Policy (see
+CLAUDE.md `[ABSOLUTE]` "Session titles downstream of live harness
+state"). Adding a new adapter does not change this rule: the
+single source of truth for display-name rendering is
+`App::agent_backend_display_name` (see `src/app.rs`), which does
+not consult the static `self.agent_backend`.
+
+Adapters themselves MUST NOT:
+- Inject their vendor name into prompt text, status messages, or
+  tool descriptions advertised to the session (prompts stay
+  harness-neutral so a session that reads its own prompt does not
+  see a competing brand name).
+- Leak their vendor name into error text surfaced to the UI when
+  the session failed to spawn (the UI formats the failure via
+  `command_name()` and the binary path, both of which are neutral
+  CLI facts, not marketing strings).
+
+Claude ref impl: `ClaudeCodeBackend::kind().display_name()` returns
+`"Claude Code"`. Codex: `CodexBackend::kind().display_name()`
+returns `"Codex"`. Neither is ever rendered except via
+`App::agent_backend_display_name` and the first-run harness
+picker modal (which lists all user-selectable harnesses by
+`display_name()` because listing their brand names there is the
+whole point of the modal).
 
 ## Implementation Map
 
@@ -678,6 +727,32 @@ other env var is touched. The only filesystem writes workbridge
 performs for a Codex session are under `std::env::temp_dir()`
 (the MCP config JSON, used by the on-disk parity path and by
 future harnesses; Codex itself does not read it).
+
+### C14 - Display name is downstream of live session state
+
+**Claude (reference)**: `ClaudeCodeBackend::kind().display_name()`
+returns `"Claude Code"`. That string reaches the UI only through
+`App::agent_backend_display_name`, which resolves from per-work-
+item `harness_choice` -> global-assistant harness ->
+`App::SESSION_TITLE_NONE`. There is no path that surfaces
+"Claude Code" as a default when no harness is committed. The old
+behaviour of falling through to `self.agent_backend.kind()` was
+removed on 2026-04-17 and is now a P0 Review Policy violation;
+the contract's invariant is `agent_backend_display_name()` returns
+`"Session"` for uncommitted contexts.
+
+**Codex**: **supported (implemented)**.
+`CodexBackend::kind().display_name()` returns `"Codex"`. Same
+resolution path as Claude - the display name only reaches the UI
+when a per-work-item `harness_choice` of `Codex` or a configured
+global-assistant harness of `Codex` is present. Codex's argv
+builder does not inject `"Codex"` into any UI-visible string
+(error text, prompt, tool description); it emits
+`command_name() = "codex"` as argv[0] (a neutral CLI fact) and
+`display_name() = "Codex"` only via the trait method consumed by
+`agent_backend_display_name`. Pinned by
+`codex_display_name_returns_codex` in `src/agent_backend.rs::tests`
+(trivial but load-bearing for C14 compliance).
 
 ## Reference Payloads (Claude)
 

@@ -3,7 +3,7 @@ source: src/ui.rs
 expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
-┌ Work Items (4) ───────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Work Items (4) ───────┐┌ Session ────────────────────────────────────────────┐
 │  ACTIVE (0) (2)       ││                                                     │
 │> [IM] Refac PR#88 fail││  Refactor backend API                               │
 │  tor backend API      ││                                                     │

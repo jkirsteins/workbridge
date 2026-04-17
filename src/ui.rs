@@ -3890,7 +3890,7 @@ fn draw_settings_keybindings_tab(buf: &mut Buffer, app: &App, theme: &Theme, are
         binding("Ctrl+B", "New backlog ticket"),
         binding("Ctrl+G", "Global assistant"),
         binding("Ctrl+R", "Refresh GitHub data"),
-        binding("Ctrl+\\", "Cycle Claude Code <-> Terminal tab"),
+        binding("Ctrl+\\", "Cycle Session <-> Terminal tab"),
         binding("?", "Settings / keybindings (this overlay)"),
         binding("Q / Ctrl+Q", "Quit"),
         Line::from(""),
@@ -3912,7 +3912,7 @@ fn draw_settings_keybindings_tab(buf: &mut Buffer, app: &App, theme: &Theme, are
         Line::styled("Session active (right panel)", h),
         binding("Ctrl+]", "Return to item list"),
         Line::from(vec![Span::styled(
-            "  (all other keys forwarded to Claude)",
+            "  (all other keys forwarded to the session)",
             d,
         )]),
         Line::from(""),
