@@ -1259,6 +1259,7 @@ Pinned by the `codex_*` tests in `src/agent_backend.rs`.
 codex
   --ask-for-approval never
   --sandbox workspace-write
+  --config granular_approval.mcp_elicitations=false
   [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
   [--config mcp_servers.<extra>.args=[...]      ]   # (emitted FIRST)
   --config mcp_servers.workbridge.command="<workbridge exe path>"
@@ -1267,15 +1268,29 @@ codex
   <auto-start user prompt (if any)>
 ```
 
-The `--ask-for-approval never --sandbox workspace-write` pair is
-equivalent to `--full-auto` minus the `-a on-request` bundled piece.
-The `--full-auto` shortcut was used until 2026-04-17, but prompts for
-approval on every MCP tool call (`-a on-request` is what `--full-auto`
-sets). The user's 2026-04-17 directive ("MCP tools need to be pre-
-allowed for codex, so it does not ask for permission for them")
+Approval-policy rationale: the `--ask-for-approval never --sandbox
+workspace-write` pair is equivalent to `--full-auto` minus the
+`-a on-request` bundled piece. The `--full-auto` shortcut was used
+until 2026-04-17, but `-a on-request` prompts on every shell/patch
+operation. The user's 2026-04-17 directive ("MCP tools need to be
+pre-allowed for codex, so it does not ask for permission for them")
 requires zero in-session approval prompts while keeping the
-workspace-write sandbox, hence the two flags are emitted directly.
-See Authorization 2b in the review-loop session log.
+workspace-write sandbox. See Authorization 2b in the review-loop
+session log.
+
+MCP-elicitation rationale: `--ask-for-approval never` only governs
+shell/patch sandbox operations in codex-cli 0.120.0; it does NOT
+silence per-MCP-tool "elicitation" approval dialogs. Without the
+`granular_approval.mcp_elicitations=false` override, the first
+`workbridge_*` MCP call pops a blocking "Allow the workbridge MCP
+server to run tool ..." dialog in the Codex TUI (verified live on
+2026-04-17 via tmux). The `granular_approval.mcp_elicitations`
+config key is present in the shipped codex binary and its
+docstring reads "Whether to allow MCP elicitation prompts" - we set
+it to `false` so MCP tool calls go through structurally without
+prompting. This is applied on every Codex profile (interactive,
+review gate, rebase gate) because the headless gates would block
+forever on the first prompt (no user to answer).
 
 Ordering invariant (R3-F-1): the workbridge primary's `--config
 mcp_servers.workbridge.*` overrides MUST be emitted AFTER every

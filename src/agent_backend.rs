@@ -771,6 +771,23 @@ impl AgentBackend for CodexBackend {
             cmd.push("--sandbox".to_string());
             cmd.push("workspace-write".to_string());
         }
+        // C3b: `--ask-for-approval never` only governs shell/patch
+        // sandbox operations in codex-cli 0.120.0; it does NOT silence
+        // the per-MCP-tool "elicitation" approval dialog that pops up
+        // the first time the model calls each workbridge_* tool.
+        // Setting `granular_approval.mcp_elicitations=false` (verified
+        // present in the shipped codex binary via `strings`; its
+        // docstring reads "Whether to allow MCP elicitation prompts")
+        // suppresses that dialog structurally so MCP calls go through
+        // without user interaction. Applied to both read-only and
+        // write-capable interactive sessions because the read-only
+        // review gate also needs unprompted MCP access to call its
+        // verdict tools. This was the fix for the 2026-04-17 user
+        // directive "MCP tools need to be pre-allowed for codex, so it
+        // does not ask for permission for them" - the approval-policy
+        // swap alone was necessary but not sufficient.
+        cmd.push("--config".to_string());
+        cmd.push("granular_approval.mcp_elicitations=false".to_string());
         // C4: Codex has no `--mcp-config` flag and no `mcp_servers.*.config`
         // sub-field that reads an external JSON (that path is what the
         // earlier implementation used; verified to be rejected by
@@ -826,9 +843,16 @@ impl AgentBackend for CodexBackend {
         // newline-delimited event stream. No `--full-auto` (this session
         // cannot write) and no `--ask-for-approval` overrides (the
         // read-only MCP server enforces the gate).
+        //
+        // C3b: also suppress MCP elicitation prompts - see the note in
+        // `build_command`. Without this, the review gate runs headless
+        // and would block forever on the first workbridge_* call
+        // because there is no interactive user to answer the prompt.
         let mut cmd = vec![
             "exec".to_string(),
             "--json".to_string(),
+            "--config".to_string(),
+            "granular_approval.mcp_elicitations=false".to_string(),
             "--config".to_string(),
             format!("instructions={}", toml_quote_string(cfg.system_prompt)),
         ];
@@ -851,12 +875,18 @@ impl AgentBackend for CodexBackend {
         // stays after `exec`. The combination parallels Claude's
         // `--dangerously-skip-permissions` (which already implies "no
         // approval prompts").
+        //
+        // C3b: also suppress MCP elicitation prompts (same reasoning as
+        // the review gate - the rebase gate is headless and would block
+        // forever on an MCP approval prompt).
         let mut cmd = vec![
             "--ask-for-approval".to_string(),
             "never".to_string(),
             "exec".to_string(),
             "--json".to_string(),
             "--full-auto".to_string(),
+            "--config".to_string(),
+            "granular_approval.mcp_elicitations=false".to_string(),
         ];
         Self::extend_mcp_bridge_argv(&mut cmd, Some(cfg.mcp_bridge), cfg.extra_bridges);
         cmd.push(cfg.initial_prompt.to_string());
@@ -1304,6 +1334,83 @@ mod tests {
         assert!(
             !argv.iter().any(|s| s == "--full-auto"),
             "interactive Codex must NOT use --full-auto"
+        );
+    }
+
+    /// Pins C3b: all three Codex profiles MUST include the
+    /// `granular_approval.mcp_elicitations=false` `--config` override.
+    /// Without this, `--ask-for-approval never` alone does NOT suppress
+    /// per-MCP-tool approval dialogs in codex-cli 0.120.0 (verified
+    /// live on 2026-04-17). The review gate and rebase gate are
+    /// headless (`exec --json`) and would hang forever on the first
+    /// workbridge_* MCP call without this flag; the interactive path
+    /// surfaces the prompt to the user, which breaks the "pre-allow
+    /// MCP tools" user requirement.
+    #[test]
+    fn codex_suppresses_mcp_elicitation_prompts_on_all_profiles() {
+        fn has_granular_flag(argv: &[String]) -> bool {
+            argv.windows(2)
+                .any(|w| w[0] == "--config" && w[1] == "granular_approval.mcp_elicitations=false")
+        }
+        let mcp_path = PathBuf::from("/tmp/workbridge-mcp-fake.sock");
+        let bridge = fake_bridge();
+
+        // Interactive write-capable.
+        let cfg = SpawnConfig {
+            stage: WorkItemStatus::Implementing,
+            system_prompt: Some("sys"),
+            mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
+            extra_bridges: &[],
+            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+            auto_start_message: None,
+            read_only: false,
+        };
+        assert!(
+            has_granular_flag(&CodexBackend.build_command(&cfg)),
+            "interactive write-capable Codex must suppress MCP elicitation prompts"
+        );
+        // Interactive read-only (global-assistant edge case + hypothetical
+        // future read-only work-item scope). Also must suppress.
+        let ro_cfg = SpawnConfig {
+            stage: WorkItemStatus::Review,
+            system_prompt: Some("ro"),
+            mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
+            extra_bridges: &[],
+            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+            auto_start_message: None,
+            read_only: true,
+        };
+        assert!(
+            has_granular_flag(&CodexBackend.build_command(&ro_cfg)),
+            "interactive read-only Codex must suppress MCP elicitation prompts"
+        );
+        // Review gate (headless read-only).
+        let rg_cfg = ReviewGateSpawnConfig {
+            system_prompt: "sys",
+            initial_prompt: "prompt",
+            json_schema: "{}",
+            mcp_config_path: &mcp_path,
+            mcp_bridge: &bridge,
+            extra_bridges: &[],
+        };
+        assert!(
+            has_granular_flag(&CodexBackend.build_review_gate_command(&rg_cfg)),
+            "review gate Codex must suppress MCP elicitation prompts"
+        );
+        // Rebase gate (headless read-write).
+        let rw_cfg = ReviewGateSpawnConfig {
+            system_prompt: "sys",
+            initial_prompt: "rebase",
+            json_schema: "{}",
+            mcp_config_path: &mcp_path,
+            mcp_bridge: &bridge,
+            extra_bridges: &[],
+        };
+        assert!(
+            has_granular_flag(&CodexBackend.build_headless_rw_command(&rw_cfg)),
+            "rebase gate Codex must suppress MCP elicitation prompts"
         );
     }
 
