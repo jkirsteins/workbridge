@@ -1,6 +1,6 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 24)"
+expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
@@ -16,8 +16,8 @@ expression: "render(&app, 80, 24)"
 │                       ││  Issue       #42 - Fix resize bug                   │
 │                       ││  Errors      (none)                                 │
 │                       ││                                                     │
-│                       ││  Press Shift+Right to move to Planning.             │
-│                       ││                                                     │
+│                       ││  Press c (Claude) or x (Codex) to                   │
+│                       ││  begin planning.                                    │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

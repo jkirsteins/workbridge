@@ -6188,7 +6188,27 @@ impl App {
     /// titles and status messages so the string is not duplicated across
     /// `src/ui.rs`. The mapping is centralised here so a new backend is
     /// a one-line addition. See `docs/harness-contract.md` glossary.
+    ///
+    /// Resolution order: (1) the per-work-item `harness_choice` for the
+    /// currently selected work item, if any - this is the harness actually
+    /// driving that item's session; (2) the global-assistant harness if
+    /// the Ctrl+G drawer is open; (3) the static `self.agent_backend`
+    /// fallback (Claude, the reference implementation) for unit tests and
+    /// for selections that have no session/harness state. This avoids the
+    /// lying-UI failure where the tab title reads "Claude Code" while a
+    /// Codex session is actually running in the pane (see CLAUDE.md
+    /// "user-facing claim" severity override).
     pub fn agent_backend_display_name(&self) -> &'static str {
+        if let Some(id) = self.selected_work_item_id()
+            && let Some(kind) = self.harness_choice.get(&id)
+        {
+            return kind.display_name();
+        }
+        if self.global_drawer_open
+            && let Some(kind) = self.global_assistant_harness_kind()
+        {
+            return kind.display_name();
+        }
         self.agent_backend.kind().display_name()
     }
 
@@ -6242,10 +6262,38 @@ impl App {
             }
         }
 
-        // Record the choice and delegate to the existing spawn path.
+        // Record the choice BEFORE any stage transition so the downstream
+        // spawn in `apply_stage_change` -> `spawn_session` has the harness
+        // available when it calls `backend_for_work_item`.
+        self.harness_choice.insert(work_item_id.clone(), kind);
+
+        // Auto-advance Backlog -> Planning so `c`/`x` is a single-keypress
+        // "begin work on this item" action. Without this, pressing c/x
+        // on a Backlog row silently records the harness but spawns no
+        // session (spawn_session early-returns for Backlog), leaving the
+        // user staring at an unchanged row. The UI hint on a Backlog row
+        // already advertises c/x as the begin-planning action.
+        let current_status = self
+            .work_items
+            .iter()
+            .find(|w| w.id == work_item_id)
+            .map(|w| w.status);
+        if current_status == Some(WorkItemStatus::Backlog) {
+            self.apply_stage_change(
+                &work_item_id,
+                &WorkItemStatus::Backlog,
+                &WorkItemStatus::Planning,
+                "user_harness_pick",
+            );
+            // apply_stage_change already calls spawn_session for stages
+            // with prompts (Planning qualifies), so no further action is
+            // needed - the session is now spawning.
+            return;
+        }
+
+        // Non-Backlog path: delegate to the existing session-open flow.
         // `finish_session_open` reads back the choice via
         // `backend_for_work_item`.
-        self.harness_choice.insert(work_item_id, kind);
         self.open_session_for_selected();
     }
 

@@ -1,6 +1,6 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 24)"
+expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
 ┌ Work Items (4) ───────┐┌ Claude Code ────────────────────────────────────────┐
@@ -19,7 +19,7 @@ expression: "render(&app, 80, 24)"
 │  settings page        ││  PR URL                                             │
 │  branch-todo-2 [no wt]││  https://github.com/o/r/pull/88                     │
 │                       ││                                                     │
-│                       ││  Press Enter to start a session.                    │
+│                       ││  Press c (Claude) or x (Codex) to start a session.  │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

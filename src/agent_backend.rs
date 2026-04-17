@@ -645,10 +645,15 @@ impl AgentBackend for ClaudeCodeBackend {
 ///
 /// Argv shape summary:
 ///
-/// - Interactive (work-item / global): `codex --full-auto
+/// - Interactive (work-item / global): `codex --ask-for-approval never
+///   --sandbox workspace-write
 ///   --config mcp_servers.workbridge.command="<exe>"
 ///   --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<sock>"]
 ///   [--config instructions="<sys>"] [<auto-start>]` (RP1c).
+///   The approval-policy + sandbox pair is equivalent to `--full-auto`
+///   minus `-a on-request`; the user explicitly disallowed per-call
+///   MCP approval prompts (see Authorization 2b in the review-loop
+///   session log, superseding the original `--full-auto` authorization).
 /// - Headless read-only (review gate): `codex exec --json
 ///   --config instructions="<sys>"
 ///   --config mcp_servers.workbridge.command="<exe>"
@@ -748,13 +753,23 @@ impl AgentBackend for CodexBackend {
 
     fn build_command(&self, cfg: &SpawnConfig<'_>) -> Vec<String> {
         let mut cmd = vec![self.command_name().to_string()];
-        // C3: Codex's `--full-auto` matches Claude's
-        // `--dangerously-skip-permissions` for write-capable sessions.
-        // Read-only interactive sessions omit it, matching the Claude
-        // parity convention (neither adapter uses the bypass for
-        // read-only - the MCP server filter enforces read-only mode).
+        // C3: Codex's approval policy and sandbox policy are split across
+        // two flags. For write-capable interactive sessions we want ZERO
+        // in-session approval prompts (the user authorised this via the
+        // 2026-04-17 "MCP tools need to be pre-allowed for codex"
+        // directive, superseding the original `--full-auto` choice) but
+        // we still want the workspace-write sandbox so Codex's shell
+        // tool is scoped to the work-item's worktree. `--full-auto`
+        // bundles `-a on-request --sandbox workspace-write`, which
+        // prompts on every MCP tool call; we emit the two flags directly
+        // instead. Read-only interactive sessions (global assistant in
+        // read-only mode, hypothetical future read-only scope) omit both
+        // since the MCP-server layer enforces read-only there.
         if !cfg.read_only {
-            cmd.push("--full-auto".to_string());
+            cmd.push("--ask-for-approval".to_string());
+            cmd.push("never".to_string());
+            cmd.push("--sandbox".to_string());
+            cmd.push("workspace-write".to_string());
         }
         // C4: Codex has no `--mcp-config` flag and no `mcp_servers.*.config`
         // sub-field that reads an external JSON (that path is what the
@@ -997,7 +1012,23 @@ mod tests {
         };
         let argv = backend.build_command(&cfg);
         assert_eq!(argv.first().map(String::as_str), Some("codex"));
-        assert!(argv.iter().any(|s| s == "--full-auto"));
+        // Interactive write-capable Codex uses `--ask-for-approval never`
+        // + `--sandbox workspace-write` (Authorization 2b, replaces the
+        // earlier `--full-auto`). `--full-auto` is `-a on-request` and
+        // prompts for approval on every MCP tool call, which the user
+        // explicitly rejected on 2026-04-17.
+        assert!(
+            argv.iter().any(|s| s == "--ask-for-approval") && argv.iter().any(|s| s == "never"),
+            "interactive Codex must pin approval policy to never"
+        );
+        assert!(
+            argv.iter().any(|s| s == "--sandbox") && argv.iter().any(|s| s == "workspace-write"),
+            "interactive Codex must keep workspace-write sandbox"
+        );
+        assert!(
+            !argv.iter().any(|s| s == "--full-auto"),
+            "interactive Codex must NOT use --full-auto (pulls in -a on-request)"
+        );
         assert!(
             argv.iter()
                 .any(|s| s == "Explain who you are and start working."),
@@ -1225,10 +1256,13 @@ mod tests {
 
     // ---- Codex backend tests ----
 
-    /// Pins C3: Codex's `--full-auto` is the permission-bypass flag for
-    /// write-capable interactive sessions.
+    /// Pins C3: interactive write-capable Codex uses `--ask-for-approval
+    /// never` + `--sandbox workspace-write` (Authorization 2b, supersedes
+    /// the earlier `--full-auto` shape). `--full-auto` pulls in
+    /// `-a on-request` which prompts for approval on every MCP tool
+    /// call; the user explicitly rejected that UX on 2026-04-17.
     #[test]
-    fn codex_interactive_argv_has_full_auto() {
+    fn codex_interactive_argv_pre_approves_tool_calls() {
         let mcp_path = PathBuf::from("/tmp/workbridge-mcp-fake.sock");
         let bridge = fake_bridge();
         let cfg = SpawnConfig {
@@ -1243,7 +1277,34 @@ mod tests {
         };
         let argv = CodexBackend.build_command(&cfg);
         assert_eq!(argv[0], "codex");
-        assert!(argv.iter().any(|s| s == "--full-auto"));
+        // Approval policy must be "never" (adjacent pair).
+        let approval_idx = argv.iter().position(|s| s == "--ask-for-approval");
+        assert!(
+            approval_idx.is_some(),
+            "interactive Codex must emit --ask-for-approval"
+        );
+        assert_eq!(
+            argv.get(approval_idx.unwrap() + 1).map(String::as_str),
+            Some("never"),
+            "--ask-for-approval value must be 'never' (no MCP tool prompts)"
+        );
+        // Sandbox must remain workspace-write (adjacent pair).
+        let sandbox_idx = argv.iter().position(|s| s == "--sandbox");
+        assert!(
+            sandbox_idx.is_some(),
+            "interactive Codex must emit --sandbox"
+        );
+        assert_eq!(
+            argv.get(sandbox_idx.unwrap() + 1).map(String::as_str),
+            Some("workspace-write"),
+            "sandbox must stay workspace-write (Authorization 2b scope)"
+        );
+        // `--full-auto` must NOT be emitted in interactive mode (it bundles
+        // -a on-request which contradicts Authorization 2b).
+        assert!(
+            !argv.iter().any(|s| s == "--full-auto"),
+            "interactive Codex must NOT use --full-auto"
+        );
     }
 
     /// Pins C4: Codex MCP injection uses per-field `--config
@@ -1393,11 +1454,11 @@ mod tests {
         );
     }
 
-    /// Pins C11: read-only interactive sessions omit `--full-auto`. The
-    /// read-only MCP server is the enforcement mechanism; the CLI flag
-    /// would be misleading.
+    /// Pins C11: read-only interactive sessions omit the write-mode
+    /// approval/sandbox pair. The read-only MCP server is the enforcement
+    /// mechanism; the CLI flags would be misleading.
     #[test]
-    fn codex_read_only_interactive_omits_full_auto() {
+    fn codex_read_only_interactive_omits_write_flags() {
         let mcp_path = PathBuf::from("/tmp/mcp.json");
         let bridge = fake_bridge();
         let cfg = SpawnConfig {
@@ -1411,6 +1472,10 @@ mod tests {
             read_only: true,
         };
         let argv = CodexBackend.build_command(&cfg);
+        // Read-only must NOT emit the write-mode approval/sandbox pair
+        // and must NOT emit the deprecated `--full-auto` shortcut.
+        assert!(!argv.iter().any(|s| s == "--ask-for-approval"));
+        assert!(!argv.iter().any(|s| s == "--sandbox"));
         assert!(!argv.iter().any(|s| s == "--full-auto"));
     }
 

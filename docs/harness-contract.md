@@ -1257,7 +1257,8 @@ Pinned by the `codex_*` tests in `src/agent_backend.rs`.
 
 ```
 codex
-  --full-auto
+  --ask-for-approval never
+  --sandbox workspace-write
   [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
   [--config mcp_servers.<extra>.args=[...]      ]   # (emitted FIRST)
   --config mcp_servers.workbridge.command="<workbridge exe path>"
@@ -1265,6 +1266,16 @@ codex
   --config instructions="<stage system prompt>"
   <auto-start user prompt (if any)>
 ```
+
+The `--ask-for-approval never --sandbox workspace-write` pair is
+equivalent to `--full-auto` minus the `-a on-request` bundled piece.
+The `--full-auto` shortcut was used until 2026-04-17, but prompts for
+approval on every MCP tool call (`-a on-request` is what `--full-auto`
+sets). The user's 2026-04-17 directive ("MCP tools need to be pre-
+allowed for codex, so it does not ask for permission for them")
+requires zero in-session approval prompts while keeping the
+workspace-write sandbox, hence the two flags are emitted directly.
+See Authorization 2b in the review-loop session log.
 
 Ordering invariant (R3-F-1): the workbridge primary's `--config
 mcp_servers.workbridge.*` overrides MUST be emitted AFTER every
@@ -1284,7 +1295,9 @@ would mis-split the TOML path. Pinned by `toml_quote_key_*` and
 `codex_extra_bridge_with_dotted_name_emits_quoted_key`.
 
 Differences from Claude's RP1:
-- `--full-auto` instead of `--dangerously-skip-permissions`.
+- `--ask-for-approval never --sandbox workspace-write` instead of
+  `--dangerously-skip-permissions` (see the approval-policy note
+  above the snippet).
 - Per-field MCP overrides instead of `--mcp-config <path>`: Codex's
   TOML schema for `mcp_servers.<name>` requires `command` (string)
   and `args` (array of strings) directly. There is no `.config=<path>`

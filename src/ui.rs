@@ -2575,8 +2575,8 @@ fn draw_work_item_detail(
     let Some(wi) = wi else {
         let text = Text::from(vec![
             Line::from(""),
-            Line::from("  Press Enter to start"),
-            Line::from("  a session."),
+            Line::from("  Press c (Claude) or x (Codex)"),
+            Line::from("  to start a session."),
         ]);
         let paragraph = Paragraph::new(text)
             .block(block)
@@ -2805,7 +2805,7 @@ fn draw_work_item_detail(
 
     lines.push(Line::from(""));
     let hint_lines: &[&str] = match wi.status {
-        WorkItemStatus::Backlog => &["  Press Shift+Right to move to Planning."],
+        WorkItemStatus::Backlog => &["  Press c (Claude) or x (Codex) to", "  begin planning."],
         WorkItemStatus::Done => &["  Done."],
         WorkItemStatus::Mergequeue => &[
             "  Waiting for PR to be merged.",
@@ -2823,7 +2823,7 @@ fn draw_work_item_detail(
             if has_stale {
                 &["  Press Enter to recover worktree."]
             } else {
-                &["  Press Enter to start a session."]
+                &["  Press c (Claude) or x (Codex) to start a session."]
             }
         }
     };
@@ -3152,8 +3152,8 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                         Line::from(""),
                         Line::from("  Session has ended."),
                         Line::from(""),
-                        Line::from("  Press Enter to start"),
-                        Line::from("  a new session."),
+                        Line::from("  Press c (Claude) or x (Codex)"),
+                        Line::from("  to start a new session."),
                     ]);
                     let paragraph = Paragraph::new(text).block(block).style(theme.style_error());
                     paragraph.render(area, buf);
@@ -3243,7 +3243,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                         lines.push(Line::from(""));
                         let hint_lines: &[&str] = match wi.map(|w| &w.status) {
                             Some(WorkItemStatus::Backlog) => {
-                                &["  Press Shift+Right to move to Planning."]
+                                &["  Press c (Claude) or x (Codex) to begin planning."]
                             }
                             Some(WorkItemStatus::Done) => &["  Done."],
                             Some(WorkItemStatus::Mergequeue) => &[
@@ -3251,7 +3251,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                                 "  Polling GitHub every 30s.",
                                 "  Shift+Left to move back to Review and stop polling.",
                             ],
-                            _ => &["  Press Enter to start a session."],
+                            _ => &["  Press c (Claude) or x (Codex) to start a session."],
                         };
                         for hint in hint_lines {
                             lines.push(Line::from(Span::styled(*hint, theme.style_text_muted())));

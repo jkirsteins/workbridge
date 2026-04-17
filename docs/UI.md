@@ -560,8 +560,18 @@ incompatible with rat-focus's widget navigation model.
   availability check via `agent_backend::is_available` runs before
   the choice is recorded; a missing binary shows a "command not
   found" toast and does not overwrite a previous choice.
+  **Backlog special case**: pressing `c` or `x` on a `Backlog`
+  row is a single-keypress "begin work on this item" action -
+  `App::open_session_with_harness` records the harness choice AND
+  advances the stage from `Backlog -> Planning` via
+  `apply_stage_change`, which in turn spawns the Planning session.
+  This avoids a two-step "press c, then press Shift+Right" dance
+  that would otherwise silently fail (spawn_session early-returns
+  for Backlog, so a c/x press with no stage advance would just
+  record the choice and do nothing visible).
 - x (left panel only, on a work item with no live session): same as
-  `c` but for `codex` (`AgentBackendKind::Codex`).
+  `c` but for `codex` (`AgentBackendKind::Codex`). Same Backlog
+  auto-advance behavior.
 - o (left panel only): open the selected row's PR in the default
   browser via `open`. Works on work items (first repo association
   with a PR wins), unlinked PRs, and review requests. Sets a "No
@@ -586,8 +596,16 @@ incompatible with rat-focus's widget navigation model.
   the arm after 1.5s even if the user walks away. `k` on a row with
   no live session is a silent no-op. After a kill, `c` / `x`
   respawns against the same stage.
-- Ctrl+\\: cycle between Claude Code and Terminal tabs (global, does
-  not change focus - see "Global Shortcuts" above)
+- Ctrl+\\: cycle between the active harness tab and the Terminal tab
+  (global, does not change focus - see "Global Shortcuts" above).
+  The harness-tab title reflects the per-work-item harness choice:
+  "Claude Code" when the selected item uses `claude`, "Codex" when
+  it uses `codex`, "Claude Code" as the default for selections
+  without a harness choice yet. Rendered via
+  `App::agent_backend_display_name` which reads `harness_choice`
+  for the currently selected work item, the global-assistant
+  harness when the Ctrl+G drawer is open, and falls back to the
+  static `self.agent_backend` otherwise.
 - Ctrl+]: return to left panel
 - Ctrl+D / Delete: delete selected work item (modal confirmation)
 - m (left panel only): rebase the selected work item's branch onto

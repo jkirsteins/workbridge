@@ -16,8 +16,8 @@ expression: "render(&mut app, 80, 24)"
 │  branch-item-7 [no wt]││  Issue       (none)                                 │
 │> [BL] Work item       ││  Errors      (none)                                 │
 │  number 10            ││                                                     │
-│  branch-item-10 [no   █│  Press Shift+Right to move to Planning.             │
-│      wt]              █│                                                     │
+│  branch-item-10 [no   █│  Press c (Claude) or x (Codex) to                   │
+│      wt]              █│  begin planning.                                    │
 │  [BL] Work item       █│                                                     │
 │  number 13            █│                                                     │
 │  branch-item-13 [no   █│                                                     │

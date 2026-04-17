@@ -1,6 +1,6 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 24)"
+expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
 ┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
@@ -13,7 +13,7 @@ expression: "render(&app, 80, 24)"
 │                       ││  - Issue #42 not found in /repo/alpha               │
 │                       ││    The issue may have been deleted or the number is │
 │                       ││                                                     │
-│                       ││  Press Enter to start a session.                    │
+│                       ││  Press c (Claude) or x (Codex) to start a session.  │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
