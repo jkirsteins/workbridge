@@ -1257,9 +1257,8 @@ Pinned by the `codex_*` tests in `src/agent_backend.rs`.
 
 ```
 codex
-  --ask-for-approval never
+  --config approval_policy={granular={mcp_elicitations=true,sandbox_approval=true,rules=true,request_permissions=true,skill_approval=true}}
   --sandbox workspace-write
-  --config granular_approval.mcp_elicitations=false
   [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
   [--config mcp_servers.<extra>.args=[...]      ]   # (emitted FIRST)
   --config mcp_servers.workbridge.command="<workbridge exe path>"
@@ -1268,29 +1267,41 @@ codex
   <auto-start user prompt (if any)>
 ```
 
-Approval-policy rationale: the `--ask-for-approval never --sandbox
-workspace-write` pair is equivalent to `--full-auto` minus the
-`-a on-request` bundled piece. The `--full-auto` shortcut was used
-until 2026-04-17, but `-a on-request` prompts on every shell/patch
-operation. The user's 2026-04-17 directive ("MCP tools need to be
-pre-allowed for codex, so it does not ask for permission for them")
-requires zero in-session approval prompts while keeping the
-workspace-write sandbox. See Authorization 2b in the review-loop
-session log.
+Approval-policy rationale (supersedes the 2026-04-17 `-a never`
+shape): codex-cli 0.120.0 has two orthogonal approval axes -
+shell/patch sandbox approvals AND per-MCP-tool "elicitation"
+approval dialogs. `--ask-for-approval never` covers only the first.
+Verified live on 2026-04-17: with `-a never` set, the first
+`workbridge_*` call still pops a blocking "Allow the workbridge
+MCP server to run tool ..." dialog.
 
-MCP-elicitation rationale: `--ask-for-approval never` only governs
-shell/patch sandbox operations in codex-cli 0.120.0; it does NOT
-silence per-MCP-tool "elicitation" approval dialogs. Without the
-`granular_approval.mcp_elicitations=false` override, the first
-`workbridge_*` MCP call pops a blocking "Allow the workbridge MCP
-server to run tool ..." dialog in the Codex TUI (verified live on
-2026-04-17 via tmux). The `granular_approval.mcp_elicitations`
-config key is present in the shipped codex binary and its
-docstring reads "Whether to allow MCP elicitation prompts" - we set
-it to `false` so MCP tool calls go through structurally without
-prompting. This is applied on every Codex profile (interactive,
-review gate, rebase gate) because the headless gates would block
-forever on the first prompt (no user to answer).
+The only mode that covers BOTH axes is the tagged enum variant
+`AskForApproval::Granular` (introduced in 0.120.0). Each sub-field
+of the granular config auto-approves (`true`) or auto-rejects
+(`false`) one approval category without prompting. The five fields
+(enumerated via `strings` on the shipped codex binary) are:
+`sandbox_approval`, `rules`, `request_permissions`,
+`mcp_elicitations`, `skill_approval`. Setting every one to `true`
+produces the "never prompt for anything, just run" UX the
+2026-04-17 user directive requires. This is applied on every Codex
+profile (interactive, review gate, rebase gate): the headless
+gates would otherwise hang forever on the first MCP elicitation.
+
+`-a` / `--ask-for-approval` is NOT emitted because the CLI rejects
+`-a granular` (the variant is config-only). `--sandbox workspace-
+write` still carries the write-scoping role (sandbox policy is
+independent of approval policy in granular mode). `--full-auto` is
+also not used: it bundles `-a on-request --sandbox workspace-
+write`, and `-a on-request` would override the granular setting.
+The effective write-capable workbridge shape is `--config
+approval_policy={granular={...all true...}} --sandbox workspace-
+write`, with read-only interactive sessions omitting the `--sandbox`
+flag but keeping the granular config (so the read-only review gate
+can still auto-invoke its verdict MCP tools).
+
+See Authorization 2b in the review-loop session log for the
+user-directive trail from the original `--full-auto` -> `--ask-
+for-approval never` -> `approval_policy={granular={...}}`.
 
 Ordering invariant (R3-F-1): the workbridge primary's `--config
 mcp_servers.workbridge.*` overrides MUST be emitted AFTER every
