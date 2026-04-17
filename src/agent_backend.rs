@@ -259,47 +259,6 @@ fn toml_quote_string_array(items: &[String]) -> String {
     out
 }
 
-/// Build the `approval_policy` config override that disables every
-/// interactive approval prompt in codex-cli 0.120.0.
-///
-/// Codex's approval system has two orthogonal axes that the user-
-/// visible `--ask-for-approval never` flag does NOT fully cover:
-/// shell/patch sandbox escalations AND per-MCP-tool "elicitation"
-/// approval dialogs. Verified live 2026-04-17: with `-a never` set,
-/// the first `workbridge_*` MCP call still pops a blocking "Allow
-/// the workbridge MCP server to run tool ..." dialog in the Codex
-/// TUI. Headless `exec --json` runs would block forever on that
-/// dialog since there is no interactive user to answer.
-///
-/// The only mode that structurally covers both axes is the tagged
-/// enum variant `AskForApproval::Granular` (introduced in 0.120.0).
-/// In granular mode, each sub-field controls one approval category;
-/// setting a field to `true` means "commands in that category are
-/// allowed" (auto-approved, not prompted), `false` means "auto-
-/// rejected without prompting". The five fields enumerated in the
-/// shipped codex binary via `strings` are `sandbox_approval`,
-/// `rules`, `request_permissions`, `mcp_elicitations`,
-/// `skill_approval`. Setting every one to `true` produces the
-/// "never prompt for anything, just run" UX the 2026-04-17 user
-/// directive requires.
-///
-/// The returned string is a `-c`-compatible TOML inline table of
-/// the form `approval_policy={granular={mcp_elicitations=true,
-/// sandbox_approval=true, rules=true, request_permissions=true,
-/// skill_approval=true}}`. It is emitted alongside `--sandbox
-/// workspace-write` (or omitted for read-only sessions); the
-/// sandbox flag scopes filesystem writes, while this function
-/// scopes approval behaviour.
-///
-/// Keeping the key ordering deterministic so tests can assert the
-/// exact string.
-fn codex_granular_auto_approve_all() -> String {
-    "approval_policy={granular={mcp_elicitations=true,\
-     sandbox_approval=true,rules=true,request_permissions=true,\
-     skill_approval=true}}"
-        .to_string()
-}
-
 /// Direct specification of an MCP stdio server (name + command + args).
 /// Emitted alongside `mcp_config_path` because some harnesses (notably
 /// Codex) register MCP servers via structured CLI overrides that need
@@ -749,6 +708,28 @@ impl CodexBackend {
             "mcp_servers.{key}.args={}",
             toml_quote_string_array(&bridge.args)
         ));
+        // C3b: set `default_tools_approval_mode = "approve"` for every
+        // bridge so Codex auto-approves all tool calls from this MCP
+        // server without prompting the user. This is the ONLY path that
+        // actually suppresses the "Allow the <server> to run tool ..."
+        // dialog in codex-cli 0.120.0 - verified by reading codex's
+        // source (`codex-rs/core/src/mcp_tool_call.rs`,
+        // `custom_mcp_tool_approval_mode` resolves to
+        // `mcp_servers.<name>.default_tools_approval_mode`; a value of
+        // `Approve` makes `auto_approved_by_policy` true and skips the
+        // prompt entirely). The global `approval_policy` flag (`never`,
+        // `granular`, etc.) covers shell/patch approvals but NOT MCP
+        // tool approvals - those are controlled per-server. The user's
+        // 2026-04-17 directive ("MCP tools need to be pre-allowed for
+        // codex, so it does not ask for permission for them") maps
+        // onto this setting. Emitted for both the workbridge primary
+        // and any user-configured extras - user-configured MCP servers
+        // in a workbridge session are equally trusted (the user chose
+        // them).
+        cmd.push("--config".to_string());
+        cmd.push(format!(
+            "mcp_servers.{key}.default_tools_approval_mode=\"approve\""
+        ));
     }
 
     /// Emit overrides for every per-repo extra bridge in order, then
@@ -794,40 +775,21 @@ impl AgentBackend for CodexBackend {
 
     fn build_command(&self, cfg: &SpawnConfig<'_>) -> Vec<String> {
         let mut cmd = vec![self.command_name().to_string()];
-        // C3 + C3b: For write-capable interactive sessions we want ZERO
-        // in-session approval prompts (the user authorised this via the
-        // 2026-04-17 "MCP tools need to be pre-allowed for codex"
-        // directive, superseding the original `--full-auto` choice) but
-        // we still want the workspace-write sandbox so Codex's shell
-        // tool is scoped to the work-item's worktree.
-        //
-        // codex-cli 0.120.0 has two approval-control axes:
-        //   (1) shell/patch approvals - governed by `approval_policy` /
-        //       `--ask-for-approval` (untrusted / on-request / never /
-        //       granular)
-        //   (2) MCP-tool elicitations - a SEPARATE dialog, NOT silenced
-        //       by `--ask-for-approval never`. Verified live on
-        //       2026-04-17: `codex --ask-for-approval never ...` still
-        //       pops "Allow the workbridge MCP server to run tool ...".
-        //
-        // The only mode that covers BOTH axes structurally is
-        // `approval_policy=granular` with every sub-field set to
-        // `true` ("allowed" = auto-approve). The fields are enumerated
-        // via `strings` on the codex binary: sandbox_approval, rules,
-        // request_permissions, mcp_elicitations, skill_approval.
-        // Setting all five to true produces the "never prompt" UX for
-        // both shell-approval and MCP-elicitation paths while the
-        // workspace-write sandbox still scopes filesystem writes to
-        // the worktree. We emit the granular config as a TOML inline
-        // table (`approval_policy={granular={...}}`).
+        // C3: for write-capable interactive sessions, emit
+        // `--ask-for-approval never` (suppresses shell/patch approvals)
+        // plus `--sandbox workspace-write` (scopes filesystem writes to
+        // the worktree). MCP tool approvals are NOT controlled by this
+        // flag in codex-cli 0.120.0; they are controlled per-server via
+        // `mcp_servers.<name>.default_tools_approval_mode = "approve"`
+        // emitted by `extend_one_mcp_bridge` below. See Authorization
+        // 2b and the 2026-04-17 user directive.
         //
         // Read-only interactive sessions (global assistant in read-only
-        // mode, hypothetical future read-only scope) omit the sandbox
-        // flag but still need MCP pre-approval so they can call the
-        // read-only workbridge tools.
-        cmd.push("--config".to_string());
-        cmd.push(codex_granular_auto_approve_all());
+        // mode, hypothetical future read-only scope) omit both flags
+        // since the MCP-server layer enforces read-only there.
         if !cfg.read_only {
+            cmd.push("--ask-for-approval".to_string());
+            cmd.push("never".to_string());
             cmd.push("--sandbox".to_string());
             cmd.push("workspace-write".to_string());
         }
@@ -883,22 +845,18 @@ impl AgentBackend for CodexBackend {
 
     fn build_review_gate_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
         // C1 headless + C11 read-only: `codex exec --json` emits a
-        // newline-delimited event stream. No sandbox-write (this session
-        // cannot write). The read-only MCP server still enforces the
-        // gate semantics regardless of the approval mode.
+        // newline-delimited event stream. No `--full-auto` (this
+        // session cannot write). The read-only MCP server enforces
+        // the gate semantics.
         //
-        // C3 + C3b: use the same `approval_policy=granular` auto-approve-
-        // everything shape as the interactive path. Without it, the
-        // headless review gate blocks forever on the first
-        // workbridge_* elicitation prompt (no interactive user to
-        // answer). The sandbox argument is NOT emitted - this session
-        // is read-only by design; MCP server-side filtering enforces
-        // read-only, not the CLI sandbox flag.
+        // C3b: MCP tool approvals are still suppressed per-server via
+        // `mcp_servers.<name>.default_tools_approval_mode = "approve"`
+        // (emitted by `extend_one_mcp_bridge`). Without that, the
+        // headless review gate would block on the first `workbridge_*`
+        // call (no user to answer the approval dialog).
         let mut cmd = vec![
             "exec".to_string(),
             "--json".to_string(),
-            "--config".to_string(),
-            codex_granular_auto_approve_all(),
             "--config".to_string(),
             format!("instructions={}", toml_quote_string(cfg.system_prompt)),
         ];
@@ -908,29 +866,24 @@ impl AgentBackend for CodexBackend {
     }
 
     fn build_headless_rw_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
-        // Headless read-write: as of codex-cli 0.120.0, `-a never` +
-        // `--full-auto` (sandbox workspace-write) covers shell/patch
-        // approvals but NOT MCP elicitations - the rebase gate would
-        // also block on `workbridge_*` MCP calls. Switch to the same
-        // `approval_policy=granular` auto-approve-all shape used by
-        // the interactive / review-gate paths. `-a never` is dropped
-        // because the granular policy supersedes it and `-a` doesn't
-        // accept "granular" as a CLI value; the config carries the
-        // whole setting. `--sandbox workspace-write` replaces the
-        // `--full-auto` shortcut (which would re-set approval to
-        // `on-request`).
+        // Headless read-write: `--ask-for-approval never` is a TOP-
+        // LEVEL codex flag and MUST precede `exec`; clap rejects it
+        // inside the `exec` subcommand. `--full-auto` IS an `exec`
+        // subcommand flag and stays after `exec`. Verified live on
+        // 2026-04-16 via `codex --ask-for-approval never exec --json
+        // --full-auto --skip-git-repo-check "echo hi"`.
         //
-        // Ordering: `-c` flags and `--sandbox` are top-level; the
-        // `exec` subcommand comes after them, consistent with the
-        // earlier lesson that codex's `-a`/`-c` must precede `exec`
-        // (clap rejects them inside the subcommand).
+        // C3b: MCP tool approvals are suppressed per-server via
+        // `mcp_servers.<name>.default_tools_approval_mode = "approve"`
+        // (emitted by `extend_one_mcp_bridge`). The headless rebase
+        // gate would otherwise block on the first `workbridge_*` MCP
+        // call with no interactive user to answer.
         let mut cmd = vec![
-            "--sandbox".to_string(),
-            "workspace-write".to_string(),
-            "--config".to_string(),
-            codex_granular_auto_approve_all(),
+            "--ask-for-approval".to_string(),
+            "never".to_string(),
             "exec".to_string(),
             "--json".to_string(),
+            "--full-auto".to_string(),
         ];
         Self::extend_mcp_bridge_argv(&mut cmd, Some(cfg.mcp_bridge), cfg.extra_bridges);
         cmd.push(cfg.initial_prompt.to_string());
@@ -1086,22 +1039,21 @@ mod tests {
         };
         let argv = backend.build_command(&cfg);
         assert_eq!(argv.first().map(String::as_str), Some("codex"));
-        // Approval governance is now config-only (granular auto-approve-
-        // all). `--ask-for-approval` is NOT emitted - codex-cli 0.120.0
-        // rejects `-a granular` at the CLI, so the whole policy is
-        // delivered via `-c approval_policy={granular={...}}`. The
-        // granular config covers BOTH shell/patch approvals AND MCP
-        // elicitations, replacing the `-a never` shape that only
-        // covered shell/patch.
-        let granular = codex_granular_auto_approve_all();
+        // Interactive write-capable Codex uses `--ask-for-approval never`
+        // + `--sandbox workspace-write` (the Authorization 2b shape).
+        // MCP-tool approvals are suppressed per-server via
+        // `mcp_servers.<name>.default_tools_approval_mode="approve"`
+        // (not the approval_policy flag - that only covers shell/patch
+        // approvals, not MCP tool calls).
+        let approval_idx = argv.iter().position(|s| s == "--ask-for-approval");
         assert!(
-            !argv.iter().any(|s| s == "--ask-for-approval"),
-            "interactive Codex must NOT emit --ask-for-approval (granular is config-only)"
+            approval_idx.is_some(),
+            "interactive Codex must emit --ask-for-approval"
         );
-        assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "--config" && w[1] == granular),
-            "interactive Codex must emit the granular auto-approve-all override, got {argv:?}"
+        assert_eq!(
+            argv.get(approval_idx.unwrap() + 1).map(String::as_str),
+            Some("never"),
+            "--ask-for-approval value must be 'never'"
         );
         assert!(
             argv.iter().any(|s| s == "--sandbox") && argv.iter().any(|s| s == "workspace-write"),
@@ -1109,7 +1061,14 @@ mod tests {
         );
         assert!(
             !argv.iter().any(|s| s == "--full-auto"),
-            "interactive Codex must NOT use --full-auto (pulls in -a on-request)"
+            "interactive Codex must NOT use --full-auto"
+        );
+        // Per-server approval pre-approve must be emitted for the
+        // workbridge primary.
+        assert!(
+            argv.iter()
+                .any(|s| s == "mcp_servers.workbridge.default_tools_approval_mode=\"approve\""),
+            "workbridge MCP server must be marked default_tools_approval_mode=\"approve\" to suppress tool-call prompts, got {argv:?}"
         );
         assert!(
             argv.iter()
@@ -1141,34 +1100,31 @@ mod tests {
             extra_bridges: &[],
         };
         let rw_argv = backend.build_headless_rw_command(&rw_cfg);
-        // Rebase gate now uses `--sandbox workspace-write` (top-level)
-        // + `-c approval_policy={granular=...}` + `exec --json`.
-        // `--ask-for-approval` is no longer emitted; the CLI does not
-        // accept `-a granular`. `--sandbox` comes first to stay on the
-        // top-level side of the `exec` subcommand boundary (clap rejects
-        // top-level flags after `exec`).
+        // Rebase gate: `--ask-for-approval never` (top-level) must
+        // precede `exec`; `--full-auto` (exec-subcommand flag) stays
+        // after `exec`. Per-server MCP approval is also emitted.
         assert_eq!(
             rw_argv.first().map(String::as_str),
-            Some("--sandbox"),
-            "rebase gate must start with top-level --sandbox flag, got {rw_argv:?}"
+            Some("--ask-for-approval"),
+            "rebase gate must start with top-level --ask-for-approval"
         );
+        let exec_idx = rw_argv
+            .iter()
+            .position(|s| s == "exec")
+            .expect("rebase gate must include `exec`");
+        let full_auto_idx = rw_argv
+            .iter()
+            .position(|s| s == "--full-auto")
+            .expect("rebase gate must include `--full-auto`");
         assert!(
-            rw_argv.iter().any(|s| s == "exec"),
-            "rebase gate must include `exec` subcommand"
+            full_auto_idx > exec_idx,
+            "--full-auto must come AFTER `exec`"
         );
         assert!(
             rw_argv
-                .windows(2)
-                .any(|w| w[0] == "--config" && w[1] == granular),
-            "rebase gate must emit granular auto-approve-all override"
-        );
-        assert!(
-            !rw_argv.iter().any(|s| s == "--ask-for-approval"),
-            "rebase gate must NOT emit --ask-for-approval (config-only)"
-        );
-        assert!(
-            !rw_argv.iter().any(|s| s == "--full-auto"),
-            "rebase gate must NOT emit --full-auto (it pulls in -a on-request which fights the granular override)"
+                .iter()
+                .any(|s| s == "mcp_servers.workbridge.default_tools_approval_mode=\"approve\""),
+            "rebase gate must mark workbridge MCP server default_tools_approval_mode=\"approve\""
         );
 
         // C4: Codex writes no session files by default in the stub.
@@ -1375,35 +1331,32 @@ mod tests {
         };
         let argv = CodexBackend.build_command(&cfg);
         assert_eq!(argv[0], "codex");
-        // Approval is now governed by the granular policy (auto-approve
-        // every category). `--ask-for-approval` / `-a` is no longer
-        // emitted because codex-cli 0.120.0's CLI rejects `-a granular`;
-        // we pass the full granular config via `-c approval_policy=...`.
-        assert!(
-            !argv.iter().any(|s| s == "--ask-for-approval" || s == "-a"),
-            "interactive Codex must NOT emit --ask-for-approval (granular is config-only)"
-        );
-        // The granular auto-approve config MUST be emitted as a
-        // `-c approval_policy=...` pair.
-        let granular_cfg = codex_granular_auto_approve_all();
-        assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "--config" && w[1] == granular_cfg),
-            "interactive Codex must emit the granular auto-approve-all approval_policy override, got {argv:?}"
+        // `--ask-for-approval never` must be present (adjacent pair).
+        let approval_idx = argv.iter().position(|s| s == "--ask-for-approval");
+        assert!(approval_idx.is_some());
+        assert_eq!(
+            argv.get(approval_idx.unwrap() + 1).map(String::as_str),
+            Some("never")
         );
         // Sandbox must remain workspace-write (adjacent pair).
         let sandbox_idx = argv.iter().position(|s| s == "--sandbox");
-        assert!(
-            sandbox_idx.is_some(),
-            "interactive Codex must emit --sandbox"
-        );
+        assert!(sandbox_idx.is_some());
         assert_eq!(
             argv.get(sandbox_idx.unwrap() + 1).map(String::as_str),
-            Some("workspace-write"),
-            "sandbox must stay workspace-write"
+            Some("workspace-write")
         );
-        // `--full-auto` must NOT be emitted in interactive mode (it
-        // bundles -a on-request which contradicts the granular override).
+        // Per-server MCP pre-approval via
+        // `mcp_servers.workbridge.default_tools_approval_mode="approve"`.
+        // This is the key that actually suppresses "Allow the
+        // workbridge MCP server to run tool ..." prompts in codex-cli
+        // 0.120.0 (verified by reading codex source; the global
+        // approval_policy flag does NOT cover MCP tool calls).
+        assert!(
+            argv.iter()
+                .any(|s| s == "mcp_servers.workbridge.default_tools_approval_mode=\"approve\""),
+            "workbridge MCP server must be marked default_tools_approval_mode=\"approve\", got {argv:?}"
+        );
+        // `--full-auto` must NOT be emitted in interactive mode.
         assert!(
             !argv.iter().any(|s| s == "--full-auto"),
             "interactive Codex must NOT use --full-auto"
@@ -1414,18 +1367,17 @@ mod tests {
     /// `granular_approval.mcp_elicitations=false` `--config` override.
     /// Without this, `--ask-for-approval never` alone does NOT suppress
     /// per-MCP-tool approval dialogs in codex-cli 0.120.0 (verified
-    /// live on 2026-04-17). The review gate and rebase gate are
-    /// headless (`exec --json`) and would hang forever on the first
-    /// workbridge_* MCP call without this flag; the interactive path
-    /// surfaces the prompt to the user, which breaks the "pre-allow
-    /// MCP tools" user requirement.
+    /// live on 2026-04-17). Suppression is done per-MCP-server via
+    /// `mcp_servers.<name>.default_tools_approval_mode = "approve"`.
+    /// The review gate and rebase gate are headless (`exec --json`)
+    /// and would hang forever on the first workbridge_* MCP call
+    /// without this setting; the interactive path surfaces the prompt
+    /// to the user, which breaks the "pre-allow MCP tools" user
+    /// requirement (2026-04-17 directive).
     #[test]
-    fn codex_suppresses_mcp_elicitation_prompts_on_all_profiles() {
-        let granular_cfg = codex_granular_auto_approve_all();
-        let has_granular_flag = |argv: &[String]| -> bool {
-            argv.windows(2)
-                .any(|w| w[0] == "--config" && w[1] == granular_cfg)
-        };
+    fn codex_suppresses_mcp_tool_call_prompts_on_all_profiles() {
+        let expected = "mcp_servers.workbridge.default_tools_approval_mode=\"approve\"".to_string();
+        let has_approve_flag = |argv: &[String]| -> bool { argv.iter().any(|s| s == &expected) };
         let mcp_path = PathBuf::from("/tmp/workbridge-mcp-fake.sock");
         let bridge = fake_bridge();
 
@@ -1441,11 +1393,11 @@ mod tests {
             read_only: false,
         };
         assert!(
-            has_granular_flag(&CodexBackend.build_command(&cfg)),
-            "interactive write-capable Codex must suppress MCP elicitation prompts"
+            has_approve_flag(&CodexBackend.build_command(&cfg)),
+            "interactive write-capable Codex must mark workbridge MCP server default_tools_approval_mode=approve"
         );
-        // Interactive read-only (global-assistant edge case + hypothetical
-        // future read-only work-item scope). Also must suppress.
+        // Interactive read-only - also must suppress (read-only MCP
+        // calls still need to go through without prompting).
         let ro_cfg = SpawnConfig {
             stage: WorkItemStatus::Review,
             system_prompt: Some("ro"),
@@ -1457,8 +1409,8 @@ mod tests {
             read_only: true,
         };
         assert!(
-            has_granular_flag(&CodexBackend.build_command(&ro_cfg)),
-            "interactive read-only Codex must suppress MCP elicitation prompts"
+            has_approve_flag(&CodexBackend.build_command(&ro_cfg)),
+            "interactive read-only Codex must mark workbridge MCP server default_tools_approval_mode=approve"
         );
         // Review gate (headless read-only).
         let rg_cfg = ReviewGateSpawnConfig {
@@ -1470,8 +1422,8 @@ mod tests {
             extra_bridges: &[],
         };
         assert!(
-            has_granular_flag(&CodexBackend.build_review_gate_command(&rg_cfg)),
-            "review gate Codex must suppress MCP elicitation prompts"
+            has_approve_flag(&CodexBackend.build_review_gate_command(&rg_cfg)),
+            "review gate Codex must mark workbridge MCP server default_tools_approval_mode=approve"
         );
         // Rebase gate (headless read-write).
         let rw_cfg = ReviewGateSpawnConfig {
@@ -1483,8 +1435,8 @@ mod tests {
             extra_bridges: &[],
         };
         assert!(
-            has_granular_flag(&CodexBackend.build_headless_rw_command(&rw_cfg)),
-            "rebase gate Codex must suppress MCP elicitation prompts"
+            has_approve_flag(&CodexBackend.build_headless_rw_command(&rw_cfg)),
+            "rebase gate Codex must mark workbridge MCP server default_tools_approval_mode=approve"
         );
     }
 
@@ -1699,21 +1651,16 @@ mod tests {
         );
     }
 
-    /// Pins the headless rebase-gate shape. As of the 2026-04-17
-    /// pre-approve-MCP-tools directive, the rebase gate uses the same
-    /// `approval_policy=granular` auto-approve-all config as the
-    /// interactive and review-gate paths. This replaces the earlier
-    /// `--ask-for-approval never ... --full-auto` shape because:
-    /// (a) `-a never` in codex-cli 0.120.0 does NOT silence MCP
-    /// elicitations (verified live 2026-04-17), so the headless
-    /// rebase gate would hang on the first workbridge_* call; and
-    /// (b) granular mode covers both shell/patch AND MCP approvals,
-    /// closing the axis gap. `-a` is no longer emitted because clap
-    /// rejects `-a granular`. `--sandbox workspace-write` carries the
-    /// write-access role that `--full-auto` previously provided.
-    /// Top-level flags (`--sandbox`, `-c`) must precede `exec`.
+    /// Pins the headless rebase-gate shape: top-level `-a never`
+    /// before `exec`, `--full-auto` after `exec`, and the per-server
+    /// `default_tools_approval_mode="approve"` override on the
+    /// workbridge MCP server. `-a` must precede `exec` (clap rejects
+    /// it as an exec flag); `--full-auto` is an exec subcommand flag
+    /// and stays after `exec`. MCP tool prompts are suppressed via
+    /// the per-server setting (the global approval_policy does NOT
+    /// cover MCP tool calls).
     #[test]
-    fn codex_headless_rw_uses_granular_approval_policy() {
+    fn codex_headless_rw_argv_shape_and_mcp_pre_approval() {
         let mcp_path = PathBuf::from("/tmp/rb.json");
         let bridge = fake_bridge();
         let cfg = ReviewGateSpawnConfig {
@@ -1731,46 +1678,36 @@ mod tests {
             .position(|s| s == "exec")
             .expect("exec subcommand must be present");
 
-        // --sandbox workspace-write must come BEFORE exec (top-level).
-        let sandbox_idx = argv
+        // `--ask-for-approval never` must precede exec (R2-F-1).
+        let approval_idx = argv
             .iter()
-            .position(|s| s == "--sandbox")
-            .expect("--sandbox must be present");
+            .position(|s| s == "--ask-for-approval")
+            .expect("--ask-for-approval must be present");
         assert!(
-            sandbox_idx < exec_idx,
-            "--sandbox must come BEFORE the `exec` subcommand; got {argv:?}"
+            approval_idx < exec_idx,
+            "--ask-for-approval must come BEFORE `exec`; got {argv:?}"
         );
         assert_eq!(
-            argv.get(sandbox_idx + 1).map(String::as_str),
-            Some("workspace-write")
+            argv.get(approval_idx + 1).map(String::as_str),
+            Some("never")
         );
 
-        // The granular auto-approve-all policy must be emitted BEFORE
-        // exec and the flag must come as a `--config key=value` pair.
-        let granular = codex_granular_auto_approve_all();
-        let granular_idx = argv
-            .windows(2)
-            .position(|w| w[0] == "--config" && w[1] == granular)
-            .expect("granular approval override must be present");
+        // `--full-auto` must come after exec (exec subcommand flag).
+        let full_auto_idx = argv
+            .iter()
+            .position(|s| s == "--full-auto")
+            .expect("--full-auto must be present");
         assert!(
-            granular_idx < exec_idx,
-            "--config approval_policy={{granular=...}} must come BEFORE exec; got {argv:?}"
+            full_auto_idx > exec_idx,
+            "--full-auto must come AFTER `exec`; got {argv:?}"
         );
 
-        // R2-F-1 regression: `-a` / `--ask-for-approval` must NOT be
-        // emitted. The CLI rejects `-a granular`; the policy is
-        // config-only and the granular override carries it.
+        // Per-server MCP pre-approval must be present so the headless
+        // rebase gate does not hang on MCP tool prompts.
         assert!(
-            !argv.iter().any(|s| s == "--ask-for-approval" || s == "-a"),
-            "rebase gate must NOT emit --ask-for-approval (policy is config-only now); got {argv:?}"
-        );
-
-        // `--full-auto` must NOT be emitted: it implicitly sets
-        // `-a on-request` which would override the granular policy we
-        // just installed.
-        assert!(
-            !argv.iter().any(|s| s == "--full-auto"),
-            "rebase gate must NOT emit --full-auto (conflicts with granular policy); got {argv:?}"
+            argv.iter()
+                .any(|s| s == "mcp_servers.workbridge.default_tools_approval_mode=\"approve\""),
+            "rebase gate must mark workbridge MCP server default_tools_approval_mode=\"approve\", got {argv:?}"
         );
 
         assert!(
