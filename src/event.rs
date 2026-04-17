@@ -2477,12 +2477,13 @@ fn copy_selection_to_clipboard(entry: &crate::work_item::SessionEntry) {
     };
 
     // Set scrollback to match the viewport the user sees.
-    let rows = parser.screen().size().0 as usize;
-    let clamped = entry.scrollback_offset.min(rows);
+    let (rows, cols) = parser.screen().size();
+    let clamped = entry.scrollback_offset.min(rows as usize);
     parser.set_scrollback(clamped);
 
-    // Normalize selection range so start is before end.
-    let (start_row, start_col, end_row, end_col) = normalize_selection(sel);
+    // Translate the selection's inclusive end column into the
+    // exclusive form `vt100::Screen::contents_between` expects.
+    let (start_row, start_col, end_row, end_col) = selection_to_vt100_bounds(sel, cols);
 
     let text = parser
         .screen()
@@ -2508,6 +2509,25 @@ fn normalize_selection(sel: &SelectionState) -> (u16, u16, u16, u16) {
     } else {
         (cr, cc, ar, ac)
     }
+}
+
+/// Convert a user-facing `SelectionState` (inclusive end cell) into the
+/// bound tuple `vt100::Screen::contents_between` expects (exclusive end
+/// column).
+///
+/// `SelectionState` stores the cell the user's cursor is over when the
+/// mouse is released, so `current` is the last highlighted cell. vt100's
+/// `contents_between`, by contrast, treats `end_col` as exclusive on both
+/// the same-row and multi-row paths (see vt100-0.15.2/src/screen.rs:182
+/// and row.rs:98). Passing the inclusive end directly truncates the last
+/// character under the cursor - that's the off-by-one this helper fixes.
+///
+/// The returned `end_col` is clamped to `cols` so a selection that ends
+/// on the final column (`cols - 1`) does not overflow past the row.
+fn selection_to_vt100_bounds(sel: &SelectionState, cols: u16) -> (u16, u16, u16, u16) {
+    let (start_row, start_col, end_row, end_col) = normalize_selection(sel);
+    let exclusive_end_col = end_col.saturating_add(1).min(cols);
+    (start_row, start_col, end_row, exclusive_end_col)
 }
 
 /// Recalculate layout from the current terminal size and resize PTY panes.
@@ -3685,5 +3705,152 @@ mod tests {
             app.toasts.is_empty(),
             "up on label without a fresh matching down must not fire a copy",
         );
+    }
+}
+
+/// Regression tests for the selection-to-clipboard extraction off-by-one.
+///
+/// `SelectionState` stores an inclusive end cell (the cell the cursor is
+/// over when the mouse is released), but vt100's `contents_between`
+/// expects an exclusive end column. Before the fix, the extraction
+/// silently truncated the last character; `selection_to_vt100_bounds`
+/// is the helper responsible for the inclusive->exclusive conversion.
+#[cfg(test)]
+mod selection_clipboard_tests {
+    use super::{SelectionState, selection_to_vt100_bounds};
+
+    /// Build a fresh vt100 parser of the requested size and feed it the
+    /// supplied payload. Keeps the test setup tiny and deterministic.
+    fn parser_with(rows: u16, cols: u16, payload: &[u8]) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(payload);
+        parser
+    }
+
+    /// Helper: extract the text a selection would copy, running through
+    /// the same `selection_to_vt100_bounds` + `contents_between` path
+    /// `copy_selection_to_clipboard` uses at runtime.
+    fn extract(parser: &vt100::Parser, sel: &SelectionState) -> String {
+        let (_, cols) = parser.screen().size();
+        let (sr, sc, er, ec) = selection_to_vt100_bounds(sel, cols);
+        parser.screen().contents_between(sr, sc, er, ec)
+    }
+
+    /// Single-row selection ending mid-line must include the cell under
+    /// the cursor. Before the fix, `end_col = 10` went straight into
+    /// `contents_between`, which treats it as exclusive, yielding
+    /// "hello worl" instead of "hello world".
+    #[test]
+    fn single_row_selection_includes_last_cell() {
+        let parser = parser_with(5, 40, b"hello world");
+        let sel = SelectionState {
+            anchor: (0, 0),
+            current: (0, 10), // inclusive end on the 'd'
+            dragging: false,
+        };
+        assert_eq!(extract(&parser, &sel), "hello world");
+    }
+
+    /// A reversed selection (drag right-to-left) must produce the same
+    /// text as the equivalent forward selection; `normalize_selection`
+    /// already handles the ordering, but we pin the behavior so a
+    /// future edit to the helper cannot regress it.
+    #[test]
+    fn reversed_selection_matches_forward_selection() {
+        let parser = parser_with(5, 40, b"hello world");
+        let forward = SelectionState {
+            anchor: (0, 0),
+            current: (0, 10),
+            dragging: false,
+        };
+        let reversed = SelectionState {
+            anchor: (0, 10),
+            current: (0, 0),
+            dragging: false,
+        };
+        assert_eq!(extract(&parser, &forward), extract(&parser, &reversed));
+    }
+
+    /// Multi-row selections exercise the `start_row < end_row` arm of
+    /// `contents_between`, which also treats `end_col` as exclusive.
+    /// The last character of the end row must be included.
+    #[test]
+    fn multi_row_selection_includes_end_row_last_cell() {
+        // Two rows of distinct content, no auto-wrap: move the cursor
+        // explicitly via CR/LF so each line starts at column 0.
+        let parser = parser_with(5, 40, b"abcdef\r\nuvwxyz");
+        // Select from row 0 col 2 ('c') through row 1 col 5 ('z').
+        let sel = SelectionState {
+            anchor: (0, 2),
+            current: (1, 5),
+            dragging: false,
+        };
+        let text = extract(&parser, &sel);
+        assert!(
+            text.ends_with('z'),
+            "multi-row selection must include final cell, got {text:?}",
+        );
+        // Full expected text. The start-row contributes "cdef" plus a
+        // newline (row not wrapped), then the end row contributes
+        // "uvwxyz" - the last 'z' is what the off-by-one previously
+        // dropped.
+        assert_eq!(text, "cdef\nuvwxyz");
+    }
+
+    /// A selection that ends exactly on the final column must not
+    /// overflow past `cols`; `selection_to_vt100_bounds` clamps the
+    /// exclusive end to `cols` so the vt100 call stays in-bounds and
+    /// the final column is still included.
+    #[test]
+    fn selection_ending_on_last_column_is_clamped() {
+        const COLS: u16 = 10;
+        // Fill exactly the first row with 10 characters so column 9
+        // holds the final 'j'.
+        let parser = parser_with(3, COLS, b"abcdefghij");
+        let sel = SelectionState {
+            anchor: (0, 0),
+            current: (0, COLS - 1), // inclusive end on final column
+            dragging: false,
+        };
+
+        // Confirm the helper's clamp kicks in: inclusive end COLS-1
+        // plus one would be COLS, and we want that preserved (not
+        // wrapped to COLS+1 or truncated to COLS-1).
+        let (_, _, _, exclusive_end) = selection_to_vt100_bounds(&sel, COLS);
+        assert_eq!(exclusive_end, COLS);
+
+        let text = extract(&parser, &sel);
+        assert_eq!(text, "abcdefghij");
+    }
+
+    /// Edge case: a degenerate single-cell selection (anchor ==
+    /// current) must still copy exactly one character, not an empty
+    /// string. Pre-fix this returned "" because vt100 saw
+    /// `start_col == end_col` and short-circuited to empty.
+    #[test]
+    fn single_cell_selection_copies_one_character() {
+        let parser = parser_with(3, 10, b"abcdefghij");
+        let sel = SelectionState {
+            anchor: (0, 4),
+            current: (0, 4), // the 'e'
+            dragging: false,
+        };
+        assert_eq!(extract(&parser, &sel), "e");
+    }
+
+    /// Saturation safety: even a pathological `current` column beyond
+    /// `cols` (shouldn't happen in practice - mouse events are clipped
+    /// upstream - but the helper must not panic) gets clamped to cols.
+    #[test]
+    fn selection_past_last_column_saturates_to_cols() {
+        const COLS: u16 = 10;
+        let sel = SelectionState {
+            anchor: (0, 0),
+            current: (0, u16::MAX),
+            dragging: false,
+        };
+        let (sr, sc, er, ec) = selection_to_vt100_bounds(&sel, COLS);
+        assert_eq!((sr, sc, er), (0, 0, 0));
+        assert_eq!(ec, COLS, "exclusive end must be clamped to cols");
     }
 }
