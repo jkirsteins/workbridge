@@ -2,6 +2,10 @@
 name = "workbridge"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Multi-repo Claude Code orchestration in your terminal."
+repository = "https://github.com/jkirsteins/workbridge"
+readme = "README.md"
 
 [dependencies]
 tui-term = "0.3"
