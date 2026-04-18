@@ -1657,6 +1657,23 @@ The spinner reuses the same braille-dot frames and 200ms tick rate as the
 status bar activity indicator. The `spinner_tick` counter advances when
 either status-bar activities or `claude_working` entries exist.
 
+**Badge dimming.** When a work item has no live Claude PTY session
+attached (`app.session_key_for(&wi.id).is_none()`), every badge on the
+row (state badge, `[RR]` kind tag, `[RG]` gate tag, `PR#N` chip, CI
+chips, and trailing state chips like `!cl` / `!pushed` / `!pulled` /
+`!merge` / `[N repos]`) is rendered with `Modifier::DIM` and a
+`Color::DarkGray` foreground via the `dim_badge_style` helper in
+`src/ui.rs`. This is the style-level companion to `dim_background` and
+makes the work item(s) with an attached session visually pop when the
+user scans the list or the board. The left-margin session indicator
+(spinner / bullet / caret) is the co-signal and is not itself dimmed;
+title text, row highlight background, and branch metadata are also
+unchanged. The rule applies uniformly regardless of row selection - a
+dim badge on the selected row stays dim, so "dim = no session" is a
+single unambiguous encoding. Rows that cannot host a PTY session by
+construction (review-request rows, unlinked-PR rows) are rendered by
+separate formatters and are out of scope for this rule.
+
 ## Testing
 
 ### Snapshot Tests
