@@ -1241,7 +1241,7 @@ nearest `GroupHeader` entry.
 
 ```
   List   Board                          Tab: switch view
-+-- Work Items ------------+-- Coding Agent | Terminal ------+
++-- Work Items ------------+-- Claude Code | Terminal -------+
 |                          |                                 |
 | UNLINKED (N)             |  [PTY output or placeholder]    |
 | ? a-very-long-pr-branch- |                                 |
@@ -1261,6 +1261,12 @@ nearest `GroupHeader` entry.
 
 The `List` label is highlighted (active). The header uses the ratatui
 `Tabs` widget with `style_view_mode_tab_active()` for the selected tab.
+
+The left label of the right-panel tab bar is the harness display name
+returned by `App::agent_backend_display_name()` - `Claude Code` (shown
+above) when that is the selected or active harness, `Codex` when Codex
+is selected, or the neutral `Session` placeholder when no harness is
+committed for the current context. See "Session tab title" above.
 
 Unlinked work items render as a wrapped branch title (with the `PR#N`
 badge right-aligned on the first line) followed by an indented
@@ -1532,9 +1538,12 @@ Tab switching:
   does not change focus. The `ClaudeCode -> Terminal` transition (the
   enum variant name is retained in code) is a no-op if the selected
   work item has no worktree. Still fires even when the current tab's
-  session has ended - the on-screen "Press Ctrl+\\ to switch back to
-  the agent" hint (shown on the dead-terminal placeholder in
-  `src/ui.rs`) and the symmetric dead-agent case both rely on this.
+  session has ended - the on-screen `Press Ctrl+\\ to switch back to
+  {harness display name}.` hint (shown on the dead-terminal
+  placeholder in `src/ui.rs`, where `{harness display name}` is the
+  value returned by `App::agent_backend_display_name()` - one of
+  `Claude Code`, `Codex`, or the neutral `Session` placeholder) and
+  the symmetric dead-agent case both rely on this.
   Because the intercept runs before the right-panel dead-session
   early-return, a dead session never blocks the flip. On the
   agent-dead -> Terminal flip, the terminal session is spawned lazily
