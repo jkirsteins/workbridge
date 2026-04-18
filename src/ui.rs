@@ -5875,9 +5875,11 @@ mod sticky_header_tests {
 #[cfg(test)]
 mod snapshot_tests {
     use super::draw_to_buffer;
+    #[cfg(unix)]
+    use crate::app::StubBackend;
     use crate::app::{
-        App, DisplayEntry, FocusPanel, ReviewGateOrigin, ReviewGateState, StubBackend,
-        UserActionKey, ViewMode, is_selectable,
+        App, DisplayEntry, FocusPanel, ReviewGateOrigin, ReviewGateState, UserActionKey, ViewMode,
+        is_selectable,
     };
     use crate::theme::Theme;
     use crate::work_item::{
@@ -5887,6 +5889,7 @@ mod snapshot_tests {
     use crate::work_item_backend::{BackendError, CreateWorkItem, WorkItemBackend, WorkItemRecord};
     use ratatui_core::{backend::TestBackend, terminal::Terminal};
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::sync::Arc;
 
     /// Helper: render the app into a TestBackend and return the buffer as a string.
@@ -6474,6 +6477,15 @@ mod snapshot_tests {
         insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
+    // This snapshot test pins the rendered paths to `/tmp/...` so the
+    // fixture is deterministic across machines, which inherently ties
+    // it to Unix: on Windows the captured snapshot would include
+    // back-slashes, drive letters, and different discovery ordering
+    // (Windows `read_dir` is not guaranteed to match Unix order). The
+    // underlying settings-overlay rendering code is platform-agnostic;
+    // it is exercised on Windows indirectly through the other UI
+    // snapshot tests that do not hardcode filesystem paths.
+    #[cfg(unix)]
     #[test]
     fn settings_overlay_with_config() {
         use crate::config::Config;

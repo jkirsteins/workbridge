@@ -2050,6 +2050,14 @@ mod tests {
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let legacy_path = dir.join("legacy.json");
+        // Escape the path through serde_json so Windows backslashes
+        // (`C:\Users\...`) end up as valid JSON string escapes
+        // (`C:\\Users\\...`) rather than being pasted in raw, which
+        // would produce invalid `\U`, `\A` etc. escapes and fail to
+        // parse. `serde_json::to_string` returns the string including
+        // surrounding quotes, so we replace the quoted `"__SELF__"`
+        // placeholder directly.
+        let self_quoted = serde_json::to_string(legacy_path.to_str().unwrap()).unwrap();
         let legacy_json = r#"{
             "id": {"LocalFile": "__SELF__"},
             "title": "Pre-feature item",
@@ -2059,7 +2067,7 @@ mod tests {
                 {"repo_path": "/repos/foo", "branch": null}
             ]
         }"#
-        .replace("__SELF__", legacy_path.to_str().unwrap());
+        .replace("\"__SELF__\"", &self_quoted);
         fs::write(&legacy_path, legacy_json).unwrap();
 
         let result = backend.list().unwrap();

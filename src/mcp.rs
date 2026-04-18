@@ -1846,16 +1846,18 @@ mod tests {
         // On Unix we pin the socket under `/tmp` because
         // `std::env::temp_dir()` on macOS returns a long
         // `/var/folders/.../T/` path that blows the `sockaddr_un`
-        // `SUN_LEN` limit (104 on macOS). On Windows there is no
-        // SUN_LEN constraint (AF_UNIX uses a larger address buffer)
-        // and `/tmp` does not exist by default, so we fall back to
-        // `env::temp_dir()`.
+        // `SUN_LEN` limit (104 on macOS). On Windows SUN_LEN is 108
+        // and the GHA runner temp dir already eats ~40 chars, so we
+        // use a shorter filename to stay under budget.
         #[cfg(unix)]
         let socket_dir = std::path::PathBuf::from("/tmp");
         #[cfg(windows)]
         let socket_dir = std::env::temp_dir();
+        #[cfg(unix)]
         let socket_path =
             socket_dir.join(format!("workbridge-test-mcp-{}.sock", uuid::Uuid::new_v4()));
+        #[cfg(windows)]
+        let socket_path = socket_dir.join(format!("wb-mcp-{}.sock", uuid::Uuid::new_v4()));
         let (tx, _rx) = unbounded();
 
         let server = McpSocketServer::start(
@@ -2050,14 +2052,26 @@ mod tests {
     fn mcp_tool_call_produces_channel_event() {
         // See `socket_server_starts_and_stops` for why Unix pins to
         // `/tmp`: macOS's `env::temp_dir()` exceeds `SUN_LEN`.
+        //
+        // On Windows we deliberately use a short filename
+        // (`wb-mcp-i-<uuid>.sock` rather than
+        // `workbridge-test-mcp-integration-<uuid>.sock`) because the
+        // GHA runner temp dir `C:\Users\runneradmin\AppData\Local\
+        // Temp\` is ~40 chars and Windows AF_UNIX `sockaddr_un` also
+        // caps `sun_path` at 108 bytes. A 73-char filename blows that
+        // budget; a 24-char filename (8 prefix + 36 uuid + 5 ext +
+        // hyphen) fits.
         #[cfg(unix)]
         let tmp_dir = std::path::PathBuf::from("/tmp");
         #[cfg(windows)]
         let tmp_dir = std::env::temp_dir();
+        #[cfg(unix)]
         let socket_path = tmp_dir.join(format!(
             "workbridge-test-mcp-integration-{}.sock",
             uuid::Uuid::new_v4()
         ));
+        #[cfg(windows)]
+        let socket_path = tmp_dir.join(format!("wb-mcp-i-{}.sock", uuid::Uuid::new_v4()));
         let (tx, rx) = unbounded();
 
         let server = McpSocketServer::start(
