@@ -8,6 +8,10 @@ Workbridge is a terminal UI for orchestrating multi-repo development work. It
 tracks work items, manages git worktrees, and drives Claude Code sessions
 through a Backlog -> Planning -> Implementing -> Review -> Done workflow.
 
+<div align="center">
+  <img src="assets/screenshot.png" alt="Workbridge TUI screenshot" width="800" />
+</div>
+
 ## Table of Contents
 
 - [Quick Start](#quick-start)
@@ -124,6 +128,7 @@ gate behavior, and review-request workflow.
 ## Further Reading
 
 - [CONTRIBUTING.md](CONTRIBUTING.md) - coding standards, error handling, UI rules
+- [docs/cli.md](docs/cli.md) - full CLI reference for every `workbridge` subcommand and flag
 - [docs/repository-registry.md](docs/repository-registry.md) - repo registration and config
 - [docs/work-items.md](docs/work-items.md) - work item lifecycle and stages
 - [docs/UI.md](docs/UI.md) - TUI layout and interactions
