@@ -47,14 +47,20 @@ This is a per-repo setting.
 
 ### 2. Build and install Workbridge
 
-Workbridge is a Rust project. Build a release binary and put it on your PATH:
+Workbridge is distributed as a Rust binary crate:
+
+```sh
+cargo install workbridge
+```
+
+For local development from a checkout, install the current workspace instead:
 
 ```sh
 cargo install --path .
 ```
 
-For local development, `cargo run -- <args>` works the same way as the
-installed `workbridge` binary.
+For local development without installing, `cargo run -- <args>` works the same
+way as the installed `workbridge` binary.
 
 ### 3. Register the repos you want to manage
 
