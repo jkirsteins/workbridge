@@ -105,7 +105,7 @@ The recovery reuses `UserActionKey::WorktreeCreate` and
 `poll_worktree_creation`, so the same single-flight guard and polling
 infrastructure handles results. The `open_session` flag is carried
 through from the original request so import-triggered recoveries do not
-spuriously open a Claude session.
+spuriously open a coding agent session.
 
 ### Auto-create on session spawn
 

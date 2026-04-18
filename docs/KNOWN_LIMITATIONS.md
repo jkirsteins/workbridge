@@ -53,10 +53,10 @@ OS. If the buffer is full because the child is busy and not consuming input,
 the write call blocks the entire UI thread.
 
 **Why it is accepted:** Single keystrokes are 1-4 bytes, well within what the
-kernel buffer can absorb instantly. Claude Code reads stdin promptly during
-normal operation. The realistic failure case - pasting megabytes of text while
-Claude is mid-computation and not reading stdin - is a narrow scenario for our
-use case.
+kernel buffer can absorb instantly. Coding agent CLIs generally read stdin
+promptly during normal operation. The realistic failure case - pasting megabytes
+of text while the agent is mid-computation and not reading stdin - is a narrow
+scenario for our use case.
 
 **Impact:** The UI freezes until the child process reads from stdin and frees
 buffer space. No data is lost - the write completes once the child catches up.
@@ -122,7 +122,7 @@ since each tick iteration renders the UI and checks liveness for all tabs.
 **Why it is accepted:** Reader threads handle output draining off the UI thread.
 Each tab has a dedicated reader thread that continuously reads PTY output and
 feeds it to the vt100 parser. The UI thread only locks parsers briefly to call
-`.screen()` for rendering. For typical Claude Code usage (1-5 tabs), this is
+`.screen()` for rendering. For typical coding agent usage (1-5 tabs), this is
 not a bottleneck. The render tick fires at ~120fps (8ms) so PTY output renders
 smoothly, and heavy background work (liveness checks, fetch drains) is throttled
 to roughly every 25th tick (~200ms) to keep CPU usage reasonable.

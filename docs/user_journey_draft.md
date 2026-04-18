@@ -15,7 +15,7 @@ Status: Draft - captured from design interview
 
 ## 1. Overview
 
-Workbridge work items represent pieces of work inside one or more repos. Work progresses through multiple stages (like a Jira board), with deep agent (Claude Code) integration at each stage. The TUI hosts an MCP server that serves as the communication backbone between agent sessions and the application.
+Workbridge work items represent pieces of work inside one or more repos. Work progresses through multiple stages (like a Jira board), with deep coding agent integration (Claude Code, Codex, and future adapters) at each stage. The TUI hosts an MCP server that serves as the communication backbone between agent sessions and the application.
 
 ---
 

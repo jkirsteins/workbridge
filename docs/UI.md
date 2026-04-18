@@ -132,7 +132,7 @@ terminal-absolute coordinates:
 1. **Global drawer** - checked first because it overlays everything.
    When the drawer is open, coordinates outside its inner area return
    `MouseTarget::None` so the dimmed background does not receive events.
-2. **Right panel** - the per-work-item PTY session area (Claude Code
+2. **Right panel** - the per-work-item PTY session area (coding agent
    or Terminal tab, depending on `right_panel_tab`).
 3. **Work item list** - the left-panel list body. Wheel scrolls over
    this area drive the authoritative viewport offset
@@ -415,7 +415,7 @@ Examples of the cache-first pattern:
   runs **every** blocking step the spawn needs: `backend.read_plan(...)`,
   `McpSocketServer::start(...)` (which binds the socket and spawns
   the accept loop), `AgentBackend::write_session_files(...)` (the
-  worktree `.mcp.json` for Claude Code's project discovery), and
+  worktree `.mcp.json` for the harness's project discovery), and
   the `std::fs::write` on the temp `--mcp-config` file. It then
   sends a `SessionOpenPlanResult` through a per-work-item receiver.
   `poll_session_opens` drains completed receivers and invokes
@@ -497,8 +497,8 @@ See invariant 15 for the render rate requirement.
 The `ViewMode` enum controls the root overview layout:
 
 - `FlatList` (default): two-panel layout with work item list (left) and
-  PTY session (right). The right panel has two tabs: Claude Code and
-  Terminal. See Layout and Right Panel Tabs sections below.
+  PTY session (right). The right panel has two tabs: the coding agent
+  session and Terminal. See Layout and Right Panel Tabs sections below.
 - `Board`: kanban board with 4 columns organized by workflow stage.
   See Board View section below.
 - `Dashboard`: global flow-metrics view (throughput, cycle time,
@@ -1241,7 +1241,7 @@ nearest `GroupHeader` entry.
 
 ```
   List   Board                          Tab: switch view
-+-- Work Items ------------+-- Claude Code | Terminal -------+
++-- Work Items ------------+-- Coding Agent | Terminal ------+
 |                          |                                 |
 | UNLINKED (N)             |  [PTY output or placeholder]    |
 | ? a-very-long-pr-branch- |                                 |
@@ -1508,12 +1508,17 @@ per-chart semantics.
 
 ### Right Panel Tabs
 
-The right panel has two tabs: **Claude Code** and **Terminal**. The
-`RightPanelTab` enum tracks which tab is active. The tab bar is shown
-in the right panel's block title when the selected work item has a
-worktree; otherwise only "Claude Code" is shown.
+The right panel has two tabs: the **coding agent** tab and the
+**Terminal** tab. The `RightPanelTab` enum tracks which tab is active;
+the agent-tab variant is still named `RightPanelTab::ClaudeCode` in
+the code for historical reasons. The tab bar is shown in the right
+panel's block title when the selected work item has a worktree;
+otherwise only the agent tab is shown. The agent tab's title is the
+live harness's `display_name()` - e.g. "Claude Code", "Codex", or the
+neutral "Session" placeholder when no harness is committed (see
+`Session tab title`).
 
-- **Claude Code**: the per-work-item Claude Code PTY session (existing
+- **Coding agent**: the per-work-item coding agent PTY session (existing
   behavior). Shows session output, dead-session prompts, work item
   details, or error lists depending on session state.
 - **Terminal**: a shell session (`$SHELL`, falling back to `/bin/sh`)
@@ -1522,20 +1527,20 @@ worktree; otherwise only "Claude Code" is shown.
   `App::terminal_sessions` keyed by `WorkItemId`.
 
 Tab switching:
-- Ctrl+\\: cycle between Claude Code and Terminal. Global intercept
-  in `handle_key()` so it works from both panels and does not change
-  focus. The `ClaudeCode -> Terminal` transition is a no-op if the
-  selected work item has no worktree. Still fires even when the
-  current tab's session has ended - the on-screen "Press Ctrl+\\ to
-  switch back to Claude Code" hint (shown on the dead-terminal
-  placeholder in `src/ui.rs`) and the symmetric dead-Claude case both
-  rely on this. Because the intercept runs before the right-panel
-  dead-session early-return, a dead session never blocks the flip.
-  On the Claude-Code-dead -> Terminal flip, the terminal session is
-  spawned lazily via `spawn_terminal_session()` if the work item has
-  a worktree.
+- Ctrl+\\: cycle between the coding agent tab and the Terminal tab.
+  Global intercept in `handle_key()` so it works from both panels and
+  does not change focus. The `ClaudeCode -> Terminal` transition (the
+  enum variant name is retained in code) is a no-op if the selected
+  work item has no worktree. Still fires even when the current tab's
+  session has ended - the on-screen "Press Ctrl+\\ to switch back to
+  the agent" hint (shown on the dead-terminal placeholder in
+  `src/ui.rs`) and the symmetric dead-agent case both rely on this.
+  Because the intercept runs before the right-panel dead-session
+  early-return, a dead session never blocks the flip. On the
+  agent-dead -> Terminal flip, the terminal session is spawned lazily
+  via `spawn_terminal_session()` if the work item has a worktree.
 - Tab (while right panel is focused): forwarded to the PTY as `\t`
-  (0x09) so Claude Code's autocomplete fires. Not intercepted by
+  (0x09) so the harness's autocomplete fires. Not intercepted by
   workbridge. On a dead right-panel session Tab takes the standard
   escape-hatch path (see below).
 - Shift+Tab (while right panel is focused, live session): forwarded
@@ -1549,10 +1554,10 @@ Tab switching:
 Terminal sessions are cleaned up on:
 - Work item deletion (killed in `delete_work_item_by_id`)
 - Orphan detection (work item removed from `work_items` list)
-- App shutdown (SIGTERM then SIGKILL like Claude sessions)
+- App shutdown (SIGTERM then SIGKILL, same lifecycle as coding agent sessions)
 
 Navigating to a different work item (Up/Down in left panel) resets the
-tab to Claude Code.
+tab to the coding agent tab.
 
 ### Overlays
 
@@ -1620,16 +1625,20 @@ new state added to the global assistant must also be cleared in
 
 The session cwd is a dedicated workbridge-owned scratch directory
 (`$TMPDIR/workbridge-global-assistant-cwd`, created idempotently
-on each spawn). This is deliberately NOT `$HOME`: Claude Code's
-workspace trust dialog ("Do you trust the files in this folder?")
-persists acceptance per-project in `~/.claude.json`, but the home
-directory does not reliably persist that acceptance, so using
-`$HOME` as the cwd would produce the trust prompt on every single
-Ctrl+G. A stable non-home scratch path lets Claude Code's own
-trust-persistence mechanism cover it after the first acceptance,
+on each spawn). This is deliberately NOT `$HOME`. The choice is
+driven by a harness-specific trust-persistence constraint: Claude
+Code's workspace trust dialog ("Do you trust the files in this
+folder?") persists acceptance per-project in `~/.claude.json`, but
+the home directory does not reliably persist that acceptance, so
+using `$HOME` as the cwd would produce the trust prompt on every
+single Ctrl+G. A stable non-home scratch path lets Claude Code's
+own trust-persistence mechanism cover it after the first acceptance,
 without workbridge ever reading or writing `~/.claude.json`
 itself (which would be a file-injection workaround - see the
-"Severity overrides" section in `CLAUDE.md`).
+"Severity overrides" section in `CLAUDE.md`). Other harnesses (e.g.
+Codex) have different trust semantics; the non-home scratch
+directory is compatible with all of them, so workbridge uses it
+uniformly.
 
 ### Settings overlay tabs
 
@@ -1655,8 +1664,8 @@ overlay.
 - Same-key-repeat confirmations (quit) stay in the status bar -
   they are not blocking choice prompts and do not need dialog boxes.
   Destructive operations on real git state (e.g., work item deletion)
-  use a modal prompt dialog instead, both to block the Claude session
-  from receiving stray keystrokes during cleanup and because the
+  use a modal prompt dialog instead, both to block the coding agent
+  session from receiving stray keystrokes during cleanup and because the
   operation should not feel like a "tap twice" shortcut.
 - Do not skip `dim_background()` in new overlays.
 
@@ -1688,7 +1697,7 @@ Board-specific styles:
 
 ## Session Activity Indicators
 
-Work items display a visual indicator when a Claude session exists,
+Work items display a visual indicator when a coding agent session exists,
 distinguishing three states:
 
 1. **No session**: no indicator (default).

@@ -69,7 +69,7 @@ cleaned up in order via `delete_work_item_by_id()`:
    logs still contribute to historical metrics and nothing is silently
    destroyed. See `docs/metrics.md` for the aggregator that consumes
    both the active and archived logs.
-2. **Sessions** - if a Claude Code PTY session is running, it receives SIGKILL
+2. **Sessions** - if a coding agent PTY session is running, it receives SIGKILL
    and the session entry is removed from the sessions map. If a terminal PTY
    session is running (spawned via the Terminal tab), it also receives SIGKILL
    and is removed from the terminal sessions map.

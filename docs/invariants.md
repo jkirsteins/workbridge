@@ -163,12 +163,12 @@ the existing plan and spawns a retroactive planning session that analyzes
 the branch's existing commits to produce a plan. The plan clear only
 proceeds if the status transition succeeds.
 
-### 13. Fresh Claude session per stage
+### 13. Fresh harness session per stage
 
-Each stage transition that involves Claude spawns a fresh session. The plan
+Each stage transition that involves a harness spawns a fresh session. The plan
 is the handoff contract between stages. Different stages have different
 system prompts. All code-changing stages (Implementing, Review) must
-instruct Claude to commit all work before finishing.
+instruct the harness to commit all work before finishing.
 
 **Enforcement:** Sessions are keyed by `(WorkItemId, WorkItemStatus)` in the
 HashMap. When a work item's stage changes, the old session key becomes
@@ -178,12 +178,13 @@ killed during periodic liveness checks.
 
 **Session lifecycle per stage:**
 - Backlog and Done: no session.
-- Planning: Claude helps refine the plan. When finalized, Claude calls
+- Planning: the harness helps refine the plan. When finalized, it calls
   `workbridge_set_plan` via MCP. This persists the plan and automatically
   advances to Implementing (the planning session becomes an orphan and is
   killed on the next liveness check).
 - Implementing: a fresh session starts with the plan in the system prompt.
-  Claude implements the plan, then calls `workbridge_set_status` to advance.
+  The harness implements the plan, then calls `workbridge_set_status` to
+  advance.
 - Review: a fresh session starts for addressing review feedback.
 
 Sessions gain context only via MCP tools (`workbridge_get_context`,
