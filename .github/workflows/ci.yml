@@ -13,6 +13,10 @@ concurrency:
 
 jobs:
   fmt:
+    # `cargo fmt --check` is platform-independent (rustfmt normalises
+    # line endings and always targets the canonical format). Running it
+    # on a single Linux host is strictly cheaper and equivalent to
+    # running it everywhere.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,7 +27,14 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    runs-on: ubuntu-latest
+    # Clippy runs per-target: lints can fire on one OS and not another
+    # because cfg-gated code paths compile differently. We want a
+    # PR-time signal that Windows-only code paths still lint clean.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -33,7 +44,13 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
-    runs-on: ubuntu-latest
+    # Run the test suite on Linux, macOS, and Windows so future PRs
+    # that regress Windows compatibility are caught before tagging.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

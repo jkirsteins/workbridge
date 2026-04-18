@@ -22,9 +22,10 @@ mod work_item;
 mod work_item_backend;
 mod worktree_service;
 
+use std::io;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rat_salsa::RunConfig;
 use rat_salsa::poll::{PollCrossterm, PollRendered, PollTimers};
@@ -650,18 +651,27 @@ fn main() -> Result<(), AppError> {
         }
     }
 
-    // Install SIGTERM and SIGINT handlers using an atomic flag.
-    // When either signal is received, the flag is set and the timer
-    // callback initiates the same graceful shutdown path as keyboard quit.
+    // Install termination handlers using an atomic flag. When a
+    // termination signal is received the flag is set and the timer
+    // callback initiates the same graceful shutdown path as keyboard
+    // quit.
+    //
+    // `ctrlc` with the `termination` feature registers handlers for
+    // SIGINT + SIGTERM + SIGHUP on Unix, and Ctrl+C + Ctrl+Break on
+    // Windows (via `SetConsoleCtrlHandler`). This gives us cross-
+    // platform parity without the Unix-only `signal_hook` dependency.
     //
     // Note: AtomicBool can coalesce two rapid signals into one observed
     // event (both set the flag before the timer reads it). This means
-    // two quick SIGTERMs could start graceful shutdown instead of force-
+    // two quick Ctrl+Cs could start graceful shutdown instead of force-
     // killing. This is acceptable because the 10-second shutdown deadline
     // handles escalation automatically.
     let signal_received = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&signal_received))?;
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&signal_received))?;
+    {
+        let flag = Arc::clone(&signal_received);
+        ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst))
+            .map_err(|e| io::Error::other(e.to_string()))?;
+    }
 
     let mut global = Global {
         ctx: Default::default(),

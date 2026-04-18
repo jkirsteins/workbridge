@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -604,18 +605,63 @@ impl Drop for RebaseGateState {
         self.cancelled.store(true, Ordering::SeqCst);
         let pid_to_kill = self.child_pid.lock().ok().and_then(|mut slot| slot.take());
         if let Some(pid) = pid_to_kill {
-            // SAFETY: `libc::killpg` is an FFI call into a stable
-            // POSIX syscall; arguments are a process-group id and a
-            // signal number, both plain integers. The harness was
-            // spawned with `Command::process_group(0)` (see
-            // `spawn_rebase_gate`), so its PID equals its
-            // process-group id. `ESRCH` after a freshly-reaped group
-            // is harmless.
-            unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            #[cfg(unix)]
+            {
+                // SAFETY: `libc::killpg` is an FFI call into a stable
+                // POSIX syscall; arguments are a process-group id and a
+                // signal number, both plain integers. The harness was
+                // spawned with `Command::process_group(0)` (see
+                // `spawn_rebase_gate`), so its PID equals its
+                // process-group id. `ESRCH` after a freshly-reaped group
+                // is harmless.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            #[cfg(windows)]
+            {
+                // Windows has no process groups. The PID slot only
+                // holds a raw u32 (the Child handle was moved into the
+                // background thread in `run_cancellable`), so we fall
+                // back to OpenProcess + TerminateProcess against the
+                // direct child. Grandchildren (e.g. `git rebase`
+                // subprocesses the harness spawned) are NOT cascaded
+                // on Windows - see `docs/harness-contract.md` clause
+                // C10 for why that divergence is acceptable on this
+                // short-lived subprocess tree.
+                terminate_process_by_id(pid);
             }
         }
     }
+}
+
+/// Windows-only helper: open a handle to a process by PID with
+/// `PROCESS_TERMINATE` rights, call `TerminateProcess`, and close the
+/// handle. Used by the rebase-gate cancellation path (see `Drop for
+/// RebaseGateState` and `run_cancellable`) as the Windows equivalent
+/// of Unix `killpg(pid, SIGKILL)`. Errors are swallowed: the pid may
+/// have already exited (harmless no-op) and there is nothing we can
+/// do from the drop path anyway.
+#[cfg(windows)]
+fn terminate_process_by_id(pid: u32) {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    // SAFETY: `OpenProcess` is a stable Win32 syscall. The returned
+    // handle is either 0 (failure, nothing to close) or an opaque
+    // HANDLE we wrap in `OwnedHandle` so it closes even if
+    // `TerminateProcess` panics (it is FFI - won't panic - but belt
+    // and braces).
+    let handle: HANDLE = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return;
+    }
+    // Wrap in OwnedHandle so we don't leak on return.
+    let owned = unsafe { OwnedHandle::from_raw_handle(handle as _) };
+    // SAFETY: handle is a valid process handle with PROCESS_TERMINATE.
+    let _ = unsafe { TerminateProcess(handle, 1) };
+    drop(owned);
 }
 
 /// Outcome of a subprocess run through `run_cancellable`.
@@ -661,7 +707,21 @@ pub fn run_cancellable(
     pid_slot: &Arc<Mutex<Option<u32>>>,
     cancelled: &AtomicBool,
 ) -> Result<SubprocessOutcome, std::io::Error> {
+    // Unix: spawn the child into its own process group so a cancel can
+    // `killpg` the whole tree (harness + any `git rebase` / `git add`
+    // subprocesses it started).
+    //
+    // Windows: there is no process group, so `process_group` does not
+    // exist on `Command`. We spawn the child directly; the cancel path
+    // uses `TerminateProcess` on the direct child. Any grandchildren
+    // (e.g. `git rebase` invoked by the harness) are NOT cascaded on
+    // Windows - documented as a known divergence in
+    // `docs/harness-contract.md` C10.
+    #[cfg(unix)]
     let mut child = cmd.process_group(0).spawn()?;
+    #[cfg(windows)]
+    let mut child = cmd.spawn()?;
+
     let pid = child.id();
 
     // Stash FIRST.
@@ -675,12 +735,22 @@ pub fn run_cancellable(
         if let Ok(mut slot) = pid_slot.lock() {
             *slot = None;
         }
-        // SAFETY: `libc::killpg` is an FFI call into a stable
-        // POSIX syscall. The child was spawned with
-        // `process_group(0)` so its PID equals its process-group
-        // id. `ESRCH` after a freshly-reaped group is harmless.
-        unsafe {
-            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        #[cfg(unix)]
+        {
+            // SAFETY: `libc::killpg` is an FFI call into a stable
+            // POSIX syscall. The child was spawned with
+            // `process_group(0)` so its PID equals its process-group
+            // id. `ESRCH` after a freshly-reaped group is harmless.
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        {
+            // No process group on Windows; kill the direct child. The
+            // `Child::kill` API wraps TerminateProcess and is equivalent
+            // to the killpg(SIGKILL) intent for the direct child only.
+            let _ = child.kill();
         }
         let _ = child.wait();
         return Ok(SubprocessOutcome::Cancelled);

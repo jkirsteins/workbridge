@@ -32,7 +32,16 @@ through a Backlog -> Planning -> Implementing -> Review -> Done workflow.
 
 ### 1. Build and install Workbridge
 
-Workbridge is distributed as a Rust binary crate:
+Workbridge runs on Linux, macOS, and Windows. You can install it two ways:
+
+**Pre-built binaries** (fastest, no Rust toolchain required). Each GitHub
+Release ships tarballs for Linux + macOS (Intel + Apple Silicon) and a zip
+for Windows, plus a `SHA256SUMS` manifest. Download from
+<https://github.com/jkirsteins/workbridge/releases>, verify the checksum,
+unpack, and drop `workbridge` (or `workbridge.exe` on Windows) onto your
+`PATH`.
+
+**From crates.io** (if you already have a Rust toolchain):
 
 ```sh
 cargo install workbridge

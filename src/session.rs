@@ -1,15 +1,18 @@
-use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
+use std::io::{self, Read, Write};
 use std::path::Path;
-use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+
 /// Grace period after SIGTERM before escalating to SIGKILL. 50ms is long
 /// enough for most well-behaved processes to handle SIGTERM, short enough
 /// to avoid noticeable UI lag.
+///
+/// Only used on Unix; Windows has no SIGTERM analogue so there is no
+/// escalation window to honour.
+#[cfg(unix)]
 const SIGTERM_GRACE_MS: u64 = 50;
 
 /// Number of scrollback lines retained by the vt100 parser. Lines that
@@ -24,17 +27,50 @@ pub const SCROLLBACK_LINES: usize = 10_000;
 
 /// A PTY-backed session running a child process (e.g. `claude`).
 ///
-/// The session owns the PTY master fd and the child process handle.
-/// A dedicated reader thread continuously reads PTY output and feeds it
+/// The session owns the PTY master handle and the child process. A
+/// dedicated reader thread continuously reads PTY output and feeds it
 /// to a shared vt100::Parser behind an Arc<Mutex>. The UI thread never
-/// reads from PTY fds - it just locks the parser and calls .screen()
+/// reads from PTY handles - it just locks the parser and calls .screen()
 /// to render.
+///
+/// Cross-platform PTY primitives are provided by `portable-pty`, which
+/// uses Unix PTYs on Unix and ConPTY (`CreatePseudoConsole`) on Windows.
+/// The call sites that wrap the PTY lifecycle (spawn / write / resize /
+/// kill / drop) keep the same signatures on both platforms; the
+/// divergences are:
+///
+/// - Unix uses `killpg` + `SIGTERM` / `SIGKILL` on the child's process
+///   group (every PTY-spawned child is a session leader, so its PID
+///   equals its PGID - this matches the old raw-libc behaviour).
+/// - Windows has no signal model; graceful-vs-force is collapsed into a
+///   single `Child::kill` (TerminateProcess). Grandchildren are not
+///   cascaded on Windows, which is acceptable for the current harness
+///   (the reference `claude` binary is not distributed for Windows today
+///   and the rebase-gate subprocess tree is short-lived). See
+///   `docs/harness-contract.md` clause C10.
 ///
 /// When the session is dropped, the child process is killed and the
 /// reader thread is joined.
 pub struct Session {
-    master: OwnedFd,
-    child: Option<Child>,
+    /// PTY master handle. Dropping it closes the master fd / ConPTY
+    /// handle, which in turn causes the reader thread's blocking read
+    /// to observe EOF and exit.
+    master: Box<dyn MasterPty + Send>,
+    /// Child handle for liveness polling and kill. Consumed by
+    /// `force_kill` / `kill` / `Drop::drop`.
+    child: Option<Box<dyn Child + Send + Sync>>,
+    /// Cached child process id. `Child::process_id` returns `None` after
+    /// the child has been waited on, but we still need the pid for
+    /// `killpg` on Unix; caching it at spawn time means a late signal
+    /// against a freshly-reaped PID is at worst `ESRCH` (harmless)
+    /// instead of a silent no-op.
+    child_pid: Option<u32>,
+    /// Writer for PTY input (keystrokes, pasted text). `portable-pty`'s
+    /// `Box<dyn Write + Send>` is itself not `Sync`, so we wrap in a
+    /// `Mutex` to let `write_bytes(&self, ...)` keep its existing
+    /// shared-reference signature without forcing every caller to lock
+    /// the Session.
+    writer: Mutex<Box<dyn Write + Send>>,
     pub parser: Arc<Mutex<vt100::Parser>>,
     reader_handle: Option<JoinHandle<()>>,
 }
@@ -45,12 +81,13 @@ impl Session {
     /// `command` is the program and its arguments (e.g. `&["claude"]` or
     /// `&["sleep", "60"]`). The first element is the program name.
     ///
-    /// Opens a PTY pair, sets the slave side to the requested size, forks
-    /// the child process with the slave as its controlling terminal, and
-    /// returns a Session holding the master fd.
+    /// Opens a PTY pair via `portable_pty::native_pty_system`, sets the
+    /// requested size, spawns the child attached to the PTY slave, and
+    /// returns a Session holding the master handle.
     ///
-    /// A reader thread is spawned that continuously reads from a dup'd
-    /// copy of the master fd and feeds bytes to the shared parser.
+    /// A reader thread is spawned that continuously reads from a cloned
+    /// reader obtained from the master handle and feeds bytes to the
+    /// shared parser.
     ///
     /// If `cwd` is provided, the child process starts in that directory.
     /// Otherwise it inherits the parent's working directory.
@@ -60,146 +97,101 @@ impl Session {
         cwd: Option<&Path>,
         command: &[&str],
     ) -> io::Result<Session> {
-        // Open a PTY master/slave pair.
-        let (master_fd, slave_fd) = openpty()?;
-
-        let master_raw = master_fd.as_raw_fd();
-
-        // Set FD_CLOEXEC on the master fd so it is not inherited by child
-        // processes. Without this, each child would hold open all master fds
-        // from other tabs, preventing proper PTY teardown.
-        set_cloexec(master_raw)?;
-
-        // Set the initial window size on the slave before the child starts,
-        // so the child sees the correct dimensions from the beginning.
-        set_winsize(master_raw, cols, rows)?;
-
-        // Both the master fd and the dup'd reader fd stay in blocking mode.
-        // Blocking reads are exactly what the reader thread wants, and
-        // blocking writes are fine for interactive input (small payloads,
-        // PTY buffer is typically 4KB+).
-
-        // Dup the master fd for the reader thread. Both fds share the same
-        // underlying file description, but closing one does not close the
-        // other.
-        let reader_fd_raw = unsafe { libc::dup(master_raw) };
-        if reader_fd_raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // Wrap in OwnedFd immediately so it is closed on any early return.
-        // This prevents fd leaks when Command::spawn() or other setup fails.
-        let reader_fd = unsafe { OwnedFd::from_raw_fd(reader_fd_raw) };
-        // Set FD_CLOEXEC on the reader fd too.
-        set_cloexec(reader_fd.as_raw_fd())?;
-
-        // Consume the OwnedFd to get a raw fd for the slave side. This
-        // transfers ownership so there is no double-close. We then dup()
-        // for stdout and stderr so each Stdio owns a distinct fd.
-        let slave_raw = slave_fd.into_raw_fd();
-        let slave_stdout = unsafe { libc::dup(slave_raw) };
-        if slave_stdout < 0 {
-            // Clean up the original fd on failure. reader_fd is an OwnedFd
-            // and will be closed automatically when it drops.
-            unsafe { libc::close(slave_raw) };
-            return Err(io::Error::last_os_error());
-        }
-        let slave_stderr = unsafe { libc::dup(slave_raw) };
-        if slave_stderr < 0 {
-            unsafe { libc::close(slave_raw) };
-            unsafe { libc::close(slave_stdout) };
-            return Err(io::Error::last_os_error());
-        }
-
-        // Build the child process. We need to set up the slave fd as
-        // stdin/stdout/stderr and establish a new session with a controlling
-        // terminal. This requires a pre_exec hook.
         let program = command.first().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "command must not be empty")
         })?;
-        let mut cmd = std::process::Command::new(program);
-        if command.len() > 1 {
-            cmd.args(&command[1..]);
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(io::Error::other)?;
+
+        // Build the command. portable-pty's CommandBuilder inherits the
+        // parent environment by default (matching std::process::Command).
+        let mut cmd_builder = CommandBuilder::new(program);
+        for arg in &command[1..] {
+            cmd_builder.arg(arg);
         }
         if let Some(dir) = cwd {
-            cmd.current_dir(dir);
+            cmd_builder.cwd(dir);
         }
-        let child = unsafe {
-            cmd.stdin(std::process::Stdio::from_raw_fd(slave_raw))
-                .stdout(std::process::Stdio::from_raw_fd(slave_stdout))
-                .stderr(std::process::Stdio::from_raw_fd(slave_stderr))
-                .pre_exec(|| {
-                    // Create a new session and set the slave as the
-                    // controlling terminal.
-                    if libc::setsid() < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    // TIOCSCTTY: set controlling terminal. Use fd 0 (stdin)
-                    // since the original slave fd may have been closed during
-                    // stdio setup (dup2 + close). Stdin is guaranteed to
-                    // point to the slave PTY at this point. The argument 0
-                    // means "don't steal from another session".
-                    if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                })
-                .spawn()?
-        };
 
-        // Note: slave fds are now owned by the Command/child process.
-        // The Command::spawn consumed the Stdio objects which close the fds
-        // in the parent after fork. No explicit close needed here.
+        // Spawn the child attached to the PTY slave. On Unix this
+        // internally runs the same `setsid` + `TIOCSCTTY` dance the
+        // old raw-libc implementation did, so the child is its own
+        // session leader and its PID equals its process-group id
+        // (which is what `killpg` in `send_sigterm` / `force_kill` /
+        // `kill` relies on). On Windows it allocates a ConPTY via
+        // `CreatePseudoConsole` and wires the child's stdio to it.
+        let child = pair
+            .slave
+            .spawn_command(cmd_builder)
+            .map_err(io::Error::other)?;
+        let child_pid = child.process_id();
+
+        // Drop the slave in the parent. Matches the old `FD_CLOEXEC`
+        // behaviour: the parent must not keep the slave alive, or the
+        // reader will never observe EOF when the child exits.
+        drop(pair.slave);
+
+        // Reader side: a blocking stream of bytes coming out of the PTY.
+        // `try_clone_reader` produces an independent handle on both Unix
+        // (dup'd fd) and Windows (cloned ConPTY output handle).
+        let mut reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
+        // Writer side: use-once per process (portable-pty internally
+        // tracks whether the writer has been taken). One writer is
+        // enough; we keep it behind a Mutex so `write_bytes(&self)` stays
+        // compatible with the existing call sites.
+        let writer = pair.master.take_writer().map_err(io::Error::other)?;
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
 
-        // Spawn the reader thread. It takes ownership of reader_fd (the
-        // dup'd master OwnedFd) and a clone of the parser Arc. When the
-        // thread exits, reader_fd drops and closes the dup'd fd.
+        // Spawn the reader thread. It owns the cloned reader; when the
+        // master side is closed (on Session drop or when the child
+        // exits and portable-pty closes the underlying handle), read()
+        // returns Ok(0) and the thread exits naturally.
         let parser_clone = Arc::clone(&parser);
         let reader_handle = std::thread::spawn(move || {
-            let reader_fd = reader_fd; // move ownership into thread
             let mut buf = [0u8; 16384];
             loop {
-                let n = unsafe {
-                    libc::read(
-                        reader_fd.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                    )
-                };
-                if n > 0 {
-                    match parser_clone.lock() {
+                match reader.read(&mut buf) {
+                    Ok(0) => break, // EOF - child exited / master closed
+                    Ok(n) => match parser_clone.lock() {
                         Ok(mut parser) => {
-                            parser.process(&buf[..n as usize]);
+                            parser.process(&buf[..n]);
                         }
                         Err(_poisoned) => {
                             // Mutex is poisoned (another thread panicked
-                            // while holding the lock). The session is in a
-                            // broken state - exit the reader thread.
+                            // while holding the lock). The session is in
+                            // a broken state - exit the reader thread.
                             break;
                         }
-                    }
-                } else if n == 0 {
-                    // EOF - slave side closed, child exited.
-                    break;
-                } else {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::Interrupted {
+                    },
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
                         // EINTR - a signal interrupted the read. This is
                         // not a real error, just retry.
                         continue;
                     }
-                    // Real error (EBADF, EIO, etc.) - fd closed, session
-                    // dropped, or something fatal. Exit the reader thread
-                    // so the session becomes [dead].
-                    break;
+                    Err(_) => {
+                        // Real error (EBADF, EIO, ConPTY closed, etc.) -
+                        // exit the reader thread so the session becomes
+                        // [dead].
+                        break;
+                    }
                 }
             }
         });
 
         Ok(Session {
-            master: master_fd,
+            master: pair.master,
             child: Some(child),
+            child_pid,
+            writer: Mutex::new(writer),
             parser,
             reader_handle: Some(reader_handle),
         })
@@ -207,33 +199,19 @@ impl Session {
 
     /// Write bytes to the PTY master (sends input to the child process).
     ///
-    /// The master fd is in blocking mode, so write() blocks until the kernel
-    /// buffer has space. This is fine for interactive input which is small.
-    /// Guards against zero-length writes.
+    /// The writer is blocking, so this blocks until the kernel / ConPTY
+    /// buffer has space. This is fine for interactive input which is
+    /// small. Guards against zero-length writes.
     pub fn write_bytes(&self, data: &[u8]) -> io::Result<()> {
-        let fd = self.master.as_raw_fd();
-        let mut offset = 0;
-        while offset < data.len() {
-            let n = unsafe {
-                libc::write(
-                    fd,
-                    data[offset..].as_ptr() as *const libc::c_void,
-                    data.len() - offset,
-                )
-            };
-            if n < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if n == 0 {
-                // write() returned 0 - should not happen on a PTY, but guard
-                // against an infinite loop.
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "write to PTY returned 0",
-                ));
-            }
-            offset += n as usize;
+        if data.is_empty() {
+            return Ok(());
         }
+        let mut guard = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::other("session writer mutex poisoned"))?;
+        guard.write_all(data)?;
+        guard.flush()?;
         Ok(())
     }
 
@@ -268,75 +246,133 @@ impl Session {
 
     /// Resize the PTY and the parser to the given dimensions.
     ///
-    /// Locks the parser BEFORE calling set_winsize so that the reader
+    /// Locks the parser BEFORE calling the PTY resize so that the reader
     /// thread cannot feed new-dimension output into an old-dimension
-    /// parser. The lock ensures: lock -> set_winsize (kernel sends
-    /// SIGWINCH) -> set_size -> unlock, so parser dimensions are always
-    /// in sync when the reader thread next acquires the lock.
+    /// parser. The lock ensures: lock -> resize (kernel sends SIGWINCH
+    /// on Unix / ConPTY notifies on Windows) -> parser.set_size ->
+    /// unlock, so parser dimensions are always in sync when the reader
+    /// thread next acquires the lock.
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         if let Ok(mut parser) = self.parser.lock() {
-            set_winsize(self.master.as_raw_fd(), cols, rows)?;
+            self.master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(io::Error::other)?;
             parser.set_size(rows, cols);
         }
         Ok(())
     }
 
-    /// Send SIGTERM to the child's process group without waiting.
+    /// Request graceful shutdown of the child process without waiting.
     ///
-    /// Used during graceful shutdown: the main loop continues running so
-    /// the UI stays responsive while children handle SIGTERM at their own
-    /// pace. Does not consume the child - liveness checks and reaping
-    /// happen via is_alive() on subsequent ticks.
+    /// On Unix: sends SIGTERM to the child's process group (`killpg`),
+    /// matching the original raw-libc behaviour - any grandchildren the
+    /// harness spawned inside the PTY session are signalled too. Used
+    /// during graceful shutdown: the main loop continues running so the
+    /// UI stays responsive while children handle SIGTERM at their own
+    /// pace.
+    ///
+    /// On Windows: there is no SIGTERM analogue; `Child::kill` calls
+    /// `TerminateProcess`, which terminates the direct child immediately
+    /// and does NOT cascade to grandchildren. The 10-second shutdown
+    /// deadline in `main.rs` still escalates to `force_kill`, so the
+    /// observable UX (a second Ctrl+C force-quits) is the same.
+    ///
+    /// Does not consume the child - liveness checks and reaping happen
+    /// via `is_alive()` on subsequent ticks.
     pub fn send_sigterm(&mut self) {
-        let Some(ref child) = self.child else {
-            return;
-        };
-        let pid = child.id() as libc::pid_t;
-        unsafe {
-            libc::killpg(pid, libc::SIGTERM);
+        #[cfg(unix)]
+        {
+            if self.child.is_some()
+                && let Some(pid) = self.child_pid
+            {
+                // SAFETY: `libc::killpg` is an FFI call into a
+                // stable POSIX syscall; arguments are a process-
+                // group id and a signal number, both plain ints.
+                // The child was spawned by portable-pty which
+                // internally calls `setsid`, so its PID equals its
+                // process-group id. `ESRCH` after a freshly-reaped
+                // group is harmless.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+            }
         }
     }
 
-    /// Send SIGKILL to the child's process group and reap it.
+    /// Force-kill the child and reap it.
     ///
-    /// Used for force-quit during shutdown and in Drop (crash/panic path).
-    /// Consumes the child so no further signals can be sent.
+    /// On Unix: sends SIGKILL to the child's process group. On Windows:
+    /// `TerminateProcess` on the direct child. Used for force-quit
+    /// during shutdown and in `Drop` (crash/panic path). Consumes the
+    /// child so no further signals can be sent.
     pub fn force_kill(&mut self) {
         let Some(mut child) = self.child.take() else {
             return;
         };
-        let pid = child.id() as libc::pid_t;
-        unsafe {
-            libc::killpg(pid, libc::SIGKILL);
+        #[cfg(unix)]
+        {
+            if let Some(pid) = self.child_pid {
+                // SAFETY: see `send_sigterm`.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            let _ = child.kill();
         }
         let _ = child.wait();
     }
 
-    /// Kill the child process group and wait for it to exit.
+    /// Kill the child and wait for it to exit.
     ///
-    /// Sends SIGTERM first and waits up to SIGTERM_GRACE_MS before
-    /// escalating to SIGKILL. Used for single-tab deletion where a
-    /// brief blocking wait is acceptable.
+    /// On Unix: sends SIGTERM to the process group, waits
+    /// `SIGTERM_GRACE_MS`, and escalates to SIGKILL if the child is
+    /// still alive - matches the original blocking-shutdown path.
+    /// On Windows: single `TerminateProcess` (no signal distinction is
+    /// possible). In both cases the child is reaped to prevent zombies.
     pub fn kill(&mut self) {
         let Some(mut child) = self.child.take() else {
             return;
         };
 
-        let pid = child.id() as libc::pid_t;
+        #[cfg(unix)]
+        {
+            if let Some(pid) = self.child_pid {
+                // SIGTERM the entire process group for graceful shutdown.
+                // SAFETY: see `send_sigterm`.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+                }
 
-        // SIGTERM the entire process group for graceful shutdown.
-        unsafe {
-            libc::killpg(pid, libc::SIGTERM);
-        }
+                // Give the process group a brief window to exit gracefully.
+                std::thread::sleep(Duration::from_millis(SIGTERM_GRACE_MS));
 
-        // Give the process group a brief window to exit gracefully.
-        std::thread::sleep(Duration::from_millis(SIGTERM_GRACE_MS));
-
-        // If still alive, force-kill the entire process group.
-        if matches!(child.try_wait(), Ok(None)) {
-            unsafe {
-                libc::killpg(pid, libc::SIGKILL);
+                // If still alive, force-kill the entire process group.
+                if matches!(child.try_wait(), Ok(None)) {
+                    unsafe {
+                        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                }
             }
+        }
+        #[cfg(windows)]
+        {
+            // Windows has no SIGTERM; a single TerminateProcess is the
+            // best we can do. Matches the escalation target on Unix.
+            let _ = child.kill();
         }
 
         // Reap the child to prevent zombies.
@@ -347,86 +383,24 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         // Force-kill the child process if still alive. Uses SIGKILL
-        // immediately - this is the crash/panic path where no UI is
-        // available for graceful shutdown.
+        // immediately on Unix / TerminateProcess on Windows - this is the
+        // crash/panic path where no UI is available for graceful shutdown.
         self.force_kill();
 
-        // Close the master fd (happens automatically via OwnedFd drop)
-        // which causes the reader thread's read() to fail, making it exit.
-        // We need to drop master BEFORE joining the reader thread.
-        // However, Rust's drop order for struct fields is declaration order,
-        // and we are in Drop::drop where we have &mut self. We need to
-        // explicitly close the master fd to unblock the reader thread
-        // before joining.
-
-        // Take the master fd and drop it to close, unblocking the reader.
-        // We use a raw fd swap: replace the OwnedFd with a dummy, then
-        // drop the original. Actually, we can't easily take an OwnedFd
-        // out of &mut self. Instead, we join with a timeout or just let
-        // the reader thread notice the fd is gone.
-        //
-        // Since kill() already killed the child, the slave side of the PTY
-        // is closed, which means the reader thread's read() will return
-        // 0 (EOF). So the reader thread should exit naturally after kill().
+        // The master handle closes automatically when `self.master` drops
+        // (declaration order: `master` is declared first, so it drops
+        // last - but that's fine because `force_kill` above has already
+        // reaped the child, and the slave handle we dropped at spawn time
+        // means the reader thread sees EOF as soon as the child exits).
 
         // Join the reader thread. It should have exited because:
-        // 1. kill() killed the child, closing the slave side
-        // 2. With no writers on the slave side, read() on master returns 0
+        // 1. force_kill killed the child, closing the slave side
+        // 2. With no writers on the slave side, the reader's read()
+        //    returns 0 (EOF) on Unix / ConPTY returns broken-pipe on
+        //    Windows.
         if let Some(handle) = self.reader_handle.take() {
             let _ = handle.join();
         }
-    }
-}
-
-/// Set the FD_CLOEXEC flag on a file descriptor so it is automatically
-/// closed when exec() is called in child processes.
-fn set_cloexec(fd: std::os::fd::RawFd) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
-    if rc < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-/// Open a PTY master/slave pair using the POSIX openpty interface.
-fn openpty() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut master_raw: libc::c_int = -1;
-    let mut slave_raw: libc::c_int = -1;
-    let rc = unsafe {
-        libc::openpty(
-            &mut master_raw,
-            &mut slave_raw,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let master = unsafe { OwnedFd::from_raw_fd(master_raw) };
-    let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
-    Ok((master, slave))
-}
-
-/// Set the window size on a PTY fd via TIOCSWINSZ ioctl.
-fn set_winsize(fd: std::os::fd::RawFd, cols: u16, rows: u16) -> io::Result<()> {
-    let ws = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as libc::c_ulong, &ws) };
-    if rc < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
     }
 }
 
@@ -434,6 +408,14 @@ fn set_winsize(fd: std::os::fd::RawFd, cols: u16, rows: u16) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// Spawn tests use `sleep`, which is a POSIX utility. On Windows the
+    /// equivalent is either `cmd /c timeout` or `powershell -c
+    /// Start-Sleep`; both have different argv shapes than `sleep`, so
+    /// rather than mud the tests with platform detection we cfg-gate
+    /// these lifecycle tests to Unix. The cross-platform PTY lifecycle
+    /// is exercised on Windows via the integration-style smoke tests
+    /// that spawn a real harness in the wider test matrix.
+    #[cfg(unix)]
     #[test]
     fn kill_is_idempotent() {
         // Spawn a real child process (sleep) so we can test the full
@@ -462,6 +444,7 @@ mod tests {
         // Drop will call kill() a third time - also a no-op.
     }
 
+    #[cfg(unix)]
     #[test]
     fn is_alive_lifecycle() {
         // Spawn a short-lived process so we can observe alive -> dead.

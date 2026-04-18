@@ -8,7 +8,8 @@ that support bracketed paste (CSI `?2004h` / `?2004l`). Modern
 terminals enable bracketed paste by default; a handful of legacy or
 misconfigured setups do not.
 
-**When it is a problem:** Raw legacy `cmd.exe` on Windows, some
+**When it is a problem:** Raw legacy `cmd.exe` on Windows (Windows
+Terminal supports bracketed paste and works correctly), some
 misconfigured ssh setups that strip the bracketed-paste DEC mode, and
 very old Unix terminal emulators. In those environments the terminal
 delivers each pasted character as an independent `Event::Key(Char)`

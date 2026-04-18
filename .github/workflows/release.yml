@@ -1,0 +1,176 @@
+name: Release
+
+# Triggered by the `v<x.y.z>` tag push that `cargo release --execute`
+# produces from a maintainer's macOS checkout. See `RELEASING.md` for
+# the end-to-end maintainer workflow. No PR triggers, no manual
+# dispatch: tag push is the only entry point.
+on:
+  push:
+    tags: ['v*']
+
+# Never cancel an in-flight release: partial releases leave a tag
+# pushed but artifacts missing. `cancel-in-progress: false` makes
+# concurrent tag pushes queue up instead of clobbering each other.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# `contents: write` lets the default `GITHUB_TOKEN` create and update
+# releases + upload assets. No PAT is needed. crates.io publishing is
+# NOT done here - that remains the local `cargo release --execute`
+# step.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          NAME="workbridge-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${{ matrix.target }}/release/workbridge" "dist/${NAME}/"
+          # README / LICENSE / CHANGELOG ride along so the tarball is
+          # self-contained. Tolerate missing files defensively.
+          for f in README.md LICENSE CHANGELOG.md; do
+            if [ -f "$f" ]; then
+              cp "$f" "dist/${NAME}/"
+            fi
+          done
+          # Strip on Linux. Apple's strip is conservative and rarely
+          # shaves meaningful bytes off a release-mode binary, so we
+          # skip it on macOS to avoid accidentally stripping symbols
+          # the dynamic loader needs.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            strip "dist/${NAME}/workbridge"
+          fi
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          shasum -a 256 "dist/${NAME}.tar.gz" > "dist/${NAME}.tar.gz.sha256"
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME
+          $name = "workbridge-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path "dist/$name" -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/workbridge.exe" "dist/$name/"
+          foreach ($f in @('README.md', 'LICENSE', 'CHANGELOG.md')) {
+              if (Test-Path $f) {
+                  Copy-Item $f "dist/$name/"
+              }
+          }
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifact-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          # Flatten all per-matrix artifacts into `dist/` so the
+          # `gh release create` glob below picks them up without a
+          # per-target subdirectory.
+          merge-multiple: true
+
+      - name: Build combined SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # Concatenate every per-artifact sha256 into one SHA256SUMS
+          # file and delete the individuals so the final release has
+          # exactly one checksum manifest (the standard download
+          # expectation).
+          cat *.sha256 > SHA256SUMS
+          rm -f *.sha256
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          # Extract the body of the `## [<version>]` section from the
+          # top of CHANGELOG.md, stopping at the next `## [` heading.
+          # Falls through to `--generate-notes` below if no matching
+          # section is found (e.g. pre-release tags that skip the
+          # changelog bump).
+          awk -v v="$VERSION" '
+            BEGIN { p = 0 }
+            /^## \[/ {
+              if (p == 1) { exit }
+              if ($0 ~ "^## \\[" v "\\]") { p = 1; next }
+            }
+            p == 1 { print }
+          ' CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "No CHANGELOG section for ${VERSION}; falling back to --generate-notes"
+            echo "use_generate=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_generate=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ steps.notes.outputs.use_generate }}" = "true" ]; then
+            gh release create "$TAG" --generate-notes --title "$TAG" \
+              dist/*.tar.gz dist/*.zip dist/SHA256SUMS
+          else
+            gh release create "$TAG" --notes-file release_notes.md --title "$TAG" \
+              dist/*.tar.gz dist/*.zip dist/SHA256SUMS
+          fi

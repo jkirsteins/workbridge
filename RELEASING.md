@@ -121,6 +121,109 @@ Everything up to step 5 is reversible without side effects. Once step 7
 succeeds, crates.io has an artifact that can only be yanked (hidden from
 new resolution), not deleted. This is why you dry-run first.
 
+## GitHub Actions release pipeline
+
+Once `cargo release --execute` pushes the `v<version>` tag in step 8
+above, the `.github/workflows/release.yml` workflow fires on the tag
+push and produces a GitHub Release with pre-built binaries attached.
+This is decoupled from crates.io - `cargo release` handles source
+distribution; the GitHub Actions workflow handles binary distribution.
+Both triggers are the same tag push, so the maintainer's workflow does
+not change.
+
+### What the workflow does
+
+1. **Matrix build** (parallel jobs):
+   - `x86_64-unknown-linux-gnu` on `ubuntu-latest`
+   - `x86_64-apple-darwin` on `macos-latest`
+   - `aarch64-apple-darwin` on `macos-latest` (cross-compiled from the
+     arm64 hosted runner)
+   - `x86_64-pc-windows-msvc` on `windows-latest`
+
+   Each matrix job runs `cargo build --release --locked --target
+   <target>`, strips the Linux binary, copies `README.md`, `LICENSE`,
+   and `CHANGELOG.md` alongside, packages as
+   `workbridge-v<version>-<target>.tar.gz` (Unix) or `.zip`
+   (Windows), and computes a SHA-256 checksum.
+2. **Release job** (runs after the matrix succeeds):
+   - Downloads every matrix artifact into a flat `dist/` directory.
+   - Merges the per-artifact checksums into a single `SHA256SUMS`
+     file.
+   - Extracts the `## [<version>]` section of `CHANGELOG.md` as the
+     release body. Falls back to GitHub's auto-generated notes if the
+     section is missing (e.g. pre-release rc tags that bypass
+     `cargo release`).
+   - Calls `gh release create <tag>` with the archives and
+     `SHA256SUMS` attached.
+
+The workflow uses only the default `GITHUB_TOKEN` (with
+`contents: write`) - no PAT, no additional secrets, and **no
+crates.io credentials**. crates.io publishing happens locally in step
+7 above; the workflow only attaches GitHub Release assets.
+
+### Watching the run
+
+Open the "Actions" tab of the repo on github.com and click the most
+recent "Release" workflow run. The four build jobs run in parallel;
+the release job runs after all builds succeed. Total wall time is
+usually 5-10 minutes.
+
+Direct link:
+`https://github.com/jkirsteins/workbridge/actions/workflows/release.yml`
+
+### Recovery if the workflow fails
+
+If the workflow fails mid-matrix (e.g. one target OOMs the runner or a
+transient flake), re-run it from the GitHub UI via "Re-run failed
+jobs". No artifacts are published until the release job completes, so
+a failed matrix run leaves no partial release behind.
+
+If the release job itself fails AFTER creating the release (e.g. a
+network blip during an asset upload), the partial release is visible
+on `https://github.com/jkirsteins/workbridge/releases`. Two options:
+
+1. **Re-upload the missing assets manually**:
+
+   ```sh
+   gh release upload v<version> dist/workbridge-v<version>-<target>.tar.gz
+   ```
+
+2. **Delete and retry**:
+
+   ```sh
+   gh release delete v<version> --yes
+   git push --delete origin v<version>
+   git tag -d v<version>
+   # fix the underlying issue, then cargo release again
+   ```
+
+   If `cargo publish` already uploaded `<version>` to crates.io, you
+   cannot re-use the same version number - yank it with `cargo yank
+   --version <version> workbridge` and bump to the next patch.
+
+### Pre-release validation (dry-running the workflow)
+
+To validate the workflow without publishing to crates.io (e.g. after
+editing `release.yml` itself), push a release-candidate tag directly,
+bypassing `cargo release`:
+
+```sh
+git tag v<next>-rc0
+git push origin v<next>-rc0
+```
+
+The workflow fires, builds the matrix, and creates a GitHub Release
+named `v<next>-rc0`. `cargo release` is not invoked; no crates.io
+publish happens; no version bump lands on `master`. If the workflow
+breaks, fix it in a new commit, delete the rc tag and release, and
+push a new rc:
+
+```sh
+gh release delete v<next>-rc0 --yes
+git push --delete origin v<next>-rc0
+git tag -d v<next>-rc0
+```
+
 ## Recovering from failures
 
 ### Pre-release hook failure (step 2)

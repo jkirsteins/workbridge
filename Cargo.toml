@@ -22,8 +22,8 @@ exclude = [
 [dependencies]
 tui-term = "0.3"
 vt100 = "0.15"
-libc = "0.2"
-signal-hook = "0.3"
+portable-pty = "0.9"
+ctrlc = { version = "3", features = ["termination"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -41,6 +41,21 @@ ratatui-widgets = "0.3"
 unicode-width = "0.2"
 arboard = "3"
 which = "6"
+
+# `libc` provides the Unix-only `killpg` / `SIGTERM` / `SIGKILL` constants
+# used by `src/app.rs` (rebase-gate subprocess teardown). The Windows build
+# does not need `libc`; `portable-pty` (whose Windows backend uses ConPTY)
+# and `ctrlc` (whose Windows backend uses SetConsoleCtrlHandler) provide all
+# the cross-platform primitives we need.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# `windows-sys` provides the Win32 `OpenProcess` / `TerminateProcess`
+# symbols used by the rebase-gate cancellation path in `src/app.rs`
+# (the Windows-only `terminate_process_by_id` helper). Scoped to
+# Windows so the Unix / macOS builds don't pull it in.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [features]
 integration = []

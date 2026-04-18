@@ -37,6 +37,28 @@ Out of scope:
 - Invariant 13 "fresh session per stage" is referenced but not
   restated (see `docs/invariants.md`).
 
+## Platform support
+
+Workbridge itself (the TUI binary) builds and runs on:
+
+- **Unix** (Linux, macOS): primary target. All clauses below apply as
+  written. The reference `claude` harness and the first-class
+  secondary `codex` harness are both distributed for these platforms.
+- **Windows** (x86_64-pc-windows-msvc): supported. The PTY layer uses
+  ConPTY via `portable-pty`; signal handling uses `ctrlc` (which
+  registers `SetConsoleCtrlHandler`). Every clause below is satisfied
+  on Windows EXCEPT one divergence in C10: `Child::kill` does not
+  cascade to grandchildren on Windows (there is no process-group
+  abstraction). The reference harness CLIs are not currently
+  distributed for Windows, so in practice the divergence surfaces
+  only against Windows-native harnesses a future contributor plugs
+  in; the divergence is documented inline in C10.
+
+Adding a new harness adapter does not require Windows-specific
+behaviour beyond satisfying the existing clauses. The clauses are
+authored in cross-platform language; divergences are called out per
+clause in the Implementation Map.
+
 ## Glossary
 
 - **Harness**: the external LLM coding CLI that workbridge spawns
@@ -45,7 +67,13 @@ Out of scope:
   against a single work item + stage. Session identity is owned by
   workbridge, not the harness (see C12).
 - **Interactive mode**: PTY-backed, long-running, driven by user
-  keystrokes forwarded through the PTY master fd.
+  keystrokes forwarded through the PTY master. The PTY abstraction is
+  provided by the `portable-pty` crate, which uses a Unix PTY pair
+  (`openpty` + `setsid` + `TIOCSCTTY`) on Unix and ConPTY
+  (`CreatePseudoConsole`) on Windows. Workbridge calls the same
+  `Session::spawn` -> `portable_pty::native_pty_system().openpty(...)`
+  path on both platforms; the OS-specific backend is selected at build
+  time.
 - **Headless mode**: one-shot, no PTY, structured JSON on stdout,
   exits when done. Used today by the review gate.
 - **Stage**: the workbridge workflow stage (Planning, Implementing,
@@ -276,20 +304,49 @@ for failure.
 The harness process MUST be well-behaved under the following
 lifecycle protocol:
 
-1. Liveness is polled by workbridge via `waitpid(WNOHANG)` (`Child::
-   try_wait`) on each background tick.
-2. Graceful shutdown is SIGTERM delivered to the **process group**
-   (`killpg`), with a ~50ms grace window before escalation to
-   SIGKILL.
-3. Drop of the `Session` struct force-kills (SIGKILL to the process
-   group) and joins the reader thread. The slave PTY closing on
-   child exit terminates the reader naturally; no fd manipulation
-   from the UI thread is required.
+1. Liveness is polled by workbridge via a cross-platform
+   `portable_pty::Child::try_wait` on each background tick (Unix:
+   `waitpid(WNOHANG)`; Windows: `WaitForSingleObject` with a zero
+   timeout).
+2. Graceful shutdown:
+   - **Unix**: SIGTERM delivered to the **process group** (`killpg`),
+     with a ~50ms grace window before escalation to SIGKILL. The
+     child is a session leader (portable-pty calls `setsid` during
+     spawn), so the PID equals the PGID and `killpg` reaches every
+     grandchild in the tree.
+   - **Windows**: there is no signal model. `Session::send_sigterm`
+     falls through to `Child::kill` (`TerminateProcess`) on the
+     direct child, and the 10-second shutdown deadline in `main.rs`
+     does the same escalation on the second tick. Grandchildren are
+     NOT cascaded - see "Known divergence" below.
+3. Drop of the `Session` struct force-kills (SIGKILL on Unix /
+   `TerminateProcess` on Windows) and joins the reader thread. The
+   slave PTY closing on child exit terminates the reader naturally;
+   no fd / handle manipulation from the UI thread is required.
 
-The harness MUST therefore: run in its own process group, not install
+**Known divergence (Windows grandchild cascade)**: the reference
+`claude` harness is not currently distributed for Windows, and the
+rebase-gate subprocess tree (harness -> `git rebase` / `git add`) is
+short-lived. On Windows, `Child::kill` calls `TerminateProcess` on
+the direct child only; any subprocesses the harness started are not
+signalled and will be cleaned up either by their own parent-death
+handling or by the OS when the user closes the terminal. This is
+acceptable because:
+
+- A harness that honours the clause below ("not spawn grandchildren
+  that survive a direct kill") behaves the same way on both OSes.
+- The `git` binary exits cleanly when its parent-PTY closes, so
+  leaked grandchildren are not observable in practice.
+- The Unix platform is still the primary target for the reference
+  harness; the Windows port exists to let contributors build and
+  develop against the workbridge binary itself, not to productise a
+  Windows harness stack.
+
+The harness MUST therefore: run in its own process group on Unix (or
+exit promptly when its parent terminates on Windows), not install
 signal handlers that swallow SIGTERM, not spawn grandchildren that
-survive SIGKILL on the group leader, and not leave the PTY in a state
-where the reader thread cannot observe EOF.
+survive SIGKILL on the group leader, and not leave the PTY in a
+state where the reader thread cannot observe EOF.
 
 ### C11 - Read-only sessions
 
@@ -680,13 +737,16 @@ No clause violation.
 ### C10 - Lifecycle and cancellation
 
 **Claude (reference)**: `Session::kill` in `src/session.rs`
-implements the SIGTERM -> 50ms grace -> SIGKILL escalation against
-the child's process group via `libc::killpg`. `Session::force_kill`
-in `src/session.rs` is the SIGKILL-immediately path used in
-`Drop`. `Session::is_alive` uses
-`Child::try_wait`. `Drop for Session`
-force-kills and joins the reader thread; slave-PTY close on child
-exit gives the reader its EOF. Work-item session teardown goes
+implements the Unix SIGTERM -> 50ms grace -> SIGKILL escalation
+against the child's process group via `libc::killpg` and collapses
+to a single `Child::kill` (`TerminateProcess`) on Windows inside the
+same function. `Session::force_kill` in `src/session.rs` is the
+immediate-kill path used in `Drop` (Unix: `killpg(SIGKILL)`;
+Windows: `Child::kill`). `Session::is_alive` uses
+`portable_pty::Child::try_wait`, which wraps `waitpid(WNOHANG)` on
+Unix and `WaitForSingleObject` with zero timeout on Windows. `Drop
+for Session` force-kills and joins the reader thread; slave-PTY
+close on child exit gives the reader its EOF on both platforms. Work-item session teardown goes
 through `App::delete_work_item_by_id`, which
 takes ownership of `SessionEntry::agent_written_files` and hands
 the list to `App::spawn_agent_file_cleanup`. That helper spawns a
@@ -1056,6 +1116,18 @@ This doc is the authoritative harness contract spec. When a spawn
 site changes, when a clause is added or relaxed, or when a new
 harness adapter is introduced, add a dated bullet here.
 
+- 2026-04-18: Windows support. Added "Platform support" section
+  noting the ConPTY-backed `portable-pty` rewrite of `src/session.rs`
+  and the `ctrlc` swap-in for signal handling. Rewrote the
+  "Interactive mode" glossary entry in cross-platform language.
+  Rewrote C10 "Lifecycle and cancellation" to split the Unix
+  `killpg`-based escalation from the Windows `TerminateProcess`
+  collapse; documented the Windows grandchild-cascade divergence as
+  a known limitation with its rationale. Updated the C10
+  Implementation Map entry to cite `portable_pty::Child::try_wait`
+  in place of raw `Child::try_wait`. Known Spawn Sites table and
+  reference payloads unchanged (the reference harness is still
+  `claude`, still Unix-primary).
 - 2026-04-15: Initial spec. Captures the three current `claude` spawn
   sites, 13 clauses, reference payloads RP1-RP5, and the Codex
   secondary-target sanity check. No code changes; `CLAUDE.md`
