@@ -75,3 +75,30 @@ Integration tests live in `src/worktree_service.rs` in the
 `integration_tests` module. Unit tests (like `parse_porcelain` tests that
 don't touch the filesystem) remain in the regular `tests` module and run
 on every `cargo test`.
+
+## Sandbox-only verification
+
+Some local agent sandboxes allow ordinary temp-file I/O but deny
+Unix-domain socket creation. In that environment, the MCP socket smoke
+tests fail while binding the socket with `PermissionDenied` /
+`Operation not permitted`, even though the same tests pass from a normal
+developer shell.
+
+For sandbox-only verification, exclude only these socket-dependent tests:
+
+```sh
+cargo test -- \
+  --skip mcp::tests::socket_server_starts_and_stops \
+  --skip mcp::tests::mcp_tool_call_produces_channel_event
+```
+
+This exception is only for restricted sandboxes that cannot bind Unix
+sockets. Normal local shells, CI, and git hooks must still run the full
+test suite, including those two MCP socket tests. If a sandbox run skips
+them, verify them separately outside the sandbox before relying on MCP
+socket behavior:
+
+```sh
+cargo test mcp::tests::socket_server_starts_and_stops -- --nocapture
+cargo test mcp::tests::mcp_tool_call_produces_channel_event -- --nocapture
+```
