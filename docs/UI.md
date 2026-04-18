@@ -1710,24 +1710,26 @@ Work items display a visual indicator when a coding agent session exists,
 distinguishing three states:
 
 1. **No session**: no indicator (default).
-2. **Session exists, idle**: a filled circle in Gray. This means a Claude
-   session is alive but has not signaled active work.
-3. **Actively working**: an animated braille spinner in Cyan+Bold. Claude
-   has called `workbridge_set_activity(working=true)` via MCP.
+2. **Session exists, idle**: a filled circle in Gray. This means a coding
+   agent session is alive but has not signaled active work.
+3. **Actively working**: an animated braille spinner in Cyan+Bold. The
+   coding agent has called `workbridge_set_activity(working=true)` via MCP.
 
 In the flat list view, the indicator appears in the left margin
 (replacing the selection caret ">"). In the board view, it appears on
 the second line alongside PR and CI indicators.
 
-The activity state is signaled by Claude via the `workbridge_set_activity`
-MCP tool and is cleared automatically when the session process exits
-(detected during liveness checks).
+The activity state is signaled by the coding agent via the
+`workbridge_set_activity` MCP tool and is cleared automatically when the
+session process exits (detected during liveness checks).
 
 The spinner reuses the same braille-dot frames and 200ms tick rate as the
 status bar activity indicator. The `spinner_tick` counter advances when
-either status-bar activities or `claude_working` entries exist.
+either status-bar activities or `claude_working` entries exist (the
+`claude_working` field name is a legacy code identifier that tracks
+activity for every coding agent adapter, not just Claude Code).
 
-**Badge dimming.** When a work item has no live Claude PTY session
+**Badge dimming.** When a work item has no live coding agent PTY session
 attached (`app.session_key_for(&wi.id).is_none()`), every badge on the
 row (state badge, `[RR]` kind tag, `[RG]` gate tag, `PR#N` chip, CI
 chips, and trailing state chips like `!cl` / `!pushed` / `!pulled` /

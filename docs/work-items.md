@@ -152,8 +152,8 @@ Stage restrictions for ReviewRequest items:
   manual stage advancement.
 - **retreat_stage**: Always blocked. There is no valid previous stage for
   a review request in Review.
-- **MCP status transitions**: `workbridge_set_status` is blocked. Claude
-  sessions should not drive workflow for someone else's PR.
+- **MCP status transitions**: `workbridge_set_status` is blocked. Coding
+  agent sessions should not drive workflow for someone else's PR.
 - **MCP review tools**: `workbridge_approve_review` and
   `workbridge_request_changes` are available only for ReviewRequest items.
   These submit a GitHub PR review via `gh pr review` and auto-move the
@@ -177,7 +177,7 @@ Stage restrictions for ReviewRequest items:
   auto-transitions to Done through the merge-gate invariant (`source
   == "pr_merge"`) and the merged PR's identity is persisted to
   `pr_identity` so the assembly fallback keeps the merged-PR link
-  visible afterwards. The Claude review session is killed by the
+  visible afterwards. The coding agent review session is killed by the
   transition (same behavior as every other Review -> Done transition in
   the codebase); the worktree is left on disk and cleaned up later by
   auto-archive (default 7 days) or immediately by the user with Ctrl+D.
@@ -212,7 +212,7 @@ is configured no dialog is shown at all - a Planning work item is created
 immediately with a placeholder title ("Quick start") and a session is
 spawned at once.
 
-The Claude agent running in this session uses the `planning_quickstart` system
+The coding agent running in this session uses the `planning_quickstart` system
 prompt, which instructs it to:
 1. Ask the user what they want to work on.
 2. Call `workbridge_set_title` via MCP once the task is understood.
