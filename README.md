@@ -287,9 +287,10 @@ read-only review gate; interactive work-item sessions see a broader tool
 surface with Codex. See `docs/harness-contract.md` C5.
 
 \*** Claude Code uses a `PostToolUse` hook to inject periodic stage
-reminders; Codex has no matching hook system, so stage reminders are either
-delivered through a different mechanism or are not delivered as frequently.
-See `docs/harness-contract.md` C8.
+reminders; Codex has no matching hook, so the Planning reminder is embedded
+in the system prompt and fires only at spawn, not on each turn. This is
+strictly weaker than the hook-based delivery because it cannot re-fire after
+the first turn. See `docs/harness-contract.md` C8.
 
 ## Further Reading
 

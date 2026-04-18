@@ -388,10 +388,10 @@ Examples of the cache-first pattern:
   applies the rework flow without freezing the UI.
 - Review gates carry a `ReviewGateOrigin` tag so `poll_review_gate`
   can dispatch Blocked outcomes correctly. `Mcp` and `Auto` origins
-  (Claude requested Review via the MCP status update, or the
+  (the harness requested Review via the MCP status update, or the
   auto-trigger after an Implementing session died) run the full
   rework flow: populate `rework_reasons`, kill the session, respawn
-  it with the implementing_rework prompt so Claude sees the reason.
+  it with the implementing_rework prompt so the harness sees the reason.
   `Tui` origin (the user pressed `l` on an Implementing item) only
   surfaces the reason in the status bar and leaves the session
   running - killing the user's primary workspace would be a
@@ -407,7 +407,7 @@ Examples of the cache-first pattern:
   enter Review: no changes on branch")`, which `poll_review_gate`
   surfaces via the Auto-origin rework flow. Gating the spawn on a
   stale fetcher cache would let items get stuck in Implementing for
-  up to two minutes after Claude's final commit (the fetch
+  up to two minutes after the branch's final commit (the fetch
   interval), with no auto-retry.
 - `spawn_session` routes through `begin_session_open` +
   `poll_session_opens` instead of calling `stage_system_prompt`
@@ -883,7 +883,7 @@ neither, never both.
 
 The "Session Activity Indicators" described later in this document
 (the left-panel list badges that reflect whether a session is alive
-and whether Claude has signalled active work via MCP) are a
+and whether the coding agent has signalled active work via MCP) are a
 **complementary** per-item view, NOT a substitute for one of the two
 primary idioms. Every background operation still owes a dialog
 spinner OR a status-bar activity regardless of whether an item badge
@@ -1331,8 +1331,8 @@ group via the `child_pid` slot if it is still alive) and surfaces
 a "Rebased onto origin/<main>" or "Rebase onto origin/<main>
 failed: <reason>" status message. The harness is spawned with
 `Command::process_group(0)` so it becomes its own group leader;
-the `killpg` therefore takes down claude AND any `git rebase` /
-`git add` subprocesses claude has started, not just claude itself.
+the `killpg` therefore takes down the harness AND any `git rebase` /
+`git add` subprocesses the harness has started, not just the harness itself.
 `drop_rebase_gate` is also called from `delete_work_item_by_id`
 and `force_kill_all`, so deleting a work item or quitting
 workbridge while a rebase is in flight tears the gate down
