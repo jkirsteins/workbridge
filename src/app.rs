@@ -22513,14 +22513,14 @@ mod tests {
         // PR #97). Prior to this test, `finish_session_open` wrote
         // `.mcp.json` to `cwd.join(".mcp.json")` alongside the
         // `--mcp-config <tempfile>` argv delivery. That in-worktree
-        // write leaked harness state into user repos (observed in
-        // `Wordlike`, `GymApp`, `webometer`, which do not gitignore
-        // `.mcp.json`) and, in the worst case, silently clobbered a
-        // pre-existing user-authored `.mcp.json` with workbridge's
-        // own MCP config JSON. The fix is a pure deletion of the
-        // write; MCP config keeps reaching Claude Code through the
-        // `--mcp-config <temp file under std::env::temp_dir()>`
-        // argv pair, which is workbridge-owned and unaffected.
+        // write leaked harness state into user repos that do not
+        // gitignore `.mcp.json` and, in the worst case, silently
+        // clobbered a pre-existing user-authored `.mcp.json` with
+        // workbridge's own MCP config JSON. The fix is a pure
+        // deletion of the write; MCP config keeps reaching Claude
+        // Code through the `--mcp-config <temp file under
+        // std::env::temp_dir()>` argv pair, which is workbridge-
+        // owned and unaffected.
         //
         // This test pins both failure modes with a single assertion:
         // it seeds `cwd.join(".mcp.json")` with a distinctive sentinel

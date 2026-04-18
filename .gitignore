@@ -2,5 +2,6 @@
 REVIEW_LOG.md
 .worktrees/
 .mcp.json
-.claude/settings.local.json
+.claude/*
+!.claude/settings.json
 *.snap.new
