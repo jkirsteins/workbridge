@@ -1,4 +1,8 @@
-# Workbridge
+<div align="center">
+  <img src="assets/logo.png" alt="Workbridge logo" width="180" />
+  <h1>Workbridge</h1>
+  <p><strong>Multi-repo Claude Code orchestration in your terminal.</strong></p>
+</div>
 
 Workbridge is a terminal UI for orchestrating multi-repo development work. It
 tracks work items, manages git worktrees, and drives Claude Code sessions
