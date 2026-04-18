@@ -334,27 +334,42 @@ read from the cache**. Concretely:
   it); `!pushed` fires on `git_state.ahead > 0` and `!pulled` fires
   on `git_state.behind > 0`, so a dirty + diverged row renders all
   three chips alongside each other. The Review -> Done **merge
-  guard** runs a live `WorktreeService::list_worktrees` precheck on
-  a background thread (`App::spawn_merge_precheck` /
-  `App::poll_merge_precheck`) before letting the actual `gh pr merge`
-  thread fire - the cache stays authoritative for the `!cl` chip but
-  is NEVER consulted for the irrevocable merge decision, because long
-  sessions can leave the cached `dirty: true` value stale long after
-  the user has committed and pushed. The classification is done via
-  `WorktreeCleanliness::from_worktree_info` against the live
-  `WorktreeInfo` so the precheck and the chip render share one
-  canonical priority ordering and wording. `App::advance_stage` does
-  NOT do its own cleanliness check on the Review -> Done branch: it
-  unconditionally opens the merge confirm modal, and the live
-  precheck inside `execute_merge` is the only authority. (The
-  earlier cached guard in `advance_stage` was the source of a stale-
-  cache regression where users could not merge after committing
-  because the fetcher cache had not refreshed yet.) The merge guard
-  reserves its `UserActionKey::PrMerge` slot in `execute_merge`
-  BEFORE spawning the precheck and only releases it on the Blocked /
-  disconnected branches of `poll_merge_precheck`, so the precheck
-  and the actual merge share one single-flight slot across both
-  phases.
+  guard** runs a live two-pronged precheck on a background thread
+  (`App::spawn_merge_precheck` / `App::poll_merge_precheck`) before
+  letting the actual `gh pr merge` thread fire: it calls both
+  `WorktreeService::list_worktrees` (for the local worktree state)
+  AND `GithubClient::fetch_live_merge_state` (for the remote PR's
+  mergeable flag + CI rollup). The cache stays authoritative for the
+  `!cl` / `!merge` / `fail` chips but is NEVER consulted for the
+  irrevocable merge decision, because long sessions can leave the
+  cached `dirty: true` / `mergeable: CONFLICTING` / `checks:
+  FAILURE` values stale long after the user has committed, rebased,
+  or re-run CI. The classification is done via
+  `MergeReadiness::classify` against the live `WorktreeInfo` and
+  `LivePrState` so the precheck and the chip render share one
+  canonical priority ordering and wording. Hard blockers, in
+  priority order: `Dirty > Untracked > Unpushed > PrConflict >
+  CiFailing > BehindOnly > Clean`. `BehindOnly` (!pulled) is a
+  soft-warning state and never blocks; pending CI is likewise
+  non-blocking. `App::advance_stage` does NOT do its own cleanliness
+  check on the Review -> Done branch: it unconditionally opens the
+  merge confirm modal, and the live precheck inside `execute_merge`
+  is the only authority. (The earlier cached guard in `advance_stage`
+  was the source of a stale-cache regression where users could not
+  merge after committing because the fetcher cache had not refreshed
+  yet.) The pre-confirm modal body does surface an **advisory soft
+  hint** via `App::merge_confirm_hint` when the cached state already
+  suggests the live precheck may block ("Live re-check will run
+  before merging." for any hard-block cached signal; "CI still
+  running; merge will queue on branch protection." when the only
+  cached warning is pending CI). The hint is purely advisory - it
+  never refuses to open the modal and never short-circuits the
+  precheck; if the cache is stale the worst case is a spurious
+  reassurance line. The merge guard reserves its
+  `UserActionKey::PrMerge` slot in `execute_merge` BEFORE spawning
+  the precheck and only releases it on the Blocked / disconnected
+  branches of `poll_merge_precheck`, so the precheck and the actual
+  merge share one single-flight slot across both phases.
 - Backend file reads (`read_plan`, `list`) - clone the `Arc<dyn
   WorkItemBackend>` into the background closure and run the read there.
 - `default_branch`, `github_remote`, `git diff` - clone the
@@ -1005,16 +1020,21 @@ Key semantics:
   alive so `is_user_action_in_flight` keeps reporting the true state;
   only the visible spinner is suppressed. `execute_merge` follows the
   same rule: the merge confirmation modal renders its own
-  "Checking working tree..." / "Merging pull request..." spinner from
-  the moment the user pressed merge, so the status-bar activity is
-  ended via `end_activity` immediately after `try_begin_user_action`
+  "Refreshing remote state..." / "Merging pull request..." spinner
+  from the moment the user pressed merge, so the status-bar activity
+  is ended via `end_activity` immediately after `try_begin_user_action`
   returns.
 - **Two-phase admission (PrMerge).** `execute_merge` admits the
-  `UserActionKey::PrMerge` slot BEFORE the live working-tree precheck
+  `UserActionKey::PrMerge` slot BEFORE the live merge precheck
   spawns, and the helper entry is held across both the precheck phase
   (`spawn_merge_precheck` / `poll_merge_precheck`) AND the actual
   `gh pr merge` phase (`perform_merge_after_precheck` /
-  `poll_pr_merge`). Only the Blocked / disconnected branches of
+  `poll_pr_merge`). The precheck phase runs two blocking fetches on
+  the same background thread - `WorktreeService::list_worktrees` for
+  the local worktree state and `GithubClient::fetch_live_merge_state`
+  (a `gh pr view` shell-out) for the remote PR mergeable flag and CI
+  rollup - before asking `MergeReadiness::classify` for a go / no-go
+  decision. Only the Blocked / disconnected branches of
   `poll_merge_precheck` and the terminal arms of `poll_pr_merge`
   release the slot. `perform_merge_after_precheck` does NOT re-admit
   the key; it only swaps the payload from
@@ -1036,7 +1056,7 @@ Key semantics:
   This is the "structural ownership over manual correlation"
   pattern from `CLAUDE.md` applied to the merge precheck. The UI
   uses `App::is_merge_precheck_phase()` to switch the modal body
-  between "Checking working tree..." and "Merging pull request..."
+  between "Refreshing remote state..." and "Merging pull request..."
   by inspecting the payload variant directly.
 - **Caller-local rejection messages.** When `try_begin_user_action`
   returns `None`, the caller re-adds its existing alert / status
@@ -1358,12 +1378,42 @@ thread:
   (`git_state.behind > 0`). Magenta. "Action available: pull (or
   rebase via `m`)."
 
-The three chips coexist on the same line: a dirty, diverged branch
-renders `!cl !pushed !pulled` with `!cl` in LightYellow and both
-divergence chips in Magenta. The chip labels (not the colors)
-distinguish push-direction from pull-direction, while `!cl` stays
-visually distinct from both. Both divergence chips are rendered
+Two additional chips come from the derived `PrInfo` for a work
+item's primary association (also pure cache reads):
+
+- `!merge` - GitHub reports `mergeable: CONFLICTING` for the PR.
+  Red.
+- `fail` - the PR's CI rollup is `FAILURE`. Red.
+
+The five chips coexist on the same line: a dirty, diverged branch
+whose PR also has conflicts and failing CI renders
+`!cl !pushed !pulled !merge fail` with distinct foregrounds so they
+remain distinguishable. The chip labels (not the colors) distinguish
+push-direction from pull-direction, while `!cl` stays visually
+distinct from both divergence chips. All chips are rendered
 alongside `!cl` in `format_work_item_entry` (`src/ui.rs`).
+
+**Hard-block summary.** Four of the five chips double as merge
+pre-condition warnings - they signal states that will hard-block a
+Review -> Done transition when the live precheck re-verifies them
+against fresh `WorktreeService::list_worktrees` and
+`GithubClient::fetch_live_merge_state` fetches:
+
+| Chip      | Cached signal               | Merge block?                  |
+|-----------|-----------------------------|-------------------------------|
+| `!cl`     | `git_state.dirty`           | Yes (Dirty / Untracked)       |
+| `!pushed` | `git_state.ahead > 0`       | Yes (Unpushed)                |
+| `!pulled` | `git_state.behind > 0`      | No (soft warning only)        |
+| `!merge`  | `mergeable == Conflicting`  | Yes (PrConflict)              |
+| `fail`    | `checks == Failing`         | Yes (CiFailing)               |
+
+Pending CI (not a chip, but tracked on `PrInfo.checks`) is also
+non-blocking, but the pre-confirm merge modal surfaces a one-line
+"CI still running; merge will queue on branch protection." hint
+(see `App::merge_confirm_hint`). The hint is advisory: the live
+precheck is the only authority, so a stale cache can never refuse
+a merge that is actually fine - the worst case is a spurious
+reassurance line.
 
 Stage transitions: Shift+Right to advance, Shift+Left to retreat.
 

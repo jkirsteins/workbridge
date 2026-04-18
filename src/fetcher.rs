@@ -434,6 +434,7 @@ mod tests {
             review_requested_prs: vec![],
 
             error: None,
+            live_pr_state: None,
         });
 
         let (rx, handle) = start(
@@ -560,6 +561,7 @@ mod tests {
                 labels: vec![],
             }],
             error: None,
+            live_pr_state: None,
         });
 
         let repo_path = PathBuf::from("/tmp/test-extra-branches");
@@ -661,6 +663,7 @@ mod tests {
             error: Some(crate::github_client::GithubError::ApiError(
                 "simulated login failure".into(),
             )),
+            live_pr_state: None,
         });
 
         let (rx, handle) = start(

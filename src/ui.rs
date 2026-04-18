@@ -162,16 +162,18 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
     if app.confirm_merge {
         if app.merge_in_progress {
             let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
-            // While the live working-tree precheck is in flight we
-            // show a "Checking working tree..." body so the user knows
-            // the merge has not yet started shelling out to GitHub. As
-            // soon as `poll_merge_precheck` swaps the helper slot's
+            // While the live merge precheck is in flight we show a
+            // "Refreshing remote state..." body so the user knows
+            // that workbridge is re-verifying both the local
+            // worktree AND the remote PR state (mergeable flag + CI
+            // rollup) before shelling out to `gh pr merge`. As soon
+            // as `poll_merge_precheck` swaps the helper slot's
             // payload from `PrMergePrecheck` to `PrMerge`, the next
             // render switches to the "Merging pull request..." body
             // without re-laying out the dialog (same `KeyChoice`
             // shape, same spinner).
             let body = if app.is_merge_precheck_phase() {
-                format!("{spinner} Checking working tree... Please wait.")
+                format!("{spinner} Refreshing remote state... Please wait.")
             } else {
                 format!("{spinner} Merging pull request... Please wait.")
             };
@@ -186,13 +188,27 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
                 },
             );
         } else {
+            // Soft hint: if the cached repo state already hints that
+            // the live precheck may block (worktree dirty / unpushed
+            // / PR conflict / CI failing), append a dim reassurance
+            // line so the user knows the authoritative check is
+            // still ahead. Never refuses at the entry point based on
+            // stale cache - see `App::merge_confirm_hint` for the
+            // rationale.
+            let base = "Merge PR?";
+            let hint = app
+                .merge_wi_id
+                .as_ref()
+                .and_then(|wi_id| app.merge_confirm_hint(wi_id));
+            let body_owned = hint.map(|h| format!("{base}\n\n{h}"));
+            let body_str: &str = body_owned.as_deref().unwrap_or(base);
             draw_prompt_dialog(
                 buf,
                 theme,
                 area,
                 PromptDialogKind::KeyChoice {
                     title: "Merge Strategy",
-                    body: "Merge PR?",
+                    body: body_str,
                     options: &[
                         ("[s]", "Squash (default)"),
                         ("[m]", "Merge"),
@@ -2140,10 +2156,11 @@ fn format_work_item_entry<'a>(
     // is the union of modified-tracked-files and untracked-files (see
     // `GitState` doc comment). The merge guard lives in
     // `App::execute_merge` as a background
-    // `WorktreeService::list_worktrees` precheck and distinguishes the
-    // variants via `WorktreeCleanliness::from_worktree_info`. The chip
-    // render here is a pure cache read and cannot shell out,
-    // honouring the "no blocking I/O on the UI thread" invariant.
+    // `WorktreeService::list_worktrees` + `GithubClient::fetch_live_merge_state`
+    // precheck and distinguishes the variants via
+    // `MergeReadiness::classify`. The chip render here is a pure cache
+    // read and cannot shell out, honouring the "no blocking I/O on
+    // the UI thread" invariant.
     //
     // Ahead/behind state is rendered via the dedicated `!pushed` /
     // `!pulled` chips below; `!cl` is exclusively for "uncommitted

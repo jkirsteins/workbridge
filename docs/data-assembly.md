@@ -85,10 +85,13 @@ cached `WorktreeInfo` fields:
   - `GitState.dirty = wt.dirty || wt.untracked` - the union, because the
     `!cl` list chip treats both the same way. Callers that need to
     distinguish them (e.g. the merge-guard alert wording) go through
-    `WorktreeCleanliness::from_worktree_info`, which reads the raw
-    `WorktreeInfo` fields directly and returns a `WorktreeCleanliness`
-    enum. The merge guard runs that classifier against a fresh
-    `WorktreeService::list_worktrees` call inside
+    `MergeReadiness::classify`, which reads the raw `WorktreeInfo`
+    fields directly AND the live PR mergeable flag / CI rollup. The
+    classifier returns a `MergeReadiness` enum whose variants include
+    local-worktree states (`Dirty`, `Untracked`, `Unpushed`) and
+    remote-PR states (`PrConflict`, `CiFailing`). The merge guard runs
+    the classifier against a fresh `WorktreeService::list_worktrees`
+    call AND a fresh `GithubClient::fetch_live_merge_state` call inside
     `App::spawn_merge_precheck` (background thread), not against the
     cached `repo_data` projection - see `docs/UI.md` "merge guard"
     for the rationale.

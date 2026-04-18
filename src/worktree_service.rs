@@ -63,8 +63,7 @@ pub struct WorktreeInfo {
     /// the check was not attempted or failed; UI-thread readers treat
     /// `None` as "unknown" and fall back to their safe default. See the
     /// "Unclean worktree indicator + merge guard" flow for how the
-    /// live precheck feeds this through
-    /// `WorktreeCleanliness::from_worktree_info`.
+    /// live precheck feeds this through `MergeReadiness::classify`.
     pub dirty: Option<bool>,
     /// Cached answer to "does this worktree have any untracked files?" -
     /// populated by `list_worktrees` from the same

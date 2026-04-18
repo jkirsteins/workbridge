@@ -789,10 +789,10 @@ pub enum MergePreCheckMessage {
     /// in the helper map's `UserActionKey::PrMerge` slot - which is
     /// the source of truth for the in-flight precheck - so it does
     /// not ride in this variant. `reason` is the user-facing alert
-    /// text, identical to the wording the cached path used (it comes
-    /// from `WorktreeCleanliness::merge_block_message` for
-    /// dirty/untracked/unpushed and a custom string for the
-    /// "branch-not-found" / "list_worktrees failed" cases).
+    /// text (it comes from `MergeReadiness::merge_block_message` for
+    /// dirty / untracked / unpushed / PR-conflict / CI-failing, and
+    /// a custom string for the "list_worktrees failed" and
+    /// "fetch_live_merge_state failed" cases).
     Blocked { reason: String },
 }
 
@@ -811,26 +811,35 @@ pub struct ReviewSubmitResult {
     pub outcome: ReviewSubmitOutcome,
 }
 
-/// Classification of a worktree's local state relative to its upstream,
-/// returned by `WorktreeCleanliness::from_worktree_info`.
+/// Classification of the combined local + remote state of a PR-bearing
+/// work item, returned by `MergeReadiness::classify`.
 ///
 /// The variants are ordered by merge-guard priority: the classifier
-/// returns the first matching one, so `Dirty` wins over `Untracked`
-/// which wins over `Unpushed` which wins over `BehindOnly` which wins
-/// over `Clean`.
+/// returns the first matching one, so
+/// `Dirty > Untracked > Unpushed > PrConflict > CiFailing > BehindOnly
+/// > Clean`.
+///
+/// Local worktree states (`Dirty`, `Untracked`, `Unpushed`) rank above
+/// remote-PR states (`PrConflict`, `CiFailing`) because they represent
+/// the user's own in-flight work that would be lost or misrepresented
+/// if the merge proceeded. Fixing a local blocker may also resolve the
+/// PR blocker (e.g. pushing unpushed commits may update CI), so the
+/// local wording is the most actionable first step.
 ///
 /// `BehindOnly` is a soft-warning state: the worktree is behind its
 /// upstream but has nothing of its own to lose, so pushing would be
 /// the wrong fix and the branch is about to be deleted on merge
-/// anyway. Every other non-Clean variant blocks the Review -> Done
-/// merge transition because advancing without addressing it would
-/// either merge a PR that does not include the user's local work or
-/// destroy that work when `gh pr merge --delete-branch` deletes the
-/// local branch.
+/// anyway. Every other non-Clean variant (except `BehindOnly`) blocks
+/// the Review -> Done merge transition because advancing without
+/// addressing it would either merge a PR that does not include the
+/// user's local work, destroy that work when `gh pr merge
+/// --delete-branch` deletes the local branch, or merge against a base
+/// branch that will reject the merge at the server.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WorktreeCleanliness {
-    /// No uncommitted changes, no untracked files, and either
-    /// up-to-date with upstream or no upstream configured at all.
+pub enum MergeReadiness {
+    /// No uncommitted changes, no untracked files, no unpushed
+    /// commits, no PR conflicts, no failing CI. Either up-to-date
+    /// with upstream or no upstream configured at all.
     Clean,
     /// Tracked files are modified / staged / renamed / deleted but
     /// not committed.
@@ -842,46 +851,88 @@ pub enum WorktreeCleanliness {
     /// user must push before merging or their work will not be in
     /// the merged PR.
     Unpushed(u32),
+    /// GitHub reports the PR as `CONFLICTING` against its base branch.
+    /// Merging would either fail or create a merge commit with
+    /// unresolved conflict markers, depending on the strategy.
+    PrConflict,
+    /// The PR's CI rollup is `FAILURE`. Branch protection would
+    /// typically reject the merge; even if it doesn't, merging
+    /// known-broken code into the base branch is a footgun.
+    CiFailing,
     /// N commits exist on the upstream that are not local. Shown
     /// as a soft warning because merging is still safe.
     BehindOnly(u32),
 }
 
-impl WorktreeCleanliness {
-    /// Classify a single `WorktreeInfo` (typically from a fresh
-    /// `WorktreeService::list_worktrees` call inside the live merge
-    /// precheck) using the canonical Dirty > Untracked > Unpushed >
-    /// BehindOnly > Clean priority order. This is the single source
-    /// of truth for the classification, called from
-    /// `App::spawn_merge_precheck` to decide whether the live
-    /// worktree state blocks a Review -> Done merge. The cached
-    /// `repo_data.worktrees` is no longer consulted for that
-    /// decision - see `execute_merge` and the doc on
-    /// `MergePreCheckMessage` for the rationale.
+impl MergeReadiness {
+    /// Classify the combined live worktree + remote PR state using
+    /// the canonical priority order documented on the enum.
+    ///
+    /// Called exclusively from `App::spawn_merge_precheck` on a
+    /// background thread after fresh fetches from both
+    /// `WorktreeService::list_worktrees` and
+    /// `GithubClient::fetch_live_merge_state`. The cached
+    /// `RepoData.worktrees` / `PrInfo.mergeable` / `PrInfo.checks`
+    /// are not consulted by this path - see `execute_merge` and the
+    /// doc on `MergePreCheckMessage` for the rationale.
+    ///
+    /// `wt` is `Option<&WorktreeInfo>` so "no matching worktree"
+    /// (PR-only items and items whose worktree was removed after the
+    /// branch was pushed) is expressible at the type level without a
+    /// sentinel value: the local checks short-circuit to "nothing
+    /// to protect" and the PR checks still run.
     ///
     /// Field semantics mirror the docs on `WorktreeInfo`: `None` for
     /// any of `dirty`, `untracked`, `unpushed`, `behind_remote` means
     /// "the underlying check was not attempted or failed" and is
     /// treated as the safe default (`false` / `0`) so the worktree is
-    /// not falsely flagged when the cache is incomplete.
-    pub fn from_worktree_info(wt: &crate::worktree_service::WorktreeInfo) -> Self {
-        if wt.dirty.unwrap_or(false) {
-            return WorktreeCleanliness::Dirty;
+    /// not falsely flagged when a freshly-listed `WorktreeInfo` is
+    /// missing a field.
+    pub fn classify(
+        wt: Option<&crate::worktree_service::WorktreeInfo>,
+        live_pr: &crate::github_client::LivePrState,
+    ) -> Self {
+        // Local checks first: the user's own in-flight work takes
+        // priority over server-side constraints because fixing the
+        // local problem is a precondition for fixing the remote
+        // problem (a CONFLICTING PR cannot be resolved without
+        // committing locally, for instance).
+        if let Some(wt) = wt {
+            if wt.dirty.unwrap_or(false) {
+                return MergeReadiness::Dirty;
+            }
+            if wt.untracked.unwrap_or(false) {
+                return MergeReadiness::Untracked;
+            }
+            if let Some(ahead) = wt.unpushed
+                && ahead > 0
+            {
+                return MergeReadiness::Unpushed(ahead);
+            }
         }
-        if wt.untracked.unwrap_or(false) {
-            return WorktreeCleanliness::Untracked;
+
+        // Remote checks: only meaningful when an open PR exists.
+        if live_pr.has_open_pr {
+            if matches!(
+                live_pr.mergeable,
+                crate::work_item::MergeableState::Conflicting
+            ) {
+                return MergeReadiness::PrConflict;
+            }
+            if matches!(live_pr.check_rollup, crate::work_item::CheckStatus::Failing) {
+                return MergeReadiness::CiFailing;
+            }
         }
-        if let Some(ahead) = wt.unpushed
-            && ahead > 0
-        {
-            return WorktreeCleanliness::Unpushed(ahead);
-        }
-        if let Some(behind) = wt.behind_remote
+
+        // Soft warning - not a blocker.
+        if let Some(wt) = wt
+            && let Some(behind) = wt.behind_remote
             && behind > 0
         {
-            return WorktreeCleanliness::BehindOnly(behind);
+            return MergeReadiness::BehindOnly(behind);
         }
-        WorktreeCleanliness::Clean
+
+        MergeReadiness::Clean
     }
 
     /// User-facing error text for a blocking state, or `None` when
@@ -894,14 +945,14 @@ impl WorktreeCleanliness {
     /// and the message to disagree on which variants block.
     pub fn merge_block_message(&self) -> Option<&'static str> {
         match self {
-            WorktreeCleanliness::Dirty => {
-                Some("Uncommitted changes. Commit & push before merging.")
-            }
-            WorktreeCleanliness::Untracked => {
+            MergeReadiness::Dirty => Some("Uncommitted changes. Commit & push before merging."),
+            MergeReadiness::Untracked => {
                 Some("Untracked files. Commit/ignore & push before merging.")
             }
-            WorktreeCleanliness::Unpushed(_) => Some("Unpushed commits. Push before merging."),
-            WorktreeCleanliness::Clean | WorktreeCleanliness::BehindOnly(_) => None,
+            MergeReadiness::Unpushed(_) => Some("Unpushed commits. Push before merging."),
+            MergeReadiness::PrConflict => Some("PR has conflicts. Resolve before merging."),
+            MergeReadiness::CiFailing => Some("CI failing. Fix checks before merging."),
+            MergeReadiness::Clean | MergeReadiness::BehindOnly(_) => None,
         }
     }
 }
@@ -1330,7 +1381,7 @@ pub struct App {
     /// The dialog stays open with a spinner in this state.
     ///
     /// Set the moment `execute_merge` admits the `UserActionKey::PrMerge`
-    /// slot, so the modal renders the "Checking working tree..."
+    /// slot, so the modal renders the "Refreshing remote state..."
     /// spinner during the precheck phase as well as the actual
     /// `gh pr merge` phase. Cleared in `poll_pr_merge` /
     /// `poll_merge_precheck` on every terminal arm.
@@ -1436,6 +1487,16 @@ pub struct App {
     pub backend: Arc<dyn WorkItemBackend>,
     /// Worktree service for creating/listing worktrees.
     pub worktree_service: Arc<dyn WorktreeService + Send + Sync>,
+    /// GitHub client used by the merge precheck to re-fetch the live
+    /// PR mergeable flag and CI rollup before admitting a merge.
+    /// Injected via the trait so tests can drive the conflict /
+    /// CI-failing / no-PR / error branches without shelling out to
+    /// `gh`. Production threads a `GhCliClient` in via
+    /// `App::with_config_worktree_and_github`; the test-only default
+    /// constructor swaps in `StubGithubClient` which always reports
+    /// "no open PR" so the precheck classifier falls through to the
+    /// worktree-only classification.
+    pub github_client: Arc<dyn crate::github_client::GithubClient + Send + Sync>,
     /// GitHub pull-request closer, injected via trait so the background
     /// delete-cleanup thread can be exercised in tests without shelling
     /// out to `gh`. Production uses `GhPullRequestCloser`.
@@ -2233,11 +2294,41 @@ impl App {
     }
 
     /// Create a new App with the given config, backend, worktree service,
-    /// and config provider.
+    /// and config provider. Uses a `StubGithubClient` for the merge
+    /// precheck - production callers that need live GitHub queries
+    /// must use `with_config_worktree_and_github` instead.
+    ///
+    /// `#[cfg(test)]` because production threads a real
+    /// `GhCliClient` in via `with_config_worktree_and_github`; this
+    /// wrapper exists so the large existing body of tests does not
+    /// have to change signatures for the merge-readiness work.
+    #[cfg(test)]
     pub fn with_config_and_worktree_service(
         config: Config,
         backend: Arc<dyn WorkItemBackend>,
         worktree_service: Arc<dyn WorktreeService + Send + Sync>,
+        config_provider: Box<dyn ConfigProvider>,
+    ) -> Self {
+        Self::with_config_worktree_and_github(
+            config,
+            backend,
+            worktree_service,
+            Arc::new(crate::github_client::StubGithubClient),
+            config_provider,
+        )
+    }
+
+    /// Primary constructor. Same as `with_config_and_worktree_service`
+    /// but also accepts a `GithubClient` used by the merge precheck
+    /// to re-fetch the live PR mergeable flag and CI rollup.
+    /// Production `main.rs` passes `GhCliClient`; tests that exercise
+    /// the conflict / CI-failing / no-PR / error branches pass a
+    /// `MockGithubClient` with `live_pr_state` configured.
+    pub fn with_config_worktree_and_github(
+        config: Config,
+        backend: Arc<dyn WorkItemBackend>,
+        worktree_service: Arc<dyn WorktreeService + Send + Sync>,
+        github_client: Arc<dyn crate::github_client::GithubClient + Send + Sync>,
         config_provider: Box<dyn ConfigProvider>,
     ) -> Self {
         let active_repo_cache = canonicalize_repo_entries(config.active_repos());
@@ -2296,6 +2387,7 @@ impl App {
             create_dialog: CreateDialog::new(),
             backend,
             worktree_service,
+            github_client,
             work_items: Vec::new(),
             unlinked_prs: Vec::new(),
             review_requested_prs: Vec::new(),
@@ -9033,9 +9125,10 @@ impl App {
     /// long-running sessions: a user who fixed a dirty worktree
     /// minutes ago could still see the "Uncommitted changes" alert
     /// when trying to merge. The precheck phase replaces that read
-    /// with a live `WorktreeService::list_worktrees` call on a
-    /// background thread, so the merge guard always reflects the
-    /// current state of the worktree.
+    /// with a live `WorktreeService::list_worktrees` call (plus a
+    /// live `GithubClient::fetch_live_merge_state` call for the
+    /// remote PR state) on a background thread, so the merge guard
+    /// always reflects the current state.
     pub fn execute_merge(&mut self, wi_id: &WorkItemId, strategy: &str) {
         // Single-flight guard via the user-action helper. Rejecting when
         // another merge is already in flight preserves the existing alert
@@ -9111,7 +9204,7 @@ impl App {
         }
         // Hide the status-bar spinner: the merge modal already renders
         // its own in-progress spinner (and now also the
-        // "Checking working tree..." precheck spinner), and stacking
+        // "Refreshing remote state..." precheck spinner), and stacking
         // two is confusing. The helper map entry is still the single
         // source of truth for `is_user_action_in_flight(&PrMerge)`.
         if let Some(state) = self.user_actions.in_flight.get(&UserActionKey::PrMerge) {
@@ -9120,9 +9213,9 @@ impl App {
         }
 
         // Modal renders the spinner from the moment the user pressed
-        // "merge" - the precheck phase shows "Checking working tree..."
-        // and the merge phase shows "Merging pull request...". The
-        // renderer in `src/ui.rs` keys off
+        // "merge" - the precheck phase shows "Refreshing remote
+        // state..." and the merge phase shows "Merging pull
+        // request...". The renderer in `src/ui.rs` keys off
         // `App::is_merge_precheck_phase()` to pick the right body,
         // which checks the helper slot's `UserActionPayload` variant.
         self.merge_in_progress = true;
@@ -9136,14 +9229,24 @@ impl App {
         );
     }
 
-    /// Spawn the live working-tree precheck for an in-flight merge.
+    /// Spawn the live merge precheck for an in-flight merge.
     ///
-    /// Runs `WorktreeService::list_worktrees` on a background thread
-    /// and translates the result into a `MergePreCheckMessage`:
-    /// `Ready` if `WorktreeCleanliness::merge_block_message` returns
-    /// `None` for the live `WorktreeInfo`, otherwise `Blocked` with
-    /// the same user-facing wording the cached path used. The
-    /// receiver is stored structurally inside the helper slot's
+    /// Runs two live fetches on a background thread:
+    /// 1. `WorktreeService::list_worktrees` for the local worktree
+    ///    state (dirty / untracked / unpushed).
+    /// 2. `GithubClient::fetch_live_merge_state` for the remote PR
+    ///    state (mergeable flag + CI rollup).
+    ///
+    /// The results are handed to `MergeReadiness::classify` which
+    /// encodes the canonical priority order
+    /// `Dirty > Untracked > Unpushed > PrConflict > CiFailing >
+    /// BehindOnly > Clean`, and
+    /// `MergeReadiness::merge_block_message` translates the
+    /// classification to the user-facing alert string. A `None`
+    /// message means the precheck clears the merge; any `Some` is
+    /// reported via `MergePreCheckMessage::Blocked`.
+    ///
+    /// The receiver is stored structurally inside the helper slot's
     /// `UserActionPayload::PrMergePrecheck` variant via
     /// `attach_user_action_payload`, so any cancel path that calls
     /// `end_user_action(&UserActionKey::PrMerge)` automatically
@@ -9151,20 +9254,28 @@ impl App {
     /// next ~200ms background tick.
     ///
     /// No-worktree fallthrough: if `list_worktrees` returns no entry
-    /// matching `branch`, the precheck reports `Ready`, not
-    /// `Blocked`. PR-only / reassembled work items - and items whose
-    /// local worktree was removed after the branch was pushed - have
-    /// no checked-out tree to protect, so there is nothing for the
-    /// dirty / untracked / unpushed guards to flag. Refusing to
-    /// merge in that case would make perfectly safe PRs unmergeable
-    /// from the UI. The cached guard this replaced treated a missing
-    /// cache entry as `Clean` for the same reason.
+    /// matching `branch`, the precheck passes `None` to
+    /// `MergeReadiness::classify` and the local checks short-circuit
+    /// to "nothing to protect". PR-only / reassembled work items -
+    /// and items whose local worktree was removed after the branch
+    /// was pushed - have no checked-out tree to protect, so there is
+    /// nothing for the dirty / untracked / unpushed guards to flag.
+    /// Refusing to merge in that case would make perfectly safe PRs
+    /// unmergeable from the UI. The cached guard this replaced
+    /// treated a missing cache entry as `Clean` for the same reason.
+    ///
+    /// No-PR fallthrough: if `fetch_live_merge_state` reports
+    /// `has_open_pr: false`, the remote checks short-circuit to "no
+    /// remote constraints" and the classifier falls back to the
+    /// local state. The downstream merge thread then surfaces the
+    /// existing `NoPr` outcome.
     ///
     /// Blocking-I/O note: every call inside the spawned closure
-    /// (`list_worktrees`) is allowed to block - that is the entire
-    /// reason it lives off the main thread. The UI thread sees only
-    /// the receiver and the `MergePreCheckMessage`. See `docs/UI.md`
-    /// "Blocking I/O Prohibition".
+    /// (`list_worktrees`, `fetch_live_merge_state`) is allowed to
+    /// block - that is the entire reason they live off the main
+    /// thread. The UI thread sees only the receiver and the
+    /// `MergePreCheckMessage`. See `docs/UI.md` "Blocking I/O
+    /// Prohibition".
     fn spawn_merge_precheck(
         &mut self,
         wi_id: WorkItemId,
@@ -9175,6 +9286,7 @@ impl App {
     ) {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ws = Arc::clone(&self.worktree_service);
+        let github = Arc::clone(&self.github_client);
         let wi_id_for_thread = wi_id;
         let strategy_for_thread = strategy;
         let repo_path_for_thread = repo_path;
@@ -9182,42 +9294,68 @@ impl App {
         let owner_repo_for_thread = owner_repo;
 
         std::thread::spawn(move || {
-            // Live source-of-truth check via the injectable
-            // WorktreeService. Reusing list_worktrees keeps the test
-            // harness identical to the fetcher path - any mock that
-            // returns a clean `WorktreeInfo` for the fetcher will
-            // return clean here too.
-            let result = ws.list_worktrees(&repo_path_for_thread);
-            let msg = match result {
-                Ok(worktrees) => {
-                    let wt = worktrees
-                        .into_iter()
-                        .find(|w| w.branch.as_deref() == Some(&branch_for_thread));
-                    // No matching worktree is treated as Ready, NOT
-                    // Blocked: PR-only items and items whose worktree
-                    // was removed after pushing have no local tree to
-                    // protect. See the doc comment for the rationale.
-                    let cleanliness = wt
-                        .as_ref()
-                        .map(WorktreeCleanliness::from_worktree_info)
-                        .unwrap_or(WorktreeCleanliness::Clean);
-                    if let Some(reason) = cleanliness.merge_block_message() {
-                        MergePreCheckMessage::Blocked {
-                            reason: reason.to_string(),
-                        }
-                    } else {
-                        MergePreCheckMessage::Ready {
-                            wi_id: wi_id_for_thread,
-                            strategy: strategy_for_thread,
-                            branch: branch_for_thread,
-                            repo_path: repo_path_for_thread,
-                            owner_repo: owner_repo_for_thread,
-                        }
-                    }
+            // 1. Live worktree state. Reusing list_worktrees keeps
+            //    the test harness identical to the fetcher path -
+            //    any mock that returns a clean `WorktreeInfo` for
+            //    the fetcher will return clean here too.
+            let worktrees = match ws.list_worktrees(&repo_path_for_thread) {
+                Ok(list) => list,
+                Err(e) => {
+                    let _ = tx.send(MergePreCheckMessage::Blocked {
+                        reason: format!("Cannot merge: working-tree check failed: {e}"),
+                    });
+                    return;
                 }
-                Err(e) => MergePreCheckMessage::Blocked {
-                    reason: format!("Cannot merge: working-tree check failed: {e}"),
-                },
+            };
+            let wt = worktrees
+                .into_iter()
+                .find(|w| w.branch.as_deref() == Some(&branch_for_thread));
+
+            // 2. Live remote PR state. Split `owner_repo` at the
+            //    first `/` - the caller guarantees this shape in
+            //    `execute_merge`, which derives it from
+            //    `repo_data[path].github_remote`. If the split fails
+            //    (malformed remote URL), block with a diagnostic
+            //    alert - the P0 "surface errors, don't auto-fix"
+            //    posture.
+            let (owner, repo) = match owner_repo_for_thread.split_once('/') {
+                Some((o, r)) if !o.is_empty() && !r.is_empty() => (o.to_string(), r.to_string()),
+                _ => {
+                    let _ = tx.send(MergePreCheckMessage::Blocked {
+                        reason: format!(
+                            "Cannot merge: malformed owner/repo identifier: {owner_repo_for_thread}"
+                        ),
+                    });
+                    return;
+                }
+            };
+            let live_pr = match github.fetch_live_merge_state(&owner, &repo, &branch_for_thread) {
+                Ok(state) => state,
+                Err(e) => {
+                    let _ = tx.send(MergePreCheckMessage::Blocked {
+                        reason: format!("Cannot merge: remote merge-state check failed: {e}"),
+                    });
+                    return;
+                }
+            };
+
+            // 3. Classify the combined state and translate to the
+            //    precheck message. `classify` owns the priority
+            //    order; `merge_block_message` owns the user-facing
+            //    wording.
+            let readiness = MergeReadiness::classify(wt.as_ref(), &live_pr);
+            let msg = if let Some(reason) = readiness.merge_block_message() {
+                MergePreCheckMessage::Blocked {
+                    reason: reason.to_string(),
+                }
+            } else {
+                MergePreCheckMessage::Ready {
+                    wi_id: wi_id_for_thread,
+                    strategy: strategy_for_thread,
+                    branch: branch_for_thread,
+                    repo_path: repo_path_for_thread,
+                    owner_repo: owner_repo_for_thread,
+                }
             };
             let _ = tx.send(msg);
         });
@@ -9239,14 +9377,72 @@ impl App {
     /// precheck phase - i.e. its payload is
     /// `UserActionPayload::PrMergePrecheck`. Used by the merge
     /// confirm modal renderer in `src/ui.rs` to switch between the
-    /// "Checking working tree..." and "Merging pull request..." body
-    /// strings without touching internal helper-map fields. Pure
-    /// in-memory check, safe on the UI thread.
+    /// "Refreshing remote state..." and "Merging pull request..."
+    /// body strings without touching internal helper-map fields.
+    /// Pure in-memory check, safe on the UI thread.
     pub fn is_merge_precheck_phase(&self) -> bool {
         matches!(
             self.user_action_payload(&UserActionKey::PrMerge),
             Some(UserActionPayload::PrMergePrecheck { .. })
         )
+    }
+
+    /// Optional hint line appended to the merge-confirm modal body
+    /// whenever the cached repo state already shows a signal that
+    /// the live precheck is likely to block on.
+    ///
+    /// This is a soft, advisory hint - it never refuses to open the
+    /// modal and never short-circuits the precheck. The whole point
+    /// of the precheck is that cache can be stale, so the cached
+    /// state is consulted ONLY for a textual reassurance, never for
+    /// a go / no-go decision. If the cache is stale the worst case
+    /// is a spurious hint; the precheck still runs and is
+    /// authoritative.
+    ///
+    /// Returned variants:
+    /// - `Some("Live re-check will run before merging.")` when any
+    ///   of `git_state.dirty`, `git_state.ahead > 0`,
+    ///   `PrInfo.mergeable == Conflicting`, or `PrInfo.checks ==
+    ///   Failing` is observed on any repo association.
+    /// - `Some("CI still running; merge will queue on branch
+    ///   protection.")` when the ONLY concerning signal is
+    ///   `PrInfo.checks == Pending` (no other hard-block hint
+    ///   fires). Pending CI does not block the merge but the user
+    ///   may still want to know that branch protection will queue
+    ///   the merge until checks land.
+    /// - `None` in all other cases.
+    ///
+    /// Pure in-memory read, safe on the UI thread.
+    pub fn merge_confirm_hint(&self, wi_id: &WorkItemId) -> Option<&'static str> {
+        let wi = self.work_items.iter().find(|w| &w.id == wi_id)?;
+
+        let mut hard_block = false;
+        let mut pending_only = false;
+        for assoc in &wi.repo_associations {
+            if let Some(gs) = assoc.git_state.as_ref()
+                && (gs.dirty || gs.ahead > 0)
+            {
+                hard_block = true;
+            }
+            if let Some(pr) = assoc.pr.as_ref() {
+                if matches!(pr.mergeable, crate::work_item::MergeableState::Conflicting) {
+                    hard_block = true;
+                }
+                match pr.checks {
+                    crate::work_item::CheckStatus::Failing => hard_block = true,
+                    crate::work_item::CheckStatus::Pending => pending_only = true,
+                    _ => {}
+                }
+            }
+        }
+
+        if hard_block {
+            Some("Live re-check will run before merging.")
+        } else if pending_only {
+            Some("CI still running; merge will queue on branch protection.")
+        } else {
+            None
+        }
     }
 
     /// Drain the live merge precheck receiver on the background tick.
@@ -9311,12 +9507,13 @@ impl App {
                 self.perform_merge_after_precheck(wi_id, strategy, branch, repo_path, owner_repo);
             }
             MergePreCheckMessage::Blocked { reason } => {
-                // The live worktree state blocks the merge. Release
-                // the helper slot (which drops the precheck receiver
+                // The live state blocks the merge. Release the
+                // helper slot (which drops the precheck receiver
                 // structurally), clear the modal, and surface the
                 // user-facing reason. The wording for the
-                // dirty/untracked/unpushed cases comes from
-                // `WorktreeCleanliness::merge_block_message`.
+                // dirty / untracked / unpushed / PR-conflict /
+                // CI-failing cases comes from
+                // `MergeReadiness::merge_block_message`.
                 self.confirm_merge = false;
                 self.merge_wi_id = None;
                 self.merge_in_progress = false;
@@ -15979,17 +16176,17 @@ mod tests {
         app.selected_item = Some(app.display_list.len() - 1);
     }
 
-    /// Priority ordering contract of
-    /// `WorktreeCleanliness::from_worktree_info`:
-    ///   Dirty > Untracked > Unpushed > BehindOnly > Clean
+    /// Priority ordering contract of `MergeReadiness::classify`:
+    ///   Dirty > Untracked > Unpushed > PrConflict > CiFailing >
+    ///   BehindOnly > Clean
     ///
     /// This is the single canonical classifier used by the live
     /// merge precheck (`spawn_merge_precheck`). Any drift on the
-    /// priority would make `dirty + untracked + unpushed` worktrees
-    /// surface a wrong-flavor block message, so the order is pinned
-    /// here.
+    /// priority would make a worktree with multiple concurrent
+    /// blockers surface a wrong-flavor block message, so the order
+    /// is pinned here.
     #[test]
-    fn worktree_cleanliness_priority_order() {
+    fn merge_readiness_classifies_priority_order() {
         fn wt(
             dirty: Option<bool>,
             untracked: Option<bool>,
@@ -16008,59 +16205,117 @@ mod tests {
             }
         }
 
-        // Dirty wins over everything else.
+        use crate::github_client::LivePrState;
+        use crate::work_item::{CheckStatus, MergeableState};
+
+        let clean_pr = LivePrState::no_pr();
+        let conflict_pr = LivePrState {
+            mergeable: MergeableState::Conflicting,
+            check_rollup: CheckStatus::Passing,
+            has_open_pr: true,
+        };
+        let ci_failing_pr = LivePrState {
+            mergeable: MergeableState::Mergeable,
+            check_rollup: CheckStatus::Failing,
+            has_open_pr: true,
+        };
+        let ci_pending_pr = LivePrState {
+            mergeable: MergeableState::Mergeable,
+            check_rollup: CheckStatus::Pending,
+            has_open_pr: true,
+        };
+        let mergeable_pr = LivePrState {
+            mergeable: MergeableState::Mergeable,
+            check_rollup: CheckStatus::Passing,
+            has_open_pr: true,
+        };
+
+        // Dirty wins over every other blocker (including PR conflict
+        // + CI failing).
+        let wt_all_bad = wt(Some(true), Some(true), Some(5), Some(5));
         assert_eq!(
-            WorktreeCleanliness::from_worktree_info(&wt(Some(true), Some(true), Some(5), Some(5),)),
-            WorktreeCleanliness::Dirty,
+            MergeReadiness::classify(Some(&wt_all_bad), &conflict_pr),
+            MergeReadiness::Dirty,
+        );
+        assert_eq!(
+            MergeReadiness::classify(Some(&wt_all_bad), &ci_failing_pr),
+            MergeReadiness::Dirty,
         );
 
         // Untracked wins over Unpushed + BehindOnly.
+        let wt_untracked = wt(Some(false), Some(true), Some(3), Some(3));
         assert_eq!(
-            WorktreeCleanliness::from_worktree_info(
-                &wt(Some(false), Some(true), Some(3), Some(3),)
-            ),
-            WorktreeCleanliness::Untracked,
+            MergeReadiness::classify(Some(&wt_untracked), &clean_pr),
+            MergeReadiness::Untracked,
         );
 
-        // Unpushed wins over BehindOnly.
+        // Unpushed wins over BehindOnly (and over any PR state).
+        let wt_unpushed = wt(Some(false), Some(false), Some(2), Some(4));
         assert_eq!(
-            WorktreeCleanliness::from_worktree_info(&wt(
-                Some(false),
-                Some(false),
-                Some(2),
-                Some(4),
-            )),
-            WorktreeCleanliness::Unpushed(2),
+            MergeReadiness::classify(Some(&wt_unpushed), &conflict_pr),
+            MergeReadiness::Unpushed(2),
         );
 
-        // BehindOnly when only behind.
+        // Clean worktree + PR conflict => PrConflict.
+        let wt_clean = wt(Some(false), Some(false), Some(0), Some(0));
         assert_eq!(
-            WorktreeCleanliness::from_worktree_info(&wt(
-                Some(false),
-                Some(false),
-                Some(0),
-                Some(7),
-            )),
-            WorktreeCleanliness::BehindOnly(7),
+            MergeReadiness::classify(Some(&wt_clean), &conflict_pr),
+            MergeReadiness::PrConflict,
+        );
+
+        // Clean worktree + mergeable PR + failing CI => CiFailing.
+        assert_eq!(
+            MergeReadiness::classify(Some(&wt_clean), &ci_failing_pr),
+            MergeReadiness::CiFailing,
+        );
+
+        // Clean worktree + mergeable PR + pending CI => Clean
+        // (pending does not block).
+        assert_eq!(
+            MergeReadiness::classify(Some(&wt_clean), &ci_pending_pr),
+            MergeReadiness::Clean,
+        );
+
+        // Clean worktree + mergeable PR + passing CI => Clean.
+        assert_eq!(
+            MergeReadiness::classify(Some(&wt_clean), &mergeable_pr),
+            MergeReadiness::Clean,
+        );
+
+        // No local worktree + PR conflict => PrConflict (PR-only
+        // items still block on the remote signal).
+        assert_eq!(
+            MergeReadiness::classify(None, &conflict_pr),
+            MergeReadiness::PrConflict,
+        );
+
+        // No local worktree + no PR => Clean (nothing to protect
+        // and no remote constraints).
+        assert_eq!(
+            MergeReadiness::classify(None, &clean_pr),
+            MergeReadiness::Clean,
+        );
+
+        // BehindOnly when worktree is only behind and PR is mergeable.
+        let wt_behind = wt(Some(false), Some(false), Some(0), Some(7));
+        assert_eq!(
+            MergeReadiness::classify(Some(&wt_behind), &mergeable_pr),
+            MergeReadiness::BehindOnly(7),
         );
 
         // All zero / clean.
         assert_eq!(
-            WorktreeCleanliness::from_worktree_info(&wt(
-                Some(false),
-                Some(false),
-                Some(0),
-                Some(0),
-            )),
-            WorktreeCleanliness::Clean,
+            MergeReadiness::classify(Some(&wt_clean), &clean_pr),
+            MergeReadiness::Clean,
         );
 
         // All-None fields (fetcher check not yet run) => Clean: the
         // safe default that lets the live precheck proceed and
         // re-classify against fresh data.
+        let wt_all_none = wt(None, None, None, None);
         assert_eq!(
-            WorktreeCleanliness::from_worktree_info(&wt(None, None, None, None)),
-            WorktreeCleanliness::Clean,
+            MergeReadiness::classify(Some(&wt_all_none), &clean_pr),
+            MergeReadiness::Clean,
         );
     }
 
@@ -16072,13 +16327,15 @@ mod tests {
     /// both that contract and the user-facing wording so copy
     /// edits to `merge_block_message` get caught.
     #[test]
-    fn worktree_cleanliness_merge_block_message_classifies_correctly() {
+    fn merge_readiness_merge_block_message_classifies_correctly() {
         for (state, blocking) in [
-            (WorktreeCleanliness::Clean, false),
-            (WorktreeCleanliness::Dirty, true),
-            (WorktreeCleanliness::Untracked, true),
-            (WorktreeCleanliness::Unpushed(1), true),
-            (WorktreeCleanliness::BehindOnly(1), false),
+            (MergeReadiness::Clean, false),
+            (MergeReadiness::Dirty, true),
+            (MergeReadiness::Untracked, true),
+            (MergeReadiness::Unpushed(1), true),
+            (MergeReadiness::PrConflict, true),
+            (MergeReadiness::CiFailing, true),
+            (MergeReadiness::BehindOnly(1), false),
         ] {
             assert_eq!(
                 state.merge_block_message().is_some(),
@@ -16088,23 +16345,269 @@ mod tests {
         }
         // Spot-check the specific wording so copy edits are caught.
         assert!(
-            WorktreeCleanliness::Dirty
+            MergeReadiness::Dirty
                 .merge_block_message()
                 .unwrap()
                 .contains("Uncommitted changes"),
         );
         assert!(
-            WorktreeCleanliness::Untracked
+            MergeReadiness::Untracked
                 .merge_block_message()
                 .unwrap()
                 .contains("Untracked files"),
         );
         assert!(
-            WorktreeCleanliness::Unpushed(3)
+            MergeReadiness::Unpushed(3)
                 .merge_block_message()
                 .unwrap()
                 .contains("Unpushed commits"),
         );
+        assert!(
+            MergeReadiness::PrConflict
+                .merge_block_message()
+                .unwrap()
+                .contains("PR has conflicts"),
+        );
+        assert!(
+            MergeReadiness::CiFailing
+                .merge_block_message()
+                .unwrap()
+                .contains("CI failing"),
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // App::merge_confirm_hint - soft, cache-based hint shown in the
+    // pre-confirm merge modal. Never refuses; always advisory.
+    // -------------------------------------------------------------------
+
+    /// Helper used by the hint tests: push a Review-stage item with a
+    /// single association whose `PrInfo` + `GitState` are fully
+    /// configurable. Mirrors `push_selected_review_item` but exposes
+    /// the state fields the hint reads.
+    #[allow(clippy::too_many_arguments)]
+    fn push_review_item_with_state(
+        app: &mut App,
+        wi_id: &WorkItemId,
+        dirty: bool,
+        ahead: u32,
+        behind: u32,
+        pr_checks: crate::work_item::CheckStatus,
+        pr_mergeable: crate::work_item::MergeableState,
+    ) {
+        use crate::work_item::{GitState, PrInfo, PrState, ReviewDecision};
+        let repo_path = PathBuf::from("/tmp/hint-tests-repo");
+        let branch = "feature/hint-tests".to_string();
+        app.work_items.push(crate::work_item::WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: crate::work_item::WorkItemKind::Own,
+            title: "hint-test".into(),
+            display_id: None,
+            description: None,
+            status: WorkItemStatus::Review,
+            status_derived: false,
+            repo_associations: vec![crate::work_item::RepoAssociation {
+                repo_path,
+                branch: Some(branch),
+                worktree_path: None,
+                pr: Some(PrInfo {
+                    number: 42,
+                    title: "hint-test PR".into(),
+                    state: PrState::Open,
+                    is_draft: false,
+                    review_decision: ReviewDecision::Approved,
+                    checks: pr_checks,
+                    mergeable: pr_mergeable,
+                    url: "https://example.com/pr/42".into(),
+                }),
+                issue: None,
+                git_state: Some(GitState {
+                    dirty,
+                    ahead,
+                    behind,
+                }),
+                stale_worktree_path: None,
+            }],
+            errors: vec![],
+        });
+    }
+
+    /// No-hint case: everything is clean / passing / mergeable.
+    #[test]
+    fn merge_confirm_hint_returns_none_when_all_clean() {
+        use crate::work_item::{CheckStatus, MergeableState};
+
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/hint-all-clean.json"));
+        push_review_item_with_state(
+            &mut app,
+            &wi_id,
+            false,
+            0,
+            0,
+            CheckStatus::Passing,
+            MergeableState::Mergeable,
+        );
+
+        assert_eq!(app.merge_confirm_hint(&wi_id), None);
+    }
+
+    /// Live-recheck hint when `git_state.dirty` is set, even if the
+    /// PR is mergeable and CI passes.
+    #[test]
+    fn merge_confirm_hint_returns_live_recheck_when_dirty() {
+        use crate::work_item::{CheckStatus, MergeableState};
+
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/hint-dirty.json"));
+        push_review_item_with_state(
+            &mut app,
+            &wi_id,
+            true,
+            0,
+            0,
+            CheckStatus::Passing,
+            MergeableState::Mergeable,
+        );
+
+        assert_eq!(
+            app.merge_confirm_hint(&wi_id),
+            Some("Live re-check will run before merging."),
+        );
+    }
+
+    /// Live-recheck hint when `git_state.ahead > 0` (unpushed commits).
+    #[test]
+    fn merge_confirm_hint_returns_live_recheck_when_unpushed() {
+        use crate::work_item::{CheckStatus, MergeableState};
+
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/hint-unpushed.json"));
+        push_review_item_with_state(
+            &mut app,
+            &wi_id,
+            false,
+            3,
+            0,
+            CheckStatus::Passing,
+            MergeableState::Mergeable,
+        );
+
+        assert_eq!(
+            app.merge_confirm_hint(&wi_id),
+            Some("Live re-check will run before merging."),
+        );
+    }
+
+    /// Live-recheck hint when the PR is CONFLICTING (even with a
+    /// clean worktree and passing CI).
+    #[test]
+    fn merge_confirm_hint_returns_live_recheck_when_pr_conflict() {
+        use crate::work_item::{CheckStatus, MergeableState};
+
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/hint-pr-conflict.json"));
+        push_review_item_with_state(
+            &mut app,
+            &wi_id,
+            false,
+            0,
+            0,
+            CheckStatus::Passing,
+            MergeableState::Conflicting,
+        );
+
+        assert_eq!(
+            app.merge_confirm_hint(&wi_id),
+            Some("Live re-check will run before merging."),
+        );
+    }
+
+    /// Live-recheck hint when CI is failing (even with a clean
+    /// worktree and mergeable PR).
+    #[test]
+    fn merge_confirm_hint_returns_live_recheck_when_ci_failing() {
+        use crate::work_item::{CheckStatus, MergeableState};
+
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/hint-ci-fail.json"));
+        push_review_item_with_state(
+            &mut app,
+            &wi_id,
+            false,
+            0,
+            0,
+            CheckStatus::Failing,
+            MergeableState::Mergeable,
+        );
+
+        assert_eq!(
+            app.merge_confirm_hint(&wi_id),
+            Some("Live re-check will run before merging."),
+        );
+    }
+
+    /// Pending-only hint: clean worktree + mergeable PR + CI still
+    /// running surfaces the branch-protection reassurance instead of
+    /// the hard-block hint. Pending CI does not block the merge - it
+    /// simply queues on branch protection, which this wording
+    /// communicates.
+    #[test]
+    fn merge_confirm_hint_returns_ci_pending_variant() {
+        use crate::work_item::{CheckStatus, MergeableState};
+
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/hint-ci-pending.json"));
+        push_review_item_with_state(
+            &mut app,
+            &wi_id,
+            false,
+            0,
+            0,
+            CheckStatus::Pending,
+            MergeableState::Mergeable,
+        );
+
+        assert_eq!(
+            app.merge_confirm_hint(&wi_id),
+            Some("CI still running; merge will queue on branch protection."),
+        );
+    }
+
+    /// Hard-block hint takes priority over pending CI: a dirty
+    /// worktree + pending CI returns the "Live re-check" variant,
+    /// not the "CI still running" variant.
+    #[test]
+    fn merge_confirm_hint_hard_block_wins_over_pending() {
+        use crate::work_item::{CheckStatus, MergeableState};
+
+        let mut app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/hint-dirty-and-pending.json"));
+        push_review_item_with_state(
+            &mut app,
+            &wi_id,
+            true,
+            0,
+            0,
+            CheckStatus::Pending,
+            MergeableState::Mergeable,
+        );
+
+        assert_eq!(
+            app.merge_confirm_hint(&wi_id),
+            Some("Live re-check will run before merging."),
+        );
+    }
+
+    /// `merge_confirm_hint` on a non-existent work item returns
+    /// `None` without panicking. Mirrors defensive UI code paths that
+    /// may hold a `WorkItemId` after reassembly dropped the item.
+    #[test]
+    fn merge_confirm_hint_returns_none_for_missing_wi_id() {
+        let app = App::new();
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/hint-missing.json"));
+        assert_eq!(app.merge_confirm_hint(&wi_id), None);
     }
 
     /// Regression: a stale `dirty: true` cache on the primary
@@ -16283,8 +16786,8 @@ mod tests {
     ///    helper reserves the slot across BOTH the precheck phase and
     ///    the actual merge phase).
     /// 3. `merge_in_progress` is set so the modal renders the
-    ///    "Checking working tree..." spinner from the moment the user
-    ///    pressed merge.
+    ///    "Refreshing remote state..." spinner from the moment the
+    ///    user pressed merge.
     /// 4. The slot's payload is `UserActionPayload::PrMergePrecheck`,
     ///    i.e. the precheck phase is in flight (and
     ///    `is_merge_precheck_phase()` returns true).
@@ -16954,6 +17457,438 @@ mod tests {
         assert!(
             app.confirm_merge,
             "merge modal must stay open through the handoff to the merge thread",
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Live remote PR precheck: conflict / CI failure / clean / error
+    // -------------------------------------------------------------------
+
+    /// Helper to build an `App` with both a clean-worktree stub and a
+    /// configurable `MockGithubClient` driving the
+    /// `fetch_live_merge_state` return. Used by the remote-precheck
+    /// tests below.
+    #[allow(clippy::too_many_arguments)]
+    fn install_live_pr_precheck_app(
+        live_pr_state: Option<Result<crate::github_client::LivePrState, GithubError>>,
+        branch: &str,
+        repo: &std::path::Path,
+        cache_dirty: Option<bool>,
+        cache_untracked: Option<bool>,
+        cache_unpushed: Option<u32>,
+    ) -> (App, WorkItemId) {
+        use crate::config::InMemoryConfigProvider;
+        use crate::github_client::MockGithubClient;
+        use crate::worktree_service::{WorktreeError, WorktreeInfo};
+
+        struct CleanWorktreeMock {
+            branch: String,
+            repo: PathBuf,
+        }
+        impl WorktreeService for CleanWorktreeMock {
+            fn list_worktrees(
+                &self,
+                repo_path: &std::path::Path,
+            ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+                assert_eq!(repo_path, self.repo);
+                Ok(vec![WorktreeInfo {
+                    path: self.repo.join(".worktrees").join(&self.branch),
+                    branch: Some(self.branch.clone()),
+                    is_main: false,
+                    has_commits_ahead: Some(false),
+                    dirty: Some(false),
+                    untracked: Some(false),
+                    unpushed: Some(0),
+                    behind_remote: Some(0),
+                }])
+            }
+            fn create_worktree(
+                &self,
+                _: &std::path::Path,
+                _: &str,
+                _: &std::path::Path,
+            ) -> Result<WorktreeInfo, WorktreeError> {
+                Err(WorktreeError::GitError("not used".into()))
+            }
+            fn remove_worktree(
+                &self,
+                _: &std::path::Path,
+                _: &std::path::Path,
+                _: bool,
+                _: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn delete_branch(
+                &self,
+                _: &std::path::Path,
+                _: &str,
+                _: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn default_branch(&self, _: &std::path::Path) -> Result<String, WorktreeError> {
+                Ok("main".to_string())
+            }
+            fn github_remote(
+                &self,
+                _: &std::path::Path,
+            ) -> Result<Option<(String, String)>, WorktreeError> {
+                Ok(None)
+            }
+            fn fetch_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn create_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn prune_worktrees(&self, _: &std::path::Path) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+        }
+
+        let github = MockGithubClient {
+            prs: Vec::new(),
+            review_requested_prs: Vec::new(),
+            issues: Vec::new(),
+            error: None,
+            live_pr_state,
+        };
+
+        let worktree_service: Arc<dyn WorktreeService + Send + Sync> =
+            Arc::new(CleanWorktreeMock {
+                branch: branch.to_string(),
+                repo: repo.to_path_buf(),
+            });
+
+        let mut app = App::with_config_worktree_and_github(
+            Config::default(),
+            Arc::new(StubBackend),
+            worktree_service,
+            Arc::new(github),
+            Box::new(InMemoryConfigProvider::new()),
+        );
+
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            repo,
+            branch,
+            cache_dirty,
+            cache_untracked,
+            cache_unpushed,
+            Some(0),
+        );
+        let wi_id = WorkItemId::LocalFile(repo.join(format!("{}.json", branch.replace('/', "-"))));
+        push_selected_review_item(&mut app, &wi_id, repo, branch);
+        app.confirm_merge = true;
+        app.merge_wi_id = Some(wi_id.clone());
+
+        (app, wi_id)
+    }
+
+    /// Clean worktree + PR with `mergeable == CONFLICTING` => precheck
+    /// blocks with "PR has conflicts. ..." and releases the slot.
+    #[test]
+    fn execute_merge_through_live_precheck_blocks_on_pr_conflict() {
+        use crate::github_client::LivePrState;
+        use crate::work_item::{CheckStatus, MergeableState};
+
+        let repo = PathBuf::from("/tmp/exec-merge-pr-conflict");
+        let branch = "feature/pr-conflict";
+        let (mut app, wi_id) = install_live_pr_precheck_app(
+            Some(Ok(LivePrState {
+                mergeable: MergeableState::Conflicting,
+                check_rollup: CheckStatus::Passing,
+                has_open_pr: true,
+            })),
+            branch,
+            &repo,
+            Some(false),
+            Some(false),
+            Some(0),
+        );
+
+        app.execute_merge(&wi_id, "squash");
+        assert!(app.is_merge_precheck_phase());
+
+        let start = std::time::Instant::now();
+        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+            app.poll_merge_precheck();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            !app.is_user_action_in_flight(&UserActionKey::PrMerge),
+            "conflicting PR must release the PrMerge slot",
+        );
+        assert!(!app.merge_in_progress);
+        assert!(!app.confirm_merge);
+        let msg = app.alert_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("PR has conflicts"),
+            "alert must surface the PR-conflict wording; got: {msg}",
+        );
+    }
+
+    /// Clean worktree + mergeable PR + CI rollup == FAILURE => precheck
+    /// blocks with "CI failing. ..." and releases the slot.
+    #[test]
+    fn execute_merge_through_live_precheck_blocks_on_ci_failure() {
+        use crate::github_client::LivePrState;
+        use crate::work_item::{CheckStatus, MergeableState};
+
+        let repo = PathBuf::from("/tmp/exec-merge-ci-fail");
+        let branch = "feature/ci-fail";
+        let (mut app, wi_id) = install_live_pr_precheck_app(
+            Some(Ok(LivePrState {
+                mergeable: MergeableState::Mergeable,
+                check_rollup: CheckStatus::Failing,
+                has_open_pr: true,
+            })),
+            branch,
+            &repo,
+            Some(false),
+            Some(false),
+            Some(0),
+        );
+
+        app.execute_merge(&wi_id, "squash");
+
+        let start = std::time::Instant::now();
+        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+            app.poll_merge_precheck();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            !app.is_user_action_in_flight(&UserActionKey::PrMerge),
+            "CI-failing PR must release the PrMerge slot",
+        );
+        let msg = app.alert_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("CI failing"),
+            "alert must surface the CI-failing wording; got: {msg}",
+        );
+    }
+
+    /// Clean worktree + no open PR => precheck falls through to the
+    /// merge phase (the downstream merge thread surfaces the existing
+    /// `NoPr` outcome).
+    #[test]
+    fn execute_merge_through_live_precheck_passes_with_no_open_pr() {
+        use crate::github_client::LivePrState;
+
+        let repo = PathBuf::from("/tmp/exec-merge-no-pr");
+        let branch = "feature/no-pr";
+        let (mut app, wi_id) = install_live_pr_precheck_app(
+            Some(Ok(LivePrState::no_pr())),
+            branch,
+            &repo,
+            Some(false),
+            Some(false),
+            Some(0),
+        );
+
+        app.execute_merge(&wi_id, "squash");
+
+        let start = std::time::Instant::now();
+        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+            app.poll_merge_precheck();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            !app.is_merge_precheck_phase(),
+            "precheck must drain within 2s",
+        );
+        assert!(
+            app.is_user_action_in_flight(&UserActionKey::PrMerge),
+            "no-open-PR case must hand off to the merge phase, keeping the slot reserved",
+        );
+        assert!(
+            app.alert_message.is_none(),
+            "no-open-PR must NOT surface a precheck alert; got: {:?}",
+            app.alert_message,
+        );
+        assert!(
+            app.confirm_merge,
+            "merge modal must stay open through the handoff to the merge thread",
+        );
+    }
+
+    /// When `fetch_live_merge_state` returns an error, the precheck
+    /// blocks the merge with a "remote merge-state check failed" alert
+    /// and releases the slot. This is the P0 "surface errors, don't
+    /// auto-fix" posture.
+    #[test]
+    fn execute_merge_through_live_precheck_surfaces_remote_error() {
+        let repo = PathBuf::from("/tmp/exec-merge-remote-error");
+        let branch = "feature/remote-error";
+        let (mut app, wi_id) = install_live_pr_precheck_app(
+            Some(Err(crate::github_client::GithubError::ApiError(
+                "simulated gh pr view failure".into(),
+            ))),
+            branch,
+            &repo,
+            Some(false),
+            Some(false),
+            Some(0),
+        );
+
+        app.execute_merge(&wi_id, "squash");
+
+        let start = std::time::Instant::now();
+        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+            app.poll_merge_precheck();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            !app.is_user_action_in_flight(&UserActionKey::PrMerge),
+            "errored remote check must release the PrMerge slot",
+        );
+        assert!(!app.merge_in_progress);
+        assert!(!app.confirm_merge);
+        let msg = app.alert_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("remote merge-state check failed"),
+            "alert must surface the remote-check error wording; got: {msg}",
+        );
+    }
+
+    /// Priority drill-down: a dirty worktree + a conflicting PR must
+    /// block with the LOCAL wording ("Uncommitted changes..."), not the
+    /// remote wording. Drives the actual precheck thread so the
+    /// classifier's priority order is verified end-to-end.
+    #[test]
+    fn execute_merge_through_live_precheck_dirty_wins_over_pr_conflict() {
+        use crate::config::InMemoryConfigProvider;
+        use crate::github_client::{LivePrState, MockGithubClient};
+        use crate::work_item::{CheckStatus, MergeableState};
+        use crate::worktree_service::{WorktreeError, WorktreeInfo};
+
+        struct DirtyWorktreeMock {
+            branch: String,
+            repo: PathBuf,
+        }
+        impl WorktreeService for DirtyWorktreeMock {
+            fn list_worktrees(
+                &self,
+                _: &std::path::Path,
+            ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
+                Ok(vec![WorktreeInfo {
+                    path: self.repo.join(".worktrees").join(&self.branch),
+                    branch: Some(self.branch.clone()),
+                    is_main: false,
+                    has_commits_ahead: Some(false),
+                    dirty: Some(true),
+                    untracked: Some(false),
+                    unpushed: Some(0),
+                    behind_remote: Some(0),
+                }])
+            }
+            fn create_worktree(
+                &self,
+                _: &std::path::Path,
+                _: &str,
+                _: &std::path::Path,
+            ) -> Result<WorktreeInfo, WorktreeError> {
+                Err(WorktreeError::GitError("not used".into()))
+            }
+            fn remove_worktree(
+                &self,
+                _: &std::path::Path,
+                _: &std::path::Path,
+                _: bool,
+                _: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn delete_branch(
+                &self,
+                _: &std::path::Path,
+                _: &str,
+                _: bool,
+            ) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn default_branch(&self, _: &std::path::Path) -> Result<String, WorktreeError> {
+                Ok("main".to_string())
+            }
+            fn github_remote(
+                &self,
+                _: &std::path::Path,
+            ) -> Result<Option<(String, String)>, WorktreeError> {
+                Ok(None)
+            }
+            fn fetch_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn create_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+            fn prune_worktrees(&self, _: &std::path::Path) -> Result<(), WorktreeError> {
+                Ok(())
+            }
+        }
+
+        let repo = PathBuf::from("/tmp/exec-merge-dirty-over-conflict");
+        let branch = "feature/dirty-over-conflict".to_string();
+
+        let github = MockGithubClient {
+            prs: Vec::new(),
+            review_requested_prs: Vec::new(),
+            issues: Vec::new(),
+            error: None,
+            live_pr_state: Some(Ok(LivePrState {
+                mergeable: MergeableState::Conflicting,
+                check_rollup: CheckStatus::Passing,
+                has_open_pr: true,
+            })),
+        };
+
+        let mut app = App::with_config_worktree_and_github(
+            Config::default(),
+            Arc::new(StubBackend),
+            Arc::new(DirtyWorktreeMock {
+                branch: branch.clone(),
+                repo: repo.clone(),
+            }),
+            Arc::new(github),
+            Box::new(InMemoryConfigProvider::new()),
+        );
+
+        install_cached_repo_with_cleanliness(
+            &mut app,
+            &repo,
+            &branch,
+            Some(true),
+            Some(false),
+            Some(0),
+            Some(0),
+        );
+        let wi_id =
+            WorkItemId::LocalFile(PathBuf::from("/tmp/exec-merge-dirty-over-conflict.json"));
+        push_selected_review_item(&mut app, &wi_id, &repo, &branch);
+        app.confirm_merge = true;
+        app.merge_wi_id = Some(wi_id.clone());
+
+        app.execute_merge(&wi_id, "squash");
+
+        let start = std::time::Instant::now();
+        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+            app.poll_merge_precheck();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let msg = app.alert_message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("Uncommitted changes"),
+            "dirty worktree must take priority over PR conflict; got: {msg}",
+        );
+        assert!(
+            !msg.contains("PR has conflicts"),
+            "must not surface the PR-conflict wording when worktree is dirty; got: {msg}",
         );
     }
 

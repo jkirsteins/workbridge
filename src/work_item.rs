@@ -216,9 +216,8 @@ pub struct RepoAssociation {
 /// - `dirty`: union of uncommitted tracked-file changes AND untracked
 ///   files present in the worktree. The `!cl` chip treats both the
 ///   same way; callers that need to distinguish them (e.g. the
-///   merge-guard alert wording) go through
-///   `WorktreeCleanliness::from_worktree_info`, which reads the raw
-///   `WorktreeInfo` fields directly.
+///   merge-guard alert wording) go through `MergeReadiness::classify`,
+///   which reads the raw `WorktreeInfo` fields directly.
 /// - `ahead`: commits on the local branch that are not yet on its
 ///   upstream - i.e. unpushed work.
 /// - `behind`: commits on the upstream that the local branch does not
