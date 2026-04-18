@@ -4,6 +4,18 @@ Workbridge is a terminal UI for orchestrating multi-repo development work. It
 tracks work items, manages git worktrees, and drives Claude Code sessions
 through a Backlog -> Planning -> Implementing -> Review -> Done workflow.
 
+## Table of Contents
+
+- [Quick Start](#quick-start)
+  - [1. Enable the git hooks](#1-enable-the-git-hooks)
+  - [2. Build and install Workbridge](#2-build-and-install-workbridge)
+  - [3. Register the repos you want to manage](#3-register-the-repos-you-want-to-manage)
+  - [4. Launch the TUI](#4-launch-the-tui)
+  - [5. Start your first quick-start session](#5-start-your-first-quick-start-session)
+- [How It Works](#how-it-works)
+- [Further Reading](#further-reading)
+- [License](#license)
+
 ## Quick Start
 
 ### 1. Enable the git hooks
