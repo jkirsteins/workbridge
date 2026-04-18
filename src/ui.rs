@@ -1571,7 +1571,7 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     } else {
         app.list_scroll_offset.get()
     };
-    let tentative_offset = tentative_offset.min(item_heights.len().saturating_sub(1).max(0));
+    let tentative_offset = tentative_offset.min(item_heights.len().saturating_sub(1));
 
     // Decide whether to reserve a sticky-header slot this frame. The
     // decision is made against the tentative offset, so a recenter

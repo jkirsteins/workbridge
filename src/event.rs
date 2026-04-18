@@ -596,30 +596,28 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
             app.toggle_view_mode();
         }
         // Left arrow - move to previous column
-        (KeyModifiers::NONE, KeyCode::Left) => {
-            if app.board_cursor.column > 0 {
-                app.board_cursor.column -= 1;
-                let items = app.items_for_column(&BOARD_COLUMNS[app.board_cursor.column]);
-                app.board_cursor.row = if items.is_empty() {
-                    None
-                } else {
-                    Some(app.board_cursor.row.unwrap_or(0).min(items.len() - 1))
-                };
-                app.sync_selection_from_board();
-            }
+        (KeyModifiers::NONE, KeyCode::Left) if app.board_cursor.column > 0 => {
+            app.board_cursor.column -= 1;
+            let items = app.items_for_column(&BOARD_COLUMNS[app.board_cursor.column]);
+            app.board_cursor.row = if items.is_empty() {
+                None
+            } else {
+                Some(app.board_cursor.row.unwrap_or(0).min(items.len() - 1))
+            };
+            app.sync_selection_from_board();
         }
         // Right arrow - move to next column
-        (KeyModifiers::NONE, KeyCode::Right) => {
-            if app.board_cursor.column < BOARD_COLUMNS.len() - 1 {
-                app.board_cursor.column += 1;
-                let items = app.items_for_column(&BOARD_COLUMNS[app.board_cursor.column]);
-                app.board_cursor.row = if items.is_empty() {
-                    None
-                } else {
-                    Some(app.board_cursor.row.unwrap_or(0).min(items.len() - 1))
-                };
-                app.sync_selection_from_board();
-            }
+        (KeyModifiers::NONE, KeyCode::Right)
+            if app.board_cursor.column < BOARD_COLUMNS.len() - 1 =>
+        {
+            app.board_cursor.column += 1;
+            let items = app.items_for_column(&BOARD_COLUMNS[app.board_cursor.column]);
+            app.board_cursor.row = if items.is_empty() {
+                None
+            } else {
+                Some(app.board_cursor.row.unwrap_or(0).min(items.len() - 1))
+            };
+            app.sync_selection_from_board();
         }
         // Up arrow - previous item in column
         (KeyModifiers::NONE, KeyCode::Up) => {
@@ -661,15 +659,13 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
             }
         }
         // Enter - drill down into item's stage (two-panel view)
-        (KeyModifiers::NONE, KeyCode::Enter) => {
-            if app.board_selected_work_item_id().is_some() {
-                let stage = BOARD_COLUMNS[app.board_cursor.column];
-                app.board_drill_down = true;
-                app.board_drill_stage = Some(stage);
-                app.build_display_list();
-                app.open_session_for_selected();
-                sync_layout(app);
-            }
+        (KeyModifiers::NONE, KeyCode::Enter) if app.board_selected_work_item_id().is_some() => {
+            let stage = BOARD_COLUMNS[app.board_cursor.column];
+            app.board_drill_down = true;
+            app.board_drill_stage = Some(stage);
+            app.build_display_list();
+            app.open_session_for_selected();
+            sync_layout(app);
         }
         // Q/q/Ctrl+Q - quit with confirmation
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('q' | 'Q'))
