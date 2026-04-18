@@ -412,6 +412,42 @@ fn handle_message(
             let id = id?;
             let is_review_request = work_item_kind == "ReviewRequest";
 
+            // MCP ToolAnnotations (per the MCP spec's
+            // `ToolAnnotations` struct). Codex 0.120.0 uses these to
+            // decide whether to prompt the user before calling the
+            // tool: `requires_mcp_tool_approval` in
+            // `codex-rs/core/src/mcp_tool_call.rs` returns `false`
+            // when `destructiveHint` and `openWorldHint` are both
+            // `false`, so Codex skips the "Allow the workbridge MCP
+            // server to run tool ..." dialog entirely. Without these
+            // annotations, Codex's default is to require approval on
+            // EVERY MCP tool call (the `destructive_hint.unwrap_or(true)
+            // || open_world_hint.unwrap_or(true)` branch), which the
+            // user has explicitly rejected ("MCP tools need to be
+            // pre-allowed for codex, so it does not ask for permission
+            // for them", 2026-04-17). Setting these hints is the
+            // MCP-standard way to mark tools as safe-to-auto-invoke;
+            // it is not a workaround.
+            //
+            // `readOnlyHint: true` on the genuinely read-only tools
+            // is factually correct and gives Codex an even stronger
+            // signal (its check short-circuits to "no approval" on
+            // read-only hints). Mutating tools use
+            // `destructiveHint: false, openWorldHint: false` which
+            // says "this operation stays inside workbridge's
+            // data and does not reach out to the wider system" -
+            // accurate for every workbridge_* tool, including
+            // `workbridge_delete` (deletes a workbridge record, not
+            // a filesystem path).
+            const READ_ONLY_ANNOTATIONS: &str =
+                r#"{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}"#;
+            const MUTATING_ANNOTATIONS: &str =
+                r#"{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}"#;
+            let read_only_anno: serde_json::Value =
+                serde_json::from_str(READ_ONLY_ANNOTATIONS).expect("static JSON");
+            let mutating_anno: serde_json::Value =
+                serde_json::from_str(MUTATING_ANNOTATIONS).expect("static JSON");
+
             // Read-only tools available for all sessions (including
             // read-only review gate sessions).
             let mut tools = vec![
@@ -421,7 +457,8 @@ fn handle_message(
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
-                    }
+                    },
+                    "annotations": read_only_anno,
                 }),
                 json!({
                     "name": "workbridge_query_log",
@@ -429,7 +466,8 @@ fn handle_message(
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
-                    }
+                    },
+                    "annotations": read_only_anno,
                 }),
             ];
 
@@ -443,7 +481,8 @@ fn handle_message(
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
-                    }
+                    },
+                    "annotations": read_only_anno,
                 }));
                 tools.push(json!({
                     "name": "workbridge_report_progress",
@@ -457,7 +496,8 @@ fn handle_message(
                             }
                         },
                         "required": ["message"]
-                    }
+                    },
+                    "annotations": read_only_anno,
                 }));
                 return Some(json!({
                     "jsonrpc": "2.0",
@@ -484,7 +524,8 @@ fn handle_message(
                         }
                     },
                     "required": ["event_type"]
-                }
+                },
+                "annotations": mutating_anno,
             }));
             tools.push(json!({
                 "name": "workbridge_set_activity",
@@ -498,7 +539,8 @@ fn handle_message(
                         }
                     },
                     "required": ["working"]
-                }
+                },
+                "annotations": mutating_anno,
             }));
             tools.push(json!({
                 "name": "workbridge_delete",
@@ -506,7 +548,8 @@ fn handle_message(
                 "inputSchema": {
                     "type": "object",
                     "properties": {}
-                }
+                },
+                "annotations": mutating_anno,
             }));
             if is_review_request {
                 // Review request items get approve/request-changes tools
@@ -522,7 +565,8 @@ fn handle_message(
                                 "description": "Optional comment to include with the approval"
                             }
                         }
-                    }
+                    },
+                    "annotations": mutating_anno,
                 }));
                 tools.push(json!({
                     "name": "workbridge_request_changes",
@@ -536,7 +580,8 @@ fn handle_message(
                             }
                         },
                         "required": ["comment"]
-                    }
+                    },
+                    "annotations": mutating_anno,
                 }));
             } else {
                 // Regular work items get set_status and set_plan tools.
@@ -557,7 +602,8 @@ fn handle_message(
                             }
                         },
                         "required": ["status"]
-                    }
+                    },
+                    "annotations": mutating_anno,
                 }));
                 tools.push(json!({
                     "name": "workbridge_set_plan",
@@ -571,7 +617,8 @@ fn handle_message(
                             }
                         },
                         "required": ["plan_text"]
-                    }
+                    },
+                    "annotations": mutating_anno,
                 }));
                 tools.push(json!({
                     "name": "workbridge_set_title",
@@ -585,7 +632,8 @@ fn handle_message(
                             }
                         },
                         "required": ["title"]
-                    }
+                    },
+                    "annotations": mutating_anno,
                 }));
             }
 
@@ -1065,6 +1113,19 @@ fn handle_global_message(msg: &Value, context_json: &str, tx: &Sender<McpEvent>)
         "notifications/initialized" => None,
         "tools/list" => {
             let id = id?;
+            // See the per-work-item tools/list branch for why these
+            // annotations are load-bearing: Codex uses
+            // `readOnlyHint` / `destructiveHint` / `openWorldHint`
+            // to decide whether to prompt before running the tool.
+            // Absent annotations default to "require approval".
+            let read_only_anno: serde_json::Value = serde_json::from_str(
+                r#"{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}"#,
+            )
+            .expect("static JSON");
+            let mutating_anno: serde_json::Value = serde_json::from_str(
+                r#"{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}"#,
+            )
+            .expect("static JSON");
             let tools = vec![
                 json!({
                     "name": "workbridge_list_repos",
@@ -1072,7 +1133,8 @@ fn handle_global_message(msg: &Value, context_json: &str, tx: &Sender<McpEvent>)
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
-                    }
+                    },
+                    "annotations": read_only_anno,
                 }),
                 json!({
                     "name": "workbridge_list_work_items",
@@ -1080,7 +1142,8 @@ fn handle_global_message(msg: &Value, context_json: &str, tx: &Sender<McpEvent>)
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
-                    }
+                    },
+                    "annotations": read_only_anno,
                 }),
                 json!({
                     "name": "workbridge_repo_info",
@@ -1094,7 +1157,8 @@ fn handle_global_message(msg: &Value, context_json: &str, tx: &Sender<McpEvent>)
                             }
                         },
                         "required": ["repo_path"]
-                    }
+                    },
+                    "annotations": read_only_anno,
                 }),
                 json!({
                     "name": "workbridge_create_work_item",
@@ -1116,7 +1180,8 @@ fn handle_global_message(msg: &Value, context_json: &str, tx: &Sender<McpEvent>)
                             }
                         },
                         "required": ["title", "description", "repo_path"]
-                    }
+                    },
+                    "annotations": mutating_anno,
                 }),
             ];
 

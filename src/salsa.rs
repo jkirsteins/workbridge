@@ -360,6 +360,14 @@ pub fn app_event(
                 // ~2 seconds after the most recent copy.
                 state.prune_toasts();
 
+                // Expire the `kk` double-press window. The hint toast
+                // auto-dismisses via `prune_toasts`, but the armed
+                // flag itself lives in `App::last_k_press` and must
+                // time out independently so a stale arm from a
+                // minute-ago press does not combine with a fresh `k`
+                // to kill a session the user did not intend to kill.
+                state.prune_k_press();
+
                 // Poll MCP status updates BEFORE liveness check so that a
                 // review gate verdict arriving in the same tick as session
                 // exit is processed before check_liveness clears the gate

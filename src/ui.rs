@@ -25,8 +25,9 @@ use tui_term::widget::PseudoTerminal;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, BOARD_COLUMNS, DisplayEntry, FocusPanel, GroupHeaderKind, RightPanelTab,
-    SettingsListFocus, SettingsTab, Toast, UserActionKey, ViewMode, WorkItemContext, is_selectable,
+    App, BOARD_COLUMNS, DisplayEntry, FirstRunGlobalHarnessModal, FocusPanel, GroupHeaderKind,
+    RightPanelTab, SettingsListFocus, SettingsTab, Toast, UserActionKey, ViewMode, WorkItemContext,
+    is_selectable,
 };
 use crate::click_targets::ClickKind;
 use crate::config;
@@ -381,6 +382,18 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
         );
     }
 
+    // First-run Ctrl+G harness picker modal (rendered above alerts so
+    // a transient error does not hide the picker, but below the global
+    // drawer - which cannot be open at the same time). The modal is
+    // opened by `App::handle_ctrl_g` when
+    // `config.defaults.global_assistant_harness` is unset, and
+    // dismissed by `App::finish_first_run_global_pick` or
+    // `App::cancel_first_run_global_pick`. See `docs/UI.md`
+    // "First-run Ctrl+G modal".
+    if let Some(ref modal) = app.first_run_global_harness_modal {
+        draw_first_run_global_harness_modal(buf, modal, theme, area);
+    }
+
     // Global assistant drawer (rendered on top, below create dialog).
     if app.global_drawer_open {
         draw_global_drawer(buf, app, theme, area);
@@ -461,6 +474,75 @@ fn draw_toasts(buf: &mut Buffer, toasts: &[Toast], theme: &Theme, frame_area: Re
         .block(block);
         paragraph.render(rect, buf);
     }
+}
+
+/// Draw the first-run Ctrl+G harness picker modal. Centred, bordered,
+/// lists each available harness with its single-letter keybinding. Esc
+/// cancels. The key-handling lives in `event.rs`
+/// (`handle_first_run_global_harness_modal`).
+fn draw_first_run_global_harness_modal(
+    buf: &mut Buffer,
+    modal: &FirstRunGlobalHarnessModal,
+    theme: &Theme,
+    frame_area: Rect,
+) {
+    let body_line_count = 3 + modal.available_harnesses.len() + 2;
+    let inner_height = body_line_count.min(12) as u16;
+    let height = (inner_height + 2).min(frame_area.height);
+    let width: u16 = 64.min(frame_area.width);
+    let area = Rect {
+        x: frame_area.x + frame_area.width.saturating_sub(width) / 2,
+        y: frame_area.y + frame_area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    Clear.render(area, buf);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Pick a harness for the global assistant ")
+        .border_style(theme.style_text());
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "Press the highlighted key to choose a harness for Ctrl+G.",
+            theme.style_text(),
+        )),
+        Line::from(Span::styled(
+            "The pick is saved to config.toml and can be changed via",
+            theme.style_text(),
+        )),
+        Line::from(Span::styled(
+            "`workbridge config set global-assistant-harness <name>`.",
+            theme.style_text(),
+        )),
+        Line::from(""),
+    ];
+    for kind in &modal.available_harnesses {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  [{}]  ", kind.keybinding()),
+                theme.style_text().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(kind.display_name(), theme.style_text()),
+            Span::styled(
+                format!("  ({} on PATH)", kind.binary_name()),
+                theme.style_text().add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Esc to cancel.",
+        theme.style_text().add_modifier(Modifier::DIM),
+    )));
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    paragraph.render(area, buf);
 }
 
 /// Draw the view mode header: a segmented tab bar showing
@@ -2493,8 +2575,8 @@ fn draw_work_item_detail(
     let Some(wi) = wi else {
         let text = Text::from(vec![
             Line::from(""),
-            Line::from("  Press Enter to start"),
-            Line::from("  a session."),
+            Line::from("  Press c (Claude) or x (Codex)"),
+            Line::from("  to start a session."),
         ]);
         let paragraph = Paragraph::new(text)
             .block(block)
@@ -2723,7 +2805,7 @@ fn draw_work_item_detail(
 
     lines.push(Line::from(""));
     let hint_lines: &[&str] = match wi.status {
-        WorkItemStatus::Backlog => &["  Press Shift+Right to move to Planning."],
+        WorkItemStatus::Backlog => &["  Press c (Claude) or x (Codex) to", "  begin planning."],
         WorkItemStatus::Done => &["  Done."],
         WorkItemStatus::Mergequeue => &[
             "  Waiting for PR to be merged.",
@@ -2741,7 +2823,7 @@ fn draw_work_item_detail(
             if has_stale {
                 &["  Press Enter to recover worktree."]
             } else {
-                &["  Press Enter to start a session."]
+                &["  Press c (Claude) or x (Codex) to start a session."]
             }
         }
     };
@@ -3070,8 +3152,8 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                         Line::from(""),
                         Line::from("  Session has ended."),
                         Line::from(""),
-                        Line::from("  Press Enter to start"),
-                        Line::from("  a new session."),
+                        Line::from("  Press c (Claude) or x (Codex)"),
+                        Line::from("  to start a new session."),
                     ]);
                     let paragraph = Paragraph::new(text).block(block).style(theme.style_error());
                     paragraph.render(area, buf);
@@ -3161,7 +3243,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                         lines.push(Line::from(""));
                         let hint_lines: &[&str] = match wi.map(|w| &w.status) {
                             Some(WorkItemStatus::Backlog) => {
-                                &["  Press Shift+Right to move to Planning."]
+                                &["  Press c (Claude) or x (Codex) to begin planning."]
                             }
                             Some(WorkItemStatus::Done) => &["  Done."],
                             Some(WorkItemStatus::Mergequeue) => &[
@@ -3169,7 +3251,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                                 "  Polling GitHub every 30s.",
                                 "  Shift+Left to move back to Review and stop polling.",
                             ],
-                            _ => &["  Press Enter to start a session."],
+                            _ => &["  Press c (Claude) or x (Codex) to start a session."],
                         };
                         for hint in hint_lines {
                             lines.push(Line::from(Span::styled(*hint, theme.style_text_muted())));
@@ -3808,7 +3890,7 @@ fn draw_settings_keybindings_tab(buf: &mut Buffer, app: &App, theme: &Theme, are
         binding("Ctrl+B", "New backlog ticket"),
         binding("Ctrl+G", "Global assistant"),
         binding("Ctrl+R", "Refresh GitHub data"),
-        binding("Ctrl+\\", "Cycle Claude Code <-> Terminal tab"),
+        binding("Ctrl+\\", "Cycle Session <-> Terminal tab"),
         binding("?", "Settings / keybindings (this overlay)"),
         binding("Q / Ctrl+Q", "Quit"),
         Line::from(""),
@@ -3830,7 +3912,7 @@ fn draw_settings_keybindings_tab(buf: &mut Buffer, app: &App, theme: &Theme, are
         Line::styled("Session active (right panel)", h),
         binding("Ctrl+]", "Return to item list"),
         Line::from(vec![Span::styled(
-            "  (all other keys forwarded to Claude)",
+            "  (all other keys forwarded to the session)",
             d,
         )]),
         Line::from(""),

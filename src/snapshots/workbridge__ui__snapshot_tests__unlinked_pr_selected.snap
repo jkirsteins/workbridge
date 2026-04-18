@@ -1,9 +1,9 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 24)"
+expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
-┌ Work Items (1) ───────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Work Items (1) ───────┐┌ Session ────────────────────────────────────────────┐
 │  UNLINKED (1)         ││                                                     │
 │> ? fix-typo      PR#45││  Unlinked PR #45                                    │
 │  unlinked             ││                                                     │

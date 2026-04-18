@@ -40,7 +40,7 @@ Out of scope:
 ## Glossary
 
 - **Harness**: the external LLM coding CLI that workbridge spawns
-  (today: `claude`; future candidates: `codex`, `opencode`).
+  (today: `claude`, `codex`; future candidate: `opencode`).
 - **Harness session**: one spawned child process running the harness
   against a single work item + stage. Session identity is owned by
   workbridge, not the harness (see C12).
@@ -59,6 +59,13 @@ Out of scope:
 - **Reference payload**: a copy-pasteable example (argv, MCP config
   JSON, hook body, etc.) of what the current `claude` reference
   implementation produces. See the RP section.
+- **Display name**: the human-readable vendor label returned by
+  `AgentBackendKind::display_name()` (e.g. `"Claude Code"`,
+  `"Codex"`). The display name is used ONLY in UI text that
+  identifies the harness actually running in a live session (C14,
+  below). It is NEVER used as a default when no harness is
+  committed - the UI renders the neutral placeholder
+  `App::SESSION_TITLE_NONE` (`"Session"`) in that case.
 
 ## Contract Clauses
 
@@ -176,15 +183,57 @@ an interactive "/" command after startup), because spawn is the only
 control surface workbridge has before the session is handed to the
 user.
 
+**Prompt parity across harnesses** (RCA 2026-04-18): the system
+prompts MUST be written in imperative, harness-neutral language that
+explicitly neutralises the model's baked-in operating instructions.
+Specifically, every interactive prompt in `prompts/stage_prompts.json`
+opens with a `HARNESS DIRECTIVE OVERRIDE:` block that forbids the
+harness from falling back to its default "assume the user wants the
+work done unless they explicitly ask for a plan" prior (Codex's
+default behaviour at time of writing). Without this block, Codex
+jumps straight to implementation in planning sessions because its
+prior outweighs a descriptive `"You are a planning assistant..."`
+opening; Claude is forgiving of descriptive phrasing because its
+training weights system prompts more heavily, which masks the bug
+during single-harness testing. Pinned by
+`prompts::tests::all_interactive_prompts_have_harness_directive_override`.
+Every prompt uses `MUST / MUST NOT` wording rather than
+`"You are ..."` role framing for the same reason: an imperative
+directive is legible to both models as an instruction, where a role
+description is only legible to a model whose training rewards
+following role descriptions.
+
+The review-gate prompt is exempt from the override block because it
+is headless + JSON-only and has no baked-in "just do the work"
+prior to override.
+
 ### C7 - Auto-start prompt
 
 For interactive spawns in `Planning`, `Implementing`, and
 `Review` (when there are pending review-gate findings), workbridge
-MUST pass a literal initial user message (e.g. "Explain who you are
-and start working."). This lets the session do useful work before the
-user types anything, and it is the only mechanism that guarantees the
-harness actually calls its own tools (which in turn exercises the
-MCP path).
+MUST pass a literal initial user message. This lets the session do
+useful work before the user types anything, and it is the only
+mechanism that guarantees the harness actually calls its own tools
+(which in turn exercises the MCP path).
+
+The auto-start message MUST NOT read as a concrete implementation
+request; it MUST defer to the system prompt as the source of truth
+for what the session should do. The current message
+(`auto_start_default`) is:
+
+> "Follow the instructions in your system prompt. Begin with the
+> first action your system prompt specifies (interview the user for
+> planning stages, execute the plan for implementation stages,
+> present review findings for review stages, etc.). Do not interpret
+> this auto-start message as a concrete implementation request."
+
+The earlier message `"Explain who you are and start working."` was
+reworded on 2026-04-18 because Codex's prior interpreted "start
+working" as a concrete implementation instruction, overriding the
+system prompt's planning-stage directives. The replacement names
+the stage-appropriate first action explicitly so both Codex and
+Claude route through the system prompt. Pinned by
+`prompts::tests::auto_start_messages_defer_to_system_prompt`.
 
 Headless spawns always have an initial prompt (the review gate
 prompt). Interactive `Blocked` spawns do **not** auto-start - the
@@ -298,6 +347,48 @@ The reason is twofold: env vars are inherited by grandchildren
 (where they can leak credentials into user-spawned subshells), and
 they are invisible to the review gate, which cannot tell from a live
 process whether a variable was set by workbridge or by the user.
+
+### C14 - Display name is downstream of live session state
+
+Adapters advertise a display name via
+`AgentBackendKind::display_name()`. Workbridge uses that display
+name ONLY to render UI text that identifies the harness actually
+running (or committed to run) in a live session: the right-panel
+Session tab title, the dead-session placeholder, and the Ctrl+\\
+toggle hint. The display name MUST NOT leak into UI strings
+outside that live-session context.
+
+Specifically, when no harness is committed to the current context
+(no `harness_choice` entry for the selected work item, no
+configured global-assistant harness), the UI renders the neutral
+`App::SESSION_TITLE_NONE` placeholder (`"Session"`) - NOT the
+display name of the workbridge-wide default. Falling back to any
+vendor display name in the absence of a live harness is a
+user-facing claim about state that the code can locally verify
+and is therefore a P0 violation of the Review Policy (see
+CLAUDE.md `[ABSOLUTE]` "Session titles downstream of live harness
+state"). Adding a new adapter does not change this rule: the
+single source of truth for display-name rendering is
+`App::agent_backend_display_name` (see `src/app.rs`), which does
+not consult the static `self.agent_backend`.
+
+Adapters themselves MUST NOT:
+- Inject their vendor name into prompt text, status messages, or
+  tool descriptions advertised to the session (prompts stay
+  harness-neutral so a session that reads its own prompt does not
+  see a competing brand name).
+- Leak their vendor name into error text surfaced to the UI when
+  the session failed to spawn (the UI formats the failure via
+  `command_name()` and the binary path, both of which are neutral
+  CLI facts, not marketing strings).
+
+Claude ref impl: `ClaudeCodeBackend::kind().display_name()` returns
+`"Claude Code"`. Codex: `CodexBackend::kind().display_name()`
+returns `"Codex"`. Neither is ever rendered except via
+`App::agent_backend_display_name` and the first-run harness
+picker modal (which lists all user-selectable harnesses by
+`display_name()` because listing their brand names there is the
+whole point of the modal).
 
 ## Implementation Map
 
@@ -430,14 +521,37 @@ disk, binds a socket, or spawns a subprocess from the UI thread.
 The bridge process is the same workbridge binary re-invoked with
 `--mcp-bridge --socket <path>` (see `build_mcp_config`).
 
-**Codex (secondary, not implemented)**: **workaround**. Codex reads
-MCP server definitions from `~/.codex/config.toml` under
-`[mcp_servers.*]`. There is no per-invocation `--mcp-config` flag
-equivalent. A Codex adapter would have to either write a temporary
-`config.toml` and point Codex at it via its config-override flag, or
-use `--config mcp_servers.workbridge=...` overrides. Both are shim-
-level work; the clause itself (per-session MCP injection with
-stdio transport) is still achievable.
+**Codex**: **workaround (implemented)**. Codex reads MCP server
+definitions from `~/.codex/config.toml` under `[mcp_servers.*]` and
+exposes the same shape via `--config key=value` (alias `-c`)
+overrides. There is no `[mcp_servers.<name>].config = "<path>"`
+sub-field that reads an external JSON - verified against the live
+CLI with `codex -c 'mcp_servers.workbridge.config="/tmp/fake.json"'
+mcp list`, which fails with "invalid transport in
+`mcp_servers.workbridge`".
+
+`CodexBackend` in `src/agent_backend.rs` therefore emits per-field
+overrides built from a structured `McpBridgeSpec` (command +
+args): `-c mcp_servers.workbridge.command="<exe>"` and `-c
+mcp_servers.workbridge.args=["--mcp-bridge","--socket","<sock>"]`.
+The helper `CodexBackend::extend_mcp_bridge_argv` renders the TOML
+values using a small `toml_quote_string` / `toml_quote_string_array`
+helper so paths and prompts with special characters (quotes,
+backslashes, newlines, equals signs) survive Codex's TOML parser
+as literal strings.
+
+The caller still writes the Claude-shaped JSON to
+`mcp_config_path` (it is used by Claude's adapter and by the
+on-disk config parity logging), but for Codex that path is
+deliberately NOT referenced in argv - only the structured
+`SpawnConfig::mcp_bridge` field is. Missing `mcp_bridge` (e.g.
+MCP socket bind failed) causes Codex to omit the overrides
+entirely, rather than falling back to `~/.codex/config.toml`
+(which would silently cross-contaminate personal config with
+workbridge runtime state). Pinned by the
+`codex_mcp_config_injected_via_config_flag` and
+`codex_mcp_bridge_none_omits_workbridge_overrides` tests; verified
+live against the real CLI on 2026-04-16.
 
 ### C5 - Tool allowlist by spawn type
 
@@ -638,11 +752,49 @@ sets any harness-specific environment variable on the child. The
 child inherits the parent environment (so the user's `$PATH`,
 `$HOME`, etc. are visible) but workbridge adds nothing.
 
-**Codex (secondary, not implemented)**: **supported**. A Codex
-adapter that needs to point at a per-session MCP config would
-either use a CLI flag (preferred) or write to a config file (see
-C4). Setting an env var like `CODEX_MCP_CONFIG` would violate C13
-and MUST be avoided.
+**Codex**: **supported (implemented)**. `CodexBackend` delivers the
+full per-session payload (system prompt, MCP server definition,
+write-access flag) exclusively through `--config key=value`
+overrides on the CLI argv. No harness-specific environment
+variable is set on the child, and `write_session_files` returns
+an empty list (no side-car writes). Specifically:
+- system prompt -> `-c instructions="<prompt>"`
+- MCP bridge command -> `-c mcp_servers.workbridge.command="<exe>"`
+- MCP bridge args -> `-c mcp_servers.workbridge.args=[...]`
+- permissions -> `--full-auto` (interactive work-capable +
+  rebase gate) or omitted (review gate)
+
+No `CODEX_MCP_CONFIG`, `CODEX_CONFIG_FILE`, `CODEX_HOME`, or any
+other env var is touched. The only filesystem writes workbridge
+performs for a Codex session are under `std::env::temp_dir()`
+(the MCP config JSON, used by the on-disk parity path and by
+future harnesses; Codex itself does not read it).
+
+### C14 - Display name is downstream of live session state
+
+**Claude (reference)**: `ClaudeCodeBackend::kind().display_name()`
+returns `"Claude Code"`. That string reaches the UI only through
+`App::agent_backend_display_name`, which resolves from per-work-
+item `harness_choice` -> global-assistant harness ->
+`App::SESSION_TITLE_NONE`. There is no path that surfaces
+"Claude Code" as a default when no harness is committed. The old
+behaviour of falling through to `self.agent_backend.kind()` was
+removed on 2026-04-17 and is now a P0 Review Policy violation;
+the contract's invariant is `agent_backend_display_name()` returns
+`"Session"` for uncommitted contexts.
+
+**Codex**: **supported (implemented)**.
+`CodexBackend::kind().display_name()` returns `"Codex"`. Same
+resolution path as Claude - the display name only reaches the UI
+when a per-work-item `harness_choice` of `Codex` or a configured
+global-assistant harness of `Codex` is present. Codex's argv
+builder does not inject `"Codex"` into any UI-visible string
+(error text, prompt, tool description); it emits
+`command_name() = "codex"` as argv[0] (a neutral CLI fact) and
+`display_name() = "Codex"` only via the trait method consumed by
+`agent_backend_display_name`. Pinned by
+`codex_display_name_returns_codex` in `src/agent_backend.rs::tests`
+(trivial but load-bearing for C14 compliance).
 
 ## Reference Payloads (Claude)
 
@@ -843,10 +995,10 @@ update the Implementation Map section above.
 
 | File          | Line   | Mode        | Scope       | Thread     | Cwd                                       |
 |---------------|--------|-------------|-------------|------------|-------------------------------------------|
-| `src/app.rs`  | 5792   | Interactive | WorkItem    | Background | Work-item worktree                        |
-| `src/app.rs`  | 9990   | Headless RO | ReviewGate  | Background | inherited                                 |
-| `src/app.rs`  | 10397  | Headless RW | RebaseGate  | Background | Work-item worktree                        |
-| `src/app.rs`  | 11608  | Interactive | Global      | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
+| `src/app.rs`  | 5962   | Interactive | WorkItem    | Background | Work-item worktree                        |
+| `src/app.rs`  | 10435  | Headless RO | ReviewGate  | Background | inherited                                 |
+| `src/app.rs`  | 10914  | Headless RW | RebaseGate  | Background | Work-item worktree                        |
+| `src/app.rs`  | 12145  | Interactive | Global      | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
 
 The "Thread" column records which thread actually calls
 `Session::spawn` / `std::process::Command::output()`. All four
@@ -1052,3 +1204,333 @@ harness adapter is introduced, add a dated bullet here.
   `poll_session_spawns`) handles the `Session::spawn` fork+exec.
   All three spawn sites (work-item, review-gate, global) are now
   fully off the UI thread. Known Spawn Sites table updated.
+- 2026-04-16: Codex adapter + per-work-item harness selection +
+  first-run Ctrl+G modal. `AgentBackendKind::Codex` promoted out
+  of `#[cfg(test)]` and `CodexBackend` is now a real adapter
+  satisfying C1..C13 with these workarounds, all pinned by unit
+  tests in `src/agent_backend.rs::tests::codex_*`:
+  - C1: `codex` (interactive) / `codex exec --json` (headless).
+  - C2: PTY sets cwd (same mechanism as Claude); `--cd` flag is
+    available but not used.
+  - C3: `--full-auto` is the permission-bypass flag; omitted for
+    read-only spawns per parity with Claude's
+    `--dangerously-skip-permissions` convention.
+  - C4: MCP injection via per-field `--config
+    mcp_servers.workbridge.command="<exe>"` plus
+    `--config mcp_servers.workbridge.args=[...]`. Per-repo extras
+    from `Config::mcp_servers_for_repo` are forwarded as additional
+    `mcp_servers.<name>.{command,args}` pairs (one set per entry,
+    threaded through `SpawnConfig::extra_bridges` /
+    `ReviewGateSpawnConfig::extra_bridges`). HTTP-transport entries
+    are filtered out at the spawn site because Codex's TOML schema
+    has no `mcp_servers.<name>.url` field. No
+    `~/.codex/config.toml` mutation (file-injection rule).
+  - C5: no CLI allowlist; enforced at the MCP server layer
+    (same mechanism as Claude's review gate).
+  - C6: `--config instructions=<prompt>` (Codex has no
+    `--system-prompt`).
+  - C7: auto-start prompt as the last positional argument.
+  - C8: **workaround** - Codex has no `PostToolUse` hook; the
+    Planning reminder is embedded in the system prompt. Strictly
+    weaker than Claude's hook because it cannot re-fire on
+    subsequent turns.
+  - C9 / C10 / C11 / C12: unchanged from the shared
+    infrastructure (PTY / `run_cancellable` / MCP filter /
+    fresh-per-open).
+  - C13: no env vars, no `$HOME` writes.
+  `OpenCodeBackend` added as future-work scaffolding only:
+  `build_command` returns just `["opencode"]`,
+  `build_review_gate_command` / `build_headless_rw_command` return
+  empty argv, and `parse_review_gate_stdout` returns a diagnostic
+  "not yet implemented" verdict. The backend is NOT user-
+  selectable: `AgentBackendKind::OpenCode` is excluded from
+  `AgentBackendKind::all()`, rejected by `AgentBackendKind::from_str`
+  so `workbridge config set global-assistant-harness opencode`
+  fails, and is not bound to any keystroke. The enum variant and
+  the `backend_for_kind` arm are kept so a future real adapter can
+  land without reintroducing the type at the same time. The `o`
+  keybinding is reserved for "open PR in browser" (its pre-
+  existing meaning); there is no harness picker on `o`.
+  Per-work-item selection: new `App::harness_choice:
+  HashMap<WorkItemId, AgentBackendKind>` stores the user's pick
+  from c (Claude) / x (Codex). Spawn sites
+  (`finish_session_open`, `spawn_review_gate`,
+  `spawn_rebase_gate`) look up the choice via
+  `App::backend_for_work_item`. Review and rebase gates abort
+  with a surfaced error when the choice is missing - "abort
+  rather than default to claude", per the plan. Enter on a
+  work-item row without a prior c/x press is now a no-op with
+  a hint toast (breaking keybinding change from the v1 scope).
+  Double-press `k` within 1.5s ends the session (SIGTERM / 50ms
+  / SIGKILL via the shared `Drop for Session` path).
+  Global assistant: `spawn_global_session` resolves its backend
+  from `config.defaults.global_assistant_harness` rather than
+  the App singleton; when the field is unset, Ctrl+G opens a
+  first-run modal (`FirstRunGlobalHarnessModal`) that lists
+  harnesses on PATH and persists the pick to `config.toml` on
+  selection. New CLI: `workbridge config set
+  global-assistant-harness <name>` sets the same field non-
+  interactively via `apply_config_set` (split into a testable
+  core + `ConfigSetOutcome` enum so unit tests can assert
+  branch-taken without shelling out).
+  New dep: `which = "6"` for lazy PATH scans via
+  `agent_backend::is_available`. Known Spawn Sites table
+  unchanged (the three sites still exist at the same call
+  sites; the trait-object used is now per-work-item rather than
+  singleton).
+- 2026-04-16: Codex MCP injection fix + silent-fallback removal.
+  C4: the previous Codex shape `-c mcp_servers.workbridge.config=<path>`
+  is syntactically accepted by Codex but rejected at configuration
+  load time with "invalid transport in `mcp_servers.workbridge`"
+  (verified against the live `codex` CLI). Replaced with per-field
+  overrides built from a new `McpBridgeSpec` (command + args):
+  `-c mcp_servers.workbridge.command="<exe>"` and
+  `-c mcp_servers.workbridge.args=[...]`. RP1c / RP2c / RP2bc
+  updated. `SpawnConfig` and `ReviewGateSpawnConfig` grew a
+  `mcp_bridge` field so the structured spec flows from the
+  session-open worker (where `std::env::current_exe` already runs)
+  to the backend without round-tripping through JSON. Claude
+  ignores it and continues to consume `--mcp-config <path>`. New
+  test `codex_mcp_bridge_none_omits_workbridge_overrides` pins
+  the "degrade, do not fall back to `~/.codex/config.toml`"
+  contract. F-2: the `finish_session_open` and `begin_session_open`
+  paths previously resolved the per-work-item backend via
+  `backend_for_work_item(id).unwrap_or_else(|| self.agent_backend)`
+  which silently ran Claude even when the user had picked Codex
+  and restarted. CLAUDE.md grew an `[ABSOLUTE]` rule forbidding
+  that; the fallback was removed at both sites and at the global-
+  assistant path. Missing `harness_choice` now produces a user-
+  visible toast ("Cannot open session: no harness chosen...") and
+  aborts the spawn, matching `spawn_review_gate` / `spawn_rebase_gate`.
+  Regression test `stage_transition_without_harness_choice_surfaces_error`.
+  `finish_session_open` signature collapsed from 8 positional
+  arguments to a single `SessionOpenPlanResult` (clippy
+  too-many-arguments threshold). Known Spawn Sites table line
+  numbers refreshed: 5792 -> 5915 (work-item interactive),
+  9990 -> 10337 (review gate), 10397 -> 10779 (rebase gate),
+  11608 -> 12018 (global assistant).
+- 2026-04-16 (round 2): Codex rebase-gate argv placement fix +
+  per-repo MCP server parity. RP2bc previously emitted
+  `exec --json --full-auto --ask-for-approval never ...`, which
+  the `codex` CLI rejects with `error: unexpected argument
+  '--ask-for-approval' found` (verified live). The flag is parsed
+  as a TOP-LEVEL `codex` flag and MUST come BEFORE the `exec`
+  subcommand; `--full-auto` is an `exec`-subcommand flag and stays
+  inside `exec`. `build_headless_rw_command` rearranged accordingly;
+  `codex_headless_rw_includes_full_auto_and_approval_never` updated
+  to assert the new placement; RP2bc updated. The interactive path
+  (`build_command`) and review-gate path (`build_review_gate_command`)
+  do not use `--ask-for-approval` and were unaffected. Per-repo
+  MCP servers from `Config::mcp_servers_for_repo` were silently
+  dropped for Codex sessions in round 1 (Claude consumed them via
+  `--mcp-config <file>`, but Codex's argv only emitted the workbridge
+  primary). `McpBridgeSpec` grew a `name` field and
+  `SpawnConfig` / `ReviewGateSpawnConfig` grew an
+  `extra_bridges: &[McpBridgeSpec]` field. The work-item, review-
+  gate, and rebase-gate spawn sites now resolve per-repo MCP servers
+  on the UI thread, filter out HTTP-transport entries (Codex has no
+  `mcp_servers.<name>.url` schema), and forward the rest. RP1c /
+  RP2c / RP2bc updated with `[--config mcp_servers.<extra>.*]`
+  placeholders. Regression test
+  `codex_mcp_bridge_extras_emit_per_key_overrides`. Function arg
+  count of `build_agent_cmd_with` collapsed via a new
+  `McpInjection<'a>` bundle struct (config_path + primary_bridge +
+  extra_bridges) to stay under the clippy threshold.
+
+- 2026-04-16 (round 3): Three Codex argv-builder hardening fixes.
+  (R3-F-1) `extend_mcp_bridge_argv` now emits per-repo extras FIRST
+  and the workbridge primary LAST so Codex's last-write-wins
+  semantics structurally protect the workbridge bridge entry from
+  being clobbered by an extra named `workbridge`. Mirrors the
+  Claude-side `build_mcp_config_workbridge_key_always_wins` invariant.
+  (R3-F-2) `extend_one_mcp_bridge` now routes `bridge.name` through
+  a new `toml_quote_key` helper: bare-key-safe names
+  (`A-Za-z0-9_-`) emit unchanged for readability, anything else
+  (dots, spaces, quotes, non-ASCII, empty) renders as a TOML
+  quoted key fragment so `mcp_servers."my.server".command=...`
+  reaches Codex as a single fragment instead of misregistering
+  under `mcp_servers.my.server.command`. (R3-F-3) The three Codex
+  spawn sites in `src/app.rs` (`begin_session_open`,
+  `spawn_review_gate`, `spawn_rebase_gate`) now push a one-shot
+  toast when one or more HTTP-transport per-repo MCP servers were
+  filtered out, so users with HTTP MCP servers see why those
+  servers are missing from a Codex session vs. their Claude
+  session. Regression tests:
+  `codex_extras_cannot_override_workbridge_primary`,
+  `toml_quote_key_*` (5 tests), and
+  `codex_extra_bridge_with_dotted_name_emits_quoted_key`. RP1c /
+  RP2c / RP2bc updated to show extras-first / workbridge-last
+  ordering.
+
+## Reference Payloads (Codex)
+
+These are the per-harness equivalents of RP1 / RP2 / RP2b for
+Codex. They are the argv that `CodexBackend::build_command` /
+`::build_review_gate_command` / `::build_headless_rw_command`
+produce for a typical Planning / review-gate / rebase-gate spawn.
+Pinned by the `codex_*` tests in `src/agent_backend.rs`.
+
+### RP1c - Codex interactive work-item argv
+
+```
+codex
+  --ask-for-approval never
+  --sandbox workspace-write
+  [--config mcp_servers.<extra>.command="..."                              ]   # zero or more extras
+  [--config mcp_servers.<extra>.args=[...]                                 ]   # (emitted FIRST)
+  [--config mcp_servers.<extra>.default_tools_approval_mode="approve"       ]
+  --config mcp_servers.workbridge.command="<workbridge exe path>"
+  --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<socket path>"]
+  --config mcp_servers.workbridge.default_tools_approval_mode="approve"
+  --config instructions="<stage system prompt>"
+  <auto-start user prompt (if any)>
+```
+
+Approval-policy rationale (2026-04-17 directive: "MCP tools need
+to be pre-allowed for codex, so it does not ask for permission for
+them"): codex-cli 0.120.0 has two orthogonal approval axes:
+
+1. **Shell/patch approvals** - governed by `--ask-for-approval`
+   (untrusted / on-request / never / granular). We emit `never` to
+   auto-approve shell commands and patch writes within the sandbox.
+
+2. **MCP tool approvals** - controlled PER-MCP-SERVER via
+   `mcp_servers.<name>.default_tools_approval_mode`. The top-level
+   `--ask-for-approval` flag does NOT cover this axis. Verified by
+   reading codex source (`codex-rs/core/src/mcp_tool_call.rs` -
+   `custom_mcp_tool_approval_mode` resolves to `mcp_servers.<name>.
+   default_tools_approval_mode`; value `"approve"` makes
+   `auto_approved_by_policy` true and skips the approval prompt).
+
+   The `AppToolApproval` enum values are `Auto` (default - may
+   prompt), `Prompt` (always prompt), `Approve` (auto-approve).
+   We emit `"approve"` for every MCP server we register (workbridge
+   primary + user-configured extras) since workbridge-session MCP
+   servers are equally trusted by the user's choice.
+
+`--full-auto` is NOT used because it bundles `-a on-request` which
+reintroduces the shell/patch prompt. `--sandbox workspace-write`
+scopes filesystem writes to the worktree. Read-only interactive
+sessions (global-assistant read-only, hypothetical future read-
+only scope) omit both `--ask-for-approval` and `--sandbox` because
+the MCP-server layer enforces read-only there; the per-server
+`default_tools_approval_mode="approve"` is still emitted so read-
+only MCP tool calls also go through without prompting.
+
+See Authorization 2b in the review-loop session log for the
+directive trail from `--full-auto` to the current shape.
+
+Ordering invariant (R3-F-1): the workbridge primary's `--config
+mcp_servers.workbridge.*` overrides MUST be emitted AFTER every
+per-repo extra. Codex's `-c key=value` overrides are last-write-wins,
+so this ordering structurally guarantees that no extra (whether
+named `workbridge` accidentally or maliciously) can clobber the
+workbridge bridge entry. Mirrors `crate::mcp::build_mcp_config`,
+which inserts the `workbridge` key into the JSON map last for the
+same reason. Pinned by `codex_extras_cannot_override_workbridge_primary`
+in `src/agent_backend.rs::tests`.
+
+Key-quoting (R3-F-2): each `<extra>` is rendered through
+`toml_quote_key` so server names containing characters outside
+TOML's bare-key alphabet (`A-Za-z0-9_-`) emit a quoted key fragment
+(`mcp_servers."my.server".command=...`) instead of a bare key that
+would mis-split the TOML path. Pinned by `toml_quote_key_*` and
+`codex_extra_bridge_with_dotted_name_emits_quoted_key`.
+
+Differences from Claude's RP1:
+- `--ask-for-approval never --sandbox workspace-write` instead of
+  `--dangerously-skip-permissions` (see the approval-policy note
+  above the snippet).
+- Per-field MCP overrides instead of `--mcp-config <path>`: Codex's
+  TOML schema for `mcp_servers.<name>` requires `command` (string)
+  and `args` (array of strings) directly. There is no `.config=<path>`
+  sub-field that reads an external JSON - verified by running
+  `codex -c 'mcp_servers.workbridge.config="/tmp/fake.json"' mcp list`,
+  which fails with "invalid transport in `mcp_servers.workbridge`".
+- `--config instructions="<prompt>"` instead of `--system-prompt
+  <prompt>`; value is TOML-quoted so prompts containing quotes,
+  newlines, or equals signs survive the TOML parser.
+- No `--allowedTools` flag (allowlist enforced at MCP server).
+- No `--settings` flag for the planning hook (C8 workaround:
+  embed reminder in system prompt).
+- Auto-start is the trailing positional; ordering relative to
+  the `--config` flags does NOT matter (unlike Claude where the
+  positional must precede `--mcp-config`).
+
+Implementation note: the `mcp_config_path` field on `SpawnConfig`
+is still populated by the caller (it is consumed by Claude and by
+the on-disk config parity logging), but it is intentionally NOT
+referenced in Codex's argv - only the structured
+`SpawnConfig::mcp_bridge` field is. Callers that fail to start the
+MCP server (e.g. socket bind error) pass `mcp_bridge: None`; Codex
+then omits the `mcp_servers.workbridge.*` overrides entirely rather
+than falling back to `~/.codex/config.toml`, which would
+silently cross-contaminate the user's personal config.
+
+### RP2c - Codex headless review-gate argv
+
+```
+exec
+  --json
+  --config instructions="<review gate system prompt>"
+  [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
+  [--config mcp_servers.<extra>.args=[...]      ]   # (emitted FIRST)
+  --config mcp_servers.workbridge.command="<workbridge exe path>"
+  --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<socket path>"]
+  <review skill prompt (e.g. /claude-adversarial-review)>
+```
+
+Same workbridge-last ordering invariant as RP1c.
+
+The first positional is `exec` (not `--print`) - Codex's headless
+mode is a separate subcommand. `--json` switches the event stream
+to newline-delimited JSON;
+`CodexBackend::parse_review_gate_stdout` keeps only the last
+`agent_message` event's `content` field and parses it as the
+verdict envelope body. The workbridge MCP bridge is registered via
+the per-field `mcp_servers.workbridge.command` / `.args` overrides
+(same rationale as RP1c).
+
+### RP2bc - Codex headless rebase-gate argv
+
+```
+--ask-for-approval never
+exec
+  --json
+  --full-auto
+  [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
+  [--config mcp_servers.<extra>.args=[...]      ]   # (emitted FIRST)
+  --config mcp_servers.workbridge.command="<workbridge exe path>"
+  --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<socket path>"]
+  <rebase instruction prompt>
+```
+
+Same workbridge-last ordering invariant as RP1c.
+
+`--ask-for-approval` is a TOP-LEVEL `codex` flag and MUST come BEFORE
+the `exec` subcommand. Verified live on 2026-04-16 by running each
+shape against the installed `codex` CLI:
+
+- `codex --ask-for-approval never exec --json --full-auto
+  --skip-git-repo-check "echo hi"` -> valid event stream.
+- `codex exec --json --full-auto --ask-for-approval never "echo hi"`
+  -> `error: unexpected argument '--ask-for-approval' found`.
+
+This pinning lives in `codex_headless_rw_includes_full_auto_and_approval_never`
+in `src/agent_backend.rs`.
+
+`--full-auto` (write access) IS an `exec` subcommand flag and stays
+inside `exec`. The combination parallels Claude's
+`--dangerously-skip-permissions`, which already implies "no approval
+prompts" so Claude needs no separate flag.
+
+Each `mcp_servers.<extra>.*` pair is rendered for one entry of
+`SpawnConfig::extra_bridges` / `ReviewGateSpawnConfig::extra_bridges`
+in addition to the workbridge primary. The list is populated from
+`Config::mcp_servers_for_repo` at the spawn site (see
+`begin_session_open` and `spawn_rebase_gate` / `spawn_review_gate`),
+mirroring the `extra_servers` slice that the Claude side already
+threads into `crate::mcp::build_mcp_config`. HTTP-transport entries
+are filtered out because Codex's `mcp_servers.<name>` schema requires
+command + args (no `url` sub-field). Missing extras render as zero
+overrides; the workbridge primary is unaffected.

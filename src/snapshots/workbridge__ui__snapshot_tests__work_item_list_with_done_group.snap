@@ -1,9 +1,9 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 24)"
+expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
-┌ Work Items (3) ───────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Work Items (3) ───────┐┌ Session ────────────────────────────────────────────┐
 │  ACTIVE (0) (1)       ││                                                     │
 │> [IM] Refac PR#88 fail││  Refactor backend API                               │
 │  tor backend API      ││                                                     │
@@ -19,7 +19,7 @@ expression: "render(&app, 80, 24)"
 │                       ││  PR URL                                             │
 │                       ││  https://github.com/o/r/pull/88                     │
 │                       ││                                                     │
-│                       ││  Press Enter to start a session.                    │
+│                       ││  Press c (Claude) or x (Codex) to start a session.  │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │

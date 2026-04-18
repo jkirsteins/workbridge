@@ -1,9 +1,9 @@
 ---
 source: src/ui.rs
-expression: "render(&app, 80, 24)"
+expression: "render(&mut app, 80, 24)"
 ---
   List    Board    Dashboard                                   Tab: switch view
-┌ Work Items (3) ───────┐┌ Claude Code ────────────────────────────────────────┐
+┌ Work Items (3) ───────┐┌ Session ────────────────────────────────────────────┐
 │  ACTIVE (0) (1)       ││                                                     │
 │> [IM] Second item     ││  Second item                                        │
 │  branch-b [no wt]     ││                                                     │
@@ -16,7 +16,7 @@ expression: "render(&app, 80, 24)"
 │                       ││  Issue       (none)                                 │
 │                       ││  Errors      (none)                                 │
 │                       ││                                                     │
-│                       ││  Press Enter to start a session.                    │
+│                       ││  Press c (Claude) or x (Codex) to start a session.  │
 │                       ││                                                     │
 │                       ││                                                     │
 │                       ││                                                     │
