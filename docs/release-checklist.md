@@ -2,6 +2,18 @@
 
 Use this checklist for manual Workbridge releases to crates.io.
 
+Workbridge uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) for
+`Cargo.toml` `version` and git tag names, and the `CHANGELOG.md` follows the
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. Each release
+is represented in git three ways:
+
+- a bumped `version` field in `Cargo.toml`,
+- a dated section in `CHANGELOG.md`, and
+- an annotated git tag named `v<MAJOR>.<MINOR>.<PATCH>` that matches the
+  `Cargo.toml` version exactly.
+
+All three must agree before publishing.
+
 ## First Publish Name Check
 
 - Confirm `workbridge` is still available immediately before the first publish:
@@ -14,6 +26,30 @@ Use this checklist for manual Workbridge releases to crates.io.
   name and audit `Cargo.toml`, README install commands, UI text, docs, and
   release notes before publishing.
 
+## Version Bump And Changelog
+
+Do this in a dedicated release-prep commit before running any publish commands.
+
+- Bump `package.version` in `Cargo.toml` to the intended release version,
+  following [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
+  (MAJOR for breaking changes, MINOR for new features, PATCH for fixes).
+- In `CHANGELOG.md`, rename the `[Unreleased]` section to
+  `[<version>] - YYYY-MM-DD` using today's date, and move any entries that
+  belong to this release into it. Leave a fresh, empty `[Unreleased]` section
+  at the top for future work.
+- Update the reference-style links at the bottom of `CHANGELOG.md` so
+  `[Unreleased]` compares against the new tag and `[<version>]` points at the
+  new release tag.
+- For the very first publish there are no prior entries to move; the existing
+  `[0.1.0]` section and its date are already correct, but confirm the date
+  still matches the actual publish day.
+- Commit the version bump and changelog update together. Example:
+
+  ```sh
+  git add Cargo.toml CHANGELOG.md
+  git commit -m "Release v<version>"
+  ```
+
 ## Preflight
 
 - Confirm the intended release commit is checked out:
@@ -23,9 +59,10 @@ Use this checklist for manual Workbridge releases to crates.io.
   git log --oneline -1
   ```
 
+- Confirm `Cargo.toml` `version`, the top dated section in `CHANGELOG.md`, and
+  the tag name you plan to push all match.
 - Do not use `--no-verify` for release commits.
 - Do not use `--allow-dirty` for Cargo package or publish commands.
-- Confirm `CHANGELOG.md` has an entry for the version in `Cargo.toml`.
 
 ## Verification
 
@@ -63,12 +100,17 @@ cargo publish
 
 ## Tag
 
-After crates.io accepts the package, tag the published commit:
+After crates.io accepts the package, create an annotated tag on the published
+commit and push it. Annotated tags (`-a`) carry their own message, author, and
+date in git, which is the convention for release tags.
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag -a v<version> -m "Release v<version>"
+git push origin v<version>
 ```
+
+The tag name must match the `Cargo.toml` `version` exactly, prefixed with `v`
+(for example, `v0.1.0`).
 
 ## Optional GitHub Release
 
