@@ -15,11 +15,10 @@ through a Backlog -> Planning -> Implementing -> Review -> Done workflow.
 ## Table of Contents
 
 - [Quick Start](#quick-start)
-  - [1. Enable the git hooks](#1-enable-the-git-hooks)
-  - [2. Build and install Workbridge](#2-build-and-install-workbridge)
-  - [3. Register the repos you want to manage](#3-register-the-repos-you-want-to-manage)
-  - [4. Launch the TUI](#4-launch-the-tui)
-  - [5. Start your first quick-start session](#5-start-your-first-quick-start-session)
+  - [1. Build and install Workbridge](#1-build-and-install-workbridge)
+  - [2. Register the repos you want to manage](#2-register-the-repos-you-want-to-manage)
+  - [3. Launch the TUI](#3-launch-the-tui)
+  - [4. Start your first quick-start session](#4-start-your-first-quick-start-session)
 - [How It Works](#how-it-works)
   - [Work Item Lifecycle](#work-item-lifecycle)
   - [Global assistant drawer](#global-assistant-drawer)
@@ -31,33 +30,24 @@ through a Backlog -> Planning -> Implementing -> Review -> Done workflow.
 
 ## Quick Start
 
-### 1. Enable the git hooks
+### 1. Build and install Workbridge
 
-The `hooks/` directory contains git hooks that enforce code quality:
-
-- **pre-commit** - runs `cargo fmt --check` and `cargo clippy` (lint + format)
-- **pre-push** - checks for unstaged/untracked files, then runs `cargo test`
-
-Enable them once after cloning:
+Workbridge is distributed as a Rust binary crate:
 
 ```sh
-git config core.hooksPath hooks
+cargo install workbridge
 ```
 
-This is a per-repo setting.
-
-### 2. Build and install Workbridge
-
-Workbridge is a Rust project. Build a release binary and put it on your PATH:
+For local development from a checkout, install the current workspace instead:
 
 ```sh
 cargo install --path .
 ```
 
-For local development, `cargo run -- <args>` works the same way as the
-installed `workbridge` binary.
+For local development without installing, `cargo run -- <args>` works the same
+way as the installed `workbridge` binary.
 
-### 3. Register the repos you want to manage
+### 2. Register the repos you want to manage
 
 Workbridge does not walk your filesystem. You tell it which repos to scan,
 either one at a time or by registering a base directory that gets scanned one
@@ -74,7 +64,7 @@ directory start unmanaged - opt them in from the TUI settings overlay (`?`)
 or with an explicit `repos add`. See [docs/repository-registry.md](docs/repository-registry.md)
 for the full CLI reference and config file format.
 
-### 4. Launch the TUI
+### 3. Launch the TUI
 
 ```sh
 workbridge
@@ -92,7 +82,7 @@ the review gate, so it can be a slash command (e.g.
 coding agent can follow. The default is a Claude Code slash command - update
 it if you are using a different coding agent.
 
-### 5. Start your first quick-start session
+### 4. Start your first quick-start session
 
 Press `Ctrl+N` to begin a quick-start session. If you have exactly one managed
 repo, Workbridge skips the dialog and creates a Planning work item immediately

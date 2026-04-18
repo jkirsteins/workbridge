@@ -2,10 +2,23 @@
 name = "workbridge"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 description = "Multi-repo Claude Code orchestration in your terminal."
 repository = "https://github.com/jkirsteins/workbridge"
+homepage = "https://github.com/jkirsteins/workbridge"
 readme = "README.md"
+keywords = ["claude", "git", "tui", "workflow", "worktree"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    ".claude/**",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README",
+    "docs/superpowers/**",
+    "hooks/**",
+    "workbridge-sidebar-playground.html",
+]
 
 [dependencies]
 tui-term = "0.3"
