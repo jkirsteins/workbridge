@@ -259,8 +259,8 @@ pub fn reassemble(
                 // tracked changes and untracked files because both
                 // block merging identically - callers that want to
                 // distinguish them go through
-                // `WorktreeCleanliness::from_worktree_info`, which
-                // reads the raw `WorktreeInfo` fields directly.
+                // `MergeReadiness::classify`, which reads the raw
+                // `WorktreeInfo` fields directly.
                 git_state = Some(GitState {
                     dirty: wt.dirty.unwrap_or(false) || wt.untracked.unwrap_or(false),
                     ahead: wt.unpushed.unwrap_or(0),
@@ -1109,8 +1109,7 @@ mod tests {
     /// flow into the derived `GitState`. `dirty` on `GitState` is the
     /// union of tracked-dirty and untracked so the UI chip renders
     /// for either - the merge guard separates them via
-    /// `WorktreeCleanliness::from_worktree_info`, which reads the
-    /// raw fields.
+    /// `MergeReadiness::classify`, which reads the raw fields.
     #[test]
     fn git_state_flows_from_worktree_info_fields() {
         let rp = repo_path("alpha");

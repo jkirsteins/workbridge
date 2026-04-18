@@ -606,10 +606,11 @@ fn main() -> Result<(), AppError> {
     let github_client: Arc<dyn github_client::GithubClient + Send + Sync> =
         Arc::new(GhCliClient::new());
 
-    let mut app = App::with_config_and_worktree_service(
+    let mut app = App::with_config_worktree_and_github(
         cfg,
         backend,
         Arc::clone(&worktree_service),
+        Arc::clone(&github_client),
         Box::new(FileConfigProvider),
     );
     // Spawn the background metrics aggregator and wire its receiver into

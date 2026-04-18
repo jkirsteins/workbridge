@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::work_item::{CheckStatus, MergeableState};
+
 /// Errors from GitHub API operations.
 #[derive(Clone, Debug)]
 pub enum GithubError {
@@ -72,6 +74,38 @@ pub struct GithubPr {
     pub requested_team_slugs: Vec<String>,
 }
 
+/// Live PR merge-state signals fetched on the merge-precheck
+/// background thread via `GithubClient::fetch_live_merge_state`.
+/// Packaged as a struct so the classifier in
+/// `MergeReadiness::classify` can consume both remote dimensions
+/// together, and so the "no open PR" sentinel is a single value
+/// (`LivePrState::no_pr()`) rather than three parallel `Option`s.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LivePrState {
+    pub mergeable: MergeableState,
+    pub check_rollup: CheckStatus,
+    /// `false` when `gh pr view` reported no open PR for the branch.
+    /// The classifier treats this as "no remote constraints" so a
+    /// clean worktree with no PR still resolves to `Clean`; the
+    /// downstream merge thread then surfaces the existing `NoPr`
+    /// outcome.
+    pub has_open_pr: bool,
+}
+
+impl LivePrState {
+    /// Sentinel for "no open PR exists for this branch". The
+    /// classifier skips remote checks when `has_open_pr` is false,
+    /// so the `Unknown` defaults for `mergeable` / `check_rollup`
+    /// never surface in a merge decision.
+    pub fn no_pr() -> Self {
+        Self {
+            mergeable: MergeableState::Unknown,
+            check_rollup: CheckStatus::None,
+            has_open_pr: false,
+        }
+    }
+}
+
 /// A raw issue as returned by the GitHub API (via gh CLI).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GithubIssue {
@@ -114,6 +148,84 @@ pub trait GithubClient: Send + Sync {
             "current_user_login not implemented for this client".into(),
         ))
     }
+
+    /// Re-fetch the live merge-state signals (mergeable flag + CI
+    /// rollup) for a single branch's open PR. Called exclusively from
+    /// `App::spawn_merge_precheck` on the merge-precheck background
+    /// thread, so it may block for as long as `gh` takes to respond.
+    ///
+    /// Returns `LivePrState::no_pr()` when `gh pr view` reports no
+    /// open PR for the branch. The merge precheck treats this as
+    /// "no remote constraints" and classifies on the local worktree
+    /// state alone; the downstream merge thread then surfaces the
+    /// existing `NoPr` outcome.
+    ///
+    /// The default impl returns an error so test doubles that do
+    /// not need this path do not have to stub it. `MockGithubClient`
+    /// overrides it via a configurable fixture; `GhCliClient`
+    /// overrides it to shell out to `gh pr view`.
+    fn fetch_live_merge_state(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<LivePrState, GithubError> {
+        let _ = (owner, repo, branch);
+        Err(GithubError::ApiError(
+            "fetch_live_merge_state not implemented for this client".into(),
+        ))
+    }
+}
+
+/// Inert GitHub client that always reports "no open PR" for the
+/// merge-precheck path and errors out of every other method. Used as
+/// the default for `App::with_config_and_worktree_service` so tests
+/// and other non-production construction sites do not have to
+/// construct a real `GhCliClient` (which would shell out to `gh`).
+/// Production `main.rs` passes a real `GhCliClient` via
+/// `App::with_config_worktree_and_github` and never touches this
+/// stub.
+#[cfg(test)]
+pub struct StubGithubClient;
+
+#[cfg(test)]
+impl GithubClient for StubGithubClient {
+    fn list_open_prs(&self, _owner: &str, _repo: &str) -> Result<Vec<GithubPr>, GithubError> {
+        Ok(Vec::new())
+    }
+
+    fn list_review_requested_prs(
+        &self,
+        _owner: &str,
+        _repo: &str,
+    ) -> Result<Vec<GithubPr>, GithubError> {
+        Ok(Vec::new())
+    }
+
+    fn get_issue(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        number: u64,
+    ) -> Result<GithubIssue, GithubError> {
+        Err(GithubError::ApiError(format!(
+            "stub github client cannot fetch issue #{number}"
+        )))
+    }
+
+    /// Matches the contract documented on the trait method: "no open
+    /// PR found" is represented by `LivePrState::no_pr()`, not an
+    /// error. Returning `no_pr()` here keeps the merge-precheck
+    /// classifier in the "no remote constraints" arm when the App
+    /// was constructed without a real GitHub client.
+    fn fetch_live_merge_state(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _branch: &str,
+    ) -> Result<LivePrState, GithubError> {
+        Ok(LivePrState::no_pr())
+    }
 }
 
 /// Mock GitHub client for tests. Returns configurable fixture data.
@@ -124,6 +236,13 @@ pub struct MockGithubClient {
     pub issues: Vec<GithubIssue>,
     /// If set, all calls return this error instead of fixture data.
     pub error: Option<GithubError>,
+    /// Fixture result for `fetch_live_merge_state`. When `None`, the
+    /// trait default (returns an error) applies - the merge precheck
+    /// tests that do not exercise the live merge-state path therefore
+    /// do not need to set this field. Set to `Some(Ok(...))` to drive
+    /// the conflict / ci-failing / clean-PR code paths; set to
+    /// `Some(Err(...))` to drive the "remote fetch failed" branch.
+    pub live_pr_state: Option<Result<LivePrState, GithubError>>,
 }
 
 #[cfg(test)]
@@ -134,6 +253,7 @@ impl MockGithubClient {
             review_requested_prs: Vec::new(),
             issues: Vec::new(),
             error: None,
+            live_pr_state: None,
         }
     }
 }
@@ -184,6 +304,23 @@ impl GithubClient for MockGithubClient {
             .filter(|p| p.state == "MERGED")
             .cloned()
             .collect())
+    }
+
+    /// Mock override. Returns the `live_pr_state` fixture when set
+    /// (so tests can drive the conflict / CI-failing / clean / error
+    /// branches of `spawn_merge_precheck`), otherwise falls back to
+    /// `LivePrState::no_pr()` so tests that do not care about the
+    /// live merge-state path still get a non-blocking default.
+    fn fetch_live_merge_state(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _branch: &str,
+    ) -> Result<LivePrState, GithubError> {
+        if let Some(ref fixture) = self.live_pr_state {
+            return fixture.clone();
+        }
+        Ok(LivePrState::no_pr())
     }
 
     /// Mock override. Returns the shared fixture error when `error`
@@ -372,6 +509,89 @@ impl GithubClient for GhCliClient {
             .map_err(|e| GithubError::ParseError(format!("failed to parse PR list JSON: {e}")))?;
 
         items.iter().map(parse_pr_from_value).collect()
+    }
+
+    fn fetch_live_merge_state(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<LivePrState, GithubError> {
+        let repo_arg = format!("{owner}/{repo}");
+        // `--json mergeable,statusCheckRollup,state` gives both
+        // signals in a single gh call. `state` is fetched so the
+        // "no open PR" fallback can distinguish "branch exists but
+        // its PR was closed/merged" from the actual error path.
+        let result = self.run_gh(&[
+            "pr",
+            "view",
+            branch,
+            "--repo",
+            &repo_arg,
+            "--json",
+            "mergeable,statusCheckRollup,state",
+        ]);
+
+        let stdout = match result {
+            Ok(s) => s,
+            Err(GithubError::ApiError(msg)) => {
+                // `gh pr view` exits non-zero with a stderr like
+                // "no pull requests found for branch ..." when the
+                // branch has no open PR. Surface that as the
+                // structural "no PR" sentinel so the merge precheck
+                // falls through to the existing `NoPr` outcome
+                // instead of blocking the merge on a fetch error.
+                let low = msg.to_lowercase();
+                if low.contains("no pull requests found")
+                    || low.contains("no pull request")
+                    || low.contains("not found")
+                {
+                    return Ok(LivePrState::no_pr());
+                }
+                return Err(GithubError::ApiError(msg));
+            }
+            Err(e) => return Err(e),
+        };
+
+        let value: Value = serde_json::from_str(stdout.trim())
+            .map_err(|e| GithubError::ParseError(format!("failed to parse pr view JSON: {e}")))?;
+
+        let state = value
+            .get("state")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_uppercase();
+        // `gh pr view <branch>` returns the most recent PR on the
+        // branch regardless of state. If it is CLOSED / MERGED, no
+        // open PR exists for the branch - treat the same as "no PR".
+        if state == "CLOSED" || state == "MERGED" {
+            return Ok(LivePrState::no_pr());
+        }
+
+        let mergeable_raw = value
+            .get("mergeable")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        let mergeable = match mergeable_raw {
+            "MERGEABLE" => MergeableState::Mergeable,
+            "CONFLICTING" => MergeableState::Conflicting,
+            _ => MergeableState::Unknown,
+        };
+
+        let rollup_raw = parse_check_status_raw(&value);
+        let check_rollup = match rollup_raw.as_str() {
+            "SUCCESS" => CheckStatus::Passing,
+            "PENDING" => CheckStatus::Pending,
+            "FAILURE" => CheckStatus::Failing,
+            "" => CheckStatus::None,
+            _ => CheckStatus::Unknown,
+        };
+
+        Ok(LivePrState {
+            mergeable,
+            check_rollup,
+            has_open_pr: true,
+        })
     }
 }
 
@@ -709,6 +929,7 @@ mod tests {
             review_requested_prs: Vec::new(),
 
             error: None,
+            live_pr_state: None,
         };
 
         let prs = client.list_open_prs("o", "r").unwrap();
@@ -724,6 +945,7 @@ mod tests {
             review_requested_prs: Vec::new(),
 
             error: Some(GithubError::AuthRequired),
+            live_pr_state: None,
         };
 
         let result = client.list_open_prs("o", "r");
@@ -743,6 +965,7 @@ mod tests {
             review_requested_prs: Vec::new(),
 
             error: None,
+            live_pr_state: None,
         };
 
         let issue = client.get_issue("o", "r", 7).unwrap();
