@@ -18,6 +18,7 @@ mod salsa;
 mod session;
 mod theme;
 mod ui;
+mod verify_ci_red;
 mod work_item;
 mod work_item_backend;
 mod worktree_service;
