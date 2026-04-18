@@ -1613,12 +1613,12 @@ dialog that blocks interaction until dismissed with Enter or Esc.
 ### Global assistant drawer session lifetime
 
 The global assistant drawer (toggled with Ctrl+G) does NOT keep its
-`claude` session alive across drawer openings. Every open spawns a
+agent session alive across drawer openings. Every open spawns a
 fresh session with an empty context and scrollback; every close
 (Ctrl+G or Esc while the drawer is open) immediately tears the
 session down via `App::teardown_global_session`. Teardown:
 
-1. SIGTERMs the `claude` child (graceful grace period + SIGKILL
+1. SIGTERMs the agent child (graceful grace period + SIGKILL
    via `Session::kill`).
 2. Drops the `SessionEntry` so `Session::Drop` joins the reader
    thread.
