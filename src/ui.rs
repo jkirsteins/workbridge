@@ -4037,7 +4037,7 @@ fn draw_settings_keybindings_tab(buf: &mut Buffer, app: &App, theme: &Theme, are
 ///   |  [error message if any]                             |
 ///   |  Enter: Create  |  Esc: Cancel  |  Tab: Next field  |
 ///   +-----------------------------------------------------+
-/// Height of the description text area (visible lines).
+/// Preferred height of the description text area (visible lines).
 ///
 /// Six rows gives enough vertical room to show wrapped multi-line
 /// descriptions without immediately scrolling on the first few lines of
@@ -4045,7 +4045,24 @@ fn draw_settings_keybindings_tab(buf: &mut Buffer, app: &App, theme: &Theme, are
 /// `rat_widget::textarea::TextArea` scrolls vertically (a scrollbar is
 /// wired through `Scroll::new`), so long descriptions are still fully
 /// editable.
+///
+/// This is a **preferred** height: the dialog layout shrinks the
+/// textarea down to [`DESC_TEXTAREA_MIN_HEIGHT`] when the terminal is
+/// too short for the full dialog (common at 80x24 with several repos
+/// configured). Without that shrink, ratatui's constraint solver used
+/// to scale every `Length` down proportionally, squeezing the textarea
+/// to 1-2 rows and causing rat-text's cursor-follow scroll to hide the
+/// first row of typed characters.
 pub const DESC_TEXTAREA_HEIGHT: u16 = 6;
+
+/// Minimum height of the description text area.
+///
+/// When the terminal is too short for the full dialog, the textarea is
+/// the sole flex element and shrinks down to this floor. A 2-row floor
+/// keeps the cursor visible while typing even in the worst case; if the
+/// terminal cannot accommodate even this, the dialog renders the
+/// "terminal too small" fallback instead (see `draw_create_dialog`).
+const DESC_TEXTAREA_MIN_HEIGHT: u16 = 2;
 
 fn draw_create_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &Theme, area: Rect) {
     // Dim the background so the dialog is the clear focal point.
@@ -4056,15 +4073,59 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &Theme
         return;
     }
 
-    // Compute dialog height based on content.
-    // Rows: border(1) + blank(1) + "Title:" label(1) + input(1) + blank(1)
-    //   + "Description:" label(1) + textarea(DESC_TEXTAREA_HEIGHT) + blank(1)
-    //   + "Repos:" label(1) + repo_lines(max 6) + blank(1)
-    //   + "Branch:" label(1) + input(1) + blank(1)
-    //   + error_line(1) + hint(1) + border(1)
-    let repo_lines = dialog.repo_list.len().clamp(1, 6) as u16;
-    let dialog_height =
-        2 + 2 + 1 + 1 + DESC_TEXTAREA_HEIGHT + 1 + 1 + repo_lines + 1 + 2 + 1 + 2 + 2;
+    // Row budget inside the dialog's `inner` rect (i.e. excluding the
+    // border and the 1-cell padding on each side):
+    //   Title label(1) + Title input(1) + blank(1)
+    //   + Description label(1) + Description textarea(preferred
+    //     DESC_TEXTAREA_HEIGHT, flex down to DESC_TEXTAREA_MIN_HEIGHT)
+    //   + blank(1) + Repos label(1) + repo_lines + blank(1)
+    //   + Branch label(1) + Branch input(1) + blank(1)
+    //   + error(1) + hint(1)
+    // Fixed (non-textarea, non-repo-list): 12 rows.
+    // Chrome (outer border + 1-cell top/bottom padding): 4 rows.
+    //
+    // The Description textarea is the SOLE flex element. When the
+    // terminal is too short for the full dialog, the textarea shrinks
+    // first; we also clamp the repo list harder (max 4 rows instead
+    // of 6) to give the textarea breathing room. Without that
+    // discipline, ratatui's constraint solver silently scales every
+    // `Length` down proportionally, crushing the textarea to 1-2 rows
+    // and causing rat-text's cursor-follow scroll to hide the first
+    // row of typed characters (the bug this layout replaced).
+    const FIXED_INNER_ROWS_WITHOUT_REPOS: u16 = 12;
+    const CHROME_ROWS: u16 = 4;
+
+    let repo_list_len = dialog.repo_list.len() as u16;
+    let repo_lines_preferred = repo_list_len.clamp(1, 6);
+    let preferred_with_max_repos =
+        FIXED_INNER_ROWS_WITHOUT_REPOS + repo_lines_preferred + DESC_TEXTAREA_HEIGHT + CHROME_ROWS;
+    let repo_lines = if preferred_with_max_repos > area.height {
+        repo_list_len.clamp(1, 4)
+    } else {
+        repo_lines_preferred
+    };
+
+    let fixed_inner_rows = FIXED_INNER_ROWS_WITHOUT_REPOS + repo_lines;
+    let preferred_height = fixed_inner_rows + DESC_TEXTAREA_HEIGHT + CHROME_ROWS;
+    let minimum_height = fixed_inner_rows + DESC_TEXTAREA_MIN_HEIGHT + CHROME_ROWS;
+
+    if area.height < minimum_height {
+        // The terminal cannot fit even the compact dialog with a
+        // 2-row textarea. Show a fallback message so keyboard focus
+        // never lands on an invisible textarea: the previous behavior
+        // of rendering the normal dialog anyway produced an
+        // unresponsive-looking popup where typed characters seemed
+        // to vanish.
+        draw_create_dialog_too_small(buf, theme, area);
+        return;
+    }
+
+    let dialog_height = preferred_height.min(area.height);
+    // Textarea absorbs whatever vertical space remains after the
+    // chrome and fixed-height sections are satisfied, subject to the
+    // DESC_TEXTAREA_MIN_HEIGHT floor (guaranteed by `minimum_height`
+    // check above).
+    let textarea_height = dialog_height - fixed_inner_rows - CHROME_ROWS;
     let dialog_width = (area.width * 60 / 100).max(40).min(area.width);
 
     let popup = centered_rect_fixed(dialog_width, dialog_height, area);
@@ -4090,21 +4151,21 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &Theme
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),                    // [0] Title label
-            Constraint::Length(1),                    // [1] Title input
-            Constraint::Length(1),                    // [2] blank
-            Constraint::Length(1),                    // [3] Description label
-            Constraint::Length(DESC_TEXTAREA_HEIGHT), // [4] Description textarea
-            Constraint::Length(1),                    // [5] blank
-            Constraint::Length(1),                    // [6] Repos label
-            Constraint::Length(repo_lines),           // [7] Repos list
-            Constraint::Length(1),                    // [8] blank
-            Constraint::Length(1),                    // [9] Branch label
-            Constraint::Length(1),                    // [10] Branch input
-            Constraint::Length(1),                    // [11] blank
-            Constraint::Length(1),                    // [12] error / blank
-            Constraint::Length(1),                    // [13] hint line
-            Constraint::Min(0),                       // [14] absorb remaining
+            Constraint::Length(1),               // [0] Title label
+            Constraint::Length(1),               // [1] Title input
+            Constraint::Length(1),               // [2] blank
+            Constraint::Length(1),               // [3] Description label
+            Constraint::Length(textarea_height), // [4] Description textarea (flex)
+            Constraint::Length(1),               // [5] blank
+            Constraint::Length(1),               // [6] Repos label
+            Constraint::Length(repo_lines),      // [7] Repos list
+            Constraint::Length(1),               // [8] blank
+            Constraint::Length(1),               // [9] Branch label
+            Constraint::Length(1),               // [10] Branch input
+            Constraint::Length(1),               // [11] blank
+            Constraint::Length(1),               // [12] error / blank
+            Constraint::Length(1),               // [13] hint line
+            Constraint::Min(0),                  // [14] absorb remaining
         ])
         .split(inner);
 
@@ -4223,6 +4284,40 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &Theme
         theme.style_text_muted(),
     );
     Paragraph::new(hint).render(sections[13], buf);
+}
+
+/// Render a compact "terminal too small" fallback for the Create Work
+/// Item dialog when `area.height` is below the minimum needed to draw
+/// the full dialog with even a 2-row description textarea.
+///
+/// The fallback is a plain `Block` + `Paragraph` so it stays within the
+/// ratatui built-in widget vocabulary (no custom layout heroics) and
+/// never leaves keyboard focus on an invisible textarea. Esc still
+/// dismisses the dialog because the normal dialog event handlers run
+/// regardless of which variant is rendered.
+fn draw_create_dialog_too_small(buf: &mut Buffer, theme: &Theme, area: Rect) {
+    let message = "Terminal too small to show the Create Work Item dialog. Enlarge the \
+         terminal or press Esc to cancel.";
+    let dialog_width = (area.width * 60 / 100).max(40).min(area.width);
+    // Minimum usable fallback: border(2) + padding(2) + at least 1 row
+    // of message. Prefer 3 rows of message so the wrapped text has
+    // room at common widths; shrink if the terminal is really tiny.
+    let preferred_height = 7_u16;
+    let dialog_height = preferred_height.min(area.height.max(3));
+    let popup = centered_rect_fixed(dialog_width, dialog_height, area);
+    Clear.render(popup, buf);
+
+    let block = Block::default()
+        .title(" Create Work Item ")
+        .title_style(theme.style_title())
+        .borders(Borders::ALL)
+        .border_style(theme.style_border_overlay());
+    let block_inner = block.inner(popup);
+    block.render(popup, buf);
+
+    Paragraph::new(Line::styled(message, theme.style_error()))
+        .wrap(Wrap { trim: true })
+        .render(block_inner, buf);
 }
 
 /// Render the compact "Quick start - select repo" dialog opened by Ctrl+N
@@ -6739,15 +6834,151 @@ mod snapshot_tests {
         );
     }
 
-    /// Regression test for "Creating a new workitem does not allow
-    /// multi-line description" (#2266).
+    /// Regression for the "typed characters hidden on first row of
+    /// description" bug.
     ///
-    /// A description that is much longer than the textarea width must
-    /// wrap onto multiple visible rows instead of being clipped at the
-    /// right margin. The description is built from a distinctive set of
-    /// uppercase tokens so the test can cheaply confirm that more than
-    /// one token lands on a different row - which is only possible if
-    /// the TextArea wrapped.
+    /// Background: at 80x24 (the common single-pane tmux / terminal
+    /// size) the Create Work Item dialog requests ~28 rows, is clamped
+    /// to 24 by `centered_rect_fixed`, and ratatui's constraint solver
+    /// silently scales the `Length` constraints down proportionally.
+    /// The description textarea ends up with only 2-3 visible rows.
+    /// Once the user types enough to wrap past that viewport, rat-text
+    /// pins the cursor row into the tiny viewport and scrolls the
+    /// earliest characters off the top. What the user sees is a blank
+    /// textarea that only starts showing content after text wraps into
+    /// the new row - precisely the symptom in the bug report.
+    ///
+    /// The test types >2 rows of text and asserts that the very first
+    /// characters of what was typed are still visible. Without the
+    /// layout fix the textarea is 2 rows and the first ~60 characters
+    /// scroll off the top; with the fix the textarea is at least
+    /// `DESC_TEXTAREA_HEIGHT` (6) rows tall when the terminal has
+    /// room, so the entire 100-char payload fits and the first `A` is
+    /// visible.
+    ///
+    /// Using `insert_char` (not `set_text`) is important: `set_text`
+    /// resets rat-text's scroll state and masks the bug. Real user
+    /// keystrokes always route through `insert_char` / `insert_str`.
+    #[test]
+    fn create_dialog_first_keystroke_visible_on_small_terminal() {
+        use crate::create_dialog::CreateDialogFocus;
+
+        let mut app = App::new();
+        // Six repos so the pre-fix layout squeezes the textarea hard
+        // and matches the worst-case live configuration.
+        let repos = vec![
+            PathBuf::from("/repo/a"),
+            PathBuf::from("/repo/b"),
+            PathBuf::from("/repo/c"),
+            PathBuf::from("/repo/d"),
+            PathBuf::from("/repo/e"),
+            PathBuf::from("/repo/f"),
+        ];
+        app.create_dialog
+            .open(&repos, Some(&PathBuf::from("/repo/a")));
+        app.create_dialog.focus_field = CreateDialogFocus::Description;
+        // Prime the first render so rat-text records the viewport
+        // size before the user starts typing, matching the live flow.
+        let _ = render(&mut app, 80, 24);
+        // Type 100 copies of 'A' one at a time, re-rendering after
+        // each keystroke so rat-text's `scroll_to_cursor` latch fires
+        // every stroke (the live event loop renders every tick).
+        for _ in 0..100 {
+            app.create_dialog.description_input.insert_char('A');
+            let _ = render(&mut app, 80, 24);
+        }
+
+        let rendered = render(&mut app, 80, 24);
+
+        // Count 'A's in the rendered output. With a 6-row textarea
+        // and ~46 cols wide, 100 'A's fit in 3 visible rows with room
+        // to spare, so all 100 should appear. Before the fix the
+        // textarea is 2 rows, only the tail (~66 'A's) fits, and the
+        // earliest characters are scrolled off.
+        let visible_a_count: usize = rendered.matches('A').count();
+        assert!(
+            visible_a_count >= 100,
+            "expected all 100 typed 'A's to be visible, but only \
+             {visible_a_count} were in the rendered buffer. This is \
+             the regression: the description textarea is squeezed \
+             so small that rat-text scrolls the earliest characters \
+             off the top.\n\nRendered output:\n{rendered}"
+        );
+    }
+
+    /// Companion to `create_dialog_first_keystroke_visible_on_small_terminal`
+    /// at a terminal size where the dialog fits with plenty of room.
+    /// Guards against a future layout change that fixes the small
+    /// terminal case by regressing the tall-terminal case.
+    #[test]
+    fn create_dialog_first_keystroke_visible_on_tall_terminal() {
+        use crate::create_dialog::CreateDialogFocus;
+
+        let mut app = App::new();
+        let repos = vec![
+            PathBuf::from("/repo/a"),
+            PathBuf::from("/repo/b"),
+            PathBuf::from("/repo/c"),
+        ];
+        app.create_dialog
+            .open(&repos, Some(&PathBuf::from("/repo/a")));
+        app.create_dialog.focus_field = CreateDialogFocus::Description;
+        let _ = render(&mut app, 80, 40);
+        for _ in 0..100 {
+            app.create_dialog.description_input.insert_char('A');
+            let _ = render(&mut app, 80, 40);
+        }
+
+        let rendered = render(&mut app, 80, 40);
+
+        let visible_a_count: usize = rendered.matches('A').count();
+        assert!(
+            visible_a_count >= 100,
+            "expected all 100 typed 'A's to be visible at 80x40, but \
+             only {visible_a_count} were in the rendered buffer:\n{rendered}"
+        );
+    }
+
+    /// When the terminal is too short to fit the compact Create dialog
+    /// (normal dialog shrunk to a 2-row textarea), the dialog must
+    /// render the "terminal too small" fallback instead of silently
+    /// drawing an unresponsive-looking popup where typed characters
+    /// vanish. Asserts the fallback message is present in the render
+    /// AND that the normal Description label is absent (so focus
+    /// cannot land on an invisible textarea).
+    #[test]
+    fn create_dialog_fallback_when_terminal_too_small() {
+        let mut app = App::new();
+        // Six repos so the compact dialog needs its full row budget.
+        // At 80x12 (12 rows tall), even the compact layout cannot fit.
+        let repos = vec![
+            PathBuf::from("/repo/a"),
+            PathBuf::from("/repo/b"),
+            PathBuf::from("/repo/c"),
+            PathBuf::from("/repo/d"),
+            PathBuf::from("/repo/e"),
+            PathBuf::from("/repo/f"),
+        ];
+        app.create_dialog
+            .open(&repos, Some(&PathBuf::from("/repo/a")));
+
+        let rendered = render(&mut app, 80, 12);
+
+        assert!(
+            rendered.contains("Terminal too small"),
+            "expected the 'Terminal too small' fallback at 80x12:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Description (optional):"),
+            "fallback dialog must NOT render the Description label (would \
+             imply focus could land on an invisible textarea):\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Repos:"),
+            "fallback dialog must NOT render the Repos section:\n{rendered}"
+        );
+    }
+
     #[test]
     fn create_dialog_wraps_long_description() {
         let mut app = App::new();
