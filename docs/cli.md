@@ -202,9 +202,10 @@ workbridge --mcp-bridge --socket /tmp/workbridge-mcp.sock
 ```
 
 Internal mode. Pipes stdin/stdout to/from a Unix domain socket, so a
-spawned Claude Code session can reach Workbridge's in-process MCP server
-through a stdio MCP client. Not intended to be run manually; Workbridge
-spawns itself with these flags when wiring MCP into a session.
+spawned harness session (any supported coding-CLI adapter, currently
+Claude Code or Codex) can reach Workbridge's in-process MCP server through
+a stdio MCP client. Not intended to be run manually; Workbridge spawns
+itself with these flags when wiring MCP into a session.
 
 ## Related Documentation
 
