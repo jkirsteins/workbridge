@@ -13684,6 +13684,14 @@ mod tests {
     /// cache keys. A symlinked repo path in config should resolve to its
     /// canonical form so that repo_data lookups by the assembly layer
     /// succeed.
+    ///
+    /// Symlinks are a Unix-only concern here: Windows has symlinks too,
+    /// but creating them in CI typically requires elevated privileges
+    /// (SeCreateSymbolicLinkPrivilege) that aren't granted to the default
+    /// GitHub Actions runner user. The canonicalization behavior itself
+    /// is platform-agnostic (`fs::canonicalize` works on both), so the
+    /// cfg-gate is about the test fixture, not the code under test.
+    #[cfg(unix)]
     #[test]
     fn active_repo_cache_uses_canonical_paths() {
         // Create a real directory and a symlink to it.
@@ -13693,14 +13701,7 @@ mod tests {
         let link_path = dir.join("link-repo");
         std::fs::create_dir_all(real_path.join(".git")).unwrap();
 
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
-        #[cfg(not(unix))]
-        {
-            // On non-Unix, skip the symlink test.
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        }
 
         // Add the symlink path as an explicit repo.
         let mut cfg = Config::default();

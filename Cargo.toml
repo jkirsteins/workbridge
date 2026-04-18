@@ -54,8 +54,14 @@ libc = "0.2"
 # symbols used by the rebase-gate cancellation path in `src/app.rs`
 # (the Windows-only `terminate_process_by_id` helper). Scoped to
 # Windows so the Unix / macOS builds don't pull it in.
+#
+# `uds_windows` provides `UnixListener` / `UnixStream` compatible types
+# backed by the AF_UNIX support Windows 10 1803+ ships natively, so the
+# MCP socket server in `src/mcp.rs` can reuse the same logical flow on
+# both platforms (the std::os::unix::net types are Unix-only).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+uds_windows = "1"
 
 [features]
 integration = []

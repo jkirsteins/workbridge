@@ -9,10 +9,14 @@
 //!   (two threads, called by Claude Code as an MCP server)
 
 use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 
 use crossbeam_channel::Sender;
 use serde_json::{Value, json};
@@ -1487,10 +1491,26 @@ pub fn build_mcp_config(
 }
 
 /// Generate the socket path for a work item session.
+///
+/// On Unix we pin the socket under `/tmp` rather than
+/// `std::env::temp_dir()` because macOS's `$TMPDIR`
+/// (`/var/folders/<hash>/T/`) is long enough that
+/// `/var/folders/.../T/workbridge-mcp-<pid>-<uuid>.sock` exceeds the
+/// 104-byte `sockaddr_un.sun_path` limit and `UnixListener::bind`
+/// returns `EINVAL`. `/tmp` is always short enough.
+///
+/// On Windows AF_UNIX uses a larger address buffer (there is no
+/// 104-byte ceiling) and `/tmp` does not exist by default, so we fall
+/// back to `std::env::temp_dir()` which typically resolves to
+/// `C:\Users\<user>\AppData\Local\Temp`.
 pub fn socket_path_for_session() -> PathBuf {
     let pid = std::process::id();
     let uuid = uuid::Uuid::new_v4();
-    PathBuf::from(format!("/tmp/workbridge-mcp-{pid}-{uuid}.sock"))
+    #[cfg(unix)]
+    let base = PathBuf::from("/tmp");
+    #[cfg(windows)]
+    let base = std::env::temp_dir();
+    base.join(format!("workbridge-mcp-{pid}-{uuid}.sock"))
 }
 
 /// Parse MCP bridge arguments from command line.
@@ -1823,10 +1843,19 @@ mod tests {
 
     #[test]
     fn socket_server_starts_and_stops() {
-        let socket_path = PathBuf::from(format!(
-            "/tmp/workbridge-test-mcp-{}.sock",
-            uuid::Uuid::new_v4()
-        ));
+        // On Unix we pin the socket under `/tmp` because
+        // `std::env::temp_dir()` on macOS returns a long
+        // `/var/folders/.../T/` path that blows the `sockaddr_un`
+        // `SUN_LEN` limit (104 on macOS). On Windows there is no
+        // SUN_LEN constraint (AF_UNIX uses a larger address buffer)
+        // and `/tmp` does not exist by default, so we fall back to
+        // `env::temp_dir()`.
+        #[cfg(unix)]
+        let socket_dir = std::path::PathBuf::from("/tmp");
+        #[cfg(windows)]
+        let socket_dir = std::env::temp_dir();
+        let socket_path =
+            socket_dir.join(format!("workbridge-test-mcp-{}.sock", uuid::Uuid::new_v4()));
         let (tx, _rx) = unbounded();
 
         let server = McpSocketServer::start(
@@ -2019,8 +2048,14 @@ mod tests {
 
     #[test]
     fn mcp_tool_call_produces_channel_event() {
-        let socket_path = PathBuf::from(format!(
-            "/tmp/workbridge-test-mcp-integration-{}.sock",
+        // See `socket_server_starts_and_stops` for why Unix pins to
+        // `/tmp`: macOS's `env::temp_dir()` exceeds `SUN_LEN`.
+        #[cfg(unix)]
+        let tmp_dir = std::path::PathBuf::from("/tmp");
+        #[cfg(windows)]
+        let tmp_dir = std::env::temp_dir();
+        let socket_path = tmp_dir.join(format!(
+            "workbridge-test-mcp-integration-{}.sock",
             uuid::Uuid::new_v4()
         ));
         let (tx, rx) = unbounded();
@@ -2093,7 +2128,7 @@ mod tests {
         }
 
         // No temp files should have been created (regression: debug logging removed).
-        let tmp_entries: Vec<_> = std::fs::read_dir("/tmp")
+        let tmp_entries: Vec<_> = std::fs::read_dir(&tmp_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {

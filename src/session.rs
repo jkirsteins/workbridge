@@ -2,6 +2,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+#[cfg(unix)]
 use std::time::Duration;
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -64,6 +65,12 @@ pub struct Session {
     /// `killpg` on Unix; caching it at spawn time means a late signal
     /// against a freshly-reaped PID is at worst `ESRCH` (harmless)
     /// instead of a silent no-op.
+    ///
+    /// Unix-only: Windows terminates the direct child via `Child::kill`
+    /// (TerminateProcess), which doesn't need the pid and doesn't have a
+    /// process-group concept to signal, so caching the pid would be dead
+    /// state.
+    #[cfg(unix)]
     child_pid: Option<u32>,
     /// Writer for PTY input (keystrokes, pasted text). `portable-pty`'s
     /// `Box<dyn Write + Send>` is itself not `Sync`, so we wrap in a
@@ -132,6 +139,7 @@ impl Session {
             .slave
             .spawn_command(cmd_builder)
             .map_err(io::Error::other)?;
+        #[cfg(unix)]
         let child_pid = child.process_id();
 
         // Drop the slave in the parent. Matches the old `FD_CLOEXEC`
@@ -190,6 +198,7 @@ impl Session {
         Ok(Session {
             master: pair.master,
             child: Some(child),
+            #[cfg(unix)]
             child_pid,
             writer: Mutex::new(writer),
             parser,
@@ -406,6 +415,11 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod tests {
+    // `use super::*` is needed only by the cfg(unix) lifecycle tests
+    // (`kill_is_idempotent`, `is_alive_lifecycle`) that touch `Session`.
+    // The vt100 scrollback tests below reference `vt100::Parser` directly
+    // via the crate-root dependency and do not need anything from super.
+    #[cfg(unix)]
     use super::*;
 
     /// Spawn tests use `sleep`, which is a POSIX utility. On Windows the
