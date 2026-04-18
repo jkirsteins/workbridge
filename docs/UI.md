@@ -1544,6 +1544,29 @@ dialog that blocks interaction until dismissed with Enter or Esc.
 5. Global assistant drawer
 6. Create dialog
 
+### Create dialog
+
+The full Create Work Item dialog (Ctrl+B) has Title / Description /
+Repos / Branch fields and lays them out vertically inside a bordered
+popup. The Description `TextArea` is the sole flex element: when the
+terminal is too short for the full dialog, the textarea shrinks to a
+2-row floor (`DESC_TEXTAREA_MIN_HEIGHT`) and the repo list is clamped
+from 6 to 4 rows so the textarea keeps breathing room. See the
+Widget Inventory entry for `TextArea` for the bug that motivated this
+layout discipline.
+
+When the terminal is so short that even the compact layout cannot fit
+(i.e. smaller than the fixed sections plus a 2-row textarea plus the
+border/padding chrome), the dialog renders a `Paragraph` fallback
+inside the same `Block`: a short "Terminal too small..." message that
+asks the user to enlarge the window or press Esc. This keeps
+keyboard focus from landing on an invisible textarea and preserves
+the structural invariant that a user-initiated dialog never silently
+drops input. The fallback uses only the `Block` and `Paragraph`
+built-ins - no custom widget - and relies on the normal dialog event
+handlers for dismissal, so Esc still works regardless of which
+variant is rendered.
+
 ### Global assistant drawer session lifetime
 
 The global assistant drawer (toggled with Ctrl+G) does NOT keep its
@@ -1720,6 +1743,18 @@ Currently used:
   Description TextArea uses `TextWrap::Word(2)` so long text wraps at word
   boundaries, and `Scroll::new()` on the vertical axis so content that
   exceeds `DESC_TEXTAREA_HEIGHT` scrolls with a visible scrollbar.
+  `DESC_TEXTAREA_HEIGHT` (6 rows) is a **preferred** height: the Create
+  dialog's vertical layout treats the textarea as the sole flex element
+  and shrinks it to a 2-row floor (`DESC_TEXTAREA_MIN_HEIGHT`) when the
+  terminal is too short for the full dialog (a common 80x24 case when
+  several repos are configured). Letting the ratatui constraint solver
+  scale the `Length(DESC_TEXTAREA_HEIGHT)` down proportionally alongside
+  the other sections was the root cause of the
+  "first-row-of-typing-invisible" bug: at 1-2 visible rows, rat-text's
+  `scroll_cursor_to_visible` pinned the cursor row into the tiny
+  viewport and scrolled the earliest typed characters off the top. The
+  flex-textarea layout keeps the viewport large enough for the cursor
+  to stay on the same row as typing progresses.
 - List (ratatui-widgets) - work item list, repo selection, board columns
   (rendered via StatefulWidget::render in board view)
 - Tabs (ratatui-widgets) - view mode header (List/Board segmented tab bar)

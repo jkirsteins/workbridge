@@ -69,7 +69,16 @@ impl CreateDialog {
     pub fn open(&mut self, active_repos: &[PathBuf], cwd_repo: Option<&PathBuf>) {
         self.visible = true;
         self.title_input.clear();
+        // `TextAreaState::clear` only clears the rope; it does NOT reset
+        // the scrollbar offset, sub-row offset, or the `scroll_to_cursor`
+        // latch (see rat-text-3.1.0/src/text_area.rs: `clear` vs
+        // `set_text`). If the user had scrolled the description on a
+        // previous open, that stale offset would carry into the next
+        // open and hide the first row of typed characters. Follow
+        // `clear()` with `set_text("")` to force a full scroll-state
+        // reset - the same reset `set_text` uses for normal assignment.
         self.description_input.clear();
+        self.description_input.set_text("");
         self.branch_input.clear();
         self.error_message = None;
         self.branch_user_edited = false;
@@ -670,6 +679,62 @@ mod tests {
         dialog.branch_user_edited = true;
         dialog.open(&[PathBuf::from("/repo/a")], None);
         assert!(!dialog.branch_user_edited);
+    }
+
+    /// Defense-in-depth: reopening the dialog must reset the
+    /// description textarea's scroll state. `TextAreaState::clear()`
+    /// alone only clears the rope; it does NOT reset the vertical
+    /// offset, sub-row offset, or `scroll_to_cursor` latch (see the
+    /// rat-text source). If the user scrolled the description on a
+    /// previous open and then reopened the dialog, a stale offset
+    /// would carry forward and hide the first row of newly-typed
+    /// characters - the exact symptom the UI-layout fix addresses,
+    /// but via a different mechanism.
+    ///
+    /// `CreateDialog::open` calls `set_text("")` after `clear()` to
+    /// force a full scroll-state reset. This test pins that behavior.
+    #[test]
+    fn open_resets_description_scroll_state() {
+        let mut dialog = CreateDialog::new();
+        dialog.open(&[PathBuf::from("/repo/a")], None);
+
+        // Simulate the user having scrolled the description by
+        // pushing a non-zero vertical offset. We drive the low-level
+        // setters directly (not insert_char) so this test does not
+        // depend on the layout or a rendered viewport; the point is
+        // to prove that `open` clears scroll state regardless of how
+        // it got set.
+        dialog
+            .description_input
+            .set_text("line1\nline2\nline3\nline4");
+        let _ = dialog.description_input.set_vertical_offset(2);
+        let _ = dialog.description_input.set_sub_row_offset(1);
+        assert_eq!(
+            dialog.description_input.vertical_offset(),
+            2,
+            "precondition: vertical offset is non-zero before reopen"
+        );
+
+        // Close and reopen. After open, the description must be
+        // empty AND the scroll state must be reset to the origin.
+        dialog.close();
+        dialog.open(&[PathBuf::from("/repo/a")], None);
+
+        assert_eq!(
+            dialog.description_input.text(),
+            "",
+            "description text must be empty after reopen"
+        );
+        assert_eq!(
+            dialog.description_input.vertical_offset(),
+            0,
+            "vertical scroll offset must be reset to 0 on reopen"
+        );
+        assert_eq!(
+            dialog.description_input.sub_row_offset(),
+            0,
+            "sub-row scroll offset must be reset to 0 on reopen"
+        );
     }
 
     // -- quick-start mode tests --
