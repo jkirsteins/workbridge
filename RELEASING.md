@@ -123,7 +123,7 @@ Run the project gates:
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
