@@ -2,6 +2,7 @@
 name = "workbridge"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 description = "Multi-repo Claude Code orchestration in your terminal."
 repository = "https://github.com/jkirsteins/workbridge"

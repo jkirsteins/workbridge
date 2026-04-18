@@ -16,20 +16,31 @@ All three must agree before publishing.
 
 ## First Publish Name Check
 
-- Confirm `workbridge` is still available immediately before the first publish:
+The authoritative signal for "is this crate name taken?" is the crates.io
+registry itself, not any local tooling. Use the URL check as the primary gate
+and `cargo info` only as a cross-check that is careful to hit the registry
+rather than the local workspace.
+
+- Primary check: confirm that `https://crates.io/crates/workbridge` returns a
+  404 in a browser. Any other response (200, redirect, etc.) means the name is
+  already registered.
+
+- Optional cross-check with `cargo info` (stable since Rust 1.79). This command
+  must be run from a directory OUTSIDE the workbridge workspace, because from
+  inside the workspace it resolves the local package and exits 0 even when the
+  name is unpublished. From a scratch directory it hits the registry and
+  returns the correct signal:
 
   ```sh
-  cargo info workbridge
+  cd /tmp && cargo info workbridge
   ```
 
-  `cargo info` (stable since Rust 1.79) resolves the exact crate name on
-  crates.io. For an unpublished name it exits non-zero with a "could not find"
-  error; any successful output means the name is already taken.
+  Exit 101 with a "could not find `workbridge` in registry" message means the
+  name is available. Exit 0 with registry metadata (authors, versions,
+  downloads) means the name is already taken.
 
-- As a cross-check, confirm that `https://crates.io/crates/workbridge` returns
-  a 404 in a browser.
-
-- If `cargo info workbridge` succeeds (or the crates.io URL resolves), stop.
+- If the crates.io URL resolves to anything other than 404 (or the
+  from-/tmp `cargo info` invocation exits 0 with registry metadata), stop.
   Choose a new crate name and audit `Cargo.toml`, README install commands, UI
   text, docs, and release notes before publishing.
 
@@ -40,6 +51,9 @@ Do this in a dedicated release-prep commit before running any publish commands.
 - Bump `package.version` in `Cargo.toml` to the intended release version,
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   (MAJOR for breaking changes, MINOR for new features, PATCH for fixes).
+- Bump `package.rust-version` in `Cargo.toml` if any new code or dependency in
+  this release requires a newer stable toolchain than the currently declared
+  MSRV. Leave it alone otherwise.
 - In `CHANGELOG.md`, rename the `[Unreleased]` section to
   `[<version>] - YYYY-MM-DD` using today's date, and move any entries that
   belong to this release into it. Leave a fresh, empty `[Unreleased]` section
