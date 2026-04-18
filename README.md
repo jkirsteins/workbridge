@@ -16,7 +16,10 @@ through a Backlog -> Planning -> Implementing -> Review -> Done workflow.
   - [3. Register the repos you want to manage](#3-register-the-repos-you-want-to-manage)
   - [4. Launch the TUI](#4-launch-the-tui)
   - [5. Start your first quick-start session](#5-start-your-first-quick-start-session)
+  - [Global assistant drawer](#global-assistant-drawer)
 - [How It Works](#how-it-works)
+  - [Work Item Lifecycle](#work-item-lifecycle)
+  - [MCP Communication](#mcp-communication)
 - [Further Reading](#further-reading)
 - [License](#license)
 
@@ -92,6 +95,14 @@ the review and merge gates.
 if you want to create a Backlog item instead of jumping straight into
 planning.
 
+### Global assistant drawer
+
+Press `Ctrl+G` at any time to open the global assistant drawer. Unlike a
+work item session, the global assistant has read-only access to all your
+managed repos and work items, and can create new work items on your behalf
+via MCP. Use it to explore across repos, ask "what is in flight right now",
+or kick off a Planning work item from a freeform conversation.
+
 ## How It Works
 
 Work items are Workbridge's central abstraction. Each one owns a branch, a
@@ -100,6 +111,8 @@ linear sequence of stages driven by Claude Code sessions. Two gates protect
 the flow: the **review gate** (PR exists, CI is green, adversarial code
 review passes the plan-vs-implementation check) and the **merge gate** (the
 PR is actually merged on GitHub).
+
+### Work Item Lifecycle
 
 ```mermaid
 flowchart TD
@@ -120,6 +133,53 @@ flowchart TD
 
 See [docs/work-items.md](docs/work-items.md) for the full stage semantics,
 gate behavior, and review-request workflow.
+
+### MCP Communication
+
+Workbridge talks to each Claude Code session via MCP over a per-session Unix
+domain socket. When a session is spawned (work item planning, implementing,
+review-request handling, or the global assistant drawer), Workbridge starts
+a small MCP server, launches `claude` with an `--mcp-config` that points at
+a bridge process, and waits for tool calls. Each tool call becomes an
+`McpEvent` on a crossbeam channel that the TUI applies on its main thread.
+
+```mermaid
+flowchart LR
+    subgraph TUI["Workbridge TUI (main thread)"]
+        State["Work item state<br/>(stage, plan, title, activity)"]
+        Drawer["Global assistant drawer<br/>(Ctrl+G)"]
+    end
+
+    subgraph Spawn["Spawn paths (src/app.rs)"]
+        SS["spawn_session<br/>planning / implementing / review"]
+        SG["spawn_global_session"]
+    end
+
+    subgraph Sessions["Claude Code sessions"]
+        WiSession["Work item session<br/>(claude --mcp-config ...)"]
+        GaSession["Global assistant session<br/>(claude --mcp-config ...)"]
+    end
+
+    subgraph Mcp["MCP server (src/mcp.rs)"]
+        WiSock["Per-work-item Unix socket"]
+        GaSock["Global Unix socket"]
+    end
+
+    State --> SS --> WiSession
+    Drawer --> SG --> GaSession
+
+    WiSession -- "JSON-RPC tool calls" --> WiSock
+    GaSession -- "JSON-RPC tool calls" --> GaSock
+
+    WiSock -- "workbridge_set_title<br/>workbridge_set_plan<br/>workbridge_set_status<br/>workbridge_set_activity<br/>workbridge_log_event<br/>workbridge_delete<br/>workbridge_get_context<br/>workbridge_query_log" --> State
+    WiSock -- "ReviewRequest items only:<br/>workbridge_approve_review<br/>workbridge_request_changes" --> State
+
+    GaSock -- "workbridge_list_repos<br/>workbridge_list_work_items<br/>workbridge_repo_info" --> Drawer
+    GaSock -- "workbridge_create_work_item" --> State
+```
+
+The headless review and rebase gates spawn similar sessions with restricted
+tool sets; see `src/mcp.rs` for the full per-stage tool list.
 
 ## Further Reading
 
