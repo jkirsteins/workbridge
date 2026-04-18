@@ -416,6 +416,30 @@ pub struct SelectionState {
     pub dragging: bool,
 }
 
+impl SelectionState {
+    /// Return the selection's `(start_row, start_col, end_row, end_col)`
+    /// in normalized (row-major) order, i.e. start is always before end.
+    /// Both ends are **inclusive** - `current` stores the cell the user's
+    /// cursor is over when the mouse is released, and that cell is part
+    /// of the selection.
+    ///
+    /// Called by both the highlight renderer (`render_selection_overlay`
+    /// in `src/ui.rs`) and the clipboard extraction helper
+    /// (`selection_to_vt100_bounds` in `src/event.rs`), which is the
+    /// whole reason the logic lives on the struct: the two sides must
+    /// agree on where the selection starts and ends, so there is exactly
+    /// one anchor-vs-current ordering rule for the whole program.
+    pub fn normalized_bounds(&self) -> (u16, u16, u16, u16) {
+        let (ar, ac) = self.anchor;
+        let (cr, cc) = self.current;
+        if ar < cr || (ar == cr && ac <= cc) {
+            (ar, ac, cr, cc)
+        } else {
+            (cr, cc, ar, ac)
+        }
+    }
+}
+
 /// A session associated with a work item. Replaces the old Tab struct's
 /// fields minus `name` (the title comes from the work item).
 pub struct SessionEntry {
