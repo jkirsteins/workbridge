@@ -1,11 +1,11 @@
 <div align="center">
   <img src="assets/logo.png" alt="Workbridge logo" width="180" />
   <h1>Workbridge</h1>
-  <p><strong>Multi-repo Claude Code orchestration in your terminal.</strong></p>
+  <p><strong>Multi-repo coding agent orchestration in your terminal.</strong></p>
 </div>
 
 Workbridge is a terminal UI for orchestrating multi-repo development work. It
-tracks work items, manages git worktrees, and drives Claude Code sessions
+tracks work items, manages git worktrees, and drives coding agent sessions
 through a Backlog -> Planning -> Implementing -> Review -> Done workflow.
 
 <div align="center">
@@ -24,6 +24,7 @@ through a Backlog -> Planning -> Implementing -> Review -> Done workflow.
   - [Work Item Lifecycle](#work-item-lifecycle)
   - [Global assistant drawer](#global-assistant-drawer)
   - [MCP Communication](#mcp-communication)
+- [Compatibility](#compatibility)
 - [Further Reading](#further-reading)
 - [License](#license)
 
@@ -82,6 +83,14 @@ The left panel lists work items grouped by status. Press `?` at any time to
 open the settings overlay (config path, base dirs, managed/available repos,
 defaults).
 
+Before starting work, open the **Review Gate** tab in the settings overlay
+(`?`, then Tab to reach the Review Gate tab) and set the "Skill (slash
+command)" field. The value is passed verbatim to whichever coding agent runs
+the review gate, so it can be a slash command (e.g.
+`/claude-adversarial-review` for Claude Code) or plain-text guidance that any
+coding agent can follow. The default is a Claude Code slash command - update
+it if you are using a different coding agent.
+
 ### 5. Start your first quick-start session
 
 Press `Ctrl+N` to begin a quick-start session. If you have exactly one managed
@@ -89,8 +98,8 @@ repo, Workbridge skips the dialog and creates a Planning work item immediately
 with a placeholder title; otherwise a compact "Quick start - select repo"
 dialog appears so you can pick the repo with Up/Down + Space, then Enter.
 
-The Claude session that spawns will ask what you want to work on, set a real
-title via MCP, and walk through planning. When planning is done it records the
+The coding agent session that spawns will ask what you want to work on, set a
+real title via MCP, and walk through planning. When planning is done it records the
 plan and the item is ready to advance to Implementing. See
 [docs/work-items.md](docs/work-items.md) for the full lifecycle, including
 the review and merge gates.
@@ -103,7 +112,7 @@ planning.
 
 Work items are Workbridge's central abstraction. Each one owns a branch, a
 worktree, an optional GitHub issue, and an optional PR, and moves through a
-linear sequence of stages driven by Claude Code sessions. Two gates protect
+linear sequence of stages driven by coding agent sessions. Two gates protect
 the flow: the **review gate** (PR exists, CI is green, adversarial code
 review passes the plan-vs-implementation check) and the **merge gate** (the
 PR is actually merged on GitHub).
@@ -227,6 +236,61 @@ Per-session tool surface (see `src/mcp.rs` for the source of truth):
   read-only `workbridge_list_repos`, `workbridge_list_work_items`,
   `workbridge_repo_info`; mutating `workbridge_create_work_item`,
   which spawns a new Planning work item.
+
+## Compatibility
+
+Workbridge is harness-agnostic. Any CLI that satisfies the clauses in
+[`docs/harness-contract.md`](docs/harness-contract.md) can be plugged in. Today
+the shipping adapters are:
+
+- **Claude Code** - reference adapter. Drives every workflow stage including
+  the headless review gate.
+- **Codex** - first-class secondary adapter. Drives every workflow stage.
+  Uses a handful of CLI-level workarounds for features that Codex does not
+  expose directly (see footnotes below and the per-clause notes in
+  `docs/harness-contract.md`).
+- **opencode** - planned. The adapter enum has a stub variant; the harness
+  is not yet selectable from the picker.
+
+Pick the harness per work item with `c` (Claude Code) / `x` (Codex) in the
+work item list; the right-panel session tab title reflects the harness
+actually running in the live session.
+
+### Feature matrix
+
+User-observable features, per harness. "Partial" means the feature works end
+to end but via a different mechanism than Claude Code, and may differ in
+granularity. See `docs/harness-contract.md` for the authoritative technical
+contract.
+
+| Feature                                        | Claude Code | Codex     | opencode |
+| ---------------------------------------------- | :---------: | :-------: | :------: |
+| Planning sessions (interactive PTY)            | Yes         | Yes       | Planned  |
+| Implementing / Blocked sessions (interactive)  | Yes         | Yes       | Planned  |
+| Review sessions (interactive)                  | Yes         | Yes       | Planned  |
+| Review gate (headless, structured output)      | Yes         | Yes       | Planned  |
+| Global assistant (`Ctrl+G`)                    | Yes         | Yes       | Planned  |
+| Workbridge MCP server injection                | Yes         | Partial*  | Planned  |
+| CLI-level tool allowlist                       | Yes         | Partial** | Planned  |
+| Stage reminders (periodic nudges)              | Yes         | Partial***| Planned  |
+| Fresh-session-per-stage invariant              | Yes         | Yes       | Planned  |
+
+\* Claude Code accepts a single `--mcp-config <file>` JSON blob; Codex reads
+its MCP servers from `~/.codex/config.toml` and is fed via per-field `-c
+mcp_servers.workbridge.*=...` overrides instead. Functionally equivalent from
+the user's perspective; see `docs/harness-contract.md` C4.
+
+\** Claude Code enforces the workbridge tool allowlist via `--allowedTools`
+at the CLI; Codex does not expose an equivalent flag, so tool gating relies
+on the workbridge MCP server filter. Same effective result for the
+read-only review gate; interactive work-item sessions see a broader tool
+surface with Codex. See `docs/harness-contract.md` C5.
+
+\*** Claude Code uses a `PostToolUse` hook to inject periodic stage
+reminders; Codex has no matching hook, so the Planning reminder is embedded
+in the system prompt and fires only at spawn, not on each turn. This is
+strictly weaker than the hook-based delivery because it cannot re-fire after
+the first turn. See `docs/harness-contract.md` C8.
 
 ## Further Reading
 

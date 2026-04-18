@@ -105,13 +105,13 @@ The recovery reuses `UserActionKey::WorktreeCreate` and
 `poll_worktree_creation`, so the same single-flight guard and polling
 infrastructure handles results. The `open_session` flag is carried
 through from the original request so import-triggered recoveries do not
-spuriously open a Claude session.
+spuriously open a coding agent session.
 
 ### Auto-create on session spawn
 
 When a session is spawned for a work item that has a branch but no worktree,
-WorkBridge creates the worktree automatically before launching the Claude
-Code session. If the branch no longer exists (cannot be fetched from origin
+WorkBridge creates the worktree automatically before launching the coding
+agent session. If the branch no longer exists (cannot be fetched from origin
 and cannot be created locally), a "Worktree Creation Failed" dialog is shown
 offering to delete the orphaned work item or dismiss.
 

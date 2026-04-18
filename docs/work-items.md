@@ -152,8 +152,8 @@ Stage restrictions for ReviewRequest items:
   manual stage advancement.
 - **retreat_stage**: Always blocked. There is no valid previous stage for
   a review request in Review.
-- **MCP status transitions**: `workbridge_set_status` is blocked. Claude
-  sessions should not drive workflow for someone else's PR.
+- **MCP status transitions**: `workbridge_set_status` is blocked. Coding
+  agent sessions should not drive workflow for someone else's PR.
 - **MCP review tools**: `workbridge_approve_review` and
   `workbridge_request_changes` are available only for ReviewRequest items.
   These submit a GitHub PR review via `gh pr review` and auto-move the
@@ -177,7 +177,7 @@ Stage restrictions for ReviewRequest items:
   auto-transitions to Done through the merge-gate invariant (`source
   == "pr_merge"`) and the merged PR's identity is persisted to
   `pr_identity` so the assembly fallback keeps the merged-PR link
-  visible afterwards. The Claude review session is killed by the
+  visible afterwards. The coding agent review session is killed by the
   transition (same behavior as every other Review -> Done transition in
   the codebase); the worktree is left on disk and cleaned up later by
   auto-archive (default 7 days) or immediately by the user with Ctrl+D.
@@ -212,7 +212,7 @@ is configured no dialog is shown at all - a Planning work item is created
 immediately with a placeholder title ("Quick start") and a session is
 spawned at once.
 
-The Claude agent running in this session uses the `planning_quickstart` system
+The coding agent running in this session uses the `planning_quickstart` system
 prompt, which instructs it to:
 1. Ask the user what they want to work on.
 2. Call `workbridge_set_title` via MCP once the task is understood.
@@ -255,7 +255,7 @@ The global assistant (Ctrl+G) can create work items via the
 and ideas in the global assistant, then transfer that exploration context into
 a proper work item for later action.
 
-When Claude calls `workbridge_create_work_item`, it provides:
+When the coding agent calls `workbridge_create_work_item`, it provides:
 - A concise title summarizing the work
 - A description capturing the exploration context and findings
 - The target repo path (must be a managed repo)
@@ -378,7 +378,7 @@ In the Mergequeue state:
 - If `gh pr view` itself fails (auth error, network error, etc.), the error is stored on the work item and shown in the right-side detail pane as "Last poll error: ...". It persists across ticks until the next successful poll, so users do not miss failures when the transient `status_message` gets overwritten.
 - The user can retreat back to Review via Shift+Left at any time. This stops polling and clears the watch and any stored poll error.
 - The right-side detail pane shows the full PR URL and a multi-line hint: "Waiting for PR to be merged. Polling GitHub every 30s. Shift+Left to move back to Review and stop polling."
-- No Claude session runs in this state.
+- No coding agent session runs in this state.
 - In the board view, Mergequeue items appear in the Review column with a `[MQ]` prefix.
 - On app restart, `reconstruct_mergequeue_watches` rebuilds a watch for every backend record with Mergequeue status, using the record's branch and the resolved GitHub remote. Nothing new has to be persisted at `enter_mergequeue` time, so existing Mergequeue tickets (created before this mechanism existed) resume polling correctly on next launch, even if their PR was merged while the app was closed.
 
@@ -427,8 +427,9 @@ There are two session types:
 
 - **Agent session** - the interactive coding-agent process where the user
   does the actual work. Spawned automatically when entering certain stages
-  via the pluggable `AgentBackend` trait - today the only backend is
-  Claude Code. See `docs/harness-contract.md` for the full contract
+  via the pluggable `AgentBackend` trait - shipping adapters today are
+  Claude Code (reference) and Codex. See `docs/harness-contract.md` for
+  the full contract
   (clauses C1..C13, reference payloads RP1..RP5) and
   `src/agent_backend.rs` for the reference implementation.
 - **Terminal session** - a shell (`$SHELL`, falling back to `/bin/sh`) launched

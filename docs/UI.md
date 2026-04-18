@@ -132,7 +132,7 @@ terminal-absolute coordinates:
 1. **Global drawer** - checked first because it overlays everything.
    When the drawer is open, coordinates outside its inner area return
    `MouseTarget::None` so the dimmed background does not receive events.
-2. **Right panel** - the per-work-item PTY session area (Claude Code
+2. **Right panel** - the per-work-item PTY session area (coding agent
    or Terminal tab, depending on `right_panel_tab`).
 3. **Work item list** - the left-panel list body. Wheel scrolls over
    this area drive the authoritative viewport offset
@@ -388,10 +388,10 @@ Examples of the cache-first pattern:
   applies the rework flow without freezing the UI.
 - Review gates carry a `ReviewGateOrigin` tag so `poll_review_gate`
   can dispatch Blocked outcomes correctly. `Mcp` and `Auto` origins
-  (Claude requested Review via the MCP status update, or the
+  (the harness requested Review via the MCP status update, or the
   auto-trigger after an Implementing session died) run the full
   rework flow: populate `rework_reasons`, kill the session, respawn
-  it with the implementing_rework prompt so Claude sees the reason.
+  it with the implementing_rework prompt so the harness sees the reason.
   `Tui` origin (the user pressed `l` on an Implementing item) only
   surfaces the reason in the status bar and leaves the session
   running - killing the user's primary workspace would be a
@@ -407,7 +407,7 @@ Examples of the cache-first pattern:
   enter Review: no changes on branch")`, which `poll_review_gate`
   surfaces via the Auto-origin rework flow. Gating the spawn on a
   stale fetcher cache would let items get stuck in Implementing for
-  up to two minutes after Claude's final commit (the fetch
+  up to two minutes after the branch's final commit (the fetch
   interval), with no auto-retry.
 - `spawn_session` routes through `begin_session_open` +
   `poll_session_opens` instead of calling `stage_system_prompt`
@@ -415,7 +415,7 @@ Examples of the cache-first pattern:
   runs **every** blocking step the spawn needs: `backend.read_plan(...)`,
   `McpSocketServer::start(...)` (which binds the socket and spawns
   the accept loop), `AgentBackend::write_session_files(...)` (the
-  worktree `.mcp.json` for Claude Code's project discovery), and
+  worktree `.mcp.json` for the harness's project discovery), and
   the `std::fs::write` on the temp `--mcp-config` file. It then
   sends a `SessionOpenPlanResult` through a per-work-item receiver.
   `poll_session_opens` drains completed receivers and invokes
@@ -497,8 +497,8 @@ See invariant 15 for the render rate requirement.
 The `ViewMode` enum controls the root overview layout:
 
 - `FlatList` (default): two-panel layout with work item list (left) and
-  PTY session (right). The right panel has two tabs: Claude Code and
-  Terminal. See Layout and Right Panel Tabs sections below.
+  PTY session (right). The right panel has two tabs: the coding agent
+  session and Terminal. See Layout and Right Panel Tabs sections below.
 - `Board`: kanban board with 4 columns organized by workflow stage.
   See Board View section below.
 - `Dashboard`: global flow-metrics view (throughput, cycle time,
@@ -883,7 +883,7 @@ neither, never both.
 
 The "Session Activity Indicators" described later in this document
 (the left-panel list badges that reflect whether a session is alive
-and whether Claude has signalled active work via MCP) are a
+and whether the coding agent has signalled active work via MCP) are a
 **complementary** per-item view, NOT a substitute for one of the two
 primary idioms. Every background operation still owes a dialog
 spinner OR a status-bar activity regardless of whether an item badge
@@ -1262,6 +1262,12 @@ nearest `GroupHeader` entry.
 The `List` label is highlighted (active). The header uses the ratatui
 `Tabs` widget with `style_view_mode_tab_active()` for the selected tab.
 
+The left label of the right-panel tab bar is the harness display name
+returned by `App::agent_backend_display_name()` - `Claude Code` (shown
+above) when that is the selected or active harness, `Codex` when Codex
+is selected, or the neutral `Session` placeholder when no harness is
+committed for the current context. See "Session tab title" above.
+
 Unlinked work items render as a wrapped branch title (with the `PR#N`
 badge right-aligned on the first line) followed by an indented
 repo-directory meta line. Long branches wrap across as many lines as
@@ -1325,8 +1331,8 @@ group via the `child_pid` slot if it is still alive) and surfaces
 a "Rebased onto origin/<main>" or "Rebase onto origin/<main>
 failed: <reason>" status message. The harness is spawned with
 `Command::process_group(0)` so it becomes its own group leader;
-the `killpg` therefore takes down claude AND any `git rebase` /
-`git add` subprocesses claude has started, not just claude itself.
+the `killpg` therefore takes down the harness AND any `git rebase` /
+`git add` subprocesses the harness has started, not just the harness itself.
 `drop_rebase_gate` is also called from `delete_work_item_by_id`
 and `force_kill_all`, so deleting a work item or quitting
 workbridge while a rebase is in flight tears the gate down
@@ -1508,12 +1514,17 @@ per-chart semantics.
 
 ### Right Panel Tabs
 
-The right panel has two tabs: **Claude Code** and **Terminal**. The
-`RightPanelTab` enum tracks which tab is active. The tab bar is shown
-in the right panel's block title when the selected work item has a
-worktree; otherwise only "Claude Code" is shown.
+The right panel has two tabs: the **coding agent** tab and the
+**Terminal** tab. The `RightPanelTab` enum tracks which tab is active;
+the agent-tab variant is still named `RightPanelTab::ClaudeCode` in
+the code for historical reasons. The tab bar is shown in the right
+panel's block title when the selected work item has a worktree;
+otherwise only the agent tab is shown. The agent tab's title is the
+live harness's `display_name()` - e.g. "Claude Code", "Codex", or the
+neutral "Session" placeholder when no harness is committed (see
+`Session tab title`).
 
-- **Claude Code**: the per-work-item Claude Code PTY session (existing
+- **Coding agent**: the per-work-item coding agent PTY session (existing
   behavior). Shows session output, dead-session prompts, work item
   details, or error lists depending on session state.
 - **Terminal**: a shell session (`$SHELL`, falling back to `/bin/sh`)
@@ -1522,20 +1533,23 @@ worktree; otherwise only "Claude Code" is shown.
   `App::terminal_sessions` keyed by `WorkItemId`.
 
 Tab switching:
-- Ctrl+\\: cycle between Claude Code and Terminal. Global intercept
-  in `handle_key()` so it works from both panels and does not change
-  focus. The `ClaudeCode -> Terminal` transition is a no-op if the
-  selected work item has no worktree. Still fires even when the
-  current tab's session has ended - the on-screen "Press Ctrl+\\ to
-  switch back to Claude Code" hint (shown on the dead-terminal
-  placeholder in `src/ui.rs`) and the symmetric dead-Claude case both
-  rely on this. Because the intercept runs before the right-panel
-  dead-session early-return, a dead session never blocks the flip.
-  On the Claude-Code-dead -> Terminal flip, the terminal session is
-  spawned lazily via `spawn_terminal_session()` if the work item has
-  a worktree.
+- Ctrl+\\: cycle between the coding agent tab and the Terminal tab.
+  Global intercept in `handle_key()` so it works from both panels and
+  does not change focus. The `ClaudeCode -> Terminal` transition (the
+  enum variant name is retained in code) is a no-op if the selected
+  work item has no worktree. Still fires even when the current tab's
+  session has ended - the on-screen `Press Ctrl+\\ to switch back to
+  {harness display name}.` hint (shown on the dead-terminal
+  placeholder in `src/ui.rs`, where `{harness display name}` is the
+  value returned by `App::agent_backend_display_name()` - one of
+  `Claude Code`, `Codex`, or the neutral `Session` placeholder) and
+  the symmetric dead-agent case both rely on this.
+  Because the intercept runs before the right-panel dead-session
+  early-return, a dead session never blocks the flip. On the
+  agent-dead -> Terminal flip, the terminal session is spawned lazily
+  via `spawn_terminal_session()` if the work item has a worktree.
 - Tab (while right panel is focused): forwarded to the PTY as `\t`
-  (0x09) so Claude Code's autocomplete fires. Not intercepted by
+  (0x09) so the harness's autocomplete fires. Not intercepted by
   workbridge. On a dead right-panel session Tab takes the standard
   escape-hatch path (see below).
 - Shift+Tab (while right panel is focused, live session): forwarded
@@ -1549,10 +1563,10 @@ Tab switching:
 Terminal sessions are cleaned up on:
 - Work item deletion (killed in `delete_work_item_by_id`)
 - Orphan detection (work item removed from `work_items` list)
-- App shutdown (SIGTERM then SIGKILL like Claude sessions)
+- App shutdown (SIGTERM then SIGKILL, same lifecycle as coding agent sessions)
 
 Navigating to a different work item (Up/Down in left panel) resets the
-tab to Claude Code.
+tab to the coding agent tab.
 
 ### Overlays
 
@@ -1599,12 +1613,12 @@ dialog that blocks interaction until dismissed with Enter or Esc.
 ### Global assistant drawer session lifetime
 
 The global assistant drawer (toggled with Ctrl+G) does NOT keep its
-`claude` session alive across drawer openings. Every open spawns a
+agent session alive across drawer openings. Every open spawns a
 fresh session with an empty context and scrollback; every close
 (Ctrl+G or Esc while the drawer is open) immediately tears the
 session down via `App::teardown_global_session`. Teardown:
 
-1. SIGTERMs the `claude` child (graceful grace period + SIGKILL
+1. SIGTERMs the agent child (graceful grace period + SIGKILL
    via `Session::kill`).
 2. Drops the `SessionEntry` so `Session::Drop` joins the reader
    thread.
@@ -1620,16 +1634,20 @@ new state added to the global assistant must also be cleared in
 
 The session cwd is a dedicated workbridge-owned scratch directory
 (`$TMPDIR/workbridge-global-assistant-cwd`, created idempotently
-on each spawn). This is deliberately NOT `$HOME`: Claude Code's
-workspace trust dialog ("Do you trust the files in this folder?")
-persists acceptance per-project in `~/.claude.json`, but the home
-directory does not reliably persist that acceptance, so using
-`$HOME` as the cwd would produce the trust prompt on every single
-Ctrl+G. A stable non-home scratch path lets Claude Code's own
-trust-persistence mechanism cover it after the first acceptance,
+on each spawn). This is deliberately NOT `$HOME`. The choice is
+driven by a harness-specific trust-persistence constraint: Claude
+Code's workspace trust dialog ("Do you trust the files in this
+folder?") persists acceptance per-project in `~/.claude.json`, but
+the home directory does not reliably persist that acceptance, so
+using `$HOME` as the cwd would produce the trust prompt on every
+single Ctrl+G. A stable non-home scratch path lets Claude Code's
+own trust-persistence mechanism cover it after the first acceptance,
 without workbridge ever reading or writing `~/.claude.json`
 itself (which would be a file-injection workaround - see the
-"Severity overrides" section in `CLAUDE.md`).
+"Severity overrides" section in `CLAUDE.md`). Other harnesses (e.g.
+Codex) have different trust semantics; the non-home scratch
+directory is compatible with all of them, so workbridge uses it
+uniformly.
 
 ### Settings overlay tabs
 
@@ -1655,8 +1673,8 @@ overlay.
 - Same-key-repeat confirmations (quit) stay in the status bar -
   they are not blocking choice prompts and do not need dialog boxes.
   Destructive operations on real git state (e.g., work item deletion)
-  use a modal prompt dialog instead, both to block the Claude session
-  from receiving stray keystrokes during cleanup and because the
+  use a modal prompt dialog instead, both to block the coding agent
+  session from receiving stray keystrokes during cleanup and because the
   operation should not feel like a "tap twice" shortcut.
 - Do not skip `dim_background()` in new overlays.
 
@@ -1688,28 +1706,28 @@ Board-specific styles:
 
 ## Session Activity Indicators
 
-Work items display a visual indicator when a Claude session exists,
+Work items display a visual indicator when a coding agent session exists,
 distinguishing three states:
 
 1. **No session**: no indicator (default).
-2. **Session exists, idle**: a filled circle in Gray. This means a Claude
-   session is alive but has not signaled active work.
-3. **Actively working**: an animated braille spinner in Cyan+Bold. Claude
-   has called `workbridge_set_activity(working=true)` via MCP.
+2. **Session exists, idle**: a filled circle in Gray. This means a coding
+   agent session is alive but has not signaled active work.
+3. **Actively working**: an animated braille spinner in Cyan+Bold. The
+   coding agent has called `workbridge_set_activity(working=true)` via MCP.
 
 In the flat list view, the indicator appears in the left margin
 (replacing the selection caret ">"). In the board view, it appears on
 the second line alongside PR and CI indicators.
 
-The activity state is signaled by Claude via the `workbridge_set_activity`
-MCP tool and is cleared automatically when the session process exits
-(detected during liveness checks).
+The activity state is signaled by the coding agent via the
+`workbridge_set_activity` MCP tool and is cleared automatically when the
+session process exits (detected during liveness checks).
 
 The spinner reuses the same braille-dot frames and 200ms tick rate as the
 status bar activity indicator. The `spinner_tick` counter advances when
-either status-bar activities or `claude_working` entries exist.
+either status-bar activities or `agent_working` entries exist.
 
-**Badge dimming.** When a work item has no live Claude PTY session
+**Badge dimming.** When a work item has no live coding agent PTY session
 attached (`app.session_key_for(&wi.id).is_none()`), every badge on the
 row (state badge, `[RR]` kind tag, `[RG]` gate tag, `PR#N` chip, CI
 chips, and trailing state chips like `!cl` / `!pushed` / `!pulled` /
