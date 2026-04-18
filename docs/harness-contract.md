@@ -465,10 +465,17 @@ read_only = true`, no caller today) also skip the bypass flag; see
 the `claude_interactive_argv_read_only_skips_permission_flags` test
 in `src/agent_backend.rs`.
 
-**Codex (secondary, not implemented)**: **supported**. Codex has
-`--full-auto` and `--ask-for-approval never` for the same role.
-Either flag satisfies C3 as long as it is passed on every spawn; no
-clause violation.
+**Codex (implemented)**: emits
+`--dangerously-bypass-approvals-and-sandbox` for all three spawn
+paths (interactive, review gate, rebase gate). Codex's built-in
+sandbox modes (`workspace-write`, `read-only`) are incompatible
+with workbridge's linked-worktree layout; full rationale and the
+per-harness permission table live in README "Per-harness
+permission model". The flag is symmetric across the three paths to
+satisfy the harness-contract review rule against asymmetric
+protections. The review gate is included explicitly even though
+it is conceptually read-only, so review skills that shell out
+(e.g. `cargo check`) are not silently denied.
 
 ### C4 - MCP injection
 
@@ -761,8 +768,9 @@ an empty list (no side-car writes). Specifically:
 - system prompt -> `-c instructions="<prompt>"`
 - MCP bridge command -> `-c mcp_servers.workbridge.command="<exe>"`
 - MCP bridge args -> `-c mcp_servers.workbridge.args=[...]`
-- permissions -> `--full-auto` (interactive work-capable +
-  rebase gate) or omitted (review gate)
+- permissions -> `--dangerously-bypass-approvals-and-sandbox`
+  (all three spawn paths: interactive work-capable, review gate,
+  rebase gate)
 
 No `CODEX_MCP_CONFIG`, `CODEX_CONFIG_FILE`, `CODEX_HOME`, or any
 other env var is touched. The only filesystem writes workbridge
@@ -995,10 +1003,10 @@ update the Implementation Map section above.
 
 | File          | Line   | Mode        | Scope       | Thread     | Cwd                                       |
 |---------------|--------|-------------|-------------|------------|-------------------------------------------|
-| `src/app.rs`  | 5962   | Interactive | WorkItem    | Background | Work-item worktree                        |
-| `src/app.rs`  | 10435  | Headless RO | ReviewGate  | Background | inherited                                 |
-| `src/app.rs`  | 10914  | Headless RW | RebaseGate  | Background | Work-item worktree                        |
-| `src/app.rs`  | 12145  | Interactive | Global      | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
+| `src/app.rs`  | 6050   | Interactive | WorkItem    | Background | Work-item worktree                        |
+| `src/app.rs`  | 10632  | Headless RO | ReviewGate  | Background | inherited                                 |
+| `src/app.rs`  | 11123  | Headless RW | RebaseGate  | Background | Work-item worktree                        |
+| `src/app.rs`  | 12366  | Interactive | Global      | Background | `$TMPDIR/workbridge-global-assistant-cwd` |
 
 The "Thread" column records which thread actually calls
 `Session::spawn` / `std::process::Command::output()`. All four
@@ -1337,6 +1345,28 @@ harness adapter is introduced, add a dated bullet here.
   `McpInjection<'a>` bundle struct (config_path + primary_bridge +
   extra_bridges) to stay under the clippy threshold.
 
+- 2026-04-18: All three Codex spawn paths switched from
+  `--ask-for-approval never --sandbox workspace-write` (interactive)
+  and `--full-auto` (rebase gate) to
+  `--dangerously-bypass-approvals-and-sandbox`. Review gate
+  explicitly included even though it is conceptually read-only, for
+  symmetry and to unblock review skills that invoke shell commands.
+  Rationale: workspace-write is incompatible with workbridge's
+  linked-worktree layout (it blocks writes to
+  `<repo>/.git/worktrees/<slug>/`, where git stores per-worktree
+  state). See README "Per-harness permission model". C3
+  Implementation Map "Codex (secondary, not implemented)" rewritten
+  to "Codex (implemented)". RP1c / RP2c / RP2bc updated to reflect
+  the new argv shape; the "Approval-policy rationale" block was
+  simplified because the dangerous flag covers both shell/patch and
+  MCP approvals (per-server `default_tools_approval_mode="approve"`
+  remains as defence in depth). UI: right-panel tab title renders
+  a `[!]` marker after "Codex" on every Codex session so the
+  no-sandbox state is visible at a glance; Claude Code and the
+  neutral `SESSION_TITLE_NONE` placeholder render unmarked. New
+  test `codex_all_spawn_paths_use_dangerous_flag` pins the
+  symmetry across the three builders so a future PR that reintroduces
+  a sandbox flag in just one place fails loudly.
 - 2026-04-16 (round 3): Three Codex argv-builder hardening fixes.
   (R3-F-1) `extend_mcp_bridge_argv` now emits per-repo extras FIRST
   and the workbridge primary LAST so Codex's last-write-wins
@@ -1374,8 +1404,7 @@ Pinned by the `codex_*` tests in `src/agent_backend.rs`.
 
 ```
 codex
-  --ask-for-approval never
-  --sandbox workspace-write
+  --dangerously-bypass-approvals-and-sandbox
   [--config mcp_servers.<extra>.command="..."                              ]   # zero or more extras
   [--config mcp_servers.<extra>.args=[...]                                 ]   # (emitted FIRST)
   [--config mcp_servers.<extra>.default_tools_approval_mode="approve"       ]
@@ -1386,39 +1415,30 @@ codex
   <auto-start user prompt (if any)>
 ```
 
-Approval-policy rationale (2026-04-17 directive: "MCP tools need
-to be pre-allowed for codex, so it does not ask for permission for
-them"): codex-cli 0.120.0 has two orthogonal approval axes:
+All shell/patch and MCP-tool approvals are bypassed via
+`--dangerously-bypass-approvals-and-sandbox`. The per-server
+`mcp_servers.<name>.default_tools_approval_mode = "approve"`
+overrides remain (defence in depth - the dangerous flag covers MCP
+approvals today but the per-server overrides ensure the behaviour
+survives a Codex change to that flag's scope).
 
-1. **Shell/patch approvals** - governed by `--ask-for-approval`
-   (untrusted / on-request / never / granular). We emit `never` to
-   auto-approve shell commands and patch writes within the sandbox.
+Codex's built-in sandbox modes (`workspace-write`, `read-only`)
+are incompatible with workbridge's linked-worktree layout: git
+stores each worktree's index outside the worktree itself, at
+`<repo>/.git/worktrees/<slug>/`, and `workspace-write` forbids
+writes outside the cwd so `git commit` fails with "Operation not
+permitted" when trying to create `<repo>/.git/worktrees/<slug>/
+index.lock`. Granting `.git/` as a writable root is blocked by
+Codex's protected-paths rule. Full rationale and the per-harness
+permission table are in README "Per-harness permission model".
 
-2. **MCP tool approvals** - controlled PER-MCP-SERVER via
-   `mcp_servers.<name>.default_tools_approval_mode`. The top-level
-   `--ask-for-approval` flag does NOT cover this axis. Verified by
-   reading codex source (`codex-rs/core/src/mcp_tool_call.rs` -
-   `custom_mcp_tool_approval_mode` resolves to `mcp_servers.<name>.
-   default_tools_approval_mode`; value `"approve"` makes
-   `auto_approved_by_policy` true and skips the approval prompt).
-
-   The `AppToolApproval` enum values are `Auto` (default - may
-   prompt), `Prompt` (always prompt), `Approve` (auto-approve).
-   We emit `"approve"` for every MCP server we register (workbridge
-   primary + user-configured extras) since workbridge-session MCP
-   servers are equally trusted by the user's choice.
-
-`--full-auto` is NOT used because it bundles `-a on-request` which
-reintroduces the shell/patch prompt. `--sandbox workspace-write`
-scopes filesystem writes to the worktree. Read-only interactive
-sessions (global-assistant read-only, hypothetical future read-
-only scope) omit both `--ask-for-approval` and `--sandbox` because
-the MCP-server layer enforces read-only there; the per-server
-`default_tools_approval_mode="approve"` is still emitted so read-
-only MCP tool calls also go through without prompting.
-
-See Authorization 2b in the review-loop session log for the
-directive trail from `--full-auto` to the current shape.
+Read-only interactive sessions (global-assistant read-only,
+hypothetical future read-only scope; no caller today) omit the
+dangerous flag entirely because the MCP-server layer enforces
+read-only there and granting write capability would be the bug
+the read-only path exists to prevent. The per-server
+`default_tools_approval_mode="approve"` is still emitted so
+read-only MCP tool calls go through without prompting.
 
 Ordering invariant (R3-F-1): the workbridge primary's `--config
 mcp_servers.workbridge.*` overrides MUST be emitted AFTER every
@@ -1438,9 +1458,12 @@ would mis-split the TOML path. Pinned by `toml_quote_key_*` and
 `codex_extra_bridge_with_dotted_name_emits_quoted_key`.
 
 Differences from Claude's RP1:
-- `--ask-for-approval never --sandbox workspace-write` instead of
-  `--dangerously-skip-permissions` (see the approval-policy note
-  above the snippet).
+- `--dangerously-bypass-approvals-and-sandbox` instead of
+  `--dangerously-skip-permissions`. Both are the vendor-named
+  "run without built-in sandbox or approval prompts" flag; the
+  rationale for preferring the dangerous-bypass flag over Codex's
+  built-in `workspace-write` sandbox is in README "Per-harness
+  permission model".
 - Per-field MCP overrides instead of `--mcp-config <path>`: Codex's
   TOML schema for `mcp_servers.<name>` requires `command` (string)
   and `args` (array of strings) directly. There is no `.config=<path>`
@@ -1470,6 +1493,7 @@ silently cross-contaminate the user's personal config.
 ### RP2c - Codex headless review-gate argv
 
 ```
+--dangerously-bypass-approvals-and-sandbox
 exec
   --json
   --config instructions="<review gate system prompt>"
@@ -1482,7 +1506,17 @@ exec
 
 Same workbridge-last ordering invariant as RP1c.
 
-The first positional is `exec` (not `--print`) - Codex's headless
+`--dangerously-bypass-approvals-and-sandbox` is a top-level codex
+flag and MUST precede `exec` (clap rejects top-level flags inside
+the `exec` subcommand). The dangerous flag is included on this
+conceptually-read-only path for two reasons: (a) symmetry across
+the three Codex spawn paths (RP1c / RP2c / RP2bc), which the
+harness-contract review rule on asymmetric protections requires;
+and (b) review skills that invoke shell commands (e.g.
+`cargo check`) would otherwise be silently denied by the
+`workspace-write` sandbox.
+
+The second positional is `exec` (not `--print`) - Codex's headless
 mode is a separate subcommand. `--json` switches the event stream
 to newline-delimited JSON;
 `CodexBackend::parse_review_gate_stdout` keeps only the last
@@ -1494,10 +1528,9 @@ the per-field `mcp_servers.workbridge.command` / `.args` overrides
 ### RP2bc - Codex headless rebase-gate argv
 
 ```
---ask-for-approval never
+--dangerously-bypass-approvals-and-sandbox
 exec
   --json
-  --full-auto
   [--config mcp_servers.<extra>.command="..."  ]   # zero or more extras
   [--config mcp_servers.<extra>.args=[...]      ]   # (emitted FIRST)
   --config mcp_servers.workbridge.command="<workbridge exe path>"
@@ -1507,22 +1540,17 @@ exec
 
 Same workbridge-last ordering invariant as RP1c.
 
-`--ask-for-approval` is a TOP-LEVEL `codex` flag and MUST come BEFORE
-the `exec` subcommand. Verified live on 2026-04-16 by running each
-shape against the installed `codex` CLI:
+`--dangerously-bypass-approvals-and-sandbox` is a TOP-LEVEL `codex`
+flag and MUST come BEFORE the `exec` subcommand; clap rejects
+top-level flags inside the `exec` subcommand. This is the same
+placement constraint that previously forced `--ask-for-approval
+never` to precede `exec`.
 
-- `codex --ask-for-approval never exec --json --full-auto
-  --skip-git-repo-check "echo hi"` -> valid event stream.
-- `codex exec --json --full-auto --ask-for-approval never "echo hi"`
-  -> `error: unexpected argument '--ask-for-approval' found`.
-
-This pinning lives in `codex_headless_rw_includes_full_auto_and_approval_never`
-in `src/agent_backend.rs`.
-
-`--full-auto` (write access) IS an `exec` subcommand flag and stays
-inside `exec`. The combination parallels Claude's
-`--dangerously-skip-permissions`, which already implies "no approval
-prompts" so Claude needs no separate flag.
+The dangerous flag parallels Claude's
+`--dangerously-skip-permissions` which already implies "no approval
+prompts and no sandbox" so Claude needs no separate flag.
+Pinned by `codex_headless_rw_argv_shape_and_mcp_pre_approval` in
+`src/agent_backend.rs`.
 
 Each `mcp_servers.<extra>.*` pair is rendered for one entry of
 `SpawnConfig::extra_bridges` / `ReviewGateSpawnConfig::extra_bridges`
