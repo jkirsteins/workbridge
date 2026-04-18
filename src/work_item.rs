@@ -126,18 +126,20 @@ impl WorkItemStatus {
         }
     }
 
-    /// Workflow-order rank for sorting within a display group.
+    /// Reverse-workflow rank for sorting within a display group.
     ///
-    /// Lower values sort first: Planning (0) -> Implementing (1) ->
-    /// Review (2) -> Mergequeue (3). Other stages return a high value
-    /// so they never displace PL/IM/RV/MQ inside the ACTIVE bucket.
-    /// Ties are broken by the caller's existing order (stable sort).
+    /// Lower values sort first: Mergequeue (0) -> Review (1) ->
+    /// Implementing (2) -> Planning (3). Items closest to shipping
+    /// appear first so the user's eye lands on near-ready work.
+    /// Other stages return a high value so they never displace
+    /// MQ/RV/IM/PL inside the ACTIVE bucket. Ties are broken by the
+    /// caller's existing order (stable sort).
     pub fn active_group_rank(&self) -> u8 {
         match self {
-            Self::Planning => 0,
-            Self::Implementing => 1,
-            Self::Review => 2,
-            Self::Mergequeue => 3,
+            Self::Mergequeue => 0,
+            Self::Review => 1,
+            Self::Implementing => 2,
+            Self::Planning => 3,
             // Blocked, Backlog, Done don't appear in the ACTIVE bucket
             // but we give them a deterministic high rank for defensive
             // robustness if the caller ever mixes buckets.

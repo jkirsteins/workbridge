@@ -4911,11 +4911,13 @@ impl App {
             }
         }
 
-        // Sort each repo's items in workflow order so PL items precede
-        // IM, IM precedes RV, etc. Stable sort preserves the existing
-        // backend path order within a stage as the tiebreaker. This is
-        // a no-op for the BLOCKED / BACKLOGGED / DONE callers because
-        // every item in those buckets shares a single status.
+        // Sort each repo's items in reverse-workflow order so MQ items
+        // precede RV, RV precedes IM, IM precedes PL - items closest to
+        // shipping appear at the top of the ACTIVE bucket. Stable sort
+        // preserves the existing backend path order within a stage as the
+        // tiebreaker. This is a no-op for the BLOCKED / BACKLOGGED / DONE
+        // callers because every item in those buckets shares a single
+        // status.
         for items in by_repo.values_mut() {
             items.sort_by_key(|&i| work_items[i].status.active_group_rank());
         }
@@ -13767,8 +13769,8 @@ mod tests {
     }
 
     /// Inside a single `ACTIVE (<repo>)` sub-group, items must be sorted
-    /// by workflow stage (PL -> IM -> RV -> MQ) regardless of the
-    /// backend's insertion order. Within a single stage, the relative
+    /// by reverse workflow stage (MQ -> RV -> IM -> PL) regardless of
+    /// the backend's insertion order. Within a single stage, the relative
     /// order from backend path order is preserved (stable sort).
     #[test]
     fn build_display_list_sorts_active_group_by_stage() {
@@ -13817,12 +13819,12 @@ mod tests {
             }
         }
 
-        // Expected: PL items first (b, d in original order), then IM
-        // (a, e), then RV (c), then MQ (f).
+        // Expected: MQ first (f), then RV (c), then IM items (a, e in
+        // original order), then PL items (b, d in original order).
         assert_eq!(
             ordered_titles,
-            vec!["b", "d", "a", "e", "c", "f"],
-            "ACTIVE group items should sort PL -> IM -> RV -> MQ \
+            vec!["f", "c", "a", "e", "b", "d"],
+            "ACTIVE group items should sort MQ -> RV -> IM -> PL \
              with backend order preserved within each stage",
         );
     }
