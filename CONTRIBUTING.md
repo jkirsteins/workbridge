@@ -36,6 +36,23 @@ Never silently ignore errors. Every error must be either:
 `unwrap_or_default()` on a Result that could contain a meaningful error is
 a bug. If you want to fall back to a default, log or display the error first.
 
+## Changelog
+
+Workbridge keeps a `CHANGELOG.md` in [Keep a Changelog](https://keepachangelog.com)
+format. When you open a PR, add a bullet under `## [Unreleased]`
+describing the user-visible change in one line. Tag the bullet with the
+PR number:
+
+    - Fix worktree cleanup when the upstream branch is gone ([#123](https://github.com/jkirsteins/workbridge/pull/123))
+
+Internal-only changes (refactors, test-only work, doc-only tweaks) do
+not need an entry.
+
+Never rename or remove the `## [Unreleased]` heading - the release
+tooling relies on it matching the literal string `## [Unreleased]` so
+the pre-release replacement can fire. Renaming it causes `cargo release`
+to abort with `min = 1` not met.
+
 ## UI and Color
 
 When choosing colors for TUI elements, consider contrast and readability on

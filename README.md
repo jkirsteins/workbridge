@@ -324,6 +324,7 @@ workbridge runs Codex without the built-in sandbox.
 - [docs/repository-registry.md](docs/repository-registry.md) - repo registration and config
 - [docs/work-items.md](docs/work-items.md) - work item lifecycle and stages
 - [docs/UI.md](docs/UI.md) - TUI layout and interactions
+- [docs/releasing.md](docs/releasing.md) - cutting a new release
 - [docs/invariants.md](docs/invariants.md) - project invariants (read-only)
 
 ## License
