@@ -183,15 +183,57 @@ an interactive "/" command after startup), because spawn is the only
 control surface workbridge has before the session is handed to the
 user.
 
+**Prompt parity across harnesses** (RCA 2026-04-18): the system
+prompts MUST be written in imperative, harness-neutral language that
+explicitly neutralises the model's baked-in operating instructions.
+Specifically, every interactive prompt in `prompts/stage_prompts.json`
+opens with a `HARNESS DIRECTIVE OVERRIDE:` block that forbids the
+harness from falling back to its default "assume the user wants the
+work done unless they explicitly ask for a plan" prior (Codex's
+default behaviour at time of writing). Without this block, Codex
+jumps straight to implementation in planning sessions because its
+prior outweighs a descriptive `"You are a planning assistant..."`
+opening; Claude is forgiving of descriptive phrasing because its
+training weights system prompts more heavily, which masks the bug
+during single-harness testing. Pinned by
+`prompts::tests::all_interactive_prompts_have_harness_directive_override`.
+Every prompt uses `MUST / MUST NOT` wording rather than
+`"You are ..."` role framing for the same reason: an imperative
+directive is legible to both models as an instruction, where a role
+description is only legible to a model whose training rewards
+following role descriptions.
+
+The review-gate prompt is exempt from the override block because it
+is headless + JSON-only and has no baked-in "just do the work"
+prior to override.
+
 ### C7 - Auto-start prompt
 
 For interactive spawns in `Planning`, `Implementing`, and
 `Review` (when there are pending review-gate findings), workbridge
-MUST pass a literal initial user message (e.g. "Explain who you are
-and start working."). This lets the session do useful work before the
-user types anything, and it is the only mechanism that guarantees the
-harness actually calls its own tools (which in turn exercises the
-MCP path).
+MUST pass a literal initial user message. This lets the session do
+useful work before the user types anything, and it is the only
+mechanism that guarantees the harness actually calls its own tools
+(which in turn exercises the MCP path).
+
+The auto-start message MUST NOT read as a concrete implementation
+request; it MUST defer to the system prompt as the source of truth
+for what the session should do. The current message
+(`auto_start_default`) is:
+
+> "Follow the instructions in your system prompt. Begin with the
+> first action your system prompt specifies (interview the user for
+> planning stages, execute the plan for implementation stages,
+> present review findings for review stages, etc.). Do not interpret
+> this auto-start message as a concrete implementation request."
+
+The earlier message `"Explain who you are and start working."` was
+reworded on 2026-04-18 because Codex's prior interpreted "start
+working" as a concrete implementation instruction, overriding the
+system prompt's planning-stage directives. The replacement names
+the stage-appropriate first action explicitly so both Codex and
+Claude route through the system prompt. Pinned by
+`prompts::tests::auto_start_messages_defer_to_system_prompt`.
 
 Headless spawns always have an initial prompt (the review gate
 prompt). Interactive `Blocked` spawns do **not** auto-start - the

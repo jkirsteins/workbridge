@@ -17988,10 +17988,18 @@ mod tests {
             "mcp_config_path must be forwarded to the backend"
         );
         // C7: Planning auto-starts with the `auto_start_default` key.
+        // The message content was tightened on 2026-04-18 to defer to
+        // the system prompt (RCA: Codex was reading the old
+        // "Explain who you are and start working." as a concrete
+        // implementation request, bypassing the planning-stage
+        // instructions). The current message references the system
+        // prompt as the source of truth for the first action; the
+        // test pins that substring rather than the full literal
+        // so minor wording edits don't require a test update.
         assert!(
             cmd.iter()
-                .any(|s| s == "Explain who you are and start working."),
-            "auto_start_default must be rendered from stage_prompts.json"
+                .any(|s| s.to_lowercase().contains("system prompt")),
+            "auto_start_default must defer to the system prompt (see prompts/stage_prompts.json, RCA 2026-04-18); got argv: {cmd:?}"
         );
     }
 
@@ -18005,9 +18013,20 @@ mod tests {
             Some(&mcp_path),
             true,
         );
+        // The auto_start_review message was tightened on 2026-04-18
+        // to match `auto_start_default`'s pattern (defer to the
+        // system prompt). It now says:
+        //   "Follow the instructions in your system prompt. Present
+        //    the review gate assessment and the pull request URL
+        //    from your system prompt to the user, then wait for
+        //    review feedback."
+        // We assert the "review gate assessment" substring still
+        // reaches the argv (it's the distinguishing token between
+        // auto_start_review and auto_start_default).
         assert!(
-            cmd.iter().any(|s| s.contains("review gate assessment")),
-            "Review with force_auto_start must use auto_start_review template"
+            cmd.iter()
+                .any(|s| s.to_lowercase().contains("review gate assessment")),
+            "Review with force_auto_start must use auto_start_review template; got argv: {cmd:?}"
         );
     }
 

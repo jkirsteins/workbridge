@@ -348,6 +348,88 @@ mod tests {
         );
     }
 
+    /// Pins harness parity: every interactive system prompt MUST open
+    /// with a `HARNESS DIRECTIVE OVERRIDE` block that explicitly
+    /// neutralises harness-specific defaults (e.g. Codex's baked-in
+    /// "assume the user wants the work done unless they explicitly
+    /// ask for a plan" prior). Without this block, Codex follows its
+    /// built-in prior instead of the workbridge prompt and jumps to
+    /// implementation in planning sessions.
+    ///
+    /// RCA (2026-04-18): a user reported that Codex went straight to
+    /// implementation on a work item that should have been in a
+    /// blocked-no-plan state. Codex's response quoted its own
+    /// "operating instructions" about assuming the user wants the
+    /// work done. The workbridge prompts were descriptive ("You are
+    /// a planning assistant") rather than imperative, so Codex's
+    /// prior won. Claude's training weights descriptive system
+    /// prompts more heavily, masking the issue. Fix: open every
+    /// interactive prompt with `HARNESS DIRECTIVE OVERRIDE:` and
+    /// explicit MUST / MUST NOT wording so both harnesses read the
+    /// same directive.
+    #[test]
+    fn all_interactive_prompts_have_harness_directive_override() {
+        let prompts: HashMap<String, PromptEntry> = serde_json::from_str(PROMPTS_JSON).unwrap();
+        let sentinel = "HARNESS DIRECTIVE OVERRIDE";
+        let interactive = [
+            "planning_quickstart",
+            "planning",
+            "planning_retroactive",
+            "implementing_with_plan",
+            "implementing_no_plan",
+            "implementing_rework",
+            "blocked",
+            "review",
+            "review_with_findings",
+            "global_assistant",
+        ];
+        for key in interactive {
+            let entry = prompts
+                .get(key)
+                .unwrap_or_else(|| panic!("missing prompt key: {key}"));
+            assert!(
+                entry.template.starts_with(sentinel),
+                "prompt '{key}' must OPEN with a `{sentinel}` block so both harnesses \
+                 read the same imperative before their baked-in priors kick in; got \
+                 first 60 chars: {:?}",
+                entry.template.chars().take(60).collect::<String>()
+            );
+        }
+        // review_gate is headless + JSON-only; the override block
+        // would add no value there and would pollute the JSON-schema
+        // hand-off. It is intentionally exempt.
+        let gate = prompts
+            .get("review_gate")
+            .expect("review_gate prompt must exist");
+        assert!(
+            !gate.template.contains(sentinel),
+            "review_gate must NOT carry a HARNESS DIRECTIVE OVERRIDE block \
+             (headless, no harness defaults to override)"
+        );
+    }
+
+    /// Pins that the auto-start messages (C7) are NOT interpreted
+    /// as concrete implementation requests. Both `auto_start_default`
+    /// and `auto_start_review` were tightened 2026-04-18 to tell the
+    /// harness to follow its system prompt's first action, rather
+    /// than the previous ambiguous "Explain who you are and start
+    /// working." which Codex's prior read as "just start implementing".
+    #[test]
+    fn auto_start_messages_defer_to_system_prompt() {
+        let prompts: HashMap<String, PromptEntry> = serde_json::from_str(PROMPTS_JSON).unwrap();
+        for key in ["auto_start_default", "auto_start_review"] {
+            let entry = prompts
+                .get(key)
+                .unwrap_or_else(|| panic!("missing prompt key: {key}"));
+            let lower = entry.template.to_lowercase();
+            assert!(
+                lower.contains("system prompt") || lower.contains("system-prompt"),
+                "auto-start '{key}' must reference the system prompt as the source of truth; got {:?}",
+                entry.template
+            );
+        }
+    }
+
     #[test]
     fn description_with_template_markers_not_expanded() {
         // User-supplied description containing {plan} must not cause plan variable injection
