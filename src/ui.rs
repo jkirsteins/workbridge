@@ -3930,9 +3930,18 @@ fn draw_settings_review_gate_tab(buf: &mut Buffer, app: &mut App, theme: &Theme,
 
     let desc = Text::from(vec![
         Line::styled(
-            "The slash command passed to `claude --print -p` during the review gate.",
+            "The initial prompt sent to the coding agent when the review gate runs.",
             theme.style_text_muted(),
         ),
+        Line::styled(
+            "Can be a slash command (e.g. /claude-adversarial-review for Claude Code)",
+            theme.style_text_muted(),
+        ),
+        Line::styled(
+            "or plain-text guidance that any coding agent can follow.",
+            theme.style_text_muted(),
+        ),
+        Line::from(""),
         Line::styled(
             "Default: /claude-adversarial-review",
             theme.style_text_muted(),

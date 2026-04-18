@@ -83,6 +83,14 @@ The left panel lists work items grouped by status. Press `?` at any time to
 open the settings overlay (config path, base dirs, managed/available repos,
 defaults).
 
+Before starting work, open the **Review Gate** tab in the settings overlay
+(`?`, then Tab to reach the Review Gate tab) and set the "Skill (slash
+command)" field. The value is passed verbatim to whichever coding agent runs
+the review gate, so it can be a slash command (e.g.
+`/claude-adversarial-review` for Claude Code) or plain-text guidance that any
+coding agent can follow. The default is a Claude Code slash command - update
+it if you are using a different coding agent.
+
 ### 5. Start your first quick-start session
 
 Press `Ctrl+N` to begin a quick-start session. If you have exactly one managed
