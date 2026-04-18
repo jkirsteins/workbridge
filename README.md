@@ -8,6 +8,10 @@ Workbridge is a terminal UI for orchestrating multi-repo development work. It
 tracks work items, manages git worktrees, and drives Claude Code sessions
 through a Backlog -> Planning -> Implementing -> Review -> Done workflow.
 
+<div align="center">
+  <img src="assets/screenshot.png" alt="Workbridge TUI screenshot" width="800" />
+</div>
+
 ## Table of Contents
 
 - [Quick Start](#quick-start)
