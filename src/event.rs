@@ -2500,17 +2500,6 @@ fn copy_selection_to_clipboard(entry: &crate::work_item::SessionEntry) {
     crate::clipboard::copy(&text);
 }
 
-/// Normalize a selection so (start_row, start_col) is before (end_row, end_col).
-fn normalize_selection(sel: &SelectionState) -> (u16, u16, u16, u16) {
-    let (ar, ac) = sel.anchor;
-    let (cr, cc) = sel.current;
-    if ar < cr || (ar == cr && ac <= cc) {
-        (ar, ac, cr, cc)
-    } else {
-        (cr, cc, ar, ac)
-    }
-}
-
 /// Convert a user-facing `SelectionState` (inclusive end cell) into the
 /// bound tuple `vt100::Screen::contents_between` expects (exclusive end
 /// column).
@@ -2524,8 +2513,14 @@ fn normalize_selection(sel: &SelectionState) -> (u16, u16, u16, u16) {
 ///
 /// The returned `end_col` is clamped to `cols` so a selection that ends
 /// on the final column (`cols - 1`) does not overflow past the row.
-fn selection_to_vt100_bounds(sel: &SelectionState, cols: u16) -> (u16, u16, u16, u16) {
-    let (start_row, start_col, end_row, end_col) = normalize_selection(sel);
+///
+/// The normalization (anchor-vs-current ordering) is delegated to
+/// `SelectionState::normalized_bounds` so the highlight renderer in
+/// `src/ui.rs` and this clipboard helper agree on exactly one rule for
+/// which corner is "start" and which is "end". See that method's
+/// rationale for why the logic lives on the struct.
+pub(crate) fn selection_to_vt100_bounds(sel: &SelectionState, cols: u16) -> (u16, u16, u16, u16) {
+    let (start_row, start_col, end_row, end_col) = sel.normalized_bounds();
     let exclusive_end_col = end_col.saturating_add(1).min(cols);
     (start_row, start_col, end_row, exclusive_end_col)
 }
@@ -3752,9 +3747,10 @@ mod selection_clipboard_tests {
     }
 
     /// A reversed selection (drag right-to-left) must produce the same
-    /// text as the equivalent forward selection; `normalize_selection`
-    /// already handles the ordering, but we pin the behavior so a
-    /// future edit to the helper cannot regress it.
+    /// text as the equivalent forward selection;
+    /// `SelectionState::normalized_bounds` already handles the ordering,
+    /// but we pin the behavior so a future edit to the helper cannot
+    /// regress it.
     #[test]
     fn reversed_selection_matches_forward_selection() {
         let parser = parser_with(5, 40, b"hello world");
@@ -3852,5 +3848,138 @@ mod selection_clipboard_tests {
         let (sr, sc, er, ec) = selection_to_vt100_bounds(&sel, COLS);
         assert_eq!((sr, sc, er), (0, 0, 0));
         assert_eq!(ec, COLS, "exclusive end must be clamped to cols");
+    }
+
+    /// Symmetry between the visible highlight and the clipboard output.
+    ///
+    /// The user-facing invariant is "whatever the user sees highlighted
+    /// is exactly what lands in the clipboard". Two independent code
+    /// paths enforce that: `render_selection_overlay` (`src/ui.rs`)
+    /// reverses one `Buffer` cell per highlighted position, and
+    /// `selection_to_vt100_bounds` + `contents_between` (`src/event.rs`)
+    /// produces the clipboard string. If either side drifts - e.g. the
+    /// renderer flips from `..=end_col` to `..end_col`, or the helper
+    /// stops adding the inclusive-to-exclusive +1 - the two will
+    /// disagree.
+    ///
+    /// This test drives the real renderer into a `Buffer`, counts the
+    /// `Modifier::REVERSED` cells, and asserts that count equals the
+    /// number of non-newline characters the clipboard path produces for
+    /// the same selection. The per-case rows are filled to full width
+    /// so there are no trailing blank cells on either side that could
+    /// be counted differently by the two paths.
+    ///
+    /// If this test fails, check the inclusive/exclusive translation on
+    /// both sides before adjusting the assertion: the two must cover
+    /// the same cells, not compensate for each other.
+    #[test]
+    fn highlight_cell_count_matches_clipboard_chars() {
+        use crate::ui::render_selection_overlay;
+        use ratatui_core::buffer::Buffer;
+        use ratatui_core::layout::{Position, Rect};
+        use ratatui_core::style::Modifier;
+
+        /// Count cells in `buf` that have `REVERSED` set - i.e. cells
+        /// the selection overlay marked as highlighted.
+        fn count_reversed(buf: &Buffer, area: Rect) -> usize {
+            let mut n = 0;
+            for y in area.y..area.y + area.height {
+                for x in area.x..area.x + area.width {
+                    if let Some(cell) = buf.cell(Position::new(x, y))
+                        && cell.modifier.contains(Modifier::REVERSED)
+                    {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        }
+
+        // Each case uses rows filled to full terminal width, so vt100
+        // will emit exactly `cols` characters per fully-covered row and
+        // the renderer will flip exactly `cols` cells per fully-covered
+        // row. Multi-row selections include `\n` separators in the
+        // clipboard text (one per non-wrapped row boundary); those are
+        // filtered out before counting characters because they do not
+        // correspond to any highlighted cell.
+        struct Case {
+            name: &'static str,
+            rows: u16,
+            cols: u16,
+            payload: &'static [u8],
+            anchor: (u16, u16),
+            current: (u16, u16),
+        }
+
+        let cases = [
+            Case {
+                name: "single-row mid-line",
+                rows: 3,
+                cols: 10,
+                payload: b"abcdefghij",
+                anchor: (0, 2),
+                current: (0, 7),
+            },
+            Case {
+                name: "single-row to final column",
+                rows: 3,
+                cols: 10,
+                payload: b"abcdefghij",
+                anchor: (0, 0),
+                current: (0, 9),
+            },
+            Case {
+                name: "reversed (drag right-to-left)",
+                rows: 3,
+                cols: 10,
+                payload: b"abcdefghij",
+                anchor: (0, 7),
+                current: (0, 2),
+            },
+            Case {
+                // Two 10-col rows fully filled, no wrap: payload
+                // writes 10 chars, CR/LF, 10 more chars. Selection
+                // covers row 0 cols 3..=9 plus row 1 cols 0..=5.
+                name: "multi-row across full-width rows",
+                rows: 3,
+                cols: 10,
+                payload: b"abcdefghij\r\nklmnopqrst",
+                anchor: (0, 3),
+                current: (1, 5),
+            },
+        ];
+
+        for case in &cases {
+            let parser = parser_with(case.rows, case.cols, case.payload);
+            let sel = SelectionState {
+                anchor: case.anchor,
+                current: case.current,
+                dragging: false,
+            };
+
+            // Drive the real renderer into a buffer sized to the
+            // terminal. The buffer starts empty; render_selection_overlay
+            // only touches cells inside the selection, so the pre-existing
+            // content does not matter for cell counting.
+            let area = Rect::new(0, 0, case.cols, case.rows);
+            let mut buf = Buffer::empty(area);
+            render_selection_overlay(&mut buf, area, &sel);
+            let highlighted = count_reversed(&buf, area);
+
+            // Run the same path copy_selection_to_clipboard uses.
+            let clipboard_text = extract(&parser, &sel);
+            let clipboard_chars = clipboard_text.chars().filter(|c| *c != '\n').count();
+
+            assert_eq!(
+                clipboard_chars, highlighted,
+                "case {:?}: clipboard produced {clipboard_chars} chars ({:?}) but overlay highlighted {highlighted} cells",
+                case.name, clipboard_text,
+            );
+            assert!(
+                highlighted > 0,
+                "case {:?}: sanity check - a non-empty selection must highlight at least one cell",
+                case.name,
+            );
+        }
     }
 }

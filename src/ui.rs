@@ -3228,16 +3228,20 @@ fn draw_global_drawer(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
 /// For each cell in the selection range, the style modifier is set to
 /// `Modifier::REVERSED` which inverts fg/bg to show the selection, matching
 /// standard terminal emulator highlighting.
-fn render_selection_overlay(buf: &mut Buffer, inner_area: Rect, selection: &SelectionState) {
-    let (start_row, start_col, end_row, end_col) = {
-        let (ar, ac) = selection.anchor;
-        let (cr, cc) = selection.current;
-        if ar < cr || (ar == cr && ac <= cc) {
-            (ar, ac, cr, cc)
-        } else {
-            (cr, cc, ar, ac)
-        }
-    };
+///
+/// The inclusive `(start, end)` bounds come from
+/// `SelectionState::normalized_bounds`, which is also the normalization
+/// used by `selection_to_vt100_bounds` in `src/event.rs` when the same
+/// selection is copied to the clipboard. Sharing that helper is what
+/// keeps the visible highlight and the copied text covering the same
+/// range of cells; see the regression test
+/// `event::selection_clipboard_tests::highlight_cell_count_matches_clipboard_chars`.
+pub(crate) fn render_selection_overlay(
+    buf: &mut Buffer,
+    inner_area: Rect,
+    selection: &SelectionState,
+) {
+    let (start_row, start_col, end_row, end_col) = selection.normalized_bounds();
 
     let max_col = inner_area.width;
 
