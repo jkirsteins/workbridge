@@ -114,7 +114,7 @@ flowchart TD
     Implementing -->|review gate| Review
     Blocked -->|review gate| Review
     Review -->|merge gate| Done
-    Review -->|poll strategy| Mergequeue
+    Review <-->|poll strategy / retreat| Mergequeue
     Mergequeue -->|PR merged externally| Done
 ```
 
