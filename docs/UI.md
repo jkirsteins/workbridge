@@ -1725,9 +1725,7 @@ session process exits (detected during liveness checks).
 
 The spinner reuses the same braille-dot frames and 200ms tick rate as the
 status bar activity indicator. The `spinner_tick` counter advances when
-either status-bar activities or `claude_working` entries exist (the
-`claude_working` field name is a legacy code identifier that tracks
-activity for every coding agent adapter, not just Claude Code).
+either status-bar activities or `agent_working` entries exist.
 
 **Badge dimming.** When a work item has no live coding agent PTY session
 attached (`app.session_key_for(&wi.id).is_none()`), every badge on the
