@@ -1164,11 +1164,13 @@ The render flow in `draw_work_item_list` (ui.rs):
 
 ### ACTIVE Group Intra-Stage Ordering
 
-Inside each `ACTIVE (<repo>)` sub-group, items are sorted in workflow
-order: Planning, then Implementing, then Review, then Mergequeue.
-Within a single stage, items keep the deterministic backend path
-order as a stable-sort tiebreaker, so single-stage repos render in
-exactly the same order as before. The sort is implemented by
+Inside each `ACTIVE (<repo>)` sub-group, items are sorted in
+reverse-workflow order: Mergequeue, then Review, then Implementing,
+then Planning - items closest to shipping appear at the top so the
+user's eye lands on near-ready work first. Within a single stage,
+items keep the deterministic backend path order as a stable-sort
+tiebreaker, so single-stage repos render in exactly the same order
+as before. The sort is implemented by
 `WorkItemStatus::active_group_rank` in `src/work_item.rs` and applied
 in `push_repo_groups` in `src/app.rs`. This rule does not apply to
 the `BLOCKED`, `BACKLOGGED`, or `DONE` groups, whose items all share
