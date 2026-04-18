@@ -16,6 +16,17 @@ Never suppress, ignore, or work around linter or formatter errors. If clippy
 or `cargo fmt --check` complains, fix the code - do not add `#[allow(...)]`,
 `// nolint`, or similar annotations to silence warnings.
 
+### Optional: Claude Code post-edit `cargo fmt` hook
+
+If you use Claude Code, `.claude/settings.json` configures a PostToolUse
+hook that runs `cargo fmt` on each `.rs` file as Claude writes it. The
+hook shells out to `jq` to parse the tool-input payload, so it requires
+`jq` on `PATH` (`brew install jq` on macOS, `apt install jq` on Debian/
+Ubuntu). If `jq` is missing the hook silently skips formatting; the
+pre-commit hook in `hooks/` catches anything the convenience hook missed,
+so contributors without Claude Code (or without `jq`) are not affected
+in CI or at commit time.
+
 ## Error Handling
 
 Never silently ignore errors. Every error must be either:
