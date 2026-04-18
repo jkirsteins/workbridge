@@ -6314,17 +6314,80 @@ impl App {
     ///    the user has configured one.
     /// 3. `SESSION_TITLE_NONE` placeholder - never a vendor default.
     pub fn agent_backend_display_name(&self) -> &'static str {
+        match self.resolved_harness_kind() {
+            Some(kind) => kind.display_name(),
+            None => Self::SESSION_TITLE_NONE,
+        }
+    }
+
+    /// Single source of truth for the Session tab title's harness
+    /// resolution. Both `agent_backend_display_name` and
+    /// `agent_backend_display_name_with_permission_marker` delegate
+    /// here so the name-vs-marker branches can never diverge (a
+    /// previous divergence-class bug silently dropped the Codex
+    /// `" [!]"` marker when a work item was selected with no
+    /// `harness_choice` entry and the Ctrl+G drawer was open with
+    /// global=Codex).
+    ///
+    /// Resolution is fall-through, matching the name path:
+    /// 1. Per-work-item `harness_choice` for the selected item, if
+    ///    such an entry exists. A selected item with no entry does
+    ///    NOT short-circuit to `None` - it falls through.
+    /// 2. Global-assistant harness when the Ctrl+G drawer is open.
+    /// 3. `None` (caller renders the neutral placeholder / unmarked).
+    fn resolved_harness_kind(&self) -> Option<AgentBackendKind> {
         if let Some(id) = self.selected_work_item_id()
             && let Some(kind) = self.harness_choice.get(&id)
         {
-            return kind.display_name();
+            return Some(*kind);
         }
-        if self.global_drawer_open
-            && let Some(kind) = self.global_assistant_harness_kind()
-        {
-            return kind.display_name();
+        if self.global_drawer_open {
+            return self.global_assistant_harness_kind();
         }
-        Self::SESSION_TITLE_NONE
+        None
+    }
+
+    /// Suffix appended to a Codex session's display name in the
+    /// right-panel tab title (and anywhere else the per-harness
+    /// permission marker is rendered). Single typable characters only
+    /// (global rule: no fancy unicode). The marker is a visible
+    /// reminder that Codex runs without its built-in sandbox - see
+    /// README "Per-harness permission model".
+    pub const PERMISSION_MARKER_CODEX: &'static str = " [!]";
+
+    /// Like `agent_backend_display_name`, but appends a visible
+    /// permission marker (` [!]`) when the resolved harness is Codex.
+    /// Call sites that render the harness name in UI chrome (right-
+    /// panel tab title, dead-session placeholder, Ctrl+\\ switch-back
+    /// hint) use this function; the marker signals to the user that
+    /// Codex runs without its built-in sandbox on every spawn path.
+    ///
+    /// The neutral `SESSION_TITLE_NONE` placeholder renders unmarked
+    /// (no harness is committed, so no permission model applies yet);
+    /// Claude Code also renders unmarked. This matches the
+    /// `[ABSOLUTE]` "session title is downstream of live harness
+    /// state" rule: the marker appears only when a harness is
+    /// actually resolved AND that harness is Codex.
+    ///
+    /// The underlying `agent_backend_display_name` stays for snapshot
+    /// / contract tests that pin the canonical vendor name.
+    pub fn agent_backend_display_name_with_permission_marker(
+        &self,
+    ) -> std::borrow::Cow<'static, str> {
+        // Delegate resolution to the shared helper so the name and
+        // the marker can never diverge. The previous separate
+        // `if/else if/else` chain here silently dropped the marker
+        // when a work item was selected with no `harness_choice`
+        // entry and the drawer was open with global=Codex: the name
+        // correctly fell through to "Codex" but the marker
+        // resolution bailed at the `if let Some(id)` arm and
+        // returned None.
+        let name = self.agent_backend_display_name();
+        if matches!(self.resolved_harness_kind(), Some(AgentBackendKind::Codex)) {
+            std::borrow::Cow::Owned(format!("{name}{}", Self::PERMISSION_MARKER_CODEX))
+        } else {
+            std::borrow::Cow::Borrowed(name)
+        }
     }
 
     /// Resolve the harness-specific backend for a work-item spawn.
@@ -25725,6 +25788,148 @@ mod tests {
         assert_eq!(
             app.agent_backend_display_name(),
             AgentBackendKind::ClaudeCode.display_name()
+        );
+    }
+
+    /// Pins the Codex-only permission marker:
+    /// `agent_backend_display_name_with_permission_marker` appends
+    /// `" [!]"` when the committed harness is Codex, and renders
+    /// unchanged for Claude Code and the neutral
+    /// `SESSION_TITLE_NONE` placeholder. This is the visible reminder
+    /// that Codex runs without its built-in sandbox on every spawn
+    /// path - see README "Per-harness permission model".
+    #[test]
+    fn agent_backend_display_name_with_permission_marker_appends_for_codex_only() {
+        let mut app = App::new();
+
+        // No committed harness -> neutral placeholder, unmarked.
+        assert_eq!(
+            app.agent_backend_display_name_with_permission_marker(),
+            App::SESSION_TITLE_NONE,
+            "neutral placeholder must render unmarked"
+        );
+
+        // Seed a selected work item + harness_choice = Claude.
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/wb-marker-test.json"));
+        app.work_items.push(WorkItem {
+            id: wi_id.clone(),
+            backend_type: BackendType::LocalFile,
+            kind: WorkItemKind::Own,
+            title: "marker-test".into(),
+            display_id: Some("marker-1".into()),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![],
+            errors: vec![],
+        });
+        app.build_display_list();
+        app.selected_item = app
+            .display_list
+            .iter()
+            .position(|e| matches!(e, DisplayEntry::WorkItemEntry(_)));
+        app.harness_choice
+            .insert(wi_id.clone(), AgentBackendKind::ClaudeCode);
+
+        // Claude Code renders unmarked.
+        assert_eq!(
+            app.agent_backend_display_name_with_permission_marker(),
+            AgentBackendKind::ClaudeCode.display_name(),
+            "Claude Code must render unmarked (no permission marker)"
+        );
+
+        // Swap to Codex -> marker must append.
+        app.harness_choice.insert(wi_id, AgentBackendKind::Codex);
+        let marked = app.agent_backend_display_name_with_permission_marker();
+        assert_eq!(
+            marked,
+            format!(
+                "{}{}",
+                AgentBackendKind::Codex.display_name(),
+                App::PERMISSION_MARKER_CODEX
+            ),
+            "Codex must render with the permission marker appended, got {marked:?}"
+        );
+        // Sanity-check the literal marker value stays single-typable
+        // characters (global rule: no fancy unicode).
+        assert_eq!(
+            App::PERMISSION_MARKER_CODEX,
+            " [!]",
+            "permission marker's literal value is load-bearing for the UI"
+        );
+    }
+
+    /// Regression test for the "marker silently drops" divergence
+    /// bug: when a work item is selected but has NO `harness_choice`
+    /// entry, and the Ctrl+G drawer is open with global=Codex, the
+    /// name resolution falls through to the global harness ("Codex")
+    /// so the marker resolution MUST do the same. Prior to the fix
+    /// the marker path used `if let Some(id) = ... else if
+    /// drawer_open` (short-circuit on selected item) while the name
+    /// path used a proper fall-through, dropping the `" [!]"` in
+    /// this exact state. Both now delegate to
+    /// `resolved_harness_kind()`.
+    #[test]
+    fn permission_marker_falls_through_to_global_drawer_when_item_has_no_harness_choice() {
+        let mut app = App::new();
+
+        // Seed the config with global_assistant_harness = "codex"
+        // so `global_assistant_harness_kind()` returns Some(Codex).
+        app.config.defaults.global_assistant_harness = Some("codex".into());
+
+        // Seed a selected work item WITHOUT inserting a
+        // harness_choice entry for it - this is the state right
+        // after a fresh work item is selected and the user opens
+        // the Ctrl+G drawer before pressing c / x.
+        let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/wb-marker-fallthrough.json"));
+        app.work_items.push(WorkItem {
+            id: wi_id,
+            backend_type: BackendType::LocalFile,
+            kind: WorkItemKind::Own,
+            title: "marker-fallthrough".into(),
+            display_id: Some("marker-2".into()),
+            description: None,
+            status: WorkItemStatus::Implementing,
+            status_derived: false,
+            repo_associations: vec![],
+            errors: vec![],
+        });
+        app.build_display_list();
+        app.selected_item = app
+            .display_list
+            .iter()
+            .position(|e| matches!(e, DisplayEntry::WorkItemEntry(_)));
+        assert!(
+            app.selected_work_item_id().is_some(),
+            "precondition: a work item must be selected"
+        );
+        assert!(
+            app.harness_choice.is_empty(),
+            "precondition: no harness_choice entries"
+        );
+
+        // Open the Ctrl+G drawer directly (bypassing the first-run
+        // modal path) so `global_drawer_open` is true.
+        app.global_drawer_open = true;
+
+        // Name resolution falls through item -> global -> "Codex".
+        assert_eq!(
+            app.agent_backend_display_name(),
+            AgentBackendKind::Codex.display_name(),
+            "name must fall through to the global harness when the selected item has no harness_choice"
+        );
+
+        // Marker resolution MUST do the same fall-through. This is
+        // the bit that regressed pre-fix.
+        let marked = app.agent_backend_display_name_with_permission_marker();
+        assert_eq!(
+            marked,
+            format!(
+                "{}{}",
+                AgentBackendKind::Codex.display_name(),
+                App::PERMISSION_MARKER_CODEX
+            ),
+            "marker must fall through to global=Codex and append \" [!]\", got {marked:?}"
         );
     }
 

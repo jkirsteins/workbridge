@@ -3077,7 +3077,10 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                 theme.style_view_mode_tab_active(),
             ),
         };
-        let backend_tab = format!(" {} ", app.agent_backend_display_name());
+        let backend_tab = format!(
+            " {} ",
+            app.agent_backend_display_name_with_permission_marker()
+        );
         Line::from(vec![
             Span::raw(" "),
             Span::styled(backend_tab, cc_style),
@@ -3086,7 +3089,10 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
             Span::styled(input_suffix, theme.style_title()),
         ])
     } else {
-        let title_text = format!(" {}{input_suffix}", app.agent_backend_display_name());
+        let title_text = format!(
+            " {}{input_suffix}",
+            app.agent_backend_display_name_with_permission_marker()
+        );
         Line::from(Span::styled(title_text, theme.style_title()))
     };
 
@@ -3121,7 +3127,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     Line::from(""),
                     Line::from(format!(
                         "  Press Ctrl+\\ to switch back to {}.",
-                        app.agent_backend_display_name()
+                        app.agent_backend_display_name_with_permission_marker()
                     )),
                 ]);
                 let paragraph = Paragraph::new(text).block(block).style(theme.style_error());

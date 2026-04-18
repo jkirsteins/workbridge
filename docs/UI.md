@@ -665,6 +665,28 @@ the live adapter's `display_name()`, which is the single source of
 truth for UI titles. Adapters MUST NOT inject their vendor name
 into any UI string outside the live-session rendering path.
 
+#### Permission marker suffix
+
+Call sites that render the harness name in UI chrome (right-panel
+Session tab title, dead-session placeholder, Ctrl+\\ switch-back
+hint) use `App::agent_backend_display_name_with_permission_marker`
+rather than `agent_backend_display_name` directly. This variant
+appends the Codex-only suffix `App::PERMISSION_MARKER_CODEX`
+(`" [!]"`) when the resolved harness is Codex, and returns the
+bare display name otherwise. Claude Code sessions render unmarked,
+and the neutral `SESSION_TITLE_NONE` placeholder also renders
+unmarked (no harness is committed, so no permission model applies
+yet). The marker is a visible reminder that Codex runs without its
+built-in sandbox on every spawn path - see README
+"Per-harness permission model" for the rationale.
+
+Both methods delegate harness resolution to a shared
+`App::resolved_harness_kind()` helper, so the name branch and the
+marker branch cannot diverge: any state where the name falls
+through to "Codex" also appends `" [!]"`. The underlying
+`agent_backend_display_name` is preserved for snapshot / contract
+tests that pin the canonical vendor name without the marker.
+
 ### Board Mode Navigation
 
 In board view, `handle_key_board()` intercepts key events before the

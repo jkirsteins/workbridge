@@ -446,9 +446,10 @@ pub trait AgentBackend: Send + Sync {
     /// Build the argv for a headless read-write spawn (rebase gate).
     /// Similar to `build_review_gate_command` but the session needs
     /// write access (file edits, git operations) so the backend MUST
-    /// include its permission-bypass flag (Claude: `--dangerously-skip-
-    /// permissions`; Codex: `--full-auto`). The returned vec goes
-    /// directly into `std::process::Command::new(...).args(...)`.
+    /// include its permission-bypass flag (Claude:
+    /// `--dangerously-skip-permissions`; Codex:
+    /// `--dangerously-bypass-approvals-and-sandbox`). The returned vec
+    /// goes directly into `std::process::Command::new(...).args(...)`.
     fn build_headless_rw_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String>;
 
     /// Parse the verdict envelope produced by a headless review-gate
@@ -645,26 +646,29 @@ impl AgentBackend for ClaudeCodeBackend {
 ///
 /// Argv shape summary:
 ///
-/// - Interactive (work-item / global): `codex --ask-for-approval never
-///   --sandbox workspace-write
+/// - Interactive (work-item / global): `codex
+///   --dangerously-bypass-approvals-and-sandbox
 ///   --config mcp_servers.workbridge.command="<exe>"
 ///   --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<sock>"]
 ///   [--config instructions="<sys>"] [<auto-start>]` (RP1c).
-///   The approval-policy + sandbox pair is equivalent to `--full-auto`
-///   minus `-a on-request`; the user explicitly disallowed per-call
-///   MCP approval prompts (see Authorization 2b in the review-loop
-///   session log, superseding the original `--full-auto` authorization).
-/// - Headless read-only (review gate): `codex exec --json
+///   No sandbox; linked-worktree layout is incompatible with Codex's
+///   `workspace-write` sandbox - see README "Per-harness permission
+///   model" for the full rationale.
+/// - Headless read-only (review gate): `codex
+///   --dangerously-bypass-approvals-and-sandbox exec --json
 ///   --config instructions="<sys>"
 ///   --config mcp_servers.workbridge.command="<exe>"
 ///   --config mcp_servers.workbridge.args=[...] <prompt>` (RP2c).
-/// - Headless read-write (rebase gate): `codex --ask-for-approval never
-///   exec --json --full-auto
+///   The dangerous flag is emitted even for this conceptually read-only
+///   path, for symmetry across the three Codex spawn sites and so
+///   review skills that shell out (e.g. `cargo check`) are not silently
+///   denied.
+/// - Headless read-write (rebase gate): `codex
+///   --dangerously-bypass-approvals-and-sandbox exec --json
 ///   --config mcp_servers.workbridge.command="<exe>"
 ///   --config mcp_servers.workbridge.args=[...] <prompt>` (RP2bc).
-///   `--ask-for-approval` is a TOP-LEVEL flag and MUST precede `exec`
-///   (clap rejects it inside the `exec` subcommand). `--full-auto`
-///   stays inside `exec`.
+///   The dangerous flag is a TOP-LEVEL codex flag and MUST precede
+///   `exec` (clap rejects top-level flags inside the `exec` subcommand).
 ///
 /// C4 note: earlier drafts used `mcp_servers.workbridge.config=<path>`
 /// pointing at the Claude-shaped JSON file. That shape is syntactically
@@ -776,22 +780,27 @@ impl AgentBackend for CodexBackend {
     fn build_command(&self, cfg: &SpawnConfig<'_>) -> Vec<String> {
         let mut cmd = vec![self.command_name().to_string()];
         // C3: for write-capable interactive sessions, emit
-        // `--ask-for-approval never` (suppresses shell/patch approvals)
-        // plus `--sandbox workspace-write` (scopes filesystem writes to
-        // the worktree). MCP tool approvals are NOT controlled by this
-        // flag in codex-cli 0.120.0; they are controlled per-server via
+        // `--dangerously-bypass-approvals-and-sandbox`. This flag
+        // bypasses both the approval prompts AND the filesystem
+        // sandbox - no sandbox; linked-worktree layout incompatible
+        // with `workspace-write`. See README "Per-harness permission
+        // model" for the full rationale (workbridge runs each work
+        // item in a linked git worktree whose index lives outside the
+        // worktree cwd, at `<repo>/.git/worktrees/<slug>/`, so
+        // `workspace-write` denies `git commit` with "Operation not
+        // permitted"). MCP tool approvals remain covered by per-server
         // `mcp_servers.<name>.default_tools_approval_mode = "approve"`
-        // emitted by `extend_one_mcp_bridge` below. See Authorization
-        // 2b and the 2026-04-17 user directive.
+        // emitted by `extend_one_mcp_bridge` below (defence in depth
+        // - the dangerous flag covers MCP approvals today but the
+        // per-server overrides ensure the behaviour survives a Codex
+        // change to that flag's scope).
         //
         // Read-only interactive sessions (global assistant in read-only
-        // mode, hypothetical future read-only scope) omit both flags
-        // since the MCP-server layer enforces read-only there.
+        // mode, hypothetical future read-only scope; no caller today)
+        // omit the flag since the MCP-server layer enforces read-only
+        // there.
         if !cfg.read_only {
-            cmd.push("--ask-for-approval".to_string());
-            cmd.push("never".to_string());
-            cmd.push("--sandbox".to_string());
-            cmd.push("workspace-write".to_string());
+            cmd.push("--dangerously-bypass-approvals-and-sandbox".to_string());
         }
         // C4: Codex has no `--mcp-config` flag and no `mcp_servers.*.config`
         // sub-field that reads an external JSON (that path is what the
@@ -845,9 +854,19 @@ impl AgentBackend for CodexBackend {
 
     fn build_review_gate_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
         // C1 headless + C11 read-only: `codex exec --json` emits a
-        // newline-delimited event stream. No `--full-auto` (this
-        // session cannot write). The read-only MCP server enforces
-        // the gate semantics.
+        // newline-delimited event stream. The read-only MCP server
+        // enforces the gate semantics.
+        //
+        // No sandbox - see README "Per-harness permission model" for
+        // why. The dangerous flag is included here explicitly even
+        // though the review gate is conceptually read-only, for
+        // symmetry across the three Codex spawn sites AND so review
+        // skills that invoke shell commands (e.g. `cargo check`) are
+        // not silently denied. `--dangerously-bypass-approvals-and-sandbox`
+        // is a top-level flag and MUST precede `exec` per Codex's
+        // clap layout (same constraint that forces the old
+        // `--ask-for-approval never` to precede `exec` in the rebase
+        // gate).
         //
         // C3b: MCP tool approvals are still suppressed per-server via
         // `mcp_servers.<name>.default_tools_approval_mode = "approve"`
@@ -855,6 +874,7 @@ impl AgentBackend for CodexBackend {
         // headless review gate would block on the first `workbridge_*`
         // call (no user to answer the approval dialog).
         let mut cmd = vec![
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
             "exec".to_string(),
             "--json".to_string(),
             "--config".to_string(),
@@ -866,24 +886,21 @@ impl AgentBackend for CodexBackend {
     }
 
     fn build_headless_rw_command(&self, cfg: &ReviewGateSpawnConfig<'_>) -> Vec<String> {
-        // Headless read-write: `--ask-for-approval never` is a TOP-
-        // LEVEL codex flag and MUST precede `exec`; clap rejects it
-        // inside the `exec` subcommand. `--full-auto` IS an `exec`
-        // subcommand flag and stays after `exec`. Verified live on
-        // 2026-04-16 via `codex --ask-for-approval never exec --json
-        // --full-auto --skip-git-repo-check "echo hi"`.
+        // Headless read-write: no sandbox - see README "Per-harness
+        // permission model" for the full rationale.
+        // `--dangerously-bypass-approvals-and-sandbox` is a TOP-LEVEL
+        // codex flag and MUST precede `exec`; clap rejects top-level
+        // flags inside the `exec` subcommand.
         //
-        // C3b: MCP tool approvals are suppressed per-server via
+        // C3b: MCP tool approvals are also suppressed per-server via
         // `mcp_servers.<name>.default_tools_approval_mode = "approve"`
-        // (emitted by `extend_one_mcp_bridge`). The headless rebase
-        // gate would otherwise block on the first `workbridge_*` MCP
-        // call with no interactive user to answer.
+        // (emitted by `extend_one_mcp_bridge`) as defence in depth.
+        // The headless rebase gate would otherwise block on the first
+        // `workbridge_*` MCP call with no interactive user to answer.
         let mut cmd = vec![
-            "--ask-for-approval".to_string(),
-            "never".to_string(),
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
             "exec".to_string(),
             "--json".to_string(),
-            "--full-auto".to_string(),
         ];
         Self::extend_mcp_bridge_argv(&mut cmd, Some(cfg.mcp_bridge), cfg.extra_bridges);
         cmd.push(cfg.initial_prompt.to_string());
@@ -1039,25 +1056,28 @@ mod tests {
         };
         let argv = backend.build_command(&cfg);
         assert_eq!(argv.first().map(String::as_str), Some("codex"));
-        // Interactive write-capable Codex uses `--ask-for-approval never`
-        // + `--sandbox workspace-write` (the Authorization 2b shape).
-        // MCP-tool approvals are suppressed per-server via
-        // `mcp_servers.<name>.default_tools_approval_mode="approve"`
-        // (not the approval_policy flag - that only covers shell/patch
-        // approvals, not MCP tool calls).
-        let approval_idx = argv.iter().position(|s| s == "--ask-for-approval");
+        // Interactive write-capable Codex uses
+        // `--dangerously-bypass-approvals-and-sandbox`. The linked-
+        // worktree layout is incompatible with Codex's built-in
+        // `workspace-write` sandbox; see README "Per-harness permission
+        // model" for the full rationale.
         assert!(
-            approval_idx.is_some(),
-            "interactive Codex must emit --ask-for-approval"
+            argv.iter()
+                .any(|s| s == "--dangerously-bypass-approvals-and-sandbox"),
+            "interactive Codex must emit --dangerously-bypass-approvals-and-sandbox, got {argv:?}"
         );
-        assert_eq!(
-            argv.get(approval_idx.unwrap() + 1).map(String::as_str),
-            Some("never"),
-            "--ask-for-approval value must be 'never'"
+        // The old sandboxed-mode flags MUST be absent.
+        assert!(
+            !argv.iter().any(|s| s == "--sandbox"),
+            "interactive Codex must NOT emit --sandbox"
         );
         assert!(
-            argv.iter().any(|s| s == "--sandbox") && argv.iter().any(|s| s == "workspace-write"),
-            "interactive Codex must keep workspace-write sandbox"
+            !argv.iter().any(|s| s == "workspace-write"),
+            "interactive Codex must NOT emit workspace-write"
+        );
+        assert!(
+            !argv.iter().any(|s| s == "--ask-for-approval"),
+            "interactive Codex must NOT emit --ask-for-approval"
         );
         assert!(
             !argv.iter().any(|s| s == "--full-auto"),
@@ -1087,8 +1107,19 @@ mod tests {
             extra_bridges: &[],
         };
         let rg_argv = backend.build_review_gate_command(&rg_cfg);
-        assert_eq!(rg_argv.first().map(String::as_str), Some("exec"));
+        // Dangerous flag is top-level and must precede `exec`.
+        assert_eq!(
+            rg_argv.first().map(String::as_str),
+            Some("--dangerously-bypass-approvals-and-sandbox"),
+            "review gate must start with --dangerously-bypass-approvals-and-sandbox"
+        );
+        assert!(rg_argv.iter().any(|s| s == "exec"));
         assert!(rg_argv.iter().any(|s| s == "--json"));
+        // Old sandboxed flags MUST be absent on the review gate path too.
+        assert!(!rg_argv.iter().any(|s| s == "--sandbox"));
+        assert!(!rg_argv.iter().any(|s| s == "workspace-write"));
+        assert!(!rg_argv.iter().any(|s| s == "--ask-for-approval"));
+        assert!(!rg_argv.iter().any(|s| s == "--full-auto"));
 
         // Headless read-write (rebase gate) shape.
         let rw_cfg = ReviewGateSpawnConfig {
@@ -1100,26 +1131,31 @@ mod tests {
             extra_bridges: &[],
         };
         let rw_argv = backend.build_headless_rw_command(&rw_cfg);
-        // Rebase gate: `--ask-for-approval never` (top-level) must
-        // precede `exec`; `--full-auto` (exec-subcommand flag) stays
-        // after `exec`. Per-server MCP approval is also emitted.
+        // Rebase gate: `--dangerously-bypass-approvals-and-sandbox`
+        // (top-level) must precede `exec`. Per-server MCP approval is
+        // also emitted as defence in depth.
         assert_eq!(
             rw_argv.first().map(String::as_str),
-            Some("--ask-for-approval"),
-            "rebase gate must start with top-level --ask-for-approval"
+            Some("--dangerously-bypass-approvals-and-sandbox"),
+            "rebase gate must start with --dangerously-bypass-approvals-and-sandbox"
         );
         let exec_idx = rw_argv
             .iter()
             .position(|s| s == "exec")
             .expect("rebase gate must include `exec`");
-        let full_auto_idx = rw_argv
+        let dangerous_idx = rw_argv
             .iter()
-            .position(|s| s == "--full-auto")
-            .expect("rebase gate must include `--full-auto`");
+            .position(|s| s == "--dangerously-bypass-approvals-and-sandbox")
+            .expect("rebase gate must include dangerous flag");
         assert!(
-            full_auto_idx > exec_idx,
-            "--full-auto must come AFTER `exec`"
+            dangerous_idx < exec_idx,
+            "--dangerously-bypass-approvals-and-sandbox must precede `exec`"
         );
+        // Old sandboxed flags MUST be absent on the rebase gate path.
+        assert!(!rw_argv.iter().any(|s| s == "--sandbox"));
+        assert!(!rw_argv.iter().any(|s| s == "workspace-write"));
+        assert!(!rw_argv.iter().any(|s| s == "--ask-for-approval"));
+        assert!(!rw_argv.iter().any(|s| s == "--full-auto"));
         assert!(
             rw_argv
                 .iter()
@@ -1310,11 +1346,14 @@ mod tests {
 
     // ---- Codex backend tests ----
 
-    /// Pins C3: interactive write-capable Codex uses `--ask-for-approval
-    /// never` + `--sandbox workspace-write` (Authorization 2b, supersedes
-    /// the earlier `--full-auto` shape). `--full-auto` pulls in
-    /// `-a on-request` which prompts for approval on every MCP tool
-    /// call; the user explicitly rejected that UX on 2026-04-17.
+    /// Pins C3: interactive write-capable Codex uses
+    /// `--dangerously-bypass-approvals-and-sandbox`. The linked-worktree
+    /// layout is incompatible with Codex's built-in `workspace-write`
+    /// sandbox (git stores per-worktree state at
+    /// `<repo>/.git/worktrees/<slug>/` - outside the worktree cwd - and
+    /// `workspace-write` denies writes there, breaking `git commit`).
+    /// See README "Per-harness permission model" for the full rationale.
+    /// Per-server MCP approval overrides remain as defence in depth.
     #[test]
     fn codex_interactive_argv_pre_approves_tool_calls() {
         let mcp_path = PathBuf::from("/tmp/workbridge-mcp-fake.sock");
@@ -1331,32 +1370,35 @@ mod tests {
         };
         let argv = CodexBackend.build_command(&cfg);
         assert_eq!(argv[0], "codex");
-        // `--ask-for-approval never` must be present (adjacent pair).
-        let approval_idx = argv.iter().position(|s| s == "--ask-for-approval");
-        assert!(approval_idx.is_some());
-        assert_eq!(
-            argv.get(approval_idx.unwrap() + 1).map(String::as_str),
-            Some("never")
-        );
-        // Sandbox must remain workspace-write (adjacent pair).
-        let sandbox_idx = argv.iter().position(|s| s == "--sandbox");
-        assert!(sandbox_idx.is_some());
-        assert_eq!(
-            argv.get(sandbox_idx.unwrap() + 1).map(String::as_str),
-            Some("workspace-write")
+        // `--dangerously-bypass-approvals-and-sandbox` MUST be present.
+        assert!(
+            argv.iter()
+                .any(|s| s == "--dangerously-bypass-approvals-and-sandbox"),
+            "interactive Codex must emit --dangerously-bypass-approvals-and-sandbox, got {argv:?}"
         );
         // Per-server MCP pre-approval via
-        // `mcp_servers.workbridge.default_tools_approval_mode="approve"`.
-        // This is the key that actually suppresses "Allow the
-        // workbridge MCP server to run tool ..." prompts in codex-cli
-        // 0.120.0 (verified by reading codex source; the global
-        // approval_policy flag does NOT cover MCP tool calls).
+        // `mcp_servers.workbridge.default_tools_approval_mode="approve"`
+        // is retained as defence in depth: the dangerous flag covers
+        // MCP approvals today but the per-server overrides ensure the
+        // behaviour survives a Codex change to that flag's scope.
         assert!(
             argv.iter()
                 .any(|s| s == "mcp_servers.workbridge.default_tools_approval_mode=\"approve\""),
             "workbridge MCP server must be marked default_tools_approval_mode=\"approve\", got {argv:?}"
         );
-        // `--full-auto` must NOT be emitted in interactive mode.
+        // Old sandboxed-mode flags MUST NOT be emitted.
+        assert!(
+            !argv.iter().any(|s| s == "--ask-for-approval"),
+            "interactive Codex must NOT emit --ask-for-approval"
+        );
+        assert!(
+            !argv.iter().any(|s| s == "--sandbox"),
+            "interactive Codex must NOT emit --sandbox"
+        );
+        assert!(
+            !argv.iter().any(|s| s == "workspace-write"),
+            "interactive Codex must NOT emit workspace-write"
+        );
         assert!(
             !argv.iter().any(|s| s == "--full-auto"),
             "interactive Codex must NOT use --full-auto"
@@ -1587,9 +1629,13 @@ mod tests {
         );
     }
 
-    /// Pins C11: read-only interactive sessions omit the write-mode
-    /// approval/sandbox pair. The read-only MCP server is the enforcement
-    /// mechanism; the CLI flags would be misleading.
+    /// Pins C11: read-only interactive sessions omit every
+    /// permission/sandbox flag entirely. The read-only MCP server is
+    /// the enforcement mechanism; adding the dangerous bypass flag
+    /// here would grant write capability that the read-only path is
+    /// supposed to deny, and the legacy sandboxed flags
+    /// (`--ask-for-approval`, `--sandbox`, `--full-auto`) are also
+    /// omitted since read-only has no write semantics to gate.
     #[test]
     fn codex_read_only_interactive_omits_write_flags() {
         let mcp_path = PathBuf::from("/tmp/mcp.json");
@@ -1605,10 +1651,17 @@ mod tests {
             read_only: true,
         };
         let argv = CodexBackend.build_command(&cfg);
-        // Read-only must NOT emit the write-mode approval/sandbox pair
-        // and must NOT emit the deprecated `--full-auto` shortcut.
+        // Read-only must NOT emit the dangerous bypass flag.
+        assert!(
+            !argv
+                .iter()
+                .any(|s| s == "--dangerously-bypass-approvals-and-sandbox"),
+            "read-only Codex must NOT emit --dangerously-bypass-approvals-and-sandbox; got {argv:?}"
+        );
+        // Read-only must NOT emit any legacy sandbox/approval flag either.
         assert!(!argv.iter().any(|s| s == "--ask-for-approval"));
         assert!(!argv.iter().any(|s| s == "--sandbox"));
+        assert!(!argv.iter().any(|s| s == "workspace-write"));
         assert!(!argv.iter().any(|s| s == "--full-auto"));
     }
 
@@ -1627,9 +1680,34 @@ mod tests {
             extra_bridges: &[],
         };
         let argv = CodexBackend.build_review_gate_command(&cfg);
-        assert_eq!(argv[0], "exec");
+        // Review gate: `--dangerously-bypass-approvals-and-sandbox` is
+        // a top-level flag and MUST precede `exec` per Codex's clap
+        // layout. Dangerous flag is included even though this path is
+        // conceptually read-only, for symmetry across the three Codex
+        // spawn sites and so review skills that shell out (e.g.
+        // `cargo check`) are not silently denied.
+        assert_eq!(
+            argv[0], "--dangerously-bypass-approvals-and-sandbox",
+            "review gate argv must start with the dangerous flag, got {argv:?}"
+        );
+        let dangerous_idx = argv
+            .iter()
+            .position(|s| s == "--dangerously-bypass-approvals-and-sandbox")
+            .expect("review gate must include dangerous flag");
+        let exec_idx = argv
+            .iter()
+            .position(|s| s == "exec")
+            .expect("review gate must include `exec`");
+        assert!(
+            dangerous_idx < exec_idx,
+            "--dangerously-bypass-approvals-and-sandbox must precede `exec`"
+        );
         assert!(argv.iter().any(|s| s == "--json"));
-        // Review gate does NOT get --full-auto (read-only).
+        // Old sandboxed-mode flags MUST NOT be emitted on the review
+        // gate path.
+        assert!(!argv.iter().any(|s| s == "--ask-for-approval"));
+        assert!(!argv.iter().any(|s| s == "--sandbox"));
+        assert!(!argv.iter().any(|s| s == "workspace-write"));
         assert!(!argv.iter().any(|s| s == "--full-auto"));
         // Per-field MCP overrides must be present.
         assert!(
@@ -1651,14 +1729,15 @@ mod tests {
         );
     }
 
-    /// Pins the headless rebase-gate shape: top-level `-a never`
-    /// before `exec`, `--full-auto` after `exec`, and the per-server
-    /// `default_tools_approval_mode="approve"` override on the
-    /// workbridge MCP server. `-a` must precede `exec` (clap rejects
-    /// it as an exec flag); `--full-auto` is an exec subcommand flag
-    /// and stays after `exec`. MCP tool prompts are suppressed via
-    /// the per-server setting (the global approval_policy does NOT
-    /// cover MCP tool calls).
+    /// Pins the headless rebase-gate shape: top-level
+    /// `--dangerously-bypass-approvals-and-sandbox` before `exec`, and
+    /// the per-server `default_tools_approval_mode="approve"` override
+    /// on the workbridge MCP server. The dangerous flag is a top-level
+    /// codex flag and MUST precede `exec` (clap rejects top-level
+    /// flags inside the `exec` subcommand). MCP tool prompts are also
+    /// suppressed via the per-server setting as defence in depth.
+    /// See README "Per-harness permission model" for why the rebase
+    /// gate does not use Codex's built-in sandbox.
     #[test]
     fn codex_headless_rw_argv_shape_and_mcp_pre_approval() {
         let mcp_path = PathBuf::from("/tmp/rb.json");
@@ -1678,28 +1757,32 @@ mod tests {
             .position(|s| s == "exec")
             .expect("exec subcommand must be present");
 
-        // `--ask-for-approval never` must precede exec (R2-F-1).
-        let approval_idx = argv
+        // `--dangerously-bypass-approvals-and-sandbox` must precede exec.
+        let dangerous_idx = argv
             .iter()
-            .position(|s| s == "--ask-for-approval")
-            .expect("--ask-for-approval must be present");
+            .position(|s| s == "--dangerously-bypass-approvals-and-sandbox")
+            .expect("--dangerously-bypass-approvals-and-sandbox must be present");
         assert!(
-            approval_idx < exec_idx,
-            "--ask-for-approval must come BEFORE `exec`; got {argv:?}"
-        );
-        assert_eq!(
-            argv.get(approval_idx + 1).map(String::as_str),
-            Some("never")
+            dangerous_idx < exec_idx,
+            "--dangerously-bypass-approvals-and-sandbox must come BEFORE `exec`; got {argv:?}"
         );
 
-        // `--full-auto` must come after exec (exec subcommand flag).
-        let full_auto_idx = argv
-            .iter()
-            .position(|s| s == "--full-auto")
-            .expect("--full-auto must be present");
+        // Old sandboxed-mode flags MUST NOT be emitted.
         assert!(
-            full_auto_idx > exec_idx,
-            "--full-auto must come AFTER `exec`; got {argv:?}"
+            !argv.iter().any(|s| s == "--ask-for-approval"),
+            "rebase gate must NOT emit --ask-for-approval; got {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|s| s == "--sandbox"),
+            "rebase gate must NOT emit --sandbox; got {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|s| s == "workspace-write"),
+            "rebase gate must NOT emit workspace-write; got {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|s| s == "--full-auto"),
+            "rebase gate must NOT emit --full-auto; got {argv:?}"
         );
 
         // Per-server MCP pre-approval must be present so the headless
@@ -1720,6 +1803,93 @@ mod tests {
                 .any(|s| s.starts_with("mcp_servers.workbridge.args=")),
             "rebase gate argv must include mcp_servers.workbridge.args override, got {argv:?}"
         );
+    }
+
+    /// Symmetry invariant: every Codex spawn path (interactive work-item
+    /// / global, headless review gate, headless rebase gate) MUST emit
+    /// `--dangerously-bypass-approvals-and-sandbox`. The review gate is
+    /// included explicitly even though it is conceptually read-only,
+    /// both for symmetry across the three spawn sites and so review
+    /// skills that invoke shell commands (e.g. `cargo check`) are not
+    /// silently denied. A future PR that re-introduces a sandbox flag
+    /// in just one builder - or drops the dangerous flag from just one
+    /// builder - must fail this test loudly. See README "Per-harness
+    /// permission model" for why the linked-worktree layout is
+    /// incompatible with Codex's built-in sandbox.
+    #[test]
+    fn codex_all_spawn_paths_use_dangerous_flag() {
+        let mcp_path = PathBuf::from("/tmp/workbridge-mcp-fake.sock");
+        let bridge = fake_bridge();
+        let dangerous = "--dangerously-bypass-approvals-and-sandbox";
+
+        // 1. Interactive work-item / global.
+        let interactive_cfg = SpawnConfig {
+            stage: WorkItemStatus::Implementing,
+            system_prompt: Some("sys"),
+            mcp_config_path: Some(&mcp_path),
+            mcp_bridge: Some(&bridge),
+            extra_bridges: &[],
+            allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+            auto_start_message: None,
+            read_only: false,
+        };
+        let interactive_argv = CodexBackend.build_command(&interactive_cfg);
+        assert!(
+            interactive_argv.iter().any(|s| s == dangerous),
+            "interactive Codex spawn path must emit {dangerous}; got {interactive_argv:?}"
+        );
+
+        // 2. Headless review gate (conceptually read-only - explicitly
+        //    included for symmetry and for review skills that shell out).
+        let rg_cfg = ReviewGateSpawnConfig {
+            system_prompt: "sys",
+            initial_prompt: "/claude-adversarial-review",
+            json_schema: "{}",
+            mcp_config_path: &mcp_path,
+            mcp_bridge: &bridge,
+            extra_bridges: &[],
+        };
+        let rg_argv = CodexBackend.build_review_gate_command(&rg_cfg);
+        assert!(
+            rg_argv.iter().any(|s| s == dangerous),
+            "review gate Codex spawn path must emit {dangerous}; got {rg_argv:?}"
+        );
+
+        // 3. Headless rebase gate.
+        let rw_cfg = ReviewGateSpawnConfig {
+            system_prompt: "",
+            initial_prompt: "rebase",
+            json_schema: "{}",
+            mcp_config_path: &mcp_path,
+            mcp_bridge: &bridge,
+            extra_bridges: &[],
+        };
+        let rw_argv = CodexBackend.build_headless_rw_command(&rw_cfg);
+        assert!(
+            rw_argv.iter().any(|s| s == dangerous),
+            "rebase gate Codex spawn path must emit {dangerous}; got {rw_argv:?}"
+        );
+
+        // Symmetrically, none of the three paths may emit the legacy
+        // sandboxed-mode flags (a future PR that re-introduces one in
+        // just one spawn site would fail this check).
+        for (label, argv) in [
+            ("interactive", &interactive_argv),
+            ("review gate", &rg_argv),
+            ("rebase gate", &rw_argv),
+        ] {
+            for banned in [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "--full-auto",
+            ] {
+                assert!(
+                    !argv.iter().any(|s| s == banned),
+                    "{label} Codex spawn path must NOT emit legacy flag {banned}; got {argv:?}"
+                );
+            }
+        }
     }
 
     /// R2-F-2 regression: per-repo user-configured MCP servers

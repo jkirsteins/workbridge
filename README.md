@@ -25,6 +25,7 @@ through a Backlog -> Planning -> Implementing -> Review -> Done workflow.
   - [Global assistant drawer](#global-assistant-drawer)
   - [MCP Communication](#mcp-communication)
 - [Compatibility](#compatibility)
+- [Per-harness permission model](#per-harness-permission-model)
 - [Further Reading](#further-reading)
 - [License](#license)
 
@@ -291,6 +292,39 @@ reminders; Codex has no matching hook, so the Planning reminder is embedded
 in the system prompt and fires only at spawn, not on each turn. This is
 strictly weaker than the hook-based delivery because it cannot re-fire after
 the first turn. See `docs/harness-contract.md` C8.
+
+## Per-harness permission model
+
+Workbridge runs LLM coding CLIs in your terminal. Each harness has its own
+permission model; workbridge's defaults differ per harness, summarised here:
+
+| Harness     | In-CLI approval prompts | Filesystem sandbox | Network access | How it's enforced |
+|-------------|-------------------------|--------------------|----------------|-------------------|
+| Claude Code | Bypassed (`--dangerously-skip-permissions`) | None - Claude has no built-in sandbox | Unrestricted | workbridge MCP server allowlist (`--allowedTools`); per-stage system prompt |
+| Codex       | Bypassed (`--dangerously-bypass-approvals-and-sandbox`) | None | Unrestricted | workbridge MCP server allowlist; per-server `default_tools_approval_mode = "approve"` |
+
+Both harnesses run with full filesystem and network access - workbridge spawns
+them on the same trust footing as running them yourself in a shell. The `[!]`
+marker next to a session's harness name in the right-panel tab title is a
+visible reminder of this.
+
+### Why Codex doesn't use its built-in sandbox
+
+workbridge runs each work item in a linked git worktree at
+`<repo>/.worktrees/<slug>/`. Git stores that worktree's index outside the
+worktree, at `<repo>/.git/worktrees/<slug>/`. Codex's default `workspace-write`
+sandbox forbids writes outside the cwd, so `git commit` inside the worktree
+fails: git tries to create `<repo>/.git/worktrees/<slug>/index.lock` and the
+sandbox returns `Operation not permitted`.
+
+Granting `<repo>/.git/` as a writable root does not work either - Codex's
+protected-paths rule denies writes to any `.git/` directory recursively.
+Granting individual subpaths (`objects/`, `refs/`, `logs/`, ...) papers over
+`git commit` but still produces `packed-refs.lock` denials, blocks `git push`
+(network is also off by default in workspace-write), and breaks `cargo build`
+against `~/.cargo/registry/`. Rather than maintain a fragile, ever-growing
+list of writable_roots that approximates "everything except `~/.ssh`",
+workbridge runs Codex without the built-in sandbox.
 
 ## Further Reading
 
