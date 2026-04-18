@@ -53,7 +53,39 @@ Do this in a dedicated release-prep commit before running any publish commands.
   (MAJOR for breaking changes, MINOR for new features, PATCH for fixes).
 - Bump `package.rust-version` in `Cargo.toml` if any new code or dependency in
   this release requires a newer stable toolchain than the currently declared
-  MSRV. Leave it alone otherwise.
+  MSRV. Determine the real MSRV floor by taking the maximum `rust_version`
+  across the normal-dependency closure of the shipped `Cargo.lock`, not just
+  the direct dependencies listed in `Cargo.toml`. One way to compute it:
+
+  ```sh
+  cargo metadata --format-version 1 --locked \
+    | python3 -c 'import json, sys
+  d = json.load(sys.stdin)
+  pkgs = {p["id"]: p for p in d["packages"]}
+  nodes = {n["id"]: n for n in d["resolve"]["nodes"]}
+  root = d["resolve"]["root"]
+  visited, queue = set(), [root]
+  while queue:
+      nid = queue.pop()
+      if nid in visited:
+          continue
+      visited.add(nid)
+      for dep in nodes[nid].get("deps", []):
+          kinds = [k.get("kind") for k in dep.get("dep_kinds", [])]
+          if any(k is None for k in kinds):
+              queue.append(dep["pkg"])
+  versions = [pkgs[pid].get("rust_version") for pid in visited]
+  versions = [v for v in versions if v]
+  versions.sort(key=lambda v: tuple(int(x) for x in v.split(".")), reverse=True)
+  print(versions[0] if versions else "none")'
+  ```
+
+  If that value is higher than the current `package.rust-version`, bump
+  `package.rust-version` to match before publishing. Do not publish a declared
+  MSRV below the actual lockfile floor: `cargo install --locked workbridge`
+  would fail to compile on toolchains that satisfy the declared MSRV but not
+  the true transitive floor. Leave `package.rust-version` alone if the
+  computed floor is unchanged.
 - In `CHANGELOG.md`, rename the `[Unreleased]` section to
   `[<version>] - YYYY-MM-DD` using today's date, and move any entries that
   belong to this release into it. Leave a fresh, empty `[Unreleased]` section
