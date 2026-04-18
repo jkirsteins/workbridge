@@ -440,7 +440,7 @@ pub fn aggregate_from_activity_logs(data_dir: &Path) -> MetricsSnapshot {
 
     snapshot
         .stuck_items
-        .sort_by(|a, b| b.stuck_for_secs.cmp(&a.stuck_for_secs));
+        .sort_by_key(|item| std::cmp::Reverse(item.stuck_for_secs));
 
     snapshot
 }
