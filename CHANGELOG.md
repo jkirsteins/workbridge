@@ -7,8 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Added `cargo-release` support and release documentation. See
-  [docs/releasing.md](docs/releasing.md).
+- Added `cargo-release` support and consolidated the release documentation
+  into [RELEASING.md](RELEASING.md) ([#130](https://github.com/jkirsteins/workbridge/pull/130)).
 
 ## [0.1.1] - 2026-04-18
 

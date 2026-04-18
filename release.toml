@@ -1,4 +1,4 @@
-# cargo-release configuration. See docs/releasing.md for the human workflow.
+# cargo-release configuration. See RELEASING.md for the human workflow.
 # Reference: https://github.com/crate-ci/cargo-release/blob/master/docs/reference.md
 
 allow-branch = ["master"]

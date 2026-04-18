@@ -319,12 +319,11 @@ workbridge runs Codex without the built-in sandbox.
 ## Further Reading
 
 - [CONTRIBUTING.md](CONTRIBUTING.md) - coding standards, error handling, UI rules
-- [RELEASING.md](RELEASING.md) - manual crates.io release process for maintainers
+- [RELEASING.md](RELEASING.md) - cutting a new release (cargo-release workflow)
 - [docs/cli.md](docs/cli.md) - full CLI reference for every `workbridge` subcommand and flag
 - [docs/repository-registry.md](docs/repository-registry.md) - repo registration and config
 - [docs/work-items.md](docs/work-items.md) - work item lifecycle and stages
 - [docs/UI.md](docs/UI.md) - TUI layout and interactions
-- [docs/releasing.md](docs/releasing.md) - cutting a new release
 - [docs/invariants.md](docs/invariants.md) - project invariants (read-only)
 
 ## License
