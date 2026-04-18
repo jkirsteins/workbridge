@@ -76,6 +76,35 @@ the review and merge gates.
 if you want to create a Backlog item instead of jumping straight into
 planning.
 
+## How It Works
+
+Work items are Workbridge's central abstraction. Each one owns a branch, a
+worktree, an optional GitHub issue, and an optional PR, and moves through a
+linear sequence of stages driven by Claude Code sessions. Two gates protect
+the flow: the **review gate** (PR exists, CI is green, adversarial code
+review passes the plan-vs-implementation check) and the **merge gate** (the
+PR is actually merged on GitHub).
+
+```mermaid
+flowchart TD
+    QS["Ctrl+N<br/>quick start"] --> Planning
+    CD["Ctrl+B<br/>creation dialog"] --> Backlog
+    GA["Global assistant<br/>transfer"] --> Planning
+    RR["Review requested<br/>on your PR"] --> Review
+
+    Backlog --> Planning
+    Planning -->|plan recorded| Implementing
+    Implementing <-->|stuck / unblocked| Blocked
+    Implementing -->|review gate| Review
+    Blocked -->|review gate| Review
+    Review -->|merge gate| Done
+    Review -->|poll strategy| Mergequeue
+    Mergequeue -->|PR merged externally| Done
+```
+
+See [docs/work-items.md](docs/work-items.md) for the full stage semantics,
+gate behavior, and review-request workflow.
+
 ## Further Reading
 
 - [CONTRIBUTING.md](CONTRIBUTING.md) - coding standards, error handling, UI rules
@@ -83,3 +112,8 @@ planning.
 - [docs/work-items.md](docs/work-items.md) - work item lifecycle and stages
 - [docs/UI.md](docs/UI.md) - TUI layout and interactions
 - [docs/invariants.md](docs/invariants.md) - project invariants (read-only)
+
+## License
+
+Workbridge is released under the MIT License. See [LICENSE](LICENSE) for the
+full text.
