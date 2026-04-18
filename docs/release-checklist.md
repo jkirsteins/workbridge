@@ -19,12 +19,19 @@ All three must agree before publishing.
 - Confirm `workbridge` is still available immediately before the first publish:
 
   ```sh
-  cargo search workbridge --limit 5
+  cargo info workbridge
   ```
 
-- If a crate with the exact name `workbridge` appears, stop. Choose a new crate
-  name and audit `Cargo.toml`, README install commands, UI text, docs, and
-  release notes before publishing.
+  `cargo info` (stable since Rust 1.79) resolves the exact crate name on
+  crates.io. For an unpublished name it exits non-zero with a "could not find"
+  error; any successful output means the name is already taken.
+
+- As a cross-check, confirm that `https://crates.io/crates/workbridge` returns
+  a 404 in a browser.
+
+- If `cargo info workbridge` succeeds (or the crates.io URL resolves), stop.
+  Choose a new crate name and audit `Cargo.toml`, README install commands, UI
+  text, docs, and release notes before publishing.
 
 ## Version Bump And Changelog
 
