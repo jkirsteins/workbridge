@@ -50,3 +50,39 @@ if [ -n "$bare_agent_files" ]; then
     exit 1
 fi
 echo "Agent spawn check OK."
+
+echo "=== pre-commit: checking for bypasses of src/side_effects/ ==="
+# src/side_effects/ is the ONLY place allowed to reach the real system
+# clipboard, directories::ProjectDirs / BaseDirs / UserDirs,
+# std::env::home_dir, or std::env::temp_dir. Every other file must
+# route through side_effects:: wrappers (for production paths) or
+# tempfile::tempdir() (for test scratch dirs).
+#
+# See docs/superpowers/specs/2026-04-18-test-side-effects-audit-design.md
+# and the corresponding P0 rule in CLAUDE.md.
+bare_sideeffect_files=""
+for f in $(git diff --cached --name-only -- '*.rs'); do
+    # side_effects/* is allowed to mention the gated symbols.
+    case "$f" in
+        src/side_effects/*) continue ;;
+    esac
+    if [ ! -f "$f" ]; then
+        continue
+    fi
+    if grep -qE 'arboard::|directories::(ProjectDirs|BaseDirs|UserDirs)|std::env::home_dir|std::env::temp_dir' "$f"; then
+        bare_sideeffect_files="$bare_sideeffect_files $f"
+    fi
+done
+if [ -n "$bare_sideeffect_files" ]; then
+    echo "ERROR: These files bypass src/side_effects/:"
+    echo "$bare_sideeffect_files"
+    echo ""
+    echo "Host-visible APIs (arboard, directories::ProjectDirs/BaseDirs/UserDirs,"
+    echo "std::env::home_dir, std::env::temp_dir) must be reached through"
+    echo "crate::side_effects::{clipboard, paths} or tempfile::tempdir(). See:"
+    echo "  - docs/TESTING.md 'Side-effect gating module'"
+    echo "  - src/side_effects/mod.rs"
+    echo "  - CLAUDE.md 'Severity overrides' (P0 rule)"
+    exit 1
+fi
+echo "Side-effect gate check OK."
