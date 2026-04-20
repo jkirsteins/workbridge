@@ -5599,7 +5599,7 @@ impl App {
         // without needing to see the worker's `SessionOpenPlanResult`.
         // Per-call UUID so concurrent workers for different work
         // items cannot collide on a shared filename.
-        let mcp_config_path = std::env::temp_dir().join(format!(
+        let mcp_config_path = crate::side_effects::paths::temp_dir().join(format!(
             "workbridge-mcp-config-{}.json",
             uuid::Uuid::new_v4()
         ));
@@ -10806,7 +10806,7 @@ impl App {
                 }
             };
             let mcp_config = crate::mcp::build_mcp_config(&exe_path, &gate_socket, &[]);
-            let config_path = std::env::temp_dir()
+            let config_path = crate::side_effects::paths::temp_dir()
                 .join(format!("workbridge-rg-mcp-{}.json", uuid::Uuid::new_v4()));
             if let Err(e) = std::fs::write(&config_path, &mcp_config) {
                 drop(gate_server);
@@ -11228,7 +11228,7 @@ impl App {
                     }
                 };
                 let mcp_config = crate::mcp::build_mcp_config(&exe_path, &gate_socket, &[]);
-                let path = std::env::temp_dir().join(format!(
+                let path = crate::side_effects::paths::temp_dir().join(format!(
                     "workbridge-rebase-mcp-{}.json",
                     uuid::Uuid::new_v4()
                 ));
@@ -12383,7 +12383,7 @@ impl App {
         // scheme, teardown + respawn + the old worker finishing
         // late would delete the new worker's live config file out
         // from under it.
-        let config_path = std::env::temp_dir().join(format!(
+        let config_path = crate::side_effects::paths::temp_dir().join(format!(
             "workbridge-global-mcp-{}-{}.json",
             std::process::id(),
             uuid::Uuid::new_v4()
@@ -12534,7 +12534,8 @@ impl App {
                 drop(mcp_server);
                 return;
             }
-            let scratch = std::env::temp_dir().join("workbridge-global-assistant-cwd");
+            let scratch =
+                crate::side_effects::paths::temp_dir().join("workbridge-global-assistant-cwd");
             if let Err(e) = std::fs::create_dir_all(&scratch) {
                 let _ = tx.send(GlobalSessionPrepResult {
                     mcp_server: Some(mcp_server),
@@ -13077,8 +13078,8 @@ mod tests {
     #[test]
     fn manage_unmanage_sets_fetcher_repos_changed() {
         // Setup: create a config with a base_dir containing a discovered repo.
-        let dir = std::env::temp_dir().join("workbridge-test-f1-fetcher-flag");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("repo-a/.git")).unwrap();
 
         let mut cfg = Config::default();
@@ -13118,16 +13119,14 @@ mod tests {
             app.fetcher_repos_changed,
             "fetcher_repos_changed should be true after unmanage"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- F-3 regression test --
 
     #[test]
     fn is_inside_managed_repo_positive() {
-        let dir = std::env::temp_dir().join("workbridge-test-f3-managed");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         // Create the subdirectory on disk so canonicalize succeeds.
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -13144,8 +13143,6 @@ mod tests {
         assert!(app.is_inside_managed_repo(&subdir));
         // An unrelated path should not be inside.
         assert!(!app.is_inside_managed_repo(&PathBuf::from("/tmp/unrelated")));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- Round 3 regression tests --
@@ -13155,8 +13152,8 @@ mod tests {
     /// a subdirectory of a managed repo.
     #[test]
     fn managed_repo_root_returns_root_not_subdir() {
-        let dir = std::env::temp_dir().join("workbridge-test-r3-f1-root");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join("src/deeply/nested")).unwrap();
 
@@ -13178,8 +13175,6 @@ mod tests {
             canonical_dir.display(),
             subdir.display(),
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// F-2: fetcher_repos_changed is set after import and delete.
@@ -13617,8 +13612,8 @@ mod tests {
     #[test]
     fn active_repo_cache_uses_canonical_paths() {
         // Create a real directory and a symlink to it.
-        let dir = std::env::temp_dir().join("workbridge-test-r4-f1-canonical");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         let real_path = dir.join("real-repo");
         let link_path = dir.join("link-repo");
         std::fs::create_dir_all(real_path.join(".git")).unwrap();
@@ -13671,8 +13666,6 @@ mod tests {
             repo_data.contains_key(cached_path),
             "repo_data lookup by canonical path should succeed",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// F-2: Unmanaging a repo prunes stale fetch cache entries.
@@ -14135,8 +14128,8 @@ mod tests {
     /// so sorting ensures stable display indices.
     #[test]
     fn backend_list_returns_sorted_records() {
-        let dir = std::env::temp_dir().join("workbridge-test-r5-f1-sorted");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         let backend = crate::work_item_backend::LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         // Create items with names that would sort differently than creation order.
@@ -14177,8 +14170,6 @@ mod tests {
         assert_eq!(paths[0], dir.join("aaa.json"));
         assert_eq!(paths[1], dir.join("mmm.json"));
         assert_eq!(paths[2], dir.join("zzz.json"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// F-3: Fetch errors queued while status bar is occupied eventually
@@ -15117,12 +15108,8 @@ mod tests {
 
         // find_reusable_worktree canonicalizes both paths, so they must
         // exist on disk. Use a temp dir with a fresh subdirectory per case.
-        let root = std::env::temp_dir().join(format!(
-            "workbridge-reusable-worktree-test-{}",
-            std::process::id(),
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let root = _tmp.path().to_path_buf();
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let wt_target = repo.join(".worktrees").join("feature-x");
@@ -15207,8 +15194,6 @@ mod tests {
             App::find_reusable_worktree(&mock, &repo, "feature-x", &missing_target).is_none(),
             "non-existent target path must not match anything",
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // -----------------------------------------------------------------------
@@ -18633,13 +18618,14 @@ mod tests {
 
     /// Helper: spin up an App backed by a real LocalFileBackend in a
     /// temp directory with one Backlog work item whose repo association
-    /// has `branch: None`. Returns (app, wi_id, temp_dir) so the caller
-    /// owns cleanup.
-    fn app_with_branchless_backlog_item(name: &str) -> (App, WorkItemId, PathBuf) {
+    /// has `branch: None`. Returns (app, wi_id, tempdir_guard); the
+    /// `TempDir` must be held live by the caller (else its Drop removes
+    /// the backend's on-disk directory mid-test).
+    fn app_with_branchless_backlog_item(_name: &str) -> (App, WorkItemId, tempfile::TempDir) {
         use crate::work_item_backend::{CreateWorkItem, LocalFileBackend, RepoAssociationRecord};
 
-        let dir = std::env::temp_dir().join(format!("workbridge-test-branchless-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
         let record = backend
             .create(CreateWorkItem {
@@ -18663,7 +18649,7 @@ mod tests {
         app.selected_work_item = Some(wi_id.clone());
         app.build_display_list();
 
-        (app, wi_id, dir)
+        (app, wi_id, tmp)
     }
 
     /// advance_stage from a branchless Backlog item must refuse the
@@ -18671,7 +18657,7 @@ mod tests {
     /// is not silently moved into Planning with no branch set.
     #[test]
     fn advance_from_backlog_without_branch_opens_dialog() {
-        let (mut app, wi_id, dir) = app_with_branchless_backlog_item("advance-opens");
+        let (mut app, wi_id, _tmp) = app_with_branchless_backlog_item("advance-opens");
 
         app.advance_stage();
 
@@ -18697,8 +18683,6 @@ mod tests {
             WorkItemStatus::Backlog,
             "advance must not mutate status when the branch invariant fails",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Confirming the Set branch dialog from an advance_stage-triggered
@@ -18706,7 +18690,7 @@ mod tests {
     /// the same stage change so the work item actually advances.
     #[test]
     fn confirm_set_branch_dialog_persists_and_advances() {
-        let (mut app, wi_id, dir) = app_with_branchless_backlog_item("confirm-advance");
+        let (mut app, wi_id, _tmp) = app_with_branchless_backlog_item("confirm-advance");
 
         // Open the dialog via the advance path.
         app.advance_stage();
@@ -18736,8 +18720,6 @@ mod tests {
             Some("user/needs-a-branch-abcd"),
             "branch must be persisted to the repo association",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Confirming the Set branch dialog from a spawn_session-triggered
@@ -18750,8 +18732,8 @@ mod tests {
     fn confirm_set_branch_dialog_persists_and_spawns_session() {
         use crate::work_item_backend::{CreateWorkItem, LocalFileBackend, RepoAssociationRecord};
 
-        let dir = std::env::temp_dir().join("workbridge-test-branchless-spawn");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
         // Use Planning so spawn_session proceeds past the
         // Backlog/Done/Mergequeue early-return.
@@ -18807,8 +18789,6 @@ mod tests {
             app.is_user_action_in_flight(&UserActionKey::WorktreeCreate),
             "re-driven spawn_session must admit a WorktreeCreate action",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Esc (cancel_set_branch_dialog) must not mutate anything: the
@@ -18816,7 +18796,7 @@ mod tests {
     /// on disk is untouched, and there is no lingering dialog state.
     #[test]
     fn cancel_set_branch_dialog_leaves_item_unchanged() {
-        let (mut app, wi_id, dir) = app_with_branchless_backlog_item("cancel");
+        let (mut app, wi_id, _tmp) = app_with_branchless_backlog_item("cancel");
 
         app.advance_stage();
         assert!(app.set_branch_dialog.is_some());
@@ -18827,8 +18807,6 @@ mod tests {
         let wi = app.work_items.iter().find(|w| w.id == wi_id).unwrap();
         assert_eq!(wi.status, WorkItemStatus::Backlog);
         assert!(wi.repo_associations[0].branch.is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// spawn_session on a branchless Planning item opens the dialog
@@ -18838,8 +18816,8 @@ mod tests {
     fn spawn_session_on_branchless_item_opens_dialog_instead_of_message() {
         use crate::work_item_backend::{CreateWorkItem, LocalFileBackend, RepoAssociationRecord};
 
-        let dir = std::env::temp_dir().join("workbridge-test-branchless-spawn-msg");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
         let record = backend
             .create(CreateWorkItem {
@@ -18873,8 +18851,6 @@ mod tests {
             !msg.contains("Set a branch name"),
             "old dead-end status message should be gone, got: {msg}",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Session lookup requires matching stage in composite key.
@@ -19070,12 +19046,12 @@ mod tests {
             agent_written_files: Vec::new(),
         });
 
-        // Pre-populate a real temp file as the MCP config path so we can
-        // verify teardown actually deletes the file from disk.
-        let temp_path = std::env::temp_dir().join(format!(
-            "workbridge-teardown-test-{}.json",
-            std::process::id()
-        ));
+        // Pre-populate a real temp file as the MCP config path so we
+        // can verify teardown actually deletes the file from disk. Use
+        // a collision-free unique name under tempfile's tempdir so
+        // parallel test threads cannot race on a shared path.
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let temp_path = _tmp.path().join("workbridge-teardown-test.json");
         std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
         assert!(temp_path.exists(), "precondition: temp file exists");
         app.global_mcp_config_path = Some(temp_path.clone());
@@ -19191,16 +19167,12 @@ mod tests {
 
         // Create two real tempfiles that mimic the side-car files
         // the worker would have written by the time the user
-        // cancels.
-        let temp_dir = std::env::temp_dir();
-        let mcp_config_path = temp_dir.join(format!(
-            "workbridge-cancel-test-mcp-{}.json",
-            uuid::Uuid::new_v4()
-        ));
-        let side_car_path = temp_dir.join(format!(
-            "workbridge-cancel-test-sidecar-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        // cancels. Use tempfile's unique-name tempdir so parallel
+        // test threads cannot collide on a shared fixed path.
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let tmp_root = _tmp.path();
+        let mcp_config_path = tmp_root.join("workbridge-cancel-test-mcp.json");
+        let side_car_path = tmp_root.join("workbridge-cancel-test-sidecar.json");
         std::fs::write(&mcp_config_path, b"{}").expect("create mcp_config tempfile");
         std::fs::write(&side_car_path, b"{}").expect("create side-car tempfile");
 
@@ -19318,10 +19290,8 @@ mod tests {
             agent_written_files: Vec::new(),
         });
 
-        let temp_path = std::env::temp_dir().join(format!(
-            "workbridge-toggle-close-test-{}.json",
-            std::process::id()
-        ));
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let temp_path = _tmp.path().join("workbridge-toggle-close-test.json");
         std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
         app.global_mcp_config_path = Some(temp_path.clone());
         app.pending_global_pty_bytes.extend_from_slice(b"leftover");
@@ -20445,8 +20415,8 @@ mod tests {
     fn collect_backfill_requests_returns_done_items_without_pr_identity() {
         use crate::work_item_backend::LocalFileBackend;
 
-        let dir = std::env::temp_dir().join("workbridge-test-backfill-collect");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         // Done item with branch but no pr_identity - should be returned.
@@ -20512,8 +20482,6 @@ mod tests {
             "no requests without github remote, got {}",
             requests.len()
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- Delete resource cleanup tests --
@@ -22518,8 +22486,8 @@ mod tests {
         // clobbered a pre-existing user-authored `.mcp.json` with
         // workbridge's own MCP config JSON. The fix is a pure
         // deletion of the write; MCP config keeps reaching Claude
-        // Code through the `--mcp-config <temp file under
-        // std::env::temp_dir()>` argv pair, which is workbridge-
+        // Code through the `--mcp-config <temp file under the
+        // process temp dir>` argv pair, which is workbridge-
         // owned and unaffected.
         //
         // This test pins both failure modes with a single assertion:
@@ -22546,12 +22514,13 @@ mod tests {
         // leave a claude subprocess running past this test.
         //
         // The happy path also writes a `workbridge-mcp-config-<uuid>
-        // .json` temp file under `std::env::temp_dir()`. The UUID
-        // makes its exact path unpredictable, so we diff-snapshot the
-        // temp directory before and after the call and delete any
-        // newly-created workbridge MCP config file. This keeps the
-        // test hermetic under invariant 9 (no leaking temp state
-        // across runs).
+        // .json` temp file under the process temp dir (reached via
+        // the side_effects::paths::temp_dir gate). The UUID makes its
+        // exact path unpredictable, so we diff-snapshot the temp
+        // directory before and after the call and delete any newly-
+        // created workbridge MCP config file. This keeps the test
+        // hermetic under invariant 9 (no leaking temp state across
+        // runs).
         const SENTINEL: &[u8] = b"SENTINEL_PRE_EXISTING_USER_MCP_JSON_MUST_NOT_BE_OVERWRITTEN";
 
         let backend = Arc::new(CountingPlanBackend::default());
@@ -22575,12 +22544,12 @@ mod tests {
         // case, which was the original bug's worse failure mode.
         std::fs::write(&mcp_json_path, SENTINEL).expect("seed sentinel .mcp.json into tempdir");
 
-        // Snapshot workbridge-owned temp MCP config files in
-        // `std::env::temp_dir()` so we can identify and remove the
-        // one `finish_session_open`'s happy path is about to write.
+        // Snapshot workbridge-owned temp MCP config files in the
+        // process temp dir so we can identify and remove the one
+        // `finish_session_open`'s happy path is about to write.
         let list_temp_mcp_configs = || -> std::collections::HashSet<PathBuf> {
             let mut out = std::collections::HashSet::new();
-            if let Ok(read_dir) = std::fs::read_dir(std::env::temp_dir()) {
+            if let Ok(read_dir) = std::fs::read_dir(crate::side_effects::paths::temp_dir()) {
                 for entry in read_dir.flatten() {
                     let name = entry.file_name();
                     let Some(name_str) = name.to_str() else {
@@ -22688,12 +22657,12 @@ mod tests {
              `.mcp.json`. This violates the CLAUDE.md 'file injection' \
              review rule (commit acafae8). MCP config is delivered \
              exclusively via `--mcp-config <tempfile>` under \
-             `std::env::temp_dir()`; see `finish_session_open` and \
+             the process temp dir; see `finish_session_open` and \
              the C4 clause in docs/harness-contract.md."
         );
 
         // Clean up any `workbridge-mcp-config-*.json` the happy path
-        // wrote under `std::env::temp_dir()`. Anything in the after-
+        // wrote under the process temp dir. Anything in the after-
         // snapshot that wasn't in the before-snapshot is ours and
         // safe to delete; leaving them accumulates state across runs.
         let after_temp_mcp_configs = list_temp_mcp_configs();
@@ -24643,8 +24612,8 @@ mod tests {
             ActivityEntry, CreateWorkItem, LocalFileBackend, RepoAssociationRecord, WorkItemBackend,
         };
 
-        let dir = std::env::temp_dir().join("workbridge-test-orphan-activity-log");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         let backend =
             LocalFileBackend::with_dir(dir.clone()).expect("backend must be constructable");
 
@@ -24729,8 +24698,6 @@ mod tests {
              exists to avoid",
         );
         let _ = std::fs::remove_file(&active_path);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Default trait impl: backends that do NOT explicitly override

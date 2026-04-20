@@ -484,11 +484,14 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("workbridge-test-metrics-{name}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Allocate a fresh tempdir for a test. Returns both the `TempDir`
+    /// guard (which removes the directory on drop) and a concrete
+    /// `PathBuf` for ergonomic use. The `_name` argument is retained for
+    /// call-site self-documentation.
+    fn temp_dir(_name: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        (tmp, dir)
     }
 
     fn write_activity(dir: &Path, id: &str, lines: &[&str]) {
@@ -518,19 +521,18 @@ mod tests {
 
     #[test]
     fn empty_directory_yields_empty_snapshot() {
-        let dir = temp_dir("empty");
+        let (_tmp, dir) = temp_dir("empty");
         let snap = aggregate_from_activity_logs(&dir);
         assert!(snap.created_per_day.is_empty());
         assert!(snap.done_per_day.is_empty());
         assert!(snap.prs_merged_per_day.is_empty());
         assert!(snap.cycle_times_secs.is_empty());
         assert!(snap.stuck_items.is_empty());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn single_item_backlog_to_done_cycle_time() {
-        let dir = temp_dir("cycle-time");
+        let (_tmp, dir) = temp_dir("cycle-time");
         // Item created at day 0, moved to Done at day 5 (5 * 86400 secs).
         let t0: i64 = 1_700_000_000;
         let t5 = t0 + 5 * 86_400;
@@ -547,12 +549,11 @@ mod tests {
         assert_eq!(snap.cycle_times_secs[0], 5 * 86_400);
         assert_eq!(snap.done_per_day[&secs_to_day(t5)], 1);
         assert_eq!(snap.created_per_day[&secs_to_day(t0)], 1);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn pr_merged_counted_independently_of_done() {
-        let dir = temp_dir("pr-merged-drift");
+        let (_tmp, dir) = temp_dir("pr-merged-drift");
         let t0: i64 = 1_700_000_000;
         // pr_merged on day 1 but no Done transition - this is the "drift"
         // case the Dashboard is designed to surface.
@@ -563,12 +564,11 @@ mod tests {
         let snap = aggregate_from_activity_logs(&dir);
         assert_eq!(snap.prs_merged_per_day[&secs_to_day(t0)], 1);
         assert!(snap.done_per_day.is_empty());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn stuck_review_item_detected() {
-        let dir = temp_dir("stuck-review");
+        let (_tmp, dir) = temp_dir("stuck-review");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -588,12 +588,11 @@ mod tests {
         assert_eq!(snap.stuck_items[0].wi_id, "stuck");
         assert_eq!(snap.stuck_items[0].status, WorkItemStatus::Review);
         assert!(snap.stuck_items[0].stuck_for_secs > STUCK_REVIEW_SECS);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn fresh_review_item_is_not_stuck() {
-        let dir = temp_dir("fresh-review");
+        let (_tmp, dir) = temp_dir("fresh-review");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -610,7 +609,6 @@ mod tests {
 
         let snap = aggregate_from_activity_logs(&dir);
         assert!(snap.stuck_items.is_empty());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -623,7 +621,7 @@ mod tests {
         // show up in the Dashboard's stuck_items list. The JSON is the
         // source of truth for liveness; an orphan top-level log is
         // classified as `Provenance::Archived`.
-        let dir = temp_dir("orphan-not-stuck");
+        let (_tmp, dir) = temp_dir("orphan-not-stuck");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -649,7 +647,6 @@ mod tests {
         // created and transitioned through backlog, so those per-day
         // counts must be populated.
         assert_eq!(snap.created_per_day.values().sum::<u32>(), 1);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -660,7 +657,7 @@ mod tests {
         // Without the JSON-liveness check, the aggregator would treat
         // the item as currently in Backlog and add it to every day
         // from its entry through now, inflating current-backlog KPIs.
-        let dir = temp_dir("orphan-not-backlogged");
+        let (_tmp, dir) = temp_dir("orphan-not-backlogged");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -686,12 +683,11 @@ mod tests {
                 "day {d} must not count the orphan top-level log (d_enter={d_enter}, today={today_d})"
             );
         }
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn backlog_reconstruction_tracks_membership() {
-        let dir = temp_dir("backlog-reconstruction");
+        let (_tmp, dir) = temp_dir("backlog-reconstruction");
         // Anchor the test to 10 days ago at 01:00 UTC so the timestamps
         // fall inside the aggregator's rolling 365-day window and are
         // offset from day boundaries (avoids alignment edge cases).
@@ -721,12 +717,11 @@ mod tests {
         assert_eq!(snap.backlog_size_per_day.get(&d0).copied(), Some(1));
         assert_eq!(snap.backlog_size_per_day.get(&d1).copied(), Some(1));
         assert_eq!(snap.backlog_size_per_day.get(&d2).copied(), Some(0));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn archived_logs_contribute_to_snapshot() {
-        let dir = temp_dir("reads-archive");
+        let (_tmp, dir) = temp_dir("reads-archive");
         let archive = dir.join("archive");
         fs::create_dir_all(&archive).unwrap();
         let t0: i64 = 1_700_000_000;
@@ -751,7 +746,6 @@ mod tests {
         assert!(snap.cycle_times_secs.contains(&(3 * 86_400)));
         assert_eq!(snap.done_per_day[&secs_to_day(t0 + 86_400)], 1);
         assert_eq!(snap.done_per_day[&secs_to_day(t_archived + 3 * 86_400)], 1);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -760,7 +754,7 @@ mod tests {
         // as stuck - it no longer exists on disk. Historical events for
         // the same item still contribute to flow metrics, but point-in-
         // time metrics like stuck_items restrict to live items only.
-        let dir = temp_dir("archived-review-not-stuck");
+        let (_tmp, dir) = temp_dir("archived-review-not-stuck");
         let archive = dir.join("archive");
         fs::create_dir_all(&archive).unwrap();
 
@@ -786,7 +780,6 @@ mod tests {
             "archived items must never appear in stuck_items, got: {:?}",
             snap.stuck_items
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -796,7 +789,7 @@ mod tests {
         // through now. The archive timestamp closes its open backlog
         // interval; days strictly after the archive must not include
         // this item.
-        let dir = temp_dir("archived-backlog-not-forever");
+        let (_tmp, dir) = temp_dir("archived-backlog-not-forever");
         let archive = dir.join("archive");
         fs::create_dir_all(&archive).unwrap();
 
@@ -825,12 +818,11 @@ mod tests {
                 "day {d} must not count the archived-in-backlog item (d_enter={d_enter}, today={today_d})"
             );
         }
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn corrupt_lines_are_skipped() {
-        let dir = temp_dir("corrupt");
+        let (_tmp, dir) = temp_dir("corrupt");
         let path = dir.join("activity-corrupt.jsonl");
         fs::write(
             &path,
@@ -843,19 +835,17 @@ mod tests {
         let snap = aggregate_from_activity_logs(&dir);
         // Only the middle line is valid; aggregator must not panic.
         assert_eq!(snap.created_per_day.values().sum::<u32>(), 1);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn files_without_activity_prefix_are_ignored() {
-        let dir = temp_dir("prefix-filter");
+        let (_tmp, dir) = temp_dir("prefix-filter");
         // A work item JSON and an unrelated file should not be treated as logs.
         fs::write(dir.join("some-item.json"), "{}").unwrap();
         fs::write(dir.join("notes.txt"), "hello").unwrap();
 
         let snap = aggregate_from_activity_logs(&dir);
         assert!(snap.created_per_day.is_empty());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -869,7 +859,7 @@ mod tests {
         // `eod = (day + 1) * SECS_PER_DAY - 1` so the reference
         // instant is the literal last second of `day` and half-open
         // interval membership is correct on both sides.
-        let dir = temp_dir("backlog-boundary");
+        let (_tmp, dir) = temp_dir("backlog-boundary");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -925,8 +915,6 @@ mod tests {
             Some(1),
             "day D+1 must count only item A, not the midnight-exiting item B"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -944,7 +932,7 @@ mod tests {
             CreateWorkItem, LocalFileBackend, RepoAssociationRecord, WorkItemBackend,
         };
 
-        let dir = temp_dir("fresh-backlog-visible");
+        let (_tmp, dir) = temp_dir("fresh-backlog-visible");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
         backend
             .create(CreateWorkItem {
@@ -985,8 +973,6 @@ mod tests {
         // Stuck_items uses Backlog-is-not-stuck semantics - a fresh
         // Backlog item is not stuck regardless of its dwell time.
         assert!(snap.stuck_items.is_empty());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1002,7 +988,7 @@ mod tests {
             CreateWorkItem, LocalFileBackend, RepoAssociationRecord, WorkItemBackend,
         };
 
-        let dir = temp_dir("fresh-planning-visible");
+        let (_tmp, dir) = temp_dir("fresh-planning-visible");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
         backend
             .create(CreateWorkItem {
@@ -1031,7 +1017,5 @@ mod tests {
             Some(0),
             "Planning item must not inflate current backlog"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }

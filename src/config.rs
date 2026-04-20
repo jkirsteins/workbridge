@@ -630,9 +630,8 @@ mod tests {
 
     #[test]
     fn save_and_load_roundtrip() {
-        let dir = std::env::temp_dir().join("workbridge-test-config");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         let path = dir.join("config.toml");
 
         let config = Config {
@@ -647,14 +646,12 @@ mod tests {
         let loaded: Config = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.base_dirs, vec!["~/Projects"]);
         assert_eq!(loaded.repos, vec!["~/Forks/repo"]);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn discover_repos_finds_git_dirs() {
-        let dir = std::env::temp_dir().join("workbridge-test-discover");
-        let _ = fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         fs::create_dir_all(dir.join("repo-a/.git")).unwrap();
         fs::create_dir_all(dir.join("repo-b/.git")).unwrap();
         fs::create_dir_all(dir.join("not-a-repo")).unwrap();
@@ -663,20 +660,15 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert!(found.iter().any(|p| p.ends_with("repo-a")));
         assert!(found.iter().any(|p| p.ends_with("repo-b")));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn discover_repos_empty_dir() {
-        let dir = std::env::temp_dir().join("workbridge-test-empty");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
 
         let found = discover_git_repos_in(&dir);
         assert!(found.is_empty());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -687,35 +679,30 @@ mod tests {
 
     #[test]
     fn add_repo_validates_git_dir() {
-        let dir = std::env::temp_dir().join("workbridge-test-add-repo");
-        let _ = fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         fs::create_dir_all(dir.join(".git")).unwrap();
 
         let mut config = Config::default();
         let result = config.add_repo(dir.to_str().unwrap());
         assert!(result.is_ok());
         assert_eq!(config.repos.len(), 1);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn add_repo_rejects_non_repo() {
-        let dir = std::env::temp_dir().join("workbridge-test-add-fail");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
 
         let mut config = Config::default();
         let result = config.add_repo(dir.to_str().unwrap());
         assert!(result.is_err());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn add_base_dir_accepts_directory() {
-        let dir = std::env::temp_dir().join("workbridge-test-add-base");
-        let _ = fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         fs::create_dir_all(dir.join("child-repo/.git")).unwrap();
 
         let mut config = Config::default();
@@ -725,8 +712,6 @@ mod tests {
         assert_eq!(config.base_dirs.len(), 1);
         let (_, count) = result.unwrap();
         assert_eq!(count, 1);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -903,8 +888,8 @@ mod tests {
 
     #[test]
     fn remove_path_removes_repo() {
-        let dir = std::env::temp_dir().join("workbridge-test-remove");
-        let _ = fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         fs::create_dir_all(dir.join(".git")).unwrap();
 
         let mut config = Config::default();
@@ -914,7 +899,5 @@ mod tests {
         let removed = config.remove_path(dir.to_str().unwrap());
         assert!(removed);
         assert!(config.repos.is_empty());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -6478,9 +6478,12 @@ mod snapshot_tests {
     fn settings_overlay_with_config() {
         use crate::config::Config;
 
-        // Use /tmp (not std::env::temp_dir()) so rendered paths are
-        // deterministic across machines. macOS temp_dir() returns
-        // /var/folders/... which differs per user.
+        // Use a fixed `/tmp/...` path (not a tempfile::tempdir()
+        // subdir) so the snapshot's rendered base-dir string is
+        // deterministic across machines. macOS tempdir roots resolve
+        // to `/var/folders/...` which differs per user; this test
+        // asserts on the rendered bytes verbatim, so the input path
+        // must be stable.
         let base = std::path::PathBuf::from("/tmp/workbridge-test-settings-overlay");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("discovered-a/.git")).unwrap();
