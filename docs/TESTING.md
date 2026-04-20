@@ -50,7 +50,9 @@ Tests must not leave side effects on the host system. This includes:
 - Writing raw terminal escape sequences to stdout / stderr outside
   `src/side_effects/`
 - Reading wall-clock time or sleeping via `Instant::now`, `SystemTime::now`,
-  `thread::sleep`, or `std::thread::sleep` outside `src/side_effects/clock.rs`
+  `thread::sleep`, `std::thread::sleep`, `Instant::elapsed()`,
+  `Receiver::recv_timeout` / `recv_deadline`, `Condvar::wait_timeout(_while)`,
+  or `Thread::park_timeout` outside `src/side_effects/clock.rs`
 - Using notification, audio, or visual system APIs
 
 ## Side-effect gating module
@@ -90,9 +92,41 @@ for real time to pass. The mock `SystemTime` starts at
 `UNIX_EPOCH + 1_700_000_000s`, so ordinary subtraction in tests has room
 before the Unix epoch.
 
+The mock clock is **per-OS-thread**, not process-global: both the
+synthetic-time offset and the sleep-safety counter live in
+`thread_local! { Cell<u64> }` storage. `cargo test`'s default libtest
+harness spawns a fresh OS thread per test, so each test observes its
+own mock clock starting at offset zero - two parallel tests cannot
+advance each other's clock, and cannot trip each other's safety cap.
+This keeps the "deterministic mock clock" contract true under
+`cargo test` default parallelism. Thread-local values persist for the
+lifetime of their thread; if a future test harness reuses OS threads
+across tests, each test still observes a monotonic clock but offsets
+accumulate. That matches the libtest default today.
+
+In addition to the `Instant::now` / `SystemTime::now` / `thread::sleep`
+wrappers, tests must NOT read the wall-clock via:
+
+- `Instant::elapsed()` - this expands to `Instant::now() - *self` and
+  silently falls back to the real clock even when `self` was captured
+  via the mock `instant_now()` wrapper. Use
+  `crate::side_effects::clock::elapsed_since(start)` instead, which
+  diffs against the mock clock in tests and the real clock in
+  production.
+- `Receiver::recv_timeout`, `Receiver::recv_deadline`,
+  `Condvar::wait_timeout(_while)`, `Thread::park_timeout` - these
+  stdlib bounded-wait APIs internally read the monotonic clock via
+  `Condvar::wait_timeout`. Tests that need a bounded receive must
+  use a `try_recv` polling loop with `clock::sleep()` between
+  attempts; see `src/fetcher.rs::recv_message` and
+  `src/app.rs::tests::test_recv_bounded` for the canonical pattern.
+
 The pre-commit hook rejects staged Rust files outside `src/side_effects/`
-that call the standard-library wall-clock APIs directly. If a test needs
-to move time forward without going through a sleep path, call
+that call any of these APIs directly (`.elapsed(`, `recv_timeout(`,
+`recv_deadline(`, `wait_timeout(`, `park_timeout(` are all on the
+forbidden list alongside `Instant::now`, `SystemTime::now`, and
+`thread::sleep`). If a test needs to move time forward without going
+through a sleep path, call
 `crate::side_effects::clock::advance_mock_clock()` from test-only code.
 
 If you genuinely need a new host-visible side effect (for example, a

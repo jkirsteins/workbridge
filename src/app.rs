@@ -13074,6 +13074,41 @@ mod tests {
         }
     }
 
+    /// Wall-clock-free analogue of the stdlib bounded-wait receive
+    /// APIs (the `recv_timeout` family). Bounded `try_recv` +
+    /// `clock::sleep(1ms)` polling loop with a ~6000-iteration cap
+    /// (matching `src/fetcher.rs::recv_message`).
+    ///
+    /// The stdlib bounded-wait APIs are forbidden in tests because
+    /// they internally read the real monotonic clock via
+    /// `Condvar::wait_timeout` - that violates the "tests never
+    /// read wall-clock time" rule enforced by `hooks/pre-commit`
+    /// and documented in `docs/TESTING.md` "Wall-clock in tests".
+    /// The mock-clock `sleep` is pure `yield_now` in tests, so
+    /// 6000 iterations gives the background thread ample real-time
+    /// opportunity to deliver a message while the mock clock
+    /// advances deterministically. A true livelock still trips the
+    /// safety cap inside `clock::sleep` itself.
+    ///
+    /// Panics if the channel disconnects before a message arrives,
+    /// or if the iteration budget is exhausted - same contract as
+    /// the replaced `.expect("...")` call on the bounded-wait
+    /// receive: caller sites treated both cases as fatal.
+    fn test_recv_bounded<T>(rx: &crossbeam_channel::Receiver<T>, context: &str) -> T {
+        for _ in 0..6_000 {
+            match rx.try_recv() {
+                Ok(msg) => return msg,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    crate::side_effects::clock::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    panic!("{context}: channel disconnected before delivering a message");
+                }
+            }
+        }
+        panic!("{context}: channel did not deliver a message within the mock-clock budget");
+    }
+
     // -- F-1 regression test --
 
     #[test]
@@ -22531,10 +22566,10 @@ mod tests {
         // (the background thread actually ran the read).
         drop(gate);
         let entry = app.session_open_rx.remove(&wi_id).unwrap();
-        let result = entry
-            .rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("background plan-read thread must deliver a result");
+        let result = test_recv_bounded(
+            &entry.rx,
+            "background plan-read thread must deliver a result",
+        );
         assert_eq!(result.plan_text, "plan-text from counting backend");
         assert!(result.read_error.is_none());
         assert_eq!(
@@ -22670,17 +22705,15 @@ mod tests {
 
         // Enqueue the plan read on the background thread, then drain
         // the result the same way `poll_session_opens` does on the UI
-        // thread - manually, via `recv_timeout`, so the test is
-        // deterministic instead of sleep-polling.
+        // thread - manually, via a bounded `try_recv` loop (see
+        // `test_recv_bounded`), so the test is deterministic instead
+        // of sleep-polling AND does not read wall-clock time.
         app.begin_session_open(&wi_id, &cwd);
         let entry = app
             .session_open_rx
             .remove(&wi_id)
             .expect("begin_session_open must register a pending receiver");
-        let result = entry
-            .rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("background plan-read must deliver a result");
+        let result = test_recv_bounded(&entry.rx, "background plan-read must deliver a result");
         app.end_activity(entry.activity);
 
         // This is the function under test. The surfaced status
@@ -22960,10 +22993,10 @@ mod tests {
         // and end the spinner manually via the internal helper.
         // This mirrors what `poll_session_opens` does on success.
         let entry = app.session_open_rx.remove(&wi_id).unwrap();
-        let _result = entry
-            .rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("background plan-read thread must deliver a result");
+        let _result = test_recv_bounded(
+            &entry.rx,
+            "background plan-read thread must deliver a result",
+        );
         app.end_activity(entry.activity);
 
         assert!(

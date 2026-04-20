@@ -532,7 +532,7 @@ pub fn app_event(
                         return Ok(Control::Quit);
                     }
                     if let Some(started) = state.shutdown_started {
-                        let elapsed = started.elapsed();
+                        let elapsed = crate::side_effects::clock::elapsed_since(started);
                         if elapsed >= Duration::from_secs(10) {
                             state.force_kill_all();
                             return Ok(Control::Quit);

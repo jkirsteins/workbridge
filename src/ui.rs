@@ -6515,14 +6515,55 @@ mod snapshot_tests {
         // canonical form.
         //
         // Pass 1: replace any tempdir-rooted path with `<TMPDIR>`.
+        // The prefix is DERIVED from `tmp.path()` rather than
+        // hard-coded to `/var/folders/.../tmp/.tmp...`, so the
+        // redaction is host-agnostic: a CI or dev environment with
+        // `TMPDIR=$HOME/scratch` (or any other exotic temp root)
+        // normalizes identically.
+        //
+        // The rendered Settings overlay truncates long paths to fit
+        // the panel width, so the verbatim `tmp.path()` string does
+        // NOT always appear in the output - the UI lops off the
+        // tail at an arbitrary character boundary. To match both
+        // the full path and every truncated form, we construct the
+        // regex as the first path component (`/var` or `/tmp` or
+        // `/private` etc.) followed by the literal-escaped tail as
+        // a sequence of individually-optional characters, each one
+        // a greedy `?`-suffixed group. Any prefix-truncation of
+        // `tmp.path()` that appears in the rendered output is
+        // matched exactly once, starting at the tmp-root, and
+        // replaced with `<TMPDIR>`. `regex::escape` on each
+        // character guards against path metacharacters.
         // Pass 2: canonicalize runs of spaces between `<TMPDIR>` (or
         // a truncated prefix of it) and the next `│` border so the
         // variable-width trailing padding left behind by the
         // substitution is squashed to a single space. Both the
         // overlay-internal `│` borders and the outer-right `│` border
         // are normalized this way.
-        let path_re = regex::Regex::new(r"(?:/private)?/var/folders/[^\s│]+|/tmp/\.tmp[^\s│]+")
-            .expect("valid regex");
+        let tmp_str = tmp.path().display().to_string();
+        // Build a regex that matches any non-empty prefix of
+        // `tmp_str` of length >= `MIN_PREFIX` chars. We require a
+        // minimum prefix length so the regex does not accidentally
+        // match `/v` or `/t` against unrelated paths; a tmp path
+        // always has the form `/<root>/<randomized dir>` which is
+        // well beyond `MIN_PREFIX`. Each character after the minimum
+        // is an optional group, so the regex matches the longest
+        // prefix available at every site.
+        const MIN_PREFIX: usize = 6;
+        let chars: Vec<char> = tmp_str.chars().collect();
+        let (required, optional) = if chars.len() <= MIN_PREFIX {
+            (chars.as_slice(), &[] as &[char])
+        } else {
+            chars.split_at(MIN_PREFIX)
+        };
+        let mut pattern = String::new();
+        for c in required {
+            pattern.push_str(&regex::escape(&c.to_string()));
+        }
+        for c in optional {
+            pattern.push_str(&format!("(?:{})?", regex::escape(&c.to_string())));
+        }
+        let path_re = regex::Regex::new(&pattern).expect("valid regex");
         let redacted = path_re.replace_all(&raw_output, "<TMPDIR>").into_owned();
         // Collapse 2+ spaces preceding a `│` on any line that contains
         // `<TMPDIR>` so trailing padding is stable. Use multi-line

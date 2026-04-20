@@ -29,6 +29,38 @@ list_staged_rs_added_or_modified() {
         | awk '$1 != "D" { print $2 }'
 }
 
+# Check whether the staged content of a file matches the given
+# ERE. Returns 0 on match, 1 on no-match. Usage:
+#
+#     if staged_matches "$path" 'regex'; then ...
+#
+# We materialize the staged blob into a file and grep against that
+# file, rather than piping the content through `grep -q`, because
+# `grep -q` exits as soon as it finds a match, SIGPIPE-kills the
+# upstream `printf`/`git show`, and with `set -o pipefail` makes
+# the whole pipeline exit 141. Inside an `if` condition that 141
+# is treated as "false" - so matches in large staged files
+# (src/app.rs is ~1MB) near the top of the buffer silently went
+# undetected by the previous `printf '%s' "$content" | grep -q`
+# pattern. Materializing to a tempfile eliminates the pipe and
+# therefore the SIGPIPE race entirely; the tempfile is removed
+# via the parent script's EXIT trap.
+staged_matches() {
+    local path="$1" pattern="$2"
+    local tmp="${HOOK_STAGED_SCRATCH_DIR}/$(printf '%s' "$path" | tr '/' '_').blob"
+    if ! git show ":$path" >"$tmp" 2>/dev/null; then
+        return 1
+    fi
+    grep -qE -- "$pattern" "$tmp"
+}
+
+# Scratch directory for materialized staged blobs. Created once
+# and removed on EXIT so no hook run leaks files. `mktemp -d`
+# produces a process-unique path under `$TMPDIR` so parallel hook
+# runs (rare, but possible in some git workflows) do not collide.
+HOOK_STAGED_SCRATCH_DIR="$(mktemp -d -t workbridge-pre-commit-XXXXXX)"
+trap 'rm -rf "$HOOK_STAGED_SCRATCH_DIR"' EXIT
+
 echo "=== pre-commit: checking format ==="
 cargo fmt -- --check
 echo "Format OK."
@@ -41,9 +73,8 @@ echo "=== pre-commit: checking for bare Command::new(\"git\") ==="
 bare_git_files=""
 while IFS= read -r f; do
     [ -z "$f" ] && continue
-    content="$(staged_content "$f")"
-    if printf '%s' "$content" | grep -q 'Command::new("git")'; then
-        if ! printf '%s' "$content" | grep -q 'env_remove("GIT_DIR")\|git_command()'; then
+    if staged_matches "$f" 'Command::new\("git"\)'; then
+        if ! staged_matches "$f" 'env_remove\("GIT_DIR"\)|git_command\(\)'; then
             bare_git_files="$bare_git_files $f"
         fi
     fi
@@ -69,8 +100,7 @@ while IFS= read -r f; do
     if [ "$(basename "$f")" = "agent_backend.rs" ]; then
         continue
     fi
-    content="$(staged_content "$f")"
-    if printf '%s' "$content" | grep -qE 'Command::new\("(claude|codex)"'; then
+    if staged_matches "$f" 'Command::new\("(claude|codex)"'; then
         bare_agent_files="$bare_agent_files $f"
     fi
 done < <(list_staged_rs_added_or_modified)
@@ -106,6 +136,29 @@ echo "=== pre-commit: checking for bypasses of src/side_effects/ ==="
 # second OR branch; a bare `temp_dir()` that survives both has no
 # legitimate source and must be flagged.
 #
+# The regex also rejects wall-clock-reading patterns that sneak
+# past `Instant::now` / `SystemTime::now` / `thread::sleep`:
+#
+# - `.elapsed(` is short for `Instant::now() - *self` and leaks
+#   the real clock even when `self` was captured via the mock
+#   `instant_now()` wrapper. Use `crate::side_effects::clock::
+#   elapsed_since(start)` instead, which diffs against the mock
+#   clock in tests and against the real clock in production.
+# - `recv_timeout(`, `recv_deadline(`, `wait_timeout(`,
+#   `park_timeout(` all read the monotonic clock under the hood
+#   to bound a wait. Tests must use a bounded `try_recv` loop
+#   with `crate::side_effects::clock::sleep()` between polls -
+#   see `src/fetcher.rs::recv_message` and `app.rs::tests::
+#   test_recv_bounded` for the canonical pattern.
+#
+# `.duration_since(` is intentionally NOT in the forbidden list:
+# the codebase calls `SystemTime::duration_since(UNIX_EPOCH)` and
+# `Instant::saturating_duration_since(other)` in dozens of
+# legitimate places where both operands are already gated values.
+# Those calls do not read wall-clock time - the time was read
+# when the operand was captured. Adding `.duration_since(` would
+# produce too many false positives to be useful.
+#
 # See docs/superpowers/specs/2026-04-18-test-side-effects-audit-design.md
 # and the corresponding P0 rule in CLAUDE.md.
 bare_sideeffect_files=""
@@ -115,9 +168,7 @@ while IFS= read -r f; do
     case "$f" in
         src/side_effects/*) continue ;;
     esac
-    content="$(staged_content "$f")"
-    [ -z "$content" ] && continue
-    if printf '%s' "$content" | grep -qE 'arboard::|directories::(ProjectDirs|BaseDirs|UserDirs)|std::env::home_dir|std::env::temp_dir|Instant::now|SystemTime::now|thread::sleep|^[[:space:]]*use[[:space:]]+arboard(::|;|[[:space:]])|^[[:space:]]*use[[:space:]]+directories::(ProjectDirs|BaseDirs|UserDirs)|^[[:space:]]*use[[:space:]]+std::env::(temp_dir|home_dir)|^[[:space:]]*use[[:space:]]+std::time::(Instant|SystemTime)|^[[:space:]]*use[[:space:]]+std::thread::sleep|^[[:space:]]*use[[:space:]]+std::thread;'; then
+    if staged_matches "$f" 'arboard::|directories::(ProjectDirs|BaseDirs|UserDirs)|std::env::home_dir|std::env::temp_dir|Instant::now|SystemTime::now|thread::sleep|\.elapsed\(|recv_timeout\(|recv_deadline\(|wait_timeout\(|park_timeout\(|^[[:space:]]*use[[:space:]]+arboard(::|;|[[:space:]])|^[[:space:]]*use[[:space:]]+directories::(ProjectDirs|BaseDirs|UserDirs)|^[[:space:]]*use[[:space:]]+std::env::(temp_dir|home_dir)|^[[:space:]]*use[[:space:]]+std::time::(Instant|SystemTime)|^[[:space:]]*use[[:space:]]+std::thread::sleep|^[[:space:]]*use[[:space:]]+std::thread;'; then
         bare_sideeffect_files="$bare_sideeffect_files $f"
     fi
 done < <(list_staged_rs_added_or_modified)
@@ -128,9 +179,15 @@ if [ -n "$bare_sideeffect_files" ]; then
     echo "Host-visible APIs (arboard, directories::ProjectDirs/BaseDirs/UserDirs,"
     echo "std::env::home_dir, std::env::temp_dir, Instant::now, SystemTime::now,"
     echo "thread::sleep) must be reached through"
-    echo "crate::side_effects::{clipboard, clock, paths} or tempfile::tempdir(). Both"
-    echo "qualified references (e.g. 'std::env::temp_dir()') and 'use' imports"
-    echo "(e.g. 'use std::env::temp_dir;') are rejected. See:"
+    echo "crate::side_effects::{clipboard, clock, paths} or tempfile::tempdir()."
+    echo ""
+    echo "Wall-clock-reading patterns (.elapsed(), recv_timeout(),"
+    echo "recv_deadline(), wait_timeout(), park_timeout()) must be replaced"
+    echo "with crate::side_effects::clock::elapsed_since(...) or a bounded"
+    echo "try_recv + clock::sleep() polling loop."
+    echo ""
+    echo "Both qualified references (e.g. 'std::env::temp_dir()') and 'use'"
+    echo "imports (e.g. 'use std::env::temp_dir;') are rejected. See:"
     echo "  - docs/TESTING.md 'Side-effect gating module'"
     echo "  - src/side_effects/mod.rs"
     echo "  - CLAUDE.md 'Severity overrides' (P0 rule)"

@@ -2080,10 +2080,34 @@ mod tests {
             "Plan saved",
         );
 
-        // Check the channel received a SetPlan event.
-        let event = rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("should receive SetPlan event");
+        // Check the channel received a SetPlan event. Bounded
+        // try_recv + mock-clock sleep (1ms) loop instead of
+        // `recv_timeout` - the stdlib's `recv_timeout` / the
+        // crossbeam equivalent both read the real monotonic clock
+        // internally, which violates the "tests never read wall-
+        // clock time" rule enforced by the side-effects gate. The
+        // iteration cap (6000 * 1ms mock budget) matches the pattern
+        // in `src/fetcher.rs::recv_message` and is generous enough
+        // to absorb OS-scheduler jitter on loaded CI hosts because
+        // `clock::sleep` is pure `yield_now` in tests.
+        let event = {
+            let mut received: Option<McpEvent> = None;
+            for _ in 0..6_000 {
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        received = Some(msg);
+                        break;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        crate::side_effects::clock::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        panic!("MCP event channel disconnected before SetPlan event arrived");
+                    }
+                }
+            }
+            received.expect("should receive SetPlan event")
+        };
         match event {
             McpEvent::SetPlan { work_item_id, plan } => {
                 assert_eq!(work_item_id, "integration-wi");
