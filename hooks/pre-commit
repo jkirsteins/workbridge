@@ -196,3 +196,33 @@ if [ -n "$bare_sideeffect_files" ]; then
     exit 1
 fi
 echo "Side-effect gate check OK."
+
+echo "=== pre-commit: file-size budgets ==="
+./hooks/budget-check.sh
+
+echo "=== pre-commit: ratatui built-in preference (warn-only) ==="
+./hooks/ratatui-builtin-check.sh
+
+echo "=== pre-commit: typos (skipped if tool missing) ==="
+if command -v typos >/dev/null 2>&1; then
+    typos --config typos.toml
+    echo "typos OK."
+else
+    echo "typos not installed; skipping. Install with: cargo install typos-cli"
+fi
+
+echo "=== pre-commit: cargo-deny (skipped if tool missing) ==="
+if command -v cargo-deny >/dev/null 2>&1; then
+    cargo deny check advisories licenses bans sources
+    echo "cargo-deny OK."
+else
+    echo "cargo-deny not installed; skipping. Install with: cargo install cargo-deny"
+fi
+
+echo "=== pre-commit: cargo-machete (skipped if tool missing) ==="
+if command -v cargo-machete >/dev/null 2>&1; then
+    cargo machete
+    echo "cargo-machete OK."
+else
+    echo "cargo-machete not installed; skipping. Install with: cargo install cargo-machete"
+fi
