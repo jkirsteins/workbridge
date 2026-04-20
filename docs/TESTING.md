@@ -17,9 +17,25 @@ equivalent mock) for config persistence. The convenience constructors
 
 ## Use temp directories for filesystem operations
 
-Tests that need real directories on disk (e.g. to test git repo discovery)
-must create them under `std::env::temp_dir()` and clean up after themselves.
-Never use hard-coded paths that could collide with real user data.
+Tests that need real directories on disk must use `tempfile::tempdir()`.
+The returned `TempDir` binds the directory to a unique path and removes
+it on drop, so parallel test threads cannot collide and `/tmp` does not
+accumulate predictable `workbridge-test-*` directories between runs.
+
+Pattern:
+
+```rust
+let _tmp = tempfile::tempdir().expect("tempdir");
+let dir = _tmp.path().to_path_buf();
+// ... test body uses `dir` ...
+// _tmp is dropped at end of scope and removes the directory
+```
+
+Do NOT use `std::env::temp_dir().join("fixed-name")`. The pre-commit
+hook rejects bare `std::env::temp_dir` outside `src/side_effects/`.
+UUID-suffixed names (`std::env::temp_dir().join(format!("...{}", Uuid::new_v4()))`)
+are technically collision-safe but still pollute `/tmp`; prefer
+`tempfile::tempdir()` for uniformity.
 
 ## No host system side effects
 
@@ -29,6 +45,51 @@ Tests must not leave side effects on the host system. This includes:
 - Creating persistent files outside of temp directories
 - Modifying environment variables without restoring them
 - Spawning processes that outlive the test
+- Writing to the system clipboard (via `arboard`, OSC 52, `NSPasteboard`,
+  or any other path)
+- Writing raw terminal escape sequences to stdout / stderr outside
+  `src/side_effects/`
+- Using notification, audio, or visual system APIs
+
+## Side-effect gating module
+
+All code paths that reach the host system outside `std::env::temp_dir()`
+live in `src/side_effects/`. That module is the ONLY place in the crate
+allowed to call `arboard::`, `directories::ProjectDirs` / `BaseDirs` /
+`UserDirs`, `std::env::home_dir`, `std::env::temp_dir`, or write raw
+terminal escape sequences (such as OSC 52) to stdout.
+
+Under `#[cfg(test)]` every gated wrapper in `side_effects::` returns a
+no-op (`copy` returns `false`) or `None` (`paths::project_dirs`,
+`paths::home_dir`). That maps cleanly to existing error branches
+(`ConfigError::NoConfigDir`, `BackendError::Io("could not determine
+data directory")`) that tests already exercise through
+`InMemoryConfigProvider` and `LocalFileBackend::with_dir`.
+
+The pre-commit hook (`hooks/pre-commit`) enforces the boundary
+structurally: a staged `.rs` file outside `src/side_effects/` that
+references any of the gated symbols is rejected at commit time. See
+the P0 rule in `CLAUDE.md` "Severity overrides" for the review policy.
+
+If you genuinely need a new host-visible side effect (for example, a
+new notification API), the add path is:
+
+1. Add the call inside `src/side_effects/` behind `#[cfg(not(test))]`,
+   returning a no-op / `None` / `false` under `cfg(test)`.
+2. Expose a narrow wrapper from `side_effects::` and route callers
+   through it.
+3. Update `docs/TESTING.md` (this file) and the pre-commit hook's
+   grep pattern if the new API uses a new symbol name.
+
+Pre-authorized bounded exceptions that live outside the module and are
+documented here rather than routed through the gate:
+
+- `src/session.rs` spawns short-lived `sleep 60` / `sleep 0` child
+  processes for PTY lifecycle smoke tests. These subprocesses are
+  reaped by the test itself and do not outlive it.
+- `src/mcp.rs` binds a UUID-suffixed Unix socket under the process temp
+  dir for the socket-server smoke test. The UUID makes the path
+  collision-free and the socket is unlinked during test teardown.
 
 ## Never use `git config` in tests
 
