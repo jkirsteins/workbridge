@@ -350,27 +350,12 @@ mod tests {
     /// asserting that any preceding messages are FetchStarted.
     fn recv_data(rx: &mpsc::Receiver<FetchMessage>) -> FetchMessage {
         loop {
-            let msg = recv_message(rx);
+            let msg = crate::side_effects::clock::bounded_recv(rx, "fetcher recv_data");
             match msg {
                 FetchMessage::FetchStarted => continue,
                 other => return other,
             }
         }
-    }
-
-    fn recv_message(rx: &mpsc::Receiver<FetchMessage>) -> FetchMessage {
-        for _ in 0..1_000 {
-            match rx.try_recv() {
-                Ok(msg) => return msg,
-                Err(mpsc::TryRecvError::Empty) => {
-                    crate::side_effects::clock::sleep(Duration::from_millis(1));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    panic!("fetcher channel disconnected before sending a message");
-                }
-            }
-        }
-        panic!("fetcher did not send a message");
     }
 
     #[test]
@@ -389,14 +374,14 @@ mod tests {
         );
 
         // First message must be FetchStarted.
-        let first = recv_message(&rx);
+        let first = crate::side_effects::clock::bounded_recv(&rx, "fetcher first-message waiter");
         assert!(
             matches!(first, FetchMessage::FetchStarted),
             "first message should be FetchStarted, got RepoData/FetcherError",
         );
 
         // Second message should be RepoData.
-        let second = recv_message(&rx);
+        let second = crate::side_effects::clock::bounded_recv(&rx, "fetcher second-message waiter");
         assert!(
             matches!(second, FetchMessage::RepoData(_)),
             "second message should be RepoData",

@@ -141,6 +141,95 @@ fn add_duration_to_mock_offset(dur: Duration) {
     });
 }
 
+// Wall-clock-free bounded-receive helper for tests.
+// ================================================================
+// `bounded_recv` is the canonical replacement for the stdlib
+// bounded-wait receive APIs (`Receiver::recv_timeout`,
+// `Receiver::recv_deadline`, `Condvar::wait_timeout(_while)`,
+// `Thread::park_timeout`), which internally read the real monotonic
+// clock via `Condvar::wait_timeout` and are therefore forbidden by
+// the wall-clock gate (see `docs/TESTING.md` "Wall-clock in tests"
+// and the `hooks/pre-commit` side-effect check).
+//
+// The helper is channel-type-agnostic via the `PollableReceiver`
+// trait; impls are provided for `std::sync::mpsc::Receiver` and
+// `crossbeam_channel::Receiver`. Adding a new channel kind only
+// requires another trait impl - the polling body stays here.
+//
+// Historical note: this module previously shipped without the
+// helper, and three near-identical bounded-poll loops accreted in
+// `src/fetcher.rs`, `src/app.rs::tests`, and `src/mcp.rs`. They
+// drifted on iteration budget (1000 vs 6000) and on panic-message
+// phrasing before being consolidated here.
+
+#[cfg(test)]
+pub(crate) enum TryRecv<T> {
+    Ready(T),
+    Empty,
+    Disconnected,
+}
+
+#[cfg(test)]
+pub(crate) trait PollableReceiver {
+    type Item;
+    fn poll_once(&self) -> TryRecv<Self::Item>;
+}
+
+#[cfg(test)]
+impl<T> PollableReceiver for std::sync::mpsc::Receiver<T> {
+    type Item = T;
+    fn poll_once(&self) -> TryRecv<T> {
+        match self.try_recv() {
+            Ok(v) => TryRecv::Ready(v),
+            Err(std::sync::mpsc::TryRecvError::Empty) => TryRecv::Empty,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => TryRecv::Disconnected,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<T> PollableReceiver for crossbeam_channel::Receiver<T> {
+    type Item = T;
+    fn poll_once(&self) -> TryRecv<T> {
+        match self.try_recv() {
+            Ok(v) => TryRecv::Ready(v),
+            Err(crossbeam_channel::TryRecvError::Empty) => TryRecv::Empty,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => TryRecv::Disconnected,
+        }
+    }
+}
+
+/// Bounded `try_recv` polling loop for tests. Wall-clock-free
+/// replacement for the stdlib `recv_timeout` family.
+///
+/// Polls `rx` up to `BUDGET` times with a 1ms mock-clock `sleep`
+/// between polls. The mock-clock `sleep` is pure `yield_now` in
+/// tests, so producer threads get ample real-time opportunity to
+/// deliver a message while the mock clock advances deterministically.
+/// A true livelock still trips the per-thread safety cap inside
+/// `sleep` itself.
+///
+/// Works with both `std::sync::mpsc::Receiver` and
+/// `crossbeam_channel::Receiver` via the `PollableReceiver` trait.
+///
+/// Panics with the provided `context` string if the channel
+/// disconnects before delivering a message, or if the iteration
+/// budget is exhausted.
+#[cfg(test)]
+pub(crate) fn bounded_recv<R: PollableReceiver>(rx: &R, context: &str) -> R::Item {
+    const BUDGET: usize = 6_000;
+    for _ in 0..BUDGET {
+        match rx.poll_once() {
+            TryRecv::Ready(v) => return v,
+            TryRecv::Empty => sleep(Duration::from_millis(1)),
+            TryRecv::Disconnected => {
+                panic!("{context}: channel disconnected before delivering a message");
+            }
+        }
+    }
+    panic!("{context}: channel did not deliver a message within {BUDGET} mock-clock iterations");
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -199,6 +288,33 @@ mod tests {
             super::elapsed_since(start) >= Duration::from_secs(5),
             "elapsed_since must reflect mock-clock advance, not real-time elapsed"
         );
+    }
+
+    #[test]
+    fn bounded_recv_returns_value_on_ready_channel() {
+        // Sanity: if the channel already has a value, the helper
+        // returns it on the first poll without burning the budget.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(42_u32).unwrap();
+        assert_eq!(super::bounded_recv(&rx, "ready-mpsc"), 42);
+
+        let (ctx, crx) = crossbeam_channel::unbounded();
+        ctx.send("hi".to_string()).unwrap();
+        assert_eq!(
+            super::bounded_recv(&crx, "ready-crossbeam"),
+            "hi".to_string()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "disconnected")]
+    fn bounded_recv_panics_on_disconnect() {
+        // A dropped sender produces Disconnected on the next
+        // try_recv; the helper must panic immediately rather than
+        // spin to the budget.
+        let (tx, rx) = std::sync::mpsc::channel::<u32>();
+        drop(tx);
+        super::bounded_recv(&rx, "disconnected-mpsc");
     }
 
     #[test]

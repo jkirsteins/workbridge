@@ -117,9 +117,12 @@ wrappers, tests must NOT read the wall-clock via:
   `Condvar::wait_timeout(_while)`, `Thread::park_timeout` - these
   stdlib bounded-wait APIs internally read the monotonic clock via
   `Condvar::wait_timeout`. Tests that need a bounded receive must
-  use a `try_recv` polling loop with `clock::sleep()` between
-  attempts; see `src/fetcher.rs::recv_message` and
-  `src/app.rs::tests::test_recv_bounded` for the canonical pattern.
+  use `crate::side_effects::clock::bounded_recv(&rx, "context")`,
+  the shared generic helper that polls `try_recv` on a mock-clock
+  driven timer. It works with both `std::sync::mpsc::Receiver` and
+  `crossbeam_channel::Receiver` via the `PollableReceiver` trait
+  impls in `src/side_effects/clock.rs`. Adding a new channel kind
+  only requires another trait impl.
 
 The pre-commit hook rejects staged Rust files outside `src/side_effects/`
 that call any of these APIs directly (`.elapsed(`, `recv_timeout(`,

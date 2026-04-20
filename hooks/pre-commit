@@ -146,10 +146,12 @@ echo "=== pre-commit: checking for bypasses of src/side_effects/ ==="
 #   clock in tests and against the real clock in production.
 # - `recv_timeout(`, `recv_deadline(`, `wait_timeout(`,
 #   `park_timeout(` all read the monotonic clock under the hood
-#   to bound a wait. Tests must use a bounded `try_recv` loop
-#   with `crate::side_effects::clock::sleep()` between polls -
-#   see `src/fetcher.rs::recv_message` and `app.rs::tests::
-#   test_recv_bounded` for the canonical pattern.
+#   to bound a wait. Tests must use the shared
+#   `crate::side_effects::clock::bounded_recv` helper, which polls
+#   `try_recv` on a mock-clock-driven timer. See
+#   `src/side_effects/clock.rs` for the helper itself and
+#   `src/app.rs::tests::manage_unmanage_sets_fetcher_repos_changed`
+#   (via the caller at ~22569) for a canonical usage.
 #
 # `.duration_since(` is intentionally NOT in the forbidden list:
 # the codebase calls `SystemTime::duration_since(UNIX_EPOCH)` and
@@ -183,8 +185,8 @@ if [ -n "$bare_sideeffect_files" ]; then
     echo ""
     echo "Wall-clock-reading patterns (.elapsed(), recv_timeout(),"
     echo "recv_deadline(), wait_timeout(), park_timeout()) must be replaced"
-    echo "with crate::side_effects::clock::elapsed_since(...) or a bounded"
-    echo "try_recv + clock::sleep() polling loop."
+    echo "with crate::side_effects::clock::elapsed_since(...) for elapsed"
+    echo "or crate::side_effects::clock::bounded_recv(...) for receives."
     echo ""
     echo "Both qualified references (e.g. 'std::env::temp_dir()') and 'use'"
     echo "imports (e.g. 'use std::env::temp_dir;') are rejected. See:"

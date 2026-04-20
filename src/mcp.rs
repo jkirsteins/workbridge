@@ -164,6 +164,19 @@ struct SessionMcpConfig {
 /// Accept loop: waits for connections and spawns a thread per connection.
 /// Each connection is handled independently so that a stale health-check
 /// connection cannot block subsequent real connections.
+///
+/// The WouldBlock backoff routes through `side_effects::clock::sleep`
+/// rather than a raw stdlib sleep call. In production that wrapper
+/// forwards to the real 50ms pause, which is what the loop wants.
+/// Under `#[cfg(test)]` the same call becomes a `yield_now` plus a
+/// mock-clock advance, so the accept loop spin-yields instead of
+/// pausing for 50ms of real time. The socket-server smoke tests
+/// (`socket_server_starts_and_stops`, `mcp_tool_call_produces_channel_event`)
+/// rely on that behaviour to finish in milliseconds instead of seconds;
+/// the tradeoff is that this loop consumes more CPU in tests than it
+/// does in production. If that ever becomes a test-flakiness source
+/// on loaded CI, replace the polling loop with a proper non-blocking
+/// accept driven by a signal/eventfd the stop path writes to.
 fn accept_loop(
     listener: UnixListener,
     cfg: &SessionMcpConfig,
@@ -2080,34 +2093,14 @@ mod tests {
             "Plan saved",
         );
 
-        // Check the channel received a SetPlan event. Bounded
-        // try_recv + mock-clock sleep (1ms) loop instead of
-        // `recv_timeout` - the stdlib's `recv_timeout` / the
-        // crossbeam equivalent both read the real monotonic clock
-        // internally, which violates the "tests never read wall-
-        // clock time" rule enforced by the side-effects gate. The
-        // iteration cap (6000 * 1ms mock budget) matches the pattern
-        // in `src/fetcher.rs::recv_message` and is generous enough
-        // to absorb OS-scheduler jitter on loaded CI hosts because
-        // `clock::sleep` is pure `yield_now` in tests.
-        let event = {
-            let mut received: Option<McpEvent> = None;
-            for _ in 0..6_000 {
-                match rx.try_recv() {
-                    Ok(msg) => {
-                        received = Some(msg);
-                        break;
-                    }
-                    Err(crossbeam_channel::TryRecvError::Empty) => {
-                        crate::side_effects::clock::sleep(std::time::Duration::from_millis(1));
-                    }
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        panic!("MCP event channel disconnected before SetPlan event arrived");
-                    }
-                }
-            }
-            received.expect("should receive SetPlan event")
-        };
+        // Bounded-wait receive via the shared helper, which polls
+        // `try_recv` on a mock-clock-driven timer instead of calling
+        // the stdlib `recv_timeout` (which internally reads the real
+        // monotonic clock via `Condvar::wait_timeout` and is blocked
+        // by the side-effects gate). See
+        // `crate::side_effects::clock::bounded_recv` for the design.
+        let event =
+            crate::side_effects::clock::bounded_recv(&rx, "MCP event channel awaiting SetPlan");
         match event {
             McpEvent::SetPlan { work_item_id, plan } => {
                 assert_eq!(work_item_id, "integration-wi");
