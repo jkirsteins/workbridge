@@ -1,0 +1,47 @@
+# deny.toml - Phase 1 baseline for cargo-deny.
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail on any known RustSec advisory.
+version = 2
+yanked = "deny"
+# RUSTSEC-2025-0057: fxhash is no longer maintained. It is pulled in
+# transitively via the rat-widget crate family (rat-ftable, rat-menu,
+# rat-popup, rat-salsa, rat-text, rat-widget) and has no known
+# vulnerability - only the "unmaintained" classification. There is no
+# safe upgrade available, and replacing the transitive chain is out
+# of scope for this Phase 1 hygiene baseline. Revisit if the advisory
+# escalates or a fix lands upstream.
+ignore = ["RUSTSEC-2025-0057"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[licenses]
+version = 2
+# Conservative allowlist. Anything outside this list needs review and
+# an explicit addition here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.93
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []
