@@ -2518,7 +2518,7 @@ impl App {
     /// Does not touch the PTY selection state - this path is
     /// independent of the existing drag-select copy flow.
     pub fn fire_chrome_copy(&mut self, value: String, kind: ClickKind) {
-        let ok = crate::clipboard::copy(&value);
+        let ok = crate::side_effects::clipboard::copy(&value);
         let short = short_display(&value, kind);
         let text = if ok {
             format!("Copied: {short}")

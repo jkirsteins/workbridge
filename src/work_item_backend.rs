@@ -361,7 +361,7 @@ impl LocalFileBackend {
     ///
     /// Creates the directory if it does not exist.
     pub fn new() -> Result<Self, BackendError> {
-        let proj = directories::ProjectDirs::from("", "", "workbridge")
+        let proj = crate::side_effects::paths::project_dirs()
             .ok_or_else(|| BackendError::Io("could not determine data directory".into()))?;
         let data_dir = proj.data_dir().join("work-items");
         fs::create_dir_all(&data_dir).map_err(|e| {

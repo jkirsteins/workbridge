@@ -451,7 +451,7 @@ pub fn aggregate_from_activity_logs(data_dir: &Path) -> MetricsSnapshot {
 /// a home directory. Honors `$HOME` overrides, so tests under a temp
 /// `HOME` see an isolated metrics directory.
 pub fn default_data_dir() -> Option<PathBuf> {
-    let proj = directories::ProjectDirs::from("", "", "workbridge")?;
+    let proj = crate::side_effects::paths::project_dirs()?;
     Some(proj.data_dir().join("work-items"))
 }
 

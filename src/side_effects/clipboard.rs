@@ -20,12 +20,22 @@
 //! encoding is a small inline implementation to keep the dependency
 //! tree lean - OSC 52 only needs standard base64 with no URL-safety
 //! or padding tricks.
+//!
+//! **Test-mode contract:** under `#[cfg(test)]`, `copy` is a no-op that
+//! returns `false`. Callers render "Copy failed: ..." toasts in that
+//! case; existing tests assert on substring matches that hold under
+//! both branches. This gating closes the pre-fix leak where test
+//! fixtures (e.g. "feat/my-branch") were being written to the real
+//! system clipboard via `arboard` during `cargo test`.
 
 #[cfg(not(test))]
 use std::io::Write;
 
 /// Attempt to copy `text` to the system clipboard via OSC 52 and
 /// `arboard`. Returns `true` if at least one path succeeded.
+///
+/// Under `#[cfg(test)]` this is a no-op that returns `false`. See the
+/// module doc for the rationale.
 ///
 /// Safety: this function writes a short escape sequence directly to
 /// `stdout`. That is safe to call between ratatui draws (which is the
@@ -34,29 +44,32 @@ use std::io::Write;
 /// the same `stdout` handle. We flush after the write so the sequence
 /// reaches the terminal before the next draw.
 pub fn copy(text: &str) -> bool {
-    let mut ok = false;
+    #[cfg(test)]
+    {
+        let _ = text;
+        false
+    }
 
-    // OSC 52 path. Skipped under `cfg(test)` because the test harness
-    // would otherwise see raw escape sequences in captured stdout and
-    // the `osc52_sequence` unit test below already covers the escape
-    // construction in isolation.
     #[cfg(not(test))]
     {
+        let mut ok = false;
+
+        // OSC 52 path.
         let seq = osc52_sequence(text);
         let mut stdout = std::io::stdout().lock();
         if stdout.write_all(seq.as_bytes()).is_ok() && stdout.flush().is_ok() {
             ok = true;
         }
-    }
 
-    // arboard path (best-effort).
-    if let Ok(mut clipboard) = arboard::Clipboard::new()
-        && clipboard.set_text(text.to_string()).is_ok()
-    {
-        ok = true;
-    }
+        // arboard path (best-effort).
+        if let Ok(mut clipboard) = arboard::Clipboard::new()
+            && clipboard.set_text(text.to_string()).is_ok()
+        {
+            ok = true;
+        }
 
-    ok
+        ok
+    }
 }
 
 /// Build the OSC 52 escape sequence that asks the terminal to push

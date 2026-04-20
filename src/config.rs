@@ -70,9 +70,10 @@ impl ConfigProvider for InMemoryConfigProvider {
     }
 }
 
-/// Get the user's home directory using the directories crate.
+/// Get the user's home directory via the side-effects gate. Returns
+/// `None` under `cfg(test)` so tests cannot reach the real `$HOME`.
 fn home_dir() -> Option<PathBuf> {
-    directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
+    crate::side_effects::paths::home_dir()
 }
 
 /// An MCP server entry configured for a specific repository.
@@ -247,8 +248,7 @@ impl From<std::io::Error> for ConfigError {
 /// macOS: ~/Library/Application Support/workbridge/config.toml
 /// Linux: ~/.config/workbridge/config.toml
 pub fn config_path() -> Result<PathBuf, ConfigError> {
-    let proj =
-        directories::ProjectDirs::from("", "", "workbridge").ok_or(ConfigError::NoConfigDir)?;
+    let proj = crate::side_effects::paths::project_dirs().ok_or(ConfigError::NoConfigDir)?;
     Ok(proj.config_dir().join("config.toml"))
 }
 
@@ -594,9 +594,13 @@ mod tests {
 
     #[test]
     fn expand_tilde_with_home() {
+        // Under cfg(test), side_effects::paths::home_dir() returns None
+        // (by design - tests must not reach the real $HOME). So
+        // expand_tilde leaves "~/..." unchanged. This test asserts that
+        // contract: when home_dir() returns None the input path is
+        // returned verbatim.
         let expanded = expand_tilde("~/Projects");
-        assert!(expanded.to_str().unwrap().contains("Projects"));
-        assert!(!expanded.to_str().unwrap().starts_with('~'));
+        assert_eq!(expanded, PathBuf::from("~/Projects"));
     }
 
     #[test]
@@ -607,8 +611,10 @@ mod tests {
 
     #[test]
     fn expand_tilde_bare() {
+        // Same contract as expand_tilde_with_home: home_dir() returns
+        // None under cfg(test), so "~" passes through unchanged.
         let expanded = expand_tilde("~");
-        assert!(!expanded.to_str().unwrap().starts_with('~'));
+        assert_eq!(expanded, PathBuf::from("~"));
     }
 
     #[test]
