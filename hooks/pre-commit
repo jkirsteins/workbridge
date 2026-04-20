@@ -1,6 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# All per-file staged-content checks below read the index (via
+# `git show ":$f"`), NOT the working tree. This is important for
+# correctness: a contributor can `git add` a file, then edit it
+# further in the working tree, then run `git commit`. In that case
+# the commit creates an object from the index content, so that is
+# the content the hook must validate. Greping the working tree
+# would let stage-then-edit-away bypasses slip through. The helper
+# `staged_content` below is the single entry point for reading an
+# index blob as text.
+#
+# Files that are staged for deletion will not have an index blob;
+# `git show` will fail with a nonzero exit code. We detect that
+# case up front (via the file's status letter) and skip it, since
+# a deletion cannot introduce a violation.
+
+staged_content() {
+    # Print the staged (index) content for a path, or nothing on
+    # failure. Callers are responsible for pre-filtering deletions.
+    git show ":$1" 2>/dev/null
+}
+
+# List staged paths that end in `.rs` and are NOT staged for
+# deletion. Output one path per line.
+list_staged_rs_added_or_modified() {
+    git diff --cached --name-status -- '*.rs' \
+        | awk '$1 != "D" { print $2 }'
+}
+
 echo "=== pre-commit: checking format ==="
 cargo fmt -- --check
 echo "Format OK."
@@ -11,13 +39,15 @@ echo "Clippy OK."
 
 echo "=== pre-commit: checking for bare Command::new(\"git\") ==="
 bare_git_files=""
-for f in $(git diff --cached --name-only -- '*.rs'); do
-    if [ -f "$f" ] && grep -q 'Command::new("git")' "$f"; then
-        if ! grep -q 'env_remove("GIT_DIR")\|git_command()' "$f"; then
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    content="$(staged_content "$f")"
+    if printf '%s' "$content" | grep -q 'Command::new("git")'; then
+        if ! printf '%s' "$content" | grep -q 'env_remove("GIT_DIR")\|git_command()'; then
             bare_git_files="$bare_git_files $f"
         fi
     fi
-done
+done < <(list_staged_rs_added_or_modified)
 if [ -n "$bare_git_files" ]; then
     echo "ERROR: These files use Command::new(\"git\") without env clearing:"
     echo "$bare_git_files"
@@ -33,15 +63,17 @@ echo "=== pre-commit: checking for bare agent binary spawns ==="
 # work when a second backend is wired. Same enforcement pattern as
 # the Command::new("git") check above.
 bare_agent_files=""
-for f in $(git diff --cached --name-only -- '*.rs'); do
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
     # agent_backend.rs is the ONLY file allowed to mention the binary name.
     if [ "$(basename "$f")" = "agent_backend.rs" ]; then
         continue
     fi
-    if [ -f "$f" ] && grep -qE 'Command::new\("(claude|codex)"' "$f"; then
+    content="$(staged_content "$f")"
+    if printf '%s' "$content" | grep -qE 'Command::new\("(claude|codex)"'; then
         bare_agent_files="$bare_agent_files $f"
     fi
-done
+done < <(list_staged_rs_added_or_modified)
 if [ -n "$bare_agent_files" ]; then
     echo "ERROR: These files spawn an agent binary directly:"
     echo "$bare_agent_files"
@@ -58,28 +90,46 @@ echo "=== pre-commit: checking for bypasses of src/side_effects/ ==="
 # route through side_effects:: wrappers (for production paths) or
 # tempfile::tempdir() (for test scratch dirs).
 #
+# The patterns cover BOTH fully-qualified paths
+# (`std::env::temp_dir()`, `arboard::Clipboard`) AND the `use ...;`
+# aliasing forms that would otherwise let a contributor import the
+# symbol under a short name and call it bare (e.g.
+# `use std::env::temp_dir;` then `temp_dir()`). Aliasing defeats
+# the simple grep from a single-axis pattern, which is why the
+# regex splits into two OR groups: one for qualified references,
+# one for the `use` imports of the gated roots.
+#
+# As a defense-in-depth layer we also flag bare calls to
+# `temp_dir()` / `home_dir()` that are not preceded by `.` (method
+# call) or `::`, in case a contributor writes `use std::env;` then
+# calls `env::temp_dir()`. `env::temp_dir` is caught by the
+# second OR branch; a bare `temp_dir()` that survives both has no
+# legitimate source and must be flagged.
+#
 # See docs/superpowers/specs/2026-04-18-test-side-effects-audit-design.md
 # and the corresponding P0 rule in CLAUDE.md.
 bare_sideeffect_files=""
-for f in $(git diff --cached --name-only -- '*.rs'); do
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
     # side_effects/* is allowed to mention the gated symbols.
     case "$f" in
         src/side_effects/*) continue ;;
     esac
-    if [ ! -f "$f" ]; then
-        continue
-    fi
-    if grep -qE 'arboard::|directories::(ProjectDirs|BaseDirs|UserDirs)|std::env::home_dir|std::env::temp_dir' "$f"; then
+    content="$(staged_content "$f")"
+    [ -z "$content" ] && continue
+    if printf '%s' "$content" | grep -qE 'arboard::|directories::(ProjectDirs|BaseDirs|UserDirs)|std::env::home_dir|std::env::temp_dir|^[[:space:]]*use[[:space:]]+arboard(::|;|[[:space:]])|^[[:space:]]*use[[:space:]]+directories::(ProjectDirs|BaseDirs|UserDirs)|^[[:space:]]*use[[:space:]]+std::env::(temp_dir|home_dir)'; then
         bare_sideeffect_files="$bare_sideeffect_files $f"
     fi
-done
+done < <(list_staged_rs_added_or_modified)
 if [ -n "$bare_sideeffect_files" ]; then
     echo "ERROR: These files bypass src/side_effects/:"
     echo "$bare_sideeffect_files"
     echo ""
     echo "Host-visible APIs (arboard, directories::ProjectDirs/BaseDirs/UserDirs,"
     echo "std::env::home_dir, std::env::temp_dir) must be reached through"
-    echo "crate::side_effects::{clipboard, paths} or tempfile::tempdir(). See:"
+    echo "crate::side_effects::{clipboard, paths} or tempfile::tempdir(). Both"
+    echo "qualified references (e.g. 'std::env::temp_dir()') and 'use' imports"
+    echo "(e.g. 'use std::env::temp_dir;') are rejected. See:"
     echo "  - docs/TESTING.md 'Side-effect gating module'"
     echo "  - src/side_effects/mod.rs"
     echo "  - CLAUDE.md 'Severity overrides' (P0 rule)"

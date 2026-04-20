@@ -27,6 +27,31 @@
 //! both branches. This gating closes the pre-fix leak where test
 //! fixtures (e.g. "feat/my-branch") were being written to the real
 //! system clipboard via `arboard` during `cargo test`.
+//!
+//! The test-mode contract is enforced two ways, not just one:
+//!
+//! 1. **Outer `#[cfg(not(test))]` gating**: the `arboard` import
+//!    and the production implementation body are both behind
+//!    `#[cfg(not(test))]`, so under `cargo test` the test binary
+//!    never links the arboard code path. Removing
+//!    `#[cfg(not(test))]` on the `use` line would produce an
+//!    unused-import warning and fail clippy.
+//!
+//! 2. **Inner compile-time assertion**: the production path
+//!    begins with a `const { assert!(!cfg!(test)) }` block. If a
+//!    future refactor weakens the outer `#[cfg(not(test))]`
+//!    attribute and the production body ends up compiled under
+//!    test, the `cfg!(test)` constant inside the const block
+//!    flips to `true` and the build fails - before the test
+//!    binary can even be linked, let alone execute
+//!    `arboard::Clipboard::new()`. The check is intentionally in
+//!    the production block (not the test block) because its job
+//!    is to fail if production ever ends up reachable from a
+//!    test-mode compilation unit.
+//!
+//! The paired `copy_is_noop_under_cfg_test` test also performs a
+//! `const { assert!(cfg!(test)) }` check so the `cfg(test)`
+//! expectation is pinned symmetrically on the test side.
 
 #[cfg(not(test))]
 use std::io::Write;
@@ -52,6 +77,20 @@ pub fn copy(text: &str) -> bool {
 
     #[cfg(not(test))]
     {
+        // Compile-time belt-and-braces gate: if a future refactor
+        // relaxes the `#[cfg(not(test))]` attributes above and the
+        // production body becomes reachable under `cargo test`, the
+        // `cfg!(test)` inside this const block flips to `true` and
+        // the `assert!` fails at BUILD time - before the test
+        // binary even links `arboard`. Do not "fix" a failure of
+        // this assertion by removing it: the failure means the
+        // compile-time gate above was loosened and the real host
+        // clipboard is about to be clobbered by test fixtures. See
+        // the module doc for the full test-mode contract.
+        const {
+            assert!(!cfg!(test));
+        }
+
         let mut ok = false;
 
         // OSC 52 path.
@@ -217,8 +256,32 @@ mod tests {
     /// with test-fixture strings. If this test fails, someone has
     /// removed the `#[cfg(test)]` early-return; do NOT "fix" the
     /// test - fix the gate.
+    ///
+    /// The test pins two things, not just one:
+    ///
+    /// 1. `copy` returns `false`. This catches the straightforward
+    ///    regression where the early-return body was removed and
+    ///    `arboard` ran and returned `true`.
+    ///
+    /// 2. `cfg!(test)` is `true` from within this test. This pins
+    ///    the runtime view that the `debug_assert!(!cfg!(test), ...)`
+    ///    in the production body relies on. If a future build mode
+    ///    caused `cfg!(test)` to report `false` inside a unit test
+    ///    the production runtime gate would silently stop firing;
+    ///    this assertion would flag that regression immediately so
+    ///    the compile-time-only half of the contract is never the
+    ///    only line of defense.
     #[test]
     fn copy_is_noop_under_cfg_test() {
+        // Compile-time check: `cfg(test)` must evaluate to `true`
+        // inside this test. The production body's runtime gate is
+        // `debug_assert!(!cfg!(test), ...)`, so if the build mode
+        // ever caused `cfg!(test)` to report `false` in a unit
+        // test the runtime gate would silently stop firing. A
+        // `const { assert!(cfg!(test), ...) }` block turns that
+        // assumption into a build-time error instead of a silent
+        // gap.
+        const { assert!(cfg!(test)) };
         let before_call = "workbridge-regression-probe";
         // Call must return false without touching any real backend.
         assert!(!copy(before_call));

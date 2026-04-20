@@ -6478,19 +6478,20 @@ mod snapshot_tests {
     fn settings_overlay_with_config() {
         use crate::config::Config;
 
-        // Use a fixed `/tmp/...` path (not a tempfile::tempdir()
-        // subdir) so the snapshot's rendered base-dir string is
-        // deterministic across machines. macOS tempdir roots resolve
-        // to `/var/folders/...` which differs per user; this test
-        // asserts on the rendered bytes verbatim, so the input path
-        // must be stable.
-        let base = std::path::PathBuf::from("/tmp/workbridge-test-settings-overlay");
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("discovered-a/.git")).unwrap();
-        std::fs::create_dir_all(base.join("discovered-b/.git")).unwrap();
+        // Use `tempfile::tempdir()` so the test stays inside the
+        // process temp root, auto-cleans on drop, and cannot collide
+        // with sibling test threads. The rendered base-dir path is
+        // volatile across machines (on macOS the root resolves to
+        // `/var/folders/...`), so after rendering we normalize the
+        // output string: redact the tempdir prefix to `<TMPDIR>` and
+        // collapse the variable-width trailing padding that ratatui
+        // leaves between the redacted content and the column border.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("discovered-a/.git")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("discovered-b/.git")).unwrap();
 
-        let base_str = base.display().to_string();
-        let discovered_a = base.join("discovered-a").display().to_string();
+        let base_str = tmp.path().display().to_string();
+        let discovered_a = tmp.path().join("discovered-a").display().to_string();
 
         let config = Config {
             base_dirs: vec![base_str],
@@ -6502,11 +6503,43 @@ mod snapshot_tests {
         };
         let mut app = App::with_config(config, Arc::new(StubBackend));
         app.show_settings = true;
-        let output = render(&mut app, 80, 24);
+        let raw_output = render(&mut app, 80, 24);
 
-        let _ = std::fs::remove_dir_all(&base);
+        // The tempdir root differs per platform (`/var/folders/...`
+        // on macOS, `/tmp/.tmp...` on Linux) and per invocation. The
+        // snapshot asserts on the rendered bytes of the Settings
+        // overlay, which includes the configured `base_dirs[0]` and
+        // the two discovered sub-repos, so without normalization the
+        // snapshot diverges per machine. Normalize the rendered
+        // string BEFORE handing it to insta so the snapshot stores a
+        // canonical form.
+        //
+        // Pass 1: replace any tempdir-rooted path with `<TMPDIR>`.
+        // Pass 2: canonicalize runs of spaces between `<TMPDIR>` (or
+        // a truncated prefix of it) and the next `│` border so the
+        // variable-width trailing padding left behind by the
+        // substitution is squashed to a single space. Both the
+        // overlay-internal `│` borders and the outer-right `│` border
+        // are normalized this way.
+        let path_re = regex::Regex::new(r"(?:/private)?/var/folders/[^\s│]+|/tmp/\.tmp[^\s│]+")
+            .expect("valid regex");
+        let redacted = path_re.replace_all(&raw_output, "<TMPDIR>").into_owned();
+        // Collapse 2+ spaces preceding a `│` on any line that contains
+        // `<TMPDIR>` so trailing padding is stable. Use multi-line
+        // mode so each line is considered independently.
+        let pad_re = regex::Regex::new(r"(?m)^(.*<TMPDIR>.*?) +(│)").expect("valid regex");
+        let mut normalized = redacted;
+        // Apply repeatedly until the pattern stops matching (handles
+        // multiple `│`-bounded padding runs on the same line).
+        loop {
+            let next = pad_re.replace_all(&normalized, "$1 $2").into_owned();
+            if next == normalized {
+                break;
+            }
+            normalized = next;
+        }
 
-        insta::assert_snapshot!(output);
+        insta::assert_snapshot!(normalized);
     }
 
     // -- Work item display tests --
