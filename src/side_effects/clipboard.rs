@@ -209,4 +209,20 @@ mod tests {
         let decoded = base64_decode(middle).expect("valid base64");
         assert_eq!(decoded, payload.as_bytes());
     }
+
+    /// Contract: under `#[cfg(test)]`, `copy` must be a pure no-op
+    /// that returns `false`. This prevents a future refactor from
+    /// re-introducing the pre-2026-04-20 leak where `arboard` ran
+    /// during `cargo test` and clobbered the user's real clipboard
+    /// with test-fixture strings. If this test fails, someone has
+    /// removed the `#[cfg(test)]` early-return; do NOT "fix" the
+    /// test - fix the gate.
+    #[test]
+    fn copy_is_noop_under_cfg_test() {
+        let before_call = "workbridge-regression-probe";
+        // Call must return false without touching any real backend.
+        assert!(!copy(before_call));
+        // Second call: still false, still no side effect.
+        assert!(!copy("another-probe"));
+    }
 }
