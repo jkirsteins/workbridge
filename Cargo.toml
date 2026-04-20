@@ -48,6 +48,27 @@ integration = []
 insta = "1"
 tempfile = "3"
 
+[lints.rust]
+# Nudge toward Rust 2018+ idioms (module path cleanliness, anonymous
+# lifetimes, etc.). Set to "warn" rather than "deny" so the group can
+# be raised incrementally without requiring #[allow] in source.
+#
+# One sub-lint in the group (elided_lifetimes_in_paths) currently
+# fires on 5 pre-existing sites in src/ui.rs. Phase 1's acceptance
+# criteria forbid both src/*.rs edits and source-level #[allow(...)],
+# so the sub-lint is held at "allow" here at the Cargo.toml level
+# (not as a source attribute). This preserves the rest of the
+# rust_2018_idioms group as active warnings so new regressions in
+# other sub-lints (bare_trait_objects, absolute_paths_not_starting_
+# with_crate, unused_extern_crates, explicit_outlives_requirements)
+# will still be caught. Cleaning up the 5 elided-lifetime sites and
+# dropping this allow is tracked for Phase 2.
+#
+# priority = -1 on the group lets the specific allow override it;
+# without the priority, the group's "warn" would win.
+rust_2018_idioms = { level = "warn", priority = -1 }
+elided_lifetimes_in_paths = "allow"
+
 [lints.clippy]
 # Prohibit accidental dbg! / todo! / unimplemented! in committed code.
 # Baseline verified clean on 2026-04-20.
