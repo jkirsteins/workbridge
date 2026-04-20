@@ -224,3 +224,21 @@ socket behavior:
 cargo test mcp::tests::socket_server_starts_and_stops -- --nocapture
 cargo test mcp::tests::mcp_tool_call_produces_channel_event -- --nocapture
 ```
+
+## CI gate
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request and
+on pushes to `master` with three parallel jobs:
+
+- `fmt` - `cargo fmt --all -- --check`
+- `clippy` - `cargo clippy --all-targets --all-features -- -D warnings`
+- `test` - `cargo test --all-features`
+
+The `test` job uses `--all-features` deliberately so the merge gate exercises
+the same integration tests as the pre-push hook. Keeping the two in sync
+means the "integration tests pass before code reaches the remote" invariant
+above holds even when a developer bypasses the local hook.
+
+The repository ruleset references these job names as required status checks,
+so a PR cannot be merged until all three are green against a branch that is
+up to date with `master`.
