@@ -228,17 +228,32 @@ cargo test mcp::tests::mcp_tool_call_produces_channel_event -- --nocapture
 ## CI gate
 
 GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request and
-on pushes to `master` with three parallel jobs:
+on pushes to `master` with the following parallel jobs:
 
 - `fmt` - `cargo fmt --all -- --check`
 - `clippy` - `cargo clippy --all-targets --all-features -- -D warnings`
 - `test` - `cargo test --all-features`
+- `audit` - `cargo audit` (RustSec advisory database)
+- `deny` - `cargo deny check advisories licenses bans sources`
+- `machete` - `cargo machete` (unused dependency scan)
+- `typos` - `crate-ci/typos` action with `typos.toml`
+- `msrv` - `cargo check --all-features` pinned to the rust-version in `Cargo.toml` (1.88)
+- `budget` - `./hooks/budget-check.sh` enforcing `ci/file-size-budgets.toml`
+- `ratatui-builtin` - `./hooks/ratatui-builtin-check.sh` (warn-only heuristic)
 
 The `test` job uses `--all-features` deliberately so the merge gate exercises
 the same integration tests as the pre-push hook. Keeping the two in sync
 means the "integration tests pass before code reaches the remote" invariant
 above holds even when a developer bypasses the local hook.
 
-The repository ruleset references these job names as required status checks,
-so a PR cannot be merged until all three are green against a branch that is
-up to date with `master`.
+`audit`, `deny`, `machete`, and `typos` are the hard CI counterparts of
+the pre-commit / pre-push checks that skip locally with an install hint
+when the tool is missing. `budget` and `ratatui-builtin` re-run the same
+hook scripts CI-side so a local hook bypass still gets caught.
+
+The repository ruleset references the pre-existing job names (`fmt`, `clippy`,
+`test`) as required status checks. New jobs added in Phase 1 of the hygiene
+campaign (`audit`, `deny`, `machete`, `typos`, `msrv`, `budget`,
+`ratatui-builtin`) run on every PR but are not yet required-status-check
+gated; promote them to required via the repository ruleset once they have
+a stable green baseline.

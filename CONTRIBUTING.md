@@ -27,6 +27,26 @@ pre-commit hook in `hooks/` catches anything the convenience hook missed,
 so contributors without Claude Code (or without `jq`) are not affected
 in CI or at commit time.
 
+### Optional local tools
+
+The pre-commit and pre-push hooks call a few third-party cargo tools.
+They are optional locally (the hooks skip with an install hint) but
+CI runs them as hard gates. To match CI locally:
+
+```sh
+cargo install cargo-audit cargo-deny cargo-machete typos-cli
+```
+
+### File-size budgets
+
+`ci/file-size-budgets.toml` declares a maximum line count per source
+file. `hooks/budget-check.sh` enforces it (locally via pre-commit and
+in CI via the `budget` job). If you legitimately need a file to grow
+past its budget, bump the entry in the budget file as part of your
+PR and explain the growth in the commit message. The budget exists
+to prevent silent module bloat, not to ban growth - it wants the
+growth to be an explicit, reviewable decision.
+
 ## Error Handling
 
 Never silently ignore errors. Every error must be either:
