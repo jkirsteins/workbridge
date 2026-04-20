@@ -19719,8 +19719,20 @@ mod tests {
         app.poll_review_gate();
     }
 
+    /// Poll a state-flag that flips when a background worker thread
+    /// completes. The iteration cap matches `clock::bounded_recv`
+    /// (6000); we deliberately oversize the budget because mock
+    /// `clock::sleep` is pure `yield_now` under cfg(test) and the
+    /// worker thread may need many scheduler turns to run on a
+    /// single-core-ish CI host before the main thread's poll sees the
+    /// flag clear. On macOS 1000 iterations was empirically enough;
+    /// on Ubuntu CI runners 1000 is too tight and the loop panics
+    /// spuriously even though the worker is not actually wedged.
+    /// 6000 iterations absorbs that jitter while still bounding a
+    /// real livelock (the thread-local safety cap in
+    /// `side_effects::clock::sleep` would trip at 100_000 anyway).
     fn drain_worktree_creation(app: &mut App) {
-        for _ in 0..1_000 {
+        for _ in 0..6_000 {
             app.poll_worktree_creation();
             if !app.is_user_action_in_flight(&UserActionKey::WorktreeCreate) {
                 return;
@@ -19731,7 +19743,7 @@ mod tests {
     }
 
     fn drain_delete_cleanup(app: &mut App) {
-        for _ in 0..1_000 {
+        for _ in 0..6_000 {
             app.poll_delete_cleanup();
             if !app.delete_in_progress {
                 return;

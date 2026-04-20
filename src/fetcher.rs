@@ -671,9 +671,16 @@ mod tests {
         // channel goes quiet. A single tick can emit multiple
         // FetcherError messages (one per failed sub-step) so we keep
         // draining instead of returning on the first match.
+        // Iteration cap matches `side_effects::clock::bounded_recv`
+        // (6000) rather than the historical 1000. On Ubuntu CI the
+        // mock-clock `sleep` is pure `yield_now`, and 1000 yields is
+        // not always enough scheduler runtime for the fetcher worker
+        // to emit both the login FetcherError and the RepoData on a
+        // heavily-loaded runner; 6000 absorbs the jitter while still
+        // bounding a genuine livelock.
         let mut saw_login_error = false;
         let mut saw_repo_data = false;
-        for _ in 0..1_000 {
+        for _ in 0..6_000 {
             if saw_login_error && saw_repo_data {
                 break;
             }
