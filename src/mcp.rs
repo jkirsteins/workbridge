@@ -195,7 +195,7 @@ fn accept_loop(
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                crate::side_effects::clock::sleep(std::time::Duration::from_millis(50));
             }
             Err(_) => {
                 break;
@@ -226,7 +226,7 @@ fn global_accept_loop(
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                crate::side_effects::clock::sleep(std::time::Duration::from_millis(50));
             }
             Err(_) => {
                 break;
@@ -1846,7 +1846,7 @@ mod tests {
         // Stop the server.
         server.stop();
         // Give the accept thread time to exit and clean up.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        crate::side_effects::clock::sleep(std::time::Duration::from_millis(200));
     }
 
     #[test]
@@ -2037,7 +2037,7 @@ mod tests {
         .expect("failed to start server");
 
         // Give the accept loop time to start.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        crate::side_effects::clock::sleep(std::time::Duration::from_millis(100));
 
         // Connect as a client.
         let stream =
@@ -2109,7 +2109,7 @@ mod tests {
         );
 
         server.stop();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        crate::side_effects::clock::sleep(std::time::Duration::from_millis(200));
     }
 
     #[test]

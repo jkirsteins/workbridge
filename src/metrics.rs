@@ -329,7 +329,7 @@ fn reconstruct_backlog_per_day(
 /// return a fresh `MetricsSnapshot`. Pure, synchronous, safe to call
 /// repeatedly; intended to run on a background thread.
 pub fn aggregate_from_activity_logs(data_dir: &Path) -> MetricsSnapshot {
-    let now_secs = std::time::SystemTime::now()
+    let now_secs = crate::side_effects::clock::system_now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
@@ -472,7 +472,7 @@ pub fn spawn_metrics_aggregator(data_dir: PathBuf) -> crossbeam_channel::Receive
                 // worker so we don't leak a busy thread.
                 break;
             }
-            std::thread::sleep(AGGREGATOR_REFRESH);
+            crate::side_effects::clock::sleep(AGGREGATOR_REFRESH);
         }
     });
     rx
@@ -569,7 +569,7 @@ mod tests {
     #[test]
     fn stuck_review_item_detected() {
         let (_tmp, dir) = temp_dir("stuck-review");
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn fresh_review_item_is_not_stuck() {
         let (_tmp, dir) = temp_dir("fresh-review");
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
@@ -622,7 +622,7 @@ mod tests {
         // source of truth for liveness; an orphan top-level log is
         // classified as `Provenance::Archived`.
         let (_tmp, dir) = temp_dir("orphan-not-stuck");
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
@@ -658,7 +658,7 @@ mod tests {
         // the item as currently in Backlog and add it to every day
         // from its entry through now, inflating current-backlog KPIs.
         let (_tmp, dir) = temp_dir("orphan-not-backlogged");
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
@@ -691,7 +691,7 @@ mod tests {
         // Anchor the test to 10 days ago at 01:00 UTC so the timestamps
         // fall inside the aggregator's rolling 365-day window and are
         // offset from day boundaries (avoids alignment edge cases).
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
@@ -758,7 +758,7 @@ mod tests {
         let archive = dir.join("archive");
         fs::create_dir_all(&archive).unwrap();
 
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
@@ -793,7 +793,7 @@ mod tests {
         let archive = dir.join("archive");
         fs::create_dir_all(&archive).unwrap();
 
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
@@ -860,7 +860,7 @@ mod tests {
         // instant is the literal last second of `day` and half-open
         // interval membership is correct on both sides.
         let (_tmp, dir) = temp_dir("backlog-boundary");
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
@@ -949,7 +949,7 @@ mod tests {
             .unwrap();
 
         let snap = aggregate_from_activity_logs(&dir);
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
@@ -1005,7 +1005,7 @@ mod tests {
             .unwrap();
 
         let snap = aggregate_from_activity_logs(&dir);
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;

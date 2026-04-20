@@ -15,7 +15,7 @@ mod pr_service;
 mod prompts;
 mod salsa;
 mod session;
-mod side_effects;
+pub mod side_effects;
 mod theme;
 mod ui;
 mod work_item;

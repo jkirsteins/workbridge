@@ -49,6 +49,8 @@ Tests must not leave side effects on the host system. This includes:
   or any other path)
 - Writing raw terminal escape sequences to stdout / stderr outside
   `src/side_effects/`
+- Reading wall-clock time or sleeping via `Instant::now`, `SystemTime::now`,
+  `thread::sleep`, or `std::thread::sleep` outside `src/side_effects/clock.rs`
 - Using notification, audio, or visual system APIs
 
 ## Side-effect gating module
@@ -56,8 +58,9 @@ Tests must not leave side effects on the host system. This includes:
 All code paths that reach the host system outside `std::env::temp_dir()`
 live in `src/side_effects/`. That module is the ONLY place in the crate
 allowed to call `arboard::`, `directories::ProjectDirs` / `BaseDirs` /
-`UserDirs`, `std::env::home_dir`, `std::env::temp_dir`, or write raw
-terminal escape sequences (such as OSC 52) to stdout.
+`UserDirs`, `std::env::home_dir`, `std::env::temp_dir`, read wall-clock
+time, sleep the current thread, or write raw terminal escape sequences
+(such as OSC 52) to stdout.
 
 Under `#[cfg(test)]` every gated wrapper in `side_effects::` returns a
 no-op (`copy` returns `false`) or `None` (`paths::project_dirs`,
@@ -70,6 +73,27 @@ The pre-commit hook (`hooks/pre-commit`) enforces the boundary
 structurally: a staged `.rs` file outside `src/side_effects/` that
 references any of the gated symbols is rejected at commit time. See
 the P0 rule in `CLAUDE.md` "Severity overrides" for the review policy.
+
+## Wall-clock in tests
+
+Tests must not read real wall-clock time or block on real sleeps. Use
+`crate::side_effects::clock::instant_now()`,
+`crate::side_effects::clock::system_now()`, and
+`crate::side_effects::clock::sleep()` instead of `Instant::now`,
+`SystemTime::now`, `thread::sleep`, or `std::thread::sleep`.
+
+In production these wrappers forward to the standard library. Under
+`#[cfg(test)]`, `instant_now()` and `system_now()` read a deterministic
+mock clock, and `sleep()` advances that mock clock while yielding the
+current thread. Polling loops therefore terminate in tests without waiting
+for real time to pass. The mock `SystemTime` starts at
+`UNIX_EPOCH + 1_700_000_000s`, so ordinary subtraction in tests has room
+before the Unix epoch.
+
+The pre-commit hook rejects staged Rust files outside `src/side_effects/`
+that call the standard-library wall-clock APIs directly. If a test needs
+to move time forward without going through a sleep path, call
+`crate::side_effects::clock::advance_mock_clock()` from test-only code.
 
 If you genuinely need a new host-visible side effect (for example, a
 new notification API), the add path is:

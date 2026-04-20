@@ -771,7 +771,7 @@ impl WorkItemBackend for LocalFileBackend {
         // the first log line. An append failure is non-fatal: the JSON
         // record is authoritative and the item still works; only
         // historical metrics lose that one entry.
-        let secs = std::time::SystemTime::now()
+        let secs = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);

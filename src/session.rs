@@ -330,7 +330,7 @@ impl Session {
         }
 
         // Give the process group a brief window to exit gracefully.
-        std::thread::sleep(Duration::from_millis(SIGTERM_GRACE_MS));
+        crate::side_effects::clock::sleep(Duration::from_millis(SIGTERM_GRACE_MS));
 
         // If still alive, force-kill the entire process group.
         if matches!(child.try_wait(), Ok(None)) {
@@ -472,8 +472,12 @@ mod tests {
         // already exited - sleep 0 is instant). Either way, after waiting
         // for the child to finish, is_alive must return false.
 
-        // Wait a bit for the process to exit.
-        std::thread::sleep(Duration::from_millis(200));
+        session
+            .child
+            .as_mut()
+            .expect("child should exist before waiting")
+            .wait()
+            .expect("sleep 0 should exit cleanly");
 
         // After the process exits, is_alive should return false.
         assert!(

@@ -26,4 +26,5 @@
 //! that reference the gated symbols.
 
 pub mod clipboard;
+pub mod clock;
 pub mod paths;

@@ -2131,7 +2131,7 @@ macro_rules! impl_pr_merge_poll_method {
             // -- Phase 2: spawn polls for any watch whose per-item
             // cooldown has elapsed and which has no in-flight poll. --
             let cooldown = std::time::Duration::from_secs(30);
-            let now = std::time::Instant::now();
+            let now = crate::side_effects::clock::instant_now();
             let mut to_spawn: Vec<(WorkItemId, Option<u64>, String, String, PathBuf)> =
                 Vec::new();
             for watch in &self.$watches_field {
@@ -2487,7 +2487,7 @@ impl App {
     pub fn push_toast(&mut self, text: String) {
         self.toasts.push(Toast {
             text,
-            expires_at: Instant::now() + Duration::from_secs(2),
+            expires_at: crate::side_effects::clock::instant_now() + Duration::from_secs(2),
         });
     }
 
@@ -2495,7 +2495,7 @@ impl App {
     /// the per-tick hook in `salsa::app_event`. Keeps the vector from
     /// growing unbounded and is the only thing that removes toasts.
     pub fn prune_toasts(&mut self) {
-        let now = Instant::now();
+        let now = crate::side_effects::clock::instant_now();
         self.toasts.retain(|t| t.expires_at > now);
     }
 
@@ -2583,7 +2583,7 @@ impl App {
         debounce: Duration,
         message: impl Into<String>,
     ) -> Option<ActivityId> {
-        let now = Instant::now();
+        let now = crate::side_effects::clock::instant_now();
         if self.user_actions.in_flight.contains_key(&key) {
             return None;
         }
@@ -3733,7 +3733,7 @@ impl App {
         // Start the archival clock for items that became Done through PR merge
         // (derived status) but don't yet have a done_at timestamp.
         if self.config.defaults.archive_after_days > 0 {
-            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            match crate::side_effects::clock::system_now().duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => {
                     let epoch = duration.as_secs();
                     for record in &list_result.records {
@@ -4720,14 +4720,15 @@ impl App {
             return records;
         }
 
-        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => d.as_secs(),
-            Err(e) => {
-                self.status_message =
-                    Some(format!("System clock error, skipping auto-archive: {e}"));
-                return records;
-            }
-        };
+        let now =
+            match crate::side_effects::clock::system_now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => d.as_secs(),
+                Err(e) => {
+                    self.status_message =
+                        Some(format!("System clock error, skipping auto-archive: {e}"));
+                    return records;
+                }
+            };
         let archive_secs = archive_days * 86400;
 
         let mut kept = Vec::with_capacity(records.len());
@@ -6495,7 +6496,7 @@ impl App {
             return;
         }
 
-        let now = Instant::now();
+        let now = crate::side_effects::clock::instant_now();
         let armed = matches!(
             self.last_k_press.as_ref(),
             Some((id, t)) if id == &work_item_id
@@ -6525,7 +6526,7 @@ impl App {
     pub fn prune_k_press(&mut self) {
         const WINDOW: Duration = Duration::from_millis(1500);
         if let Some((_, t)) = &self.last_k_press
-            && Instant::now().saturating_duration_since(*t) >= WINDOW
+            && crate::side_effects::clock::instant_now().saturating_duration_since(*t) >= WINDOW
         {
             self.last_k_press = None;
         }
@@ -8782,7 +8783,7 @@ impl App {
         // Track when items enter/leave Done for auto-archival.
         let mut done_at_error = false;
         if *new_status == WorkItemStatus::Done {
-            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            match crate::side_effects::clock::system_now().duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => {
                     if let Err(e) = self.backend.set_done_at(wi_id, Some(duration.as_secs())) {
                         self.status_message = Some(format!("Failed to set archive timestamp: {e}"));
@@ -10739,7 +10740,7 @@ impl App {
                             return; // Receiver dropped - gate cancelled.
                         }
                         iteration += 1;
-                        std::thread::sleep(std::time::Duration::from_secs(15));
+                        crate::side_effects::clock::sleep(std::time::Duration::from_secs(15));
                     }
                 }
             }
@@ -12859,7 +12860,7 @@ pub fn now_iso8601_pub() -> String {
 
 /// Return the current time as an ISO 8601 string (UTC).
 fn now_iso8601() -> String {
-    let dur = std::time::SystemTime::now()
+    let dur = crate::side_effects::clock::system_now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = dur.as_secs();
@@ -13064,12 +13065,12 @@ mod tests {
     /// milliseconds; the 5-second default timeout is for stressed
     /// CI hosts, not for correctness.
     fn wait_until_file_removed(path: &std::path::Path, timeout: std::time::Duration) {
-        let start = std::time::Instant::now();
+        let start = crate::side_effects::clock::instant_now();
         while path.exists() {
             if start.elapsed() >= timeout {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -14694,8 +14695,7 @@ mod tests {
         app.import_selected_unlinked();
 
         // Wait for the background thread to complete and poll the result.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        app.poll_worktree_creation();
+        drain_worktree_creation(&mut app);
 
         // Verify a worktree was created.
         let created = mock_ws.created.lock().unwrap();
@@ -14976,8 +14976,7 @@ mod tests {
         app.import_selected_unlinked();
 
         // Wait for the background thread to complete and poll the result.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        app.poll_worktree_creation();
+        drain_worktree_creation(&mut app);
 
         // Verify NO worktree was created (fetch failed, so we skip).
         let created = mock_ws.created.lock().unwrap();
@@ -15647,8 +15646,7 @@ mod tests {
         app.import_selected_unlinked();
 
         // Wait for the background thread to complete and poll the result.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        app.poll_worktree_creation();
+        drain_worktree_creation(&mut app);
 
         // Verify the worktree target directory uses config.defaults.worktree_dir
         // and sanitizes the branch name.
@@ -17249,10 +17247,10 @@ mod tests {
 
         // Drive the background thread via a polling loop. Bounded by a
         // 2s timeout so a regression cannot wedge CI forever.
-        let start = std::time::Instant::now();
+        let start = crate::side_effects::clock::instant_now();
         while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(
@@ -17365,10 +17363,10 @@ mod tests {
         app.execute_merge(&wi_id, "squash");
         assert!(app.is_merge_precheck_phase());
 
-        let start = std::time::Instant::now();
+        let start = crate::side_effects::clock::instant_now();
         while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(!app.is_merge_precheck_phase());
@@ -17485,10 +17483,10 @@ mod tests {
         app.execute_merge(&wi_id, "squash");
 
         // Drain the precheck.
-        let start = std::time::Instant::now();
+        let start = crate::side_effects::clock::instant_now();
         while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(
@@ -17661,10 +17659,10 @@ mod tests {
         app.execute_merge(&wi_id, "squash");
         assert!(app.is_merge_precheck_phase());
 
-        let start = std::time::Instant::now();
+        let start = crate::side_effects::clock::instant_now();
         while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(
@@ -17704,10 +17702,10 @@ mod tests {
 
         app.execute_merge(&wi_id, "squash");
 
-        let start = std::time::Instant::now();
+        let start = crate::side_effects::clock::instant_now();
         while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(
@@ -17741,10 +17739,10 @@ mod tests {
 
         app.execute_merge(&wi_id, "squash");
 
-        let start = std::time::Instant::now();
+        let start = crate::side_effects::clock::instant_now();
         while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(
@@ -17787,10 +17785,10 @@ mod tests {
 
         app.execute_merge(&wi_id, "squash");
 
-        let start = std::time::Instant::now();
+        let start = crate::side_effects::clock::instant_now();
         while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(
@@ -17925,10 +17923,10 @@ mod tests {
 
         app.execute_merge(&wi_id, "squash");
 
-        let start = std::time::Instant::now();
+        let start = crate::side_effects::clock::instant_now();
         while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         let msg = app.alert_message.as_deref().unwrap_or("");
@@ -18151,7 +18149,7 @@ mod tests {
             owner_repo: "owner/repo".into(),
             branch: "feature/x".into(),
             repo_path: PathBuf::from("/tmp/repo"),
-            last_polled: Some(std::time::Instant::now()),
+            last_polled: Some(crate::side_effects::clock::instant_now()),
         });
         // Seed a stale poll error to confirm it is cleared on the successful
         // merge detection.
@@ -18220,7 +18218,7 @@ mod tests {
             owner_repo: "owner/repo".into(),
             branch: "feature/y".into(),
             repo_path: PathBuf::from("/tmp/repo"),
-            last_polled: Some(std::time::Instant::now()),
+            last_polled: Some(crate::side_effects::clock::instant_now()),
         });
 
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -18288,7 +18286,7 @@ mod tests {
             owner_repo: "owner/repo".into(),
             branch: "feature/backfill".into(),
             repo_path: PathBuf::from("/tmp/repo"),
-            last_polled: Some(std::time::Instant::now()),
+            last_polled: Some(crate::side_effects::clock::instant_now()),
         });
 
         // Simulate a successful poll returning the PR as still OPEN.
@@ -18356,7 +18354,7 @@ mod tests {
                 owner_repo: "owner/repo".into(),
                 branch: branch.into(),
                 repo_path: PathBuf::from("/tmp/repo"),
-                last_polled: Some(std::time::Instant::now()),
+                last_polled: Some(crate::side_effects::clock::instant_now()),
             });
         }
         // Build the display list and select item B so retreat_stage acts
@@ -19628,16 +19626,41 @@ mod tests {
     /// send a `Blocked` message for stub-backend cases (no plan, etc.) so
     /// the loop normally returns within a single millisecond.
     fn drain_review_gate_with_timeout(app: &mut App, wi_id: &WorkItemId) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while app.review_gates.contains_key(wi_id) && std::time::Instant::now() < deadline {
+        let deadline =
+            crate::side_effects::clock::instant_now() + std::time::Duration::from_secs(5);
+        while app.review_gates.contains_key(wi_id)
+            && crate::side_effects::clock::instant_now() < deadline
+        {
             app.poll_review_gate();
             if !app.review_gates.contains_key(wi_id) {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(5));
         }
         // Final poll to catch any message that arrived during the last sleep.
         app.poll_review_gate();
+    }
+
+    fn drain_worktree_creation(app: &mut App) {
+        for _ in 0..1_000 {
+            app.poll_worktree_creation();
+            if !app.is_user_action_in_flight(&UserActionKey::WorktreeCreate) {
+                return;
+            }
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("worktree creation did not finish");
+    }
+
+    fn drain_delete_cleanup(app: &mut App) {
+        for _ in 0..1_000 {
+            app.poll_delete_cleanup();
+            if !app.delete_in_progress {
+                return;
+            }
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("background delete cleanup did not finish");
     }
 
     /// Test helper: insert a manually-constructed `ReviewGateState`
@@ -20984,21 +21007,10 @@ mod tests {
 
         // Open the prompt, confirm, then drain the background cleanup
         // thread via poll_delete_cleanup (matches how the real event
-        // loop consumes results). Spin for up to ~1s so flaky CI still
-        // passes despite thread scheduling jitter.
+        // loop consumes results).
         app.open_delete_prompt();
         app.confirm_delete_from_prompt();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while app.delete_in_progress && std::time::Instant::now() < deadline {
-            app.poll_delete_cleanup();
-            if app.delete_in_progress {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-        assert!(
-            !app.delete_in_progress,
-            "background delete cleanup should have completed within 1s"
-        );
+        drain_delete_cleanup(&mut app);
 
         // Verify remove_worktree was called with correct arguments.
         let rw_calls = recording_ws.remove_worktree_calls.lock().unwrap();
@@ -21141,17 +21153,7 @@ mod tests {
 
         app.open_delete_prompt();
         app.confirm_delete_from_prompt();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while app.delete_in_progress && std::time::Instant::now() < deadline {
-            app.poll_delete_cleanup();
-            if app.delete_in_progress {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-        assert!(
-            !app.delete_in_progress,
-            "background delete cleanup should have completed within 1s"
-        );
+        drain_delete_cleanup(&mut app);
 
         // The closer must have been invoked with the correct arguments
         // so we know we actually exercised the PR-close-first branch,
@@ -21323,7 +21325,7 @@ mod tests {
 
     #[test]
     fn auto_archive_deletes_expired_done_items() {
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
@@ -21348,7 +21350,7 @@ mod tests {
 
     #[test]
     fn auto_archive_skips_when_disabled() {
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
@@ -21393,7 +21395,7 @@ mod tests {
 
     #[test]
     fn auto_archive_keeps_recent_done_items() {
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
@@ -21417,7 +21419,7 @@ mod tests {
 
     #[test]
     fn auto_archive_works_for_derived_done_items() {
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
@@ -21478,7 +21480,7 @@ mod tests {
 
     #[test]
     fn apply_stage_change_clears_done_at_on_retreat() {
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
@@ -22855,7 +22857,7 @@ mod tests {
         // Wait for the background read to produce a result, then drain
         // it via `poll_session_opens`. The spinner MUST be cleared once
         // the result is applied.
-        let recv_start = std::time::Instant::now();
+        let recv_start = crate::side_effects::clock::instant_now();
         loop {
             let ready = app
                 .session_open_rx
@@ -22868,7 +22870,7 @@ mod tests {
             if recv_start.elapsed() > std::time::Duration::from_secs(2) {
                 panic!("background plan-read thread did not produce a result");
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(10));
         }
 
         // `finish_session_open` will try to spawn a Claude session,
@@ -23188,7 +23190,7 @@ mod tests {
         );
 
         // Wait for the single completion message to land in the channel.
-        let recv_start = std::time::Instant::now();
+        let recv_start = crate::side_effects::clock::instant_now();
         loop {
             if !app.orphan_cleanup_finished_rx.is_empty() {
                 break;
@@ -23196,7 +23198,7 @@ mod tests {
             if recv_start.elapsed() > std::time::Duration::from_secs(2) {
                 panic!("orphan cleanup background thread did not enqueue completion message");
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(10));
         }
 
         app.poll_orphan_cleanup_finished();
@@ -23272,7 +23274,7 @@ mod tests {
         );
 
         // Wait for the single completion message to arrive.
-        let recv_start = std::time::Instant::now();
+        let recv_start = crate::side_effects::clock::instant_now();
         loop {
             if !app.orphan_cleanup_finished_rx.is_empty() {
                 break;
@@ -23280,7 +23282,7 @@ mod tests {
             if recv_start.elapsed() > std::time::Duration::from_secs(2) {
                 panic!("orphan cleanup background thread did not enqueue completion message");
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(10));
         }
 
         app.poll_orphan_cleanup_finished();
@@ -23618,7 +23620,7 @@ mod tests {
         )
         .expect("first admit must succeed");
         app.end_user_action(&UserActionKey::GithubRefresh);
-        std::thread::sleep(Duration::from_millis(20));
+        crate::side_effects::clock::sleep(Duration::from_millis(20));
         let retry = app.try_begin_user_action(
             UserActionKey::GithubRefresh,
             Duration::from_millis(10),
@@ -25006,7 +25008,7 @@ mod tests {
         // `poll_review_request_merges` never spawns a real `gh pr
         // view` subprocess during a unit test. Individual tests that
         // exercise Phase 2 can override this back to None.
-        let now = std::time::Instant::now();
+        let now = crate::side_effects::clock::instant_now();
         for w in &mut app.review_request_merge_watches {
             w.last_polled = Some(now);
         }
@@ -25417,7 +25419,7 @@ mod tests {
             owner_repo: "owner/repo".into(),
             branch: "feature/ghost".into(),
             repo_path: PathBuf::from("/tmp/ghost-repo"),
-            last_polled: Some(std::time::Instant::now()),
+            last_polled: Some(crate::side_effects::clock::instant_now()),
         });
         app.review_request_merge_poll_errors
             .insert(rec_id.clone(), "stale".into());

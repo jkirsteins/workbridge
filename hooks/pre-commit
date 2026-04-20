@@ -86,9 +86,9 @@ echo "Agent spawn check OK."
 echo "=== pre-commit: checking for bypasses of src/side_effects/ ==="
 # src/side_effects/ is the ONLY place allowed to reach the real system
 # clipboard, directories::ProjectDirs / BaseDirs / UserDirs,
-# std::env::home_dir, or std::env::temp_dir. Every other file must
-# route through side_effects:: wrappers (for production paths) or
-# tempfile::tempdir() (for test scratch dirs).
+# std::env::home_dir, std::env::temp_dir, or wall-clock time. Every
+# other file must route through side_effects:: wrappers (for
+# production paths) or tempfile::tempdir() (for test scratch dirs).
 #
 # The patterns cover BOTH fully-qualified paths
 # (`std::env::temp_dir()`, `arboard::Clipboard`) AND the `use ...;`
@@ -117,7 +117,7 @@ while IFS= read -r f; do
     esac
     content="$(staged_content "$f")"
     [ -z "$content" ] && continue
-    if printf '%s' "$content" | grep -qE 'arboard::|directories::(ProjectDirs|BaseDirs|UserDirs)|std::env::home_dir|std::env::temp_dir|^[[:space:]]*use[[:space:]]+arboard(::|;|[[:space:]])|^[[:space:]]*use[[:space:]]+directories::(ProjectDirs|BaseDirs|UserDirs)|^[[:space:]]*use[[:space:]]+std::env::(temp_dir|home_dir)'; then
+    if printf '%s' "$content" | grep -qE 'arboard::|directories::(ProjectDirs|BaseDirs|UserDirs)|std::env::home_dir|std::env::temp_dir|Instant::now|SystemTime::now|thread::sleep|^[[:space:]]*use[[:space:]]+arboard(::|;|[[:space:]])|^[[:space:]]*use[[:space:]]+directories::(ProjectDirs|BaseDirs|UserDirs)|^[[:space:]]*use[[:space:]]+std::env::(temp_dir|home_dir)|^[[:space:]]*use[[:space:]]+std::time::(Instant|SystemTime)|^[[:space:]]*use[[:space:]]+std::thread::sleep|^[[:space:]]*use[[:space:]]+std::thread;'; then
         bare_sideeffect_files="$bare_sideeffect_files $f"
     fi
 done < <(list_staged_rs_added_or_modified)
@@ -126,8 +126,9 @@ if [ -n "$bare_sideeffect_files" ]; then
     echo "$bare_sideeffect_files"
     echo ""
     echo "Host-visible APIs (arboard, directories::ProjectDirs/BaseDirs/UserDirs,"
-    echo "std::env::home_dir, std::env::temp_dir) must be reached through"
-    echo "crate::side_effects::{clipboard, paths} or tempfile::tempdir(). Both"
+    echo "std::env::home_dir, std::env::temp_dir, Instant::now, SystemTime::now,"
+    echo "thread::sleep) must be reached through"
+    echo "crate::side_effects::{clipboard, clock, paths} or tempfile::tempdir(). Both"
     echo "qualified references (e.g. 'std::env::temp_dir()') and 'use' imports"
     echo "(e.g. 'use std::env::temp_dir;') are rejected. See:"
     echo "  - docs/TESTING.md 'Side-effect gating module'"
