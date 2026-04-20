@@ -682,7 +682,8 @@ impl AgentBackend for ClaudeCodeBackend {
 /// is delivered via the `--config` CLI flag. The adapter does NOT touch
 /// `~/.codex/config.toml` or any other file in `$HOME`, and does NOT
 /// set environment variables. Temp files written by
-/// `write_session_files` go under `std::env::temp_dir()` only.
+/// `write_session_files` go under the process temp dir only (reached
+/// through `crate::side_effects::paths::temp_dir`).
 pub struct CodexBackend;
 
 impl CodexBackend {
@@ -1164,7 +1165,8 @@ mod tests {
         );
 
         // C4: Codex writes no session files by default in the stub.
-        let cwd = std::env::temp_dir();
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = _tmp.path().to_path_buf();
         let files = backend.write_session_files(&cwd, "{}").unwrap();
         assert!(files.is_empty());
     }
@@ -2224,7 +2226,8 @@ mod tests {
     /// or user home. The caller prepares the temp JSON before spawning.
     #[test]
     fn codex_writes_no_session_files() {
-        let cwd = std::env::temp_dir();
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = _tmp.path().to_path_buf();
         let files = CodexBackend.write_session_files(&cwd, "{}").unwrap();
         assert!(files.is_empty());
     }
@@ -2271,9 +2274,8 @@ mod tests {
         assert!(!verdict.approved);
         assert!(verdict.detail.contains("not yet implemented"));
 
-        let files = backend
-            .write_session_files(&std::env::temp_dir(), "{}")
-            .unwrap();
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let files = backend.write_session_files(_tmp.path(), "{}").unwrap();
         assert!(files.is_empty());
     }
 

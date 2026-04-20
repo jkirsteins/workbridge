@@ -164,6 +164,19 @@ struct SessionMcpConfig {
 /// Accept loop: waits for connections and spawns a thread per connection.
 /// Each connection is handled independently so that a stale health-check
 /// connection cannot block subsequent real connections.
+///
+/// The WouldBlock backoff routes through `side_effects::clock::sleep`
+/// rather than a raw stdlib sleep call. In production that wrapper
+/// forwards to the real 50ms pause, which is what the loop wants.
+/// Under `#[cfg(test)]` the same call becomes a `yield_now` plus a
+/// mock-clock advance, so the accept loop spin-yields instead of
+/// pausing for 50ms of real time. The socket-server smoke tests
+/// (`socket_server_starts_and_stops`, `mcp_tool_call_produces_channel_event`)
+/// rely on that behaviour to finish in milliseconds instead of seconds;
+/// the tradeoff is that this loop consumes more CPU in tests than it
+/// does in production. If that ever becomes a test-flakiness source
+/// on loaded CI, replace the polling loop with a proper non-blocking
+/// accept driven by a signal/eventfd the stop path writes to.
 fn accept_loop(
     listener: UnixListener,
     cfg: &SessionMcpConfig,
@@ -195,7 +208,7 @@ fn accept_loop(
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                crate::side_effects::clock::sleep(std::time::Duration::from_millis(50));
             }
             Err(_) => {
                 break;
@@ -226,7 +239,7 @@ fn global_accept_loop(
                 });
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                crate::side_effects::clock::sleep(std::time::Duration::from_millis(50));
             }
             Err(_) => {
                 break;
@@ -1846,7 +1859,7 @@ mod tests {
         // Stop the server.
         server.stop();
         // Give the accept thread time to exit and clean up.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        crate::side_effects::clock::sleep(std::time::Duration::from_millis(200));
     }
 
     #[test]
@@ -2037,7 +2050,7 @@ mod tests {
         .expect("failed to start server");
 
         // Give the accept loop time to start.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        crate::side_effects::clock::sleep(std::time::Duration::from_millis(100));
 
         // Connect as a client.
         let stream =
@@ -2080,10 +2093,14 @@ mod tests {
             "Plan saved",
         );
 
-        // Check the channel received a SetPlan event.
-        let event = rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("should receive SetPlan event");
+        // Bounded-wait receive via the shared helper, which polls
+        // `try_recv` on a mock-clock-driven timer instead of calling
+        // the stdlib `recv_timeout` (which internally reads the real
+        // monotonic clock via `Condvar::wait_timeout` and is blocked
+        // by the side-effects gate). See
+        // `crate::side_effects::clock::bounded_recv` for the design.
+        let event =
+            crate::side_effects::clock::bounded_recv(&rx, "MCP event channel awaiting SetPlan");
         match event {
             McpEvent::SetPlan { work_item_id, plan } => {
                 assert_eq!(work_item_id, "integration-wi");
@@ -2109,7 +2126,7 @@ mod tests {
         );
 
         server.stop();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        crate::side_effects::clock::sleep(std::time::Duration::from_millis(200));
     }
 
     #[test]

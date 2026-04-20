@@ -340,9 +340,10 @@ pub trait WorkItemBackend: Send + Sync {
 
 /// Local filesystem backend that stores each work item as a JSON file.
 ///
-/// Files are stored in a platform-specific data directory (via
-/// `directories::ProjectDirs`) under a `work-items/` subdirectory.
-/// Each file is named with a UUID v4 and a `.json` extension.
+/// Files are stored in a platform-specific data directory (reached
+/// through `crate::side_effects::paths::project_dirs`) under a
+/// `work-items/` subdirectory. Each file is named with a UUID v4 and
+/// a `.json` extension.
 pub struct LocalFileBackend {
     data_dir: PathBuf,
     /// Serializes read-modify-write access to `id-counters.json` so
@@ -361,7 +362,7 @@ impl LocalFileBackend {
     ///
     /// Creates the directory if it does not exist.
     pub fn new() -> Result<Self, BackendError> {
-        let proj = directories::ProjectDirs::from("", "", "workbridge")
+        let proj = crate::side_effects::paths::project_dirs()
             .ok_or_else(|| BackendError::Io("could not determine data directory".into()))?;
         let data_dir = proj.data_dir().join("work-items");
         fs::create_dir_all(&data_dir).map_err(|e| {
@@ -770,7 +771,7 @@ impl WorkItemBackend for LocalFileBackend {
         // the first log line. An append failure is non-fatal: the JSON
         // record is authoritative and the item still works; only
         // historical metrics lose that one entry.
-        let secs = std::time::SystemTime::now()
+        let secs = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
@@ -1006,15 +1007,22 @@ mod tests {
     use super::*;
     use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("workbridge-test-backend-{name}"));
-        let _ = fs::remove_dir_all(&dir);
-        dir
+    /// Allocate a fresh tempdir for a test. Returns both the `TempDir`
+    /// guard (which removes the directory on drop) and a concrete
+    /// `PathBuf` for ergonomic use. The `_name` argument is retained for
+    /// call-site self-documentation (the suffix used to encode the test
+    /// name into the fixed `/tmp/workbridge-test-backend-<name>` path)
+    /// even though `tempfile::tempdir()` already produces a collision-
+    /// free name.
+    fn temp_dir(_name: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        (tmp, dir)
     }
 
     #[test]
     fn create_and_list_roundtrip() {
-        let dir = temp_dir("roundtrip");
+        let (_tmp, dir) = temp_dir("roundtrip");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1049,13 +1057,11 @@ mod tests {
         assert_eq!(result.records[0].title, "Fix auth bug");
         assert_eq!(result.records[0].status, WorkItemStatus::Backlog);
         assert_eq!(result.records[0].repo_associations.len(), 1);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn create_validates_non_empty_repos() {
-        let dir = temp_dir("validate-repos");
+        let (_tmp, dir) = temp_dir("validate-repos");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let result = backend.create(CreateWorkItem {
@@ -1077,13 +1083,11 @@ mod tests {
             }
             other => panic!("expected Validation error, got: {other}"),
         }
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn delete_removes_file() {
-        let dir = temp_dir("delete");
+        let (_tmp, dir) = temp_dir("delete");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1116,13 +1120,11 @@ mod tests {
 
         let result = backend.list().unwrap();
         assert!(result.records.is_empty());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn delete_not_found() {
-        let dir = temp_dir("delete-notfound");
+        let (_tmp, dir) = temp_dir("delete-notfound");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let result = backend.delete(&WorkItemId::LocalFile(dir.join("nonexistent.json")));
@@ -1143,13 +1145,11 @@ mod tests {
             BackendError::UnsupportedId(_) => {}
             other => panic!("expected UnsupportedId, got: {other}"),
         }
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn delete_archives_activity_log() {
-        let dir = temp_dir("delete-archive");
+        let (_tmp, dir) = temp_dir("delete-archive");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1211,13 +1211,11 @@ mod tests {
             archived_contents, original_contents,
             "archived log must preserve the original bytes"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn delete_creates_archive_dir_if_missing() {
-        let dir = temp_dir("delete-archive-dir-created");
+        let (_tmp, dir) = temp_dir("delete-archive-dir-created");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1257,8 +1255,6 @@ mod tests {
             archive_dir.exists() && archive_dir.is_dir(),
             "delete should create the archive directory on demand"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1268,7 +1264,7 @@ mod tests {
         // removes it to simulate the no-log scenario (e.g. a record
         // imported before the seeding-on-create change, or one whose
         // log was cleaned up out of band).
-        let dir = temp_dir("delete-no-activity");
+        let (_tmp, dir) = temp_dir("delete-no-activity");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1299,13 +1295,11 @@ mod tests {
             !archive_dir.exists(),
             "archive dir should not be created when there is nothing to archive"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn import_creates_from_pr() {
-        let dir = temp_dir("import");
+        let (_tmp, dir) = temp_dir("import");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let unlinked = UnlinkedPr {
@@ -1340,13 +1334,11 @@ mod tests {
         let result = backend.list().unwrap();
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.records[0].title, "Fix the widget");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn list_surfaces_corrupt_files() {
-        let dir = temp_dir("corrupt");
+        let (_tmp, dir) = temp_dir("corrupt");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         // Write a corrupt JSON file directly.
@@ -1383,25 +1375,21 @@ mod tests {
             "reason should mention corrupt JSON, got: {}",
             result.corrupt[0].reason,
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn list_empty_dir() {
-        let dir = temp_dir("empty");
+        let (_tmp, dir) = temp_dir("empty");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let result = backend.list().unwrap();
         assert!(result.records.is_empty());
         assert!(result.corrupt.is_empty());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn update_status_persists() {
-        let dir = temp_dir("update-status");
+        let (_tmp, dir) = temp_dir("update-status");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1435,13 +1423,11 @@ mod tests {
 
         let result = backend.list().unwrap();
         assert_eq!(result.records[0].status, WorkItemStatus::Implementing);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn update_status_not_found() {
-        let dir = temp_dir("update-notfound");
+        let (_tmp, dir) = temp_dir("update-notfound");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let result = backend.update_status(
@@ -1453,13 +1439,11 @@ mod tests {
             BackendError::NotFound(_) => {}
             other => panic!("expected NotFound, got: {other}"),
         }
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn update_title_persists() {
-        let dir = temp_dir("update-title");
+        let (_tmp, dir) = temp_dir("update-title");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1483,13 +1467,11 @@ mod tests {
         let result = backend.list().unwrap();
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.records[0].title, "Implement dark mode toggle");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn update_title_not_found() {
-        let dir = temp_dir("update-title-notfound");
+        let (_tmp, dir) = temp_dir("update-title-notfound");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let result =
@@ -1499,13 +1481,11 @@ mod tests {
             BackendError::NotFound(_) => {}
             other => panic!("expected NotFound, got: {other}"),
         }
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn update_branch_persists() {
-        let dir = temp_dir("update-branch");
+        let (_tmp, dir) = temp_dir("update-branch");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1533,13 +1513,11 @@ mod tests {
             result.records[0].repo_associations[0].branch.as_deref(),
             Some("feature/x")
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn update_branch_not_found() {
-        let dir = temp_dir("update-branch-notfound");
+        let (_tmp, dir) = temp_dir("update-branch-notfound");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let result = backend.update_branch(
@@ -1552,13 +1530,11 @@ mod tests {
             BackendError::NotFound(_) => {}
             other => panic!("expected NotFound, got: {other}"),
         }
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn update_branch_only_touches_matching_repo() {
-        let dir = temp_dir("update-branch-scoped");
+        let (_tmp, dir) = temp_dir("update-branch-scoped");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1602,8 +1578,6 @@ mod tests {
             Some("existing/b"),
             "unrelated repo association must not be mutated"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1630,7 +1604,7 @@ mod tests {
 
     #[test]
     fn activity_log_append_and_read_roundtrip() {
-        let dir = temp_dir("activity-roundtrip");
+        let (_tmp, dir) = temp_dir("activity-roundtrip");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1676,8 +1650,6 @@ mod tests {
         assert_eq!(entries[2].event_type, "note");
         assert_eq!(entries[2].timestamp, "2000Z");
         assert_eq!(entries[2].payload["message"], "started work");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1687,7 +1659,7 @@ mod tests {
         // metrics dashboard count freshly created items in
         // `created_per_day` and in the current-backlog trailing edge
         // before any subsequent stage_change happens.
-        let dir = temp_dir("activity-seeded-on-create");
+        let (_tmp, dir) = temp_dir("activity-seeded-on-create");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1724,13 +1696,11 @@ mod tests {
             secs > 1_600_000_000,
             "timestamp should be a real epoch: {ts}"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn plan_storage_roundtrip() {
-        let dir = temp_dir("plan-roundtrip");
+        let (_tmp, dir) = temp_dir("plan-roundtrip");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1772,13 +1742,11 @@ mod tests {
         let result = backend.list().unwrap();
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.records[0].plan, Some("Revised plan".to_string()),);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn activity_path_for_returns_path() {
-        let dir = temp_dir("activity-path");
+        let (_tmp, dir) = temp_dir("activity-path");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1808,8 +1776,6 @@ mod tests {
             "path should end with .jsonl, got: {}",
             path.display(),
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1828,7 +1794,7 @@ mod tests {
 
     #[test]
     fn set_done_at_roundtrip() {
-        let dir = temp_dir("set-done-at");
+        let (_tmp, dir) = temp_dir("set-done-at");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1858,13 +1824,11 @@ mod tests {
         backend.set_done_at(&record.id, None).unwrap();
         let result = backend.list().unwrap();
         assert_eq!(result.records[0].done_at, None);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn save_pr_identity_roundtrip() {
-        let dir = temp_dir("pr-identity");
+        let (_tmp, dir) = temp_dir("pr-identity");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let repo = PathBuf::from("/my/repo");
@@ -1916,8 +1880,6 @@ mod tests {
             .as_ref()
             .expect("pr_identity should survive list roundtrip");
         assert_eq!(listed.number, 42);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------
@@ -1948,7 +1910,7 @@ mod tests {
 
     #[test]
     fn create_assigns_display_id() {
-        let dir = temp_dir("display-id-first");
+        let (_tmp, dir) = temp_dir("display-id-first");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let record = backend
@@ -1960,13 +1922,11 @@ mod tests {
             Some("workbridge-1"),
             "first item in `workbridge` repo should be workbridge-1"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn display_id_counts_per_repo() {
-        let dir = temp_dir("display-id-per-repo");
+        let (_tmp, dir) = temp_dir("display-id-per-repo");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         // Three items in `foo`, interleaved with two in `bar`. The
@@ -1984,13 +1944,11 @@ mod tests {
         assert_eq!(f3.display_id.as_deref(), Some("foo-3"));
         assert_eq!(b1.display_id.as_deref(), Some("bar-1"));
         assert_eq!(b2.display_id.as_deref(), Some("bar-2"));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn display_id_never_reuses_on_delete() {
-        let dir = temp_dir("display-id-no-reuse");
+        let (_tmp, dir) = temp_dir("display-id-no-reuse");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let r1 = backend.create(make_request("/repos/foo", "one")).unwrap();
@@ -2009,14 +1967,11 @@ mod tests {
             Some("foo-4"),
             "deleted IDs leave permanent gaps; the counter always advances"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn counter_persists_across_backend_instances() {
-        let dir = temp_dir("display-id-persist");
-        let _ = fs::remove_dir_all(&dir);
+        let (_tmp, dir) = temp_dir("display-id-persist");
 
         // Instance 1: allocate foo-1.
         {
@@ -2037,8 +1992,6 @@ mod tests {
                 "counter must survive backend drop/recreate via id-counters.json"
             );
         }
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2046,7 +1999,7 @@ mod tests {
         // Migration-compat: an on-disk JSON written before the
         // `display_id` field existed must still load cleanly with
         // `display_id: None`.
-        let dir = temp_dir("display-id-legacy");
+        let (_tmp, dir) = temp_dir("display-id-legacy");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let legacy_path = dir.join("legacy.json");
@@ -2071,8 +2024,6 @@ mod tests {
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.records[0].display_id, None);
         assert_eq!(result.records[0].title, "Pre-feature item");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2080,7 +2031,7 @@ mod tests {
         // A manually corrupted `id-counters.json` must be tolerated:
         // the backend logs a warning, starts the counter from zero,
         // and the next save rewrites a valid file from scratch.
-        let dir = temp_dir("display-id-corrupt-counter");
+        let (_tmp, dir) = temp_dir("display-id-corrupt-counter");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         fs::write(dir.join("id-counters.json"), "{bad json").unwrap();
@@ -2099,8 +2050,6 @@ mod tests {
         let parsed: HashMap<String, u64> =
             serde_json::from_str(&contents).expect("counter file should be valid JSON after save");
         assert_eq!(parsed.get("foo").copied(), Some(1));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2109,7 +2058,7 @@ mod tests {
         // must skip it rather than reporting it as corrupt. Without
         // the skip, every normal startup would surface a fake
         // "corrupt JSON" entry in the UI.
-        let dir = temp_dir("display-id-counter-skip");
+        let (_tmp, dir) = temp_dir("display-id-counter-skip");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         backend.create(make_request("/repos/foo", "one")).unwrap();
@@ -2121,8 +2070,6 @@ mod tests {
             result.corrupt
         );
         assert_eq!(result.records.len(), 1);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------
@@ -2151,7 +2098,7 @@ mod tests {
 
     #[test]
     fn legacy_record_missing_id_loads_cleanly_via_list() {
-        let dir = temp_dir("missing-id-list");
+        let (_tmp, dir) = temp_dir("missing-id-list");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let legacy_path = dir.join("legacy-no-id.json");
@@ -2178,13 +2125,11 @@ mod tests {
         // placeholder from `#[serde(default)]` has been overwritten
         // by `list()` with the real on-disk path.
         assert_eq!(record.id, WorkItemId::LocalFile(legacy_path));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn legacy_record_missing_id_loads_cleanly_via_read() {
-        let dir = temp_dir("missing-id-read");
+        let (_tmp, dir) = temp_dir("missing-id-read");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         let legacy_path = dir.join("legacy-read.json");
@@ -2200,8 +2145,6 @@ mod tests {
         assert_eq!(record.title, "Legacy item");
         assert_eq!(record.status, WorkItemStatus::Implementing);
         assert_eq!(record.id, WorkItemId::LocalFile(legacy_path));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2209,7 +2152,7 @@ mod tests {
         // Genuine corruption (malformed JSON) must NOT be swept up by
         // the missing-id serde default. It has to keep surfacing as a
         // CorruptRecord with a "corrupt JSON" reason.
-        let dir = temp_dir("missing-id-still-corrupt");
+        let (_tmp, dir) = temp_dir("missing-id-still-corrupt");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         fs::write(dir.join("broken.json"), "{ this is not json").unwrap();
@@ -2222,8 +2165,6 @@ mod tests {
             "reason should still mention corrupt JSON, got: {}",
             result.corrupt[0].reason
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2236,7 +2177,7 @@ mod tests {
         // must surface as `CorruptRecord`. Guards against a future
         // refactor that "helps" by synthesizing a placeholder for any
         // parse error on the id field.
-        let dir = temp_dir("malformed-id-still-corrupt");
+        let (_tmp, dir) = temp_dir("malformed-id-still-corrupt");
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         fs::write(
@@ -2259,7 +2200,5 @@ mod tests {
             "reason should mention corrupt JSON, got: {}",
             result.corrupt[0].reason
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }

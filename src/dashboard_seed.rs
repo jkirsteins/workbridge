@@ -49,7 +49,7 @@ pub fn seed_dashboard(target_dir: &Path) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&archive_dir)?;
     refuse_if_populated(&archive_dir)?;
 
-    let now = std::time::SystemTime::now()
+    let now = crate::side_effects::clock::system_now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
     let day = 86_400_i64;

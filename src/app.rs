@@ -2131,7 +2131,7 @@ macro_rules! impl_pr_merge_poll_method {
             // -- Phase 2: spawn polls for any watch whose per-item
             // cooldown has elapsed and which has no in-flight poll. --
             let cooldown = std::time::Duration::from_secs(30);
-            let now = std::time::Instant::now();
+            let now = crate::side_effects::clock::instant_now();
             let mut to_spawn: Vec<(WorkItemId, Option<u64>, String, String, PathBuf)> =
                 Vec::new();
             for watch in &self.$watches_field {
@@ -2487,7 +2487,7 @@ impl App {
     pub fn push_toast(&mut self, text: String) {
         self.toasts.push(Toast {
             text,
-            expires_at: Instant::now() + Duration::from_secs(2),
+            expires_at: crate::side_effects::clock::instant_now() + Duration::from_secs(2),
         });
     }
 
@@ -2495,7 +2495,7 @@ impl App {
     /// the per-tick hook in `salsa::app_event`. Keeps the vector from
     /// growing unbounded and is the only thing that removes toasts.
     pub fn prune_toasts(&mut self) {
-        let now = Instant::now();
+        let now = crate::side_effects::clock::instant_now();
         self.toasts.retain(|t| t.expires_at > now);
     }
 
@@ -2518,7 +2518,7 @@ impl App {
     /// Does not touch the PTY selection state - this path is
     /// independent of the existing drag-select copy flow.
     pub fn fire_chrome_copy(&mut self, value: String, kind: ClickKind) {
-        let ok = crate::clipboard::copy(&value);
+        let ok = crate::side_effects::clipboard::copy(&value);
         let short = short_display(&value, kind);
         let text = if ok {
             format!("Copied: {short}")
@@ -2583,7 +2583,7 @@ impl App {
         debounce: Duration,
         message: impl Into<String>,
     ) -> Option<ActivityId> {
-        let now = Instant::now();
+        let now = crate::side_effects::clock::instant_now();
         if self.user_actions.in_flight.contains_key(&key) {
             return None;
         }
@@ -3733,7 +3733,7 @@ impl App {
         // Start the archival clock for items that became Done through PR merge
         // (derived status) but don't yet have a done_at timestamp.
         if self.config.defaults.archive_after_days > 0 {
-            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            match crate::side_effects::clock::system_now().duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => {
                     let epoch = duration.as_secs();
                     for record in &list_result.records {
@@ -4720,14 +4720,15 @@ impl App {
             return records;
         }
 
-        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => d.as_secs(),
-            Err(e) => {
-                self.status_message =
-                    Some(format!("System clock error, skipping auto-archive: {e}"));
-                return records;
-            }
-        };
+        let now =
+            match crate::side_effects::clock::system_now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => d.as_secs(),
+                Err(e) => {
+                    self.status_message =
+                        Some(format!("System clock error, skipping auto-archive: {e}"));
+                    return records;
+                }
+            };
         let archive_secs = archive_days * 86400;
 
         let mut kept = Vec::with_capacity(records.len());
@@ -5599,7 +5600,7 @@ impl App {
         // without needing to see the worker's `SessionOpenPlanResult`.
         // Per-call UUID so concurrent workers for different work
         // items cannot collide on a shared filename.
-        let mcp_config_path = std::env::temp_dir().join(format!(
+        let mcp_config_path = crate::side_effects::paths::temp_dir().join(format!(
             "workbridge-mcp-config-{}.json",
             uuid::Uuid::new_v4()
         ));
@@ -6495,7 +6496,7 @@ impl App {
             return;
         }
 
-        let now = Instant::now();
+        let now = crate::side_effects::clock::instant_now();
         let armed = matches!(
             self.last_k_press.as_ref(),
             Some((id, t)) if id == &work_item_id
@@ -6525,7 +6526,7 @@ impl App {
     pub fn prune_k_press(&mut self) {
         const WINDOW: Duration = Duration::from_millis(1500);
         if let Some((_, t)) = &self.last_k_press
-            && Instant::now().saturating_duration_since(*t) >= WINDOW
+            && crate::side_effects::clock::instant_now().saturating_duration_since(*t) >= WINDOW
         {
             self.last_k_press = None;
         }
@@ -8782,7 +8783,7 @@ impl App {
         // Track when items enter/leave Done for auto-archival.
         let mut done_at_error = false;
         if *new_status == WorkItemStatus::Done {
-            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            match crate::side_effects::clock::system_now().duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => {
                     if let Err(e) = self.backend.set_done_at(wi_id, Some(duration.as_secs())) {
                         self.status_message = Some(format!("Failed to set archive timestamp: {e}"));
@@ -10739,7 +10740,7 @@ impl App {
                             return; // Receiver dropped - gate cancelled.
                         }
                         iteration += 1;
-                        std::thread::sleep(std::time::Duration::from_secs(15));
+                        crate::side_effects::clock::sleep(std::time::Duration::from_secs(15));
                     }
                 }
             }
@@ -10806,7 +10807,7 @@ impl App {
                 }
             };
             let mcp_config = crate::mcp::build_mcp_config(&exe_path, &gate_socket, &[]);
-            let config_path = std::env::temp_dir()
+            let config_path = crate::side_effects::paths::temp_dir()
                 .join(format!("workbridge-rg-mcp-{}.json", uuid::Uuid::new_v4()));
             if let Err(e) = std::fs::write(&config_path, &mcp_config) {
                 drop(gate_server);
@@ -11228,7 +11229,7 @@ impl App {
                     }
                 };
                 let mcp_config = crate::mcp::build_mcp_config(&exe_path, &gate_socket, &[]);
-                let path = std::env::temp_dir().join(format!(
+                let path = crate::side_effects::paths::temp_dir().join(format!(
                     "workbridge-rebase-mcp-{}.json",
                     uuid::Uuid::new_v4()
                 ));
@@ -12383,7 +12384,7 @@ impl App {
         // scheme, teardown + respawn + the old worker finishing
         // late would delete the new worker's live config file out
         // from under it.
-        let config_path = std::env::temp_dir().join(format!(
+        let config_path = crate::side_effects::paths::temp_dir().join(format!(
             "workbridge-global-mcp-{}-{}.json",
             std::process::id(),
             uuid::Uuid::new_v4()
@@ -12534,7 +12535,8 @@ impl App {
                 drop(mcp_server);
                 return;
             }
-            let scratch = std::env::temp_dir().join("workbridge-global-assistant-cwd");
+            let scratch =
+                crate::side_effects::paths::temp_dir().join("workbridge-global-assistant-cwd");
             if let Err(e) = std::fs::create_dir_all(&scratch) {
                 let _ = tx.send(GlobalSessionPrepResult {
                     mcp_server: Some(mcp_server),
@@ -12858,7 +12860,7 @@ pub fn now_iso8601_pub() -> String {
 
 /// Return the current time as an ISO 8601 string (UTC).
 fn now_iso8601() -> String {
-    let dur = std::time::SystemTime::now()
+    let dur = crate::side_effects::clock::system_now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = dur.as_secs();
@@ -13063,22 +13065,28 @@ mod tests {
     /// milliseconds; the 5-second default timeout is for stressed
     /// CI hosts, not for correctness.
     fn wait_until_file_removed(path: &std::path::Path, timeout: std::time::Duration) {
-        let start = std::time::Instant::now();
+        let start = crate::side_effects::clock::instant_now();
         while path.exists() {
-            if start.elapsed() >= timeout {
+            if crate::side_effects::clock::elapsed_since(start) >= timeout {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(10));
         }
     }
+
+    // The wall-clock-free bounded-receive helper lives in
+    // `crate::side_effects::clock::bounded_recv` and works with both
+    // `mpsc::Receiver` and `crossbeam_channel::Receiver`. It replaces
+    // three earlier per-module copies that had drifted on iteration
+    // budget and panic wording.
 
     // -- F-1 regression test --
 
     #[test]
     fn manage_unmanage_sets_fetcher_repos_changed() {
         // Setup: create a config with a base_dir containing a discovered repo.
-        let dir = std::env::temp_dir().join("workbridge-test-f1-fetcher-flag");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("repo-a/.git")).unwrap();
 
         let mut cfg = Config::default();
@@ -13118,16 +13126,14 @@ mod tests {
             app.fetcher_repos_changed,
             "fetcher_repos_changed should be true after unmanage"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- F-3 regression test --
 
     #[test]
     fn is_inside_managed_repo_positive() {
-        let dir = std::env::temp_dir().join("workbridge-test-f3-managed");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         // Create the subdirectory on disk so canonicalize succeeds.
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -13144,8 +13150,6 @@ mod tests {
         assert!(app.is_inside_managed_repo(&subdir));
         // An unrelated path should not be inside.
         assert!(!app.is_inside_managed_repo(&PathBuf::from("/tmp/unrelated")));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- Round 3 regression tests --
@@ -13155,8 +13159,8 @@ mod tests {
     /// a subdirectory of a managed repo.
     #[test]
     fn managed_repo_root_returns_root_not_subdir() {
-        let dir = std::env::temp_dir().join("workbridge-test-r3-f1-root");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join("src/deeply/nested")).unwrap();
 
@@ -13178,8 +13182,6 @@ mod tests {
             canonical_dir.display(),
             subdir.display(),
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// F-2: fetcher_repos_changed is set after import and delete.
@@ -13617,8 +13619,8 @@ mod tests {
     #[test]
     fn active_repo_cache_uses_canonical_paths() {
         // Create a real directory and a symlink to it.
-        let dir = std::env::temp_dir().join("workbridge-test-r4-f1-canonical");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         let real_path = dir.join("real-repo");
         let link_path = dir.join("link-repo");
         std::fs::create_dir_all(real_path.join(".git")).unwrap();
@@ -13671,8 +13673,6 @@ mod tests {
             repo_data.contains_key(cached_path),
             "repo_data lookup by canonical path should succeed",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// F-2: Unmanaging a repo prunes stale fetch cache entries.
@@ -14135,8 +14135,8 @@ mod tests {
     /// so sorting ensures stable display indices.
     #[test]
     fn backend_list_returns_sorted_records() {
-        let dir = std::env::temp_dir().join("workbridge-test-r5-f1-sorted");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         let backend = crate::work_item_backend::LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         // Create items with names that would sort differently than creation order.
@@ -14177,8 +14177,6 @@ mod tests {
         assert_eq!(paths[0], dir.join("aaa.json"));
         assert_eq!(paths[1], dir.join("mmm.json"));
         assert_eq!(paths[2], dir.join("zzz.json"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// F-3: Fetch errors queued while status bar is occupied eventually
@@ -14703,8 +14701,7 @@ mod tests {
         app.import_selected_unlinked();
 
         // Wait for the background thread to complete and poll the result.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        app.poll_worktree_creation();
+        drain_worktree_creation(&mut app);
 
         // Verify a worktree was created.
         let created = mock_ws.created.lock().unwrap();
@@ -14985,8 +14982,7 @@ mod tests {
         app.import_selected_unlinked();
 
         // Wait for the background thread to complete and poll the result.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        app.poll_worktree_creation();
+        drain_worktree_creation(&mut app);
 
         // Verify NO worktree was created (fetch failed, so we skip).
         let created = mock_ws.created.lock().unwrap();
@@ -15117,12 +15113,8 @@ mod tests {
 
         // find_reusable_worktree canonicalizes both paths, so they must
         // exist on disk. Use a temp dir with a fresh subdirectory per case.
-        let root = std::env::temp_dir().join(format!(
-            "workbridge-reusable-worktree-test-{}",
-            std::process::id(),
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let root = _tmp.path().to_path_buf();
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let wt_target = repo.join(".worktrees").join("feature-x");
@@ -15207,8 +15199,6 @@ mod tests {
             App::find_reusable_worktree(&mock, &repo, "feature-x", &missing_target).is_none(),
             "non-existent target path must not match anything",
         );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 
     // -----------------------------------------------------------------------
@@ -15662,8 +15652,7 @@ mod tests {
         app.import_selected_unlinked();
 
         // Wait for the background thread to complete and poll the result.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        app.poll_worktree_creation();
+        drain_worktree_creation(&mut app);
 
         // Verify the worktree target directory uses config.defaults.worktree_dir
         // and sanitizes the branch name.
@@ -17264,15 +17253,24 @@ mod tests {
 
         // Drive the background thread via a polling loop. Bounded by a
         // 2s timeout so a regression cannot wedge CI forever.
-        let start = std::time::Instant::now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        let start = crate::side_effects::clock::instant_now();
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(
             !app.is_merge_precheck_phase(),
-            "precheck must drain within 2s",
+            "precheck must drain within 60s",
         );
         assert!(
             app.is_user_action_in_flight(&UserActionKey::PrMerge),
@@ -17380,10 +17378,19 @@ mod tests {
         app.execute_merge(&wi_id, "squash");
         assert!(app.is_merge_precheck_phase());
 
-        let start = std::time::Instant::now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        let start = crate::side_effects::clock::instant_now();
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(!app.is_merge_precheck_phase());
@@ -17500,15 +17507,24 @@ mod tests {
         app.execute_merge(&wi_id, "squash");
 
         // Drain the precheck.
-        let start = std::time::Instant::now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        let start = crate::side_effects::clock::instant_now();
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(
             !app.is_merge_precheck_phase(),
-            "precheck must drain within 2s",
+            "precheck must drain within 60s",
         );
         assert!(
             app.alert_message.is_none(),
@@ -17676,10 +17692,19 @@ mod tests {
         app.execute_merge(&wi_id, "squash");
         assert!(app.is_merge_precheck_phase());
 
-        let start = std::time::Instant::now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        let start = crate::side_effects::clock::instant_now();
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(
@@ -17719,10 +17744,19 @@ mod tests {
 
         app.execute_merge(&wi_id, "squash");
 
-        let start = std::time::Instant::now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        let start = crate::side_effects::clock::instant_now();
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(
@@ -17756,15 +17790,24 @@ mod tests {
 
         app.execute_merge(&wi_id, "squash");
 
-        let start = std::time::Instant::now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        let start = crate::side_effects::clock::instant_now();
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(
             !app.is_merge_precheck_phase(),
-            "precheck must drain within 2s",
+            "precheck must drain within 60s",
         );
         assert!(
             app.is_user_action_in_flight(&UserActionKey::PrMerge),
@@ -17802,10 +17845,19 @@ mod tests {
 
         app.execute_merge(&wi_id, "squash");
 
-        let start = std::time::Instant::now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        let start = crate::side_effects::clock::instant_now();
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         assert!(
@@ -17940,10 +17992,19 @@ mod tests {
 
         app.execute_merge(&wi_id, "squash");
 
-        let start = std::time::Instant::now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        let start = crate::side_effects::clock::instant_now();
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
-            std::thread::sleep(Duration::from_millis(10));
+            crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
 
         let msg = app.alert_message.as_deref().unwrap_or("");
@@ -18166,7 +18227,7 @@ mod tests {
             owner_repo: "owner/repo".into(),
             branch: "feature/x".into(),
             repo_path: PathBuf::from("/tmp/repo"),
-            last_polled: Some(std::time::Instant::now()),
+            last_polled: Some(crate::side_effects::clock::instant_now()),
         });
         // Seed a stale poll error to confirm it is cleared on the successful
         // merge detection.
@@ -18235,7 +18296,7 @@ mod tests {
             owner_repo: "owner/repo".into(),
             branch: "feature/y".into(),
             repo_path: PathBuf::from("/tmp/repo"),
-            last_polled: Some(std::time::Instant::now()),
+            last_polled: Some(crate::side_effects::clock::instant_now()),
         });
 
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -18303,7 +18364,7 @@ mod tests {
             owner_repo: "owner/repo".into(),
             branch: "feature/backfill".into(),
             repo_path: PathBuf::from("/tmp/repo"),
-            last_polled: Some(std::time::Instant::now()),
+            last_polled: Some(crate::side_effects::clock::instant_now()),
         });
 
         // Simulate a successful poll returning the PR as still OPEN.
@@ -18371,7 +18432,7 @@ mod tests {
                 owner_repo: "owner/repo".into(),
                 branch: branch.into(),
                 repo_path: PathBuf::from("/tmp/repo"),
-                last_polled: Some(std::time::Instant::now()),
+                last_polled: Some(crate::side_effects::clock::instant_now()),
             });
         }
         // Build the display list and select item B so retreat_stage acts
@@ -18633,13 +18694,14 @@ mod tests {
 
     /// Helper: spin up an App backed by a real LocalFileBackend in a
     /// temp directory with one Backlog work item whose repo association
-    /// has `branch: None`. Returns (app, wi_id, temp_dir) so the caller
-    /// owns cleanup.
-    fn app_with_branchless_backlog_item(name: &str) -> (App, WorkItemId, PathBuf) {
+    /// has `branch: None`. Returns (app, wi_id, tempdir_guard); the
+    /// `TempDir` must be held live by the caller (else its Drop removes
+    /// the backend's on-disk directory mid-test).
+    fn app_with_branchless_backlog_item(_name: &str) -> (App, WorkItemId, tempfile::TempDir) {
         use crate::work_item_backend::{CreateWorkItem, LocalFileBackend, RepoAssociationRecord};
 
-        let dir = std::env::temp_dir().join(format!("workbridge-test-branchless-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
         let record = backend
             .create(CreateWorkItem {
@@ -18663,7 +18725,7 @@ mod tests {
         app.selected_work_item = Some(wi_id.clone());
         app.build_display_list();
 
-        (app, wi_id, dir)
+        (app, wi_id, tmp)
     }
 
     /// advance_stage from a branchless Backlog item must refuse the
@@ -18671,7 +18733,7 @@ mod tests {
     /// is not silently moved into Planning with no branch set.
     #[test]
     fn advance_from_backlog_without_branch_opens_dialog() {
-        let (mut app, wi_id, dir) = app_with_branchless_backlog_item("advance-opens");
+        let (mut app, wi_id, _tmp) = app_with_branchless_backlog_item("advance-opens");
 
         app.advance_stage();
 
@@ -18697,8 +18759,6 @@ mod tests {
             WorkItemStatus::Backlog,
             "advance must not mutate status when the branch invariant fails",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Confirming the Set branch dialog from an advance_stage-triggered
@@ -18706,7 +18766,7 @@ mod tests {
     /// the same stage change so the work item actually advances.
     #[test]
     fn confirm_set_branch_dialog_persists_and_advances() {
-        let (mut app, wi_id, dir) = app_with_branchless_backlog_item("confirm-advance");
+        let (mut app, wi_id, _tmp) = app_with_branchless_backlog_item("confirm-advance");
 
         // Open the dialog via the advance path.
         app.advance_stage();
@@ -18736,8 +18796,6 @@ mod tests {
             Some("user/needs-a-branch-abcd"),
             "branch must be persisted to the repo association",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Confirming the Set branch dialog from a spawn_session-triggered
@@ -18750,8 +18808,8 @@ mod tests {
     fn confirm_set_branch_dialog_persists_and_spawns_session() {
         use crate::work_item_backend::{CreateWorkItem, LocalFileBackend, RepoAssociationRecord};
 
-        let dir = std::env::temp_dir().join("workbridge-test-branchless-spawn");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
         // Use Planning so spawn_session proceeds past the
         // Backlog/Done/Mergequeue early-return.
@@ -18807,8 +18865,6 @@ mod tests {
             app.is_user_action_in_flight(&UserActionKey::WorktreeCreate),
             "re-driven spawn_session must admit a WorktreeCreate action",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Esc (cancel_set_branch_dialog) must not mutate anything: the
@@ -18816,7 +18872,7 @@ mod tests {
     /// on disk is untouched, and there is no lingering dialog state.
     #[test]
     fn cancel_set_branch_dialog_leaves_item_unchanged() {
-        let (mut app, wi_id, dir) = app_with_branchless_backlog_item("cancel");
+        let (mut app, wi_id, _tmp) = app_with_branchless_backlog_item("cancel");
 
         app.advance_stage();
         assert!(app.set_branch_dialog.is_some());
@@ -18827,8 +18883,6 @@ mod tests {
         let wi = app.work_items.iter().find(|w| w.id == wi_id).unwrap();
         assert_eq!(wi.status, WorkItemStatus::Backlog);
         assert!(wi.repo_associations[0].branch.is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// spawn_session on a branchless Planning item opens the dialog
@@ -18838,8 +18892,8 @@ mod tests {
     fn spawn_session_on_branchless_item_opens_dialog_instead_of_message() {
         use crate::work_item_backend::{CreateWorkItem, LocalFileBackend, RepoAssociationRecord};
 
-        let dir = std::env::temp_dir().join("workbridge-test-branchless-spawn-msg");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
         let record = backend
             .create(CreateWorkItem {
@@ -18873,8 +18927,6 @@ mod tests {
             !msg.contains("Set a branch name"),
             "old dead-end status message should be gone, got: {msg}",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Session lookup requires matching stage in composite key.
@@ -19070,12 +19122,12 @@ mod tests {
             agent_written_files: Vec::new(),
         });
 
-        // Pre-populate a real temp file as the MCP config path so we can
-        // verify teardown actually deletes the file from disk.
-        let temp_path = std::env::temp_dir().join(format!(
-            "workbridge-teardown-test-{}.json",
-            std::process::id()
-        ));
+        // Pre-populate a real temp file as the MCP config path so we
+        // can verify teardown actually deletes the file from disk. Use
+        // a collision-free unique name under tempfile's tempdir so
+        // parallel test threads cannot race on a shared path.
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let temp_path = _tmp.path().join("workbridge-teardown-test.json");
         std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
         assert!(temp_path.exists(), "precondition: temp file exists");
         app.global_mcp_config_path = Some(temp_path.clone());
@@ -19191,16 +19243,12 @@ mod tests {
 
         // Create two real tempfiles that mimic the side-car files
         // the worker would have written by the time the user
-        // cancels.
-        let temp_dir = std::env::temp_dir();
-        let mcp_config_path = temp_dir.join(format!(
-            "workbridge-cancel-test-mcp-{}.json",
-            uuid::Uuid::new_v4()
-        ));
-        let side_car_path = temp_dir.join(format!(
-            "workbridge-cancel-test-sidecar-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        // cancels. Use tempfile's unique-name tempdir so parallel
+        // test threads cannot collide on a shared fixed path.
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let tmp_root = _tmp.path();
+        let mcp_config_path = tmp_root.join("workbridge-cancel-test-mcp.json");
+        let side_car_path = tmp_root.join("workbridge-cancel-test-sidecar.json");
         std::fs::write(&mcp_config_path, b"{}").expect("create mcp_config tempfile");
         std::fs::write(&side_car_path, b"{}").expect("create side-car tempfile");
 
@@ -19318,10 +19366,8 @@ mod tests {
             agent_written_files: Vec::new(),
         });
 
-        let temp_path = std::env::temp_dir().join(format!(
-            "workbridge-toggle-close-test-{}.json",
-            std::process::id()
-        ));
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let temp_path = _tmp.path().join("workbridge-toggle-close-test.json");
         std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
         app.global_mcp_config_path = Some(temp_path.clone());
         app.pending_global_pty_bytes.extend_from_slice(b"leftover");
@@ -19658,16 +19704,53 @@ mod tests {
     /// send a `Blocked` message for stub-backend cases (no plan, etc.) so
     /// the loop normally returns within a single millisecond.
     fn drain_review_gate_with_timeout(app: &mut App, wi_id: &WorkItemId) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while app.review_gates.contains_key(wi_id) && std::time::Instant::now() < deadline {
+        let deadline =
+            crate::side_effects::clock::instant_now() + std::time::Duration::from_secs(5);
+        while app.review_gates.contains_key(wi_id)
+            && crate::side_effects::clock::instant_now() < deadline
+        {
             app.poll_review_gate();
             if !app.review_gates.contains_key(wi_id) {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(5));
         }
         // Final poll to catch any message that arrived during the last sleep.
         app.poll_review_gate();
+    }
+
+    /// Poll a state-flag that flips when a background worker thread
+    /// completes. The iteration cap matches `clock::bounded_recv`
+    /// (6000); we deliberately oversize the budget because mock
+    /// `clock::sleep` is pure `yield_now` under cfg(test) and the
+    /// worker thread may need many scheduler turns to run on a
+    /// single-core-ish CI host before the main thread's poll sees the
+    /// flag clear. On macOS 1000 iterations was empirically enough;
+    /// on Ubuntu CI runners 1000 is too tight and the loop panics
+    /// spuriously even though the worker is not actually wedged.
+    /// 6000 iterations absorbs that jitter while still bounding a
+    /// real livelock (the thread-local safety cap in
+    /// `side_effects::clock::sleep` would trip at 100_000 anyway).
+    fn drain_worktree_creation(app: &mut App) {
+        for _ in 0..6_000 {
+            app.poll_worktree_creation();
+            if !app.is_user_action_in_flight(&UserActionKey::WorktreeCreate) {
+                return;
+            }
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("worktree creation did not finish");
+    }
+
+    fn drain_delete_cleanup(app: &mut App) {
+        for _ in 0..6_000 {
+            app.poll_delete_cleanup();
+            if !app.delete_in_progress {
+                return;
+            }
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("background delete cleanup did not finish");
     }
 
     /// Test helper: insert a manually-constructed `ReviewGateState`
@@ -20445,8 +20528,8 @@ mod tests {
     fn collect_backfill_requests_returns_done_items_without_pr_identity() {
         use crate::work_item_backend::LocalFileBackend;
 
-        let dir = std::env::temp_dir().join("workbridge-test-backfill-collect");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         // Done item with branch but no pr_identity - should be returned.
@@ -20512,8 +20595,6 @@ mod tests {
             "no requests without github remote, got {}",
             requests.len()
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- Delete resource cleanup tests --
@@ -21016,21 +21097,10 @@ mod tests {
 
         // Open the prompt, confirm, then drain the background cleanup
         // thread via poll_delete_cleanup (matches how the real event
-        // loop consumes results). Spin for up to ~1s so flaky CI still
-        // passes despite thread scheduling jitter.
+        // loop consumes results).
         app.open_delete_prompt();
         app.confirm_delete_from_prompt();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while app.delete_in_progress && std::time::Instant::now() < deadline {
-            app.poll_delete_cleanup();
-            if app.delete_in_progress {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-        assert!(
-            !app.delete_in_progress,
-            "background delete cleanup should have completed within 1s"
-        );
+        drain_delete_cleanup(&mut app);
 
         // Verify remove_worktree was called with correct arguments.
         let rw_calls = recording_ws.remove_worktree_calls.lock().unwrap();
@@ -21173,17 +21243,7 @@ mod tests {
 
         app.open_delete_prompt();
         app.confirm_delete_from_prompt();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while app.delete_in_progress && std::time::Instant::now() < deadline {
-            app.poll_delete_cleanup();
-            if app.delete_in_progress {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-        assert!(
-            !app.delete_in_progress,
-            "background delete cleanup should have completed within 1s"
-        );
+        drain_delete_cleanup(&mut app);
 
         // The closer must have been invoked with the correct arguments
         // so we know we actually exercised the PR-close-first branch,
@@ -21355,7 +21415,7 @@ mod tests {
 
     #[test]
     fn auto_archive_deletes_expired_done_items() {
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
@@ -21380,7 +21440,7 @@ mod tests {
 
     #[test]
     fn auto_archive_skips_when_disabled() {
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
@@ -21425,7 +21485,7 @@ mod tests {
 
     #[test]
     fn auto_archive_keeps_recent_done_items() {
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
@@ -21449,7 +21509,7 @@ mod tests {
 
     #[test]
     fn auto_archive_works_for_derived_done_items() {
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
@@ -21510,7 +21570,7 @@ mod tests {
 
     #[test]
     fn apply_stage_change_clears_done_at_on_retreat() {
-        let now = std::time::SystemTime::now()
+        let now = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
@@ -22489,10 +22549,10 @@ mod tests {
         // (the background thread actually ran the read).
         drop(gate);
         let entry = app.session_open_rx.remove(&wi_id).unwrap();
-        let result = entry
-            .rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("background plan-read thread must deliver a result");
+        let result = crate::side_effects::clock::bounded_recv(
+            &entry.rx,
+            "background plan-read thread must deliver a result",
+        );
         assert_eq!(result.plan_text, "plan-text from counting backend");
         assert!(result.read_error.is_none());
         assert_eq!(
@@ -22518,8 +22578,8 @@ mod tests {
         // clobbered a pre-existing user-authored `.mcp.json` with
         // workbridge's own MCP config JSON. The fix is a pure
         // deletion of the write; MCP config keeps reaching Claude
-        // Code through the `--mcp-config <temp file under
-        // std::env::temp_dir()>` argv pair, which is workbridge-
+        // Code through the `--mcp-config <temp file under the
+        // process temp dir>` argv pair, which is workbridge-
         // owned and unaffected.
         //
         // This test pins both failure modes with a single assertion:
@@ -22546,12 +22606,13 @@ mod tests {
         // leave a claude subprocess running past this test.
         //
         // The happy path also writes a `workbridge-mcp-config-<uuid>
-        // .json` temp file under `std::env::temp_dir()`. The UUID
-        // makes its exact path unpredictable, so we diff-snapshot the
-        // temp directory before and after the call and delete any
-        // newly-created workbridge MCP config file. This keeps the
-        // test hermetic under invariant 9 (no leaking temp state
-        // across runs).
+        // .json` temp file under the process temp dir (reached via
+        // the side_effects::paths::temp_dir gate). The UUID makes its
+        // exact path unpredictable, so we diff-snapshot the temp
+        // directory before and after the call and delete any newly-
+        // created workbridge MCP config file. This keeps the test
+        // hermetic under invariant 9 (no leaking temp state across
+        // runs).
         const SENTINEL: &[u8] = b"SENTINEL_PRE_EXISTING_USER_MCP_JSON_MUST_NOT_BE_OVERWRITTEN";
 
         let backend = Arc::new(CountingPlanBackend::default());
@@ -22575,12 +22636,12 @@ mod tests {
         // case, which was the original bug's worse failure mode.
         std::fs::write(&mcp_json_path, SENTINEL).expect("seed sentinel .mcp.json into tempdir");
 
-        // Snapshot workbridge-owned temp MCP config files in
-        // `std::env::temp_dir()` so we can identify and remove the
-        // one `finish_session_open`'s happy path is about to write.
+        // Snapshot workbridge-owned temp MCP config files in the
+        // process temp dir so we can identify and remove the one
+        // `finish_session_open`'s happy path is about to write.
         let list_temp_mcp_configs = || -> std::collections::HashSet<PathBuf> {
             let mut out = std::collections::HashSet::new();
-            if let Ok(read_dir) = std::fs::read_dir(std::env::temp_dir()) {
+            if let Ok(read_dir) = std::fs::read_dir(crate::side_effects::paths::temp_dir()) {
                 for entry in read_dir.flatten() {
                     let name = entry.file_name();
                     let Some(name_str) = name.to_str() else {
@@ -22627,17 +22688,18 @@ mod tests {
 
         // Enqueue the plan read on the background thread, then drain
         // the result the same way `poll_session_opens` does on the UI
-        // thread - manually, via `recv_timeout`, so the test is
-        // deterministic instead of sleep-polling.
+        // thread - manually, via a bounded `try_recv` loop (see
+        // `clock::bounded_recv`), so the test is deterministic instead
+        // of sleep-polling AND does not read wall-clock time.
         app.begin_session_open(&wi_id, &cwd);
         let entry = app
             .session_open_rx
             .remove(&wi_id)
             .expect("begin_session_open must register a pending receiver");
-        let result = entry
-            .rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("background plan-read must deliver a result");
+        let result = crate::side_effects::clock::bounded_recv(
+            &entry.rx,
+            "background plan-read must deliver a result",
+        );
         app.end_activity(entry.activity);
 
         // This is the function under test. The surfaced status
@@ -22688,12 +22750,12 @@ mod tests {
              `.mcp.json`. This violates the CLAUDE.md 'file injection' \
              review rule (commit acafae8). MCP config is delivered \
              exclusively via `--mcp-config <tempfile>` under \
-             `std::env::temp_dir()`; see `finish_session_open` and \
+             the process temp dir; see `finish_session_open` and \
              the C4 clause in docs/harness-contract.md."
         );
 
         // Clean up any `workbridge-mcp-config-*.json` the happy path
-        // wrote under `std::env::temp_dir()`. Anything in the after-
+        // wrote under the process temp dir. Anything in the after-
         // snapshot that wasn't in the before-snapshot is ours and
         // safe to delete; leaving them accumulates state across runs.
         let after_temp_mcp_configs = list_temp_mcp_configs();
@@ -22886,7 +22948,7 @@ mod tests {
         // Wait for the background read to produce a result, then drain
         // it via `poll_session_opens`. The spinner MUST be cleared once
         // the result is applied.
-        let recv_start = std::time::Instant::now();
+        let recv_start = crate::side_effects::clock::instant_now();
         loop {
             let ready = app
                 .session_open_rx
@@ -22896,10 +22958,20 @@ mod tests {
             if ready {
                 break;
             }
-            if recv_start.elapsed() > std::time::Duration::from_secs(2) {
+            // 60s of mock-clock budget (6000 iterations of the 10ms
+            // mock `sleep`) to absorb OS-scheduler jitter on loaded CI
+            // hosts. `clock::sleep` is pure `yield_now` in tests, so
+            // each iteration is only a few hundred microseconds of
+            // real time - 6000 yields gives the background thread
+            // ample real-time opportunity to make progress while the
+            // mock clock advances. A true livelock still trips this
+            // cap deterministically.
+            if crate::side_effects::clock::elapsed_since(recv_start)
+                > std::time::Duration::from_secs(60)
+            {
                 panic!("background plan-read thread did not produce a result");
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(10));
         }
 
         // `finish_session_open` will try to spawn a Claude session,
@@ -22907,10 +22979,10 @@ mod tests {
         // and end the spinner manually via the internal helper.
         // This mirrors what `poll_session_opens` does on success.
         let entry = app.session_open_rx.remove(&wi_id).unwrap();
-        let _result = entry
-            .rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("background plan-read thread must deliver a result");
+        let _result = crate::side_effects::clock::bounded_recv(
+            &entry.rx,
+            "background plan-read thread must deliver a result",
+        );
         app.end_activity(entry.activity);
 
         assert!(
@@ -23219,15 +23291,25 @@ mod tests {
         );
 
         // Wait for the single completion message to land in the channel.
-        let recv_start = std::time::Instant::now();
+        let recv_start = crate::side_effects::clock::instant_now();
         loop {
             if !app.orphan_cleanup_finished_rx.is_empty() {
                 break;
             }
-            if recv_start.elapsed() > std::time::Duration::from_secs(2) {
+            // 60s of mock-clock budget (6000 iterations of the 10ms
+            // mock `sleep`) to absorb OS-scheduler jitter on loaded CI
+            // hosts. `clock::sleep` is pure `yield_now` in tests, so
+            // each iteration is only a few hundred microseconds of
+            // real time - 6000 yields gives the background thread
+            // ample real-time opportunity to make progress while the
+            // mock clock advances. A true livelock still trips this
+            // cap deterministically.
+            if crate::side_effects::clock::elapsed_since(recv_start)
+                > std::time::Duration::from_secs(60)
+            {
                 panic!("orphan cleanup background thread did not enqueue completion message");
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(10));
         }
 
         app.poll_orphan_cleanup_finished();
@@ -23303,15 +23385,25 @@ mod tests {
         );
 
         // Wait for the single completion message to arrive.
-        let recv_start = std::time::Instant::now();
+        let recv_start = crate::side_effects::clock::instant_now();
         loop {
             if !app.orphan_cleanup_finished_rx.is_empty() {
                 break;
             }
-            if recv_start.elapsed() > std::time::Duration::from_secs(2) {
+            // 60s of mock-clock budget (6000 iterations of the 10ms
+            // mock `sleep`) to absorb OS-scheduler jitter on loaded CI
+            // hosts. `clock::sleep` is pure `yield_now` in tests, so
+            // each iteration is only a few hundred microseconds of
+            // real time - 6000 yields gives the background thread
+            // ample real-time opportunity to make progress while the
+            // mock clock advances. A true livelock still trips this
+            // cap deterministically.
+            if crate::side_effects::clock::elapsed_since(recv_start)
+                > std::time::Duration::from_secs(60)
+            {
                 panic!("orphan cleanup background thread did not enqueue completion message");
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::side_effects::clock::sleep(std::time::Duration::from_millis(10));
         }
 
         app.poll_orphan_cleanup_finished();
@@ -23649,7 +23741,7 @@ mod tests {
         )
         .expect("first admit must succeed");
         app.end_user_action(&UserActionKey::GithubRefresh);
-        std::thread::sleep(Duration::from_millis(20));
+        crate::side_effects::clock::sleep(Duration::from_millis(20));
         let retry = app.try_begin_user_action(
             UserActionKey::GithubRefresh,
             Duration::from_millis(10),
@@ -24643,8 +24735,8 @@ mod tests {
             ActivityEntry, CreateWorkItem, LocalFileBackend, RepoAssociationRecord, WorkItemBackend,
         };
 
-        let dir = std::env::temp_dir().join("workbridge-test-orphan-activity-log");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let dir = _tmp.path().to_path_buf();
         let backend =
             LocalFileBackend::with_dir(dir.clone()).expect("backend must be constructable");
 
@@ -24729,8 +24821,6 @@ mod tests {
              exists to avoid",
         );
         let _ = std::fs::remove_file(&active_path);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Default trait impl: backends that do NOT explicitly override
@@ -25039,7 +25129,7 @@ mod tests {
         // `poll_review_request_merges` never spawns a real `gh pr
         // view` subprocess during a unit test. Individual tests that
         // exercise Phase 2 can override this back to None.
-        let now = std::time::Instant::now();
+        let now = crate::side_effects::clock::instant_now();
         for w in &mut app.review_request_merge_watches {
             w.last_polled = Some(now);
         }
@@ -25450,7 +25540,7 @@ mod tests {
             owner_repo: "owner/repo".into(),
             branch: "feature/ghost".into(),
             repo_path: PathBuf::from("/tmp/ghost-repo"),
-            last_polled: Some(std::time::Instant::now()),
+            last_polled: Some(crate::side_effects::clock::instant_now()),
         });
         app.review_request_merge_poll_errors
             .insert(rec_id.clone(), "stale".into());

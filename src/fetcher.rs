@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::thread;
 use std::time::Duration;
 
 use regex::Regex;
@@ -60,7 +59,7 @@ pub fn start_with_extra_branches(
         // Threads are fully independent - we don't store JoinHandles.
         // They exit on their own when the stop flag is set or when the
         // channel receiver is dropped (send returns Err).
-        thread::spawn(move || {
+        std::thread::spawn(move || {
             fetcher_loop(repo_path, tx, stop, ws, gc, &pattern, extras);
         });
     }
@@ -244,7 +243,7 @@ fn interruptible_sleep(stop: &AtomicBool, seconds: u64) -> bool {
         if stop.load(Ordering::Relaxed) {
             return false;
         }
-        thread::sleep(Duration::from_secs(1));
+        crate::side_effects::clock::sleep(Duration::from_secs(1));
     }
     true
 }
@@ -351,9 +350,7 @@ mod tests {
     /// asserting that any preceding messages are FetchStarted.
     fn recv_data(rx: &mpsc::Receiver<FetchMessage>) -> FetchMessage {
         loop {
-            let msg = rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("should receive a FetchMessage within 5 seconds");
+            let msg = crate::side_effects::clock::bounded_recv(rx, "fetcher recv_data");
             match msg {
                 FetchMessage::FetchStarted => continue,
                 other => return other,
@@ -377,18 +374,14 @@ mod tests {
         );
 
         // First message must be FetchStarted.
-        let first = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("should receive first message");
+        let first = crate::side_effects::clock::bounded_recv(&rx, "fetcher first-message waiter");
         assert!(
             matches!(first, FetchMessage::FetchStarted),
             "first message should be FetchStarted, got RepoData/FetcherError",
         );
 
         // Second message should be RepoData.
-        let second = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("should receive second message");
+        let second = crate::side_effects::clock::bounded_recv(&rx, "fetcher second-message waiter");
         assert!(
             matches!(second, FetchMessage::RepoData(_)),
             "second message should be RepoData",
@@ -678,11 +671,20 @@ mod tests {
         // channel goes quiet. A single tick can emit multiple
         // FetcherError messages (one per failed sub-step) so we keep
         // draining instead of returning on the first match.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // Iteration cap matches `side_effects::clock::bounded_recv`
+        // (6000) rather than the historical 1000. On Ubuntu CI the
+        // mock-clock `sleep` is pure `yield_now`, and 1000 yields is
+        // not always enough scheduler runtime for the fetcher worker
+        // to emit both the login FetcherError and the RepoData on a
+        // heavily-loaded runner; 6000 absorbs the jitter while still
+        // bounding a genuine livelock.
         let mut saw_login_error = false;
         let mut saw_repo_data = false;
-        while std::time::Instant::now() < deadline && !(saw_login_error && saw_repo_data) {
-            match rx.recv_timeout(Duration::from_millis(500)) {
+        for _ in 0..6_000 {
+            if saw_login_error && saw_repo_data {
+                break;
+            }
+            match rx.try_recv() {
                 Ok(FetchMessage::FetchStarted) => continue,
                 Ok(FetchMessage::FetcherError { error, .. }) => {
                     if error.contains("failed to look up current user login") {
@@ -696,7 +698,10 @@ mod tests {
                         "login should be None when the lookup failed",
                     );
                 }
-                Err(_) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    crate::side_effects::clock::sleep(Duration::from_millis(1));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
 

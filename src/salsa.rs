@@ -307,7 +307,7 @@ pub fn app_event(
                 state.send_sigterm_all();
                 state.cleanup_all_mcp();
                 state.shutting_down = true;
-                state.shutdown_started = Some(std::time::Instant::now());
+                state.shutdown_started = Some(crate::side_effects::clock::instant_now());
                 state.should_quit = false;
                 state.status_message =
                     Some("Waiting for sessions (force quit in 10s, or press Q)".into());
@@ -514,7 +514,7 @@ pub fn app_event(
                         state.send_sigterm_all();
                         state.cleanup_all_mcp();
                         state.shutting_down = true;
-                        state.shutdown_started = Some(std::time::Instant::now());
+                        state.shutdown_started = Some(crate::side_effects::clock::instant_now());
                         state.status_message =
                             Some("Waiting for sessions (force quit in 10s, or press Q)".into());
                         if state.all_dead() {
@@ -532,7 +532,7 @@ pub fn app_event(
                         return Ok(Control::Quit);
                     }
                     if let Some(started) = state.shutdown_started {
-                        let elapsed = started.elapsed();
+                        let elapsed = crate::side_effects::clock::elapsed_since(started);
                         if elapsed >= Duration::from_secs(10) {
                             state.force_kill_all();
                             return Ok(Control::Quit);

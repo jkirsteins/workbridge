@@ -2820,7 +2820,7 @@ fn copy_selection_to_clipboard(entry: &crate::work_item::SessionEntry) {
     // helper. This fixes the existing PTY drag-select path over SSH
     // as a side benefit: OSC 52 works when `arboard` can't reach a
     // native display.
-    crate::clipboard::copy(&text);
+    crate::side_effects::clipboard::copy(&text);
 }
 
 /// Convert a user-facing `SelectionState` (inclusive end cell) into the

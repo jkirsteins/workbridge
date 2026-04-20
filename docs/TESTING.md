@@ -17,9 +17,25 @@ equivalent mock) for config persistence. The convenience constructors
 
 ## Use temp directories for filesystem operations
 
-Tests that need real directories on disk (e.g. to test git repo discovery)
-must create them under `std::env::temp_dir()` and clean up after themselves.
-Never use hard-coded paths that could collide with real user data.
+Tests that need real directories on disk must use `tempfile::tempdir()`.
+The returned `TempDir` binds the directory to a unique path and removes
+it on drop, so parallel test threads cannot collide and `/tmp` does not
+accumulate predictable `workbridge-test-*` directories between runs.
+
+Pattern:
+
+```rust
+let _tmp = tempfile::tempdir().expect("tempdir");
+let dir = _tmp.path().to_path_buf();
+// ... test body uses `dir` ...
+// _tmp is dropped at end of scope and removes the directory
+```
+
+Do NOT use `std::env::temp_dir().join("fixed-name")`. The pre-commit
+hook rejects bare `std::env::temp_dir` outside `src/side_effects/`.
+UUID-suffixed names (`std::env::temp_dir().join(format!("...{}", Uuid::new_v4()))`)
+are technically collision-safe but still pollute `/tmp`; prefer
+`tempfile::tempdir()` for uniformity.
 
 ## No host system side effects
 
@@ -29,6 +45,112 @@ Tests must not leave side effects on the host system. This includes:
 - Creating persistent files outside of temp directories
 - Modifying environment variables without restoring them
 - Spawning processes that outlive the test
+- Writing to the system clipboard (via `arboard`, OSC 52, `NSPasteboard`,
+  or any other path)
+- Writing raw terminal escape sequences to stdout / stderr outside
+  `src/side_effects/`
+- Reading wall-clock time or sleeping via `Instant::now`, `SystemTime::now`,
+  `thread::sleep`, `std::thread::sleep`, `Instant::elapsed()`,
+  `Receiver::recv_timeout` / `recv_deadline`, `Condvar::wait_timeout(_while)`,
+  or `Thread::park_timeout` outside `src/side_effects/clock.rs`
+- Using notification, audio, or visual system APIs
+
+## Side-effect gating module
+
+All code paths that reach the host system outside `std::env::temp_dir()`
+live in `src/side_effects/`. That module is the ONLY place in the crate
+allowed to call `arboard::`, `directories::ProjectDirs` / `BaseDirs` /
+`UserDirs`, `std::env::home_dir`, `std::env::temp_dir`, read wall-clock
+time, sleep the current thread, or write raw terminal escape sequences
+(such as OSC 52) to stdout.
+
+Under `#[cfg(test)]` every gated wrapper in `side_effects::` returns a
+no-op (`copy` returns `false`) or `None` (`paths::project_dirs`,
+`paths::home_dir`). That maps cleanly to existing error branches
+(`ConfigError::NoConfigDir`, `BackendError::Io("could not determine
+data directory")`) that tests already exercise through
+`InMemoryConfigProvider` and `LocalFileBackend::with_dir`.
+
+The pre-commit hook (`hooks/pre-commit`) enforces the boundary
+structurally: a staged `.rs` file outside `src/side_effects/` that
+references any of the gated symbols is rejected at commit time. See
+the P0 rule in `CLAUDE.md` "Severity overrides" for the review policy.
+
+## Wall-clock in tests
+
+Tests must not read real wall-clock time or block on real sleeps. Use
+`crate::side_effects::clock::instant_now()`,
+`crate::side_effects::clock::system_now()`, and
+`crate::side_effects::clock::sleep()` instead of `Instant::now`,
+`SystemTime::now`, `thread::sleep`, or `std::thread::sleep`.
+
+In production these wrappers forward to the standard library. Under
+`#[cfg(test)]`, `instant_now()` and `system_now()` read a deterministic
+mock clock, and `sleep()` advances that mock clock while yielding the
+current thread. Polling loops therefore terminate in tests without waiting
+for real time to pass. The mock `SystemTime` starts at
+`UNIX_EPOCH + 1_700_000_000s`, so ordinary subtraction in tests has room
+before the Unix epoch.
+
+The mock clock is **per-OS-thread**, not process-global: both the
+synthetic-time offset and the sleep-safety counter live in
+`thread_local! { Cell<u64> }` storage. `cargo test`'s default libtest
+harness spawns a fresh OS thread per test, so each test observes its
+own mock clock starting at offset zero - two parallel tests cannot
+advance each other's clock, and cannot trip each other's safety cap.
+This keeps the "deterministic mock clock" contract true under
+`cargo test` default parallelism. Thread-local values persist for the
+lifetime of their thread; if a future test harness reuses OS threads
+across tests, each test still observes a monotonic clock but offsets
+accumulate. That matches the libtest default today.
+
+In addition to the `Instant::now` / `SystemTime::now` / `thread::sleep`
+wrappers, tests must NOT read the wall-clock via:
+
+- `Instant::elapsed()` - this expands to `Instant::now() - *self` and
+  silently falls back to the real clock even when `self` was captured
+  via the mock `instant_now()` wrapper. Use
+  `crate::side_effects::clock::elapsed_since(start)` instead, which
+  diffs against the mock clock in tests and the real clock in
+  production.
+- `Receiver::recv_timeout`, `Receiver::recv_deadline`,
+  `Condvar::wait_timeout(_while)`, `Thread::park_timeout` - these
+  stdlib bounded-wait APIs internally read the monotonic clock via
+  `Condvar::wait_timeout`. Tests that need a bounded receive must
+  use `crate::side_effects::clock::bounded_recv(&rx, "context")`,
+  the shared generic helper that polls `try_recv` on a mock-clock
+  driven timer. It works with both `std::sync::mpsc::Receiver` and
+  `crossbeam_channel::Receiver` via the `PollableReceiver` trait
+  impls in `src/side_effects/clock.rs`. Adding a new channel kind
+  only requires another trait impl.
+
+The pre-commit hook rejects staged Rust files outside `src/side_effects/`
+that call any of these APIs directly (`.elapsed(`, `recv_timeout(`,
+`recv_deadline(`, `wait_timeout(`, `park_timeout(` are all on the
+forbidden list alongside `Instant::now`, `SystemTime::now`, and
+`thread::sleep`). If a test needs to move time forward without going
+through a sleep path, call
+`crate::side_effects::clock::advance_mock_clock()` from test-only code.
+
+If you genuinely need a new host-visible side effect (for example, a
+new notification API), the add path is:
+
+1. Add the call inside `src/side_effects/` behind `#[cfg(not(test))]`,
+   returning a no-op / `None` / `false` under `cfg(test)`.
+2. Expose a narrow wrapper from `side_effects::` and route callers
+   through it.
+3. Update `docs/TESTING.md` (this file) and the pre-commit hook's
+   grep pattern if the new API uses a new symbol name.
+
+Pre-authorized bounded exceptions that live outside the module and are
+documented here rather than routed through the gate:
+
+- `src/session.rs` spawns short-lived `sleep 60` / `sleep 0` child
+  processes for PTY lifecycle smoke tests. These subprocesses are
+  reaped by the test itself and do not outlive it.
+- `src/mcp.rs` binds a UUID-suffixed Unix socket under the process temp
+  dir for the socket-server smoke test. The UUID makes the path
+  collision-free and the socket is unlinked during test teardown.
 
 ## Never use `git config` in tests
 

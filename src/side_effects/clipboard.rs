@@ -20,12 +20,47 @@
 //! encoding is a small inline implementation to keep the dependency
 //! tree lean - OSC 52 only needs standard base64 with no URL-safety
 //! or padding tricks.
+//!
+//! **Test-mode contract:** under `#[cfg(test)]`, `copy` is a no-op that
+//! returns `false`. Callers render "Copy failed: ..." toasts in that
+//! case; existing tests assert on substring matches that hold under
+//! both branches. This gating closes the pre-fix leak where test
+//! fixtures (e.g. "feat/my-branch") were being written to the real
+//! system clipboard via `arboard` during `cargo test`.
+//!
+//! The test-mode contract is enforced two ways, not just one:
+//!
+//! 1. **Outer `#[cfg(not(test))]` gating**: the `arboard` import
+//!    and the production implementation body are both behind
+//!    `#[cfg(not(test))]`, so under `cargo test` the test binary
+//!    never links the arboard code path. Removing
+//!    `#[cfg(not(test))]` on the `use` line would produce an
+//!    unused-import warning and fail clippy.
+//!
+//! 2. **Inner compile-time assertion**: the production path
+//!    begins with a `const { assert!(!cfg!(test)) }` block. If a
+//!    future refactor weakens the outer `#[cfg(not(test))]`
+//!    attribute and the production body ends up compiled under
+//!    test, the `cfg!(test)` constant inside the const block
+//!    flips to `true` and the build fails - before the test
+//!    binary can even be linked, let alone execute
+//!    `arboard::Clipboard::new()`. The check is intentionally in
+//!    the production block (not the test block) because its job
+//!    is to fail if production ever ends up reachable from a
+//!    test-mode compilation unit.
+//!
+//! The paired `copy_is_noop_under_cfg_test` test also performs a
+//! `const { assert!(cfg!(test)) }` check so the `cfg(test)`
+//! expectation is pinned symmetrically on the test side.
 
 #[cfg(not(test))]
 use std::io::Write;
 
 /// Attempt to copy `text` to the system clipboard via OSC 52 and
 /// `arboard`. Returns `true` if at least one path succeeded.
+///
+/// Under `#[cfg(test)]` this is a no-op that returns `false`. See the
+/// module doc for the rationale.
 ///
 /// Safety: this function writes a short escape sequence directly to
 /// `stdout`. That is safe to call between ratatui draws (which is the
@@ -34,29 +69,46 @@ use std::io::Write;
 /// the same `stdout` handle. We flush after the write so the sequence
 /// reaches the terminal before the next draw.
 pub fn copy(text: &str) -> bool {
-    let mut ok = false;
+    #[cfg(test)]
+    {
+        let _ = text;
+        false
+    }
 
-    // OSC 52 path. Skipped under `cfg(test)` because the test harness
-    // would otherwise see raw escape sequences in captured stdout and
-    // the `osc52_sequence` unit test below already covers the escape
-    // construction in isolation.
     #[cfg(not(test))]
     {
+        // Compile-time belt-and-braces gate: if a future refactor
+        // relaxes the `#[cfg(not(test))]` attributes above and the
+        // production body becomes reachable under `cargo test`, the
+        // `cfg!(test)` inside this const block flips to `true` and
+        // the `assert!` fails at BUILD time - before the test
+        // binary even links `arboard`. Do not "fix" a failure of
+        // this assertion by removing it: the failure means the
+        // compile-time gate above was loosened and the real host
+        // clipboard is about to be clobbered by test fixtures. See
+        // the module doc for the full test-mode contract.
+        const {
+            assert!(!cfg!(test));
+        }
+
+        let mut ok = false;
+
+        // OSC 52 path.
         let seq = osc52_sequence(text);
         let mut stdout = std::io::stdout().lock();
         if stdout.write_all(seq.as_bytes()).is_ok() && stdout.flush().is_ok() {
             ok = true;
         }
-    }
 
-    // arboard path (best-effort).
-    if let Ok(mut clipboard) = arboard::Clipboard::new()
-        && clipboard.set_text(text.to_string()).is_ok()
-    {
-        ok = true;
-    }
+        // arboard path (best-effort).
+        if let Ok(mut clipboard) = arboard::Clipboard::new()
+            && clipboard.set_text(text.to_string()).is_ok()
+        {
+            ok = true;
+        }
 
-    ok
+        ok
+    }
 }
 
 /// Build the OSC 52 escape sequence that asks the terminal to push
@@ -195,5 +247,45 @@ mod tests {
         let middle = &seq["\x1b]52;c;".len()..seq.len() - 1];
         let decoded = base64_decode(middle).expect("valid base64");
         assert_eq!(decoded, payload.as_bytes());
+    }
+
+    /// Contract: under `#[cfg(test)]`, `copy` must be a pure no-op
+    /// that returns `false`. This prevents a future refactor from
+    /// re-introducing the pre-2026-04-20 leak where `arboard` ran
+    /// during `cargo test` and clobbered the user's real clipboard
+    /// with test-fixture strings. If this test fails, someone has
+    /// removed the `#[cfg(test)]` early-return; do NOT "fix" the
+    /// test - fix the gate.
+    ///
+    /// The test pins two things, not just one:
+    ///
+    /// 1. `copy` returns `false`. This catches the straightforward
+    ///    regression where the early-return body was removed and
+    ///    `arboard` ran and returned `true`.
+    ///
+    /// 2. `cfg!(test)` is `true` from within this test. This pins
+    ///    the runtime view that the `debug_assert!(!cfg!(test), ...)`
+    ///    in the production body relies on. If a future build mode
+    ///    caused `cfg!(test)` to report `false` inside a unit test
+    ///    the production runtime gate would silently stop firing;
+    ///    this assertion would flag that regression immediately so
+    ///    the compile-time-only half of the contract is never the
+    ///    only line of defense.
+    #[test]
+    fn copy_is_noop_under_cfg_test() {
+        // Compile-time check: `cfg(test)` must evaluate to `true`
+        // inside this test. The production body's runtime gate is
+        // `debug_assert!(!cfg!(test), ...)`, so if the build mode
+        // ever caused `cfg!(test)` to report `false` in a unit
+        // test the runtime gate would silently stop firing. A
+        // `const { assert!(cfg!(test), ...) }` block turns that
+        // assumption into a build-time error instead of a silent
+        // gap.
+        const { assert!(cfg!(test)) };
+        let before_call = "workbridge-regression-probe";
+        // Call must return false without touching any real backend.
+        assert!(!copy(before_call));
+        // Second call: still false, still no side effect.
+        assert!(!copy("another-probe"));
     }
 }
