@@ -13067,7 +13067,7 @@ mod tests {
     fn wait_until_file_removed(path: &std::path::Path, timeout: std::time::Duration) {
         let start = crate::side_effects::clock::instant_now();
         while path.exists() {
-            if start.elapsed() >= timeout {
+            if crate::side_effects::clock::elapsed_since(start) >= timeout {
                 return;
             }
             crate::side_effects::clock::sleep(std::time::Duration::from_millis(10));
@@ -17248,7 +17248,16 @@ mod tests {
         // Drive the background thread via a polling loop. Bounded by a
         // 2s timeout so a regression cannot wedge CI forever.
         let start = crate::side_effects::clock::instant_now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
             crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
@@ -17364,7 +17373,16 @@ mod tests {
         assert!(app.is_merge_precheck_phase());
 
         let start = crate::side_effects::clock::instant_now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
             crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
@@ -17484,7 +17502,16 @@ mod tests {
 
         // Drain the precheck.
         let start = crate::side_effects::clock::instant_now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
             crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
@@ -17660,7 +17687,16 @@ mod tests {
         assert!(app.is_merge_precheck_phase());
 
         let start = crate::side_effects::clock::instant_now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
             crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
@@ -17703,7 +17739,16 @@ mod tests {
         app.execute_merge(&wi_id, "squash");
 
         let start = crate::side_effects::clock::instant_now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
             crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
@@ -17740,7 +17785,16 @@ mod tests {
         app.execute_merge(&wi_id, "squash");
 
         let start = crate::side_effects::clock::instant_now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
             crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
@@ -17786,7 +17840,16 @@ mod tests {
         app.execute_merge(&wi_id, "squash");
 
         let start = crate::side_effects::clock::instant_now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
             crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
@@ -17924,7 +17987,16 @@ mod tests {
         app.execute_merge(&wi_id, "squash");
 
         let start = crate::side_effects::clock::instant_now();
-        while app.is_merge_precheck_phase() && start.elapsed() < Duration::from_secs(2) {
+        // 60s of mock-clock budget (6000 iterations of the 10ms mock
+        // `sleep`) to absorb OS-scheduler jitter on loaded CI hosts.
+        // `clock::sleep` is pure `yield_now` in tests, so each
+        // iteration is only a few hundred microseconds of real time -
+        // 6000 yields gives the background precheck thread ample
+        // opportunity to finish while the mock clock advances. A true
+        // livelock still trips this cap deterministically.
+        while app.is_merge_precheck_phase()
+            && crate::side_effects::clock::elapsed_since(start) < Duration::from_secs(60)
+        {
             app.poll_merge_precheck();
             crate::side_effects::clock::sleep(Duration::from_millis(10));
         }
@@ -22867,7 +22939,17 @@ mod tests {
             if ready {
                 break;
             }
-            if recv_start.elapsed() > std::time::Duration::from_secs(2) {
+            // 60s of mock-clock budget (6000 iterations of the 10ms
+            // mock `sleep`) to absorb OS-scheduler jitter on loaded CI
+            // hosts. `clock::sleep` is pure `yield_now` in tests, so
+            // each iteration is only a few hundred microseconds of
+            // real time - 6000 yields gives the background thread
+            // ample real-time opportunity to make progress while the
+            // mock clock advances. A true livelock still trips this
+            // cap deterministically.
+            if crate::side_effects::clock::elapsed_since(recv_start)
+                > std::time::Duration::from_secs(60)
+            {
                 panic!("background plan-read thread did not produce a result");
             }
             crate::side_effects::clock::sleep(std::time::Duration::from_millis(10));
@@ -23195,7 +23277,17 @@ mod tests {
             if !app.orphan_cleanup_finished_rx.is_empty() {
                 break;
             }
-            if recv_start.elapsed() > std::time::Duration::from_secs(2) {
+            // 60s of mock-clock budget (6000 iterations of the 10ms
+            // mock `sleep`) to absorb OS-scheduler jitter on loaded CI
+            // hosts. `clock::sleep` is pure `yield_now` in tests, so
+            // each iteration is only a few hundred microseconds of
+            // real time - 6000 yields gives the background thread
+            // ample real-time opportunity to make progress while the
+            // mock clock advances. A true livelock still trips this
+            // cap deterministically.
+            if crate::side_effects::clock::elapsed_since(recv_start)
+                > std::time::Duration::from_secs(60)
+            {
                 panic!("orphan cleanup background thread did not enqueue completion message");
             }
             crate::side_effects::clock::sleep(std::time::Duration::from_millis(10));
@@ -23279,7 +23371,17 @@ mod tests {
             if !app.orphan_cleanup_finished_rx.is_empty() {
                 break;
             }
-            if recv_start.elapsed() > std::time::Duration::from_secs(2) {
+            // 60s of mock-clock budget (6000 iterations of the 10ms
+            // mock `sleep`) to absorb OS-scheduler jitter on loaded CI
+            // hosts. `clock::sleep` is pure `yield_now` in tests, so
+            // each iteration is only a few hundred microseconds of
+            // real time - 6000 yields gives the background thread
+            // ample real-time opportunity to make progress while the
+            // mock clock advances. A true livelock still trips this
+            // cap deterministically.
+            if crate::side_effects::clock::elapsed_since(recv_start)
+                > std::time::Duration::from_secs(60)
+            {
                 panic!("orphan cleanup background thread did not enqueue completion message");
             }
             crate::side_effects::clock::sleep(std::time::Duration::from_millis(10));
