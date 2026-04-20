@@ -6563,6 +6563,18 @@ mod snapshot_tests {
         for c in optional {
             pattern.push_str(&format!("(?:{})?", regex::escape(&c.to_string())));
         }
+        // After the tmp-path prefix, greedily eat any path-continuation
+        // characters (slash + anything that is not whitespace or the
+        // column-border `│`). On Linux the tmp prefix is short (e.g.
+        // `/tmp/.tmpAbCdEf`, 14 chars) so the rendered cell has room
+        // for the suffix `/discovered-a` after the tmp root - without
+        // this tail the regex would redact only the prefix and leave
+        // `<TMPDIR>/disco` in the snapshot. On macOS the tmp prefix
+        // (`/var/folders/...`, 40+ chars) already fills the cell so
+        // there is no suffix to match and the optional group is a
+        // no-op. The group is optional so a rendered path that was
+        // truncated mid-prefix still matches.
+        pattern.push_str(r"(?:/[^\s│]*)?");
         let path_re = regex::Regex::new(&pattern).expect("valid regex");
         let redacted = path_re.replace_all(&raw_output, "<TMPDIR>").into_owned();
         // Collapse 2+ spaces preceding a `│` on any line that contains
