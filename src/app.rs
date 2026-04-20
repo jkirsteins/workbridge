@@ -17264,7 +17264,7 @@ mod tests {
 
         assert!(
             !app.is_merge_precheck_phase(),
-            "precheck must drain within 2s",
+            "precheck must drain within 60s",
         );
         assert!(
             app.is_user_action_in_flight(&UserActionKey::PrMerge),
@@ -17518,7 +17518,7 @@ mod tests {
 
         assert!(
             !app.is_merge_precheck_phase(),
-            "precheck must drain within 2s",
+            "precheck must drain within 60s",
         );
         assert!(
             app.alert_message.is_none(),
@@ -17801,7 +17801,7 @@ mod tests {
 
         assert!(
             !app.is_merge_precheck_phase(),
-            "precheck must drain within 2s",
+            "precheck must drain within 60s",
         );
         assert!(
             app.is_user_action_in_flight(&UserActionKey::PrMerge),
