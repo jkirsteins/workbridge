@@ -33,7 +33,6 @@ directories = "5"
 rat-salsa = "4"
 rat-widget = "3"
 rat-event = "2"
-rat-focus = "2"
 crossbeam-channel = "0.5"
 ratatui-core = "0.1"
 ratatui-crossterm = "0.1"
@@ -48,3 +47,20 @@ integration = []
 [dev-dependencies]
 insta = "1"
 tempfile = "3"
+
+[lints.clippy]
+# Prohibit accidental dbg! / todo! / unimplemented! in committed code.
+# Baseline verified clean on 2026-04-20.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# Pedantic, nursery, and restriction carpet-bombs are intentionally
+# not set here. They ship in Phase 3 of the hygiene campaign, which
+# has the budget for cleaning the findings they produce. Raising them
+# in Phase 1 would either require #[allow] in source (prohibited) or
+# generate CI failures before the cleanup work exists.
+
+[lints.rustdoc]
+# No existing crate-level docs to break; safe to deny from day one.
+broken_intra_doc_links = "deny"
