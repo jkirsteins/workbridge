@@ -1,0 +1,41 @@
+# ci/file-size-budgets.toml
+#
+# Max line count per source file. Enforced by hooks/budget-check.sh
+# (pre-commit) and the corresponding CI job.
+#
+# Initial values freeze the current line count so no file grows. As
+# Phase 4 of the hygiene campaign extracts subsystems out of
+# src/app.rs, its budget ratchets down and extracted modules get
+# their own entries.
+#
+# Note: the plan included a placeholder entry for "src/clipboard.rs"
+# at seed time. That file does not exist in the current tree (the
+# clipboard gate lives under src/side_effects/clipboard.rs which is
+# not a top-level src/*.rs file), so the entry was omitted. If a
+# clipboard.rs ever lands at the top level, add it here with its
+# seed line count.
+
+[budgets]
+"src/agent_backend.rs"     = 2383
+"src/app.rs"               = 26206
+"src/assembly.rs"          = 2318
+"src/click_targets.rs"     = 215
+"src/config.rs"            = 903
+"src/create_dialog.rs"     = 844
+"src/dashboard_seed.rs"    = 369
+"src/event.rs"             = 4842
+"src/fetcher.rs"           = 719
+"src/github_client.rs"     = 1417
+"src/layout.rs"            = 209
+"src/main.rs"              = 804
+"src/mcp.rs"               = 2268
+"src/metrics.rs"           = 1021
+"src/pr_service.rs"        = 45
+"src/prompts.rs"           = 453
+"src/salsa.rs"             = 678
+"src/session.rs"           = 532
+"src/theme.rs"             = 561
+"src/ui.rs"                = 7798
+"src/work_item.rs"         = 677
+"src/work_item_backend.rs" = 2204
+"src/worktree_service.rs"  = 1692
