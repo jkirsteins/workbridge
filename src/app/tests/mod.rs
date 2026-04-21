@@ -7,6 +7,24 @@
 
 use std::path::PathBuf;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crate::agent_backend::AgentBackendKind;
+use crate::config::{Config, RepoEntry, RepoSource};
+use crate::github_client::GithubError;
+use crate::mcp::McpEvent;
+use crate::work_item::{
+    FetchMessage, RepoFetchResult, SessionEntry, UnlinkedPr, WorkItem, WorkItemId, WorkItemKind,
+    WorkItemStatus,
+};
+use crate::work_item_backend::{
+    ActivityEntry, BackendError, CreateWorkItem, PrIdentityRecord, RepoAssociationRecord,
+    WorkItemBackend,
+};
+use crate::worktree_service::WorktreeService;
+
 use super::*;
 use crate::work_item::BackendType;
 
