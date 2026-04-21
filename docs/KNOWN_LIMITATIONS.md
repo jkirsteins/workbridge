@@ -74,7 +74,7 @@ the buffered input.
 
 ## Worktree reuse via symlink-resolved path equality
 
-**What:** `App::find_reusable_worktree` (src/app.rs) decides whether an
+**What:** `App::find_reusable_worktree` decides whether an
 existing git worktree can be reused in place of `git worktree add` by
 comparing the canonicalized `.worktrees/<branch>` target against the
 canonicalized path git reports. `config::canonicalize_path` resolves

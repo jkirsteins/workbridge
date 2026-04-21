@@ -167,7 +167,7 @@ Stage restrictions for ReviewRequest items:
   poller (`App::poll_mergequeue` /
   `App::reconstruct_mergequeue_watches`) are generated from a single
   pair of macros (`impl_pr_merge_poll_method!` +
-  `impl_pr_merge_reconstruct_method!` in `src/app.rs`) so the
+  `impl_pr_merge_reconstruct_method!` in the `app` module) so the
   subprocess path, the 30 s cooldown, the Phase 1 drain, the
   still-eligible guard, the `pr_number` backfill, and the merge-gate
   dispatch cannot drift between the two stages. Per-stage deltas
