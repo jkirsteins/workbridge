@@ -6,22 +6,28 @@
 
 Subsystem extraction from `App` is in progress. As of the current branch head:
 
-- **Done (6 of ~18 subsystems + SharedServices):**
-  - `UserActionGuard` (pre-existing) - `src/app/user_actions.rs`
-  - `Toasts` - `src/app/toasts.rs`
-  - `Activities` - `src/app/activities.rs`
-  - `ClickTracking` - `src/app/click_tracking.rs`
-  - `Shell` - `src/app/shell.rs`
-  - `GlobalDrawer` - `src/app/global_drawer.rs`
-  - `SharedServices` aggregate - `src/app/shared_services.rs`
+- **Done (8 of ~18 subsystems + SharedServices):**
+  - `UserActionGuard` (pre-existing) - `app::user_actions`
+  - `Toasts` - `app::toasts`
+  - `Activities` - `app::activities`
+  - `ClickTracking` - `app::click_tracking`
+  - `Shell` - `app::shell`
+  - `GlobalDrawer` - `app::global_drawer`
+  - `SettingsOverlay` - `app::settings_overlay` (8 fields consolidated)
+  - `Metrics` - `app::metrics` (2 fields + drain-to-latest `poll` method)
+  - `SharedServices` aggregate - `app::shared_services`
 
-- **Still to extract (follow-up work):** modals, settings overlay, display list + selection, work items, metrics, fetcher bridge, harness, MCP bridge, sessions, review gate, rebase gate, PR lifecycle (create + merge + mergequeue + review-request-merge + identity-backfill), cleanup, stage transitions.
+- **Still to extract (follow-up work):** modals, display list + selection, work items, fetcher bridge, harness, MCP bridge, sessions, review gate, rebase gate, PR lifecycle (create + merge + mergequeue + review-request-merge + identity-backfill + orphan cleanup), cleanup, stage transitions.
+
+- **Docs hygiene: DONE.** Every `src/**/*.rs` path reference in `docs/UI.md`, `docs/harness-contract.md`, `docs/TESTING.md`, `docs/KNOWN_LIMITATIONS.md`, `docs/work-items.md`, `docs/cli.md`, `docs/metrics.md`, and `CLAUDE.md` has been replaced with a logical Rust identifier (struct name, method path, module path). Line-number citations have been removed. `docs/invariants.md` is unchanged (immutable per CLAUDE.md rule). The only remaining `src/**/*.rs` reference is the meta-example inside the P1 rule in CLAUDE.md that defines what that rule bans.
+
+- **`CLAUDE.md` itself: DONE.** Every rule text reference to `src/app.rs`, `src/event.rs`, `src/mcp.rs`, `src/session.rs` has been converted to a logical Rust identifier or module path.
 
 - **Mechanical impl-split removed:** the 18 files `impl_01.rs..impl_18.rs` (all of which carried the identical doc comment "split across sibling files solely to keep every file within the 700-line ceiling") have been renamed to subsystem-concern files (`setup_and_user_actions`, `sessions_core`, `fetcher_bridge`, `cleanup`, `display_list`, `session_spawn`, `harness`, `worktree_and_first_run`, `mcp_bridge_and_imports`, `work_item_ops`, `stage_transitions`, `pr_creation`, `pr_merge_and_review`, `mergequeue`, `review_gate`, `rebase_gate_spawn`, `gate_polling`, `global_drawer_polling`). Each file's doc comment now describes its subsystem.
 
-- **Tests:** `cargo test --all-features` 790 passing, 0 failing. `./hooks/clippy-check.sh` green. `cargo fmt --all` green.
+- **Tests:** `cargo test --all-features` 779 passing, 0 failing. `./hooks/clippy-check.sh` green. `cargo fmt --all` green.
 
-The remaining subsystems follow the same Stage-2 extraction pattern and the same task structure as `Toasts`/`Activities`/`ClickTracking`/`Shell`/`GlobalDrawer` below.
+The remaining subsystems follow the same Stage-2 extraction pattern and the same task structure as `Toasts`/`Activities`/`ClickTracking`/`Shell`/`GlobalDrawer`/`SettingsOverlay`/`Metrics` below.
 
 **Goal:** Complete the hygiene campaign: decompose every workbridge source file to <=700 lines by logical subsystem ownership (not mechanical impl-splits), physically delete the exception mechanism, and add review-policy rules that (a) ban future size exceptions and (b) ban unstable source-path/line-number references in docs.
 
