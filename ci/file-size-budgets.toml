@@ -36,7 +36,6 @@
 "src/dashboard_seed.rs"    = 380
 "src/event.rs"             = 4860
 "src/layout.rs"            = 209
-"src/mcp.rs"               = 2280
 "src/pr_service.rs"        = 45
 "src/prompts.rs"           = 460
 "src/salsa.rs"             = 672
