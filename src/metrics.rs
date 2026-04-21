@@ -27,12 +27,12 @@ const SECS_PER_DAY: i64 = 86_400;
 pub type DayNumber = i64;
 
 /// Convert a Unix timestamp in seconds to a day index.
-pub fn secs_to_day(secs: i64) -> DayNumber {
+pub const fn secs_to_day(secs: i64) -> DayNumber {
     secs.div_euclid(SECS_PER_DAY)
 }
 
 /// Stuck-item dwell threshold for Review: items currently in Review whose
-/// latest stage_change is older than this count as stuck.
+/// latest `stage_change` is older than this count as stuck.
 pub const STUCK_REVIEW_SECS: i64 = 3 * SECS_PER_DAY;
 /// Stuck-item dwell threshold for Blocked.
 pub const STUCK_BLOCKED_SECS: i64 = SECS_PER_DAY;
@@ -92,8 +92,8 @@ fn parse_ts(s: &str) -> Option<i64> {
     trimmed.parse::<i64>().ok()
 }
 
-/// Parse a WorkItemStatus name into the enum, honoring the serde aliases
-/// so old records using "Todo" / "InProgress" still load.
+/// Parse a `WorkItemStatus` name into the enum, honoring the serde aliases
+/// so old records using "Todo" / "`InProgress`" still load.
 fn parse_status(s: &str) -> Option<WorkItemStatus> {
     match s {
         "Backlog" | "Todo" => Some(WorkItemStatus::Backlog),
@@ -249,9 +249,9 @@ struct BacklogInterval {
 }
 
 /// Reconstruct Backlog-state intervals from a sorted event list. The
-/// first stage_change's `from` field tells us the initial status, which
+/// first `stage_change`'s `from` field tells us the initial status, which
 /// is assumed to have been held from the item's first recorded event
-/// until the first transition. Items with zero stage_change events
+/// until the first transition. Items with zero `stage_change` events
 /// contribute no intervals (their initial state is unknown).
 fn backlog_intervals(entries: &[ParsedEntry]) -> Vec<BacklogInterval> {
     if entries.is_empty() {
@@ -331,8 +331,7 @@ fn reconstruct_backlog_per_day(
 pub fn aggregate_from_activity_logs(data_dir: &Path) -> MetricsSnapshot {
     let now_secs = crate::side_effects::clock::system_now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs() as i64);
 
     let per_item = load_per_item(data_dir);
 
@@ -428,7 +427,7 @@ pub fn aggregate_from_activity_logs(data_dir: &Path) -> MetricsSnapshot {
             && let Some(last) = intervals.last_mut()
             && last.end.is_none()
         {
-            let last_event_ts = entries.last().map(|e| e.secs).unwrap_or(last.start);
+            let last_event_ts = entries.last().map_or(last.start, |e| e.secs);
             last.end = Some(last_event_ts);
         }
         all_intervals.push(intervals);
@@ -447,7 +446,7 @@ pub fn aggregate_from_activity_logs(data_dir: &Path) -> MetricsSnapshot {
 
 /// Resolve the same workbridge work-items directory that
 /// `LocalFileBackend::new()` uses, without going through the backend
-/// trait. Returns None on platforms where ProjectDirs cannot determine
+/// trait. Returns None on platforms where `ProjectDirs` cannot determine
 /// a home directory. Honors `$HOME` overrides, so tests under a temp
 /// `HOME` see an isolated metrics directory.
 pub fn default_data_dir() -> Option<PathBuf> {
@@ -541,7 +540,7 @@ mod tests {
             stage(t0, "Backlog", "Implementing"),
             stage(t5, "Implementing", "Done"),
         ];
-        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let refs: Vec<&str> = lines.iter().map(std::string::String::as_str).collect();
         write_activity(&dir, "abc", &refs);
 
         let snap = aggregate_from_activity_logs(&dir);
@@ -559,7 +558,7 @@ mod tests {
         // pr_merged on day 1 but no Done transition - this is the "drift"
         // case the Dashboard is designed to surface.
         let lines = [pr_merged(t0)];
-        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let refs: Vec<&str> = lines.iter().map(std::string::String::as_str).collect();
         write_activity(&dir, "drift", &refs);
 
         let snap = aggregate_from_activity_logs(&dir);
@@ -580,7 +579,7 @@ mod tests {
             stage(entered_backlog, "Backlog", "Implementing"),
             stage(entered_review, "Implementing", "Review"),
         ];
-        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let refs: Vec<&str> = lines.iter().map(std::string::String::as_str).collect();
         write_activity(&dir, "stuck", &refs);
         touch_work_item_json(&dir, "stuck");
 
@@ -604,7 +603,7 @@ mod tests {
             stage(entered_backlog, "Backlog", "Implementing"),
             stage(entered_review, "Implementing", "Review"),
         ];
-        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let refs: Vec<&str> = lines.iter().map(std::string::String::as_str).collect();
         write_activity(&dir, "fresh", &refs);
         touch_work_item_json(&dir, "fresh");
 
@@ -633,7 +632,7 @@ mod tests {
             stage(entered_backlog, "Backlog", "Implementing"),
             stage(entered_review, "Implementing", "Review"),
         ];
-        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let refs: Vec<&str> = lines.iter().map(std::string::String::as_str).collect();
         // Deliberately NO `touch_work_item_json` - this simulates the
         // failed-archival orphan state.
         write_activity(&dir, "orphan", &refs);
@@ -668,7 +667,7 @@ mod tests {
         // Planning -> Backlog with no subsequent transition: the naive
         // interval would stay open indefinitely.
         let lines = [stage(t_enter, "Planning", "Backlog")];
-        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let refs: Vec<&str> = lines.iter().map(std::string::String::as_str).collect();
         write_activity(&dir, "orphan-bl", &refs);
         // No sibling JSON.
 
@@ -708,7 +707,7 @@ mod tests {
             stage(t_enter, "Planning", "Backlog"),
             stage(t_exit, "Backlog", "Implementing"),
         ];
-        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let refs: Vec<&str> = lines.iter().map(std::string::String::as_str).collect();
         write_activity(&dir, "bl", &refs);
 
         let snap = aggregate_from_activity_logs(&dir);
@@ -730,7 +729,10 @@ mod tests {
             stage(t0, "Backlog", "Implementing"),
             stage(t0 + 86_400, "Implementing", "Done"),
         ];
-        let refs_active: Vec<&str> = lines_active.iter().map(|s| s.as_str()).collect();
+        let refs_active: Vec<&str> = lines_active
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
         write_activity(&dir, "live", &refs_active);
 
         let t_archived: i64 = 1_600_000_000;
@@ -738,7 +740,10 @@ mod tests {
             stage(t_archived, "Backlog", "Implementing"),
             stage(t_archived + 3 * 86_400, "Implementing", "Done"),
         ];
-        let refs_archived: Vec<&str> = lines_archived.iter().map(|s| s.as_str()).collect();
+        let refs_archived: Vec<&str> = lines_archived
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
         write_activity(&archive, "old", &refs_archived);
 
         let snap = aggregate_from_activity_logs(&dir);
@@ -772,7 +777,7 @@ mod tests {
             stage(entered_backlog, "Backlog", "Implementing"),
             stage(entered_review, "Implementing", "Review"),
         ];
-        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let refs: Vec<&str> = lines.iter().map(std::string::String::as_str).collect();
         write_activity(&archive, "ghost", &refs);
 
         let snap = aggregate_from_activity_logs(&dir);
@@ -803,7 +808,7 @@ mod tests {
         // Only a Planning -> Backlog transition. Its last known state
         // is Backlog at t_enter; archival closes the interval there.
         let lines = [stage(t_enter, "Planning", "Backlog")];
-        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let refs: Vec<&str> = lines.iter().map(std::string::String::as_str).collect();
         write_activity(&archive, "gone-in-backlog", &refs);
 
         let snap = aggregate_from_activity_logs(&dir);
@@ -875,7 +880,7 @@ mod tests {
         // day D, NOT leak into day D-1 just because its timestamp
         // equals day D-1's previous notion of `eod`.
         let lines_a = [stage(day_d_midnight, "Planning", "Backlog")];
-        let refs_a: Vec<&str> = lines_a.iter().map(|s| s.as_str()).collect();
+        let refs_a: Vec<&str> = lines_a.iter().map(std::string::String::as_str).collect();
         write_activity(&dir, "enters-at-midnight", &refs_a);
         touch_work_item_json(&dir, "enters-at-midnight");
 
@@ -888,7 +893,7 @@ mod tests {
             stage(day_d_midnight - SECS_PER_DAY, "Planning", "Backlog"),
             stage(day_d_plus_1_midnight, "Backlog", "Implementing"),
         ];
-        let refs_b: Vec<&str> = lines_b.iter().map(|s| s.as_str()).collect();
+        let refs_b: Vec<&str> = lines_b.iter().map(std::string::String::as_str).collect();
         write_activity(&dir, "leaves-at-midnight", &refs_b);
         touch_work_item_json(&dir, "leaves-at-midnight");
 

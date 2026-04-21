@@ -12,7 +12,7 @@ use crate::work_item::{
 use crate::work_item_backend::WorkItemRecord;
 use crate::worktree_service::WorktreeInfo;
 
-/// Convert a raw GithubPr into a display-ready PrInfo.
+/// Convert a raw `GithubPr` into a display-ready `PrInfo`.
 fn convert_pr(pr: &GithubPr) -> PrInfo {
     PrInfo {
         number: pr.number,
@@ -26,7 +26,7 @@ fn convert_pr(pr: &GithubPr) -> PrInfo {
     }
 }
 
-/// Convert a raw state string from GitHub into a PrState enum.
+/// Convert a raw state string from GitHub into a `PrState` enum.
 fn convert_pr_state(raw: &str) -> PrState {
     match raw.to_uppercase().as_str() {
         "MERGED" => PrState::Merged,
@@ -35,7 +35,7 @@ fn convert_pr_state(raw: &str) -> PrState {
     }
 }
 
-/// Convert a raw review decision string from GitHub into a ReviewDecision enum.
+/// Convert a raw review decision string from GitHub into a `ReviewDecision` enum.
 fn convert_review_decision(raw: &str) -> ReviewDecision {
     match raw {
         "APPROVED" => ReviewDecision::Approved,
@@ -45,7 +45,7 @@ fn convert_review_decision(raw: &str) -> ReviewDecision {
     }
 }
 
-/// Convert a raw status check rollup string into a CheckStatus enum.
+/// Convert a raw status check rollup string into a `CheckStatus` enum.
 fn convert_check_status(raw: &str) -> CheckStatus {
     match raw {
         "SUCCESS" => CheckStatus::Passing,
@@ -56,7 +56,7 @@ fn convert_check_status(raw: &str) -> CheckStatus {
     }
 }
 
-/// Convert a raw mergeable string from GitHub into a MergeableState enum.
+/// Convert a raw mergeable string from GitHub into a `MergeableState` enum.
 fn convert_mergeable_state(raw: &str) -> MergeableState {
     match raw {
         "MERGEABLE" => MergeableState::Mergeable,
@@ -152,7 +152,7 @@ fn find_issue_in_fetch(
 /// Returns true if the issue number appears in the fetched issues list
 /// (regardless of whether the result was Ok or Err). When true and
 /// `find_issue_in_fetch` returned None, it means the fetch failed
-/// (e.g. 404) and IssueNotFound is genuine. When false, the fetcher
+/// (e.g. 404) and `IssueNotFound` is genuine. When false, the fetcher
 /// never tried to fetch this issue (e.g. no worktree had a branch
 /// matching this number), so we should not emit an error.
 fn issue_was_attempted(
@@ -200,21 +200,20 @@ pub fn reassemble(
         for assoc_record in &record.repo_associations {
             let repo_path = &assoc_record.repo_path;
 
-            let branch = match &assoc_record.branch {
-                Some(b) => b,
-                None => {
-                    // branch=None: pre-planning state, skip all matching
-                    assembled_associations.push(RepoAssociation {
-                        repo_path: repo_path.clone(),
-                        branch: None,
-                        worktree_path: None,
-                        pr: None,
-                        issue: None,
-                        stale_worktree_path: None,
-                        git_state: None,
-                    });
-                    continue;
-                }
+            let branch = if let Some(b) = &assoc_record.branch {
+                b
+            } else {
+                // branch=None: pre-planning state, skip all matching
+                assembled_associations.push(RepoAssociation {
+                    repo_path: repo_path.clone(),
+                    branch: None,
+                    worktree_path: None,
+                    pr: None,
+                    issue: None,
+                    stale_worktree_path: None,
+                    git_state: None,
+                });
+                continue;
             };
 
             if first_branch.is_none() {
@@ -373,16 +372,16 @@ pub fn reassemble(
         // --- Title derivation ---
         // Priority: PR title > issue title > backend title > branch > "untitled"
         let title = if let Some(pr_title) = best_pr_title {
-            if !pr_title.is_empty() {
-                pr_title
-            } else {
+            if pr_title.is_empty() {
                 derive_fallback_title(&record.title, &first_branch)
+            } else {
+                pr_title
             }
         } else if let Some(issue_title) = best_issue_title {
-            if !issue_title.is_empty() {
-                issue_title
-            } else {
+            if issue_title.is_empty() {
                 derive_fallback_title(&record.title, &first_branch)
+            } else {
+                issue_title
             }
         } else {
             derive_fallback_title(&record.title, &first_branch)
@@ -471,8 +470,8 @@ fn derive_fallback_title(backend_title: &str, first_branch: &Option<String>) -> 
     }
 }
 
-/// Derive the BackendType from a WorkItemId.
-fn backend_type_from_id(id: &crate::work_item::WorkItemId) -> crate::work_item::BackendType {
+/// Derive the `BackendType` from a `WorkItemId`.
+const fn backend_type_from_id(id: &crate::work_item::WorkItemId) -> crate::work_item::BackendType {
     match id {
         crate::work_item::WorkItemId::LocalFile(_) => crate::work_item::BackendType::LocalFile,
         crate::work_item::WorkItemId::GithubIssue { .. } => {
@@ -484,7 +483,7 @@ fn backend_type_from_id(id: &crate::work_item::WorkItemId) -> crate::work_item::
     }
 }
 
-/// Collect PRs from all repos whose (repo_path, branch) is not already
+/// Collect PRs from all repos whose (`repo_path`, branch) is not already
 /// claimed by a work item. All fetched PRs are pre-filtered to the
 /// authenticated user via `--author @me` in the gh CLI calls.
 fn collect_unlinked_prs(
@@ -643,7 +642,7 @@ mod tests {
             url: format!("https://github.com/o/r/pull/{number}"),
             review_decision: review.to_string(),
             status_check_rollup: checks.to_string(),
-            head_repo_owner: owner.map(|s| s.to_string()),
+            head_repo_owner: owner.map(std::string::ToString::to_string),
             author: Some("testuser".to_string()),
             mergeable: String::new(),
             requested_reviewer_logins: Vec::new(),
@@ -663,7 +662,7 @@ mod tests {
     fn create_mock_worktree(path: &str, branch: Option<&str>) -> WorktreeInfo {
         WorktreeInfo {
             path: PathBuf::from(path),
-            branch: branch.map(|s| s.to_string()),
+            branch: branch.map(std::string::ToString::to_string),
             is_main: false,
             has_commits_ahead: None,
             dirty: None,
@@ -846,7 +845,7 @@ mod tests {
                 "",
                 WorkItemStatus::Backlog,
                 vec![RepoAssociationRecord {
-                    repo_path: rp.clone(),
+                    repo_path: rp,
                     branch: None,
                     pr_identity: None,
                 }],
@@ -974,7 +973,7 @@ mod tests {
         let pr = create_mock_pr(1, "Some PR", "some-branch", "", "");
         let wt = create_mock_worktree("/worktrees/some-branch", Some("some-branch"));
 
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![pr], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![wt], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, unlinked, _, _) =
@@ -1013,7 +1012,7 @@ mod tests {
         let pr1 = create_mock_pr(1, "PR one", branch, "", "");
         let pr2 = create_mock_pr(2, "PR two", branch, "", "");
 
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr1, pr2], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![], vec![pr1, pr2], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) =
@@ -1063,7 +1062,7 @@ mod tests {
         // Only a detached worktree exists - no worktree on feature-x.
         let wt_detached = create_mock_worktree("/worktrees/some-detached", None);
 
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt_detached], vec![], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![wt_detached], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) =
@@ -1131,7 +1130,7 @@ mod tests {
             behind_remote: Some(1),
             ..WorktreeInfo::default()
         };
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![wt], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) =
@@ -1175,7 +1174,7 @@ mod tests {
             behind_remote: Some(0),
             ..WorktreeInfo::default()
         };
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![wt], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) =
@@ -1213,7 +1212,7 @@ mod tests {
 
         // All cleanliness fields = None.
         let wt = create_mock_worktree("/worktrees/feature-unknown", Some(branch));
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![wt], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) =
@@ -1297,8 +1296,7 @@ mod tests {
 
         let issue = create_mock_issue(42, "Fix the bug");
 
-        let (rp_key, fetch) =
-            create_mock_repo_data(rp.clone(), vec![], vec![], vec![(42, Ok(issue))]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![], vec![], vec![(42, Ok(issue))]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) = reassemble(&[record], &repo_data, r"^(\d+)-", ".worktrees");
@@ -1333,7 +1331,7 @@ mod tests {
 
         // Fetcher attempted issue #99 but got an error (not found).
         let (rp_key, fetch) = create_mock_repo_data(
-            rp.clone(),
+            rp,
             vec![],
             vec![],
             vec![(99, Err(GithubError::ApiError("not found".into())))],
@@ -1377,7 +1375,7 @@ mod tests {
         );
 
         // Repo data exists but fetcher did not attempt issue #99.
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) =
@@ -1457,7 +1455,7 @@ mod tests {
     // collect_review_requested_prs filter tests
     // -----------------------------------------------------------------------
 
-    /// Build a repo_data map with a single review-requested PR on the given
+    /// Build a `repo_data` map with a single review-requested PR on the given
     /// branch and review decision. Helper for the filter tests below.
     fn repo_data_with_review_request(
         rp: PathBuf,
@@ -1472,7 +1470,7 @@ mod tests {
             head_branch: branch.to_string(),
             url: "https://github.com/o/r/pull/1".to_string(),
             review_decision: review_decision.to_string(),
-            status_check_rollup: "".to_string(),
+            status_check_rollup: String::new(),
             head_repo_owner: Some("other".to_string()),
             author: Some("someone-else".to_string()),
             mergeable: String::new(),
@@ -1627,7 +1625,7 @@ mod tests {
                 pr_identity: None,
             }],
         );
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         // Invalid regex pattern should not panic - just skip issue extraction.
@@ -1649,8 +1647,8 @@ mod tests {
         let pr_a = create_mock_pr(1, "PR in alpha", "feature-a", "", "");
         let pr_b = create_mock_pr(2, "PR in beta", "feature-b", "", "");
 
-        let (key_a, fetch_a) = create_mock_repo_data(rp_a.clone(), vec![], vec![pr_a], vec![]);
-        let (key_b, fetch_b) = create_mock_repo_data(rp_b.clone(), vec![], vec![pr_b], vec![]);
+        let (key_a, fetch_a) = create_mock_repo_data(rp_a, vec![], vec![pr_a], vec![]);
+        let (key_b, fetch_b) = create_mock_repo_data(rp_b, vec![], vec![pr_b], vec![]);
         let repo_data = HashMap::from([(key_a, fetch_a), (key_b, fetch_b)]);
 
         let (items, unlinked, _, _) =
@@ -1683,7 +1681,7 @@ mod tests {
         // Repo data has a worktree on a different branch.
         let wt = create_mock_worktree("/worktrees/other-branch", Some("other-branch"));
 
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![wt], vec![], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![wt], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) =
@@ -1718,7 +1716,7 @@ mod tests {
             "In progress work",
             WorkItemStatus::Implementing,
             vec![RepoAssociationRecord {
-                repo_path: rp.clone(),
+                repo_path: rp,
                 branch: None,
                 pr_identity: None,
             }],
@@ -1822,7 +1820,7 @@ mod tests {
         let mut pr = create_mock_pr(10, "Ship it", branch, "APPROVED", "SUCCESS");
         pr.state = "MERGED".to_string();
 
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) =
@@ -1855,7 +1853,7 @@ mod tests {
 
         let pr = create_mock_pr(10, "Work", branch, "", "");
 
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) =
@@ -1915,7 +1913,7 @@ mod tests {
     // -- Round 7 regression tests --
 
     /// F-1: Fork PRs with the same branch name as a local branch must not
-    /// be matched. Only same-repo PRs (where head_repo_owner matches the
+    /// be matched. Only same-repo PRs (where `head_repo_owner` matches the
     /// repo owner) should match.
     #[test]
     fn fork_pr_not_matched_to_local_branch() {
@@ -1953,7 +1951,7 @@ mod tests {
         );
 
         let (rp_key, fetch) =
-            create_mock_repo_data(rp.clone(), vec![], vec![same_repo_pr, fork_pr], vec![]);
+            create_mock_repo_data(rp, vec![], vec![same_repo_pr, fork_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, unlinked, _, _) =
@@ -1989,7 +1987,7 @@ mod tests {
         );
     }
 
-    /// F-1: When head_repo_owner is None (gh CLI did not return the field),
+    /// F-1: When `head_repo_owner` is None (gh CLI did not return the field),
     /// PRs are still matched (backwards compatibility).
     #[test]
     fn pr_without_head_repo_owner_still_matches() {
@@ -2010,7 +2008,7 @@ mod tests {
         // PR without head_repo_owner (None).
         let pr = create_mock_pr(1, "Fix typo", branch, "", "");
 
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![pr], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![], vec![pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) =
@@ -2025,8 +2023,8 @@ mod tests {
 
     // -- Round 8 regression tests --
 
-    /// F-2 (Round 8) + F-1 fix (Round 10): Fork PRs appear in unlinked_prs
-    /// only when their (repo_path, branch) is NOT claimed by a work item.
+    /// F-2 (Round 8) + F-1 fix (Round 10): Fork PRs appear in `unlinked_prs`
+    /// only when their (`repo_path`, branch) is NOT claimed by a work item.
     /// Once imported, the fork PR's branch is claimed and it disappears
     /// from the unlinked list.
     #[test]
@@ -2065,7 +2063,7 @@ mod tests {
         );
 
         let (rp_key, fetch) =
-            create_mock_repo_data(rp.clone(), vec![], vec![same_repo_pr, fork_pr], vec![]);
+            create_mock_repo_data(rp, vec![], vec![same_repo_pr, fork_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, unlinked, _, _) =
@@ -2095,7 +2093,7 @@ mod tests {
 
     // -- PR identity fallback tests --
 
-    /// Persisted pr_identity produces a PrInfo when the backend record is
+    /// Persisted `pr_identity` produces a `PrInfo` when the backend record is
     /// Done and no live PR is found.
     #[test]
     fn pr_identity_fallback_produces_pr_info_for_done_item() {
@@ -2118,7 +2116,7 @@ mod tests {
         );
 
         // No live PRs in repo data.
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) =
@@ -2143,7 +2141,7 @@ mod tests {
         assert_eq!(pr.url, "https://github.com/o/r/pull/42");
     }
 
-    /// A live PR takes precedence over persisted pr_identity.
+    /// A live PR takes precedence over persisted `pr_identity`.
     #[test]
     fn live_pr_takes_precedence_over_pr_identity() {
         let rp = repo_path("alpha");
@@ -2167,7 +2165,7 @@ mod tests {
         // A live PR exists on the same branch.
         let live_pr = create_mock_pr(99, "New PR on same branch", branch, "", "PENDING");
 
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![live_pr], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![], vec![live_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) =
@@ -2184,7 +2182,7 @@ mod tests {
         assert_eq!(pr.state, PrState::Open);
     }
 
-    /// Persisted pr_identity is ignored when the item is NOT Done.
+    /// Persisted `pr_identity` is ignored when the item is NOT Done.
     /// This prevents an irreversible Done lock when a merge is reverted
     /// and the user moves the item back.
     #[test]
@@ -2209,7 +2207,7 @@ mod tests {
         );
 
         // No live PRs.
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![], vec![], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (items, _, _, _) =
@@ -2239,7 +2237,7 @@ mod tests {
 
     /// F-1 regression: After importing a fork PR, reassembling should NOT
     /// show it as unlinked again. The import creates a work item that
-    /// claims the (repo_path, branch), so collect_unlinked_prs must
+    /// claims the (`repo_path`, branch), so `collect_unlinked_prs` must
     /// respect that claim for fork PRs too.
     #[test]
     fn imported_fork_pr_not_re_listed_as_unlinked() {
@@ -2269,7 +2267,7 @@ mod tests {
             Some("contributor"),
         );
 
-        let (rp_key, fetch) = create_mock_repo_data(rp.clone(), vec![], vec![fork_pr], vec![]);
+        let (rp_key, fetch) = create_mock_repo_data(rp, vec![], vec![fork_pr], vec![]);
         let repo_data = HashMap::from([(rp_key, fetch)]);
 
         let (_items, unlinked, _, _) =

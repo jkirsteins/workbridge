@@ -184,5 +184,100 @@ pair is itself denied at the crate level to prevent regressions.
 
 ## Post-cleanup inventory
 
-See "Post-cleanup inventory" section at the end of this document
-(added in the final Phase E commit once Phase D was complete).
+After Phase D finished, the final `[lints]` matrix landed in
+`Cargo.toml` and both clippy invocations exit 0:
+
+```sh
+cargo clippy --bins --all-features -- -D warnings
+cargo clippy --tests --all-features -- -D warnings \
+    -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
+```
+
+The final lint-matrix disposition:
+
+### Deny (P1 hygiene, zero findings)
+
+- `clippy::dbg_macro`
+- `clippy::todo`
+- `clippy::unimplemented`
+- `clippy::allow_attributes`
+- `clippy::allow_attributes_without_reason`
+- `rustdoc::broken_intra_doc_links`
+
+### Deny (production restriction lints, zero findings)
+
+- `clippy::unwrap_used`
+- `clippy::expect_used`
+- `clippy::panic`
+
+Tests are permitted to use these via CI's two-invocation pattern
+(`-A clippy::unwrap_used -A clippy::expect_used -A clippy::panic` on
+the `--tests` invocation). No source-level `#[allow]` attribute is
+used to implement the carve-out; the `clippy::allow_attributes`
+lint itself denies them.
+
+### Warn / deny (via -D warnings)
+
+- `clippy::pedantic` (group, priority -1)
+- `clippy::nursery` (group, priority -1)
+- `rust_2018_idioms` (group, priority -1)
+
+### Allow (with rationale in Cargo.toml)
+
+- **CLI surface**: `print_stdout`, `print_stderr`, `exit`.
+- **Design-doc noise**: `module_name_repetitions`,
+  `missing_errors_doc`, `missing_panics_doc`, `too_many_lines`,
+  `similar_names`.
+- **TUI cast math**: `cast_possible_truncation`, `cast_possible_wrap`,
+  `cast_sign_loss`, `cast_lossless`, `cast_precision_loss`.
+- **Phase-4 structural**: `needless_pass_by_value`,
+  `significant_drop_tightening`, `struct_excessive_bools`,
+  `unused_self`.
+- **Judgment-heavy rewrites**: `manual_let_else`, `option_if_let_else`,
+  `items_after_statements`, `match_same_arms`, `or_fun_call`,
+  `trivially_copy_pass_by_ref`, `ref_option`, `comparison_chain`,
+  `missing_const_for_fn`, `unnecessary_wraps`.
+- **Test-only patterns**: `used_underscore_binding`,
+  `unreadable_literal`.
+- **Unsafe code**: `unsafe_code = "allow"`; review-based policy
+  documented in `CONTRIBUTING.md` ("Unsafe code policy").
+
+### Source-level `#[allow]` attributes removed
+
+Phase C deleted the seven pre-existing source-level `#[allow]`
+attributes:
+
+- `src/app.rs:16442` (`clippy::too_many_arguments` x1 -> struct-bundled
+  as `ReviewItemState`)
+- `src/app.rs:17552` (`clippy::too_many_arguments` x1 -> struct-bundled
+  as `LivePrPrecheckSpec`)
+- `src/config.rs:13`, `:39`, `:45` (`dead_code` x3 ->
+  `InMemoryConfigProvider` moved to `#[cfg(test)] mod test_support`;
+  `ConfigProvider::load` allow dropped because the trait method is
+  used in production by `main.rs::config_set`)
+- `src/salsa.rs:28`, `:37`, `:43` (`dead_code` x3 ->
+  `AppEvent::Message(AppMessage)` and the `AppMessage` enum deleted
+  along with the dispatcher arm)
+- `src/work_item.rs:302`, `:320`, `:331`, `:338` (`dead_code` x4 ->
+  `IssueInfo::state` field, `IssueState` enum,
+  `WorkItemError::DetachedHead` / `CorruptBackendRecord` /
+  `WorktreeGone` variants deleted; renderer and fixture sites
+  updated)
+- `src/work_item_backend.rs:20`, `:336` (`dead_code` x2 ->
+  `BackendError::Parse` variant and `WorkItemBackend::backend_type()`
+  trait method deleted, along with the 19 downstream trait impls)
+- `src/worktree_service.rs:354` (`dead_code` x1 -> attribute simply
+  removed; `find_branch_for_worktree` is actually used by
+  `remove_worktree`, clippy misjudged)
+
+After Phase C, `grep -rn '#\[allow\|#!\[allow' src/` returns zero
+source-level allow attributes.
+
+## Calibration artifact provenance
+
+The raw lint counts in the top of this file were produced on
+2026-04-21 against master `c5d56b2`. Future hygiene campaigns can
+regenerate a comparable baseline by re-running the command quoted in
+"Raw source" above and diffing the JSON output against
+`/tmp/workbridge-p3-clippy.json` (not committed; see CONTRIBUTING.md
+for how to avoid committing raw artifacts).

@@ -90,8 +90,8 @@ fn fetcher_loop(
         Ok(r) => r,
         Err(e) => {
             let msg = FetchMessage::FetcherError {
-                repo_path: repo_path.clone(),
-                error: format!("invalid issue pattern '{}': {}", issue_pattern, e),
+                repo_path,
+                error: format!("invalid issue pattern '{issue_pattern}': {e}"),
             };
             // If the receiver is already gone, just return.
             let _ = tx.send(msg);
@@ -116,7 +116,7 @@ fn fetcher_loop(
             Err(e) => {
                 let msg = FetchMessage::FetcherError {
                     repo_path: repo_path.clone(),
-                    error: format!("failed to determine GitHub remote: {}", e),
+                    error: format!("failed to determine GitHub remote: {e}"),
                 };
                 if tx.send(msg).is_err() {
                     break;
@@ -347,13 +347,12 @@ mod tests {
     }
 
     /// Helper: receive the next non-FetchStarted message from the channel,
-    /// asserting that any preceding messages are FetchStarted.
+    /// asserting that any preceding messages are `FetchStarted`.
     fn recv_data(rx: &mpsc::Receiver<FetchMessage>) -> FetchMessage {
         loop {
             let msg = crate::side_effects::clock::bounded_recv(rx, "fetcher recv_data");
-            match msg {
-                FetchMessage::FetchStarted => continue,
-                other => return other,
+            if !matches!(msg, FetchMessage::FetchStarted) {
+                return msg;
             }
         }
     }
@@ -685,7 +684,7 @@ mod tests {
                 break;
             }
             match rx.try_recv() {
-                Ok(FetchMessage::FetchStarted) => continue,
+                Ok(FetchMessage::FetchStarted) => {}
                 Ok(FetchMessage::FetcherError { error, .. }) => {
                     if error.contains("failed to look up current user login") {
                         saw_login_error = true;

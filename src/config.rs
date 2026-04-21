@@ -38,7 +38,7 @@ impl ConfigProvider for FileConfigProvider {
 /// `crate::config::InMemoryConfigProvider` via the `pub use` re-export
 /// below, so existing call sites do not need updating.
 #[cfg(test)]
-pub(crate) mod test_support {
+pub mod test_support {
     use std::sync::Mutex;
 
     use super::{Config, ConfigError, ConfigProvider};
@@ -169,7 +169,7 @@ pub struct Defaults {
     /// harnesses on PATH and persists the pick here. Settable non-
     /// interactively via `workbridge config set global-assistant-
     /// harness <name>`. "opencode" is not a valid value: the stub
-    /// adapter for OpenCode exists only as internal scaffolding and
+    /// adapter for `OpenCode` exists only as internal scaffolding and
     /// is not user-selectable (rejected by `AgentBackendKind::from_str`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_assistant_harness: Option<String>,
@@ -187,7 +187,7 @@ fn default_review_skill() -> String {
     "/claude-adversarial-review".into()
 }
 
-fn default_archive_after_days() -> u64 {
+const fn default_archive_after_days() -> u64 {
     7
 }
 
@@ -234,13 +234,13 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::Io(e) => write!(f, "I/O error: {e}"),
-            ConfigError::Parse(e) => write!(f, "config parse error: {e}"),
-            ConfigError::Serialize(e) => write!(f, "config serialization error: {e}"),
-            ConfigError::NoConfigDir => write!(f, "could not determine config directory"),
-            ConfigError::PathNotFound(p) => write!(f, "path not found: {p}"),
-            ConfigError::NotAGitRepo(p) => write!(f, "not a git repository: {p}"),
-            ConfigError::DuplicateMcpServer { repo, name } => {
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Parse(e) => write!(f, "config parse error: {e}"),
+            Self::Serialize(e) => write!(f, "config serialization error: {e}"),
+            Self::NoConfigDir => write!(f, "could not determine config directory"),
+            Self::PathNotFound(p) => write!(f, "path not found: {p}"),
+            Self::NotAGitRepo(p) => write!(f, "not a git repository: {p}"),
+            Self::DuplicateMcpServer { repo, name } => {
                 write!(f, "MCP server '{name}' already exists for repo '{repo}'")
             }
         }
@@ -249,7 +249,7 @@ impl fmt::Display for ConfigError {
 
 impl From<std::io::Error> for ConfigError {
     fn from(e: std::io::Error) -> Self {
-        ConfigError::Io(e)
+        Self::Io(e)
     }
 }
 
@@ -324,9 +324,9 @@ impl Config {
     /// as the source. Avoids tests needing to specify every field.
     #[cfg(test)]
     pub fn for_test() -> Self {
-        Config {
+        Self {
             source: "in-memory (test)".into(),
-            ..Config::default()
+            ..Self::default()
         }
     }
 
@@ -337,13 +337,13 @@ impl Config {
         let path = config_path()?;
         let source = format!("{}", path.display());
         if !path.exists() {
-            return Ok(Config {
+            return Ok(Self {
                 source: format!("{source} (not yet created)"),
-                ..Config::default()
+                ..Self::default()
             });
         }
         let contents = fs::read_to_string(&path)?;
-        let mut cfg: Config = toml::from_str(&contents).map_err(ConfigError::Parse)?;
+        let mut cfg: Self = toml::from_str(&contents).map_err(ConfigError::Parse)?;
         cfg.source = source;
         // Normalize included_repos so hand-edited paths (relative, non-canonical)
         // match correctly in active_repos() filtering.
@@ -394,7 +394,7 @@ impl Config {
         Ok((display, count))
     }
 
-    /// Remove a path from repos, base_dirs, and included_repos.
+    /// Remove a path from repos, `base_dirs`, and `included_repos`.
     pub fn remove_path(&mut self, raw: &str) -> bool {
         let target = expand_tilde(raw);
         let target_canonical = canonicalize_path(&target).ok();
@@ -425,7 +425,7 @@ impl Config {
         after < before
     }
 
-    /// Discover git repos under all base_dirs (one level deep).
+    /// Discover git repos under all `base_dirs` (one level deep).
     pub fn discover_repos(&self) -> Vec<PathBuf> {
         let mut found = Vec::new();
         for base in &self.base_dirs {
@@ -528,7 +528,7 @@ impl Config {
         let normalized = normalize_repo_path(repo);
         let count = entries.len();
         for mut entry in entries {
-            entry.repo = normalized.clone();
+            entry.repo.clone_from(&normalized);
             if let Some(existing) = self
                 .mcp_servers
                 .iter_mut()
@@ -573,8 +573,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp_path = parent.join(format!(
         ".{}.tmp",
         path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "config".into())
+            .map_or_else(|| "config".into(), |n| n.to_string_lossy().into_owned())
     ));
     fs::write(&tmp_path, data)?;
     fs::rename(&tmp_path, path)?;

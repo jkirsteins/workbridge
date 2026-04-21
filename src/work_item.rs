@@ -13,7 +13,7 @@ use crate::worktree_service::{WorktreeError, WorktreeInfo};
 ///
 /// Each variant corresponds to a backend type. The id uniquely identifies
 /// a work item across sessions and restarts. All variant fields are
-/// hashable, so WorkItemId can be used as a HashMap key.
+/// hashable, so `WorkItemId` can be used as a `HashMap` key.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WorkItemId {
     /// Stored as a JSON file on the local filesystem.
@@ -34,8 +34,8 @@ impl Hash for WorkItemId {
         // field values do not collide.
         std::mem::discriminant(self).hash(state);
         match self {
-            WorkItemId::LocalFile(path) => path.hash(state),
-            WorkItemId::GithubIssue {
+            Self::LocalFile(path) => path.hash(state),
+            Self::GithubIssue {
                 owner,
                 repo,
                 number,
@@ -44,7 +44,7 @@ impl Hash for WorkItemId {
                 repo.hash(state);
                 number.hash(state);
             }
-            WorkItemId::GithubProject { node_id } => node_id.hash(state),
+            Self::GithubProject { node_id } => node_id.hash(state),
         }
     }
 }
@@ -88,7 +88,7 @@ pub enum WorkItemStatus {
 
 impl WorkItemStatus {
     /// The next stage in the workflow, or None if at the terminal stage.
-    pub fn next_stage(&self) -> Option<WorkItemStatus> {
+    pub const fn next_stage(&self) -> Option<Self> {
         match self {
             Self::Backlog => Some(Self::Planning),
             Self::Planning => Some(Self::Implementing),
@@ -101,7 +101,7 @@ impl WorkItemStatus {
     }
 
     /// The previous stage in the workflow, or None if at the first stage.
-    pub fn prev_stage(&self) -> Option<WorkItemStatus> {
+    pub const fn prev_stage(&self) -> Option<Self> {
         match self {
             Self::Backlog => None,
             Self::Planning => Some(Self::Backlog),
@@ -114,7 +114,7 @@ impl WorkItemStatus {
     }
 
     /// Short badge text for display in the work item list.
-    pub fn badge_text(&self) -> &'static str {
+    pub const fn badge_text(&self) -> &'static str {
         match self {
             Self::Backlog => "[BL]",
             Self::Planning => "[PL]",
@@ -134,7 +134,7 @@ impl WorkItemStatus {
     /// Other stages return a high value so they never displace
     /// MQ/RV/IM/PL inside the ACTIVE bucket. Ties are broken by the
     /// caller's existing order (stable sort).
-    pub fn active_group_rank(&self) -> u8 {
+    pub const fn active_group_rank(&self) -> u8 {
         match self {
             Self::Mergequeue => 0,
             Self::Review => 1,
@@ -164,8 +164,7 @@ impl WorkItemStatus {
 pub fn repo_slug_from_path(repo_path: &Path) -> String {
     repo_path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "unknown".into())
+        .map_or_else(|| "unknown".into(), |n| n.to_string_lossy().into_owned())
 }
 
 /// A fully assembled work item with backend data and derived metadata.
@@ -413,7 +412,7 @@ impl SelectionState {
     /// whole reason the logic lives on the struct: the two sides must
     /// agree on where the selection starts and ends, so there is exactly
     /// one anchor-vs-current ordering rule for the whole program.
-    pub fn normalized_bounds(&self) -> (u16, u16, u16, u16) {
+    pub const fn normalized_bounds(&self) -> (u16, u16, u16, u16) {
         let (ar, ac) = self.anchor;
         let (cr, cc) = self.current;
         if ar < cr || (ar == cr && ac <= cc) {
@@ -466,7 +465,7 @@ pub struct RepoFetchResult {
     pub issues: Vec<(u64, Result<GithubIssue, GithubError>)>,
     /// The GitHub login of the currently authenticated user, resolved
     /// once per fetch tick via `gh api user` (cached inside the
-    /// github_client). None when the lookup has not yet succeeded -
+    /// `github_client`). None when the lookup has not yet succeeded -
     /// e.g. the gh CLI is missing, auth is expired, or the first call
     /// happens to hit a transient error. Lookup failures are NOT
     /// silent: the fetcher emits a `FetchMessage::FetcherError` on
@@ -490,7 +489,7 @@ pub enum FetchMessage {
 
 /// Handle to background fetcher threads. Holds a shared stop flag for
 /// clean shutdown. Threads are fully independent once spawned - we do
-/// not store JoinHandles or join on stop. Threads exit on their own
+/// not store `JoinHandles` or join on stop. Threads exit on their own
 /// when the stop flag is set or when their channel send fails.
 pub struct FetcherHandle {
     pub stop: Arc<AtomicBool>,

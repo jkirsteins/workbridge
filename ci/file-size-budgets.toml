@@ -24,26 +24,31 @@
 # 700-line implicit ceiling unless an explicit entry is added below.
 
 [budgets]
-"src/agent_backend.rs"     = 2383
-"src/app.rs"               = 26206
+# Phase 3 hygiene cleanup added a handful of lines to most of these
+# files (added doc comments, widened `match` arms into `let ... else`
+# blocks, migrated static-JSON parses to the `json!` macro). Each
+# budget was bumped just enough to absorb the cleanup; none is
+# expected to grow further before the Phase 4 decomposition.
+"src/agent_backend.rs"     = 2390
+"src/app.rs"               = 26300
 "src/assembly.rs"          = 2319
 "src/click_targets.rs"     = 215
 "src/config.rs"            = 920
 "src/create_dialog.rs"     = 844
-"src/dashboard_seed.rs"    = 369
-"src/event.rs"             = 4850
+"src/dashboard_seed.rs"    = 380
+"src/event.rs"             = 4860
 "src/fetcher.rs"           = 719
-"src/github_client.rs"     = 1417
+"src/github_client.rs"     = 1425
 "src/layout.rs"            = 209
-"src/main.rs"              = 804
-"src/mcp.rs"               = 2271
-"src/metrics.rs"           = 1022
+"src/main.rs"              = 810
+"src/mcp.rs"               = 2280
+"src/metrics.rs"           = 1030
 "src/pr_service.rs"        = 45
-"src/prompts.rs"           = 454
+"src/prompts.rs"           = 460
 "src/salsa.rs"             = 672
 "src/session.rs"           = 532
 "src/theme.rs"             = 561
-"src/ui.rs"                = 7797
+"src/ui.rs"                = 7800
 "src/work_item.rs"         = 677
-"src/work_item_backend.rs" = 2203
+"src/work_item_backend.rs" = 2210
 "src/worktree_service.rs"  = 1693

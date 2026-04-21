@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `cargo-release` support and consolidated the release documentation
   into [RELEASING.md](RELEASING.md) ([#130](https://github.com/jkirsteins/workbridge/pull/130)).
+- Internal/hygiene: enable pedantic + nursery + selected restriction clippy
+  lints, clean up the resulting findings, enforce an implicit 700-line
+  budget for new top-level source files, and document the lints and
+  unsafe-code policies in CONTRIBUTING.md. Tests continue to permit
+  `unwrap`/`expect`/`panic` via CI's two-invocation clippy pattern -
+  no source-level `#[allow]` attribute was introduced
+  ([hygiene Phase 3](docs/hygiene-campaign/phase-3-calibration.md)).
 
 ## [0.1.1] - 2026-04-18
 

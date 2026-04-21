@@ -45,8 +45,8 @@ const SPINNER_FRAMES: &[char] = &[
 /// (session output), plus optional context bar and status bar at the bottom.
 ///
 /// Buffer-based rendering entry point. Called by the rat-salsa render
-/// callback. All rendering uses Widget::render(area, buf) and
-/// StatefulWidget::render(widget, area, buf, &mut state) directly.
+/// callback. All rendering uses `Widget::render(area`, buf) and
+/// `StatefulWidget::render(widget`, area, buf, &mut state) directly.
 ///
 /// `app` is `&mut` because stateful widgets owned by `App` (currently the
 /// `rat-widget` text fields inside `CreateDialog`) need `&mut State` to
@@ -130,7 +130,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
                 String::new()
             };
             let line = Line::from(vec![
-                Span::styled(format!(" {} ", spinner), theme.style_activity_spinner()),
+                Span::styled(format!(" {spinner} "), theme.style_activity_spinner()),
                 Span::styled(activity_msg, theme.style_activity()),
                 Span::styled(count_suffix, theme.style_text_muted()),
             ]);
@@ -263,11 +263,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
                 },
             );
         } else {
-            let pr_num = app
-                .cleanup_unlinked_target
-                .as_ref()
-                .map(|t| t.2)
-                .unwrap_or(0);
+            let pr_num = app.cleanup_unlinked_target.as_ref().map_or(0, |t| t.2);
             draw_prompt_dialog(
                 buf,
                 theme,
@@ -560,13 +556,7 @@ fn draw_first_run_global_harness_modal(
 fn draw_view_mode_header(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     let selected = match app.view_mode {
         ViewMode::FlatList => 0,
-        ViewMode::Board => {
-            if app.board_drill_down {
-                0
-            } else {
-                1
-            }
-        }
+        ViewMode::Board => usize::from(!app.board_drill_down),
         ViewMode::Dashboard => 2,
     };
 
@@ -1897,7 +1887,7 @@ fn format_review_request_item<'a>(
     let first_width = content_width
         .saturating_sub(prefix.width())
         .saturating_sub(right.width())
-        .saturating_sub(if right.is_empty() { 0 } else { 1 });
+        .saturating_sub(usize::from(!right.is_empty()));
     let rest_width = content_width.saturating_sub(prefix.width());
     let title_lines = wrap_two_widths(title, first_width.max(1), rest_width.max(1));
     let first_title = title_lines.first().cloned().unwrap_or_default();
@@ -2052,8 +2042,7 @@ fn format_unlinked_item<'a>(
         .repo_path
         .file_name()
         .and_then(|n| n.to_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| "<unknown repo>".to_string());
+        .map_or_else(|| "<unknown repo>".to_string(), str::to_string);
     for wrapped in wrap_text(&repo_name, content_width) {
         lines.push(Line::from(vec![
             Span::raw("  "),
@@ -2066,7 +2055,7 @@ fn format_unlinked_item<'a>(
 
 /// Format a work item entry for the left panel list.
 ///
-/// Returns a 2-line ListItem:
+/// Returns a 2-line `ListItem`:
 ///   Line 1: title (+ PR badge + CI badge if present)
 ///   Line 2: repo-name  branch-name  [no wt] (all muted)
 fn format_work_item_entry<'a>(
@@ -2163,7 +2152,7 @@ fn format_work_item_entry<'a>(
     let is_unclean = wi
         .repo_associations
         .iter()
-        .any(|a| a.git_state.as_ref().map(|gs| gs.dirty).unwrap_or(false));
+        .any(|a| a.git_state.as_ref().is_some_and(|gs| gs.dirty));
     if is_unclean {
         right_parts.push((" !cl".to_string(), theme.style_badge_worktree_unclean()));
     }
@@ -2175,7 +2164,7 @@ fn format_work_item_entry<'a>(
     let needs_push = wi
         .repo_associations
         .iter()
-        .any(|a| a.git_state.as_ref().map(|gs| gs.ahead > 0).unwrap_or(false));
+        .any(|a| a.git_state.as_ref().is_some_and(|gs| gs.ahead > 0));
     if needs_push {
         right_parts.push((" !pushed".to_string(), theme.style_badge_pushed()));
     }
@@ -2184,12 +2173,10 @@ fn format_work_item_entry<'a>(
     // Rendered whenever `git_state.behind > 0` for at least one
     // association. Coexists with `!cl` and `!pushed` on a row that is
     // dirty AND diverged in both directions.
-    let needs_pull = wi.repo_associations.iter().any(|a| {
-        a.git_state
-            .as_ref()
-            .map(|gs| gs.behind > 0)
-            .unwrap_or(false)
-    });
+    let needs_pull = wi
+        .repo_associations
+        .iter()
+        .any(|a| a.git_state.as_ref().is_some_and(|gs| gs.behind > 0));
     if needs_pull {
         right_parts.push((" !pulled".to_string(), theme.style_badge_pulled()));
     }
@@ -2205,7 +2192,7 @@ fn format_work_item_entry<'a>(
     // that populates `right_parts` and before the width-budget loop that
     // decides which badges to keep, avoids having to wrap each individual
     // `push` site above and guarantees no badge escapes the rule.
-    for (_, style) in right_parts.iter_mut() {
+    for (_, style) in &mut right_parts {
         *style = dim_badge_style(*style, has_session);
     }
 
@@ -2262,7 +2249,7 @@ fn format_work_item_entry<'a>(
 
     let available = space_for_content
         .saturating_sub(right_text.width())
-        .saturating_sub(if right_text.is_empty() { 0 } else { 1 });
+        .saturating_sub(usize::from(!right_text.is_empty()));
 
     // When selected, the List widget only sets bg (via style_tab_highlight_bg).
     // We apply fg per-span here so title+badge get the original highlight look
@@ -2421,11 +2408,11 @@ fn format_work_item_entry<'a>(
     ListItem::new(lines)
 }
 
-/// Word-wrap a string to fit within max_width display columns.
+/// Word-wrap a string to fit within `max_width` display columns.
 /// Breaks at word boundaries (space, /, -, paren) when possible.
 /// Wraps to as many lines as needed - no artificial cap.
 /// When `indent` is true, continuation lines are indented with 4 spaces.
-/// Every output line is guaranteed to be <= max_width display columns.
+/// Every output line is guaranteed to be <= `max_width` display columns.
 fn wrap_text_impl(s: &str, max_width: usize, indent: bool) -> Vec<String> {
     const INDENT_STR: &str = "    ";
     let indent_width = if indent { INDENT_STR.width() } else { 0 };
@@ -2467,20 +2454,21 @@ fn wrap_text_impl(s: &str, max_width: usize, indent: bool) -> Vec<String> {
             })
             .take_while(|&(_, cum_w)| cum_w <= effective_width)
             .last()
-            .map(|(i, _)| {
-                // Advance past this char to get the end byte index
-                i + remaining[i..].chars().next().map_or(0, |c| c.len_utf8())
-            })
-            .unwrap_or_else(|| {
-                // First char is already wider than effective_width; take it anyway
-                remaining.chars().next().map_or(0, |c| c.len_utf8())
-            });
+            .map_or_else(
+                || {
+                    // First char is already wider than effective_width; take it anyway
+                    remaining.chars().next().map_or(0, char::len_utf8)
+                },
+                |(i, _)| {
+                    // Advance past this char to get the end byte index
+                    i + remaining[i..].chars().next().map_or(0, char::len_utf8)
+                },
+            );
 
         // Try to break at a word boundary within the limit
         let break_at = remaining[..byte_limit]
             .rfind([' ', '/', '-', '('])
-            .map(|i| i + 1)
-            .unwrap_or(byte_limit);
+            .map_or(byte_limit, |i| i + 1);
 
         let (line, rest) = remaining.split_at(break_at);
         lines.push(line.to_string());
@@ -2537,7 +2525,7 @@ fn wrap_two_widths(s: &str, first_width: usize, rest_width: usize) -> Vec<String
     lines
 }
 
-/// Truncate a string to fit within max_len display columns.
+/// Truncate a string to fit within `max_len` display columns.
 /// If truncated, appends "..".
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.width() <= max_len {
@@ -2566,7 +2554,7 @@ fn truncate_to_width(s: &str, max_cols: usize) -> String {
     result
 }
 
-/// Format a WorkItemError into a user-facing message and optional suggestion.
+/// Format a `WorkItemError` into a user-facing message and optional suggestion.
 fn format_work_item_error(error: &WorkItemError) -> (String, Option<String>) {
     match error {
         WorkItemError::MultiplePrsForBranch {
@@ -2645,9 +2633,10 @@ fn draw_work_item_detail(
         BackendType::GithubProject => "GitHub project",
     };
 
-    let repo_str = first_assoc
-        .map(|a| a.repo_path.display().to_string())
-        .unwrap_or_else(|| "(none)".to_string());
+    let repo_str = first_assoc.map_or_else(
+        || "(none)".to_string(),
+        |a| a.repo_path.display().to_string(),
+    );
 
     let branch_str = first_assoc
         .and_then(|a| a.branch.as_deref())
@@ -2655,13 +2644,12 @@ fn draw_work_item_detail(
 
     let worktree_str = first_assoc
         .and_then(|a| a.worktree_path.as_ref())
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "(none)".to_string());
+        .map_or_else(|| "(none)".to_string(), |p| p.display().to_string());
 
-    let pr_str = first_assoc
-        .and_then(|a| a.pr.as_ref())
-        .map(|pr| format!("#{} - {}", pr.number, pr.title))
-        .unwrap_or_else(|| "(none)".to_string());
+    let pr_str = first_assoc.and_then(|a| a.pr.as_ref()).map_or_else(
+        || "(none)".to_string(),
+        |pr| format!("#{} - {}", pr.number, pr.title),
+    );
 
     // PR URL is rendered on its own dedicated line below the field block
     // (not as a regular `label  value` row) so that the URL gets the full
@@ -2671,10 +2659,10 @@ fn draw_work_item_detail(
     // single-line `Paragraph` otherwise.
     let pr_url = first_assoc.and_then(|a| a.pr.as_ref()).map(|pr| &pr.url);
 
-    let issue_str = first_assoc
-        .and_then(|a| a.issue.as_ref())
-        .map(|issue| format!("#{} - {}", issue.number, issue.title))
-        .unwrap_or_else(|| "(none)".to_string());
+    let issue_str = first_assoc.and_then(|a| a.issue.as_ref()).map_or_else(
+        || "(none)".to_string(),
+        |issue| format!("#{} - {}", issue.number, issue.title),
+    );
 
     let errors_str = if wi.errors.is_empty() {
         "(none)".to_string()
@@ -2818,7 +2806,7 @@ fn draw_work_item_detail(
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("  PR URL", label_style)));
         let line_index = lines.len() as u16;
-        let url_value = url.to_string();
+        let url_value = url.clone();
         let url_width = UnicodeWidthStr::width(url_value.as_str()) as u16;
         registry.push_copy(
             Rect {
@@ -3003,10 +2991,10 @@ fn draw_importable_pr_detail(
 }
 
 /// Draw the right panel showing captured PTY output.
-/// Uses vt100::Parser + tui-term PseudoTerminal for full ANSI color rendering.
+/// Uses `vt100::Parser` + tui-term `PseudoTerminal` for full ANSI color rendering.
 ///
 /// The active session is determined by the currently selected work item:
-/// - If selected item is a work item with a session -> render PseudoTerminal
+/// - If selected item is a work item with a session -> render `PseudoTerminal`
 /// - If selected item is a work item without a session -> prompt to start
 /// - If selected item is an unlinked PR -> prompt to import
 /// - If nothing selected -> show welcome message
@@ -3123,8 +3111,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
             let rebase_gate_active = app
                 .work_items
                 .get(*wi_idx)
-                .map(|wi| app.rebase_gates.contains_key(&wi.id))
-                .unwrap_or(false);
+                .is_some_and(|wi| app.rebase_gates.contains_key(&wi.id));
 
             if rebase_gate_active {
                 let spinner_chars = [b'|', b'/', b'-', b'\\'];
@@ -3153,8 +3140,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
             let review_gate_active = app
                 .work_items
                 .get(*wi_idx)
-                .map(|wi| app.review_gates.contains_key(&wi.id))
-                .unwrap_or(false);
+                .is_some_and(|wi| app.review_gates.contains_key(&wi.id));
 
             if review_gate_active {
                 let spinner_chars = [b'|', b'/', b'-', b'\\'];
@@ -3227,14 +3213,9 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     // show a spinner instead of the "Press Enter to start a
                     // session." hint - Enter is a no-op while the background
                     // thread is running, so the hint would be misleading.
-                    let worktree_creating = app
-                        .work_items
-                        .get(*wi_idx)
-                        .map(|wi| {
-                            app.user_action_work_item(&UserActionKey::WorktreeCreate)
-                                == Some(&wi.id)
-                        })
-                        .unwrap_or(false);
+                    let worktree_creating = app.work_items.get(*wi_idx).is_some_and(|wi| {
+                        app.user_action_work_item(&UserActionKey::WorktreeCreate) == Some(&wi.id)
+                    });
 
                     if worktree_creating {
                         let spinner_chars = [b'|', b'/', b'-', b'\\'];
@@ -3257,15 +3238,14 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
                     }
 
                     let wi = app.work_items.get(*wi_idx);
-                    let errors = wi.map(|w| &w.errors);
-                    let has_errors = errors.is_some_and(|e| !e.is_empty());
+                    let errors = wi.map(|w| &w.errors).filter(|e| !e.is_empty());
 
-                    if has_errors {
+                    if let Some(errors) = errors {
                         let mut lines = vec![
                             Line::from(""),
                             Line::from(Span::styled("  Errors:", theme.style_error())),
                         ];
-                        for error in errors.unwrap() {
+                        for error in errors {
                             lines.push(Line::from(""));
                             let (msg, suggestion) = format_work_item_error(error);
                             lines.push(Line::from(Span::styled(
@@ -3525,11 +3505,7 @@ fn draw_global_drawer(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
 /// keeps the visible highlight and the copied text covering the same
 /// range of cells; see the regression test
 /// `event::selection_clipboard_tests::highlight_cell_count_matches_clipboard_chars`.
-pub(crate) fn render_selection_overlay(
-    buf: &mut Buffer,
-    inner_area: Rect,
-    selection: &SelectionState,
-) {
+pub fn render_selection_overlay(buf: &mut Buffer, inner_area: Rect, selection: &SelectionState) {
     let (start_row, start_col, end_row, end_col) = selection.normalized_bounds();
 
     let max_col = inner_area.width;
@@ -3592,7 +3568,7 @@ fn draw_context_bar(buf: &mut Buffer, ctx: &WorkItemContext, theme: &Theme, area
 }
 
 /// Return a centered rect using the given percentage of the outer rect.
-fn centered_rect(percent_x: u16, percent_y: u16, outer: Rect) -> Rect {
+const fn centered_rect(percent_x: u16, percent_y: u16, outer: Rect) -> Rect {
     let popup_width = outer.width * percent_x / 100;
     let popup_height = outer.height * percent_y / 100;
     let x = outer.x + (outer.width.saturating_sub(popup_width)) / 2;
@@ -4296,7 +4272,7 @@ fn draw_create_dialog_too_small(buf: &mut Buffer, theme: &Theme, area: Rect) {
 /// hardcoded to `QUICKSTART_TITLE` and its branch is auto-generated by
 /// `App::create_quickstart_work_item_for_repo`; the agent later renames the
 /// title via `workbridge_set_title`.
-fn draw_quickstart_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &Theme, area: Rect) {
+fn draw_quickstart_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &Theme, area: Rect) {
     // Compute dialog height: border(1) + padding(1) + Repos label(1)
     //   + repo_lines + blank(1) + error(1) + hint(1) + padding(1) + border(1).
     // Allow up to 8 visible repo rows (the dialog is otherwise small).
@@ -4444,14 +4420,14 @@ fn dim_background(buf: &mut Buffer, area: Rect) {
 ///
 /// Mirrors `dim_background`'s approach at the style level: adds
 /// `Modifier::DIM` and forces foreground to `Color::DarkGray`. The
-/// DarkGray override is load-bearing - on some terminals DIM alone
-/// is indistinguishable from normal, and DarkGray collapses all
+/// `DarkGray` override is load-bearing - on some terminals DIM alone
+/// is indistinguishable from normal, and `DarkGray` collapses all
 /// per-badge hues to a single neutral so the dim reads consistently
 /// across themes.
 ///
 /// Returns `style` unchanged when `has_session` is true, so callers
 /// can wrap every badge style unconditionally without branching.
-fn dim_badge_style(
+const fn dim_badge_style(
     style: ratatui_core::style::Style,
     has_session: bool,
 ) -> ratatui_core::style::Style {
@@ -4677,15 +4653,14 @@ fn draw_prompt_dialog(buf: &mut Buffer, theme: &Theme, area: Rect, kind: PromptD
 mod wrap_tests {
     use super::wrap_text;
 
-    /// Every output line must fit within max_width (measured in display columns).
+    /// Every output line must fit within `max_width` (measured in display columns).
     fn assert_all_lines_fit(lines: &[String], max_width: usize) {
         use unicode_width::UnicodeWidthStr;
         for (i, line) in lines.iter().enumerate() {
             let display_width = line.width();
             assert!(
                 display_width <= max_width,
-                "line {i} is {display_width} cols but max_width is {max_width}: {:?}",
-                line,
+                "line {i} is {display_width} cols but max_width is {max_width}: {line:?}",
             );
         }
     }
@@ -4710,7 +4685,7 @@ mod wrap_tests {
     fn wraps_at_word_boundary() {
         let result = wrap_text("  hello world foo bar", 14);
         assert_all_lines_fit(&result, 14);
-        assert!(result.len() >= 2, "should wrap: {:?}", result);
+        assert!(result.len() >= 2, "should wrap: {result:?}");
     }
 
     #[test]
@@ -4718,7 +4693,7 @@ mod wrap_tests {
         // Simulates a branch like "janiskirsteins/agent-specific-labels"
         let result = wrap_text("  janiskirsteins/agent-specific-labels (walleyboard)", 25);
         assert_all_lines_fit(&result, 25);
-        assert!(result.len() >= 2, "should wrap: {:?}", result);
+        assert!(result.len() >= 2, "should wrap: {result:?}");
     }
 
     #[test]
@@ -4869,7 +4844,7 @@ mod wrap_variant_tests {
         );
         // Continuation lines use the wider budget
         for line in result.iter().skip(1) {
-            assert!(line.width() <= 25, "continuation too wide: {:?}", line);
+            assert!(line.width() <= 25, "continuation too wide: {line:?}");
         }
         // All words present
         let joined: String = result.join(" ");
@@ -4901,7 +4876,7 @@ mod format_entry_tests {
     use crate::theme::Theme;
     use crate::work_item::*;
 
-    /// Render a ListItem to a string by putting it in a List widget and
+    /// Render a `ListItem` to a string by putting it in a List widget and
     /// rendering to a buffer.
     fn render_list_item_to_string(
         item: ratatui_widgets::list::ListItem<'_>,
@@ -5169,7 +5144,7 @@ mod format_entry_tests {
         );
     }
 
-    /// Every line in the rendered item must fit within max_width.
+    /// Every line in the rendered item must fit within `max_width`.
     #[test]
     fn all_lines_fit_within_max_width() {
         let wi = WorkItem {
@@ -5201,8 +5176,7 @@ mod format_entry_tests {
             let line_width = line.width();
             assert!(
                 line_width <= max_width,
-                "line {i} is {line_width} cols but max is {max_width}: {:?}",
-                line,
+                "line {i} is {line_width} cols but max is {max_width}: {line:?}",
             );
         }
     }
@@ -5363,7 +5337,7 @@ mod format_entry_tests {
 
     /// With a live session registered for the work item, the badge must
     /// render in its normal theme style - `dim_badge_style` is a no-op
-    /// and the helper must not leak DIM or DarkGray into the output.
+    /// and the helper must not leak DIM or `DarkGray` into the output.
     #[test]
     fn work_item_badge_undimmed_when_session_attached() {
         use std::sync::{Arc, Mutex};
@@ -5863,14 +5837,14 @@ mod snapshot_tests {
         UnlinkedPr, WorkItem, WorkItemError, WorkItemId, WorkItemStatus,
     };
 
-    /// Helper: render the app into a TestBackend and return the buffer as a string.
+    /// Helper: render the app into a `TestBackend` and return the buffer as a string.
     fn render(app: &mut App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::default_theme();
         terminal
             .draw(|frame: &mut ratatui_core::terminal::Frame<'_>| {
-                draw_to_buffer(frame.area(), frame.buffer_mut(), app, &theme)
+                draw_to_buffer(frame.area(), frame.buffer_mut(), app, &theme);
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -5882,7 +5856,7 @@ mod snapshot_tests {
             }
             lines.push(line.trim_end().to_string());
         }
-        while lines.last().is_some_and(|l| l.is_empty()) {
+        while lines.last().is_some_and(std::string::String::is_empty) {
             lines.pop();
         }
         lines.join("\n")
@@ -6086,7 +6060,7 @@ mod snapshot_tests {
         );
     }
 
-    /// When no current_user_login is known, the detail panel cannot
+    /// When no `current_user_login` is known, the detail panel cannot
     /// collapse any login to "you", so every directly-requested user
     /// must be rendered as their literal login.
     #[test]
@@ -6466,7 +6440,8 @@ mod snapshot_tests {
             pattern.push_str(&regex::escape(&c.to_string()));
         }
         for c in optional {
-            pattern.push_str(&format!("(?:{})?", regex::escape(&c.to_string())));
+            use std::fmt::Write as _;
+            let _ = write!(pattern, "(?:{})?", regex::escape(&c.to_string()));
         }
         // After the tmp-path prefix, greedily eat any path-continuation
         // characters (slash + anything that is not whitespace or the
@@ -7058,7 +7033,7 @@ mod snapshot_tests {
         let theme = Theme::default_theme();
         terminal
             .draw(|frame: &mut ratatui_core::terminal::Frame<'_>| {
-                draw_to_buffer(frame.area(), frame.buffer_mut(), app, &theme)
+                draw_to_buffer(frame.area(), frame.buffer_mut(), app, &theme);
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -7223,7 +7198,7 @@ mod snapshot_tests {
         let x = scrollbar_column(80);
         let cyan = count_block_cells_with_fg(&buf, x, ratatui_core::style::Color::Cyan);
         let gray = count_block_cells_with_fg(&buf, x, ratatui_core::style::Color::Gray);
-        assert_eq!(cyan, 0, "onscreen selection must not paint the Cyan marker",);
+        assert_eq!(cyan, 0, "onscreen selection must not paint the Cyan marker");
         assert!(
             gray > 0,
             "overflowing list must paint at least one Gray thumb cell",

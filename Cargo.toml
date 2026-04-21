@@ -53,21 +53,161 @@ tempfile = "3"
 # lifetimes, no bare trait objects, etc. Set to "warn" rather than
 # "deny" so the group can be raised incrementally; CI's
 # `-D warnings` then promotes any warning to an error.
-# Baseline verified clean on 2026-04-21.
-rust_2018_idioms = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+# `unsafe_code` stays at `allow` (not `forbid`, not `warn`) because
+# the PTY FFI in `src/session.rs` and the two `killpg` calls in
+# `src/app.rs` are legitimate and SAFETY-commented, and a crate-wide
+# `warn` promoted to error via `-D warnings` would break the build
+# with no way to locally suppress (source-level `#[allow]` is denied
+# by `clippy::allow_attributes`). The review policy in CONTRIBUTING.md
+# ("Unsafe code policy") is the real enforcement: new unsafe blocks
+# require a SAFETY comment and a reviewer.
+unsafe_code = "allow"
 
 [lints.clippy]
 # Prohibit accidental dbg! / todo! / unimplemented! in committed code.
-# Baseline verified clean on 2026-04-20.
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
 
-# Pedantic, nursery, and restriction carpet-bombs are intentionally
-# not set here. They ship in Phase 3 of the hygiene campaign, which
-# has the budget for cleaning the findings they produce. Raising them
-# in Phase 1 would either require #[allow] in source (prohibited) or
-# generate CI failures before the cleanup work exists.
+# Carpet-bombs at warn: promoted to error via CI's -D warnings. These
+# were flipped in Phase 3 of the hygiene campaign after the mechanical
+# findings were cleaned up. `priority = -1` lets individual
+# `allow`/`deny` lines below override a group-level warn.
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Restriction lints - production code only; tests carve out via CI's
+# two-invocation pattern (`-A clippy::unwrap_used ...` on --tests).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+# Close the source-level allow loophole so Phase 3's cleanup does not
+# regress through "just add #[allow]" pressure. Every suppression now
+# has to live in this file with a rationale.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
+# CLI-surface allows: main.rs is the CLI entry point; non-CLI code
+# routes user-visible output through the toast / status-bar subsystem,
+# enforced by review rather than by the lint.
+print_stdout = "allow"
+print_stderr = "allow"
+exit = "allow"
+
+# Design-doc noise allows (per the hygiene campaign design doc Phase 1
+# block list). Each has been judged pure noise for this crate's style.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"   # File-size budget is the real enforcement.
+similar_names = "allow"    # False-positive-heavy in TUI / event code.
+
+# TUI cast allows: the ratatui geometry surface is u16 width/height;
+# almost every cast the lint flags is u16<->u32<->usize arithmetic on
+# those inputs, which is safe for realistic terminal sizes.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+cast_precision_loss = "allow"
+
+# Phase-4-deferred structural lints: all sites are in src/app.rs and
+# the cleanup requires the decomposition that Phase 4 will do. These
+# allow entries flip back to warn in the Phase 4 PR that finishes the
+# split.
+needless_pass_by_value = "allow"
+significant_drop_tightening = "allow"
+struct_excessive_bools = "allow"
+unused_self = "allow"
+
+# `missing_const_for_fn` is a nursery lint that false-positives on
+# functions whose bodies call non-const helpers (e.g. `home_dir()`
+# calls `crate::side_effects::paths::home_dir()`, and that helper
+# can't be const because it reads env vars). The lint's auto-fix
+# adds `const fn`, which then fails to compile with E0015. Flipping
+# this to `allow` stops `cargo clippy --fix` from cycling on these
+# sites. Individual cases where `const fn` is genuinely applicable
+# are still encouraged by review; the lint's machine-applicable
+# heuristic is just too aggressive for this crate's shape.
+missing_const_for_fn = "allow"
+
+# `unnecessary_wraps` fires on `pub fn app_render(...) -> Result<(), AppError>`
+# and `app_event(...) -> Result<Control<AppEvent>, AppError>` in
+# `src/salsa.rs` because both functions currently only ever return
+# `Ok(_)`. Both signatures are fixed by the rat-salsa `run_tui`
+# callback contract and cannot shed the `Result` without breaking
+# the harness. Allow crate-wide rather than at each site.
+unnecessary_wraps = "allow"
+
+# `comparison_chain` insists that a three-way `n > 0 / n == 0 / n < 0`
+# if-chain be rewritten as `match n.cmp(&0)`. The one site in
+# `src/session.rs::Session::spawn_reader_thread` has rich branch
+# bodies where `match` would re-indent ~30 lines of PTY read
+# handling with no readability improvement.
+comparison_chain = "allow"
+
+# `ref_option` flags `&Option<String>` parameters and suggests
+# `Option<&String>`. That is idiomatic but many sites in the
+# assembly / work-item layer hold the `Option<String>` inside a
+# borrowed struct and passing `&Option<String>` avoids a re-borrow
+# dance at the call site. Allow crate-wide as a style preference.
+ref_option = "allow"
+
+# `used_underscore_binding` fires when a variable bound with `_`
+# prefix is later read (which the convention says means "unused").
+# Tests idiomatically bind a `_guard` or `_tmp` to keep a handle
+# alive through a scope, and occasionally inspect fields on it -
+# that's a legitimate pattern, not a bug. The sites are all in
+# `#[cfg(test)]` code.
+used_underscore_binding = "allow"
+
+# `unreadable_literal` insists on `_` separators inside long
+# numeric literals (e.g. `1000000` -> `1_000_000`). The flagged
+# sites are all in tests where the literal is a direct fixture
+# input (not read by a human reviewer for quick pattern-matching).
+unreadable_literal = "allow"
+
+# Judgment-heavy pedantic / nursery lints where the recommended
+# rewrite is frequently less readable than the original. Each was
+# evaluated during Phase 3 calibration and failed the "mechanical
+# rewrite that always improves the code" bar:
+#
+# - `manual_let_else`: the `let Some(x) = y else { ... }` form is
+#   strictly equivalent to the `match`/`if let` forms, but for
+#   multi-arm fall-through logic (where the `else` block does more
+#   than `return`/`continue`) the explicit `match` keeps the two
+#   paths symmetric and easier to follow. The crate has ~47 such
+#   sites; flipping each one would be churn with no review payoff.
+# - `option_if_let_else`: `.map_or_else(default_fn, mapping_fn)` is
+#   idiomatic for short closures, but the crate's sites are almost
+#   all multi-statement closures where the `if let ... else` form
+#   reads more naturally. Re-enable on a per-site basis when the
+#   site is a one-liner.
+# - `items_after_statements`: declaring a helper struct or `const`
+#   after the first statement of a function is occasionally the
+#   clearest structure (e.g. a local type that wraps a value captured
+#   in the first statement). Strict top-of-function placement would
+#   force unrelated items up the file for no readability gain.
+# - `match_same_arms`: collapsing two arms with `|` erases the
+#   intent signal that "these two enum variants happen to behave the
+#   same today"; the explicit form documents the per-variant decision.
+# - `or_fun_call`: the flagged sites are `.unwrap_or_else(|| expr)`
+#   vs `.unwrap_or(expr)` choices where the inner expression is
+#   either a cheap literal or produces an unavoidable allocation
+#   either way. Performance is a wash; the shorter `.unwrap_or(...)`
+#   stays.
+# - `trivially_copy_pass_by_ref`: fires on `&u8` / `&u16` / `&bool`
+#   parameters even when the caller naturally holds a reference
+#   (e.g. field access through a shared `Arc<_>`). Flipping to
+#   pass-by-value would force copies at every call site.
+manual_let_else = "allow"
+option_if_let_else = "allow"
+items_after_statements = "allow"
+match_same_arms = "allow"
+or_fun_call = "allow"
+trivially_copy_pass_by_ref = "allow"
 
 [lints.rustdoc]
 # No existing crate-level docs to break; safe to deny from day one.

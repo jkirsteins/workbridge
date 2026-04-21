@@ -257,8 +257,12 @@ fn refuse_if_populated(dir: &Path) -> Result<(), Box<dyn Error>> {
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        let looks_like_record = name_str.ends_with(".json");
-        let looks_like_activity = name_str.starts_with("activity-") && name_str.ends_with(".jsonl");
+        let ext = std::path::Path::new(name_str)
+            .extension()
+            .and_then(|e| e.to_str());
+        let looks_like_record = ext.is_some_and(|e| e.eq_ignore_ascii_case("json"));
+        let looks_like_activity = name_str.starts_with("activity-")
+            && ext.is_some_and(|e| e.eq_ignore_ascii_case("jsonl"));
         if looks_like_record || looks_like_activity {
             return Err(format!(
                 "target directory {} already contains workbridge work-item files \
@@ -272,7 +276,7 @@ fn refuse_if_populated(dir: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Compose a stage_change ActivityEntry with the project's canonical
+/// Compose a `stage_change` `ActivityEntry` with the project's canonical
 /// timestamp format (`{secs}Z`) and payload shape (`{from, to}`).
 fn stage_event(secs: i64, from: WorkItemStatus, to: WorkItemStatus) -> ActivityEntry {
     ActivityEntry {
@@ -293,7 +297,7 @@ fn pr_merged_event(secs: i64) -> ActivityEntry {
     }
 }
 
-fn status_label(status: WorkItemStatus) -> &'static str {
+const fn status_label(status: WorkItemStatus) -> &'static str {
     match status {
         WorkItemStatus::Backlog => "Backlog",
         WorkItemStatus::Planning => "Planning",

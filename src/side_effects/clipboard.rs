@@ -12,7 +12,7 @@
 //!
 //! There is no reliable cross-terminal way to detect OSC 52 support at
 //! runtime, so we write the escape unconditionally. Modern terminals
-//! (Ghostty, iTerm2, Alacritty, Kitty, WezTerm, xterm) silently swallow
+//! (Ghostty, iTerm2, Alacritty, Kitty, `WezTerm`, xterm) silently swallow
 //! sequences they don't recognize.
 //!
 //! The OSC 52 sequence is built by `osc52_sequence` (split out from
@@ -68,6 +68,7 @@ use std::io::Write;
 /// drag-select handler) because ratatui's frame writes also go through
 /// the same `stdout` handle. We flush after the write so the sequence
 /// reaches the terminal before the next draw.
+#[must_use]
 pub fn copy(text: &str) -> bool {
     #[cfg(test)]
     {
@@ -122,6 +123,7 @@ pub fn copy(text: &str) -> bool {
 /// X selection). `BEL` (`\x07`) terminates the sequence; the alternate
 /// `ST` (`ESC \\`) terminator is also valid but `BEL` is shorter and
 /// universally supported.
+#[must_use]
 pub fn osc52_sequence(text: &str) -> String {
     let mut encoded = String::new();
     base64_encode(text.as_bytes(), &mut encoded);

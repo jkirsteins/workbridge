@@ -42,9 +42,9 @@ use crate::work_item::WorkItemStatus;
 pub enum AgentBackendKind {
     /// Anthropic Claude Code CLI. Reference implementation.
     ClaudeCode,
-    /// OpenAI / Codex CLI. Implemented adapter; see `CodexBackend`.
+    /// `OpenAI` / Codex CLI. Implemented adapter; see `CodexBackend`.
     Codex,
-    /// OpenCode CLI. Future-work stub: `OpenCodeBackend` exists and
+    /// `OpenCode` CLI. Future-work stub: `OpenCodeBackend` exists and
     /// `backend_for_kind` returns it, but the variant is not exposed
     /// through `all()`, `FromStr`, or any keybinding, so there is no
     /// user-facing path to produce this value. The scaffolding is kept
@@ -59,38 +59,38 @@ impl AgentBackendKind {
     /// user can make". Deliberately excludes `OpenCode` because that
     /// variant has no user-facing spawn path; see the type-level
     /// comment above.
-    pub fn all() -> [AgentBackendKind; 2] {
-        [AgentBackendKind::ClaudeCode, AgentBackendKind::Codex]
+    pub const fn all() -> [Self; 2] {
+        [Self::ClaudeCode, Self::Codex]
     }
 
     /// Lowercase canonical name used in the CLI (`workbridge config
     /// set global-assistant-harness <name>`), in `config.toml`, and in
     /// the first-run modal keybindings.
-    pub fn canonical_name(self) -> &'static str {
+    pub const fn canonical_name(self) -> &'static str {
         match self {
-            AgentBackendKind::ClaudeCode => "claude",
-            AgentBackendKind::Codex => "codex",
-            AgentBackendKind::OpenCode => "opencode",
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
         }
     }
 
     /// Binary name expected on `PATH`. Used by `is_available` and by the
     /// "command not found" toast text.
-    pub fn binary_name(self) -> &'static str {
+    pub const fn binary_name(self) -> &'static str {
         match self {
-            AgentBackendKind::ClaudeCode => "claude",
-            AgentBackendKind::Codex => "codex",
-            AgentBackendKind::OpenCode => "opencode",
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
         }
     }
 
     /// Human-readable display name used in status-bar text, UI titles
     /// and the first-run modal body.
-    pub fn display_name(self) -> &'static str {
+    pub const fn display_name(self) -> &'static str {
         match self {
-            AgentBackendKind::ClaudeCode => "Claude Code",
-            AgentBackendKind::Codex => "Codex",
-            AgentBackendKind::OpenCode => "OpenCode",
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+            Self::OpenCode => "OpenCode",
         }
     }
 
@@ -100,11 +100,11 @@ impl AgentBackendKind {
     /// variant is not user-selectable (absent from `all()`) so the
     /// value is never rendered or read; it is kept only so the match
     /// remains exhaustive.
-    pub fn keybinding(self) -> char {
+    pub const fn keybinding(self) -> char {
         match self {
-            AgentBackendKind::ClaudeCode => 'c',
-            AgentBackendKind::Codex => 'x',
-            AgentBackendKind::OpenCode => '\0',
+            Self::ClaudeCode => 'c',
+            Self::Codex => 'x',
+            Self::OpenCode => '\0',
         }
     }
 }
@@ -126,8 +126,8 @@ impl FromStr for AgentBackendKind {
         // type-level comment on `AgentBackendKind` for why the variant
         // still exists internally.
         match s {
-            "claude" => Ok(AgentBackendKind::ClaudeCode),
-            "codex" => Ok(AgentBackendKind::Codex),
+            "claude" => Ok(Self::ClaudeCode),
+            "codex" => Ok(Self::Codex),
             other => Err(UnknownHarnessName {
                 got: other.to_string(),
             }),
@@ -384,7 +384,7 @@ pub struct ReviewGateSpawnConfig<'a> {
 /// Verdict parsed from a headless review-gate session's stdout (RP5).
 /// Absence of either field is interpreted as `approved: false` with an
 /// empty detail.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewGateVerdict {
     pub approved: bool,
     pub detail: String,
@@ -640,7 +640,7 @@ impl AgentBackend for ClaudeCodeBackend {
     }
 }
 
-/// Real adapter for the OpenAI Codex CLI (`codex`). Satisfies C1..C13 per
+/// Real adapter for the `OpenAI` Codex CLI (`codex`). Satisfies C1..C13 per
 /// `docs/harness-contract.md`; see the "Codex" column of the
 /// Implementation Map for the per-clause workaround details.
 ///
@@ -650,7 +650,7 @@ impl AgentBackend for ClaudeCodeBackend {
 ///   --dangerously-bypass-approvals-and-sandbox
 ///   --config mcp_servers.workbridge.command="<exe>"
 ///   --config mcp_servers.workbridge.args=["--mcp-bridge","--socket","<sock>"]
-///   [--config instructions="<sys>"] [<auto-start>]` (RP1c).
+///   [--config instructions="<sys>"] [<auto-start>]` (`RP1c`).
 ///   No sandbox; linked-worktree layout is incompatible with Codex's
 ///   `workspace-write` sandbox - see README "Per-harness permission
 ///   model" for the full rationale.
@@ -658,7 +658,7 @@ impl AgentBackend for ClaudeCodeBackend {
 ///   --dangerously-bypass-approvals-and-sandbox exec --json
 ///   --config instructions="<sys>"
 ///   --config mcp_servers.workbridge.command="<exe>"
-///   --config mcp_servers.workbridge.args=[...] <prompt>` (RP2c).
+///   --config mcp_servers.workbridge.args=[...] <prompt>` (`RP2c`).
 ///   The dangerous flag is emitted even for this conceptually read-only
 ///   path, for symmetry across the three Codex spawn sites and so
 ///   review skills that shell out (e.g. `cargo check`) are not silently
@@ -666,7 +666,7 @@ impl AgentBackend for ClaudeCodeBackend {
 /// - Headless read-write (rebase gate): `codex
 ///   --dangerously-bypass-approvals-and-sandbox exec --json
 ///   --config mcp_servers.workbridge.command="<exe>"
-///   --config mcp_servers.workbridge.args=[...] <prompt>` (RP2bc).
+///   --config mcp_servers.workbridge.args=[...] <prompt>` (`RP2bc`).
 ///   The dangerous flag is a TOP-LEVEL codex flag and MUST precede
 ///   `exec` (clap rejects top-level flags inside the `exec` subcommand).
 ///
@@ -931,7 +931,7 @@ impl AgentBackend for CodexBackend {
                 }
                 v.get("content")
                     .and_then(|c| c.as_str())
-                    .map(|s| s.to_string())
+                    .map(std::string::ToString::to_string)
             })
             .next_back();
 
@@ -944,7 +944,10 @@ impl AgentBackend for CodexBackend {
 
         match serde_json::from_str::<serde_json::Value>(content.trim()) {
             Ok(v) => ReviewGateVerdict {
-                approved: v.get("approved").and_then(|a| a.as_bool()).unwrap_or(false),
+                approved: v
+                    .get("approved")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
                 detail: v
                     .get("detail")
                     .and_then(|d| d.as_str())
@@ -970,7 +973,7 @@ impl AgentBackend for CodexBackend {
     }
 }
 
-/// Future-work stub adapter for the OpenCode CLI. Not implemented:
+/// Future-work stub adapter for the `OpenCode` CLI. Not implemented:
 /// every method returns empty argv and a diagnostic verdict. No
 /// user-facing path currently reaches this backend - the `AgentBackendKind::OpenCode`
 /// variant is not exposed through `AgentBackendKind::all()`, not
@@ -1337,7 +1340,7 @@ mod tests {
         assert!(verdict.approved);
         assert_eq!(verdict.detail, "ok");
 
-        let missing = backend.parse_review_gate_stdout(r#"{}"#);
+        let missing = backend.parse_review_gate_stdout(r"{}");
         assert!(!missing.approved);
         assert_eq!(missing.detail, "");
 
@@ -2208,7 +2211,7 @@ mod tests {
         assert_eq!(verdict.detail, "ok");
     }
 
-    /// Empty stream or no agent_message -> unapproved with a diagnostic
+    /// Empty stream or no `agent_message` -> unapproved with a diagnostic
     /// detail. Pins the "absent envelope" failure mode.
     #[test]
     fn codex_parse_empty_stream_returns_unapproved() {

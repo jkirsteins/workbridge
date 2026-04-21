@@ -61,7 +61,7 @@ pub enum ClickTarget {
 
 impl ClickTarget {
     /// Rect in absolute frame coordinates, regardless of variant.
-    pub fn rect(&self) -> Rect {
+    pub const fn rect(&self) -> Rect {
         match self {
             Self::Copy { rect, .. } => *rect,
             Self::WorkItemRow { rect, .. } => *rect,
@@ -108,7 +108,7 @@ impl ClickRegistry {
 /// right and bottom edges (matches ratatui's `Rect::right()` /
 /// `Rect::bottom()` semantics: the cell at `rect.right()` is the first
 /// cell *outside* the rect).
-fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
+const fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x
         && x < rect.x.saturating_add(rect.width)
         && y >= rect.y
@@ -144,7 +144,7 @@ mod tests {
                 assert_eq!(*kind, ClickKind::PrUrl);
                 assert_eq!(value, "url");
             }
-            other => panic!("expected Copy, got {other:?}"),
+            ClickTarget::WorkItemRow { .. } => panic!("expected Copy, got WorkItemRow"),
         }
 
         // Left boundary of A is inclusive.
@@ -196,7 +196,7 @@ mod tests {
         let hit = reg.hit_test(15, 5).expect("inside row rect");
         match hit {
             ClickTarget::WorkItemRow { index, .. } => assert_eq!(*index, 7),
-            other => panic!("expected WorkItemRow, got {other:?}"),
+            ClickTarget::Copy { .. } => panic!("expected WorkItemRow, got Copy"),
         }
         assert!(reg.hit_test(15, 6).is_none(), "row is height 1");
     }

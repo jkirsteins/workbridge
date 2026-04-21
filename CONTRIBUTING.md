@@ -16,6 +16,80 @@ Never suppress, ignore, or work around linter or formatter errors. If clippy
 or `cargo fmt --check` complains, fix the code - do not add `#[allow(...)]`,
 `// nolint`, or similar annotations to silence warnings.
 
+### Lints configuration
+
+The `[lints]` table in `Cargo.toml` is the single source of truth for which
+clippy lint groups are enabled and which individual lints are allowed crate
+wide. The Phase 3 hygiene campaign landed the current matrix; a quick
+summary:
+
+- **Deny (P1 hygiene):** `dbg_macro`, `todo`, `unimplemented`,
+  `allow_attributes`, `allow_attributes_without_reason`,
+  `broken_intra_doc_links`.
+- **Deny (production restriction lints):** `unwrap_used`, `expect_used`,
+  `panic`. Tests carve these out via the two-invocation CI pattern
+  (`cargo clippy --tests ... -- -A clippy::unwrap_used -A clippy::expect_used
+  -A clippy::panic`) rather than any source-level `#[allow]`.
+- **Warn (groups):** `pedantic`, `nursery`. CI promotes warnings to errors
+  via `-D warnings`.
+- **Allow (with rationale in Cargo.toml):** CLI surface (`print_stdout`,
+  `print_stderr`, `exit`), design-doc noise (`module_name_repetitions`,
+  `missing_errors_doc`, `missing_panics_doc`, `too_many_lines`,
+  `similar_names`), TUI cast math (`cast_possible_truncation`,
+  `cast_possible_wrap`, `cast_sign_loss`, `cast_lossless`,
+  `cast_precision_loss`), judgment-heavy rewrites that frequently make
+  the code less readable (`manual_let_else`, `option_if_let_else`,
+  `items_after_statements`, `match_same_arms`, `or_fun_call`,
+  `trivially_copy_pass_by_ref`, `ref_option`, `comparison_chain`,
+  `missing_const_for_fn`, `unnecessary_wraps`), test-only patterns
+  (`used_underscore_binding`, `unreadable_literal`), and Phase-4-deferred
+  structural lints (`needless_pass_by_value`,
+  `significant_drop_tightening`, `struct_excessive_bools`,
+  `unused_self`). Every `allow` has a one-line rationale comment in
+  `Cargo.toml`; any new allow entry needs the same.
+
+**Do not add source-level `#[allow(...)]`**. The
+`clippy::allow_attributes_without_reason` lint denies them, and the
+`clippy::allow_attributes` lint denies the shorter `#[allow(...)]` form
+too. If a specific site really does need a suppression, add it to
+`[lints]` in `Cargo.toml` with a rationale comment and propose the
+diff in the PR so a reviewer can evaluate whether the category
+genuinely warrants a crate-wide allow.
+
+### Unsafe code policy
+
+`unsafe_code` is at `allow` crate-wide rather than `forbid` because
+the crate has two legitimate unsafe surfaces that cannot be rewritten
+in safe Rust:
+
+- `src/session.rs` - PTY FFI (`libc::openpty`, `libc::dup`,
+  `libc::fcntl`, `libc::read`/`libc::write`, raw-fd construction) for
+  the embedded terminal backend. Covered by unit and integration
+  tests.
+- `src/app.rs` - two `libc::killpg(pid, SIGKILL)` blocks in the
+  graceful-shutdown and panic-handler paths.
+
+Every existing unsafe block carries a preceding SAFETY comment
+documenting why the block is sound. Adding a new unsafe block
+requires:
+
+1. A SAFETY comment that states the preconditions relied on and why
+   they hold at the call site.
+2. A reviewer-visible justification in the PR description explaining
+   why the operation cannot be expressed in safe Rust.
+3. Matching test coverage, or an explicit note in the PR stating why
+   the block is impossible to test in-process (e.g. the FFI path
+   needs a real PTY device).
+
+Reviewers must flag any new unsafe block that lacks any of the above,
+even if clippy does not fire (the lint is at `allow`, so detection is
+human, not mechanical).
+
+`forbid` is not an option because even a single legitimate unsafe
+block in the crate would then force `#[allow(unsafe_code)]` at the
+site - and that allow is denied by `clippy::allow_attributes`. The
+review-based policy documented here is the enforcement path.
+
 ### Optional: nightly rustfmt for import style
 
 `rustfmt.toml` enables two nightly-only options
@@ -91,6 +165,16 @@ past its budget, bump the entry in the budget file as part of your
 PR and explain the growth in the commit message. The budget exists
 to prevent silent module bloat, not to ban growth - it wants the
 growth to be an explicit, reviewable decision.
+
+**Implicit 700-line ceiling for new top-level source files.** Tracked
+top-level `src/*.rs` files WITHOUT an explicit entry in the budget
+table are subject to an implicit 700-line ceiling. Under the ceiling
+passes silently; over the ceiling fails with a message asking the
+contributor to either shrink the file or add an explicit entry with
+a larger budget and rationale in the commit message. Nested files
+(e.g. `src/side_effects/*.rs`) are intentionally out of scope; the
+ceiling only enforces that newly-extracted top-level modules cannot
+grow silently past the point where they warrant explicit review.
 
 ## Error Handling
 

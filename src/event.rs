@@ -12,7 +12,7 @@ use crate::work_item::SelectionState;
 
 /// Returns true if `c` is the character that crossterm 0.28's legacy
 /// keyboard parser reports for `Ctrl+<symbol>`. Crossterm maps the raw
-/// control bytes 0x1C..=0x1F to KeyCode::Char('4'..='7') with CONTROL,
+/// control bytes 0x1C..=0x1F to `KeyCode::Char`('4'..='7') with CONTROL,
 /// so a Ctrl+\ press arrives either as the literal '\\' or as '4'
 /// depending on the host terminal. This helper centralises the
 /// translation so call sites do not need to rediscover the mapping.
@@ -103,11 +103,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // When an alert dialog is shown, Enter or Esc dismisses it.
     // This must be checked before other prompts since alerts overlay everything.
     if app.alert_message.is_some() {
-        match (key.modifiers, key.code) {
-            (_, KeyCode::Enter) | (_, KeyCode::Esc) => {
-                app.alert_message = None;
-            }
-            _ => {}
+        if let (_, KeyCode::Enter | KeyCode::Esc) = (key.modifiers, key.code) {
+            app.alert_message = None;
         }
         return true;
     }
@@ -179,7 +176,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if app.branch_gone_prompt.is_some() {
         match (key.modifiers, key.code) {
             (_, KeyCode::Char('d')) => {
-                let (wi_id, _) = app.branch_gone_prompt.take().unwrap();
+                // The outer `if app.branch_gone_prompt.is_some()`
+                // guard guarantees `take()` yields `Some`, but an
+                // `if let` here avoids a restriction-lint `unwrap()`
+                // and degrades to a no-op on the impossible None
+                // path rather than panicking the whole TUI.
+                let Some((wi_id, _)) = app.branch_gone_prompt.take() else {
+                    return true;
+                };
                 // Target the work item by identity rather than going
                 // through selected_work_item_id(), which in Board view
                 // reads from board_cursor rather than selected_item. The
@@ -225,8 +229,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
         match (key.modifiers, key.code) {
             (_, KeyCode::Enter) => {
-                let prompt = app.stale_worktree_prompt.take().unwrap();
-                app.spawn_stale_worktree_recovery(prompt);
+                // Same guard-pattern as the branch-gone dialog above:
+                // the outer `is_some()` makes `take() == Some(_)`
+                // structurally, but an `if let` avoids a
+                // restriction-lint `unwrap()` and is a no-op on the
+                // impossible None path.
+                if let Some(prompt) = app.stale_worktree_prompt.take() {
+                    app.spawn_stale_worktree_recovery(prompt);
+                }
             }
             (_, KeyCode::Esc) => {
                 app.stale_worktree_prompt = None;
@@ -340,7 +350,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             {
                 let new_value = app.settings_review_skill_input.text().trim().to_string();
                 let old_value = app.config.defaults.review_skill.clone();
-                app.config.defaults.review_skill = new_value.clone();
+                app.config.defaults.review_skill.clone_from(&new_value);
                 if let Err(e) = app.config_provider.save(&app.config) {
                     // Rollback on save failure.
                     app.config.defaults.review_skill = old_value;
@@ -883,7 +893,7 @@ fn handle_key_left(app: &mut App, key: KeyEvent) {
                         sync_layout(app);
                     }
                 }
-                _ => {}
+                DisplayEntry::GroupHeader { .. } => {}
             }
         }
         // Shift+Right - advance to next workflow stage
@@ -1169,7 +1179,7 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
             app.buffer_bytes_to_right_panel(seq.as_bytes());
         }
         _ => {}
-    };
+    }
 
     false
 }
@@ -1178,7 +1188,7 @@ fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
 /// Ctrl+G toggles the drawer (closing it, or respawning if the session
 /// died). Ctrl+] also closes the drawer. Esc is forwarded to the PTY as
 /// \x1b. All other keys are forwarded to the global session PTY using
-/// the same encoding as handle_key_right.
+/// the same encoding as `handle_key_right`.
 fn handle_global_drawer_key(app: &mut App, key: KeyEvent) -> bool {
     // Ctrl+G toggles the drawer (handles dead-session respawn internally).
     if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1315,7 +1325,7 @@ fn buffer_csi_key(app: &mut App, key: u8, modifiers: KeyModifiers) {
 
 /// Compute the xterm modifier parameter for ANSI escape sequences.
 /// Returns 1 for no modifiers (caller should omit the parameter).
-fn modifier_param(modifiers: KeyModifiers) -> u8 {
+const fn modifier_param(modifiers: KeyModifiers) -> u8 {
     let mut code: u8 = 1;
     if modifiers.contains(KeyModifiers::SHIFT) {
         code += 1;
@@ -1448,8 +1458,8 @@ pub fn handle_paste(app: &mut App, data: &str) -> bool {
 /// is currently up. The invariant is behavioral, not textual: for every
 /// reachable app state, paste lands in the same field `handle_key`
 /// would type into. This holds because all modal flags in
-/// `any_modal_visible` are mutually exclusive at runtime (set_branch,
-/// create_dialog, rework, cleanup, settings editing, merge, delete,
+/// `any_modal_visible` are mutually exclusive at runtime (`set_branch`,
+/// `create_dialog`, rework, cleanup, settings editing, merge, delete,
 /// branch-gone, stale-worktree, no-plan, alert, and in-progress
 /// spinners are each opened by flows that refuse to run while another
 /// modal is up), so the literal arm order in this function does not
@@ -1548,7 +1558,7 @@ fn route_paste_to_modal_input(app: &mut App, data: &str) -> bool {
 fn handle_merge_prompt(app: &mut App, key: KeyEvent) {
     let had_status = app.has_visible_status_bar();
     match (key.modifiers, key.code) {
-        (_, KeyCode::Char('s')) | (_, KeyCode::Enter) => {
+        (_, KeyCode::Char('s') | KeyCode::Enter) => {
             if let Some(wi_id) = app.merge_wi_id.clone() {
                 app.execute_merge(&wi_id, "squash");
             }
@@ -1658,7 +1668,7 @@ fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
 /// Handle key events for the "Set branch name" recovery modal.
 ///
 /// Enter confirms (persists the branch via `update_branch` and re-drives
-/// whichever gesture opened the dialog - spawn_session or advance_stage).
+/// whichever gesture opened the dialog - `spawn_session` or `advance_stage`).
 /// Esc dismisses without touching the backend. Character input keys and
 /// basic cursor navigation are forwarded to the rat-widget
 /// `TextInputState`.
@@ -1818,12 +1828,11 @@ fn handle_no_plan_prompt(app: &mut App, key: KeyEvent) {
             // next item automatically (no status_message needed).
         }
         (KeyModifiers::NONE, KeyCode::Char('p')) => {
-            let wi_id = match app.no_plan_prompt_queue.pop_front() {
-                Some(id) => id,
-                None => {
-                    app.no_plan_prompt_visible = false;
-                    return;
-                }
+            let wi_id = if let Some(id) = app.no_plan_prompt_queue.pop_front() {
+                id
+            } else {
+                app.no_plan_prompt_visible = false;
+                return;
             };
             app.plan_from_branch(&wi_id);
             // Clear prompt if queue is empty; otherwise dialog stays for
@@ -1838,8 +1847,8 @@ fn handle_no_plan_prompt(app: &mut App, key: KeyEvent) {
 
 /// Handle key events while the delete confirmation modal is visible but
 /// the background cleanup thread has not started yet. Once confirmed,
-/// delete_in_progress becomes true and a separate intercept higher up
-/// in handle_key swallows further input.
+/// `delete_in_progress` becomes true and a separate intercept higher up
+/// in `handle_key` swallows further input.
 fn handle_delete_prompt(app: &mut App, key: KeyEvent) {
     match (key.modifiers, key.code) {
         (_, KeyCode::Esc) => {
@@ -2456,7 +2465,7 @@ fn handle_mouse_with_terminal_size(
 /// place so the user can scroll away, scroll back, and still land on
 /// the same selection. Step size is 3 rows per tick to match the PTY
 /// scrollback step.
-fn handle_work_item_list_scroll(app: &mut App, scroll_up: bool) -> bool {
+fn handle_work_item_list_scroll(app: &App, scroll_up: bool) -> bool {
     let current = app.list_scroll_offset.get();
     let max = app.list_max_item_offset.get();
     let next = if scroll_up {
@@ -2652,19 +2661,15 @@ fn handle_scroll_global(app: &mut App, scroll_up: bool, local_col: u16, local_ro
                 .parser
                 .lock()
                 .ok()
-                .map(|p| p.screen().size().0 as usize)
-                .unwrap_or(0);
+                .map_or(0, |p| p.screen().size().0 as usize);
             entry.scrollback_offset = (entry.scrollback_offset + 3).min(max);
         }
         return true;
     }
     // Scroll-down while in scrollback: decrement offset locally.
-    if app
-        .global_session
-        .as_ref()
-        .is_some_and(|s| s.scrollback_offset > 0)
+    if let Some(entry) = app.global_session.as_mut()
+        && entry.scrollback_offset > 0
     {
-        let entry = app.global_session.as_mut().unwrap();
         entry.scrollback_offset = entry.scrollback_offset.saturating_sub(3);
         return true;
     }
@@ -2701,8 +2706,7 @@ fn handle_scroll_right(app: &mut App, scroll_up: bool, local_col: u16, local_row
                 .parser
                 .lock()
                 .ok()
-                .map(|p| p.screen().size().0 as usize)
-                .unwrap_or(0);
+                .map_or(0, |p| p.screen().size().0 as usize);
             entry.scrollback_offset = (entry.scrollback_offset + 3).min(max);
         }
         return true;
@@ -2818,8 +2822,11 @@ fn copy_selection_to_clipboard(entry: &crate::work_item::SessionEntry) {
     // Copy to system clipboard via the OSC 52 + arboard dual-path
     // helper. This fixes the existing PTY drag-select path over SSH
     // as a side benefit: OSC 52 works when `arboard` can't reach a
-    // native display.
-    crate::side_effects::clipboard::copy(&text);
+    // native display. Return value is intentionally ignored here -
+    // this drag-select path does not surface clipboard success /
+    // failure to the user (see the Ctrl+C path for the toast-aware
+    // wiring).
+    let _ = crate::side_effects::clipboard::copy(&text);
 }
 
 /// Convert a user-facing `SelectionState` (inclusive end cell) into the
@@ -2841,7 +2848,7 @@ fn copy_selection_to_clipboard(entry: &crate::work_item::SessionEntry) {
 /// `src/ui.rs` and this clipboard helper agree on exactly one rule for
 /// which corner is "start" and which is "end". See that method's
 /// rationale for why the logic lives on the struct.
-pub(crate) fn selection_to_vt100_bounds(sel: &SelectionState, cols: u16) -> (u16, u16, u16, u16) {
+pub fn selection_to_vt100_bounds(sel: &SelectionState, cols: u16) -> (u16, u16, u16, u16) {
     let (start_row, start_col, end_row, end_col) = sel.normalized_bounds();
     let exclusive_end_col = end_col.saturating_add(1).min(cols);
     (start_row, start_col, end_row, exclusive_end_col)
@@ -2850,7 +2857,7 @@ pub(crate) fn selection_to_vt100_bounds(sel: &SelectionState, cols: u16) -> (u16
 /// Recalculate layout from the current terminal size and resize PTY panes.
 /// Called when the status bar visibility changes to keep the PTY pane
 /// dimensions in sync with the actual display area.
-pub(crate) fn sync_layout(app: &mut App) {
+pub fn sync_layout(app: &mut App) {
     if let Ok((cols, rows)) = ratatui_crossterm::crossterm::terminal::size() {
         handle_resize(app, cols, rows);
     }
@@ -2920,7 +2927,7 @@ mod tests {
     }
 
     /// F-2: Create dialog is unreachable during shutdown.
-    /// When shutting_down is true, handle_key must ignore all keys except
+    /// When `shutting_down` is true, `handle_key` must ignore all keys except
     /// Q (force quit). Even if the create dialog was open when shutdown
     /// began, it should be closed and no input should reach it.
     #[test]
@@ -3752,8 +3759,7 @@ mod tests {
         let target = mouse_target_with_size(&app, 50, 10, (TEST_COLS, TEST_ROWS));
         assert!(
             matches!(target, MouseTarget::RightPanel { .. }),
-            "expected RightPanel classification, got {:?}",
-            target,
+            "expected RightPanel classification, got {target:?}",
         );
     }
 
@@ -3802,8 +3808,7 @@ mod tests {
         let classification = mouse_target_with_size(&app, 50, 10, (TEST_COLS, TEST_ROWS));
         assert!(
             matches!(classification, MouseTarget::RightPanel { .. }),
-            "test coordinate must land inside the right panel, got {:?}",
-            classification,
+            "test coordinate must land inside the right panel, got {classification:?}",
         );
 
         let down = mouse(MouseEventKind::Down(MouseButton::Left), 50, 10);
@@ -3869,7 +3874,7 @@ mod tests {
     }
 
     /// Negative test: a right-panel click that does NOT hit any
-    /// registered target must fall through to the normal RightPanel
+    /// registered target must fall through to the normal `RightPanel`
     /// arm (which is a no-op on a fresh `App` with no session), NOT
     /// spuriously arm a pending chrome click. Guards against a
     /// future priority check that accidentally hit-tests the empty
@@ -3943,8 +3948,7 @@ mod tests {
         let classification = mouse_target_with_size(&app, 10, 30, (TEST_COLS, TEST_ROWS));
         assert!(
             matches!(classification, MouseTarget::GlobalDrawer { .. }),
-            "test coordinate must land inside the global drawer, got {:?}",
-            classification,
+            "test coordinate must land inside the global drawer, got {classification:?}",
         );
 
         {
@@ -4156,7 +4160,7 @@ mod tests {
         assert!(changed, "paste into Description should return true");
         let text = app.create_dialog.description_input.text();
         assert!(
-            text.contains("a") && text.contains("b") && text.contains("c"),
+            text.contains('a') && text.contains('b') && text.contains('c'),
             "description must contain all pasted lines, got: {text:?}",
         );
         assert!(
@@ -4175,7 +4179,7 @@ mod tests {
         app.create_dialog.focus_field = CreateDialogFocus::Repos;
 
         let changed = handle_paste(&mut app, "this must not land anywhere");
-        assert!(!changed, "paste into Repos focus must return false (no-op)",);
+        assert!(!changed, "paste into Repos focus must return false (no-op)");
         assert_eq!(app.create_dialog.title_input.text(), "");
         assert_eq!(app.create_dialog.branch_input.text(), "");
         assert_eq!(app.create_dialog.description_input.text(), "");
@@ -4253,7 +4257,7 @@ mod tests {
         }
 
         let changed = handle_paste(&mut app, "feature\nname");
-        assert!(changed, "paste into set-branch dialog should return true",);
+        assert!(changed, "paste into set-branch dialog should return true");
         let text = app
             .set_branch_dialog
             .as_ref()
@@ -4561,8 +4565,7 @@ mod tests {
         let target = mouse_target_with_size(&app, rect.x + 5, rect.y + 5, (TEST_COLS, TEST_ROWS));
         assert!(
             matches!(target, MouseTarget::WorkItemList),
-            "point inside body rect must classify as WorkItemList, got {:?}",
-            target,
+            "point inside body rect must classify as WorkItemList, got {target:?}",
         );
     }
 }
