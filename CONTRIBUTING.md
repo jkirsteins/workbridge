@@ -30,7 +30,8 @@ summary:
   `panic`. Tests carve these out via the two-invocation CI pattern
   (`cargo clippy --tests ... -- -A clippy::unwrap_used -A clippy::expect_used
   -A clippy::panic`) rather than any source-level `#[allow]`.
-- **Warn (groups):** `pedantic`, `nursery`. CI promotes warnings to errors
+- **Warn (groups):** `rust_2018_idioms` (from `[lints.rust]`), `pedantic`,
+  `nursery` (both from `[lints.clippy]`). CI promotes warnings to errors
   via `-D warnings`.
 - **Allow (with rationale in Cargo.toml):** CLI surface (`print_stdout`,
   `print_stderr`, `exit`), design-doc noise (`module_name_repetitions`,
@@ -64,10 +65,11 @@ Rust:
   tests. The module opts out via a single file-level
   `#![expect(unsafe_code, reason = "...")]` attribute at the top of
   `src/session.rs` (the entire file is the FFI boundary).
-- `src/app.rs` - two `libc::killpg(pid, SIGKILL)` blocks in the
-  graceful-shutdown and panic-handler paths. Each enclosing function
-  opts out via `#[expect(unsafe_code, reason = "...")]` attached to
-  the function, not to the unsafe block itself.
+- `src/app.rs` - two `libc::killpg(pid, SIGKILL)` blocks: one in the
+  rebase-gate drop path (`impl Drop for RebaseGateState`) and one in
+  the subprocess cancellation helper (`run_cancellable`). Each
+  enclosing function opts out via `#[expect(unsafe_code, reason =
+  "...")]` attached to the function, not to the unsafe block itself.
 
 Note that the opt-out uses `#[expect]`, NOT `#[allow]`, because
 `clippy::allow_attributes` is denied crate-wide so that no
