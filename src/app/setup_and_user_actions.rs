@@ -107,8 +107,6 @@ impl super::App {
     ) -> Self {
         let active_repo_cache = canonicalize_repo_entries(config.active_repos());
         let (mcp_tx, mcp_rx) = crossbeam_channel::unbounded();
-        let (orphan_cleanup_finished_tx, orphan_cleanup_finished_rx) =
-            crossbeam_channel::unbounded();
         let services = SharedServices {
             backend,
             worktree_service,
@@ -208,8 +206,7 @@ impl super::App {
             pr_identity_backfill_activity: None,
             session_open_rx: HashMap::new(),
             session_spawn_rx: HashMap::new(),
-            orphan_cleanup_finished_tx,
-            orphan_cleanup_finished_rx,
+            orphan_cleanup: OrphanCleanup::new(),
             global_drawer: GlobalDrawer::new(),
             pending_active_pty_bytes: Vec::new(),
             right_panel_tab: RightPanelTab::ClaudeCode,

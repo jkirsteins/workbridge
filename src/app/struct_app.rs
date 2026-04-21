@@ -394,15 +394,13 @@ pub struct App {
     /// different items do not collide.
     pub session_spawn_rx: HashMap<WorkItemId, SessionSpawnPending>,
 
-    /// Sender for completion messages from `spawn_orphan_worktree_cleanup`
-    /// background threads. Cloned into each spawned closure. The closure
-    /// always sends exactly one `OrphanCleanupFinished` when it finishes
-    /// (success or failure), so `poll_orphan_cleanup_finished` can both
-    /// surface any warnings AND end the matching status-bar activity.
-    /// Drained by `poll_orphan_cleanup_finished` on each background tick.
-    pub orphan_cleanup_finished_tx: crossbeam_channel::Sender<OrphanCleanupFinished>,
-    /// Receiver paired with `orphan_cleanup_finished_tx`.
-    pub orphan_cleanup_finished_rx: crossbeam_channel::Receiver<OrphanCleanupFinished>,
+    /// `OrphanCleanup` subsystem: owns the completion-message channel
+    /// pair used by `spawn_orphan_worktree_cleanup` background
+    /// threads. Replaces the previously sibling
+    /// `orphan_cleanup_finished_tx` / `_rx` fields so the channel
+    /// pair has one owner and a narrow `drain_pending` interface.
+    /// See `app::OrphanCleanup`.
+    pub orphan_cleanup: OrphanCleanup,
 
     /// Global assistant drawer state: open flag, PTY session, MCP
     /// server, config tempfile path, pane geometry, pre-drawer focus,

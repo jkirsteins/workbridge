@@ -518,7 +518,7 @@ impl super::App {
             worktree_path.display()
         ));
         let ws = Arc::clone(&self.services.worktree_service);
-        let finished_tx = self.orphan_cleanup_finished_tx.clone();
+        let finished_tx = self.orphan_cleanup.tx.clone();
         std::thread::spawn(move || {
             let mut warnings: Vec<String> = Vec::new();
             if let Err(e) = ws.remove_worktree(&repo_path, &worktree_path, true, true) {
@@ -554,8 +554,9 @@ impl super::App {
     /// from the background-work tick alongside the other `poll_*`
     /// methods.
     pub fn poll_orphan_cleanup_finished(&mut self) {
+        let drained = self.orphan_cleanup.drain_pending();
         let mut warnings: Vec<String> = Vec::new();
-        while let Ok(msg) = self.orphan_cleanup_finished_rx.try_recv() {
+        for msg in drained {
             self.activities.end(msg.activity);
             warnings.extend(msg.warnings);
         }

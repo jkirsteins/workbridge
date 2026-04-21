@@ -225,7 +225,7 @@ fn spawn_orphan_worktree_cleanup_surfaces_failures_via_status_message() {
     // Wait for the single completion message to land in the channel.
     let recv_start = crate::side_effects::clock::instant_now();
     loop {
-        if !app.orphan_cleanup_finished_rx.is_empty() {
+        if !app.orphan_cleanup.rx.is_empty() {
             break;
         }
         // 60s of mock-clock budget (6000 iterations of the 10ms
@@ -320,7 +320,7 @@ fn spawn_orphan_worktree_cleanup_ends_activity_on_success() {
     // Wait for the single completion message to arrive.
     let recv_start = crate::side_effects::clock::instant_now();
     loop {
-        if !app.orphan_cleanup_finished_rx.is_empty() {
+        if !app.orphan_cleanup.rx.is_empty() {
             break;
         }
         // 60s of mock-clock budget (6000 iterations of the 10ms
