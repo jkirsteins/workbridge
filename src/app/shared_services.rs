@@ -1,8 +1,7 @@
 //! `SharedServices` - the aggregate of trait objects + config that
 //! every subsystem needs read-access (or write-access) to.
 //!
-//! Stage 2 of the Phase 4 logical decomposition specifies that every
-//! subsystem method takes `&mut SharedServices` plus any other
+//! Every subsystem method takes `&mut SharedServices` plus any other
 //! subsystem refs it needs - NOT `&mut App` - so the app-wide fan-out
 //! (`backend`, `worktree_service`, `github_client`, `pr_closer`,
 //! `agent_backend`, `config`, `config_provider`) is available

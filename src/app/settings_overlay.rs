@@ -1,8 +1,8 @@
 //! `SettingsOverlay` subsystem - all state owned by the settings modal
 //! overlay (the `?` key).
 //!
-//! Stage 2.7 of the Phase 4 logical decomposition: `App` used to own
-//! `show_settings`, `settings_repo_selected`, `settings_available_selected`,
+//! `App` used to own `show_settings`, `settings_repo_selected`,
+//! `settings_available_selected`,
 //! `settings_tab`, `settings_list_focus`, `settings_keybindings_scroll`,
 //! `settings_review_skill_input`, and `settings_review_skill_editing` as
 //! eight sibling fields on `App`. This file consolidates them into a

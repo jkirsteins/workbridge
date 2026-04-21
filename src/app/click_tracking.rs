@@ -1,8 +1,7 @@
 //! Click-tracking subsystem - per-frame click target registry and
 //! pending-click gesture state for the click-to-copy flow.
 //!
-//! Stage 2.4 of the Phase 4 logical decomposition. `App` previously
-//! held `click_registry: RefCell<ClickRegistry>` and
+//! `App` previously held `click_registry: RefCell<ClickRegistry>` and
 //! `pending_chrome_click: Option<...>` as two sibling fields, with
 //! `fire_chrome_copy` implemented directly on `impl App`. Copy
 //! effects (clipboard + confirmation toast) straddled the boundary
@@ -18,8 +17,7 @@
 
 use std::cell::RefCell;
 
-use super::Toasts;
-use super::short_display;
+use super::{Toasts, short_display};
 use crate::click_targets::{ClickKind, ClickRegistry};
 
 /// Owns the per-frame click registry (populated during render,

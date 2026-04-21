@@ -68,8 +68,7 @@ echo "Format OK."
 echo "=== pre-commit: running clippy ==="
 # Two-invocation pattern lives in hooks/clippy-check.sh so this hook
 # and .github/workflows/ci.yml share exactly one copy of the flag
-# set. See hooks/clippy-check.sh and
-# docs/hygiene-campaign/phase-3-calibration.md for the rationale.
+# set. See hooks/clippy-check.sh for the rationale.
 ./hooks/clippy-check.sh
 echo "Clippy OK."
 

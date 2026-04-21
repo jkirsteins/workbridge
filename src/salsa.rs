@@ -25,10 +25,9 @@ use crate::{event, fetcher, github_client, layout, ui, worktree_service};
 /// implementations produce. The `From` impls below satisfy the trait
 /// bounds that `PollCrossterm`, `PollTimers`, and `PollRendered` require.
 ///
-/// An aspirational `Message(AppMessage)` variant was removed when
-/// Phase 3 of the hygiene campaign eliminated dead `#[allow(dead_code)]`
-/// attributes; re-add it (and its dispatcher arm) in the same commit
-/// as the first real producer when inter-component messaging lands.
+/// An aspirational `Message(AppMessage)` variant was removed during a
+/// dead-code cleanup; re-add it (and its dispatcher arm) in the same
+/// commit as the first real producer when inter-component messaging lands.
 #[derive(Debug)]
 pub enum AppEvent {
     /// Terminal events (keyboard, mouse, resize) from crossterm.

@@ -1,8 +1,8 @@
 //! `PrIdentityBackfill` subsystem - receiver + status-bar activity for
 //! the one-time PR identity backfill thread spawned at startup.
 //!
-//! Stage 2.18a of the Phase 4 logical decomposition: `App` used to own
-//! `pr_identity_backfill_rx` and `pr_identity_backfill_activity` as two
+//! `App` used to own `pr_identity_backfill_rx` and
+//! `pr_identity_backfill_activity` as two
 //! sibling `Option<_>` fields. Their lifetimes are coupled (the rx is
 //! set the moment the background thread is spawned, alongside the
 //! activity; both are cleared together on disconnect) so grouping
@@ -15,8 +15,7 @@
 //! because it reaches across subsystems. This subsystem owns only the
 //! pair + install / clear / take helpers.
 
-use super::ActivityId;
-use super::PrIdentityBackfillResult;
+use super::{ActivityId, PrIdentityBackfillResult};
 
 /// Owns the receiver and status-bar activity for the one-time
 /// startup PR identity backfill.
@@ -71,8 +70,9 @@ impl PrIdentityBackfill {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crossbeam_channel::unbounded;
+
+    use super::*;
 
     #[test]
     fn new_is_inactive() {

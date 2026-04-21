@@ -1,14 +1,13 @@
 //! Activities subsystem - status-bar spinners and in-flight indicators.
 //!
-//! Stage 2.3 of the Phase 4 logical decomposition. `App` previously
-//! held `activity_counter`, `activities`, `spinner_tick`,
-//! `structural_fetch_activity`, and `pending_fetch_count` as separate
-//! fields, with `start_activity` / `end_activity` / `current_activity`
-//! implemented directly on `impl App`. That scatter made the spinner
-//! ownership story hard to reason about: the invariant "exactly one
-//! spinner at a time (either the user-action guard or the structural
-//! fetch) owns the indicator" is enforced by code that had to reach
-//! across multiple App fields.
+//! `App` previously held `activity_counter`, `activities`,
+//! `spinner_tick`, `structural_fetch_activity`, and
+//! `pending_fetch_count` as separate fields, with `start_activity` /
+//! `end_activity` / `current_activity` implemented directly on `impl
+//! App`. That scatter made the spinner ownership story hard to reason
+//! about: the invariant "exactly one spinner at a time (either the
+//! user-action guard or the structural fetch) owns the indicator" is
+//! enforced by code that had to reach across multiple App fields.
 //!
 //! This module makes the subsystem a single struct (`Activities`)
 //! owning all five fields and exposing a narrow API. `App` now holds

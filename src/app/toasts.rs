@@ -1,7 +1,7 @@
 //! Toasts subsystem - transient top-right notifications.
 //!
-//! Stage 2.2 of the Phase 4 logical decomposition: `App` used to own
-//! `toasts: Vec<Toast>` directly and carry `push_toast` / `prune_toasts`
+//! `App` used to own `toasts: Vec<Toast>` directly and carry
+//! `push_toast` / `prune_toasts`
 //! on `impl App`. This file owns both the data and the narrow API that
 //! mutates it, so the rest of `App` never touches the vector itself.
 //!

@@ -847,47 +847,47 @@ Expected: exit 0, "file-size budget OK" (or equivalent success message).
 
 Remove explicit hygiene-campaign phase references from source, hooks, and config. Preserve internal algorithm-phase comments.
 
-- [ ] **Task 18.1: Scrub `src/work_item_backend.rs` (now `src/work_item_backend/mod.rs` or wherever it moved).**
+- [x] **Task 18.1: Scrub `src/work_item_backend.rs` (now `src/work_item_backend/mod.rs` or wherever it moved).**
 
 Find the "Phase 3 of the hygiene campaign" comment and replace with a neutral description of what the code does, with no campaign reference.
 
-- [ ] **Task 18.2: Scrub `src/work_item.rs`.**
+- [x] **Task 18.2: Scrub `src/work_item.rs`.**
 
 Same treatment for both "Phase 3 of the hygiene campaign" references.
 
-- [ ] **Task 18.3: Scrub `src/salsa.rs`.**
+- [x] **Task 18.3: Scrub `src/salsa.rs`.**
 
 Replace "Phase 3 of the hygiene campaign eliminated dead..." with a neutral phrasing. Keep any `// Phase 2: drain PTY spawn results` algorithm comment - that's internal, not campaign.
 
-- [ ] **Task 18.4: Scrub `hooks/clippy-check.sh`.**
+- [x] **Task 18.4: Scrub `hooks/clippy-check.sh`.**
 
 Remove the "See docs/hygiene-campaign/phase-3-calibration.md" link. The doc itself stays.
 
-- [ ] **Task 18.5: Scrub `hooks/pre-commit`.**
+- [x] **Task 18.5: Scrub `hooks/pre-commit`.**
 
 Remove the "docs/hygiene-campaign/phase-3-calibration.md for the rationale" reference.
 
-- [ ] **Task 18.6: Scrub `hooks/ratatui-builtin-check.sh`.**
+- [x] **Task 18.6: Scrub `hooks/ratatui-builtin-check.sh`.**
 
 Remove "In Phase 1 this runs warn-only" comments. The hook may still run warn-only or be promoted - leave the behavior, rewrite the rationale without phase naming.
 
-- [ ] **Task 18.7: Scrub `clippy.toml`.**
+- [x] **Task 18.7: Scrub `clippy.toml`.**
 
 Replace "Phase 1 baseline", "Phase 3 during clippy cleanup" with neutral descriptions of what the config does.
 
-- [ ] **Task 18.8: Scrub `deny.toml`.**
+- [x] **Task 18.8: Scrub `deny.toml`.**
 
 Same treatment.
 
-- [ ] **Task 18.9: Scrub `typos.toml`.**
+- [x] **Task 18.9: Scrub `typos.toml`.**
 
 Same.
 
-- [ ] **Task 18.10: Scrub `Cargo.toml`.**
+- [x] **Task 18.10: Scrub `Cargo.toml`.**
 
 Remove phase references; keep the functional content of the `[lints]` table. Any allow that was "flipped in Phase 3" is now just documented as "allow with rationale: ...".
 
-- [ ] **Task 18.11: Verify scrub complete.**
+- [x] **Task 18.11: Verify scrub complete.**
 
 ```bash
 git grep -nE 'hygiene campaign|Phase [1-4] of|hygiene-campaign' -- 'src/**' 'hooks/**' '*.toml'
@@ -895,7 +895,7 @@ git grep -nE 'hygiene campaign|Phase [1-4] of|hygiene-campaign' -- 'src/**' 'hoo
 
 Expected: output is empty, or only matches historical doc paths which are allowed.
 
-- [ ] **Task 18.12:** fmt/clippy/test. Commit.
+- [x] **Task 18.12:** fmt/clippy/test. Commit.
 
 ---
 

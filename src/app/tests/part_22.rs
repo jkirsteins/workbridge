@@ -391,10 +391,10 @@ pub fn seed_rr_app(
         );
     }
     app.reassemble_work_items();
-    // Pin the per-watch cooldown so Phase 2 of
+    // Pin the per-watch cooldown so the spawn phase of
     // `poll_review_request_merges` never spawns a real `gh pr
     // view` subprocess during a unit test. Individual tests that
-    // exercise Phase 2 can override this back to None.
+    // exercise the spawn phase can override this back to None.
     let now = crate::side_effects::clock::instant_now();
     for w in &mut app.review_request_merge_watches {
         w.last_polled = Some(now);

@@ -305,14 +305,13 @@ macro_rules! impl_pr_merge_reconstruct_method {
 
 // === Submodule declarations ===
 //
-// Phase 4 logical decomposition: subsystem structs (`Toasts`,
-// `Activities`, `ClickTracking`, `UserActionGuard`) live in their
-// own owning-struct modules. The remainder of `impl App` is split
-// into subsystem-named files below. Methods are grouped by the
-// subsystem concern they serve - NOT by line-count budget. Each
-// file's doc comment names the subsystem it implements. Moving
-// methods between files is a logical-ownership change, not a
-// mechanical one.
+// Subsystem structs (`Toasts`, `Activities`, `ClickTracking`,
+// `UserActionGuard`) live in their own owning-struct modules. The
+// remainder of `impl App` is split into subsystem-named files below.
+// Methods are grouped by the subsystem concern they serve - NOT by
+// line-count budget. Each file's doc comment names the subsystem it
+// implements. Moving methods between files is a logical-ownership
+// change, not a mechanical one.
 mod activities;
 mod cleanup;
 mod click_tracking;

@@ -1,4 +1,4 @@
-//! PR creation + merge-execution subsystem (Phase 1).
+//! PR creation + merge-execution subsystem.
 //!
 //! Drains the background PR-creation channel
 //! (`poll_pr_creation`), admits a merge action

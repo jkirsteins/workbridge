@@ -1,8 +1,7 @@
 //! `GlobalDrawer` subsystem - the persistent global-assistant drawer
 //! state (PTY session, MCP server, context, geometry, spawn lifecycle).
 //!
-//! Stage 2.15 of the Phase 4 logical decomposition. `App` previously
-//! held ten sibling fields for the global-assistant feature
+//! `App` previously held ten sibling fields for the global-assistant feature
 //! (`global_drawer_open`, `global_session`, `global_mcp_server`,
 //! `global_mcp_context`, `pre_drawer_focus`, `global_pane_cols`,
 //! `global_pane_rows`, `global_mcp_config_path`,

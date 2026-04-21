@@ -1,8 +1,8 @@
 //! Shell subsystem - top-level app chrome (quit, focus, status bar,
 //! pane geometry, shutdown sequence).
 //!
-//! Stage 2.5 of the Phase 4 logical decomposition. `App` previously
-//! held `should_quit`, `focus`, `status_message`, `confirm_quit`,
+//! `App` previously held `should_quit`, `focus`, `status_message`,
+//! `confirm_quit`,
 //! `pane_cols`, `pane_rows`, `shutting_down`, and `shutdown_started`
 //! as eight sibling fields. All of them belong to a single "shell"
 //! concern: the outer window chrome + status bar + quit / shutdown

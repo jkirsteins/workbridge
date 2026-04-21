@@ -69,10 +69,9 @@ dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
 
-# Carpet-bombs at warn: promoted to error via CI's -D warnings. These
-# were flipped in Phase 3 of the hygiene campaign after the mechanical
-# findings were cleaned up. `priority = -1` lets individual
-# `allow`/`deny` lines below override a group-level warn.
+# Carpet-bombs at warn: promoted to error via CI's -D warnings.
+# `priority = -1` lets individual `allow`/`deny` lines below override
+# a group-level warn.
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 
@@ -82,9 +81,8 @@ unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 
-# Close the source-level allow loophole so Phase 3's cleanup does not
-# regress through "just add #[allow]" pressure. Every suppression now
-# has to live in this file with a rationale.
+# Close the source-level allow loophole. Every suppression has to live
+# in this file with a rationale rather than in an ad-hoc `#[allow]`.
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 
@@ -95,8 +93,7 @@ print_stdout = "allow"
 print_stderr = "allow"
 exit = "allow"
 
-# Design-doc noise allows (per the hygiene campaign design doc Phase 1
-# block list). Each has been judged pure noise for this crate's style.
+# Noise allows. Each has been judged pure noise for this crate's style.
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
@@ -112,22 +109,22 @@ cast_sign_loss = "allow"
 cast_lossless = "allow"
 cast_precision_loss = "allow"
 
-# Phase-4-deferred structural lints: all sites are in src/app.rs and
-# the cleanup requires the decomposition that Phase 4 will do. These
-# allow entries flip back to warn in the Phase 4 PR that finishes the
-# split.
+# Structural lints deferred until the app-module decomposition stabilises.
+# The remaining sites are concentrated in the `app` module tree and the
+# cleanup requires further structural refactoring; flip these back to warn
+# once that work lands.
 needless_pass_by_value = "allow"
 significant_drop_tightening = "allow"
 struct_excessive_bools = "allow"
 unused_self = "allow"
 
-# Wildcard imports are used inside the `src/app/` module tree to let each
+# Wildcard imports are used inside the `app` module tree to let each
 # sibling submodule (types_NN, impl_NN, helpers, stubs, tests parts)
 # pick up the shared item namespace via `use super::*;`. Each file
 # listing every type it touches explicitly would add 30+ lines of
 # boilerplate per file without improving clarity - the aggregator is
 # the parent `mod.rs`, which is the only thing that needs to be audited
-# for what is exported. See Phase 4 decomposition plan.
+# for what is exported.
 wildcard_imports = "allow"
 
 [lints.rustdoc]

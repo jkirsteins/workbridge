@@ -1,4 +1,4 @@
-# deny.toml - Phase 1 baseline for cargo-deny.
+# deny.toml - configuration for cargo-deny.
 # https://embarkstudios.github.io/cargo-deny/
 
 [graph]
@@ -13,8 +13,7 @@ yanked = "deny"
 # rat-popup, rat-salsa, rat-text, rat-widget) and has no known
 # vulnerability - only the "unmaintained" classification. There is no
 # safe upgrade available, and replacing the transitive chain is out
-# of scope for this Phase 1 hygiene baseline. Revisit if the advisory
-# escalates or a fix lands upstream.
+# of scope. Revisit if the advisory escalates or a fix lands upstream.
 ignore = ["RUSTSEC-2025-0057"]
 
 [bans]

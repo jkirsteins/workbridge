@@ -6,9 +6,9 @@
 # already exists. The CLAUDE.md review policy calls this a P0 issue;
 # this script is a defense-in-depth assist, not a perfect oracle.
 #
-# In Phase 1 this runs warn-only (exit 0 even on findings). Promotion
-# to a blocking check happens after we've observed the false-positive
-# rate and tuned the patterns.
+# Currently runs warn-only (exit 0 even on findings). Promotion to a
+# blocking check happens after we've observed the false-positive rate
+# and tuned the patterns.
 #
 # IMPORTANT: every `git grep` below is invoked via `git --no-pager grep`.
 # `git grep` is in git's built-in pager list (per git-config(1)
@@ -69,5 +69,5 @@ if [ "$findings" -eq 0 ]; then
     echo "ratatui built-in preference check: no findings."
 fi
 
-# Warn-only in Phase 1.
+# Warn-only until false-positive rate is dialed in.
 exit 0

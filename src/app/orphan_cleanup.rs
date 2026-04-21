@@ -1,8 +1,8 @@
 //! `OrphanCleanup` subsystem - the completion-message channel for
 //! background orphan-worktree cleanup threads.
 //!
-//! Stage 2.19 of the Phase 4 logical decomposition: `App` used to own
-//! `orphan_cleanup_finished_tx` and `orphan_cleanup_finished_rx` as two
+//! `App` used to own `orphan_cleanup_finished_tx` and
+//! `orphan_cleanup_finished_rx` as two
 //! sibling fields (one always-open sender cloned into each background
 //! thread, one receiver drained by the timer tick). Their ownership is
 //! coupled - the pair is created together at `App::new`, never

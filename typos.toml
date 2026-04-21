@@ -1,4 +1,4 @@
-# typos.toml - Phase 1 baseline for the `typos` spellchecker.
+# typos.toml - configuration for the `typos` spellchecker.
 # https://github.com/crate-ci/typos
 
 [default]

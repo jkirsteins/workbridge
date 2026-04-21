@@ -1,8 +1,8 @@
 //! `Metrics` subsystem - owns the latest aggregated metrics snapshot
 //! and the receiver that feeds it from the background aggregator thread.
 //!
-//! Stage 2.10 of the Phase 4 logical decomposition: `App` used to own
-//! `metrics_snapshot` and `metrics_rx` as two sibling fields. Their
+//! `App` used to own `metrics_snapshot` and `metrics_rx` as two
+//! sibling fields. Their
 //! ownership is coupled (the snapshot is written in response to the
 //! receiver producing a value, and a disconnect clears the receiver
 //! while leaving the last snapshot untouched) so a small struct with
@@ -88,8 +88,9 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crossbeam_channel::unbounded;
+
+    use super::*;
 
     fn empty_snapshot() -> MetricsSnapshot {
         MetricsSnapshot::default()
