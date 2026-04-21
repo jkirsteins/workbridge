@@ -66,12 +66,13 @@ cargo fmt -- --check
 echo "Format OK."
 
 echo "=== pre-commit: running clippy ==="
-# Two-invocation pattern: production code (lib + bins) is denied
-# unwrap/expect/panic as part of the restriction lint set; tests are
-# allowed to use those idiomatically. The carve-out is done via `-A`
-# flags at the CLI so no source-level `#[allow]` attribute is needed
-# (and the `clippy::allow_attributes` / `allow_attributes_without_reason`
-# lints are themselves at `deny`, enforcing that). See
+# Two-invocation pattern: production code (`--bins`; no `--lib` because
+# workbridge has no library target today) is denied unwrap/expect/panic
+# as part of the restriction lint set; tests are allowed to use those
+# idiomatically. The carve-out is done via `-A` flags at the CLI so no
+# source-level `#[allow]` attribute is needed (and the
+# `clippy::allow_attributes` / `allow_attributes_without_reason` lints
+# are themselves at `deny`, enforcing that). See
 # docs/hygiene-campaign/phase-3-calibration.md for the full rationale.
 cargo clippy --bins --all-features -- -D warnings
 cargo clippy --tests --all-features -- -D warnings -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic

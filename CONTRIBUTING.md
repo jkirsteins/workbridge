@@ -37,16 +37,11 @@ summary:
   `missing_errors_doc`, `missing_panics_doc`, `too_many_lines`,
   `similar_names`), TUI cast math (`cast_possible_truncation`,
   `cast_possible_wrap`, `cast_sign_loss`, `cast_lossless`,
-  `cast_precision_loss`), judgment-heavy rewrites that frequently make
-  the code less readable (`manual_let_else`, `option_if_let_else`,
-  `items_after_statements`, `match_same_arms`, `or_fun_call`,
-  `trivially_copy_pass_by_ref`, `ref_option`, `comparison_chain`,
-  `missing_const_for_fn`, `unnecessary_wraps`), test-only patterns
-  (`used_underscore_binding`, `unreadable_literal`), and Phase-4-deferred
-  structural lints (`needless_pass_by_value`,
-  `significant_drop_tightening`, `struct_excessive_bools`,
-  `unused_self`). Every `allow` has a one-line rationale comment in
-  `Cargo.toml`; any new allow entry needs the same.
+  `cast_precision_loss`), and Phase-4-deferred structural lints
+  (`needless_pass_by_value`, `significant_drop_tightening`,
+  `struct_excessive_bools`, `unused_self`). Every `allow` has a
+  one-line rationale comment in `Cargo.toml`; any new allow entry
+  needs the same.
 
 **Do not add source-level `#[allow(...)]`**. The
 `clippy::allow_attributes_without_reason` lint denies them, and the

@@ -173,7 +173,7 @@ subsystem; that rule is enforced by review, not by the lint.
 implemented via CI's two-invocation pattern:
 
 ```yaml
-- run: cargo clippy --lib --bins --all-features -- -D warnings
+- run: cargo clippy --bins --all-features -- -D warnings
 - run: cargo clippy --tests --all-features -- -D warnings \
         -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
 ```
