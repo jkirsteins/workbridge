@@ -1,9 +1,14 @@
-# rustfmt.toml - Phase 1 baseline.
+# rustfmt.toml
 #
-# Contains only settings that either match rustfmt's current default
-# output or formally pin the edition. Opinionated style settings
-# (imports_granularity, group_imports, etc.) are deferred to Phase 2
-# of the hygiene campaign, which runs the reformat in a dedicated PR
-# and records the hash in .git-blame-ignore-revs.
+# `imports_granularity` and `group_imports` are nightly-only rustfmt
+# features. Stable rustfmt parses this file, warns about the unstable
+# options, and silently falls back to defaults - so `cargo fmt --check`
+# on stable passes on nightly-formatted output without enforcing the
+# import style. Source of truth is therefore `cargo +nightly fmt --all`;
+# drift prevention lives in CLAUDE.md (reviewers run the nightly check),
+# not in CI.
 edition = "2024"
 max_width = 100
+unstable_features = true
+imports_granularity = "Module"
+group_imports = "StdExternalCrate"

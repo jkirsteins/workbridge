@@ -16,6 +16,24 @@ Never suppress, ignore, or work around linter or formatter errors. If clippy
 or `cargo fmt --check` complains, fix the code - do not add `#[allow(...)]`,
 `// nolint`, or similar annotations to silence warnings.
 
+### Optional: nightly rustfmt for import style
+
+`rustfmt.toml` enables two nightly-only options
+(`imports_granularity = "Module"`, `group_imports = "StdExternalCrate"`).
+Stable rustfmt parses these but silently ignores them, so the stable
+`cargo fmt --check` gate used by pre-commit and CI will pass on code
+that violates them. Drift prevention lives in `CLAUDE.md`: reviewers
+run nightly `fmt --check` and flag any diff.
+
+To preview what the reviewer will flag, install nightly rustfmt:
+
+```sh
+rustup toolchain install nightly --component rustfmt
+cargo +nightly fmt --all -- --check
+```
+
+This is optional; CI does not require nightly.
+
 ### Optional: Claude Code post-edit `cargo fmt` hook
 
 If you use Claude Code, `.claude/settings.json` configures a PostToolUse

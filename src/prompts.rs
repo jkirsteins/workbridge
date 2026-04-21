@@ -4,8 +4,9 @@
 //! binary via include_str!. This allows editing prompts without changing
 //! Rust code - just edit the JSON and recompile.
 
-use serde::Deserialize;
 use std::collections::HashMap;
+
+use serde::Deserialize;
 
 /// Raw prompt template with placeholder variables like {title}, {situation}, {plan}.
 #[derive(Deserialize)]

@@ -26,12 +26,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use rat_salsa::RunConfig;
-use rat_salsa::poll::{PollCrossterm, PollRendered, PollTimers};
-
 use app::App;
 use config::{ConfigProvider, FileConfigProvider};
 use github_client::GhCliClient;
+use rat_salsa::RunConfig;
+use rat_salsa::poll::{PollCrossterm, PollRendered, PollTimers};
 use salsa::{AppError, AppEvent, Global};
 use worktree_service::GitWorktreeService;
 
@@ -710,8 +709,9 @@ fn main() -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use config::InMemoryConfigProvider;
+
+    use super::*;
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
