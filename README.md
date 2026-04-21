@@ -23,6 +23,7 @@ through a Backlog -> Planning -> Implementing -> Review -> Done workflow.
   - [Work Item Lifecycle](#work-item-lifecycle)
   - [Global assistant drawer](#global-assistant-drawer)
   - [MCP Communication](#mcp-communication)
+  - [Module architecture](#module-architecture)
 - [Compatibility](#compatibility)
 - [Per-harness permission model](#per-harness-permission-model)
 - [Further Reading](#further-reading)
@@ -227,6 +228,116 @@ Per-session tool surface (see `src/mcp.rs` for the source of truth):
   read-only `workbridge_list_repos`, `workbridge_list_work_items`,
   `workbridge_repo_info`; mutating `workbridge_create_work_item`,
   which spawns a new Planning work item.
+
+### Module architecture
+
+The workbridge binary is organized as a single crate with one module
+per subsystem. The TUI runs on a single main thread that owns the
+`App` aggregate; every blocking operation (git, `gh`, PTY I/O, metrics
+aggregation) is spawned onto a background thread and drains back
+through a crossbeam or `mpsc` channel. Host-visible APIs (clipboard,
+wall-clock time, user directories) are routed through a gated
+`side_effects` module so the test suite cannot touch the developer's
+real environment.
+
+```mermaid
+flowchart LR
+    classDef entry fill:#dbeafe,stroke:#2563eb,color:#0f172a
+    classDef ui fill:#ede9fe,stroke:#7c3aed,color:#0f172a
+    classDef core fill:#fef3c7,stroke:#d97706,color:#0f172a
+    classDef svc fill:#dcfce7,stroke:#16a34a,color:#0f172a
+    classDef bg fill:#fee2e2,stroke:#dc2626,color:#0f172a
+    classDef gate fill:#f1f5f9,stroke:#475569,color:#0f172a
+
+    Main["main<br/>binary entry + handle_cli"]:::entry
+    CLI["cli::{repos, mcp,<br/>config, seed_dashboard}"]:::entry
+
+    Salsa["salsa<br/>rat-salsa event loop"]:::ui
+    App["app::App<br/>aggregate state"]:::ui
+    UI["ui<br/>render functions"]:::ui
+    Event["event::{keyboard,<br/>mouse, paste, layout}"]:::ui
+
+    Assembly["assembly<br/>reassemble work items"]:::core
+    CreateDialog["create_dialog<br/>CreateDialog, SetBranchDialog"]:::core
+    Session["session<br/>PTY session lifecycle"]:::core
+    WorkItem["work_item<br/>WorkItem types + enums"]:::core
+
+    AgentBackend["agent_backend<br/>AgentBackend trait +<br/>claude_code / codex / opencode"]:::svc
+    WorkItemBackend["work_item_backend<br/>WorkItemBackend trait +<br/>local_file / mock"]:::svc
+    WorktreeService["worktree_service<br/>WorktreeService trait +<br/>git_impl"]:::svc
+    GithubClient["github_client<br/>GithubClient trait +<br/>real (gh) / stub / mock"]:::svc
+    Config["config<br/>Config, FileConfigProvider,<br/>loader, operations"]:::svc
+    Mcp["mcp<br/>McpSocketServer, server,<br/>bridge"]:::svc
+
+    Fetcher["fetcher<br/>per-repo poller threads"]:::bg
+    Metrics["metrics<br/>dashboard aggregator"]:::bg
+
+    SideEffects["side_effects<br/>clipboard, clock, paths<br/>(#[cfg(not(test))] gate)"]:::gate
+
+    Main --> CLI
+    Main --> Salsa
+    CLI --> Config
+    Salsa --> App
+    Salsa --> UI
+    Salsa --> Event
+
+    Event --> App
+    UI --> App
+    App --> Assembly
+    App --> CreateDialog
+    App --> Session
+    App --> WorkItem
+
+    Assembly --> WorkItem
+    Assembly --> WorkItemBackend
+    App --> AgentBackend
+    App --> WorkItemBackend
+    App --> WorktreeService
+    App --> GithubClient
+    App --> Config
+    App --> Mcp
+    App --> Fetcher
+    App --> Metrics
+
+    Session --> AgentBackend
+    Session --> Mcp
+
+    Fetcher --> WorktreeService
+    Fetcher --> GithubClient
+
+    Metrics --> WorkItemBackend
+
+    WorktreeService --> SideEffects
+    GithubClient --> SideEffects
+    WorkItemBackend --> SideEffects
+    Config --> SideEffects
+    Metrics --> SideEffects
+```
+
+- **Entry and CLI (blue):** `main` parses argv, dispatches to the
+  appropriate `cli::*::handle_*_subcommand`, or falls through to the
+  TUI path.
+- **UI layer (purple):** `salsa` wires rat-salsa to the `App`
+  aggregate; `ui` owns pure render functions; `event` routes
+  keyboard, mouse, paste, and resize events back to `App`.
+- **Core (amber):** `assembly` merges persisted records with live
+  fetcher data into `WorkItem` values; `create_dialog` owns the
+  creation-modal and set-branch-modal state; `session` drives PTY
+  lifecycle for spawned harnesses.
+- **Services (green):** every external dependency is a trait with a
+  real implementation and a stub/mock. `agent_backend` isolates
+  harness CLI differences; `work_item_backend` persists records;
+  `worktree_service` wraps `git`; `github_client` wraps `gh`;
+  `config` loads `config.toml`; `mcp` serves per-session JSON-RPC
+  over a Unix socket.
+- **Background workers (red):** `fetcher` runs one polling thread
+  per registered repo and streams results via `mpsc`; `metrics` runs
+  a single aggregator thread and streams snapshots via
+  `crossbeam-channel`.
+- **Side-effects gate (slate):** every clipboard / clock / user-dirs
+  call routes through `side_effects::*`, which returns no-ops under
+  `#[cfg(test)]` so the test suite cannot write the developer's real
+  clipboard, read the system clock, or touch `$HOME`.
 
 ## Compatibility
 
