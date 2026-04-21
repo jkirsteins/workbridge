@@ -16,6 +16,16 @@
 # commit message. Nested files (e.g. src/side_effects/*.rs) are
 # intentionally out of scope.
 #
+# Why 700: at PR #136 it is roughly the 40th percentile of the
+# top-level `src/*.rs` line-count distribution (9 of 23 files fall
+# at or below it, and every larger file already carries an explicit
+# entry here). It is also small enough that a module at the ceiling
+# still fits on a reviewer's mental cache in one pass. The number is
+# a default, not a target: modules that have a principled reason to
+# grow past 700 are expected to declare an explicit entry with
+# rationale in the introducing commit, so this budget file becomes
+# the inventory of every exception rather than a hard wall.
+#
 # Note: the plan included a placeholder entry for "src/clipboard.rs"
 # at seed time. That file does not exist in the current tree (the
 # clipboard gate lives under src/side_effects/clipboard.rs which is

@@ -170,13 +170,10 @@ subsystem; that rule is enforced by review, not by the lint.
 
 `clippy::unwrap_used` / `clippy::expect_used` / `clippy::panic` are
 `deny` for production code and allowed for tests. The carve-out is
-implemented via CI's two-invocation pattern:
-
-```yaml
-- run: cargo clippy --bins --all-features -- -D warnings
-- run: cargo clippy --tests --all-features -- -D warnings \
-        -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
-```
+implemented via the two-invocation clippy pattern in
+`hooks/clippy-check.sh`, which is called from both `hooks/pre-commit`
+and `.github/workflows/ci.yml` so the `-A` flag set lives in exactly
+one place and cannot drift between hook and CI.
 
 No source-level `#[allow(...)]` attribute is introduced to implement
 this carve-out. The `clippy::allow_attributes` / `allow_attributes_without_reason`
@@ -185,13 +182,8 @@ pair is itself denied at the crate level to prevent regressions.
 ## Post-cleanup inventory
 
 After Phase D finished, the final `[lints]` matrix landed in
-`Cargo.toml` and both clippy invocations exit 0:
-
-```sh
-cargo clippy --bins --all-features -- -D warnings
-cargo clippy --tests --all-features -- -D warnings \
-    -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
-```
+`Cargo.toml` and `hooks/clippy-check.sh` (which runs both invocations
+of the two-invocation pattern) exits 0.
 
 The final lint-matrix disposition:
 

@@ -27,9 +27,11 @@ summary:
   `allow_attributes`, `allow_attributes_without_reason`,
   `broken_intra_doc_links`.
 - **Deny (production restriction lints):** `unwrap_used`, `expect_used`,
-  `panic`. Tests carve these out via the two-invocation CI pattern
-  (`cargo clippy --tests ... -- -A clippy::unwrap_used -A clippy::expect_used
-  -A clippy::panic`) rather than any source-level `#[allow]`.
+  `panic`. Tests carve these out via the two-invocation clippy pattern
+  implemented in `hooks/clippy-check.sh` (called from both pre-commit
+  and CI), rather than any source-level `#[allow]`. The script is the
+  single source of truth for the `-A` carve-out flag set; updating
+  the carve-out requires editing exactly one file.
 - **Warn (groups):** `rust_2018_idioms` (from `[lints.rust]`), `pedantic`,
   `nursery` (both from `[lints.clippy]`). CI promotes warnings to errors
   via `-D warnings`.
@@ -64,7 +66,13 @@ Rust:
   for the embedded terminal backend. Covered by unit and integration
   tests. The module opts out via a single file-level
   `#![expect(unsafe_code, reason = "...")]` attribute at the top of
-  `src/session.rs` (the entire file is the FFI boundary).
+  `src/session.rs` (the entire file is the FFI boundary). The
+  file-level `#![expect]` suppresses the `unsafe_code` lint across
+  the whole module; it does NOT relieve the per-block SAFETY comment
+  requirement described below. Every `unsafe { ... }` block still
+  needs its own preceding SAFETY comment, and reviewers must flag
+  any new block that lacks one even when the file-level attribute
+  would otherwise silence the lint.
 - `src/app.rs` - two `libc::killpg(pid, SIGKILL)` blocks: one in the
   rebase-gate drop path (`impl Drop for RebaseGateState`) and one in
   the subprocess cancellation helper (`run_cancellable`). Each
