@@ -172,7 +172,7 @@ flowchart LR
         Drawer["Global assistant drawer<br/>(Ctrl+G)"]
     end
 
-    subgraph Spawn["Spawn paths (src/app.rs)"]
+    subgraph Spawn["Spawn paths (App spawn_* methods)"]
         SS["spawn_session<br/>planning / implementing /<br/>review request"]
         SR["spawn_review_gate (read_only=true)<br/>spawn_rebase_gate (read_only=false)"]
         SG["spawn_global_session"]
@@ -184,7 +184,7 @@ flowchart LR
         GaSession["Global assistant session"]
     end
 
-    subgraph Mcp["MCP server (src/mcp.rs)"]
+    subgraph Mcp["MCP server (crate::mcp module)"]
         WiSock["Per-work-item socket"]
         GaSock["Global socket"]
     end
@@ -204,7 +204,7 @@ flowchart LR
     GaSock -- "workbridge_create_work_item<br/>becomes an McpEvent" --> State
 ```
 
-Per-session tool surface (see `src/mcp.rs` for the source of truth):
+Per-session tool surface (see the `crate::mcp` module for the source of truth):
 
 - **Interactive work-item session** and **rebase gate**: read-only
   `workbridge_get_context`, `workbridge_query_log`; mutating

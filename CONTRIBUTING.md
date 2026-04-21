@@ -61,23 +61,24 @@ by CI's `-D warnings`) rather than `forbid` because the crate has
 two legitimate unsafe surfaces that cannot be rewritten in safe
 Rust:
 
-- `src/session.rs` - PTY FFI (`libc::openpty`, `libc::dup`,
+- The `session` module - PTY FFI (`libc::openpty`, `libc::dup`,
   `libc::fcntl`, `libc::read`/`libc::write`, raw-fd construction)
   for the embedded terminal backend. Covered by unit and integration
   tests. The module opts out via a single file-level
   `#![expect(unsafe_code, reason = "...")]` attribute at the top of
-  `src/session.rs` (the entire file is the FFI boundary). The
+  the module (the entire module is the FFI boundary). The
   file-level `#![expect]` suppresses the `unsafe_code` lint across
   the whole module; it does NOT relieve the per-block SAFETY comment
   requirement described below. Every `unsafe { ... }` block still
   needs its own preceding SAFETY comment, and reviewers must flag
   any new block that lacks one even when the file-level attribute
   would otherwise silence the lint.
-- `src/app.rs` - two `libc::killpg(pid, SIGKILL)` blocks: one in the
-  rebase-gate drop path (`impl Drop for RebaseGateState`) and one in
-  the subprocess cancellation helper (`run_cancellable`). Each
-  enclosing function opts out via `#[expect(unsafe_code, reason =
-  "...")]` attached to the function, not to the unsafe block itself.
+- The `app` module tree - two `libc::killpg(pid, SIGKILL)` blocks:
+  one in the rebase-gate drop path (`impl Drop for RebaseGateState`)
+  and one in the subprocess cancellation helper (`run_cancellable`).
+  Each enclosing function opts out via `#[expect(unsafe_code, reason
+  = "...")]` attached to the function, not to the unsafe block
+  itself.
 
 Note that the opt-out uses `#[expect]`, NOT `#[allow]`, because
 `clippy::allow_attributes` is denied crate-wide so that no
