@@ -60,21 +60,21 @@ pub fn handle_key_board(app: &mut App, key: KeyEvent) {
         }
         // Shift+Right - advance stage
         (KeyModifiers::SHIFT, KeyCode::Right) => {
-            let had_status = app.status_message.is_some();
+            let had_status = app.shell.status_message.is_some();
             // Sync selected_work_item so sync_board_cursor can follow the item
             // to its new column after the stage change.
             app.sync_selection_from_board();
             app.advance_stage();
-            if app.status_message.is_some() != had_status {
+            if app.shell.status_message.is_some() != had_status {
                 sync_layout(app);
             }
         }
         // Shift+Left - retreat stage
         (KeyModifiers::SHIFT, KeyCode::Left) => {
-            let had_status = app.status_message.is_some();
+            let had_status = app.shell.status_message.is_some();
             app.sync_selection_from_board();
             app.retreat_stage();
-            if app.status_message.is_some() != had_status {
+            if app.shell.status_message.is_some() != had_status {
                 sync_layout(app);
             }
         }
@@ -90,11 +90,12 @@ pub fn handle_key_board(app: &mut App, key: KeyEvent) {
         // Q/q/Ctrl+Q - quit with confirmation
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('q' | 'Q'))
         | (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
-            if !app.has_any_session() || app.confirm_quit {
-                app.should_quit = true;
+            if !app.has_any_session() || app.shell.confirm_quit {
+                app.shell.should_quit = true;
             } else {
-                app.confirm_quit = true;
-                app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                app.shell.confirm_quit = true;
+                app.shell.status_message =
+                    Some("Press Q again to quit and kill all sessions".into());
                 sync_layout(app);
             }
         }
@@ -111,10 +112,11 @@ pub fn handle_key_board(app: &mut App, key: KeyEvent) {
                     .map(|r| r.path.clone())
                     .collect();
                 app.create_dialog.open_quickstart(&active_repos);
-                app.status_message = Some("Multiple repos - select one and press Enter".into());
+                app.shell.status_message =
+                    Some("Multiple repos - select one and press Enter".into());
             }
             Err(msg) => {
-                app.status_message = Some(msg);
+                app.shell.status_message = Some(msg);
             }
         },
         // Ctrl+B - open the new backlog ticket creation dialog
@@ -169,11 +171,12 @@ pub fn handle_key_dashboard(app: &mut App, key: KeyEvent) {
         // Q/q/Ctrl+Q - quit with confirmation (mirrors handle_key_board).
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('q' | 'Q'))
         | (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
-            if !app.has_any_session() || app.confirm_quit {
-                app.should_quit = true;
+            if !app.has_any_session() || app.shell.confirm_quit {
+                app.shell.should_quit = true;
             } else {
-                app.confirm_quit = true;
-                app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                app.shell.confirm_quit = true;
+                app.shell.status_message =
+                    Some("Press Q again to quit and kill all sessions".into());
                 sync_layout(app);
             }
         }
@@ -193,12 +196,13 @@ pub fn handle_key_left(app: &mut App, key: KeyEvent) {
         | (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
             if !app.has_any_session() {
                 // No live sessions to lose - quit immediately.
-                app.should_quit = true;
-            } else if app.confirm_quit {
-                app.should_quit = true;
+                app.shell.should_quit = true;
+            } else if app.shell.confirm_quit {
+                app.shell.should_quit = true;
             } else {
-                app.confirm_quit = true;
-                app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                app.shell.confirm_quit = true;
+                app.shell.status_message =
+                    Some("Press Q again to quit and kill all sessions".into());
                 sync_layout(app);
             }
         }
@@ -215,10 +219,11 @@ pub fn handle_key_left(app: &mut App, key: KeyEvent) {
                     .map(|r| r.path.clone())
                     .collect();
                 app.create_dialog.open_quickstart(&active_repos);
-                app.status_message = Some("Multiple repos - select one and press Enter".into());
+                app.shell.status_message =
+                    Some("Multiple repos - select one and press Enter".into());
             }
             Err(msg) => {
-                app.status_message = Some(msg);
+                app.shell.status_message = Some(msg);
             }
         },
         // Ctrl+B - open the new backlog ticket creation dialog
@@ -300,7 +305,7 @@ pub fn handle_key_left(app: &mut App, key: KeyEvent) {
                 }
                 DisplayEntry::ReviewRequestItem(_) => {
                     app.import_selected_review_request();
-                    if app.status_message.is_some() != had_status {
+                    if app.shell.status_message.is_some() != had_status {
                         sync_layout(app);
                     }
                 }
@@ -445,16 +450,17 @@ pub fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
             if let Some(entry) = app.active_session_entry() {
                 if !entry.alive {
                     app.flush_pty_buffers();
-                    app.focus = FocusPanel::Left;
-                    app.status_message = Some("Session has ended - returned to work items".into());
+                    app.shell.focus = FocusPanel::Left;
+                    app.shell.status_message =
+                        Some("Session has ended - returned to work items".into());
                     sync_layout(app);
                     return true;
                 }
             } else {
                 // No session for this work item - return to left panel.
                 app.flush_pty_buffers();
-                app.focus = FocusPanel::Left;
-                app.status_message = None;
+                app.shell.focus = FocusPanel::Left;
+                app.shell.status_message = None;
                 sync_layout(app);
                 return true;
             }
@@ -463,8 +469,8 @@ pub fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
             if let Some(entry) = app.active_terminal_entry() {
                 if !entry.alive {
                     app.flush_pty_buffers();
-                    app.focus = FocusPanel::Left;
-                    app.status_message =
+                    app.shell.focus = FocusPanel::Left;
+                    app.shell.status_message =
                         Some("Terminal session has ended - returned to work items".into());
                     sync_layout(app);
                     return true;
@@ -472,8 +478,8 @@ pub fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
             } else {
                 // No terminal session yet - return to left panel.
                 app.flush_pty_buffers();
-                app.focus = FocusPanel::Left;
-                app.status_message = None;
+                app.shell.focus = FocusPanel::Left;
+                app.shell.status_message = None;
                 sync_layout(app);
                 return true;
             }
@@ -491,8 +497,8 @@ pub fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
             if key.modifiers.contains(KeyModifiers::CONTROL) && is_ctrl_symbol_char(c, ']') =>
         {
             app.flush_pty_buffers();
-            app.focus = FocusPanel::Left;
-            app.status_message = None;
+            app.shell.focus = FocusPanel::Left;
+            app.shell.status_message = None;
             // If returning from board drill-down, restore the full board view.
             if app.board_drill_down {
                 app.board_drill_down = false;

@@ -57,7 +57,7 @@ fn poll_review_request_merges_merged_advances_to_done_and_clears_watch() {
         "stale poll error should be cleared on success"
     );
 
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("Review request PR merged externally") && msg.contains("[DN]"),
         "status message should reflect external review-request merge, got: {msg}"
@@ -225,7 +225,7 @@ fn poll_review_request_merges_closed_does_not_transition() {
         "watch must remain after CLOSED so retry is possible"
     );
 
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("closed without merging") && msg.contains("Ctrl+D"),
         "should warn about closed-without-merge, got: {msg}"
@@ -328,7 +328,7 @@ fn poll_review_request_merges_discards_result_when_item_moved_away() {
         !app.review_request_merge_poll_errors.contains_key(&rec_id),
         "stale error for a vanished item should be cleared"
     );
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         !msg.contains("Review request PR merged externally"),
         "no spurious transition message should be set, got: {msg}"
@@ -528,6 +528,7 @@ fn harness_choice_applied_to_rebase_gate_spawn() {
         branch: "feature/r".to_string(),
     });
     let msg = app
+        .shell
         .status_message
         .clone()
         .expect("no-harness abort must surface a status message");
@@ -546,13 +547,13 @@ fn harness_choice_applied_to_rebase_gate_spawn() {
     // but they fire after the harness check).
     app.harness_choice
         .insert(wi_id.clone(), AgentBackendKind::Codex);
-    app.status_message = None;
+    app.shell.status_message = None;
     app.spawn_rebase_gate(RebaseTarget {
         wi_id: wi_id.clone(),
         worktree_path: repo.join(".worktrees/feature/r"),
         branch: "feature/r".to_string(),
     });
-    let post_msg = app.status_message.clone().unwrap_or_default();
+    let post_msg = app.shell.status_message.clone().unwrap_or_default();
     assert!(
         !post_msg.contains("no harness chosen"),
         "with a chosen harness, the abort reason must not appear, got: {post_msg}"

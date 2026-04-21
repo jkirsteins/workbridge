@@ -32,8 +32,8 @@ pub fn handle_global_drawer_key(app: &mut App, key: KeyEvent) -> bool {
     // close the drawer rather than forwarding to a defunct PTY.
     if app.global_session.as_ref().is_none_or(|s| !s.alive) {
         app.global_drawer_open = false;
-        app.focus = app.pre_drawer_focus;
-        app.status_message = Some("Global assistant session ended".into());
+        app.shell.focus = app.pre_drawer_focus;
+        app.shell.status_message = Some("Global assistant session ended".into());
         sync_layout(app);
         return true;
     }
@@ -49,7 +49,7 @@ pub fn handle_global_drawer_key(app: &mut App, key: KeyEvent) -> bool {
             if key.modifiers.contains(KeyModifiers::CONTROL) && is_ctrl_symbol_char(c, ']') =>
         {
             app.global_drawer_open = false;
-            app.focus = app.pre_drawer_focus;
+            app.shell.focus = app.pre_drawer_focus;
             return true;
         }
         // Forward all other keys to the global session PTY via buffer.

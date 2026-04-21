@@ -453,7 +453,7 @@ fn create_work_item_with_rejects_repos_without_git_dir() {
     assert!(result.is_ok(), "create should succeed for valid repos");
 
     // The status message should indicate success.
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("Created"),
         "expected success message, got: {msg}",

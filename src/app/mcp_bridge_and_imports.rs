@@ -45,7 +45,7 @@ impl super::App {
                         "Review" => WorkItemStatus::Review,
                         "Done" => WorkItemStatus::Done,
                         other => {
-                            self.status_message =
+                            self.shell.status_message =
                                 Some(format!("MCP: unrecognized status '{other}'"));
                             continue;
                         }
@@ -55,7 +55,8 @@ impl super::App {
                     let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
                         Ok(id) => id,
                         Err(e) => {
-                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            self.shell.status_message =
+                                Some(format!("MCP: invalid work item ID: {e}"));
                             continue;
                         }
                     };
@@ -64,7 +65,7 @@ impl super::App {
                     // which is user-initiated. Allowing MCP to set Done would
                     // bypass both the review gate and the merge gate.
                     if new_status == WorkItemStatus::Done {
-                        self.status_message =
+                        self.shell.status_message =
                             Some("MCP: cannot set Done directly (use the merge gate)".into());
                         continue;
                     }
@@ -75,14 +76,15 @@ impl super::App {
                     // Block transitions on derived statuses (e.g. merged PR -> Done)
                     // to prevent backend/display divergence, mirroring advance/retreat_stage.
                     if wi_ref.is_some_and(|w| w.status_derived) {
-                        self.status_message = Some("MCP: status is derived from merged PR".into());
+                        self.shell.status_message =
+                            Some("MCP: status is derived from merged PR".into());
                         continue;
                     }
 
                     // Block all MCP transitions for review request items.
                     // Claude sessions should not drive workflow for someone else's PR.
                     if wi_ref.is_some_and(|w| w.kind == WorkItemKind::ReviewRequest) {
-                        self.status_message = Some(
+                        self.shell.status_message = Some(
                             "MCP: status transitions not supported for review request items".into(),
                         );
                         continue;
@@ -107,7 +109,7 @@ impl super::App {
                             )
                     );
                     if !allowed {
-                        self.status_message = Some(format!(
+                        self.shell.status_message = Some(format!(
                             "MCP: transition from {} to {} is not allowed",
                             current_status.map_or("unknown", |s| s.badge_text()),
                             new_status.badge_text()
@@ -151,11 +153,11 @@ impl super::App {
                     {
                         match self.spawn_review_gate(&wi_id, ReviewGateOrigin::Mcp) {
                             ReviewGateSpawn::Spawned => {
-                                self.status_message =
+                                self.shell.status_message =
                                     Some("Claude requested Review - running review gate...".into());
                             }
                             ReviewGateSpawn::Blocked(reason) => {
-                                self.status_message = Some(reason);
+                                self.shell.status_message = Some(reason);
                             }
                         }
                         continue;
@@ -172,7 +174,7 @@ impl super::App {
 
                     // Build MCP-specific status message that preserves any
                     // detail from apply_stage_change (e.g. "PR created: URL").
-                    let existing = self.status_message.take().unwrap_or_default();
+                    let existing = self.shell.status_message.take().unwrap_or_default();
                     let pr_suffix = if existing.contains("PR created") {
                         // Extract the PR info portion after the dash.
                         existing
@@ -187,7 +189,7 @@ impl super::App {
                     } else {
                         format!(" - {reason}")
                     };
-                    self.status_message = Some(format!(
+                    self.shell.status_message = Some(format!(
                         "Claude moved to {}{}{}",
                         new_status.badge_text(),
                         pr_suffix,
@@ -202,7 +204,8 @@ impl super::App {
                     let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
                         Ok(id) => id,
                         Err(e) => {
-                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            self.shell.status_message =
+                                Some(format!("MCP: invalid work item ID: {e}"));
                             continue;
                         }
                     };
@@ -212,7 +215,7 @@ impl super::App {
                         payload,
                     };
                     if let Err(e) = self.services.backend.append_activity(&wi_id, &entry) {
-                        self.status_message = Some(format!("Activity log error: {e}"));
+                        self.shell.status_message = Some(format!("Activity log error: {e}"));
                     }
                 }
                 McpEvent::SetPlan {
@@ -222,12 +225,13 @@ impl super::App {
                     let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
                         Ok(id) => id,
                         Err(e) => {
-                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            self.shell.status_message =
+                                Some(format!("MCP: invalid work item ID: {e}"));
                             continue;
                         }
                     };
                     if let Err(e) = self.services.backend.update_plan(&wi_id, &plan) {
-                        self.status_message = Some(format!("Plan update error: {e}"));
+                        self.shell.status_message = Some(format!("Plan update error: {e}"));
                     } else {
                         // Log the plan set event to the activity log.
                         let entry = ActivityEntry {
@@ -239,9 +243,9 @@ impl super::App {
                             }),
                         };
                         if let Err(e) = self.services.backend.append_activity(&wi_id, &entry) {
-                            self.status_message = Some(format!("Activity log error: {e}"));
+                            self.shell.status_message = Some(format!("Activity log error: {e}"));
                         } else {
-                            self.status_message = Some("Plan saved by Claude".to_string());
+                            self.shell.status_message = Some("Plan saved by Claude".to_string());
                         }
 
                         // Auto-advance from Planning to Implementing when plan is set.
@@ -259,7 +263,7 @@ impl super::App {
                             }
                             Ok(_) => {}
                             Err(e) => {
-                                self.status_message =
+                                self.shell.status_message =
                                     Some(format!("Plan saved but could not verify status: {e}"));
                             }
                         }
@@ -272,12 +276,13 @@ impl super::App {
                     let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
                         Ok(id) => id,
                         Err(e) => {
-                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            self.shell.status_message =
+                                Some(format!("MCP: invalid work item ID: {e}"));
                             continue;
                         }
                     };
                     if let Err(e) = self.services.backend.update_title(&wi_id, &title) {
-                        self.status_message = Some(format!("Title update error: {e}"));
+                        self.shell.status_message = Some(format!("Title update error: {e}"));
                     } else {
                         self.reassemble_work_items();
                         self.build_display_list();
@@ -290,7 +295,8 @@ impl super::App {
                     let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
                         Ok(id) => id,
                         Err(e) => {
-                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            self.shell.status_message =
+                                Some(format!("MCP: invalid work item ID: {e}"));
                             continue;
                         }
                     };
@@ -306,7 +312,8 @@ impl super::App {
                     let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
                         Ok(id) => id,
                         Err(e) => {
-                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            self.shell.status_message =
+                                Some(format!("MCP: invalid work item ID: {e}"));
                             continue;
                         }
                     };
@@ -358,7 +365,7 @@ impl super::App {
                     if let Err(e) =
                         self.delete_work_item_by_id(&wi_id, &mut warnings, &mut orphan_worktrees)
                     {
-                        self.status_message = Some(format!("MCP delete error: {e}"));
+                        self.shell.status_message = Some(format!("MCP delete error: {e}"));
                         continue;
                     }
 
@@ -428,12 +435,12 @@ impl super::App {
                     }
                     self.sync_selection_identity();
 
-                    self.focus = FocusPanel::Left;
+                    self.shell.focus = FocusPanel::Left;
                     if warnings.is_empty() {
-                        self.status_message =
+                        self.shell.status_message =
                             Some("Work item deleted via MCP (resource cleanup in progress)".into());
                     } else {
-                        self.status_message = Some(format!(
+                        self.shell.status_message = Some(format!(
                             "Deleted via MCP (with warnings: {})",
                             warnings.join("; ")
                         ));
@@ -447,18 +454,19 @@ impl super::App {
                     let wi_id = match serde_json::from_str::<WorkItemId>(&wi_id_str) {
                         Ok(id) => id,
                         Err(e) => {
-                            self.status_message = Some(format!("MCP: invalid work item ID: {e}"));
+                            self.shell.status_message =
+                                Some(format!("MCP: invalid work item ID: {e}"));
                             continue;
                         }
                     };
                     let wi = self.work_items.iter().find(|w| w.id == wi_id);
                     if !wi.is_some_and(|w| w.kind == WorkItemKind::ReviewRequest) {
-                        self.status_message =
+                        self.shell.status_message =
                             Some("MCP: review tools only work on review request items".into());
                         continue;
                     }
                     if !wi.is_some_and(|w| w.status == WorkItemStatus::Review) {
-                        self.status_message =
+                        self.shell.status_message =
                             Some("MCP: review request is not in Review status".into());
                         continue;
                     }
@@ -487,7 +495,7 @@ impl super::App {
                         .iter()
                         .any(|r| r.path == repo && r.git_dir_present);
                     if !repo_valid {
-                        self.status_message = Some(format!(
+                        self.shell.status_message = Some(format!(
                             "MCP: repo '{repo_path}' not found or has no git dir"
                         ));
                         continue;
@@ -519,12 +527,12 @@ impl super::App {
 
                             // Close the global drawer and spawn the planning session.
                             self.global_drawer_open = false;
-                            self.focus = self.pre_drawer_focus;
+                            self.shell.focus = self.pre_drawer_focus;
                             self.spawn_session(&wi_id);
-                            self.status_message = Some(format!("Created work item: {title}"));
+                            self.shell.status_message = Some(format!("Created work item: {title}"));
                         }
                         Err(e) => {
-                            self.status_message =
+                            self.shell.status_message =
                                 Some(format!("MCP: failed to create work item: {e}"));
                         }
                     }
@@ -563,7 +571,7 @@ impl super::App {
                 self.spawn_import_worktree(wi_id, repo_path, branch, title);
             }
             Err(e) => {
-                self.status_message = Some(format!("Import error: {e}"));
+                self.shell.status_message = Some(format!("Import error: {e}"));
             }
         }
     }
@@ -598,7 +606,7 @@ impl super::App {
                 self.spawn_import_worktree(wi_id, repo_path, branch, title);
             }
             Err(e) => {
-                self.status_message = Some(format!("Import error: {e}"));
+                self.shell.status_message = Some(format!("Import error: {e}"));
             }
         }
     }

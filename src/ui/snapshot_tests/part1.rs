@@ -7,7 +7,7 @@ fn empty_app_default_view() {
 #[test]
 fn empty_app_with_status_message() {
     let mut app = App::new();
-    app.status_message = Some("Press Ctrl+N to create a work item".to_string());
+    app.shell.status_message = Some("Press Ctrl+N to create a work item".to_string());
     insta::assert_snapshot!(render(&mut app, 80, 24));
 }
 
@@ -335,7 +335,7 @@ fn right_panel_focused_with_session() {
     )];
     let mut app = app_with_items(items, vec![]);
     app.selected_item = app.display_list.iter().position(is_selectable);
-    app.focus = FocusPanel::Right;
+    app.shell.focus = FocusPanel::Right;
     insta::assert_snapshot!(render(&mut app, 80, 24));
 }
 
@@ -380,7 +380,7 @@ fn work_item_context_bar_with_status() {
     });
     let mut app = app_with_items(vec![wi], vec![]);
     app.selected_item = app.display_list.iter().position(is_selectable);
-    app.status_message = Some("Right panel focused - press Ctrl+] to return".into());
+    app.shell.status_message = Some("Right panel focused - press Ctrl+] to return".into());
     insta::assert_snapshot!(render(&mut app, 80, 24));
 }
 
@@ -395,7 +395,7 @@ fn activity_indicator_overrides_status_message() {
     )];
     let mut app = app_with_items(items, vec![]);
     app.selected_item = app.display_list.iter().position(is_selectable);
-    app.status_message = Some("This should be hidden".into());
+    app.shell.status_message = Some("This should be hidden".into());
     app.activities.start("Creating pull request...");
     app.activities.spinner_tick = 3; // Pick a specific frame for deterministic snapshot.
     insta::assert_snapshot!(render(&mut app, 80, 24));

@@ -149,7 +149,7 @@ impl super::App {
             if disconnected {
                 // Thread exited without sending a Result - treat as gate error.
                 self.drop_review_gate(&wi_id);
-                self.status_message =
+                self.shell.status_message =
                     Some("Review gate: background thread exited unexpectedly".into());
                 continue;
             }
@@ -194,13 +194,13 @@ impl super::App {
                         // Preserve master's non-destructive behaviour: the
                         // user's session is still the primary workspace,
                         // so just surface the reason.
-                        self.status_message =
+                        self.shell.status_message =
                             Some(format!("Review gate failed to start: {reason}"));
                         continue;
                     }
                     ReviewGateOrigin::Mcp | ReviewGateOrigin::Auto => {
                         self.rework_reasons.insert(wi_id.clone(), reason.clone());
-                        self.status_message =
+                        self.shell.status_message =
                             Some(format!("Review gate failed to start: {reason}"));
 
                         // If Blocked, transition to Implementing so the
@@ -268,7 +268,7 @@ impl super::App {
                     }),
                 };
                 if let Err(e) = self.services.backend.append_activity(&wi_id, &entry) {
-                    self.status_message = Some(format!("Activity log error: {e}"));
+                    self.shell.status_message = Some(format!("Activity log error: {e}"));
                 }
 
                 // Store the gate's assessment so the Review session can present
@@ -300,14 +300,15 @@ impl super::App {
                     }),
                 };
                 if let Err(e) = self.services.backend.append_activity(&wi_id, &entry) {
-                    self.status_message = Some(format!("Activity log error: {e}"));
+                    self.shell.status_message = Some(format!("Activity log error: {e}"));
                 }
                 // Store the rejection reason so the next Claude session uses the
                 // implementing_rework prompt with specific feedback, rather than
                 // a generic implementing prompt.
                 self.rework_reasons
                     .insert(wi_id.clone(), result.detail.clone());
-                self.status_message = Some(format!("Review gate rejected: {}", result.detail));
+                self.shell.status_message =
+                    Some(format!("Review gate rejected: {}", result.detail));
 
                 // If Blocked, transition to Implementing so the implementing_rework
                 // prompt (which has {rework_reason}) is used instead of the "blocked"
@@ -397,7 +398,7 @@ impl super::App {
 
             if disconnected && result.is_none() {
                 self.drop_rebase_gate(&wi_id);
-                self.status_message =
+                self.shell.status_message =
                     Some("Rebase gate: background thread exited unexpectedly".into());
                 continue;
             }
@@ -447,7 +448,7 @@ impl super::App {
                 use std::fmt::Write as _;
                 let _ = write!(status_message, " (activity log error: {err})");
             }
-            self.status_message = Some(status_message);
+            self.shell.status_message = Some(status_message);
         }
     }
 
@@ -486,7 +487,7 @@ impl super::App {
             // Close drawer, restore previous focus, and tear down the
             // session so the next open starts from a blank slate.
             self.global_drawer_open = false;
-            self.focus = self.pre_drawer_focus;
+            self.shell.focus = self.pre_drawer_focus;
             self.teardown_global_session();
         } else {
             // Open drawer. Defensively tear down any lingering session
@@ -496,7 +497,7 @@ impl super::App {
             // time so the user always sees an empty PTY with no prior
             // conversation or scrollback.
             self.teardown_global_session();
-            self.pre_drawer_focus = self.focus;
+            self.pre_drawer_focus = self.shell.focus;
             self.global_drawer_open = true;
             self.spawn_global_session();
         }

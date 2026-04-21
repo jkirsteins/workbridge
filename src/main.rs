@@ -104,11 +104,11 @@ fn main() -> Result<(), AppError> {
     }
     // Surface config/backend load errors in the TUI status bar so the user sees them.
     if let Some(msg) = config_error {
-        app.status_message = Some(msg);
+        app.shell.status_message = Some(msg);
     } else if let Some(msg) = backend_error {
-        app.status_message = Some(msg);
+        app.shell.status_message = Some(msg);
     } else if !app.gh_available {
-        app.status_message =
+        app.shell.status_message =
             Some("Warning: 'gh' CLI not found. PR creation and merge features require it.".into());
     }
 
@@ -122,8 +122,8 @@ fn main() -> Result<(), AppError> {
         app.services.config.defaults.branch_issue_pattern = String::new();
         let msg = format!("Invalid branch_issue_pattern '{bad}': {e} (issue extraction disabled)");
         // Only overwrite if no higher-priority error is already shown.
-        if app.status_message.is_none() {
-            app.status_message = Some(msg);
+        if app.shell.status_message.is_none() {
+            app.shell.status_message = Some(msg);
         } else {
             app.pending_fetch_errors.push(msg);
         }

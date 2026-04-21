@@ -168,7 +168,7 @@ impl super::App {
         };
         let Ok(result) = recv_result else {
             self.end_user_action(&UserActionKey::WorktreeCreate);
-            self.status_message =
+            self.shell.status_message =
                 Some("Worktree creation: background thread exited unexpectedly".into());
             return;
         };
@@ -193,7 +193,7 @@ impl super::App {
                         // ran - we do NOT own it, so we must not force-remove
                         // it here. Surface a status message so the user can
                         // clean up manually if needed.
-                        self.status_message = Some(
+                        self.shell.status_message = Some(
                             "Work item deleted while creating worktree; pre-existing worktree left in place"
                                 .into(),
                         );
@@ -209,7 +209,7 @@ impl super::App {
                         path.clone(),
                         result.branch.clone(),
                     );
-                    self.status_message = Some(
+                    self.shell.status_message = Some(
                         "Worktree created but work item was deleted - cleaning up in background"
                             .into(),
                     );
@@ -226,7 +226,7 @@ impl super::App {
                     // filesystem I/O back on the UI thread.
                     self.begin_session_open(&result.wi_id, &path);
                 } else {
-                    self.status_message = Some("Imported (worktree created)".into());
+                    self.shell.status_message = Some("Imported (worktree created)".into());
                 }
             }
             (None, Some(error)) => {
@@ -252,13 +252,14 @@ impl super::App {
                     if result.open_session {
                         self.alert_message = Some(error);
                     } else {
-                        self.status_message = Some(error);
+                        self.shell.status_message = Some(error);
                     }
                 }
             }
             (None, None) => {
                 // Unexpected - no path and no error.
-                self.status_message = Some("Worktree creation completed with no result".into());
+                self.shell.status_message =
+                    Some("Worktree creation completed with no result".into());
             }
         }
     }
@@ -301,7 +302,7 @@ impl super::App {
             .is_none()
         {
             self.clear_stale_recovery();
-            self.status_message = Some("Worktree operation already in progress...".into());
+            self.shell.status_message = Some("Worktree operation already in progress...".into());
             return;
         }
 

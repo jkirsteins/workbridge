@@ -60,7 +60,7 @@ impl super::App {
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone())
         else {
-            self.status_message = Some(
+            self.shell.status_message = Some(
                 "PR creation skipped: GitHub remote not yet cached (waiting for next fetch)".into(),
             );
             return;
@@ -262,7 +262,8 @@ impl super::App {
         };
         let Ok(result) = recv_result else {
             self.end_user_action(&UserActionKey::PrCreate);
-            self.status_message = Some("PR creation: background thread exited unexpectedly".into());
+            self.shell.status_message =
+                Some("PR creation: background thread exited unexpectedly".into());
             // Try next pending PR creation despite the failure.
             // Skip items that were deleted or retreated from Review.
             while let Some(next_id) = self.pr_create_pending.pop_front() {
@@ -292,15 +293,15 @@ impl super::App {
                 .backend
                 .append_activity(&result.wi_id, &log_entry)
             {
-                self.status_message = Some(format!("Activity log error: {e}"));
+                self.shell.status_message = Some(format!("Activity log error: {e}"));
             }
         }
 
         // Update status message.
         if let Some(info) = result.info {
-            self.status_message = Some(info);
+            self.shell.status_message = Some(info);
         } else if let Some(error) = result.error {
-            self.status_message = Some(error);
+            self.shell.status_message = Some(error);
         }
 
         // Drain the pending queue: spawn the next queued PR creation if any.

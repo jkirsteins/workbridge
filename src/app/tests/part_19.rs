@@ -90,7 +90,7 @@ fn stage_transition_without_harness_choice_surfaces_error() {
                 panic!(
                     "abort must surface a user-visible toast; toasts were {all_toasts:?}, \
                  status_message: {:?}",
-                    app.status_message
+                    app.shell.status_message
                 )
             },
             |t| t.text.clone(),
@@ -207,7 +207,7 @@ fn spawn_orphan_worktree_cleanup_surfaces_failures_via_status_message() {
 
     // Drain any pre-existing status message so the assertion
     // below is unambiguous.
-    app.status_message = None;
+    app.shell.status_message = None;
 
     app.spawn_orphan_worktree_cleanup(
         PathBuf::from("/tmp/codex-orphan-repo"),
@@ -247,6 +247,7 @@ fn spawn_orphan_worktree_cleanup_surfaces_failures_via_status_message() {
     app.poll_orphan_cleanup_finished();
 
     let msg = app
+        .shell
         .status_message
         .as_ref()
         .expect("poll_orphan_cleanup_finished must surface a status message");
@@ -279,12 +280,12 @@ fn poll_orphan_cleanup_finished_is_silent_on_idle_channel() {
         Arc::new(StubWorktreeService),
         Box::new(crate::config::InMemoryConfigProvider::new()),
     );
-    app.status_message = Some("unrelated status message".into());
+    app.shell.status_message = Some("unrelated status message".into());
 
     app.poll_orphan_cleanup_finished();
 
     assert_eq!(
-        app.status_message.as_deref(),
+        app.shell.status_message.as_deref(),
         Some("unrelated status message"),
         "empty completion channel must not clobber unrelated status messages",
     );
@@ -303,7 +304,7 @@ fn spawn_orphan_worktree_cleanup_ends_activity_on_success() {
         Arc::new(StubWorktreeService),
         Box::new(crate::config::InMemoryConfigProvider::new()),
     );
-    app.status_message = None;
+    app.shell.status_message = None;
 
     app.spawn_orphan_worktree_cleanup(
         PathBuf::from("/tmp/orphan-success-repo"),
@@ -345,9 +346,9 @@ fn spawn_orphan_worktree_cleanup_ends_activity_on_success() {
         "poll_orphan_cleanup_finished must end the spawned activity on success",
     );
     assert!(
-        app.status_message.is_none(),
+        app.shell.status_message.is_none(),
         "successful orphan cleanup must not set status_message, got {:?}",
-        app.status_message,
+        app.shell.status_message,
     );
 }
 

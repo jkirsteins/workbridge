@@ -120,10 +120,7 @@ impl super::App {
         };
         let mut app = Self {
             services,
-            should_quit: false,
-            focus: FocusPanel::Left,
-            status_message: None,
-            confirm_quit: false,
+            shell: Shell::new(),
             delete_prompt_visible: false,
             delete_target_wi_id: None,
             delete_target_title: None,
@@ -152,10 +149,6 @@ impl super::App {
             stale_recovery_in_progress: false,
             no_plan_prompt_visible: false,
             no_plan_prompt_queue: VecDeque::new(),
-            shutting_down: false,
-            shutdown_started: None,
-            pane_cols: 80,
-            pane_rows: 24,
             show_settings: false,
             active_repo_cache,
             settings_repo_selected: 0,
@@ -256,7 +249,7 @@ impl super::App {
     /// subsystems (shell-level `status_message` + activities queue).
     #[must_use]
     pub const fn has_visible_status_bar(&self) -> bool {
-        self.status_message.is_some() || !self.activities.entries.is_empty()
+        self.shell.status_message.is_some() || !self.activities.entries.is_empty()
     }
 
     // -- User action guard API --
@@ -513,7 +506,7 @@ impl super::App {
             .min(self.active_repo_cache.len().saturating_sub(1));
         let entry = &self.active_repo_cache[idx];
         if entry.source == RepoSource::Explicit {
-            self.status_message =
+            self.shell.status_message =
                 Some("Explicit repos cannot be unmanaged (use 'repos remove')".into());
             return;
         }
@@ -522,10 +515,10 @@ impl super::App {
         if let Err(e) = self.services.config_provider.save(&self.services.config) {
             // Rollback: re-add the inclusion since save failed.
             self.services.config.include_repo(&path);
-            self.status_message = Some(format!("Error saving config: {e}"));
+            self.shell.status_message = Some(format!("Error saving config: {e}"));
             return;
         }
-        self.status_message = Some(format!("Unmanaged: {path}"));
+        self.shell.status_message = Some(format!("Unmanaged: {path}"));
         self.fetcher_repos_changed = true;
         self.refresh_repo_cache();
         // Adjust cursor if it went past the end.
@@ -554,10 +547,10 @@ impl super::App {
         if let Err(e) = self.services.config_provider.save(&self.services.config) {
             // Rollback: remove the inclusion since save failed.
             self.services.config.uninclude_repo(&path);
-            self.status_message = Some(format!("Error saving config: {e}"));
+            self.shell.status_message = Some(format!("Error saving config: {e}"));
             return;
         }
-        self.status_message = Some(format!("Managed: {path}"));
+        self.shell.status_message = Some(format!("Managed: {path}"));
         self.fetcher_repos_changed = true;
         self.refresh_repo_cache();
         // Adjust cursor if it went past the end.

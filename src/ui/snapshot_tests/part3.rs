@@ -531,7 +531,7 @@
         let mut app = app_with_items(items, vec![]);
         app.view_mode = ViewMode::Board;
         app.sync_board_cursor();
-        app.status_message = Some("Item moved to Planning".to_string());
+        app.shell.status_message = Some("Item moved to Planning".to_string());
         insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 

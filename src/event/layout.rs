@@ -7,8 +7,8 @@ pub fn handle_resize(app: &mut App, cols: u16, rows: u16) {
     let bottom_rows = u16::from(app.has_visible_status_bar())
         + u16::from(app.selected_work_item_context().is_some());
     let pl = layout::compute(cols, rows, bottom_rows);
-    app.pane_cols = pl.pane_cols;
-    app.pane_rows = pl.pane_rows;
+    app.shell.pane_cols = pl.pane_cols;
+    app.shell.pane_rows = pl.pane_rows;
 
     // Compute global drawer PTY dimensions via shared helper.
     let dl = layout::compute_drawer(cols, rows);

@@ -126,7 +126,7 @@ pub fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rec
     // overlay is the clear focal point.
     let border_style = if app.show_settings {
         theme.style_border_unfocused()
-    } else if app.focus == FocusPanel::Left {
+    } else if app.shell.focus == FocusPanel::Left {
         theme.style_border_focused()
     } else {
         theme.style_border_unfocused()

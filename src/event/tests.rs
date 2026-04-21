@@ -44,7 +44,7 @@ fn create_dialog_closed_during_shutdown() {
     assert!(app.create_dialog.visible, "dialog should be open");
 
     // Begin shutdown.
-    app.shutting_down = true;
+    app.shell.shutting_down = true;
 
     // Send a key event (anything, e.g. Enter). handle_key should close
     // the dialog and ignore the key.
@@ -61,7 +61,7 @@ fn create_dialog_closed_during_shutdown() {
 #[test]
 fn ctrl_n_blocked_during_shutdown() {
     let mut app = App::new();
-    app.shutting_down = true;
+    app.shell.shutting_down = true;
 
     let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
     handle_key(&mut app, ctrl_n);
@@ -80,7 +80,7 @@ fn merge_prompt_esc_cancels() {
     app.merge_wi_id = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
         "/tmp/test.json",
     )));
-    app.status_message = Some("Merge prompt".into());
+    app.shell.status_message = Some("Merge prompt".into());
 
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(&mut app, esc);
@@ -88,7 +88,7 @@ fn merge_prompt_esc_cancels() {
     assert!(!app.confirm_merge, "confirm_merge should be cleared");
     assert!(app.merge_wi_id.is_none(), "merge_wi_id should be cleared");
     assert!(
-        app.status_message.is_none(),
+        app.shell.status_message.is_none(),
         "status_message should be cleared",
     );
 }
@@ -101,7 +101,7 @@ fn merge_prompt_unknown_key_cancels() {
     app.merge_wi_id = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
         "/tmp/test.json",
     )));
-    app.status_message = Some("Merge prompt".into());
+    app.shell.status_message = Some("Merge prompt".into());
 
     let key_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
     handle_key(&mut app, key_x);
@@ -118,7 +118,7 @@ fn rework_prompt_esc_cancels() {
     app.rework_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
         "/tmp/test.json",
     )));
-    app.status_message = Some("Rework reason: ".into());
+    app.shell.status_message = Some("Rework reason: ".into());
 
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(&mut app, esc);
@@ -132,7 +132,7 @@ fn rework_prompt_esc_cancels() {
         "rework_prompt_wi should be cleared",
     );
     assert!(
-        app.status_message.is_none(),
+        app.shell.status_message.is_none(),
         "status_message should be cleared",
     );
 }
@@ -163,14 +163,14 @@ fn rework_prompt_blocks_other_keys() {
     app.rework_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
         "/tmp/test.json",
     )));
-    app.status_message = Some("Rework reason: ".into());
+    app.shell.status_message = Some("Rework reason: ".into());
 
     // Press 'q' - should type 'q' into the input, not quit.
     let key_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
     handle_key(&mut app, key_q);
 
     assert!(
-        !app.should_quit,
+        !app.shell.should_quit,
         "should not quit while rework prompt is open"
     );
     assert_eq!(app.rework_prompt_input.text(), "q");
@@ -187,7 +187,8 @@ fn no_plan_prompt_esc_dismisses() {
         .push_back(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
             "/tmp/test.json",
         )));
-    app.status_message = Some("No plan available. [p] Plan from branch  [Esc] Stay blocked".into());
+    app.shell.status_message =
+        Some("No plan available. [p] Plan from branch  [Esc] Stay blocked".into());
 
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(&mut app, esc);
@@ -201,7 +202,7 @@ fn no_plan_prompt_esc_dismisses() {
         "no_plan_prompt_queue should be empty",
     );
     assert!(
-        app.status_message.is_none(),
+        app.shell.status_message.is_none(),
         "status_message should be cleared",
     );
 }
@@ -245,14 +246,14 @@ fn no_plan_prompt_blocks_other_keys() {
         .push_back(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
             "/tmp/test.json",
         )));
-    app.status_message = Some("No plan available.".into());
+    app.shell.status_message = Some("No plan available.".into());
 
     // Press 'q' - should not quit.
     let key_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
     handle_key(&mut app, key_q);
 
     assert!(
-        !app.should_quit,
+        !app.shell.should_quit,
         "should not quit while no-plan prompt is open",
     );
     assert!(
@@ -275,7 +276,7 @@ fn merge_prompt_blocks_during_active() {
     handle_key(&mut app, key_q);
 
     assert!(
-        !app.should_quit,
+        !app.shell.should_quit,
         "should not quit while merge prompt is open"
     );
     assert!(

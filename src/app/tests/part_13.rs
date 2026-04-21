@@ -73,7 +73,7 @@ fn tui_advance_stage_blocked_without_plan() {
         "TUI advance_stage must not advance to Review without a plan",
     );
     // Status message should explain why.
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("no plan"),
         "status message should explain gate failure, got: {msg}",
@@ -138,7 +138,7 @@ fn poll_review_gate_tui_blocked_preserves_session() {
         "Tui-origin Blocked must NOT populate rework_reasons",
     );
     // Status must explain the gate failure.
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("no changes on branch"),
         "status message should carry the Blocked reason, got: {msg}",
@@ -249,7 +249,7 @@ fn poll_review_gate_rejection_populates_rework_reasons() {
         app.rework_reasons.get(&wi_id).unwrap(),
         "Tests are missing for the new feature",
     );
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("rejected"),
         "status should mention rejection, got: {msg}",
@@ -385,7 +385,7 @@ fn poll_review_gate_disconnect_after_progress() {
         !app.review_gates.contains_key(&wi_id),
         "gate should be cleared"
     );
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("unexpectedly"),
         "status should mention unexpected exit, got: {msg}",
@@ -429,7 +429,7 @@ fn mcp_gate_spawn_failure_sets_rework_reasons() {
         "status must not change to Review when gate is blocked",
     );
     // The synchronous Blocked path surfaces the reason in status_message.
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("no branch"),
         "status should mention 'no branch', got: {msg}",
@@ -582,7 +582,7 @@ fn blocked_gate_failure_transitions_to_implementing() {
         "rework_reasons must be populated for Blocked gate failure",
     );
     // Verify status message mentions the gate failure.
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("Review gate failed") || msg.contains("no plan"),
         "status should mention gate failure, got: {msg}",

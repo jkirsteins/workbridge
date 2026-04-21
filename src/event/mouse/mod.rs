@@ -181,7 +181,7 @@ pub fn handle_mouse_with_terminal_size(
     };
 
     // Ignore during shutdown or when overlays are visible.
-    if app.shutting_down || any_modal_visible(app) {
+    if app.shell.shutting_down || any_modal_visible(app) {
         return false;
     }
 

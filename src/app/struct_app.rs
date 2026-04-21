@@ -17,12 +17,11 @@ use crate::work_item::{
 
 /// App holds the entire application state.
 pub struct App {
-    pub should_quit: bool,
-    pub focus: FocusPanel,
-    /// Status message displayed to the user (errors, confirmations, etc.).
-    pub status_message: Option<String>,
-    /// True when waiting for a second press to confirm quit.
-    pub confirm_quit: bool,
+    /// Top-level shell chrome: quit flag, focus panel, status bar
+    /// message, double-Q confirm, PTY pane dimensions, shutdown
+    /// lifecycle. Owned by the `Shell` subsystem so the state
+    /// machine lives in one place. See `app::Shell`.
+    pub shell: Shell,
     /// True when the delete confirmation modal is visible.
     pub delete_prompt_visible: bool,
     /// Identity of the work item targeted by the open delete modal. Stored
@@ -115,16 +114,6 @@ pub struct App {
     /// all are queued. The front item is shown to the user; resolving it
     /// pops it and shows the next (if any).
     pub no_plan_prompt_queue: VecDeque<WorkItemId>,
-    /// True when the app has sent SIGTERM to all sessions and is waiting
-    /// for them to exit. During shutdown, only Q (force quit) is accepted.
-    pub shutting_down: bool,
-    /// When shutdown was initiated. Used to enforce the 10-second deadline
-    /// after which all remaining sessions are force-killed.
-    pub shutdown_started: Option<std::time::Instant>,
-    /// The terminal columns available for the right panel (PTY pane).
-    pub pane_cols: u16,
-    /// The terminal rows available for the right panel (PTY pane).
-    pub pane_rows: u16,
     /// App-wide service aggregate: `backend`, `worktree_service`,
     /// `github_client`, `pr_closer`, `agent_backend`, `config`,
     /// `config_provider`. Replaces seven previously sibling fields on

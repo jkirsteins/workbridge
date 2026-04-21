@@ -86,7 +86,7 @@ fn worktree_fetch_error_surfaces_in_status() {
     assert!(received, "should have received a message");
 
     // The status message should mention the worktree error.
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("Worktree error") && msg.contains("not a git repository"),
         "expected worktree error in status, got: {msg}",
@@ -100,7 +100,7 @@ fn worktree_fetch_error_surfaces_in_status() {
 
     // Sending a second error for the same repo should NOT overwrite
     // the status message.
-    app.status_message = Some("other message".into());
+    app.shell.status_message = Some("other message".into());
     tx.send(FetchMessage::RepoData(Box::new(
         crate::work_item::RepoFetchResult {
             repo_path,
@@ -115,7 +115,7 @@ fn worktree_fetch_error_surfaces_in_status() {
     .unwrap();
     app.drain_fetch_results();
     assert_eq!(
-        app.status_message.as_deref(),
+        app.shell.status_message.as_deref(),
         Some("other message"),
         "second worktree error for same repo should not overwrite status",
     );
@@ -504,7 +504,7 @@ fn pending_fetch_errors_surface_when_status_clears() {
     let mut app = App::new();
 
     // Occupy the status bar.
-    app.status_message = Some("busy doing something".into());
+    app.shell.status_message = Some("busy doing something".into());
 
     // Create a channel and send a FetcherError while status is occupied.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -519,7 +519,7 @@ fn pending_fetch_errors_surface_when_status_clears() {
     // Drain: the error should be queued, not shown.
     app.drain_fetch_results();
     assert_eq!(
-        app.status_message.as_deref(),
+        app.shell.status_message.as_deref(),
         Some("busy doing something"),
         "status bar should remain occupied",
     );
@@ -530,12 +530,12 @@ fn pending_fetch_errors_surface_when_status_clears() {
     );
 
     // Clear the status bar and drain pending errors.
-    app.status_message = None;
+    app.shell.status_message = None;
     app.drain_pending_fetch_errors();
 
     // The queued error should now be shown.
     assert_eq!(
-        app.status_message.as_deref(),
+        app.shell.status_message.as_deref(),
         Some("Fetch error (/repo): connection timed out"),
         "queued error should surface when status clears",
     );
@@ -551,7 +551,7 @@ fn github_errors_queued_when_status_occupied() {
     let mut app = App::new();
 
     // Occupy the status bar.
-    app.status_message = Some("something important".into());
+    app.shell.status_message = Some("something important".into());
 
     let (tx, rx) = std::sync::mpsc::channel();
     app.fetch_rx = Some(rx);
@@ -575,7 +575,10 @@ fn github_errors_queued_when_status_occupied() {
     app.drain_fetch_results();
 
     // The status should remain unchanged.
-    assert_eq!(app.status_message.as_deref(), Some("something important"),);
+    assert_eq!(
+        app.shell.status_message.as_deref(),
+        Some("something important"),
+    );
     // The error should be queued.
     assert_eq!(app.pending_fetch_errors.len(), 1);
     assert!(
@@ -585,10 +588,11 @@ fn github_errors_queued_when_status_occupied() {
     );
 
     // Clear status and drain.
-    app.status_message = None;
+    app.shell.status_message = None;
     app.drain_pending_fetch_errors();
     assert!(
-        app.status_message
+        app.shell
+            .status_message
             .as_deref()
             .unwrap_or("")
             .contains("rate limited"),

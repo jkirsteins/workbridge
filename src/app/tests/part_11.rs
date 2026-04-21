@@ -234,7 +234,7 @@ fn spawn_session_on_branchless_item_opens_dialog_instead_of_message() {
         "spawn_session must open the Set branch dialog, not surface a hint string",
     );
     // And it must NOT have left the old dead-end message behind.
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         !msg.contains("Set a branch name"),
         "old dead-end status message should be gone, got: {msg}",

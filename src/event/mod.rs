@@ -46,7 +46,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // During shutdown, only Q triggers force quit. All other keys are ignored.
     // Check this before the create dialog so users cannot create work items
     // while sessions are winding down.
-    if app.shutting_down {
+    if app.shell.shutting_down {
         // Close the create dialog if it was open when shutdown began.
         if app.create_dialog.visible {
             app.create_dialog.close();
@@ -59,7 +59,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
         ) {
             app.force_kill_all();
-            app.should_quit = true;
+            app.shell.should_quit = true;
         }
         return true;
     }
@@ -134,11 +134,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 KeyCode::Char('q' | 'Q')
             ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
         ) {
-            if !app.has_any_session() || app.confirm_quit {
-                app.should_quit = true;
+            if !app.has_any_session() || app.shell.confirm_quit {
+                app.shell.should_quit = true;
             } else {
-                app.confirm_quit = true;
-                app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                app.shell.confirm_quit = true;
+                app.shell.status_message =
+                    Some("Press Q again to quit and kill all sessions".into());
                 sync_layout(app);
             }
         }
@@ -202,11 +203,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                     KeyCode::Char('q' | 'Q')
                 ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
             ) {
-                if !app.has_any_session() || app.confirm_quit {
-                    app.should_quit = true;
+                if !app.has_any_session() || app.shell.confirm_quit {
+                    app.shell.should_quit = true;
                 } else {
-                    app.confirm_quit = true;
-                    app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                    app.shell.confirm_quit = true;
+                    app.shell.status_message =
+                        Some("Press Q again to quit and kill all sessions".into());
                     sync_layout(app);
                 }
             }
@@ -245,11 +247,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 KeyCode::Char('q' | 'Q')
             ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
         ) {
-            if !app.has_any_session() || app.confirm_quit {
-                app.should_quit = true;
+            if !app.has_any_session() || app.shell.confirm_quit {
+                app.shell.should_quit = true;
             } else {
-                app.confirm_quit = true;
-                app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                app.shell.confirm_quit = true;
+                app.shell.status_message =
+                    Some("Press Q again to quit and kill all sessions".into());
                 sync_layout(app);
             }
         }
@@ -273,11 +276,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 KeyCode::Char('q' | 'Q')
             ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
         ) {
-            if !app.has_any_session() || app.confirm_quit {
-                app.should_quit = true;
+            if !app.has_any_session() || app.shell.confirm_quit {
+                app.shell.should_quit = true;
             } else {
-                app.confirm_quit = true;
-                app.status_message = Some("Press Q again to quit and kill all sessions".into());
+                app.shell.confirm_quit = true;
+                app.shell.status_message =
+                    Some("Press Q again to quit and kill all sessions".into());
                 sync_layout(app);
             }
         }
@@ -343,9 +347,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 if let Err(e) = app.services.config_provider.save(&app.services.config) {
                     // Rollback on save failure.
                     app.services.config.defaults.review_skill = old_value;
-                    app.status_message = Some(format!("Error saving config: {e}"));
+                    app.shell.status_message = Some(format!("Error saving config: {e}"));
                 } else {
-                    app.status_message = Some(format!("Review skill set to: {new_value}"));
+                    app.shell.status_message = Some(format!("Review skill set to: {new_value}"));
                 }
                 app.settings_review_skill_editing = false;
                 app.settings_review_skill_input.clear();
@@ -455,7 +459,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // Any key other than the expected confirmation clears pending confirmations.
     // Track whether any confirmation state was actually cleared so we know
     // if app state changed even when the sub-handler only forwards to a PTY.
-    let is_quit_confirm = app.confirm_quit
+    let is_quit_confirm = app.shell.confirm_quit
         && matches!(
             (key.modifiers, key.code),
             (
@@ -466,9 +470,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 
     let mut state_changed = false;
     let had_status = app.has_visible_status_bar();
-    if app.confirm_quit && !is_quit_confirm {
-        app.confirm_quit = false;
-        app.status_message = None;
+    if app.shell.confirm_quit && !is_quit_confirm {
+        app.shell.confirm_quit = false;
+        app.shell.status_message = None;
         state_changed = true;
     }
     // If cancelling a confirmation hid the status bar, resync layout so
@@ -498,7 +502,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         // talking to github.com. The 500ms debounce below still applies
         // as a secondary guard against pre-FetchStarted spam windows.
         if app.activities.pending_fetch_count > 0 {
-            app.status_message = Some("Refresh already in progress".into());
+            app.shell.status_message = Some("Refresh already in progress".into());
             return true;
         }
         if app
@@ -514,7 +518,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             // Only distinguish the "already in flight" case; the
             // debounce rejection is intentionally silent so normal
             // key-spam protection does not pollute the status bar.
-            app.status_message = Some("Refresh already in progress".into());
+            app.shell.status_message = Some("Refresh already in progress".into());
         }
         return true;
     }
@@ -550,7 +554,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
-    match app.focus {
+    match app.shell.focus {
         FocusPanel::Left => {
             handle_key_left(app, key);
             true
@@ -562,7 +566,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 /// Cycle the right-panel tab between Claude Code and Terminal.
 ///
 /// Bound to the global `Ctrl+\` intercept so it works from either
-/// panel. Intentionally does NOT touch `app.focus` or call
+/// panel. Intentionally does NOT touch `app.shell.focus` or call
 /// `sync_layout` - focus is preserved on whichever panel the user was
 /// in, and the caller is responsible for triggering a re-render
 /// (`handle_key()` returns `true`).

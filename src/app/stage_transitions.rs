@@ -134,7 +134,7 @@ impl super::App {
             }
         }
         self.sync_selection_identity();
-        self.focus = FocusPanel::Left;
+        self.shell.focus = FocusPanel::Left;
 
         // Spawn the background cleanup thread. Keep the modal visible and
         // flip it into the in-progress state; poll_delete_cleanup closes
@@ -185,7 +185,7 @@ impl super::App {
 
         pre_warnings.extend(cleanup_warnings);
         if pre_warnings.is_empty() {
-            self.status_message = Some("Work item deleted".into());
+            self.shell.status_message = Some("Work item deleted".into());
         } else {
             self.alert_message = Some(format!(
                 "Deleted with warnings: {}",
@@ -206,13 +206,14 @@ impl super::App {
             return;
         };
         if wi.status_derived {
-            self.status_message = Some("Status is derived from merged PR".into());
+            self.shell.status_message = Some("Status is derived from merged PR".into());
             return;
         }
         // Review request items cannot be manually advanced.  The only way
         // to complete them is via the approve/request-changes MCP tools.
         if wi.kind == WorkItemKind::ReviewRequest {
-            self.status_message = Some("Use approve/request-changes in the Claude session".into());
+            self.shell.status_message =
+                Some("Use approve/request-changes in the Claude session".into());
             return;
         }
         let current_status = wi.status;
@@ -224,7 +225,7 @@ impl super::App {
         // stuck "Planning with no branch" item on disk.
         let has_branch = wi.repo_associations.iter().any(|a| a.branch.is_some());
         let Some(new_status) = current_status.next_stage() else {
-            self.status_message = Some("Already at final stage".into());
+            self.shell.status_message = Some("Already at final stage".into());
             return;
         };
 
@@ -253,7 +254,7 @@ impl super::App {
         // Block manual advance to prevent skipping the plan handoff.
         if current_status == WorkItemStatus::Planning && new_status == WorkItemStatus::Implementing
         {
-            self.status_message =
+            self.shell.status_message =
                 Some("Plan must be set via Claude session (workbridge_set_plan)".into());
             return;
         }
@@ -270,7 +271,7 @@ impl super::App {
                     // Gate is running in background - do not advance yet.
                 }
                 ReviewGateSpawn::Blocked(reason) => {
-                    self.status_message = Some(reason);
+                    self.shell.status_message = Some(reason);
                 }
             }
             return;
@@ -303,7 +304,7 @@ impl super::App {
 
         // Mergequeue items are waiting for an external merge - block manual advance.
         if current_status == WorkItemStatus::Mergequeue {
-            self.status_message =
+            self.shell.status_message =
                 Some("Waiting for PR to be merged - retreat with Shift+Left to cancel".into());
             return;
         }
@@ -321,18 +322,18 @@ impl super::App {
             return;
         };
         if wi.status_derived {
-            self.status_message = Some("Status is derived from merged PR".into());
+            self.shell.status_message = Some("Status is derived from merged PR".into());
             return;
         }
         // Review request items cannot retreat - there is no valid previous
         // stage for a review request in Review.
         if wi.kind == WorkItemKind::ReviewRequest {
-            self.status_message = Some("Review request items cannot be retreated".into());
+            self.shell.status_message = Some("Review request items cannot be retreated".into());
             return;
         }
         let current_status = wi.status;
         let Some(new_status) = current_status.prev_stage() else {
-            self.status_message = Some("Already at first stage".into());
+            self.shell.status_message = Some("Already at first stage".into());
             return;
         };
 
@@ -409,7 +410,7 @@ impl super::App {
             .find(|w| w.id == *wi_id)
             .is_some_and(|w| w.status == WorkItemStatus::Blocked);
         if !is_blocked {
-            self.status_message = Some("Work item is no longer blocked".into());
+            self.shell.status_message = Some("Work item is no longer blocked".into());
             return;
         }
 
@@ -431,7 +432,7 @@ impl super::App {
 
         // Clear the plan so the planning session starts fresh.
         if let Err(e) = self.services.backend.update_plan(wi_id, "") {
-            self.status_message = Some(format!("Could not clear plan: {e}"));
+            self.shell.status_message = Some(format!("Could not clear plan: {e}"));
         }
     }
 
@@ -455,7 +456,7 @@ impl super::App {
             && source != "pr_merge"
             && source != "review_submitted"
         {
-            self.status_message = Some("Cannot move to Done without a merged PR".to_string());
+            self.shell.status_message = Some("Cannot move to Done without a merged PR".to_string());
             return;
         }
 
@@ -469,11 +470,11 @@ impl super::App {
             }),
         };
         if let Err(e) = self.services.backend.append_activity(wi_id, &entry) {
-            self.status_message = Some(format!("Activity log error: {e}"));
+            self.shell.status_message = Some(format!("Activity log error: {e}"));
         }
 
         if let Err(e) = self.services.backend.update_status(wi_id, new_status) {
-            self.status_message = Some(format!("Stage update error: {e}"));
+            self.shell.status_message = Some(format!("Stage update error: {e}"));
             return;
         }
 
@@ -487,12 +488,13 @@ impl super::App {
                         .backend
                         .set_done_at(wi_id, Some(duration.as_secs()))
                     {
-                        self.status_message = Some(format!("Failed to set archive timestamp: {e}"));
+                        self.shell.status_message =
+                            Some(format!("Failed to set archive timestamp: {e}"));
                         done_at_error = true;
                     }
                 }
                 Err(e) => {
-                    self.status_message = Some(format!(
+                    self.shell.status_message = Some(format!(
                         "System clock error, skipping archive timestamp: {e}"
                     ));
                     done_at_error = true;
@@ -501,14 +503,14 @@ impl super::App {
         } else if current_status == WorkItemStatus::Done
             && let Err(e) = self.services.backend.set_done_at(wi_id, None)
         {
-            self.status_message = Some(format!("Failed to clear archive timestamp: {e}"));
+            self.shell.status_message = Some(format!("Failed to clear archive timestamp: {e}"));
             done_at_error = true;
         }
 
         self.reassemble_work_items();
         self.build_display_list();
         if !done_at_error {
-            self.status_message = Some(format!("Moved to {}", new_status.badge_text()));
+            self.shell.status_message = Some(format!("Moved to {}", new_status.badge_text()));
         }
 
         // Feature 1: Auto-create PR when entering Review (async).

@@ -20,7 +20,7 @@ pub fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) 
     // When the settings overlay is open, dim background panels.
     let border_style = if app.show_settings {
         theme.style_border_unfocused()
-    } else if app.focus == FocusPanel::Right {
+    } else if app.shell.focus == FocusPanel::Right {
         theme.style_border_input()
     } else {
         theme.style_border_default()
@@ -34,7 +34,7 @@ pub fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) 
 
     let input_suffix = if in_scrollback {
         " [SCROLLBACK] "
-    } else if app.focus == FocusPanel::Right {
+    } else if app.shell.focus == FocusPanel::Right {
         " [INPUT] "
     } else {
         " "

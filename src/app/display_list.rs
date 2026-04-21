@@ -44,7 +44,7 @@ impl super::App {
             match crate::side_effects::clock::system_now().duration_since(std::time::UNIX_EPOCH) {
                 Ok(d) => d.as_secs(),
                 Err(e) => {
-                    self.status_message =
+                    self.shell.status_message =
                         Some(format!("System clock error, skipping auto-archive: {e}"));
                     return records;
                 }
@@ -92,15 +92,17 @@ impl super::App {
 
         if archived_count > 0 {
             if all_warnings.is_empty() {
-                self.status_message = Some(format!("Auto-archived {archived_count} done item(s)"));
+                self.shell.status_message =
+                    Some(format!("Auto-archived {archived_count} done item(s)"));
             } else {
-                self.status_message = Some(format!(
+                self.shell.status_message = Some(format!(
                     "Auto-archived {archived_count} done item(s) (warnings: {})",
                     all_warnings.join("; ")
                 ));
             }
         } else if !all_warnings.is_empty() {
-            self.status_message = Some(format!("Auto-archive errors: {}", all_warnings.join("; ")));
+            self.shell.status_message =
+                Some(format!("Auto-archive errors: {}", all_warnings.join("; ")));
         }
 
         kept
@@ -625,8 +627,9 @@ impl super::App {
                 .get(&existing_key)
                 .is_some_and(|entry| entry.alive);
             if is_alive {
-                self.focus = FocusPanel::Right;
-                self.status_message = Some("Right panel focused - press Ctrl+] to return".into());
+                self.shell.focus = FocusPanel::Right;
+                self.shell.status_message =
+                    Some("Right panel focused - press Ctrl+] to return".into());
                 return;
             }
             self.sessions.remove(&existing_key);

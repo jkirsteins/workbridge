@@ -184,7 +184,7 @@ fn create_work_item_with_errors_when_all_repos_lack_git_dir() {
         "create should fail when all repos lack git dir"
     );
 
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("No selected repos have a git directory"),
         "expected git directory error in status, got: {msg}",

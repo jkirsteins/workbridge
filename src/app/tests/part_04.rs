@@ -264,7 +264,7 @@ fn import_skips_worktree_when_fetch_fails() {
     );
 
     // Verify status message tells user about manual checkout.
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("could not fetch branch") && msg.contains("Manual checkout required"),
         "expected manual checkout message, got: {msg}",

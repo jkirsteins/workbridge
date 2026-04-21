@@ -120,7 +120,7 @@ impl super::App {
                     if let Err(ref e) = result.worktrees
                         && self.worktree_errors_shown.insert(result.repo_path.clone())
                     {
-                        self.status_message = Some(format!(
+                        self.shell.status_message = Some(format!(
                             "Worktree error ({}): {e}",
                             result.repo_path.display(),
                         ));
@@ -133,21 +133,21 @@ impl super::App {
                             GithubError::CliNotFound => {
                                 if !self.gh_cli_not_found_shown {
                                     self.gh_cli_not_found_shown = true;
-                                    self.status_message =
+                                    self.shell.status_message =
                                         Some("gh CLI not found - GitHub features disabled".into());
                                 }
                             }
                             GithubError::AuthRequired => {
                                 if !self.gh_auth_required_shown {
                                     self.gh_auth_required_shown = true;
-                                    self.status_message =
+                                    self.shell.status_message =
                                         Some("gh auth required - run 'gh auth login'".into());
                                 }
                             }
                             _ => {
                                 let msg = format!("GitHub: {e}");
-                                if self.status_message.is_none() {
-                                    self.status_message = Some(msg);
+                                if self.shell.status_message.is_none() {
+                                    self.shell.status_message = Some(msg);
                                 } else {
                                     self.pending_fetch_errors.push(msg);
                                 }
@@ -187,8 +187,8 @@ impl super::App {
                         self.review_reopen_suppress.clear();
                     }
                     let msg = format!("Fetch error ({}): {error}", repo_path.display());
-                    if self.status_message.is_none() {
-                        self.status_message = Some(msg);
+                    if self.shell.status_message.is_none() {
+                        self.shell.status_message = Some(msg);
                     } else {
                         self.pending_fetch_errors.push(msg);
                     }
@@ -199,8 +199,8 @@ impl super::App {
         if disconnected && !self.fetcher_disconnected {
             self.fetcher_disconnected = true;
             let msg = "Background fetcher stopped unexpectedly".to_string();
-            if self.status_message.is_none() {
-                self.status_message = Some(msg);
+            if self.shell.status_message.is_none() {
+                self.shell.status_message = Some(msg);
             } else {
                 self.pending_fetch_errors.push(msg);
             }
@@ -213,11 +213,11 @@ impl super::App {
     /// was occupied eventually surface. Shows one error per tick to
     /// avoid overwhelming the user.
     pub fn drain_pending_fetch_errors(&mut self) {
-        if self.status_message.is_none()
+        if self.shell.status_message.is_none()
             && let Some(msg) = self.pending_fetch_errors.first().cloned()
         {
             self.pending_fetch_errors.remove(0);
-            self.status_message = Some(msg);
+            self.shell.status_message = Some(msg);
         }
     }
 
@@ -230,14 +230,14 @@ impl super::App {
         let list_result = match self.services.backend.list() {
             Ok(r) => r,
             Err(e) => {
-                self.status_message = Some(format!("Backend error: {e}"));
+                self.shell.status_message = Some(format!("Backend error: {e}"));
                 return;
             }
         };
         if !list_result.corrupt.is_empty() {
             let count = list_result.corrupt.len();
             let first = &list_result.corrupt[0];
-            self.status_message = Some(format!(
+            self.shell.status_message = Some(format!(
                 "{count} corrupt work item file(s): {} ({})",
                 first.path.display(),
                 first.reason,
@@ -270,13 +270,13 @@ impl super::App {
                             && let Err(e) =
                                 self.services.backend.set_done_at(&record.id, Some(epoch))
                         {
-                            self.status_message =
+                            self.shell.status_message =
                                 Some(format!("Failed to set archive timestamp: {e}"));
                         }
                     }
                 }
                 Err(e) => {
-                    self.status_message = Some(format!(
+                    self.shell.status_message = Some(format!(
                         "System clock error, skipping archive timestamps: {e}"
                     ));
                 }
@@ -296,12 +296,12 @@ impl super::App {
                     .backend
                     .update_status(wi_id, WorkItemStatus::Review)
                 {
-                    self.status_message = Some(format!("Re-open error: {e}"));
+                    self.shell.status_message = Some(format!("Re-open error: {e}"));
                     continue;
                 }
                 // Clear done_at so auto-archive won't delete the re-opened item.
                 if let Err(e) = self.services.backend.set_done_at(wi_id, None) {
-                    self.status_message =
+                    self.shell.status_message =
                         Some(format!("Failed to clear archive timestamp on re-open: {e}"));
                 }
                 let entry = ActivityEntry {
@@ -330,7 +330,7 @@ impl super::App {
             self.review_requested_prs = review_requested;
 
             let count = reopen_ids.len();
-            self.status_message = Some(format!("{count} review request(s) re-opened"));
+            self.shell.status_message = Some(format!("{count} review request(s) re-opened"));
         }
 
         // Auto-archive: delete Done items that have exceeded the retention period.
@@ -357,7 +357,7 @@ impl super::App {
                     }
                 }
                 Err(e) => {
-                    self.status_message =
+                    self.shell.status_message =
                         Some(format!("Failed to list items for auto-archive: {e}"));
                 }
             }

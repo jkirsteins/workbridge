@@ -128,7 +128,7 @@ fn toggle_global_drawer_close_tears_down_session() {
 
     // Simulate a drawer that is already open with live state.
     app.global_drawer_open = true;
-    app.pre_drawer_focus = app.focus;
+    app.pre_drawer_focus = app.shell.focus;
 
     let parser = Arc::new(std::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
     app.global_session = Some(SessionEntry {
@@ -203,7 +203,7 @@ fn plan_from_branch_accepts_blocked_item() {
 
     // StubBackend persists nothing, so we verify via the status message
     // that apply_stage_change was called (it sets "Moved to [PL]").
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("[PL]"),
         "should show Planning transition message, got: {msg}",
@@ -234,7 +234,7 @@ fn plan_from_branch_rejects_non_blocked() {
     app.plan_from_branch(&wi_id);
 
     // Item should remain unchanged - verify via status message.
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("no longer blocked"),
         "should show informational message, got: {msg}",
@@ -449,14 +449,14 @@ fn has_visible_status_bar_with_activity() {
 #[test]
 fn has_visible_status_bar_with_message() {
     let mut app = App::new();
-    app.status_message = Some("test".into());
+    app.shell.status_message = Some("test".into());
     assert!(app.has_visible_status_bar());
 }
 
 #[test]
 fn has_visible_status_bar_activity_overrides_message() {
     let mut app = App::new();
-    app.status_message = Some("test".into());
+    app.shell.status_message = Some("test".into());
     let id = app.activities.start("Working...");
     assert!(app.has_visible_status_bar());
     // Activity takes precedence in rendering, but bar is visible either way.

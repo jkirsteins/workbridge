@@ -68,11 +68,11 @@ impl super::App {
             // next session restart.
             match self.spawn_review_gate(&wi_id, ReviewGateOrigin::Auto) {
                 ReviewGateSpawn::Spawned => {
-                    self.status_message =
+                    self.shell.status_message =
                         Some("Implementing session ended - running review gate...".into());
                 }
                 ReviewGateSpawn::Blocked(reason) => {
-                    self.status_message = Some(reason);
+                    self.shell.status_message = Some(reason);
                 }
             }
         }
@@ -321,7 +321,7 @@ impl super::App {
         let mut first_error: Option<std::io::Error> = None;
         for entry in self.sessions.values() {
             if let Some(ref session) = entry.session
-                && let Err(e) = session.resize(self.pane_cols, self.pane_rows)
+                && let Err(e) = session.resize(self.shell.pane_cols, self.shell.pane_rows)
                 && first_error.is_none()
             {
                 first_error = Some(e);
@@ -338,14 +338,14 @@ impl super::App {
         // Resize terminal sessions to the same dimensions as the right pane.
         for entry in self.terminal_sessions.values() {
             if let Some(ref session) = entry.session
-                && let Err(e) = session.resize(self.pane_cols, self.pane_rows)
+                && let Err(e) = session.resize(self.shell.pane_cols, self.shell.pane_rows)
                 && first_error.is_none()
             {
                 first_error = Some(e);
             }
         }
         if let Some(e) = first_error {
-            self.status_message = Some(format!("PTY resize error: {e}"));
+            self.shell.status_message = Some(format!("PTY resize error: {e}"));
         }
     }
 
@@ -568,7 +568,7 @@ impl super::App {
         if let Some(ref session) = entry.session
             && let Err(e) = session.write_bytes(data)
         {
-            self.status_message = Some(format!("Send error: {e}"));
+            self.shell.status_message = Some(format!("Send error: {e}"));
         }
     }
 
@@ -595,11 +595,16 @@ impl super::App {
             .iter()
             .find_map(|a| a.worktree_path.clone())
         else {
-            self.status_message = Some("No worktree available for terminal".into());
+            self.shell.status_message = Some("No worktree available for terminal".into());
             return;
         };
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        match Session::spawn(self.pane_cols, self.pane_rows, Some(&cwd), &[&shell]) {
+        match Session::spawn(
+            self.shell.pane_cols,
+            self.shell.pane_rows,
+            Some(&cwd),
+            &[&shell],
+        ) {
             Ok(session) => {
                 let parser = Arc::clone(&session.parser);
                 self.terminal_sessions.insert(
@@ -615,7 +620,7 @@ impl super::App {
                 );
             }
             Err(e) => {
-                self.status_message = Some(format!("Terminal spawn error: {e}"));
+                self.shell.status_message = Some(format!("Terminal spawn error: {e}"));
             }
         }
     }
@@ -648,7 +653,7 @@ impl super::App {
         if let Some(ref session) = entry.session
             && let Err(e) = session.write_bytes(data)
         {
-            self.status_message = Some(format!("Terminal send error: {e}"));
+            self.shell.status_message = Some(format!("Terminal send error: {e}"));
         }
     }
 }

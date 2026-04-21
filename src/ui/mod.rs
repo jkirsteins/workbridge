@@ -143,8 +143,8 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
                 Span::styled(count_suffix, theme.style_text_muted()),
             ]);
             Paragraph::new(line).render(area, buf);
-        } else if let Some(msg) = &app.status_message {
-            let style = if app.shutting_down {
+        } else if let Some(msg) = &app.shell.status_message {
+            let style = if app.shell.shutting_down {
                 theme.style_status_shutdown()
             } else {
                 theme.style_status()

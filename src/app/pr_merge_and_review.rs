@@ -254,7 +254,7 @@ impl super::App {
                         identity,
                     )
                 {
-                    self.status_message = Some(format!("PR identity save error: {e}"));
+                    self.shell.status_message = Some(format!("PR identity save error: {e}"));
                 }
 
                 // Log merge to activity log (always - the merge happened on GitHub).
@@ -271,14 +271,14 @@ impl super::App {
                     .backend
                     .append_activity(&result.wi_id, &log_entry)
                 {
-                    self.status_message = Some(format!("Activity log error: {e}"));
+                    self.shell.status_message = Some(format!("Activity log error: {e}"));
                 }
 
                 if actual_status.as_ref() != Some(&WorkItemStatus::Review) {
                     // Item was moved away from Review while merge was in-flight.
                     // The merge already happened on GitHub, but we do not change
                     // the local status or delete the worktree.
-                    self.status_message = Some(
+                    self.shell.status_message = Some(
                         "PR merged on GitHub, but item status was changed - not advancing to Done"
                             .to_string(),
                     );
@@ -295,7 +295,8 @@ impl super::App {
                     WorkItemStatus::Done,
                     "pr_merge",
                 );
-                self.status_message = Some(format!("PR merged ({strategy}) and moved to [DN]"));
+                self.shell.status_message =
+                    Some(format!("PR merged ({strategy}) and moved to [DN]"));
             }
             PrMergeOutcome::Conflict { ref stderr } => {
                 if actual_status.as_ref() != Some(&WorkItemStatus::Review) {
@@ -315,7 +316,7 @@ impl super::App {
                     .backend
                     .append_activity(&result.wi_id, &conflict_entry)
                 {
-                    self.status_message = Some(format!("Activity log error: {e}"));
+                    self.shell.status_message = Some(format!("Activity log error: {e}"));
                 }
                 let reason = "Merge failed due to conflicts. Rebase onto the base branch and resolve all conflicts.".to_string();
                 self.rework_reasons.insert(result.wi_id.clone(), reason);
@@ -342,7 +343,7 @@ impl super::App {
         // In-flight guard via the user-action helper. Rejection message
         // is preserved verbatim.
         if self.is_user_action_in_flight(&UserActionKey::ReviewSubmit) {
-            self.status_message = Some(REVIEW_SUBMIT_ALREADY_IN_PROGRESS.into());
+            self.shell.status_message = Some(REVIEW_SUBMIT_ALREADY_IN_PROGRESS.into());
             return;
         }
 
@@ -350,13 +351,13 @@ impl super::App {
             return;
         };
         let Some(assoc) = wi.repo_associations.first() else {
-            self.status_message = Some("Cannot submit review: no repo association".into());
+            self.shell.status_message = Some("Cannot submit review: no repo association".into());
             return;
         };
         let branch = if let Some(b) = assoc.branch.as_ref() {
             b.clone()
         } else {
-            self.status_message = Some("Cannot submit review: no branch".into());
+            self.shell.status_message = Some("Cannot submit review: no branch".into());
             return;
         };
         let repo_path = assoc.repo_path.clone();
@@ -371,7 +372,7 @@ impl super::App {
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone())
         else {
-            self.status_message = Some(
+            self.shell.status_message = Some(
                 "Cannot submit review: GitHub remote not yet cached (waiting for next fetch)"
                     .into(),
             );
@@ -394,7 +395,7 @@ impl super::App {
         {
             // Race with another in-flight submission; preserve the
             // pre-refactor wording.
-            self.status_message = Some(REVIEW_SUBMIT_ALREADY_IN_PROGRESS.into());
+            self.shell.status_message = Some(REVIEW_SUBMIT_ALREADY_IN_PROGRESS.into());
             return;
         }
         let action_owned = action.to_string();
@@ -468,7 +469,7 @@ impl super::App {
         };
         let Ok(result) = recv_result else {
             self.end_user_action(&UserActionKey::ReviewSubmit);
-            self.status_message =
+            self.shell.status_message =
                 Some("Review submission: background thread exited unexpectedly".into());
             return;
         };
@@ -493,7 +494,7 @@ impl super::App {
                     .backend
                     .append_activity(&result.wi_id, &log_entry)
                 {
-                    self.status_message = Some(format!("Activity log error: {e}"));
+                    self.shell.status_message = Some(format!("Activity log error: {e}"));
                 }
 
                 // Suppress re-open for this item until fresh repo_data
@@ -516,11 +517,11 @@ impl super::App {
                     .find(|w| w.id == result.wi_id)
                     .is_some_and(|w| w.status == WorkItemStatus::Done);
                 if reached_done {
-                    self.status_message = Some(format!("Review {verb} and moved to [DN]"));
+                    self.shell.status_message = Some(format!("Review {verb} and moved to [DN]"));
                 }
             }
             ReviewSubmitOutcome::Failed { ref error } => {
-                self.status_message = Some(error.clone());
+                self.shell.status_message = Some(error.clone());
             }
         }
     }

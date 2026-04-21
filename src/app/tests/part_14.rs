@@ -99,7 +99,7 @@ fn mcp_blocked_to_review_is_allowed_transition() {
 
     // The transition should NOT be rejected as "not allowed". It should
     // reach the gate spawn path (and fail there due to no plan).
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         !msg.contains("not allowed"),
         "Blocked->Review must not be rejected as 'not allowed', got: {msg}",

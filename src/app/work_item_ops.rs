@@ -41,10 +41,10 @@ impl super::App {
                 std::thread::spawn(move || {
                     let _ = std::process::Command::new("open").arg(&url).status();
                 });
-                self.status_message = Some(format!("Opening {label}"));
+                self.shell.status_message = Some(format!("Opening {label}"));
             }
             None => {
-                self.status_message = Some("No PR to open".into());
+                self.shell.status_message = Some("No PR to open".into());
             }
         }
     }
@@ -102,14 +102,14 @@ impl super::App {
     /// `try_begin_user_action` for single-flight admission.
     pub fn start_rebase_on_main(&mut self) {
         let Some(target) = self.selected_rebase_target() else {
-            self.status_message = Some("No branch to rebase".into());
+            self.shell.status_message = Some("No branch to rebase".into());
             return;
         };
         // Reject a rebase on a work item that already has a rebase gate
         // in flight before talking to the user-action guard, so the
         // status message names the right cause.
         if self.rebase_gates.contains_key(&target.wi_id) {
-            self.status_message = Some("Rebase already in progress for this item".into());
+            self.shell.status_message = Some("Rebase already in progress for this item".into());
             return;
         }
         // Reject a rebase while the work item has a live interactive
@@ -130,7 +130,7 @@ impl super::App {
             .get(&target.wi_id)
             .is_some_and(|entry| entry.alive);
         if has_live_session || has_live_terminal {
-            self.status_message =
+            self.shell.status_message =
                 Some("Cannot rebase while a session is active for this item".into());
             return;
         }
@@ -148,7 +148,7 @@ impl super::App {
         title: String,
     ) {
         if self.is_user_action_in_flight(&UserActionKey::WorktreeCreate) {
-            self.status_message = Some(format!(
+            self.shell.status_message = Some(format!(
                 "Imported: {title} (worktree queued - another in progress)"
             ));
             return;
@@ -169,7 +169,7 @@ impl super::App {
             )
             .is_none()
         {
-            self.status_message = Some(format!(
+            self.shell.status_message = Some(format!(
                 "Imported: {title} (worktree queued - another in progress)"
             ));
             return;
@@ -265,7 +265,7 @@ impl super::App {
             &UserActionKey::WorktreeCreate,
             UserActionPayload::WorktreeCreate { rx, wi_id },
         );
-        self.status_message = Some(format!("Imported: {title} (creating worktree...)"));
+        self.shell.status_message = Some(format!("Imported: {title} (creating worktree...)"));
     }
 
     /// Create a new work item with explicit parameters from the creation
@@ -280,7 +280,7 @@ impl super::App {
     ) -> Result<(), String> {
         if repos.is_empty() {
             let msg = "No repos selected".to_string();
-            self.status_message = Some(msg.clone());
+            self.shell.status_message = Some(msg.clone());
             return Err(msg);
         }
 
@@ -298,7 +298,7 @@ impl super::App {
 
         if valid_repos.is_empty() {
             let msg = "No selected repos have a git directory".to_string();
-            self.status_message = Some(msg.clone());
+            self.shell.status_message = Some(msg.clone());
             return Err(msg);
         }
 
@@ -324,12 +324,12 @@ impl super::App {
                 self.reassemble_work_items();
                 self.build_display_list();
                 self.fetcher_repos_changed = true;
-                self.status_message = Some(format!("Created: {title}"));
+                self.shell.status_message = Some(format!("Created: {title}"));
                 Ok(())
             }
             Err(e) => {
                 let msg = format!("Create error: {e}");
-                self.status_message = Some(msg.clone());
+                self.shell.status_message = Some(msg.clone());
                 Err(msg)
             }
         }
@@ -374,7 +374,7 @@ impl super::App {
             }
             Err(e) => {
                 let msg = format!("Create error: {e}");
-                self.status_message = Some(msg.clone());
+                self.shell.status_message = Some(msg.clone());
                 Err(msg)
             }
         }
@@ -412,7 +412,7 @@ impl super::App {
             }
             Err(e) => {
                 let msg = format!("Create error: {e}");
-                self.status_message = Some(msg.clone());
+                self.shell.status_message = Some(msg.clone());
                 Err(msg)
             }
         }
@@ -506,7 +506,7 @@ impl super::App {
         let branch = dlg.input.text().trim().to_string();
         if branch.is_empty() {
             // Restore the dialog so the user can edit the field.
-            self.status_message = Some("Branch name cannot be empty".into());
+            self.shell.status_message = Some("Branch name cannot be empty".into());
             self.set_branch_dialog = Some(dlg);
             return;
         }
@@ -520,7 +520,7 @@ impl super::App {
                     .map(|a| a.repo_path.clone())
                     .collect()
             } else {
-                self.status_message = Some("Work item not found".into());
+                self.shell.status_message = Some("Work item not found".into());
                 return;
             };
 
@@ -529,7 +529,7 @@ impl super::App {
             // item that already has a branch on every repo, treat it as
             // a no-op but still re-drive the pending action so the
             // gesture is not silently lost.
-            self.status_message = Some("Branch already set".into());
+            self.shell.status_message = Some("Branch already set".into());
         } else {
             for repo_path in &targets {
                 if let Err(e) = self
@@ -537,7 +537,7 @@ impl super::App {
                     .backend
                     .update_branch(&dlg.wi_id, repo_path, &branch)
                 {
-                    self.status_message = Some(format!("Failed to set branch: {e}"));
+                    self.shell.status_message = Some(format!("Failed to set branch: {e}"));
                     // Restore the dialog so the user can retry.
                     self.set_branch_dialog = Some(dlg);
                     return;
@@ -570,7 +570,7 @@ impl super::App {
     /// user presses 'y'.
     pub fn open_delete_prompt(&mut self) {
         let Some(work_item_id) = self.selected_work_item_id() else {
-            self.status_message = Some("No work item selected".into());
+            self.shell.status_message = Some("No work item selected".into());
             return;
         };
         self.open_delete_prompt_for(work_item_id);
@@ -584,7 +584,7 @@ impl super::App {
     pub fn open_delete_prompt_for(&mut self, work_item_id: WorkItemId) {
         // Look up the target work item to fetch its title for the modal.
         let Some(target) = self.work_items.iter().find(|w| w.id == work_item_id) else {
-            self.status_message = Some("Work item not found".into());
+            self.shell.status_message = Some("Work item not found".into());
             return;
         };
 

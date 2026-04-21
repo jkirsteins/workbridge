@@ -106,7 +106,7 @@ impl super::App {
                         // `cancel_session_open_entry` and end the
                         // spinner so a retry is possible.
                         self.cancel_session_open_entry(&wi_id);
-                        self.status_message =
+                        self.shell.status_message =
                             Some("Session open: background thread exited unexpectedly".into());
                         continue;
                     }
@@ -120,13 +120,13 @@ impl super::App {
             // populates at most one of the three slots per failure
             // class, and the last non-empty message wins in the bar.
             if let Some(msg) = result.read_error.clone() {
-                self.status_message = Some(msg);
+                self.shell.status_message = Some(msg);
             }
             if let Some(msg) = result.server_error.clone() {
-                self.status_message = Some(msg);
+                self.shell.status_message = Some(msg);
             }
             if let Some(msg) = result.mcp_config_error.clone() {
-                self.status_message = Some(msg);
+                self.shell.status_message = Some(msg);
             }
             self.finish_session_open(result);
         }
@@ -231,8 +231,8 @@ impl super::App {
         // flows back through `session_spawn_rx` and is drained by
         // `poll_session_spawns` on the next timer tick.
         let (tx, rx) = crossbeam_channel::bounded::<SessionSpawnResult>(1);
-        let pane_cols = self.pane_cols;
-        let pane_rows = self.pane_rows;
+        let pane_cols = self.shell.pane_cols;
+        let pane_rows = self.shell.pane_rows;
         let cwd_owned = cwd.to_path_buf();
         let wi_id_clone = work_item_id.clone();
         let session_key_clone = session_key;
@@ -297,7 +297,7 @@ impl super::App {
                     if let Some(pending) = self.session_spawn_rx.remove(&wi_id) {
                         self.activities.end(pending.activity);
                     }
-                    self.status_message =
+                    self.shell.status_message =
                         Some("Session spawn: background thread exited unexpectedly".into());
                     continue;
                 }
@@ -336,8 +336,8 @@ impl super::App {
                     if let Some(server) = result.mcp_server {
                         self.mcp_servers.insert(result.wi_id.clone(), server);
                     }
-                    self.focus = FocusPanel::Right;
-                    self.status_message =
+                    self.shell.focus = FocusPanel::Right;
+                    self.shell.status_message =
                         Some("Right panel focused - press Ctrl+] to return".into());
                 }
                 (Some(session), _) => {
@@ -359,7 +359,7 @@ impl super::App {
                         self.drop_mcp_server_off_thread(server);
                     }
                     self.spawn_agent_file_cleanup(result.written_files);
-                    self.status_message = Some(e);
+                    self.shell.status_message = Some(e);
                 }
                 (None, None) => {
                     // Should not happen, but handle gracefully.
@@ -367,7 +367,7 @@ impl super::App {
                         self.drop_mcp_server_off_thread(server);
                     }
                     self.spawn_agent_file_cleanup(result.written_files);
-                    self.status_message =
+                    self.shell.status_message =
                         Some("Session spawn returned no session and no error".into());
                 }
             }

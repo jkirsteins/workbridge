@@ -22,7 +22,7 @@ pub fn flatten_paste_for_single_line(data: &str) -> String {
 /// focused PTY session as a bracketed paste sequence so the receiving
 /// application handles it atomically.
 pub fn handle_paste(app: &mut App, data: &str) -> bool {
-    if app.shutting_down {
+    if app.shell.shutting_down {
         return false;
     }
 
@@ -40,7 +40,7 @@ pub fn handle_paste(app: &mut App, data: &str) -> bool {
         app.send_bytes_to_global(bracketed.as_bytes());
         return true;
     }
-    match app.focus {
+    match app.shell.focus {
         FocusPanel::Right => {
             match app.right_panel_tab {
                 RightPanelTab::ClaudeCode => app.send_bytes_to_active(bracketed.as_bytes()),
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn paste_with_no_modal_returns_false_when_left_focused() {
         let mut app = App::new();
-        app.focus = FocusPanel::Left;
+        app.shell.focus = FocusPanel::Left;
         // Sanity: no modal is up.
         assert!(!any_modal_visible(&app));
 
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn paste_during_shutdown_returns_false() {
         let mut app = App::new();
-        app.shutting_down = true;
+        app.shell.shutting_down = true;
         app.create_dialog.open(&[PathBuf::from("/repo/a")], None);
 
         let changed = handle_paste(&mut app, "must be ignored");

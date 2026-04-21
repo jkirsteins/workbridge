@@ -58,7 +58,7 @@ fn start_rebase_blocked_while_claude_session_alive() {
     );
     app.start_rebase_on_main();
     assert_eq!(
-        app.status_message.as_deref(),
+        app.shell.status_message.as_deref(),
         Some("Cannot rebase while a session is active for this item"),
         "rebase must be blocked while a Claude session is alive",
     );
@@ -86,7 +86,7 @@ fn start_rebase_blocked_while_terminal_session_alive() {
     );
     app.start_rebase_on_main();
     assert_eq!(
-        app.status_message.as_deref(),
+        app.shell.status_message.as_deref(),
         Some("Cannot rebase while a session is active for this item"),
         "rebase must be blocked while a terminal session is alive",
     );
@@ -132,7 +132,7 @@ fn start_rebase_allowed_with_dead_sessions() {
     // by the dead session guard. The status message should NOT
     // be the "Cannot rebase while a session is active" message.
     assert_ne!(
-        app.status_message.as_deref(),
+        app.shell.status_message.as_deref(),
         Some("Cannot rebase while a session is active for this item"),
         "dead sessions must NOT block the rebase",
     );

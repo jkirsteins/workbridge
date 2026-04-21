@@ -24,19 +24,19 @@ impl super::App {
             return;
         };
         let Some(assoc) = wi.repo_associations.first() else {
-            self.status_message = Some("Cannot enter mergequeue: no repo association".into());
+            self.shell.status_message = Some("Cannot enter mergequeue: no repo association".into());
             return;
         };
         let branch = if let Some(b) = assoc.branch.as_ref() {
             b.clone()
         } else {
-            self.status_message = Some("Cannot enter mergequeue: no branch".into());
+            self.shell.status_message = Some("Cannot enter mergequeue: no branch".into());
             return;
         };
         let pr_number = if let Some(pr) = assoc.pr.as_ref() {
             pr.number
         } else {
-            self.status_message = Some("Cannot enter mergequeue: no PR found".into());
+            self.shell.status_message = Some("Cannot enter mergequeue: no PR found".into());
             return;
         };
         let repo_path = assoc.repo_path.clone();
@@ -47,7 +47,7 @@ impl super::App {
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone())
         else {
-            self.status_message = Some(
+            self.shell.status_message = Some(
                 "Cannot enter mergequeue: GitHub remote not yet cached \
                  (waiting for next fetch)"
                     .into(),
@@ -74,7 +74,7 @@ impl super::App {
             WorkItemStatus::Mergequeue,
             "user",
         );
-        self.status_message = Some("Entered mergequeue - polling PR until merged".into());
+        self.shell.status_message = Some("Entered mergequeue - polling PR until merged".into());
     }
 
     impl_pr_merge_poll_method!(
@@ -266,13 +266,14 @@ impl super::App {
                             &result.repo_path,
                             &result.identity,
                         ) {
-                            self.status_message = Some(format!("PR identity backfill error: {e}"));
+                            self.shell.status_message =
+                                Some(format!("PR identity backfill error: {e}"));
                         } else {
                             changed = true;
                         }
                     }
                     Err(e) => {
-                        self.status_message = Some(format!("PR identity backfill: {e}"));
+                        self.shell.status_message = Some(format!("PR identity backfill: {e}"));
                     }
                 },
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -306,7 +307,7 @@ impl super::App {
                     true,
                     false,
                 ) {
-                    self.status_message = Some(format!("Worktree cleanup warning: {e}"));
+                    self.shell.status_message = Some(format!("Worktree cleanup warning: {e}"));
                 }
             } else if let Some(ref branch) = assoc.branch {
                 // No worktree but a branch exists - still clean up the branch.
@@ -315,7 +316,7 @@ impl super::App {
                         .worktree_service
                         .delete_branch(&assoc.repo_path, branch, false)
                 {
-                    self.status_message = Some(format!("Branch cleanup warning: {e}"));
+                    self.shell.status_message = Some(format!("Branch cleanup warning: {e}"));
                 }
             }
         }

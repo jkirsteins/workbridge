@@ -418,7 +418,7 @@ fn open_pr_sets_no_pr_status_when_no_pr() {
     });
     app.selected_item = Some(0);
     app.open_selected_pr_in_browser();
-    assert_eq!(app.status_message.as_deref(), Some("No PR to open"));
+    assert_eq!(app.shell.status_message.as_deref(), Some("No PR to open"));
 }
 
 // -----------------------------------------------------------------------
@@ -573,5 +573,8 @@ fn start_rebase_on_main_sets_status_when_nothing_to_rebase() {
     });
     app.selected_item = Some(0);
     app.start_rebase_on_main();
-    assert_eq!(app.status_message.as_deref(), Some("No branch to rebase"));
+    assert_eq!(
+        app.shell.status_message.as_deref(),
+        Some("No branch to rebase")
+    );
 }

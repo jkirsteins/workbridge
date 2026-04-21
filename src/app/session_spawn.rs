@@ -39,7 +39,7 @@ impl super::App {
         // Replacing the helper payload while a thread is running would orphan
         // the worktree on disk (the poll handler would never see the result).
         if self.is_user_action_in_flight(&UserActionKey::WorktreeCreate) {
-            self.status_message = Some("Worktree creation already in progress...".into());
+            self.shell.status_message = Some("Worktree creation already in progress...".into());
             return;
         }
 
@@ -92,7 +92,7 @@ impl super::App {
                         )
                         .is_none()
                     {
-                        self.status_message =
+                        self.shell.status_message =
                             Some("Worktree creation already in progress...".into());
                         return;
                     }
@@ -247,13 +247,13 @@ impl super::App {
             // Phase 1 already in flight - the pending worker will
             // finish the open. Re-surface the spinner message so a
             // repeat Enter press is not silent.
-            self.status_message = Some("Opening session...".into());
+            self.shell.status_message = Some("Opening session...".into());
             return;
         }
         if self.session_spawn_rx.contains_key(work_item_id) {
             // Phase 2 PTY spawn already in flight - the pending
             // `poll_session_spawns` tick will install the session.
-            self.status_message = Some("Spawning agent session...".into());
+            self.shell.status_message = Some("Spawning agent session...".into());
             return;
         }
         // Resolve the per-work-item harness backend for the Phase 1

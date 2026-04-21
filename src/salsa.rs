@@ -144,8 +144,8 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
         let bottom_rows = u16::from(state.has_visible_status_bar())
             + u16::from(state.selected_work_item_context().is_some());
         let pl = layout::compute(size.width, size.height, bottom_rows);
-        state.pane_cols = pl.pane_cols;
-        state.pane_rows = pl.pane_rows;
+        state.shell.pane_cols = pl.pane_cols;
+        state.shell.pane_rows = pl.pane_rows;
 
         // Compute global drawer PTY dimensions via shared helper.
         let dl = layout::compute_drawer(size.width, size.height);
@@ -296,19 +296,19 @@ pub fn app_event(
                 }
             }
             // Check if the app wants to quit after handling the key event.
-            if state.should_quit && !state.shutting_down {
+            if state.shell.should_quit && !state.shell.shutting_down {
                 // Initiate graceful shutdown.
                 state.send_sigterm_all();
                 state.cleanup_all_mcp();
-                state.shutting_down = true;
-                state.shutdown_started = Some(crate::side_effects::clock::instant_now());
-                state.should_quit = false;
-                state.status_message =
+                state.shell.shutting_down = true;
+                state.shell.shutdown_started = Some(crate::side_effects::clock::instant_now());
+                state.shell.should_quit = false;
+                state.shell.status_message =
                     Some("Waiting for sessions (force quit in 10s, or press Q)".into());
                 if state.all_dead() {
                     return Ok(Control::Quit);
                 }
-            } else if state.should_quit && state.shutting_down {
+            } else if state.shell.should_quit && state.shell.shutting_down {
                 // Force quit during shutdown (Q pressed).
                 return Ok(Control::Quit);
             }
@@ -499,7 +499,7 @@ pub fn app_event(
 
                 // Check for external signals (SIGTERM, SIGINT).
                 if ctx.signal_received.swap(false, Ordering::Relaxed) {
-                    if state.shutting_down {
+                    if state.shell.shutting_down {
                         // Second signal during shutdown - force kill and
                         // exit.
                         state.force_kill_all();
@@ -508,9 +508,9 @@ pub fn app_event(
                     // First signal - initiate graceful shutdown.
                     state.send_sigterm_all();
                     state.cleanup_all_mcp();
-                    state.shutting_down = true;
-                    state.shutdown_started = Some(crate::side_effects::clock::instant_now());
-                    state.status_message =
+                    state.shell.shutting_down = true;
+                    state.shell.shutdown_started = Some(crate::side_effects::clock::instant_now());
+                    state.shell.status_message =
                         Some("Waiting for sessions (force quit in 10s, or press Q)".into());
                     if state.all_dead() {
                         return Ok(Control::Quit);
@@ -518,21 +518,21 @@ pub fn app_event(
                 }
 
                 // Shutdown deadline checks.
-                if state.shutting_down {
+                if state.shell.shutting_down {
                     if state.all_dead() {
                         return Ok(Control::Quit);
                     }
-                    if state.should_quit {
+                    if state.shell.should_quit {
                         return Ok(Control::Quit);
                     }
-                    if let Some(started) = state.shutdown_started {
+                    if let Some(started) = state.shell.shutdown_started {
                         let elapsed = crate::side_effects::clock::elapsed_since(started);
                         if elapsed >= Duration::from_secs(10) {
                             state.force_kill_all();
                             return Ok(Control::Quit);
                         }
                         let remaining = 10u64.saturating_sub(elapsed.as_secs());
-                        state.status_message = Some(format!(
+                        state.shell.status_message = Some(format!(
                             "Waiting for sessions (force quit in {remaining}s, or press Q)"
                         ));
                     }
@@ -611,7 +611,7 @@ pub fn app_error(
     if let AppError::Io(_) = err {
         Err(err)
     } else {
-        state.status_message = Some(format!("Error: {err}"));
+        state.shell.status_message = Some(format!("Error: {err}"));
         Ok(Control::Changed)
     }
 }
@@ -657,6 +657,7 @@ mod tests {
         );
         assert!(
             state
+                .shell
                 .status_message
                 .as_deref()
                 .unwrap_or("")

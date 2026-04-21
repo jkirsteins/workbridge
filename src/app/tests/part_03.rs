@@ -110,8 +110,8 @@ fn invalid_branch_issue_pattern_caught_at_startup() {
         let bad = app.services.config.defaults.branch_issue_pattern.clone();
         app.services.config.defaults.branch_issue_pattern = String::new();
         let msg = format!("Invalid branch_issue_pattern '{bad}': {e} (issue extraction disabled)");
-        if app.status_message.is_none() {
-            app.status_message = Some(msg);
+        if app.shell.status_message.is_none() {
+            app.shell.status_message = Some(msg);
         } else {
             app.pending_fetch_errors.push(msg);
         }
@@ -124,7 +124,7 @@ fn invalid_branch_issue_pattern_caught_at_startup() {
     );
 
     // An error message should have been set.
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("Invalid branch_issue_pattern") && msg.contains("[invalid("),
         "expected invalid pattern error in status, got: {msg}",
@@ -155,17 +155,17 @@ fn disconnected_fetcher_surfaces_error() {
         "fetcher_disconnected should be true after channel disconnect",
     );
 
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("Background fetcher stopped unexpectedly"),
         "expected disconnect error in status, got: {msg}",
     );
 
     // Calling drain again should NOT push duplicate errors.
-    app.status_message = None;
+    app.shell.status_message = None;
     app.drain_fetch_results();
     assert!(
-        app.status_message.is_none(),
+        app.shell.status_message.is_none(),
         "should not push duplicate disconnect error",
     );
 }
@@ -432,7 +432,7 @@ fn import_creates_worktree_for_branch() {
     );
 
     // Verify status message indicates success with worktree.
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("Imported") && msg.contains("worktree created"),
         "expected import success with worktree message, got: {msg}",

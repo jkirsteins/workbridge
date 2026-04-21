@@ -108,7 +108,7 @@ impl super::App {
         // `handle_ctrl_g`'s guard.
         let Some(kind) = self.global_assistant_harness_kind() else {
             self.global_drawer_open = false;
-            self.focus = self.pre_drawer_focus;
+            self.shell.focus = self.pre_drawer_focus;
             self.toasts.push(
                 "Cannot open global assistant: no harness configured. Press Ctrl+G again to pick one."
                     .into(),
@@ -354,9 +354,9 @@ impl super::App {
                     std::thread::spawn(move || drop(session));
                 }
                 self.spawn_agent_file_cleanup(vec![pending.config_path]);
-                self.status_message = Some(err);
+                self.shell.status_message = Some(err);
                 self.global_drawer_open = false;
-                self.focus = pending.pre_drawer_focus;
+                self.shell.focus = pending.pre_drawer_focus;
                 // Clear buffered keystrokes so they do not leak
                 // into the next successful open.
                 self.pending_global_pty_bytes.clear();
@@ -389,10 +389,10 @@ impl super::App {
             // cleanup anyway (same rationale as the error arm
             // above).
             self.spawn_agent_file_cleanup(vec![pending.config_path]);
-            self.status_message =
+            self.shell.status_message =
                 Some("Global assistant: preparation worker exited unexpectedly".into());
             self.global_drawer_open = false;
-            self.focus = pending.pre_drawer_focus;
+            self.shell.focus = pending.pre_drawer_focus;
             self.pending_global_pty_bytes.clear();
         }
     }
@@ -404,7 +404,7 @@ impl super::App {
             && let Some(ref session) = entry.session
             && let Err(e) = session.write_bytes(data)
         {
-            self.status_message = Some(format!("Global assistant write error: {e}"));
+            self.shell.status_message = Some(format!("Global assistant write error: {e}"));
         }
     }
 
@@ -497,7 +497,7 @@ impl super::App {
                 *guard = ctx.to_string();
             }
             Err(e) => {
-                self.status_message = Some(format!("Global MCP context lock poisoned: {e}"));
+                self.shell.status_message = Some(format!("Global MCP context lock poisoned: {e}"));
             }
         }
     }

@@ -43,7 +43,7 @@ impl super::App {
         // not eat a repeat press - this way the user can press `c` to
         // pick a harness and immediately retry.
         let Some(agent_backend) = self.backend_for_work_item(&wi_id) else {
-            self.status_message = Some(
+            self.shell.status_message = Some(
                 "Cannot rebase: no harness chosen for this work item. Press c / x to pick one first.".into(),
             );
             return;

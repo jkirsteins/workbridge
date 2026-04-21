@@ -40,7 +40,7 @@ impl super::App {
             Duration::ZERO,
             "Cleaning up unlinked PR...",
         ) else {
-            self.status_message = Some("Unlinked PR cleanup already in progress".into());
+            self.shell.status_message = Some("Unlinked PR cleanup already in progress".into());
             return;
         };
         // The cleanup modal already renders its own in-progress spinner
@@ -259,7 +259,7 @@ impl super::App {
         self.fetcher_repos_changed = true;
 
         if result.warnings.is_empty() {
-            self.status_message = Some("Unlinked item closed".into());
+            self.shell.status_message = Some("Unlinked item closed".into());
         } else {
             self.alert_message = Some(format!(
                 "Closed with warnings: {}",
@@ -579,7 +579,7 @@ impl super::App {
             warnings.extend(msg.warnings);
         }
         if !warnings.is_empty() {
-            self.status_message = Some(warnings.join(" | "));
+            self.shell.status_message = Some(warnings.join(" | "));
         }
     }
 
@@ -641,7 +641,7 @@ impl super::App {
         }
 
         if result.warnings.is_empty() {
-            self.status_message = Some("Work item resource cleanup complete".into());
+            self.shell.status_message = Some("Work item resource cleanup complete".into());
         } else {
             self.alert_message = Some(format!(
                 "Delete cleanup warnings: {}",

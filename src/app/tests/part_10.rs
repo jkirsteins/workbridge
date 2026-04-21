@@ -74,7 +74,7 @@ fn poll_pr_merge_merged_advances_to_done() {
     app.poll_pr_merge();
     // After apply_stage_change, reassemble rebuilds from StubBackend (empty),
     // so we verify via the status message that the merge path was taken.
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("PR merged") && msg.contains("[DN]"),
         "should confirm merge and Done, got: {msg}",
@@ -145,7 +145,7 @@ fn poll_mergequeue_merged_advances_to_done_and_clears_watch() {
         !app.mergequeue_poll_errors.contains_key(&wi_id),
         "stale poll error should be cleared on success",
     );
-    let msg = app.status_message.as_deref().unwrap_or("");
+    let msg = app.shell.status_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("PR merged") && msg.contains("[DN]"),
         "should confirm external merge and Done, got: {msg}",
@@ -565,7 +565,8 @@ fn advance_stage_planning_to_implementing_blocked() {
     // Status should still be Planning - manual advance blocked.
     assert_eq!(app.work_items[0].status, WorkItemStatus::Planning);
     assert!(
-        app.status_message
+        app.shell
+            .status_message
             .as_deref()
             .unwrap_or("")
             .contains("workbridge_set_plan"),

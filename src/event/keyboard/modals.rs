@@ -28,13 +28,13 @@ pub fn handle_merge_prompt(app: &mut App, key: KeyEvent) {
         (_, KeyCode::Esc) => {
             app.confirm_merge = false;
             app.merge_wi_id = None;
-            app.status_message = None;
+            app.shell.status_message = None;
         }
         _ => {
             // Unrecognized key - cancel.
             app.confirm_merge = false;
             app.merge_wi_id = None;
-            app.status_message = None;
+            app.shell.status_message = None;
         }
     }
     if app.has_visible_status_bar() != had_status {
@@ -53,7 +53,7 @@ pub fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
             app.rework_prompt_visible = false;
             app.rework_prompt_input.clear();
             app.rework_prompt_wi = None;
-            app.status_message = None;
+            app.shell.status_message = None;
         }
         (_, KeyCode::Enter) => {
             let reason = app.rework_prompt_input.text().trim().to_string();
@@ -75,7 +75,7 @@ pub fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
                 payload: serde_json::json!({ "reason": reason }),
             };
             if let Err(e) = app.services.backend.append_activity(&wi_id, &log_entry) {
-                app.status_message = Some(format!("Activity log error: {e}"));
+                app.shell.status_message = Some(format!("Activity log error: {e}"));
             }
 
             // Complete the retreat from Review to Implementing.
@@ -198,7 +198,7 @@ pub fn handle_cleanup_prompt(app: &mut App, key: KeyEvent) {
             // Cancel on explicit Esc only.
             app.cleanup_prompt_visible = false;
             app.cleanup_unlinked_target = None;
-            app.status_message = None;
+            app.shell.status_message = None;
         }
         _ => {
             // Swallow unrecognized keys (arrows, function keys, etc.).
@@ -222,7 +222,7 @@ pub fn handle_cleanup_reason_input(app: &mut App, key: KeyEvent) {
             app.cleanup_reason_input_active = false;
             app.cleanup_reason_input.clear();
             app.cleanup_unlinked_target = None;
-            app.status_message = None;
+            app.shell.status_message = None;
         }
         (_, KeyCode::Enter) => {
             let reason = app.cleanup_reason_input.text().trim().to_string();
@@ -272,7 +272,7 @@ pub fn handle_no_plan_prompt(app: &mut App, key: KeyEvent) {
             app.no_plan_prompt_queue.pop_front();
             if app.no_plan_prompt_queue.is_empty() {
                 app.no_plan_prompt_visible = false;
-                app.status_message = None;
+                app.shell.status_message = None;
             }
             // If queue still has items, the dialog stays visible with the
             // next item automatically (no status_message needed).

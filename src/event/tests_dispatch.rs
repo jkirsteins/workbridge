@@ -54,7 +54,7 @@ fn ctrl_backslash_on_dead_terminal_cycles_to_claude_code() {
     );
 
     app.right_panel_tab = RightPanelTab::Terminal;
-    app.focus = FocusPanel::Right;
+    app.shell.focus = FocusPanel::Right;
 
     // Ctrl+\ should cycle to Claude Code, NOT redirect to the left panel.
     // Crossterm 0.28 may deliver the chord either as the literal
@@ -68,8 +68,8 @@ fn ctrl_backslash_on_dead_terminal_cycles_to_claude_code() {
         // exercise the actual transition rather than the second key
         // being a no-op on an already-cycled state.
         app.right_panel_tab = RightPanelTab::Terminal;
-        app.focus = FocusPanel::Right;
-        app.status_message = None;
+        app.shell.focus = FocusPanel::Right;
+        app.shell.status_message = None;
 
         handle_key(&mut app, key);
 
@@ -78,10 +78,10 @@ fn ctrl_backslash_on_dead_terminal_cycles_to_claude_code() {
             "Ctrl+\\ ({key:?}) must flip the dead-terminal tab to Claude Code",
         );
         assert!(
-            matches!(app.focus, FocusPanel::Right),
+            matches!(app.shell.focus, FocusPanel::Right),
             "focus must stay on the right panel after the Ctrl+\\ ({key:?}) flip",
         );
-        let status = app.status_message.as_deref().unwrap_or("");
+        let status = app.shell.status_message.as_deref().unwrap_or("");
         assert!(
             !status.contains("returned to work items"),
             "status must not be the dead-session 'returned to work items' message, got: {status}",
@@ -169,8 +169,8 @@ fn ctrl_backslash_on_dead_claude_code_cycles_to_terminal() {
         KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL),
     ] {
         app.right_panel_tab = RightPanelTab::ClaudeCode;
-        app.focus = FocusPanel::Right;
-        app.status_message = None;
+        app.shell.focus = FocusPanel::Right;
+        app.shell.status_message = None;
 
         handle_key(&mut app, key);
 
@@ -179,10 +179,10 @@ fn ctrl_backslash_on_dead_claude_code_cycles_to_terminal() {
             "Ctrl+\\ ({key:?}) must flip the dead Claude Code tab to Terminal",
         );
         assert!(
-            matches!(app.focus, FocusPanel::Right),
+            matches!(app.shell.focus, FocusPanel::Right),
             "focus must stay on the right panel after the Ctrl+\\ ({key:?}) flip",
         );
-        let status = app.status_message.as_deref().unwrap_or("");
+        let status = app.shell.status_message.as_deref().unwrap_or("");
         assert!(
             !status.contains("returned to work items"),
             "status must not be the dead-session 'returned to work items' message, got: {status}",
@@ -374,7 +374,7 @@ fn ctrl_r_rapid_double_press_through_handle_key_is_gated() {
         "second Ctrl+R must not re-flip fetcher_repos_changed",
     );
     assert_eq!(
-        app.status_message.as_deref(),
+        app.shell.status_message.as_deref(),
         Some("Refresh already in progress"),
         "in-flight rejection must surface the user-visible message",
     );
@@ -406,7 +406,7 @@ fn ctrl_r_rejected_while_pending_fetch_count_nonzero() {
         "count gate must reject BEFORE the helper is admitted",
     );
     assert_eq!(
-        app.status_message.as_deref(),
+        app.shell.status_message.as_deref(),
         Some("Refresh already in progress"),
         "count-gate rejection must surface the user-visible message",
     );

@@ -116,7 +116,7 @@ macro_rules! impl_pr_merge_poll_method {
                                 identity,
                             )
                         {
-                            self.status_message =
+                            self.shell.status_message =
                                 Some(format!("PR identity save error: {e}"));
                         }
 
@@ -131,7 +131,7 @@ macro_rules! impl_pr_merge_poll_method {
                         if let Err(e) =
                             self.services.backend.append_activity(&result.wi_id, &log_entry)
                         {
-                            self.status_message =
+                            self.shell.status_message =
                                 Some(format!("Activity log error: {e}"));
                         }
 
@@ -148,7 +148,7 @@ macro_rules! impl_pr_merge_poll_method {
                             WorkItemStatus::Done,
                             "pr_merge",
                         );
-                        self.status_message = Some($merged_message.into());
+                        self.shell.status_message = Some($merged_message.into());
                     }
                     "CLOSED" => {
                         // A closed PR is NOT a merge - it must not
@@ -157,7 +157,7 @@ macro_rules! impl_pr_merge_poll_method {
                         // somebody reopens the same PR) and surface a
                         // distinct warning.
                         self.$errors_field.remove(&result.wi_id);
-                        self.status_message = Some($closed_message.into());
+                        self.shell.status_message = Some($closed_message.into());
                     }
                     s if s.starts_with("ERROR:") => {
                         let msg = format!(
@@ -166,7 +166,7 @@ macro_rules! impl_pr_merge_poll_method {
                         );
                         self.$errors_field
                             .insert(result.wi_id.clone(), msg.clone());
-                        self.status_message = Some(msg);
+                        self.shell.status_message = Some(msg);
                         // Item stays in its source stage - will retry
                         // on next poll cycle.
                     }
@@ -333,6 +333,7 @@ mod session_spawn;
 mod sessions_core;
 mod setup_and_user_actions;
 mod shared_services;
+mod shell;
 mod stage_transitions;
 mod struct_app;
 #[cfg(test)]
@@ -352,6 +353,7 @@ pub use activities::*;
 pub use click_tracking::*;
 pub use helpers::*;
 pub use shared_services::*;
+pub use shell::*;
 pub use struct_app::*;
 #[cfg(test)]
 pub use stubs::*;
