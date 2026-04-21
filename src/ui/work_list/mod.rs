@@ -327,7 +327,7 @@ pub fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rec
     // the registry hit-test is a linear scan, so keeping it small
     // keeps the mouse path cheap.
     {
-        let mut registry = app.click_registry.borrow_mut();
+        let mut registry = app.click_tracking.registry.borrow_mut();
         let mut y = body_area.y;
         let end_y = body_area.y.saturating_add(body_area.height);
         for (i, h) in item_heights.iter().enumerate().skip(resolved_offset) {

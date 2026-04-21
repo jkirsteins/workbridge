@@ -4,7 +4,7 @@
 //! keep every file within the 700-line ceiling. Methods behave
 //! identically to the original single-file layout.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use super::*;
 use crate::agent_backend::ClaudeCodeBackend;
-use crate::click_targets::{ClickKind, ClickRegistry};
 use crate::config::{Config, ConfigProvider, RepoEntry, RepoSource};
 use crate::create_dialog::CreateDialog;
 use crate::work_item::WorkItemId;
@@ -229,42 +228,12 @@ impl super::App {
             right_panel_tab: RightPanelTab::ClaudeCode,
             terminal_sessions: HashMap::new(),
             pending_terminal_pty_bytes: Vec::new(),
-            click_registry: RefCell::new(ClickRegistry::default()),
-            pending_chrome_click: None,
+            click_tracking: ClickTracking::new(),
             toasts: Toasts::new(),
         };
         app.reassemble_work_items();
         app.build_display_list();
         app
-    }
-
-    /// Fire a click-to-copy action: write `value` to the clipboard via
-    /// the OSC 52 + arboard backend and push a confirmation toast. The
-    /// toast shows a short-form of `value` based on `kind` so long
-    /// URLs and file paths do not overflow the frame.
-    ///
-    /// Branches on the clipboard backend's return value: on success
-    /// the toast reads `Copied: <short>`; on failure it reads
-    /// `Copy failed: <short>`. Lying about the clipboard state is
-    /// the worst UX failure mode for this feature - a user who
-    /// believes the copy succeeded will paste stale content and
-    /// only notice long after the fact. `clipboard::copy` returns
-    /// `true` iff at least one of OSC 52 (stdout write + flush) or
-    /// `arboard` (native clipboard) succeeded; a `false` result
-    /// means neither path even delivered bytes, so the clipboard
-    /// definitely does not hold `value`.
-    ///
-    /// Does not touch the PTY selection state - this path is
-    /// independent of the existing drag-select copy flow.
-    pub fn fire_chrome_copy(&mut self, value: String, kind: ClickKind) {
-        let ok = crate::side_effects::clipboard::copy(&value);
-        let short = short_display(&value, kind);
-        let text = if ok {
-            format!("Copied: {short}")
-        } else {
-            format!("Copy failed: {short}")
-        };
-        self.toasts.push(text);
     }
 
     // -- Activity indicator API --

@@ -63,7 +63,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
     // Clear stale click targets from the previous frame before any
     // render pushes. `handle_mouse` never runs during a draw, so
     // this `borrow_mut` never conflicts with a concurrent borrow.
-    app.click_registry.borrow_mut().clear();
+    app.click_tracking.registry.borrow_mut().clear();
 
     // Vertical split: 1-row view mode header + main area + optional context bar + optional status bar.
     let has_context = app.selected_work_item_context().is_some();

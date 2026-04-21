@@ -75,7 +75,7 @@ pub fn draw_work_item_detail(
     // and a column offset to this origin so `handle_mouse` receives
     // the same coordinates it reads from `MouseEvent`.
     let inner = block.inner(area);
-    let mut registry = app.click_registry.borrow_mut();
+    let mut registry = app.click_tracking.registry.borrow_mut();
 
     let first_assoc = wi.repo_associations.first();
     let label_style = theme.style_heading();

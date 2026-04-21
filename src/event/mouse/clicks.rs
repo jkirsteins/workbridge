@@ -106,12 +106,13 @@ pub fn handle_chrome_click_fallback(app: &mut App, mouse: MouseEvent, action: Mo
     match action {
         MouseAction::SelectDown => {
             let hit = app
-                .click_registry
+                .click_tracking
+                .registry
                 .try_borrow()
                 .ok()
                 .and_then(|r| r.hit_test(mouse.column, mouse.row).cloned());
             if let Some(ClickTarget::Copy { kind, value, .. }) = hit {
-                app.pending_chrome_click = Some((mouse.column, mouse.row, kind, value));
+                app.click_tracking.pending = Some((mouse.column, mouse.row, kind, value));
                 true
             } else {
                 // Row targets are dispatched by the caller; anything
@@ -123,9 +124,10 @@ pub fn handle_chrome_click_fallback(app: &mut App, mouse: MouseEvent, action: Mo
         // `Scroll`: chrome labels do not respond to scroll.
         MouseAction::SelectDrag | MouseAction::Scroll { .. } => false,
         MouseAction::SelectUp => {
-            let pending = app.pending_chrome_click.take();
+            let pending = app.click_tracking.pending.take();
             let hit = app
-                .click_registry
+                .click_tracking
+                .registry
                 .try_borrow()
                 .ok()
                 .and_then(|r| r.hit_test(mouse.column, mouse.row).cloned());
@@ -134,7 +136,17 @@ pub fn handle_chrome_click_fallback(app: &mut App, mouse: MouseEvent, action: Mo
                     Some((_, _, pending_kind, pending_value)),
                     Some(ClickTarget::Copy { kind, .. }),
                 ) if kind == pending_kind => {
-                    app.fire_chrome_copy(pending_value, pending_kind);
+                    // Cross-subsystem field-borrow split: hand out
+                    // disjoint `&mut` borrows on `click_tracking`
+                    // and `toasts` so `ClickTracking::fire_copy`
+                    // can push a confirmation toast without holding
+                    // a borrow on the rest of `App`.
+                    let App {
+                        click_tracking,
+                        toasts,
+                        ..
+                    } = app;
+                    click_tracking.fire_copy(&mut *toasts, pending_value, pending_kind);
                     true
                 }
                 _ => false,

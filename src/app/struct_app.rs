@@ -1,13 +1,12 @@
 //! The `App` struct definition, extracted from `src/app/mod.rs`.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 
 use super::*;
 use crate::agent_backend::{AgentBackend, AgentBackendKind};
-use crate::click_targets::{ClickKind, ClickRegistry};
 use crate::config::{Config, ConfigProvider, RepoEntry};
 use crate::create_dialog::CreateDialog;
 use crate::mcp::{McpEvent, McpSocketServer};
@@ -501,16 +500,14 @@ pub struct App {
     /// Buffered bytes destined for the active terminal PTY session.
     pub pending_terminal_pty_bytes: Vec<u8>,
 
-    /// Per-frame click-to-copy target registry. Populated during draw
-    /// (via `&App`, which is why this is a `RefCell`), consumed by
-    /// `handle_mouse`. Cleared at the top of every frame.
-    pub click_registry: RefCell<ClickRegistry>,
-
-    /// Tracks a pending click-to-copy gesture between `Down(Left)` and
-    /// `Up(Left)`. A drag or an `Up` outside the original target
-    /// cancels the gesture. Stored as `(col, row, kind, value)` in
-    /// absolute frame coordinates.
-    pub pending_chrome_click: Option<(u16, u16, ClickKind, String)>,
+    /// Per-frame click registry + pending click-to-copy gesture.
+    /// Owned by the `ClickTracking` subsystem so the two previously
+    /// sibling fields (`click_registry`, `pending_chrome_click`) and
+    /// the `fire_chrome_copy` cross-subsystem call now live behind
+    /// a single narrow interface. Field-borrow splitting at the
+    /// mouse event dispatcher lets `ClickTracking::fire_copy` take
+    /// `&mut self` + `&mut Toasts` disjointly.
+    pub click_tracking: ClickTracking,
 
     /// Transient top-right toast notifications. Owned by the `Toasts`
     /// subsystem so the rest of `App` cannot reach the vector directly;

@@ -305,6 +305,7 @@ macro_rules! impl_pr_merge_reconstruct_method {
 
 // === Submodule declarations ===
 mod activities;
+mod click_tracking;
 mod helpers;
 mod impl_01;
 mod impl_02;
@@ -338,6 +339,7 @@ mod user_actions;
 // Re-exports so `super::<Type>` / `super::<helper>` paths in sibling
 // submodules keep resolving without changing the import shape.
 pub use activities::*;
+pub use click_tracking::*;
 pub use helpers::*;
 pub use struct_app::*;
 #[cfg(test)]

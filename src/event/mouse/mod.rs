@@ -189,7 +189,7 @@ pub fn handle_mouse_with_terminal_size(
     // happen before target dispatch because a drag over a PTY pane
     // still invalidates a pending chrome click that started elsewhere.
     if matches!(action, MouseAction::SelectDrag) {
-        app.pending_chrome_click = None;
+        app.click_tracking.pending = None;
     }
 
     // Interactive labels (click-to-copy) and work item row clicks both
@@ -224,7 +224,8 @@ pub fn handle_mouse_with_terminal_size(
     // click.
     if matches!(action, MouseAction::SelectDown | MouseAction::SelectUp) {
         let dispatch = app
-            .click_registry
+            .click_tracking
+            .registry
             .try_borrow()
             .ok()
             .and_then(|r| r.hit_test(mouse.column, mouse.row).cloned());
@@ -248,7 +249,7 @@ pub fn handle_mouse_with_terminal_size(
     // click-to-copy gesture from the registry's point of view: the
     // user released outside every interactive label, so any pending
     // click armed by an earlier `SelectDown` is abandoned. Without
-    // this clear, a stale `pending_chrome_click` could linger and
+    // this clear, a stale `click_tracking.pending` could linger and
     // later fire a false copy on an unrelated `SelectUp` that
     // happens to hit a same-kind label (for example on terminals
     // that coalesce intervening `Drag` events, or over SSH sessions
@@ -256,12 +257,12 @@ pub fn handle_mouse_with_terminal_size(
     // report `Down`/`Up`). The drag-cancel clear above catches the
     // well-behaved case; this catches the lossy case. It is safe
     // on all paths because (a) the priority check above already
-    // `take()`s `pending_chrome_click` on a matching up and returns
+    // `take()`s `click_tracking.pending` on a matching up and returns
     // before reaching here, and (b) the `MouseTarget::None` fallback
     // below also `take()`s it, so clearing here cannot destroy any
     // state that another branch still needs.
     if matches!(action, MouseAction::SelectUp) {
-        app.pending_chrome_click = None;
+        app.click_tracking.pending = None;
     }
 
     let target = terminal_size.map_or(MouseTarget::None, |size| {

@@ -68,7 +68,7 @@ fn mouse_target_with_size_classifies_right_panel_for_test_size() {
 /// Before the fix, the `RightPanel` arm would match first,
 /// `active_session_entry_mut_for_tab` would return `None` (no
 /// session on a fresh `App`), and the Down event would be
-/// consumed as a no-op selection click - `pending_chrome_click`
+/// consumed as a no-op selection click - `click_tracking.pending`
 /// would never get set and no toast would be pushed.
 #[test]
 fn chrome_click_inside_right_panel_still_fires() {
@@ -79,7 +79,7 @@ fn chrome_click_inside_right_panel_still_fires() {
     let mut app = App::new();
     // Register a target that overlaps the right-panel inner area.
     {
-        let mut reg = app.click_registry.borrow_mut();
+        let mut reg = app.click_tracking.registry.borrow_mut();
         reg.push_copy(
             Rect {
                 x: 40,
@@ -108,13 +108,13 @@ fn chrome_click_inside_right_panel_still_fires() {
 
     assert!(handle_mouse_with_terminal_size(&mut app, down, TEST_SIZE));
     assert!(
-        app.pending_chrome_click.is_some(),
+        app.click_tracking.pending.is_some(),
         "Down(Left) on a registered label must arm the pending click \
          even when geometric classification says RightPanel",
     );
     assert!(handle_mouse_with_terminal_size(&mut app, up, TEST_SIZE));
     assert!(
-        app.pending_chrome_click.is_none(),
+        app.click_tracking.pending.is_none(),
         "Up(Left) must clear the pending click",
     );
     assert_eq!(app.toasts.entries.len(), 1, "one toast must be queued");
@@ -137,7 +137,7 @@ fn chrome_click_drag_inside_right_panel_cancels() {
 
     let mut app = App::new();
     {
-        let mut reg = app.click_registry.borrow_mut();
+        let mut reg = app.click_tracking.registry.borrow_mut();
         reg.push_copy(
             Rect {
                 x: 40,
@@ -162,7 +162,7 @@ fn chrome_click_drag_inside_right_panel_cancels() {
         "drag must cancel the copy gesture, got toasts={:?}",
         app.toasts.iter().map(|t| &t.text).collect::<Vec<_>>(),
     );
-    assert!(app.pending_chrome_click.is_none());
+    assert!(app.click_tracking.pending.is_none());
 }
 
 /// Negative test: a right-panel click that does NOT hit any
@@ -181,7 +181,7 @@ fn right_panel_click_without_registry_hit_does_not_arm_chrome_click() {
     // Register a target somewhere on the same row, but NOT at
     // the click coordinate.
     {
-        let mut reg = app.click_registry.borrow_mut();
+        let mut reg = app.click_tracking.registry.borrow_mut();
         reg.push_copy(
             Rect {
                 x: 80,
@@ -204,7 +204,7 @@ fn right_panel_click_without_registry_hit_does_not_arm_chrome_click() {
     let down = mouse(MouseEventKind::Down(MouseButton::Left), 50, 10);
     handle_mouse_with_terminal_size(&mut app, down, TEST_SIZE);
     assert!(
-        app.pending_chrome_click.is_none(),
+        app.click_tracking.pending.is_none(),
         "click outside any registered target must not arm a chrome copy",
     );
 
@@ -244,7 +244,7 @@ fn chrome_click_inside_global_drawer_still_fires() {
     );
 
     {
-        let mut reg = app.click_registry.borrow_mut();
+        let mut reg = app.click_tracking.registry.borrow_mut();
         reg.push_copy(
             Rect {
                 x: 5,
@@ -262,7 +262,7 @@ fn chrome_click_inside_global_drawer_still_fires() {
 
     assert!(handle_mouse_with_terminal_size(&mut app, down, TEST_SIZE));
     assert!(
-        app.pending_chrome_click.is_some(),
+        app.click_tracking.pending.is_some(),
         "priority check must also rescue drawer-area clicks",
     );
     assert!(handle_mouse_with_terminal_size(&mut app, up, TEST_SIZE));
@@ -295,7 +295,7 @@ fn unmatched_select_up_clears_stale_pending_chrome_click() {
 
     let mut app = App::new();
     {
-        let mut reg = app.click_registry.borrow_mut();
+        let mut reg = app.click_tracking.registry.borrow_mut();
         reg.push_copy(
             Rect {
                 x: 40,
@@ -324,7 +324,7 @@ fn unmatched_select_up_clears_stale_pending_chrome_click() {
     let down_on_label = mouse(MouseEventKind::Down(MouseButton::Left), 50, 10);
     handle_mouse_with_terminal_size(&mut app, down_on_label, TEST_SIZE);
     assert!(
-        app.pending_chrome_click.is_some(),
+        app.click_tracking.pending.is_some(),
         "priority check must arm pending on down over a registered label",
     );
 
@@ -335,8 +335,8 @@ fn unmatched_select_up_clears_stale_pending_chrome_click() {
     let up_off_label = mouse(MouseEventKind::Up(MouseButton::Left), 100, 10);
     handle_mouse_with_terminal_size(&mut app, up_off_label, TEST_SIZE);
     assert!(
-        app.pending_chrome_click.is_none(),
-        "unmatched SelectUp must clear stale pending_chrome_click, \
+        app.click_tracking.pending.is_none(),
+        "unmatched SelectUp must clear stale click_tracking.pending, \
          otherwise a later unrelated SelectUp on a same-kind label \
          could fire a false copy",
     );
@@ -482,7 +482,7 @@ fn left_click_on_row_selects_it() {
     let rect = seed_work_item_list(&mut app, 20, 15);
     // Register one row target at y=5 covering the full body width.
     {
-        let mut reg = app.click_registry.borrow_mut();
+        let mut reg = app.click_tracking.registry.borrow_mut();
         reg.push_work_item_row(
             UiRect {
                 x: rect.x,
@@ -538,7 +538,7 @@ fn drawer_open_suppresses_work_item_row_click() {
     let mut app = App::new();
     let rect = seed_work_item_list(&mut app, 20, 15);
     {
-        let mut reg = app.click_registry.borrow_mut();
+        let mut reg = app.click_tracking.registry.borrow_mut();
         reg.push_work_item_row(
             UiRect {
                 x: rect.x,
