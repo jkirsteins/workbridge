@@ -37,6 +37,33 @@ CI runs them as hard gates. To match CI locally:
 cargo install cargo-audit cargo-deny cargo-machete typos-cli
 ```
 
+#### Adding another tool that internally runs git
+
+If you add a new pre-commit or pre-push step that shells out to a
+cargo tool (or any tool) whose work involves running `git` as a
+subprocess - think `cargo-deny`'s advisory-db update, `cargo-audit`'s
+RustSec sync, or any future tool that maintains a local git-backed
+database - wrap that call in a subshell that unsets the inherited git
+env vars:
+
+```sh
+(
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+    cargo some-tool check
+)
+```
+
+Otherwise the child `git` calls inherit `GIT_DIR` / `GIT_INDEX_FILE`
+from the `git commit` (or `git push`) process that invoked the hook,
+and any `git fetch` / `git reset` the tool runs against its own
+database silently operates on THIS worktree instead. The symptoms
+range from empty commit trees (staged changes vanish) to
+`fatal: cannot lock ref 'HEAD'` at commit time, and they are hard
+to diagnose because the failure is in a subprocess, not in your
+code. The existing `cargo deny` call in `hooks/pre-commit` and the
+top-of-hook unset in `hooks/pre-push` are the reference patterns;
+copy whichever fits the surrounding structure.
+
 ### File-size budgets
 
 `ci/file-size-budgets.toml` declares a maximum line count per source
