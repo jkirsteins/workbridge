@@ -20,38 +20,38 @@ use serde_json::{Value, json};
 /// An MCP event sent from the socket handler to the main TUI thread.
 #[derive(Clone, Debug)]
 pub enum McpEvent {
-    /// Claude called workbridge_set_status.
+    /// Claude called `workbridge_set_status`.
     StatusUpdate {
         work_item_id: String,
         status: String,
         reason: String,
     },
-    /// Claude called workbridge_log_event.
+    /// Claude called `workbridge_log_event`.
     LogEvent {
         work_item_id: String,
         event_type: String,
         payload: Value,
     },
-    /// Claude called workbridge_set_plan.
+    /// Claude called `workbridge_set_plan`.
     SetPlan { work_item_id: String, plan: String },
-    /// Claude called workbridge_set_title.
+    /// Claude called `workbridge_set_title`.
     SetTitle { work_item_id: String, title: String },
-    /// Claude called workbridge_set_activity.
+    /// Claude called `workbridge_set_activity`.
     SetActivity { work_item_id: String, working: bool },
-    /// Claude called workbridge_delete.
+    /// Claude called `workbridge_delete`.
     DeleteWorkItem { work_item_id: String },
-    /// Claude called workbridge_approve_review or workbridge_request_changes.
+    /// Claude called `workbridge_approve_review` or `workbridge_request_changes`.
     SubmitReview {
         work_item_id: String,
         action: String,
         comment: String,
     },
-    /// Claude called workbridge_report_progress during review gate.
+    /// Claude called `workbridge_report_progress` during review gate.
     ReviewGateProgress {
         work_item_id: String,
         message: String,
     },
-    /// Claude called workbridge_create_work_item from the global assistant.
+    /// Claude called `workbridge_create_work_item` from the global assistant.
     CreateWorkItem {
         title: String,
         description: String,
@@ -165,7 +165,7 @@ struct SessionMcpConfig {
 /// Each connection is handled independently so that a stale health-check
 /// connection cannot block subsequent real connections.
 ///
-/// The WouldBlock backoff routes through `side_effects::clock::sleep`
+/// The `WouldBlock` backoff routes through `side_effects::clock::sleep`
 /// rather than a raw stdlib sleep call. In production that wrapper
 /// forwards to the real 50ms pause, which is what the loop wants.
 /// Under `#[cfg(test)]` the same call becomes a `yield_now` plus a
@@ -260,9 +260,8 @@ fn handle_global_connection(
     if stream.set_nonblocking(false).is_err() {
         return;
     }
-    let reader_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
+    let Ok(reader_stream) = stream.try_clone() else {
+        return;
     };
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
@@ -299,9 +298,8 @@ fn handle_connection(
     if stream.set_nonblocking(false).is_err() {
         return;
     }
-    let reader_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
+    let Ok(reader_stream) = stream.try_clone() else {
+        return;
     };
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
@@ -333,6 +331,10 @@ fn handle_connection(
 /// NDJSON is tried first (if the first non-empty line starts with `{`),
 /// otherwise Content-Length headers are expected.
 fn read_message(reader: &mut impl BufRead) -> io::Result<Value> {
+    // Cap allocation to 16 MB to prevent a malicious or buggy
+    // Content-Length header from causing an out-of-memory condition.
+    const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
     let mut content_length: Option<usize> = None;
     loop {
         let mut line = String::new();
@@ -364,9 +366,6 @@ fn read_message(reader: &mut impl BufRead) -> io::Result<Value> {
         io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
     })?;
 
-    // Cap allocation to 16 MB to prevent a malicious or buggy
-    // Content-Length header from causing an out-of-memory condition.
-    const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
     if len > MAX_MESSAGE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -452,14 +451,20 @@ fn handle_message(
             // accurate for every workbridge_* tool, including
             // `workbridge_delete` (deletes a workbridge record, not
             // a filesystem path).
-            const READ_ONLY_ANNOTATIONS: &str =
-                r#"{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}"#;
-            const MUTATING_ANNOTATIONS: &str =
-                r#"{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}"#;
-            let read_only_anno: serde_json::Value =
-                serde_json::from_str(READ_ONLY_ANNOTATIONS).expect("static JSON");
-            let mutating_anno: serde_json::Value =
-                serde_json::from_str(MUTATING_ANNOTATIONS).expect("static JSON");
+            // Build the annotation objects directly via the `json!`
+            // macro rather than parsing a string literal; this is
+            // infallible at the type-checker level and avoids a
+            // source-level restriction-lint `expect()` call.
+            let read_only_anno: serde_json::Value = json!({
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "openWorldHint": false,
+            });
+            let mutating_anno: serde_json::Value = json!({
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "openWorldHint": false,
+            });
 
             // Read-only tools available for all sessions (including
             // read-only review gate sessions).
@@ -662,7 +667,10 @@ fn handle_message(
             let id = id?;
             let params = msg.get("params")?;
             let tool_name = params.get("name")?.as_str()?;
-            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
 
             // Reject mutating tool calls in read-only mode. Even if a
             // caller somehow discovers the tool name, the call is blocked.
@@ -930,7 +938,7 @@ fn handle_message(
                 "workbridge_set_activity" => {
                     let working = arguments
                         .get("working")
-                        .and_then(|v| v.as_bool())
+                        .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false);
 
                     let event = McpEvent::SetActivity {
@@ -997,7 +1005,8 @@ fn handle_message(
                     }
                 }
                 "workbridge_get_plan" => {
-                    let ctx: Value = serde_json::from_str(context_json).unwrap_or(json!({}));
+                    let ctx: Value =
+                        serde_json::from_str(context_json).unwrap_or_else(|_| json!({}));
                     let plan = ctx
                         .get("plan")
                         .and_then(|v| v.as_str())
@@ -1131,14 +1140,16 @@ fn handle_global_message(msg: &Value, context_json: &str, tx: &Sender<McpEvent>)
             // `readOnlyHint` / `destructiveHint` / `openWorldHint`
             // to decide whether to prompt before running the tool.
             // Absent annotations default to "require approval".
-            let read_only_anno: serde_json::Value = serde_json::from_str(
-                r#"{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}"#,
-            )
-            .expect("static JSON");
-            let mutating_anno: serde_json::Value = serde_json::from_str(
-                r#"{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}"#,
-            )
-            .expect("static JSON");
+            let read_only_anno: serde_json::Value = json!({
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "openWorldHint": false,
+            });
+            let mutating_anno: serde_json::Value = json!({
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "openWorldHint": false,
+            });
             let tools = vec![
                 json!({
                     "name": "workbridge_list_repos",
@@ -1210,7 +1221,10 @@ fn handle_global_message(msg: &Value, context_json: &str, tx: &Sender<McpEvent>)
             let id = id?;
             let params = msg.get("params")?;
             let tool_name = params.get("name")?.as_str()?;
-            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
 
             // Parse the dynamic context once per tool call.
             let ctx: Value = match serde_json::from_str(context_json) {
@@ -1268,7 +1282,7 @@ fn handle_global_message(msg: &Value, context_json: &str, tx: &Sender<McpEvent>)
                             })
                         })
                         .cloned()
-                        .unwrap_or(json!({"error": "repo not found in managed repos"}));
+                        .unwrap_or_else(|| json!({"error": "repo not found in managed repos"}));
 
                     let text = serde_json::to_string_pretty(&repo_info).unwrap_or_default();
                     Some(json!({
@@ -1409,9 +1423,8 @@ pub fn run_bridge(socket_path: PathBuf) {
         let mut buf = [0u8; 8192];
         loop {
             let n = match reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => n,
-                Err(_) => break,
             };
             if writer.write_all(&buf[..n]).is_err() {
                 break;
@@ -1430,9 +1443,8 @@ pub fn run_bridge(socket_path: PathBuf) {
         let mut buf = [0u8; 8192];
         loop {
             let n = match reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => n,
-                Err(_) => break,
             };
             if writer.write_all(&buf[..n]).is_err() {
                 break;
@@ -1846,7 +1858,7 @@ mod tests {
         let server = McpSocketServer::start(
             socket_path.clone(),
             "test-wi".into(),
-            "".into(),
+            String::new(),
             "{}".into(),
             None,
             tx,
@@ -1993,8 +2005,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(
             err.to_string().contains("exceeds maximum"),
-            "error should mention size limit, got: {}",
-            err,
+            "error should mention size limit, got: {err}",
         );
     }
 
@@ -2044,7 +2055,7 @@ mod tests {
         let server = McpSocketServer::start(
             socket_path.clone(),
             "integration-wi".into(),
-            "".into(),
+            String::new(),
             "{}".into(),
             None,
             tx,
@@ -2109,13 +2120,13 @@ mod tests {
                 assert_eq!(work_item_id, "integration-wi");
                 assert_eq!(plan, plan_text);
             }
-            other => panic!("expected SetPlan event, got: {:?}", other),
+            other => panic!("expected SetPlan event, got: {other:?}"),
         }
 
         // No temp files should have been created (regression: debug logging removed).
         let tmp_entries: Vec<_> = std::fs::read_dir("/tmp")
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| {
                 e.file_name()
                     .to_string_lossy()
@@ -2124,8 +2135,7 @@ mod tests {
             .collect();
         assert!(
             tmp_entries.is_empty(),
-            "no debug temp files should exist, found: {:?}",
-            tmp_entries,
+            "no debug temp files should exist, found: {tmp_entries:?}",
         );
 
         server.stop();
@@ -2165,7 +2175,7 @@ mod tests {
 
     // -- Review gate MCP wording regression tests --
 
-    /// Regression: set_status("Review") response must contain "NOT changed"
+    /// Regression: `set_status("Review`") response must contain "NOT changed"
     /// and "review gate" to prevent Claude from telling the user the status
     /// changed when it has not (it is pending gate approval).
     #[test]
@@ -2195,7 +2205,7 @@ mod tests {
         );
     }
 
-    /// Regression: set_status("Blocked") response must NOT contain "NOT changed"
+    /// Regression: `set_status("Blocked`") response must NOT contain "NOT changed"
     /// since non-Review transitions are applied immediately.
     #[test]
     fn set_status_blocked_response_does_not_contain_not_changed() {

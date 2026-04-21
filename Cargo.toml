@@ -53,21 +53,73 @@ tempfile = "3"
 # lifetimes, no bare trait objects, etc. Set to "warn" rather than
 # "deny" so the group can be raised incrementally; CI's
 # `-D warnings` then promotes any warning to an error.
-# Baseline verified clean on 2026-04-21.
-rust_2018_idioms = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+# `unsafe_code` at `warn` (not `forbid`) because the PTY FFI in
+# `src/session.rs` and the two `killpg` blocks in `src/app.rs` are
+# legitimate and SAFETY-commented. Each legitimate unsafe site opts
+# out via `#[expect(unsafe_code, reason = "...")]` (not `#[allow]`,
+# because `clippy::allow_attributes` is denied). Review policy in
+# CONTRIBUTING.md ("Unsafe code policy") requires a SAFETY comment
+# and a reviewer for any new unsafe block.
+unsafe_code = "warn"
 
 [lints.clippy]
 # Prohibit accidental dbg! / todo! / unimplemented! in committed code.
-# Baseline verified clean on 2026-04-20.
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
 
-# Pedantic, nursery, and restriction carpet-bombs are intentionally
-# not set here. They ship in Phase 3 of the hygiene campaign, which
-# has the budget for cleaning the findings they produce. Raising them
-# in Phase 1 would either require #[allow] in source (prohibited) or
-# generate CI failures before the cleanup work exists.
+# Carpet-bombs at warn: promoted to error via CI's -D warnings. These
+# were flipped in Phase 3 of the hygiene campaign after the mechanical
+# findings were cleaned up. `priority = -1` lets individual
+# `allow`/`deny` lines below override a group-level warn.
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Restriction lints - production code only; tests carve out via CI's
+# two-invocation pattern (`-A clippy::unwrap_used ...` on --tests).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+# Close the source-level allow loophole so Phase 3's cleanup does not
+# regress through "just add #[allow]" pressure. Every suppression now
+# has to live in this file with a rationale.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
+# CLI-surface allows: main.rs is the CLI entry point; non-CLI code
+# routes user-visible output through the toast / status-bar subsystem,
+# enforced by review rather than by the lint.
+print_stdout = "allow"
+print_stderr = "allow"
+exit = "allow"
+
+# Design-doc noise allows (per the hygiene campaign design doc Phase 1
+# block list). Each has been judged pure noise for this crate's style.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"   # File-size budget is the real enforcement.
+similar_names = "allow"    # False-positive-heavy in TUI / event code.
+
+# TUI cast allows: the ratatui geometry surface is u16 width/height;
+# almost every cast the lint flags is u16<->u32<->usize arithmetic on
+# those inputs, which is safe for realistic terminal sizes.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+cast_precision_loss = "allow"
+
+# Phase-4-deferred structural lints: all sites are in src/app.rs and
+# the cleanup requires the decomposition that Phase 4 will do. These
+# allow entries flip back to warn in the Phase 4 PR that finishes the
+# split.
+needless_pass_by_value = "allow"
+significant_drop_tightening = "allow"
+struct_excessive_bools = "allow"
+unused_self = "allow"
 
 [lints.rustdoc]
 # No existing crate-level docs to break; safe to deny from day one.

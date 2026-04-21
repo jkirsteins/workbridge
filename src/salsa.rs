@@ -22,10 +22,14 @@ use crate::{event, fetcher, github_client, layout, ui, worktree_service};
 /// Custom event type for the application.
 ///
 /// Each variant wraps one of the event sources that rat-salsa's poll
-/// implementations produce. The From impls below satisfy the trait
-/// bounds that PollCrossterm, PollTimers, and PollRendered require.
+/// implementations produce. The `From` impls below satisfy the trait
+/// bounds that `PollCrossterm`, `PollTimers`, and `PollRendered` require.
+///
+/// An aspirational `Message(AppMessage)` variant was removed when
+/// Phase 3 of the hygiene campaign eliminated dead `#[allow(dead_code)]`
+/// attributes; re-add it (and its dispatcher arm) in the same commit
+/// as the first real producer when inter-component messaging lands.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum AppEvent {
     /// Terminal events (keyboard, mouse, resize) from crossterm.
     Crossterm(ct::event::Event),
@@ -33,28 +37,13 @@ pub enum AppEvent {
     Timer(TimeOut),
     /// Sent immediately after a frame render completes.
     Rendered,
-    /// Internal messages between components (future: dialog results).
-    #[allow(dead_code)]
-    Message(AppMessage),
-}
-
-/// Internal messages between components (for future use).
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum AppMessage {
-    CreateConfirmed {
-        title: String,
-        repos: Vec<std::path::PathBuf>,
-        branch: Option<String>,
-    },
-    CreateCancelled,
 }
 
 /// Application error type.
 ///
 /// Wraps the error kinds that can occur during the rat-salsa event
-/// loop. run_tui requires `Error: From<io::Error>`.
-/// RunConfig::default() requires `Error: From<crossbeam::channel::TryRecvError>`.
+/// loop. `run_tui` requires `Error: From<io::Error>`.
+/// `RunConfig::default()` requires `Error: From<crossbeam::channel::TryRecvError>`.
 #[derive(Debug)]
 pub enum AppError {
     Io(std::io::Error),
@@ -64,21 +53,21 @@ pub enum AppError {
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AppError::Io(e) => write!(f, "{}", e),
-            AppError::General(msg) => write!(f, "{}", msg),
+            Self::Io(e) => write!(f, "{e}"),
+            Self::General(msg) => write!(f, "{msg}"),
         }
     }
 }
 
 impl From<std::io::Error> for AppError {
     fn from(e: std::io::Error) -> Self {
-        AppError::Io(e)
+        Self::Io(e)
     }
 }
 
 impl From<crossbeam_channel::TryRecvError> for AppError {
     fn from(e: crossbeam_channel::TryRecvError) -> Self {
-        AppError::General(format!("channel recv error: {}", e))
+        Self::General(format!("channel recv error: {e}"))
     }
 }
 
@@ -86,26 +75,26 @@ impl From<crossbeam_channel::TryRecvError> for AppError {
 
 impl From<ct::event::Event> for AppEvent {
     fn from(event: ct::event::Event) -> Self {
-        AppEvent::Crossterm(event)
+        Self::Crossterm(event)
     }
 }
 
 impl From<TimeOut> for AppEvent {
     fn from(timeout: TimeOut) -> Self {
-        AppEvent::Timer(timeout)
+        Self::Timer(timeout)
     }
 }
 
 impl From<RenderedEvent> for AppEvent {
     fn from(_: RenderedEvent) -> Self {
-        AppEvent::Rendered
+        Self::Rendered
     }
 }
 
-/// Global context that implements SalsaContext.
+/// Global context that implements `SalsaContext`.
 ///
-/// This is the "thin" global state that rat-salsa's run_tui requires.
-/// It holds the SalsaAppContext (which run_tui populates during init),
+/// This is the "thin" global state that rat-salsa's `run_tui` requires.
+/// It holds the `SalsaAppContext` (which `run_tui` populates during init),
 /// plus application-wide immutable state like the theme and signal flag.
 ///
 /// All mutable application state lives in the State parameter (the
@@ -249,6 +238,10 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
 
 /// Render callback. Called by rat-salsa when the UI needs to be redrawn.
 /// Receives a raw Buffer instead of a Frame - widgets render directly to it.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "rat-salsa `run_tui` render-callback contract requires `Result<(), E>`"
+)]
 pub fn app_render(
     area: Rect,
     buf: &mut Buffer,
@@ -262,6 +255,10 @@ pub fn app_render(
 
 /// Event callback. Dispatches crossterm events to key/resize handlers,
 /// timer events to periodic work (liveness, fetch drain, signals, shutdown).
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "rat-salsa `run_tui` event-callback contract requires `Result<Control<E>, E>`"
+)]
 pub fn app_event(
     evt: &AppEvent,
     state: &mut App,
@@ -315,6 +312,11 @@ pub fn app_event(
             Ok(Control::Changed)
         }
         AppEvent::Timer(timeout) => {
+            // The render tick fires at ~120fps (8ms).  Heavy background
+            // work only runs every BACKGROUND_TICK_DIVISOR-th tick to
+            // keep CPU usage reasonable (~200ms cadence).
+            const BACKGROUND_TICK_DIVISOR: usize = 25;
+
             // Flush any buffered PTY writes before rendering. Key events
             // that forward to the PTY buffer bytes instead of writing
             // immediately, so rapid keystrokes (e.g. drag-and-drop
@@ -324,10 +326,6 @@ pub fn app_event(
             // behavior.
             state.flush_pty_buffers();
 
-            // The render tick fires at ~120fps (8ms).  Heavy background
-            // work only runs every BACKGROUND_TICK_DIVISOR-th tick to
-            // keep CPU usage reasonable (~200ms cadence).
-            const BACKGROUND_TICK_DIVISOR: usize = 25;
             let is_background_tick = timeout.counter % BACKGROUND_TICK_DIVISOR == 0;
 
             if is_background_tick {
@@ -503,17 +501,16 @@ pub fn app_event(
                         // exit.
                         state.force_kill_all();
                         return Ok(Control::Quit);
-                    } else {
-                        // First signal - initiate graceful shutdown.
-                        state.send_sigterm_all();
-                        state.cleanup_all_mcp();
-                        state.shutting_down = true;
-                        state.shutdown_started = Some(crate::side_effects::clock::instant_now());
-                        state.status_message =
-                            Some("Waiting for sessions (force quit in 10s, or press Q)".into());
-                        if state.all_dead() {
-                            return Ok(Control::Quit);
-                        }
+                    }
+                    // First signal - initiate graceful shutdown.
+                    state.send_sigterm_all();
+                    state.cleanup_all_mcp();
+                    state.shutting_down = true;
+                    state.shutdown_started = Some(crate::side_effects::clock::instant_now());
+                    state.status_message =
+                        Some("Waiting for sessions (force quit in 10s, or press Q)".into());
+                    if state.all_dead() {
+                        return Ok(Control::Quit);
                     }
                 }
 
@@ -598,10 +595,6 @@ pub fn app_event(
             Ok(Control::Changed)
         }
         AppEvent::Rendered => Ok(Control::Continue),
-        AppEvent::Message(_msg) => {
-            // Future: handle inter-component messages (dialog results).
-            Ok(Control::Continue)
-        }
     }
 }
 
@@ -612,12 +605,11 @@ pub fn app_error(
     state: &mut App,
     _ctx: &mut Global,
 ) -> Result<Control<AppEvent>, AppError> {
-    match err {
-        AppError::Io(_) => Err(err),
-        _ => {
-            state.status_message = Some(format!("Error: {err}"));
-            Ok(Control::Changed)
-        }
+    if let AppError::Io(_) = err {
+        Err(err)
+    } else {
+        state.status_message = Some(format!("Error: {err}"));
+        Ok(Control::Changed)
     }
 }
 
@@ -625,7 +617,7 @@ pub fn app_error(
 mod tests {
     use super::*;
 
-    /// F-1: app_error re-raises I/O errors instead of swallowing them.
+    /// F-1: `app_error` re-raises I/O errors instead of swallowing them.
     /// Terminal and poll failures must propagate so rat-salsa exits
     /// cleanly rather than looping with a broken terminal.
     #[test]

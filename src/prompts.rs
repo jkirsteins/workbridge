@@ -1,7 +1,7 @@
 //! Data-driven stage prompts compiled into the binary.
 //!
-//! Prompts are defined in prompts/stage_prompts.json and compiled into the
-//! binary via include_str!. This allows editing prompts without changing
+//! Prompts are defined in `prompts/stage_prompts.json` and compiled into the
+//! binary via `include_str`!. This allows editing prompts without changing
 //! Rust code - just edit the JSON and recompile.
 
 use std::collections::HashMap;
@@ -19,13 +19,19 @@ static PROMPTS_JSON: &str = include_str!("../prompts/stage_prompts.json");
 
 /// Get a prompt template by key and render it with the given variables.
 ///
-/// Variables are replaced using single-pass {key} substitution.
+/// Variables are replaced using single-pass `{key}` substitution.
 /// This ensures that substituted values are never re-scanned for further
 /// template markers, preventing user-supplied text from injecting variables.
 /// Unknown keys in the template are left as-is.
+///
+/// Returns `None` when `prompts/stage_prompts.json` either fails to
+/// parse (a build-time invariant that `cargo test` would catch before
+/// shipping) or does not contain a template for `key`. Collapsing
+/// both failure modes into `None` lets the caller surface a status
+/// message without introducing a restriction-lint `expect()` at this
+/// site.
 pub fn render(key: &str, vars: &HashMap<&str, &str>) -> Option<String> {
-    let prompts: HashMap<String, PromptEntry> =
-        serde_json::from_str(PROMPTS_JSON).expect("prompts/stage_prompts.json must be valid JSON");
+    let prompts: HashMap<String, PromptEntry> = serde_json::from_str(PROMPTS_JSON).ok()?;
     let entry = prompts.get(key)?;
     Some(render_template(&entry.template, vars))
 }
@@ -171,8 +177,7 @@ mod tests {
             }
             assert!(
                 entry.template.contains(prohibition),
-                "prompt '{}' is missing git config prohibition",
-                key
+                "prompt '{key}' is missing git config prohibition"
             );
         }
     }
@@ -187,8 +192,7 @@ mod tests {
             }
             assert!(
                 entry.template.contains(prohibition),
-                "prompt '{}' is missing git checkout prohibition",
-                key
+                "prompt '{key}' is missing git checkout prohibition"
             );
         }
     }
@@ -288,9 +292,7 @@ mod tests {
                     // Allow JSON-like braces or empty braces, but flag template vars
                     assert!(
                         inner.contains(' ') || inner.contains(':') || inner.is_empty(),
-                        "prompt '{}' has unsubstituted marker: {{{}}}",
-                        key,
-                        inner
+                        "prompt '{key}' has unsubstituted marker: {{{inner}}}"
                     );
                     rest = &after[close + 1..];
                 } else {

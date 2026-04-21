@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::{fmt, fs};
 
 use serde::{Deserialize, Serialize};
@@ -8,9 +7,8 @@ use serde::{Deserialize, Serialize};
 /// Abstracts config persistence so tests can use an in-memory store
 /// instead of writing to the real config file.
 pub trait ConfigProvider {
-    /// Load the persisted config. Used by FileConfigProvider at startup
-    /// and by InMemoryConfigProvider in tests.
-    #[allow(dead_code)]
+    /// Load the persisted config. Used by `FileConfigProvider` at
+    /// startup and by the test-only `InMemoryConfigProvider`.
     fn load(&self) -> Result<Config, ConfigError>;
     fn save(&self, config: &Config) -> Result<(), ConfigError>;
 }
@@ -34,44 +32,63 @@ impl ConfigProvider for FileConfigProvider {
     }
 }
 
-/// In-memory config provider for tests. Never touches disk.
-/// Constructed only in `#[cfg(test)]` code.
-#[allow(dead_code)]
-pub struct InMemoryConfigProvider {
-    data: Mutex<Option<String>>,
-}
+/// Test-only helpers. Gated behind `#[cfg(test)]` so the production
+/// build never sees these items, which keeps `dead_code` clean without
+/// needing source-level `#[allow]` attributes. Tests import
+/// `crate::config::InMemoryConfigProvider` via the `pub use` re-export
+/// below, so existing call sites do not need updating.
+#[cfg(test)]
+pub mod test_support {
+    use std::sync::Mutex;
 
-impl InMemoryConfigProvider {
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self {
-            data: Mutex::new(None),
-        }
+    use super::{Config, ConfigError, ConfigProvider};
+
+    /// In-memory config provider for tests. Never touches disk.
+    pub struct InMemoryConfigProvider {
+        data: Mutex<Option<String>>,
     }
-}
 
-impl ConfigProvider for InMemoryConfigProvider {
-    fn load(&self) -> Result<Config, ConfigError> {
-        let guard = self.data.lock().unwrap();
-        match &*guard {
-            Some(contents) => {
-                let cfg: Config = toml::from_str(contents).map_err(ConfigError::Parse)?;
-                Ok(cfg)
+    impl InMemoryConfigProvider {
+        pub fn new() -> Self {
+            Self {
+                data: Mutex::new(None),
             }
-            None => Ok(Config::default()),
         }
     }
 
-    fn save(&self, config: &Config) -> Result<(), ConfigError> {
-        let contents = toml::to_string_pretty(config).map_err(ConfigError::Serialize)?;
-        let mut guard = self.data.lock().unwrap();
-        *guard = Some(contents);
-        Ok(())
+    impl ConfigProvider for InMemoryConfigProvider {
+        fn load(&self) -> Result<Config, ConfigError> {
+            let guard = self.data.lock().unwrap();
+            match &*guard {
+                Some(contents) => {
+                    let cfg: Config = toml::from_str(contents).map_err(ConfigError::Parse)?;
+                    Ok(cfg)
+                }
+                None => Ok(Config::default()),
+            }
+        }
+
+        fn save(&self, config: &Config) -> Result<(), ConfigError> {
+            let contents = toml::to_string_pretty(config).map_err(ConfigError::Serialize)?;
+            let mut guard = self.data.lock().unwrap();
+            *guard = Some(contents);
+            Ok(())
+        }
     }
 }
+
+#[cfg(test)]
+pub use test_support::InMemoryConfigProvider;
 
 /// Get the user's home directory via the side-effects gate. Returns
 /// `None` under `cfg(test)` so tests cannot reach the real `$HOME`.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "delegates to a side-effects gate that is `const` only under cfg(test); under cfg(not(test)) the body calls a non-const user-dirs helper and cannot be const"
+    )
+)]
 fn home_dir() -> Option<PathBuf> {
     crate::side_effects::paths::home_dir()
 }
@@ -159,7 +176,7 @@ pub struct Defaults {
     /// harnesses on PATH and persists the pick here. Settable non-
     /// interactively via `workbridge config set global-assistant-
     /// harness <name>`. "opencode" is not a valid value: the stub
-    /// adapter for OpenCode exists only as internal scaffolding and
+    /// adapter for `OpenCode` exists only as internal scaffolding and
     /// is not user-selectable (rejected by `AgentBackendKind::from_str`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_assistant_harness: Option<String>,
@@ -177,7 +194,7 @@ fn default_review_skill() -> String {
     "/claude-adversarial-review".into()
 }
 
-fn default_archive_after_days() -> u64 {
+const fn default_archive_after_days() -> u64 {
     7
 }
 
@@ -224,13 +241,13 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::Io(e) => write!(f, "I/O error: {e}"),
-            ConfigError::Parse(e) => write!(f, "config parse error: {e}"),
-            ConfigError::Serialize(e) => write!(f, "config serialization error: {e}"),
-            ConfigError::NoConfigDir => write!(f, "could not determine config directory"),
-            ConfigError::PathNotFound(p) => write!(f, "path not found: {p}"),
-            ConfigError::NotAGitRepo(p) => write!(f, "not a git repository: {p}"),
-            ConfigError::DuplicateMcpServer { repo, name } => {
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Parse(e) => write!(f, "config parse error: {e}"),
+            Self::Serialize(e) => write!(f, "config serialization error: {e}"),
+            Self::NoConfigDir => write!(f, "could not determine config directory"),
+            Self::PathNotFound(p) => write!(f, "path not found: {p}"),
+            Self::NotAGitRepo(p) => write!(f, "not a git repository: {p}"),
+            Self::DuplicateMcpServer { repo, name } => {
                 write!(f, "MCP server '{name}' already exists for repo '{repo}'")
             }
         }
@@ -239,7 +256,7 @@ impl fmt::Display for ConfigError {
 
 impl From<std::io::Error> for ConfigError {
     fn from(e: std::io::Error) -> Self {
-        ConfigError::Io(e)
+        Self::Io(e)
     }
 }
 
@@ -314,9 +331,9 @@ impl Config {
     /// as the source. Avoids tests needing to specify every field.
     #[cfg(test)]
     pub fn for_test() -> Self {
-        Config {
+        Self {
             source: "in-memory (test)".into(),
-            ..Config::default()
+            ..Self::default()
         }
     }
 
@@ -327,13 +344,13 @@ impl Config {
         let path = config_path()?;
         let source = format!("{}", path.display());
         if !path.exists() {
-            return Ok(Config {
+            return Ok(Self {
                 source: format!("{source} (not yet created)"),
-                ..Config::default()
+                ..Self::default()
             });
         }
         let contents = fs::read_to_string(&path)?;
-        let mut cfg: Config = toml::from_str(&contents).map_err(ConfigError::Parse)?;
+        let mut cfg: Self = toml::from_str(&contents).map_err(ConfigError::Parse)?;
         cfg.source = source;
         // Normalize included_repos so hand-edited paths (relative, non-canonical)
         // match correctly in active_repos() filtering.
@@ -384,7 +401,7 @@ impl Config {
         Ok((display, count))
     }
 
-    /// Remove a path from repos, base_dirs, and included_repos.
+    /// Remove a path from repos, `base_dirs`, and `included_repos`.
     pub fn remove_path(&mut self, raw: &str) -> bool {
         let target = expand_tilde(raw);
         let target_canonical = canonicalize_path(&target).ok();
@@ -415,7 +432,7 @@ impl Config {
         after < before
     }
 
-    /// Discover git repos under all base_dirs (one level deep).
+    /// Discover git repos under all `base_dirs` (one level deep).
     pub fn discover_repos(&self) -> Vec<PathBuf> {
         let mut found = Vec::new();
         for base in &self.base_dirs {
@@ -518,7 +535,7 @@ impl Config {
         let normalized = normalize_repo_path(repo);
         let count = entries.len();
         for mut entry in entries {
-            entry.repo = normalized.clone();
+            entry.repo.clone_from(&normalized);
             if let Some(existing) = self
                 .mcp_servers
                 .iter_mut()
@@ -559,12 +576,11 @@ impl Config {
 /// directory and then renaming. On POSIX, rename within the same filesystem
 /// is atomic, so a crash mid-write leaves the original file intact.
 fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp_path = parent.join(format!(
         ".{}.tmp",
         path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "config".into())
+            .map_or_else(|| "config".into(), |n| n.to_string_lossy().into_owned())
     ));
     fs::write(&tmp_path, data)?;
     fs::rename(&tmp_path, path)?;
@@ -631,8 +647,8 @@ mod tests {
 
     #[test]
     fn save_and_load_roundtrip() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         let path = dir.join("config.toml");
 
         let config = Config {
@@ -651,8 +667,8 @@ mod tests {
 
     #[test]
     fn discover_repos_finds_git_dirs() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         fs::create_dir_all(dir.join("repo-a/.git")).unwrap();
         fs::create_dir_all(dir.join("repo-b/.git")).unwrap();
         fs::create_dir_all(dir.join("not-a-repo")).unwrap();
@@ -665,8 +681,8 @@ mod tests {
 
     #[test]
     fn discover_repos_empty_dir() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
 
         let found = discover_git_repos_in(&dir);
         assert!(found.is_empty());
@@ -680,8 +696,8 @@ mod tests {
 
     #[test]
     fn add_repo_validates_git_dir() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         fs::create_dir_all(dir.join(".git")).unwrap();
 
         let mut config = Config::default();
@@ -692,8 +708,8 @@ mod tests {
 
     #[test]
     fn add_repo_rejects_non_repo() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
 
         let mut config = Config::default();
         let result = config.add_repo(dir.to_str().unwrap());
@@ -702,8 +718,8 @@ mod tests {
 
     #[test]
     fn add_base_dir_accepts_directory() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         fs::create_dir_all(dir.join("child-repo/.git")).unwrap();
 
         let mut config = Config::default();
@@ -889,8 +905,8 @@ mod tests {
 
     #[test]
     fn remove_path_removes_repo() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         fs::create_dir_all(dir.join(".git")).unwrap();
 
         let mut config = Config::default();

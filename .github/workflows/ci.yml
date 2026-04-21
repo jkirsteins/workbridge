@@ -30,7 +30,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # Two-invocation pattern lives in hooks/clippy-check.sh so this
+      # job and hooks/pre-commit share exactly one copy of the flag
+      # set. See hooks/clippy-check.sh and
+      # docs/hygiene-campaign/phase-3-calibration.md for the rationale.
+      - run: ./hooks/clippy-check.sh
 
   test:
     runs-on: ubuntu-latest

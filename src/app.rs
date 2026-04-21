@@ -72,21 +72,30 @@ pub fn short_display(value: &str, kind: ClickKind) -> String {
         ClickKind::PrUrl => {
             // Find `/pull/` and keep everything from one segment
             // before it: e.g. `owner/repo/pull/123`.
-            if let Some(idx) = value.find("/pull/") {
-                let before = &value[..idx];
-                let owner_repo = before.rsplit('/').take(2).collect::<Vec<_>>();
-                let owner_repo = owner_repo.into_iter().rev().collect::<Vec<_>>().join("/");
-                let tail = &value[idx..];
-                format!("{owner_repo}{tail}")
-            } else {
-                truncate_tail(value, MAX)
-            }
+            value.find("/pull/").map_or_else(
+                || truncate_tail(value, MAX),
+                |idx| {
+                    let before = &value[..idx];
+                    let owner_repo = before
+                        .rsplit('/')
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    let tail = &value[idx..];
+                    format!("{owner_repo}{tail}")
+                },
+            )
         }
         ClickKind::RepoPath => std::path::Path::new(value)
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| truncate_tail(value, MAX)),
+            .map_or_else(
+                || truncate_tail(value, MAX),
+                std::string::ToString::to_string,
+            ),
         ClickKind::Branch | ClickKind::Title => truncate_head(value, MAX),
     }
 }
@@ -147,7 +156,7 @@ pub enum DashboardWindow {
 
 impl DashboardWindow {
     /// Number of days the window covers (inclusive of today).
-    pub fn days(self) -> i64 {
+    pub const fn days(self) -> i64 {
         match self {
             Self::Week => 7,
             Self::Month => 30,
@@ -157,7 +166,7 @@ impl DashboardWindow {
     }
 
     /// Short label shown in the header strip.
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Week => "7d",
             Self::Month => "30d",
@@ -170,7 +179,7 @@ impl DashboardWindow {
 /// Cursor state for the board view.
 /// Tracks which column is selected and which item within that column.
 pub struct BoardCursor {
-    /// Index into BOARD_COLUMNS (0=Backlog, 1=Planning, 2=Implementing, 3=Review).
+    /// Index into `BOARD_COLUMNS` (0=Backlog, 1=Planning, 2=Implementing, 3=Review).
     pub column: usize,
     /// Index of the selected item within the column, or None if column is empty.
     pub row: Option<usize>,
@@ -178,8 +187,8 @@ pub struct BoardCursor {
 
 /// The four visible columns in the board view (Done is hidden).
 /// Sentinel title used when a quick-start work item is created before the
-/// user has specified what they want to work on. The planning_quickstart
-/// system prompt instructs Claude to call workbridge_set_title once the
+/// user has specified what they want to work on. The `planning_quickstart`
+/// system prompt instructs Claude to call `workbridge_set_title` once the
 /// user explains the task, replacing this placeholder.
 pub const QUICKSTART_TITLE: &str = "Quick start";
 
@@ -218,7 +227,7 @@ pub enum SettingsListFocus {
 
 /// Lightweight display data for the work-item context bar.
 ///
-/// Derived from the currently selected WorkItem's fields on each call
+/// Derived from the currently selected `WorkItem`'s fields on each call
 /// to `selected_work_item_context()`.
 #[derive(Clone, Debug)]
 pub struct WorkItemContext {
@@ -237,7 +246,7 @@ pub struct WorkItemContext {
 }
 
 /// Visual style variant for group headers.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GroupHeaderKind {
     Normal,
     Blocked,
@@ -252,11 +261,11 @@ pub enum DisplayEntry {
         count: usize,
         kind: GroupHeaderKind,
     },
-    /// A review-requested PR (index into App::review_requested_prs).
+    /// A review-requested PR (index into `App::review_requested_prs`).
     ReviewRequestItem(usize),
-    /// An unlinked PR (index into App::unlinked_prs).
+    /// An unlinked PR (index into `App::unlinked_prs`).
     UnlinkedItem(usize),
-    /// A work item (index into App::work_items).
+    /// A work item (index into `App::work_items`).
     WorkItemEntry(usize),
 }
 
@@ -433,7 +442,7 @@ pub enum ReviewGateMessage {
 /// Who initiated a review gate. Determines how `poll_review_gate`
 /// handles a `Blocked` outcome:
 ///
-/// - `Mcp`: Claude requested Review via workbridge_set_status and the
+/// - `Mcp`: Claude requested Review via `workbridge_set_status` and the
 ///   background gate decided it cannot run. The rework flow applies -
 ///   kill the existing session and respawn with the rejection reason so
 ///   Claude has feedback to iterate on.
@@ -442,7 +451,7 @@ pub enum ReviewGateMessage {
 ///   workspace - killing and respawning would be destructive. Only
 ///   surface the reason in the status bar and let the user decide.
 /// - `Auto`: An Implementing session died without calling
-///   workbridge_set_status("Review"). Auto-triggering the gate is a
+///   `workbridge_set_status("Review`"). Auto-triggering the gate is a
 ///   convenience; if it blocks we still want the rework flow so Claude
 ///   sees the reason on the next restart (mirrors Mcp semantics).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -599,6 +608,10 @@ pub struct RebaseGateState {
 /// `killpg` in `drop_rebase_gate`, just guaranteed for every removal
 /// path including ones we have not written yet.
 impl Drop for RebaseGateState {
+    #[expect(
+        unsafe_code,
+        reason = "libc::killpg FFI on a process-group id we spawned; SAFETY comment below"
+    )]
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::SeqCst);
         let pid_to_kill = self.child_pid.lock().ok().and_then(|mut slot| slot.take());
@@ -626,7 +639,7 @@ pub enum SubprocessOutcome {
     /// `Output.status` to determine success/failure.
     Completed(std::process::Output),
     /// The `cancelled` flag was set while the subprocess was alive.
-    /// The helper already SIGKILLed the process group and reaped
+    /// The helper already `SIGKILLed` the process group and reaped
     /// the child; the caller should exit the gate cleanly.
     Cancelled,
 }
@@ -655,6 +668,10 @@ pub enum SubprocessOutcome {
 /// helper. The helper makes the class of bug impossible to
 /// reintroduce at new call sites because the ordering is baked
 /// into one place rather than replicated.
+#[expect(
+    unsafe_code,
+    reason = "libc::killpg FFI on a process-group id we spawned; SAFETY comment below"
+)]
 pub fn run_cancellable(
     cmd: &mut std::process::Command,
     pid_slot: &Arc<Mutex<Option<u32>>>,
@@ -790,8 +807,8 @@ pub enum MergePreCheckMessage {
     /// not ride in this variant. `reason` is the user-facing alert
     /// text (it comes from `MergeReadiness::merge_block_message` for
     /// dirty / untracked / unpushed / PR-conflict / CI-failing, and
-    /// a custom string for the "list_worktrees failed" and
-    /// "fetch_live_merge_state failed" cases).
+    /// a custom string for the "`list_worktrees` failed" and
+    /// "`fetch_live_merge_state` failed" cases).
     Blocked { reason: String },
 }
 
@@ -814,9 +831,9 @@ pub struct ReviewSubmitResult {
 /// work item, returned by `MergeReadiness::classify`.
 ///
 /// The variants are ordered by merge-guard priority: the classifier
-/// returns the first matching one, so
-/// `Dirty > Untracked > Unpushed > PrConflict > CiFailing > BehindOnly
-/// > Clean`.
+/// returns the first matching one, so the effective order is
+/// `Dirty` > `Untracked` > `Unpushed` > `PrConflict` > `CiFailing` >
+/// `BehindOnly` > `Clean`.
 ///
 /// Local worktree states (`Dirty`, `Untracked`, `Unpushed`) rank above
 /// remote-PR states (`PrConflict`, `CiFailing`) because they represent
@@ -898,15 +915,15 @@ impl MergeReadiness {
         // committing locally, for instance).
         if let Some(wt) = wt {
             if wt.dirty.unwrap_or(false) {
-                return MergeReadiness::Dirty;
+                return Self::Dirty;
             }
             if wt.untracked.unwrap_or(false) {
-                return MergeReadiness::Untracked;
+                return Self::Untracked;
             }
             if let Some(ahead) = wt.unpushed
                 && ahead > 0
             {
-                return MergeReadiness::Unpushed(ahead);
+                return Self::Unpushed(ahead);
             }
         }
 
@@ -916,10 +933,10 @@ impl MergeReadiness {
                 live_pr.mergeable,
                 crate::work_item::MergeableState::Conflicting
             ) {
-                return MergeReadiness::PrConflict;
+                return Self::PrConflict;
             }
             if matches!(live_pr.check_rollup, crate::work_item::CheckStatus::Failing) {
-                return MergeReadiness::CiFailing;
+                return Self::CiFailing;
             }
         }
 
@@ -928,10 +945,10 @@ impl MergeReadiness {
             && let Some(behind) = wt.behind_remote
             && behind > 0
         {
-            return MergeReadiness::BehindOnly(behind);
+            return Self::BehindOnly(behind);
         }
 
-        MergeReadiness::Clean
+        Self::Clean
     }
 
     /// User-facing error text for a blocking state, or `None` when
@@ -942,16 +959,14 @@ impl MergeReadiness {
     /// separate `is_merge_blocking` predicate because that would
     /// make it possible (via copy-paste drift) for the predicate
     /// and the message to disagree on which variants block.
-    pub fn merge_block_message(&self) -> Option<&'static str> {
+    pub const fn merge_block_message(&self) -> Option<&'static str> {
         match self {
-            MergeReadiness::Dirty => Some("Uncommitted changes. Commit & push before merging."),
-            MergeReadiness::Untracked => {
-                Some("Untracked files. Commit/ignore & push before merging.")
-            }
-            MergeReadiness::Unpushed(_) => Some("Unpushed commits. Push before merging."),
-            MergeReadiness::PrConflict => Some("PR has conflicts. Resolve before merging."),
-            MergeReadiness::CiFailing => Some("CI failing. Fix checks before merging."),
-            MergeReadiness::Clean | MergeReadiness::BehindOnly(_) => None,
+            Self::Dirty => Some("Uncommitted changes. Commit & push before merging."),
+            Self::Untracked => Some("Untracked files. Commit/ignore & push before merging."),
+            Self::Unpushed(_) => Some("Unpushed commits. Push before merging."),
+            Self::PrConflict => Some("PR has conflicts. Resolve before merging."),
+            Self::CiFailing => Some("CI failing. Fix checks before merging."),
+            Self::Clean | Self::BehindOnly(_) => None,
         }
     }
 }
@@ -974,7 +989,7 @@ impl MergeReadiness {
 ///
 /// `pr_number` is `None` on a watch that was rebuilt from a backend
 /// record after an app restart (since the in-memory `assoc.pr` may have
-/// been gone by then) and on ReviewRequest watches where the
+/// been gone by then) and on `ReviewRequest` watches where the
 /// author-filtered fetch never populated `assoc.pr` in the first place.
 /// In those cases the poll thread falls back to `gh pr view <branch>`;
 /// the result drain writes the resolved number back into the watch so
@@ -1001,7 +1016,7 @@ pub struct PrMergePollState {
 }
 
 /// Result from a background `gh pr view` merge-state poll. Shared by
-/// both the Mergequeue and the ReviewRequest merge pollers - the JSON
+/// both the Mergequeue and the `ReviewRequest` merge pollers - the JSON
 /// shape and all fields are identical.
 pub struct PrMergePollResult {
     pub wi_id: WorkItemId,
@@ -1036,7 +1051,7 @@ pub struct OrphanCleanupFinished {
 pub struct CleanupResult {
     /// Best-effort warnings (non-fatal failures during PR close / branch delete).
     pub warnings: Vec<String>,
-    /// (repo_path, branch) pairs for PRs that were successfully closed.
+    /// (`repo_path`, branch) pairs for PRs that were successfully closed.
     /// Used to populate `cleanup_evicted_branches` so stale fetch data
     /// does not resurrect closed PRs as phantom unlinked items.
     pub closed_pr_branches: Vec<(PathBuf, String)>,
@@ -1044,7 +1059,7 @@ pub struct CleanupResult {
 
 /// Info gathered on the main thread for one repo association, passed to
 /// the background delete-cleanup thread for resource removal.
-pub(crate) struct DeleteCleanupInfo {
+pub struct DeleteCleanupInfo {
     repo_path: PathBuf,
     branch: Option<String>,
     worktree_path: Option<PathBuf>,
@@ -1318,7 +1333,7 @@ pub struct WorktreeCreateResult {
 /// branch name is preserved so the cleanup thread deletes the stale
 /// branch ref too (dropping it here would leak the branch on master's
 /// pre-P0-fix behaviour).
-pub(crate) struct OrphanWorktree {
+pub struct OrphanWorktree {
     pub repo_path: PathBuf,
     pub worktree_path: PathBuf,
     pub branch: Option<String>,
@@ -1369,7 +1384,7 @@ pub struct App {
     /// When `Some`, the "Set branch name" recovery modal is visible.
     /// Shown when a Planning/Implementing work item has no branch on any
     /// repo association and would otherwise be stuck (e.g. Enter pressed
-    /// on a branchless item, or advance_stage called on a branchless
+    /// on a branchless item, or `advance_stage` called on a branchless
     /// Backlog item). See `docs/UI.md` "Set branch recovery dialog".
     pub set_branch_dialog: Option<crate::create_dialog::SetBranchDialog>,
     /// True when the merge strategy prompt is visible (Review -> Done).
@@ -1391,12 +1406,12 @@ pub struct App {
     pub rework_prompt_input: rat_widget::text_input::TextInputState,
     /// The work item ID that the rework prompt applies to.
     pub rework_prompt_wi: Option<WorkItemId>,
-    /// Rework reasons keyed by work item ID. Used by stage_system_prompt
-    /// to select the "implementing_rework" prompt template.
+    /// Rework reasons keyed by work item ID. Used by `stage_system_prompt`
+    /// to select the "`implementing_rework`" prompt template.
     pub rework_reasons: HashMap<WorkItemId, String>,
     /// Review-gate findings keyed by work item ID. Populated when the gate
     /// approves, consumed one-shot by `stage_system_prompt` to select the
-    /// "review_with_findings" prompt template and inject the assessment.
+    /// "`review_with_findings`" prompt template and inject the assessment.
     pub review_gate_findings: HashMap<WorkItemId, String>,
     /// True when the unlinked-item cleanup confirmation prompt is visible.
     pub cleanup_prompt_visible: bool,
@@ -1405,7 +1420,7 @@ pub struct App {
     pub cleanup_reason_input_active: bool,
     /// Text input for the optional close reason.
     pub cleanup_reason_input: rat_widget::text_input::TextInputState,
-    /// Identity of the unlinked PR being cleaned up: (repo_path, branch, pr_number).
+    /// Identity of the unlinked PR being cleaned up: (`repo_path`, branch, `pr_number`).
     /// Stored by identity rather than index so it survives reassembly.
     pub cleanup_unlinked_target: Option<(PathBuf, String, u64)>,
     /// PR number shown in the in-progress dialog body.
@@ -1416,13 +1431,13 @@ pub struct App {
     pub cleanup_progress_branch: Option<String>,
     /// Branches whose PRs were recently closed via cleanup. Used to suppress
     /// stale fetch results from re-adding the PR as unlinked. Applied and
-    /// cleared when a fresh fetch arrives (drain_fetch_results returns true).
+    /// cleared when a fresh fetch arrives (`drain_fetch_results` returns true).
     pub cleanup_evicted_branches: Vec<(PathBuf, String)>,
     /// General-purpose alert dialog. When Some, a red-bordered modal is shown.
     /// Dismissed with Enter or Esc.
     pub alert_message: Option<String>,
     /// Branch-gone dialog. Shown when worktree creation fails because the
-    /// work item's branch no longer exists. Holds (work_item_id, error_message).
+    /// work item's branch no longer exists. Holds (`work_item_id`, `error_message`).
     /// The user can choose to delete the work item or dismiss.
     pub branch_gone_prompt: Option<(WorkItemId, String)>,
     /// Stale-worktree recovery dialog. Shown when worktree creation fails
@@ -1590,20 +1605,20 @@ pub struct App {
     /// this flag and restarts the background fetcher with the updated repo
     /// list so newly managed repos get fetched and removed repos stop.
     pub fetcher_repos_changed: bool,
-    /// Tracks the WorkItemId of the currently selected work item so that
+    /// Tracks the `WorkItemId` of the currently selected work item so that
     /// selection survives reassembly even when display indices change.
-    /// After build_display_list, the matching entry is found and
-    /// selected_item is restored.
+    /// After `build_display_list`, the matching entry is found and
+    /// `selected_item` is restored.
     pub selected_work_item: Option<WorkItemId>,
-    /// Tracks the (repo_path, branch) of the currently selected unlinked PR
+    /// Tracks the (`repo_path`, branch) of the currently selected unlinked PR
     /// so that selection survives reassembly even when display indices change.
-    /// Keyed by both repo_path and branch to disambiguate same-named branches
+    /// Keyed by both `repo_path` and branch to disambiguate same-named branches
     /// across different repos.
     pub selected_unlinked_branch: Option<(PathBuf, String)>,
     /// Tracks the selected review-requested PR for selection restoration.
     pub selected_review_request_branch: Option<(PathBuf, String)>,
     /// Fetch errors that could not be shown because the status bar was
-    /// occupied. Drained on the next tick when status_message is None.
+    /// occupied. Drained on the next tick when `status_message` is None.
     pub pending_fetch_errors: Vec<String>,
     /// True when the fetcher channel has disconnected unexpectedly (all
     /// sender threads exited). Surfaced in the status bar so the user
@@ -1648,7 +1663,7 @@ pub struct App {
     /// contract.md` and `src/agent_backend.rs`).
     pub mcp_servers: HashMap<WorkItemId, McpSocketServer>,
     /// Work item IDs where the agent has signaled it is actively working
-    /// (via workbridge_set_activity). Cleared when the session dies.
+    /// (via `workbridge_set_activity`). Cleared when the session dies.
     pub agent_working: std::collections::HashSet<WorkItemId>,
     /// Side-car file paths written by the agent backend, tracked for cleanup.
     /// Receiver for MCP events from all socket servers.
@@ -1667,10 +1682,10 @@ pub struct App {
     pub rebase_gates: HashMap<WorkItemId, RebaseGateState>,
 
     // -- Activity indicator --
-    /// Monotonic counter for generating unique ActivityId values.
+    /// Monotonic counter for generating unique `ActivityId` values.
     pub activity_counter: u64,
     /// Currently running activities. The last entry is displayed in the
-    /// status bar. When empty, the normal status_message shows through.
+    /// status bar. When empty, the normal `status_message` shows through.
     pub activities: Vec<Activity>,
     /// Spinner frame index, advanced on each 200ms timer tick when
     /// activities are present.
@@ -1706,9 +1721,9 @@ pub struct App {
     pub pr_create_pending: VecDeque<WorkItemId>,
 
     /// Work item IDs whose reviews were just submitted. These are excluded
-    /// from the re-open logic in reassemble_work_items() because repo_data
+    /// from the re-open logic in `reassemble_work_items()` because `repo_data`
     /// may still contain stale review-requested entries until the next
-    /// GitHub fetch cycle. Cleared when fresh repo_data arrives.
+    /// GitHub fetch cycle. Cleared when fresh `repo_data` arrives.
     pub review_reopen_suppress: std::collections::HashSet<WorkItemId>,
 
     // -- Mergequeue polling --
@@ -1728,19 +1743,19 @@ pub struct App {
     pub mergequeue_poll_errors: HashMap<WorkItemId, String>,
 
     // -- ReviewRequest merge polling --
-    /// Active watches for ReviewRequest work items in Review, waiting for
+    /// Active watches for `ReviewRequest` work items in Review, waiting for
     /// their PR to be merged externally. Same shape as
     /// `mergequeue_watches`: each entry owns its own cooldown timestamp so
     /// polls run concurrently rather than serially round-robin, and
     /// reassembly rebuilds them idempotently so app restarts never lose a
     /// watch.
     pub review_request_merge_watches: Vec<PrMergeWatch>,
-    /// In-flight ReviewRequest polls keyed by work item ID. At most one
+    /// In-flight `ReviewRequest` polls keyed by work item ID. At most one
     /// entry per watched item; the entry owns the receiver and the
     /// activity ID so retreat / delete can drop it cleanly without
     /// touching unrelated items (structural ownership, per CLAUDE.md).
     pub review_request_merge_polls: HashMap<WorkItemId, PrMergePollState>,
-    /// Last poll error per watched ReviewRequest work item. Cleared when
+    /// Last poll error per watched `ReviewRequest` work item. Cleared when
     /// the next poll succeeds or when the item leaves Review. Surfaced in
     /// the detail pane so `gh pr view` failures persist across ticks
     /// instead of vanishing with the transient `status_message`.
@@ -1824,7 +1839,7 @@ pub struct App {
     /// Buffered bytes destined for the active PTY session. Key events
     /// that forward to the PTY push here instead of writing immediately.
     /// Flushed as a single write on the next timer tick so the child
-    /// process receives all characters in one read() - matching how a
+    /// process receives all characters in one `read()` - matching how a
     /// native terminal delivers drag-and-drop or fast paste.
     pub pending_active_pty_bytes: Vec<u8>,
     /// Same buffer for the global assistant session.
@@ -1862,7 +1877,7 @@ pub struct App {
 ///
 /// `target` is the pinned PR number when known (unambiguous), otherwise
 /// the branch name. The branch fallback is used on watches reconstructed
-/// from a backend record after an app restart, and on all ReviewRequest
+/// from a backend record after an app restart, and on all `ReviewRequest`
 /// watches where the `--author @me` fetch never populated `assoc.pr`.
 /// The poll's caller backfills the resolved number into the watch on
 /// the first successful result so subsequent polls target the exact PR.
@@ -1879,9 +1894,7 @@ fn spawn_gh_pr_view_poll(
 ) -> crossbeam_channel::Receiver<PrMergePollResult> {
     let (tx, rx) = crossbeam_channel::bounded(1);
     std::thread::spawn(move || {
-        let target = pr_number
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| branch.clone());
+        let target = pr_number.map_or_else(|| branch.clone(), |n| n.to_string());
         let outcome = match std::process::Command::new("gh")
             .args([
                 "pr",
@@ -1914,15 +1927,14 @@ fn spawn_gh_pr_view_poll(
                     .and_then(|s| s.as_str())
                     .unwrap_or("UNKNOWN")
                     .to_string();
-                let pr_identity =
-                    parsed
-                        .get("number")
-                        .and_then(|n| n.as_u64())
-                        .and_then(|number| {
-                            let title = parsed.get("title")?.as_str()?.to_string();
-                            let url = parsed.get("url")?.as_str()?.to_string();
-                            Some(PrIdentityRecord { number, title, url })
-                        });
+                let pr_identity = parsed
+                    .get("number")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|number| {
+                        let title = parsed.get("title")?.as_str()?.to_string();
+                        let url = parsed.get("url")?.as_str()?.to_string();
+                        Some(PrIdentityRecord { number, title, url })
+                    });
                 PrMergePollResult {
                     wi_id,
                     pr_state: state,
@@ -2093,8 +2105,8 @@ macro_rules! impl_pr_merge_poll_method {
 
                         self.apply_stage_change(
                             &result.wi_id,
-                            &$source_stage,
-                            &WorkItemStatus::Done,
+                            $source_stage,
+                            WorkItemStatus::Done,
                             "pr_merge",
                         );
                         self.status_message = Some($merged_message.into());
@@ -2265,7 +2277,7 @@ impl App {
     }
 
     /// Create a new App with default (empty) config and a stub backend.
-    /// Uses InMemoryConfigProvider so tests never touch the real config.
+    /// Uses `InMemoryConfigProvider` so tests never touch the real config.
     #[cfg(test)]
     pub fn new() -> Self {
         use crate::config::InMemoryConfigProvider;
@@ -2278,7 +2290,7 @@ impl App {
     }
 
     /// Create a new App with the given config and backend.
-    /// Uses InMemoryConfigProvider so tests never touch the real config.
+    /// Uses `InMemoryConfigProvider` so tests never touch the real config.
     /// Uses a no-op worktree service. Call `with_config_and_worktree_service`
     /// to provide a real or mock worktree service.
     #[cfg(test)]
@@ -2553,7 +2565,7 @@ impl App {
 
     /// Whether the status bar row should be visible. True when either
     /// a status message or an activity indicator is present.
-    pub fn has_visible_status_bar(&self) -> bool {
+    pub const fn has_visible_status_bar(&self) -> bool {
         self.status_message.is_some() || !self.activities.is_empty()
     }
 
@@ -2615,13 +2627,21 @@ impl App {
     /// it - exactly the latent-state bug the helper is meant to
     /// eliminate.
     pub fn attach_user_action_payload(&mut self, key: &UserActionKey, payload: UserActionPayload) {
-        match self.user_actions.in_flight.get_mut(key) {
-            Some(state) => state.payload = payload,
-            None => panic!(
+        if let Some(state) = self.user_actions.in_flight.get_mut(key) {
+            state.payload = payload;
+        } else {
+            // Calling `attach_user_action_payload` without a prior
+            // successful `try_begin_user_action` is a caller-side
+            // invariant violation: every attach must be preceded by
+            // an admit that returned `Some(_)`. Hard-panic in debug
+            // so the bug surfaces in tests; in release, fall through
+            // silently so production never crashes the whole TUI on
+            // what should be a recoverable wiring mistake.
+            debug_assert!(
+                false,
                 "attach_user_action_payload called without a prior successful \
-                 try_begin_user_action for {key:?}: every attach must be preceded \
-                 by an admit that returned Some(_)",
-            ),
+                 try_begin_user_action for {key:?}",
+            );
         }
     }
 
@@ -2738,7 +2758,7 @@ impl App {
     }
 
     /// Total number of active repos for scroll bounds.
-    pub fn total_repos(&self) -> usize {
+    pub const fn total_repos(&self) -> usize {
         self.active_repo_cache.len()
     }
 
@@ -2765,10 +2785,10 @@ impl App {
                     .repo_associations
                     .first()
                     .map(|a| {
-                        a.repo_path
-                            .file_name()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| a.repo_path.display().to_string())
+                        a.repo_path.file_name().map_or_else(
+                            || a.repo_path.display().to_string(),
+                            |s| s.to_string_lossy().into_owned(),
+                        )
                     })
                     .unwrap_or_default();
                 let labels = wi
@@ -2789,7 +2809,7 @@ impl App {
     }
 
     /// Unmanage the currently selected managed repo and save config.
-    /// Removes from included_repos. Explicit repos cannot be unmanaged
+    /// Removes from `included_repos`. Explicit repos cannot be unmanaged
     /// this way (they must be removed via `remove_path`).
     /// If the save fails, the in-memory mutation is rolled back so the
     /// UI stays consistent with what is persisted on disk.
@@ -2818,17 +2838,17 @@ impl App {
         self.fetcher_repos_changed = true;
         self.refresh_repo_cache();
         // Adjust cursor if it went past the end.
-        if !self.active_repo_cache.is_empty() {
+        if self.active_repo_cache.is_empty() {
+            self.settings_repo_selected = 0;
+        } else {
             self.settings_repo_selected = self
                 .settings_repo_selected
                 .min(self.active_repo_cache.len() - 1);
-        } else {
-            self.settings_repo_selected = 0;
         }
     }
 
     /// Manage the currently selected available repo and save config.
-    /// Adds to included_repos.
+    /// Adds to `included_repos`.
     /// If the save fails, the in-memory mutation is rolled back.
     pub fn manage_selected_repo(&mut self) {
         let available = self.available_repos();
@@ -2859,7 +2879,7 @@ impl App {
         }
     }
 
-    /// Check liveness (try_wait) on all sessions. Called on periodic ticks.
+    /// Check liveness (`try_wait`) on all sessions. Called on periodic ticks.
     ///
     /// The reader threads handle PTY output continuously - no reading
     /// happens here. This only checks if child processes have exited.
@@ -2867,7 +2887,7 @@ impl App {
     pub fn check_liveness(&mut self) {
         let mut dead_ids: Vec<WorkItemId> = Vec::new();
         let mut dead_implementing: Vec<WorkItemId> = Vec::new();
-        for ((wi_id, stage), entry) in self.sessions.iter_mut() {
+        for ((wi_id, stage), entry) in &mut self.sessions {
             let was_alive = entry.alive;
             if let Some(ref mut session) = entry.session {
                 entry.alive = session.is_alive();
@@ -2890,9 +2910,8 @@ impl App {
         // If the session ended without calling workbridge_set_status("Review"),
         // check for commits and run the gate automatically.
         for wi_id in dead_implementing {
-            let wi = match self.work_items.iter().find(|w| w.id == wi_id) {
-                Some(w) => w,
-                None => continue,
+            let Some(wi) = self.work_items.iter().find(|w| w.id == wi_id) else {
+                continue;
             };
             if wi.status != WorkItemStatus::Implementing || self.review_gates.contains_key(&wi_id) {
                 continue;
@@ -3159,7 +3178,7 @@ impl App {
     /// Resize PTY sessions and vt100 parsers to match the current pane
     /// dimensions. Resize is an instant ioctl call, so we resize all
     /// sessions immediately. The first resize failure per call is surfaced
-    /// via status_message.
+    /// via `status_message`.
     pub fn resize_pty_panes(&mut self) {
         let mut first_error: Option<std::io::Error> = None;
         for entry in self.sessions.values() {
@@ -3251,7 +3270,7 @@ impl App {
     /// process tree, and the shutdown loop must not let `Control::Quit`
     /// fire while one is in flight or workbridge will exit before
     /// the harness has been signalled. `send_sigterm_all` empties
-    /// the rebase_gates map on the first shutdown tick, so this
+    /// the `rebase_gates` map on the first shutdown tick, so this
     /// check is satisfied as soon as the SIGKILL has propagated;
     /// the explicit dependency keeps any future caller that adds a
     /// new shutdown entrypoint from accidentally letting the loop
@@ -3463,13 +3482,13 @@ impl App {
         }
     }
 
-    /// Get the terminal SessionEntry for the currently selected work item.
+    /// Get the terminal `SessionEntry` for the currently selected work item.
     pub fn active_terminal_entry(&self) -> Option<&SessionEntry> {
         let wi_id = self.selected_work_item_id()?;
         self.terminal_sessions.get(&wi_id)
     }
 
-    /// Get a mutable terminal SessionEntry for the currently selected work item.
+    /// Get a mutable terminal `SessionEntry` for the currently selected work item.
     pub fn active_terminal_entry_mut(&mut self) -> Option<&mut SessionEntry> {
         let wi_id = self.selected_work_item_id()?;
         self.terminal_sessions.get_mut(&wi_id)
@@ -3518,8 +3537,8 @@ impl App {
 
     /// Drain pending fetch results from the background fetcher channel.
     ///
-    /// Calls try_recv() in a loop until the channel is empty, storing each
-    /// RepoData result in self.repo_data. FetcherError messages are surfaced
+    /// Calls `try_recv()` in a loop until the channel is empty, storing each
+    /// `RepoData` result in `self.repo_data`. `FetcherError` messages are surfaced
     /// via the status bar.
     ///
     /// Returns true if any messages were received (meaning reassembly is
@@ -3697,8 +3716,8 @@ impl App {
 
     /// Reassemble work items from backend records and cached repo data.
     ///
-    /// Calls backend.list() for fresh records, then runs the assembly
-    /// layer to produce work_items and unlinked_prs. Surfaces any
+    /// Calls `backend.list()` for fresh records, then runs the assembly
+    /// layer to produce `work_items` and `unlinked_prs`. Surfaces any
     /// corrupt backend records to the user via the status bar.
     pub fn reassemble_work_items(&mut self) {
         let list_result = match self.backend.list() {
@@ -3785,9 +3804,8 @@ impl App {
                 let _ = self.backend.append_activity(wi_id, &entry);
             }
             // Reassemble again to pick up the status changes.
-            let list_result = match self.backend.list() {
-                Ok(r) => r,
-                Err(_) => return,
+            let Ok(list_result) = self.backend.list() else {
+                return;
             };
             let (items, unlinked, review_requested, _) = assembly::reassemble(
                 &list_result.records,
@@ -3949,12 +3967,11 @@ impl App {
             // running, leave the helper entry intact so
             // `poll_worktree_creation` can drain it on the next tick
             // and run its orphan-cleanup path.
-            let (thread_done, captured_orphan) = match self
+            let (thread_done, captured_orphan) = self
                 .user_actions
                 .in_flight
                 .get(&UserActionKey::WorktreeCreate)
-            {
-                Some(state) => match &state.payload {
+                .map_or((true, None), |state| match &state.payload {
                     UserActionPayload::WorktreeCreate { rx, .. } => match rx.try_recv() {
                         Ok(result) => {
                             let orphan = if !result.reused
@@ -3974,9 +3991,7 @@ impl App {
                         Err(crossbeam_channel::TryRecvError::Empty) => (false, None),
                     },
                     _ => (true, None),
-                },
-                None => (true, None),
-            };
+                });
             if let Some(orphan) = captured_orphan {
                 orphan_worktrees.push(orphan);
             }
@@ -4033,16 +4048,14 @@ impl App {
         if self
             .branch_gone_prompt
             .as_ref()
-            .map(|(id, _)| id == wi_id)
-            .unwrap_or(false)
+            .is_some_and(|(id, _)| id == wi_id)
         {
             self.branch_gone_prompt = None;
         }
         if self
             .stale_worktree_prompt
             .as_ref()
-            .map(|p| p.wi_id == *wi_id)
-            .unwrap_or(false)
+            .is_some_and(|p| p.wi_id == *wi_id)
         {
             self.clear_stale_recovery();
         }
@@ -4052,7 +4065,7 @@ impl App {
 
     /// Keep the dialog open in progress mode and spawn a background thread to
     /// close the PR and delete the branch. The dialog shows a spinner until
-    /// poll_unlinked_cleanup() receives the result.
+    /// `poll_unlinked_cleanup()` receives the result.
     pub fn spawn_unlinked_cleanup(&mut self, reason: Option<&str>) {
         let Some((repo_path, branch, pr_number)) = self.cleanup_unlinked_target.take() else {
             return;
@@ -4067,16 +4080,13 @@ impl App {
         // request. The modal's "in-progress spinner" is rendered by
         // reading `is_user_action_in_flight(&UserActionKey::UnlinkedCleanup)`
         // via the UI layer.
-        let activity_id = match self.try_begin_user_action(
+        let Some(activity_id) = self.try_begin_user_action(
             UserActionKey::UnlinkedCleanup,
             Duration::ZERO,
             "Cleaning up unlinked PR...",
-        ) {
-            Some(aid) => aid,
-            None => {
-                self.status_message = Some("Unlinked PR cleanup already in progress".into());
-                return;
-            }
+        ) else {
+            self.status_message = Some("Unlinked PR cleanup already in progress".into());
+            return;
         };
         // The cleanup modal already renders its own in-progress spinner
         // in the dialog body; a duplicate status-bar indicator would
@@ -4100,7 +4110,7 @@ impl App {
         self.cleanup_progress_branch = Some(branch.clone());
         self.selected_unlinked_branch = None;
 
-        let reason_owned: Option<String> = reason.map(|s| s.to_string());
+        let reason_owned: Option<String> = reason.map(std::string::ToString::to_string);
         let ws = Arc::clone(&self.worktree_service);
         let (tx, rx) = crossbeam_channel::bounded(1);
 
@@ -4263,17 +4273,14 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
             }
         };
-        let result = match recv_result {
-            Ok(r) => r,
-            Err(()) => {
-                self.end_user_action(&UserActionKey::UnlinkedCleanup);
-                self.cleanup_prompt_visible = false;
-                self.cleanup_progress_pr_number = None;
-                self.cleanup_progress_repo_path = None;
-                self.cleanup_progress_branch = None;
-                self.alert_message = Some("Cleanup: background thread exited unexpectedly".into());
-                return;
-            }
+        let Ok(result) = recv_result else {
+            self.end_user_action(&UserActionKey::UnlinkedCleanup);
+            self.cleanup_prompt_visible = false;
+            self.cleanup_progress_pr_number = None;
+            self.cleanup_progress_repo_path = None;
+            self.cleanup_progress_branch = None;
+            self.alert_message = Some("Cleanup: background thread exited unexpectedly".into());
+            return;
         };
 
         self.end_user_action(&UserActionKey::UnlinkedCleanup);
@@ -4329,7 +4336,7 @@ impl App {
                     .filter(|wt| !wt.is_main)
                     .map(|wt| wt.path.clone());
 
-                let branch_in_main_worktree = wt_for_branch.map(|wt| wt.is_main).unwrap_or(false);
+                let branch_in_main_worktree = wt_for_branch.is_some_and(|wt| wt.is_main);
 
                 let open_pr_number = assoc.branch.as_deref().and_then(|branch| {
                     self.repo_data.get(&assoc.repo_path).and_then(|rd| {
@@ -4362,7 +4369,7 @@ impl App {
     /// removal, branch deletion, PR close) for a deleted work item.
     /// Called from the MCP delete handler or from the user-initiated modal
     /// delete flow after the backend record and session have already been
-    /// cleaned up on the main thread. poll_delete_cleanup() receives the
+    /// cleaned up on the main thread. `poll_delete_cleanup()` receives the
     /// result.
     ///
     /// When `show_status_activity` is true, a "Deleting work item
@@ -4378,36 +4385,33 @@ impl App {
     ) {
         // Route single-flight admission through the user-action guard.
         // Preserves the pre-refactor alert wording verbatim on rejection.
-        let activity_id = match self.try_begin_user_action(
+        let Some(activity_id) = self.try_begin_user_action(
             UserActionKey::DeleteCleanup,
             Duration::ZERO,
             "Deleting work item resources...",
-        ) {
-            Some(aid) => aid,
-            None => {
-                // A previous delete cleanup is still running. Alert the user
-                // so orphaned resources (worktrees, branches, open PRs) are
-                // visible rather than silently dropped.
-                //
-                // Reset `delete_in_progress` here because the modal
-                // delete flow (`confirm_delete_from_prompt`) sets it to
-                // true BEFORE calling into `spawn_delete_cleanup`. If
-                // admission is rejected we must close that latent-state
-                // gap - otherwise the modal stays pinned at the
-                // in-progress spinner with no key input accepted and
-                // no exit path. The helper map is the single source of
-                // truth for "is cleanup running", but `delete_in_progress`
-                // still gates modal rendering and key input in the
-                // current code, so both flags must clear together on
-                // the rejection arm.
-                self.delete_in_progress = false;
-                self.alert_message = Some(
-                    "Delete cleanup skipped: a previous cleanup is still in progress. \
-                     Worktrees, branches, and open PRs for this item may need manual cleanup."
-                        .into(),
-                );
-                return;
-            }
+        ) else {
+            // A previous delete cleanup is still running. Alert the user
+            // so orphaned resources (worktrees, branches, open PRs) are
+            // visible rather than silently dropped.
+            //
+            // Reset `delete_in_progress` here because the modal
+            // delete flow (`confirm_delete_from_prompt`) sets it to
+            // true BEFORE calling into `spawn_delete_cleanup`. If
+            // admission is rejected we must close that latent-state
+            // gap - otherwise the modal stays pinned at the
+            // in-progress spinner with no key input accepted and
+            // no exit path. The helper map is the single source of
+            // truth for "is cleanup running", but `delete_in_progress`
+            // still gates modal rendering and key input in the
+            // current code, so both flags must clear together on
+            // the rejection arm.
+            self.delete_in_progress = false;
+            self.alert_message = Some(
+                "Delete cleanup skipped: a previous cleanup is still in progress. \
+                 Worktrees, branches, and open PRs for this item may need manual cleanup."
+                    .into(),
+            );
+            return;
         };
         // Modal delete flow already renders its own in-progress spinner
         // in the dialog body - a duplicate status-bar spinner would
@@ -4639,26 +4643,23 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
             }
         };
-        let result = match recv_result {
-            Ok(r) => r,
-            Err(()) => {
-                self.end_user_action(&UserActionKey::DeleteCleanup);
-                let sync_warnings = std::mem::take(&mut self.delete_sync_warnings);
-                if self.delete_in_progress {
-                    self.delete_in_progress = false;
-                    self.delete_prompt_visible = false;
-                    self.delete_target_wi_id = None;
-                    self.delete_target_title = None;
-                }
-                let mut msg = String::from("Delete cleanup: background thread exited unexpectedly");
-                if !sync_warnings.is_empty() {
-                    msg.push_str(" (sync warnings: ");
-                    msg.push_str(&sync_warnings.join("; "));
-                    msg.push(')');
-                }
-                self.alert_message = Some(msg);
-                return;
+        let Ok(result) = recv_result else {
+            self.end_user_action(&UserActionKey::DeleteCleanup);
+            let sync_warnings = std::mem::take(&mut self.delete_sync_warnings);
+            if self.delete_in_progress {
+                self.delete_in_progress = false;
+                self.delete_prompt_visible = false;
+                self.delete_target_wi_id = None;
+                self.delete_target_title = None;
             }
+            let mut msg = String::from("Delete cleanup: background thread exited unexpectedly");
+            if !sync_warnings.is_empty() {
+                msg.push_str(" (sync warnings: ");
+                msg.push_str(&sync_warnings.join("; "));
+                msg.push(')');
+            }
+            self.alert_message = Some(msg);
+            return;
         };
 
         self.end_user_action(&UserActionKey::DeleteCleanup);
@@ -4694,8 +4695,8 @@ impl App {
         }
     }
 
-    /// Remove recently-closed PRs from cached repo_data. Called after
-    /// poll_unlinked_cleanup and after drain_fetch_results to ensure stale
+    /// Remove recently-closed PRs from cached `repo_data`. Called after
+    /// `poll_unlinked_cleanup` and after `drain_fetch_results` to ensure stale
     /// fetch data doesn't resurrect closed PRs in the unlinked list.
     pub fn apply_cleanup_evictions(&mut self) {
         for (repo_path, branch) in &self.cleanup_evicted_branches {
@@ -4785,7 +4786,7 @@ impl App {
         kept
     }
 
-    /// Build the display list from current work_items and unlinked_prs.
+    /// Build the display list from current `work_items` and `unlinked_prs`.
     ///
     /// Groups (each hidden if empty):
     /// 1. REVIEW REQUESTS - PRs where the user is requested as reviewer
@@ -4833,11 +4834,7 @@ impl App {
                 let login = self.current_user_login.as_deref();
                 let mut indices: Vec<usize> = (0..self.review_requested_prs.len()).collect();
                 indices.sort_by_key(|&i| {
-                    if self.review_requested_prs[i].is_direct_request(login) {
-                        0u8
-                    } else {
-                        1u8
-                    }
+                    u8::from(!self.review_requested_prs[i].is_direct_request(login))
                 });
                 for i in indices {
                     list.push(DisplayEntry::ReviewRequestItem(i));
@@ -4992,11 +4989,10 @@ impl App {
         let mut by_repo: std::collections::HashMap<String, Vec<usize>> =
             std::collections::HashMap::new();
         for &i in indices {
-            let repo = work_items[i]
-                .repo_associations
-                .first()
-                .map(|a| crate::work_item::repo_slug_from_path(&a.repo_path))
-                .unwrap_or_else(|| "unknown".to_string());
+            let repo = work_items[i].repo_associations.first().map_or_else(
+                || "unknown".to_string(),
+                |a| crate::work_item::repo_slug_from_path(&a.repo_path),
+            );
             by_repo.entry(repo.clone()).or_default().push(i);
             if !repo_order.contains(&repo) {
                 repo_order.push(repo);
@@ -5027,9 +5023,9 @@ impl App {
         }
     }
 
-    /// Sync the identity trackers (selected_work_item, selected_unlinked_branch)
-    /// from the current selected_item index. Called after any navigation that
-    /// changes selected_item so that reassembly can restore the correct entry.
+    /// Sync the identity trackers (`selected_work_item`, `selected_unlinked_branch`)
+    /// from the current `selected_item` index. Called after any navigation that
+    /// changes `selected_item` so that reassembly can restore the correct entry.
     pub(crate) fn sync_selection_identity(&mut self) {
         self.selected_work_item = None;
         self.selected_unlinked_branch = None;
@@ -5067,10 +5063,7 @@ impl App {
     /// flag is deliberately NOT set on the "no further selectable item"
     /// branch, since the selection and viewport both stay put.
     pub fn select_next_item(&mut self) {
-        let start = match self.selected_item {
-            Some(idx) => idx + 1,
-            None => 0,
-        };
+        let start = self.selected_item.map_or(0, |idx| idx + 1);
         for i in start..self.display_list.len() {
             if is_selectable(&self.display_list[i]) {
                 self.selected_item = Some(i);
@@ -5111,7 +5104,7 @@ impl App {
         // If nothing found before current position, keep current selection.
     }
 
-    /// Get the WorkItemId for the currently selected work item, if any.
+    /// Get the `WorkItemId` for the currently selected work item, if any.
     /// Returns None if nothing is selected or the selection is an unlinked PR.
     /// In board mode (without drill-down), delegates to the board cursor.
     pub fn selected_work_item_id(&self) -> Option<WorkItemId> {
@@ -5131,27 +5124,27 @@ impl App {
 
     /// Get indices into `self.work_items` for items matching the given status.
     /// For the Implementing column, also includes Blocked items.
-    pub fn items_for_column(&self, status: &WorkItemStatus) -> Vec<usize> {
+    pub fn items_for_column(&self, status: WorkItemStatus) -> Vec<usize> {
         self.work_items
             .iter()
             .enumerate()
             .filter(|(_, wi)| {
-                if *status == WorkItemStatus::Implementing {
+                if status == WorkItemStatus::Implementing {
                     wi.status == WorkItemStatus::Implementing
                         || wi.status == WorkItemStatus::Blocked
-                } else if *status == WorkItemStatus::Review {
+                } else if status == WorkItemStatus::Review {
                     wi.status == WorkItemStatus::Review || wi.status == WorkItemStatus::Mergequeue
                 } else {
-                    wi.status == *status
+                    wi.status == status
                 }
             })
             .map(|(i, _)| i)
             .collect()
     }
 
-    /// Resolve the board cursor to a WorkItemId.
+    /// Resolve the board cursor to a `WorkItemId`.
     pub fn board_selected_work_item_id(&self) -> Option<WorkItemId> {
-        let col_status = BOARD_COLUMNS.get(self.board_cursor.column)?;
+        let col_status = *BOARD_COLUMNS.get(self.board_cursor.column)?;
         let items = self.items_for_column(col_status);
         let row = self.board_cursor.row?;
         let wi_idx = items.get(row)?;
@@ -5165,7 +5158,7 @@ impl App {
         // If we have a selected work item, try to find it in the board.
         if let Some(ref target_id) = self.selected_work_item {
             for (col_idx, status) in BOARD_COLUMNS.iter().enumerate() {
-                let items = self.items_for_column(status);
+                let items = self.items_for_column(*status);
                 for (row_idx, &wi_idx) in items.iter().enumerate() {
                     if let Some(wi) = self.work_items.get(wi_idx)
                         && wi.id == *target_id
@@ -5182,7 +5175,8 @@ impl App {
         let items = self.items_for_column(
             BOARD_COLUMNS
                 .get(self.board_cursor.column)
-                .unwrap_or(&WorkItemStatus::Backlog),
+                .copied()
+                .unwrap_or(WorkItemStatus::Backlog),
         );
         if items.is_empty() {
             self.board_cursor.row = None;
@@ -5198,8 +5192,8 @@ impl App {
         self.selected_work_item = self.board_selected_work_item_id();
     }
 
-    /// Cycle view mode: FlatList -> Board -> Dashboard -> FlatList. Also
-    /// syncs cursor state when leaving Board mode so the FlatList cursor
+    /// Cycle view mode: `FlatList` -> Board -> Dashboard -> `FlatList`. Also
+    /// syncs cursor state when leaving Board mode so the `FlatList` cursor
     /// stays on the selected work item.
     pub fn toggle_view_mode(&mut self) {
         match self.view_mode {
@@ -5277,10 +5271,8 @@ impl App {
             if w.branch.as_deref() != Some(branch) {
                 return false;
             }
-            match crate::config::canonicalize_path(&w.path) {
-                Ok(existing_canonical) => existing_canonical == target_canonical,
-                Err(_) => false,
-            }
+            crate::config::canonicalize_path(&w.path)
+                .is_ok_and(|existing_canonical| existing_canonical == target_canonical)
         })
     }
 
@@ -5360,180 +5352,179 @@ impl App {
 
         // Find the first worktree path among the work item's repo associations.
         // If none exists, spawn a background thread to auto-create one.
-        match wi
+        if let Some(path) = wi
             .repo_associations
             .iter()
             .find_map(|a| a.worktree_path.clone())
         {
-            Some(path) => {
-                // Worktree already exists - enqueue the background plan
-                // read that feeds `finish_session_open`. The read MUST
-                // live on a background thread because
-                // `WorkItemBackend::read_plan` hits the filesystem
-                // (see `docs/UI.md` "Blocking I/O Prohibition").
-                self.begin_session_open(&work_item_id, &path);
-            }
-            None => {
-                // Try to find an association with a branch name and auto-create
-                // a worktree for it in the background.
-                let branch_assoc = wi.repo_associations.iter().find(|a| a.branch.is_some());
-                match branch_assoc {
-                    Some(assoc) => {
-                        let branch = assoc.branch.as_ref().unwrap().clone();
-                        let repo_path = assoc.repo_path.clone();
-                        let wt_target = Self::worktree_target_path(
-                            &repo_path,
-                            &branch,
-                            &self.config.defaults.worktree_dir,
-                        );
+            // Worktree already exists - enqueue the background plan
+            // read that feeds `finish_session_open`. The read MUST
+            // live on a background thread because
+            // `WorkItemBackend::read_plan` hits the filesystem
+            // (see `docs/UI.md` "Blocking I/O Prohibition").
+            self.begin_session_open(&work_item_id, &path);
+        } else {
+            // Try to find an association with a branch name and auto-create
+            // a worktree for it in the background.
+            // Keep only associations with a branch - and bind the
+            // branch string directly, so the subsequent match arm
+            // can destructure `Some((assoc, branch))` without a
+            // restriction-lint `unwrap()`.
+            let branch_assoc = wi
+                .repo_associations
+                .iter()
+                .find_map(|a| a.branch.as_ref().map(|b| (a, b.clone())));
+            match branch_assoc {
+                Some((assoc, branch)) => {
+                    let repo_path = assoc.repo_path.clone();
+                    let wt_target = Self::worktree_target_path(
+                        &repo_path,
+                        &branch,
+                        &self.config.defaults.worktree_dir,
+                    );
 
-                        // Admit the user action BEFORE spawning the
-                        // background thread. If the admit ever fails
-                        // (defense-in-depth against a future async
-                        // entry point), we must NOT have already
-                        // spawned a thread that creates a worktree on
-                        // disk with no receiver attached - that would
-                        // be a durable orphan. Match the
-                        // `spawn_import_worktree` ordering exactly.
-                        if self
-                            .try_begin_user_action(
-                                UserActionKey::WorktreeCreate,
-                                Duration::ZERO,
-                                "Initializing worktree...",
-                            )
-                            .is_none()
+                    // Admit the user action BEFORE spawning the
+                    // background thread. If the admit ever fails
+                    // (defense-in-depth against a future async
+                    // entry point), we must NOT have already
+                    // spawned a thread that creates a worktree on
+                    // disk with no receiver attached - that would
+                    // be a durable orphan. Match the
+                    // `spawn_import_worktree` ordering exactly.
+                    if self
+                        .try_begin_user_action(
+                            UserActionKey::WorktreeCreate,
+                            Duration::ZERO,
+                            "Initializing worktree...",
+                        )
+                        .is_none()
+                    {
+                        self.status_message =
+                            Some("Worktree creation already in progress...".into());
+                        return;
+                    }
+
+                    let ws = Arc::clone(&self.worktree_service);
+                    let wi_id_clone = work_item_id.clone();
+
+                    let (tx, rx) = crossbeam_channel::bounded(1);
+
+                    std::thread::spawn(move || {
+                        // Fetch the branch from origin first.
+                        // If fetch fails, try to create a new local branch.
+                        if ws.fetch_branch(&repo_path, &branch).is_err()
+                            && let Err(create_err) = ws.create_branch(&repo_path, &branch)
                         {
-                            self.status_message =
-                                Some("Worktree creation already in progress...".into());
+                            let _ = tx.send(WorktreeCreateResult {
+                                wi_id: wi_id_clone,
+                                repo_path,
+                                branch: Some(branch.clone()),
+                                path: None,
+                                error: Some(format!(
+                                    "Could not fetch or create branch '{branch}': {create_err}",
+                                )),
+                                open_session: true,
+                                branch_gone: true,
+                                reused: false,
+                                stale_worktree_path: None,
+                            });
                             return;
                         }
-
-                        let ws = Arc::clone(&self.worktree_service);
-                        let wi_id_clone = work_item_id.clone();
-
-                        let (tx, rx) = crossbeam_channel::bounded(1);
-
-                        std::thread::spawn(move || {
-                            // Fetch the branch from origin first.
-                            // If fetch fails, try to create a new local branch.
-                            if ws.fetch_branch(&repo_path, &branch).is_err()
-                                && let Err(create_err) = ws.create_branch(&repo_path, &branch)
-                            {
+                        // Reuse an existing worktree only if it lives at
+                        // the exact expected location (wt_target) and is
+                        // NOT the main worktree. Matching purely on
+                        // branch name would hijack the user's primary
+                        // checkout when it happens to be on the same
+                        // feature branch, or adopt an unrelated worktree
+                        // at some other path - both of which would then
+                        // feed into destructive orphan-cleanup paths.
+                        let reused_wt = Self::find_reusable_worktree(
+                            ws.as_ref(),
+                            &repo_path,
+                            &branch,
+                            &wt_target,
+                        );
+                        let (wt_result, reused) = reused_wt.map_or_else(
+                            || (ws.create_worktree(&repo_path, &branch, &wt_target), false),
+                            |existing_wt| (Ok(existing_wt), true),
+                        );
+                        match wt_result {
+                            Ok(wt_info) => {
+                                let _ = tx.send(WorktreeCreateResult {
+                                    wi_id: wi_id_clone,
+                                    repo_path,
+                                    branch: Some(branch),
+                                    path: Some(wt_info.path),
+                                    error: None,
+                                    open_session: true,
+                                    branch_gone: false,
+                                    reused,
+                                    stale_worktree_path: None,
+                                });
+                            }
+                            Err(
+                                crate::worktree_service::WorktreeError::BranchLockedToWorktree {
+                                    ref locked_at,
+                                    ..
+                                },
+                            ) => {
                                 let _ = tx.send(WorktreeCreateResult {
                                     wi_id: wi_id_clone,
                                     repo_path,
                                     branch: Some(branch.clone()),
                                     path: None,
                                     error: Some(format!(
-                                        "Could not fetch or create branch '{}': {create_err}",
+                                        "Branch '{}' is locked to a stale worktree at '{}'\n\
+                                         (likely from an interrupted rebase).",
                                         branch,
+                                        locked_at.display(),
                                     )),
                                     open_session: true,
-                                    branch_gone: true,
+                                    branch_gone: false,
+                                    reused: false,
+                                    stale_worktree_path: Some(locked_at.clone()),
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(WorktreeCreateResult {
+                                    wi_id: wi_id_clone,
+                                    repo_path,
+                                    branch: Some(branch.clone()),
+                                    path: None,
+                                    error: Some(format!(
+                                        "Failed to create worktree for '{branch}': {e}",
+                                    )),
+                                    open_session: true,
+                                    branch_gone: false,
                                     reused: false,
                                     stale_worktree_path: None,
                                 });
-                                return;
                             }
-                            // Reuse an existing worktree only if it lives at
-                            // the exact expected location (wt_target) and is
-                            // NOT the main worktree. Matching purely on
-                            // branch name would hijack the user's primary
-                            // checkout when it happens to be on the same
-                            // feature branch, or adopt an unrelated worktree
-                            // at some other path - both of which would then
-                            // feed into destructive orphan-cleanup paths.
-                            let reused_wt = Self::find_reusable_worktree(
-                                ws.as_ref(),
-                                &repo_path,
-                                &branch,
-                                &wt_target,
-                            );
-                            let (wt_result, reused) = match reused_wt {
-                                Some(existing_wt) => (Ok(existing_wt), true),
-                                None => {
-                                    (ws.create_worktree(&repo_path, &branch, &wt_target), false)
-                                }
-                            };
-                            match wt_result {
-                                Ok(wt_info) => {
-                                    let _ = tx.send(WorktreeCreateResult {
-                                        wi_id: wi_id_clone,
-                                        repo_path,
-                                        branch: Some(branch),
-                                        path: Some(wt_info.path),
-                                        error: None,
-                                        open_session: true,
-                                        branch_gone: false,
-                                        reused,
-                                        stale_worktree_path: None,
-                                    });
-                                }
-                                Err(
-                                    crate::worktree_service::WorktreeError::BranchLockedToWorktree {
-                                        ref locked_at,
-                                        ..
-                                    },
-                                ) => {
-                                    let _ = tx.send(WorktreeCreateResult {
-                                        wi_id: wi_id_clone,
-                                        repo_path,
-                                        branch: Some(branch.clone()),
-                                        path: None,
-                                        error: Some(format!(
-                                            "Branch '{}' is locked to a stale worktree at '{}'\n\
-                                             (likely from an interrupted rebase).",
-                                            branch,
-                                            locked_at.display(),
-                                        )),
-                                        open_session: true,
-                                        branch_gone: false,
-                                        reused: false,
-                                        stale_worktree_path: Some(locked_at.clone()),
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(WorktreeCreateResult {
-                                        wi_id: wi_id_clone,
-                                        repo_path,
-                                        branch: Some(branch.clone()),
-                                        path: None,
-                                        error: Some(format!(
-                                            "Failed to create worktree for '{}': {e}",
-                                            branch,
-                                        )),
-                                        open_session: true,
-                                        branch_gone: false,
-                                        reused: false,
-                                        stale_worktree_path: None,
-                                    });
-                                }
-                            }
-                        });
+                        }
+                    });
 
-                        self.attach_user_action_payload(
-                            &UserActionKey::WorktreeCreate,
-                            UserActionPayload::WorktreeCreate {
-                                rx,
-                                wi_id: work_item_id,
-                            },
-                        );
-                    }
-                    None => {
-                        // No repo association has a branch. Open the
-                        // recovery dialog instead of leaving the user
-                        // stuck on a dead-end status message. When the
-                        // user confirms, the dialog's
-                        // `PendingBranchAction::SpawnSession` arm
-                        // re-enters `spawn_session` with the same work
-                        // item ID, so the worktree is created and the
-                        // Claude pane opens without the user having to
-                        // press Enter a second time.
-                        self.open_set_branch_dialog(
-                            work_item_id.clone(),
-                            crate::create_dialog::PendingBranchAction::SpawnSession,
-                        );
-                    }
+                    self.attach_user_action_payload(
+                        &UserActionKey::WorktreeCreate,
+                        UserActionPayload::WorktreeCreate {
+                            rx,
+                            wi_id: work_item_id,
+                        },
+                    );
+                }
+                None => {
+                    // No repo association has a branch. Open the
+                    // recovery dialog instead of leaving the user
+                    // stuck on a dead-end status message. When the
+                    // user confirms, the dialog's
+                    // `PendingBranchAction::SpawnSession` arm
+                    // re-enters `spawn_session` with the same work
+                    // item ID, so the worktree is created and the
+                    // Claude pane opens without the user having to
+                    // press Enter a second time.
+                    self.open_set_branch_dialog(
+                        work_item_id.clone(),
+                        crate::create_dialog::PendingBranchAction::SpawnSession,
+                    );
                 }
             }
         }
@@ -5637,25 +5628,25 @@ impl App {
         let (wi_kind, context_json, repo_mcp_servers) = {
             let wi = self.work_items.iter().find(|w| w.id == *work_item_id);
             let wi_kind = wi.map(|w| format!("{:?}", w.kind)).unwrap_or_default();
-            let context_json = if let Some(wi) = wi {
-                let pr_url = wi
-                    .repo_associations
-                    .first()
-                    .and_then(|a| a.pr.as_ref())
-                    .map(|pr| pr.url.as_str())
-                    .unwrap_or("");
-                serde_json::json!({
-                    "work_item_id": wi_id_str,
-                    "stage": format!("{:?}", wi.status),
-                    "title": wi.title,
-                    "description": wi.description,
-                    "repo": cwd_clone.display().to_string(),
-                    "pr_url": pr_url,
-                })
-                .to_string()
-            } else {
-                "{}".to_string()
-            };
+            let context_json = wi.map_or_else(
+                || "{}".to_string(),
+                |wi| {
+                    let pr_url = wi
+                        .repo_associations
+                        .first()
+                        .and_then(|a| a.pr.as_ref())
+                        .map_or("", |pr| pr.url.as_str());
+                    serde_json::json!({
+                        "work_item_id": wi_id_str,
+                        "stage": format!("{:?}", wi.status),
+                        "title": wi.title,
+                        "description": wi.description,
+                        "repo": cwd_clone.display().to_string(),
+                        "pr_url": pr_url,
+                    })
+                    .to_string()
+                },
+            );
             let repo_mcp_servers: Vec<crate::config::McpServerEntry> = wi
                 .and_then(|w| w.repo_associations.first())
                 .map(|assoc| {
@@ -5801,7 +5792,7 @@ impl App {
                         // the `workbridge` key of the JSON.
                         mcp_bridge_out = Some(crate::agent_backend::McpBridgeSpec {
                             name: "workbridge".to_string(),
-                            command: exe.clone(),
+                            command: exe,
                             args: vec![
                                 "--mcp-bridge".to_string(),
                                 "--socket".to_string(),
@@ -5822,11 +5813,10 @@ impl App {
                         // orphan the side-car file.
                         match agent_backend.write_session_files(&cwd_clone, &mcp_config) {
                             Ok(paths) => {
-                                if !paths.is_empty() {
-                                    worker_committed_files
-                                        .lock()
-                                        .unwrap()
-                                        .extend(paths.iter().cloned());
+                                if !paths.is_empty()
+                                    && let Ok(mut guard) = worker_committed_files.lock()
+                                {
+                                    guard.extend(paths.iter().cloned());
                                 }
                                 written_files.extend(paths);
                             }
@@ -6138,9 +6128,9 @@ impl App {
         let pane_rows = self.pane_rows;
         let cwd_owned = cwd.to_path_buf();
         let wi_id_clone = work_item_id.clone();
-        let session_key_clone = session_key.clone();
+        let session_key_clone = session_key;
         std::thread::spawn(move || {
-            let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+            let cmd_refs: Vec<&str> = cmd.iter().map(std::string::String::as_str).collect();
             let result = match Session::spawn(pane_cols, pane_rows, Some(&cwd_owned), &cmd_refs) {
                 Ok(session) => SessionSpawnResult {
                     wi_id: wi_id_clone,
@@ -6189,9 +6179,8 @@ impl App {
         }
         let keys: Vec<WorkItemId> = self.session_spawn_rx.keys().cloned().collect();
         for wi_id in keys {
-            let pending = match self.session_spawn_rx.get(&wi_id) {
-                Some(p) => p,
-                None => continue,
+            let Some(pending) = self.session_spawn_rx.get(&wi_id) else {
+                continue;
             };
             let result = match pending.rx.try_recv() {
                 Ok(r) => r,
@@ -6314,10 +6303,8 @@ impl App {
     ///    the user has configured one.
     /// 3. `SESSION_TITLE_NONE` placeholder - never a vendor default.
     pub fn agent_backend_display_name(&self) -> &'static str {
-        match self.resolved_harness_kind() {
-            Some(kind) => kind.display_name(),
-            None => Self::SESSION_TITLE_NONE,
-        }
+        self.resolved_harness_kind()
+            .map_or(Self::SESSION_TITLE_NONE, |kind| kind.display_name())
     }
 
     /// Single source of truth for the Session tab title's harness
@@ -6459,8 +6446,8 @@ impl App {
         if current_status == Some(WorkItemStatus::Backlog) {
             self.apply_stage_change(
                 &work_item_id,
-                &WorkItemStatus::Backlog,
-                &WorkItemStatus::Planning,
+                WorkItemStatus::Backlog,
+                WorkItemStatus::Planning,
                 "user_harness_pick",
             );
             // apply_stage_change already calls spawn_session for stages
@@ -6693,14 +6680,11 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
             }
         };
-        let result = match recv_result {
-            Ok(r) => r,
-            Err(()) => {
-                self.end_user_action(&UserActionKey::WorktreeCreate);
-                self.status_message =
-                    Some("Worktree creation: background thread exited unexpectedly".into());
-                return;
-            }
+        let Ok(result) = recv_result else {
+            self.end_user_action(&UserActionKey::WorktreeCreate);
+            self.status_message =
+                Some("Worktree creation: background thread exited unexpectedly".into());
+            return;
         };
 
         self.end_user_action(&UserActionKey::WorktreeCreate);
@@ -6864,10 +6848,10 @@ impl App {
 
             let reused_wt =
                 Self::find_reusable_worktree(ws.as_ref(), &repo_path, &branch, &wt_target);
-            let (wt_result, reused) = match reused_wt {
-                Some(existing) => (Ok(existing), true),
-                None => (ws.create_worktree(&repo_path, &branch, &wt_target), false),
-            };
+            let (wt_result, reused) = reused_wt.map_or_else(
+                || (ws.create_worktree(&repo_path, &branch, &wt_target), false),
+                |existing| (Ok(existing), true),
+            );
 
             match wt_result {
                 Ok(wt_info) => {
@@ -6886,10 +6870,9 @@ impl App {
                 Err(e) => {
                     let mut msg = format!("Recovery failed: {e}");
                     if !cleanup_errors.is_empty() {
-                        msg.push_str(&format!(
-                            " (cleanup also failed: {})",
-                            cleanup_errors.join("; ")
-                        ));
+                        use std::fmt::Write as _;
+                        let _ =
+                            write!(msg, " (cleanup also failed: {})", cleanup_errors.join("; "));
                     }
                     let _ = tx.send(WorktreeCreateResult {
                         wi_id,
@@ -7018,22 +7001,24 @@ impl App {
                 )
             }
             WorkItemStatus::Review => {
-                let pr_line = match &pr_url {
-                    Some(url) => format!(" Pull request: {url}."),
-                    None => format!(
-                        " Note: no pull request URL is available yet (it may still be creating). \
-                         You can find it by running: gh pr list --head {branch_name}"
-                    ),
-                };
-                if !review_gate_findings.is_empty() {
+                let pr_line = pr_url.as_ref().map_or_else(
+                    || {
+                        format!(
+                            " Note: no pull request URL is available yet (it may still be creating). \
+                             You can find it by running: gh pr list --head {branch_name}"
+                        )
+                    },
+                    |url| format!(" Pull request: {url}."),
+                );
+                if review_gate_findings.is_empty() {
                     format!(
                         "Worktree: {worktree_display}. Branch: {branch_name}. \
-                         Implementation passed the review gate and is ready for review.{pr_line}"
+                         Implementation is complete and ready for review.{pr_line}"
                     )
                 } else {
                     format!(
                         "Worktree: {worktree_display}. Branch: {branch_name}. \
-                         Implementation is complete and ready for review.{pr_line}"
+                         Implementation passed the review gate and is ready for review.{pr_line}"
                     )
                 }
             }
@@ -7065,10 +7050,10 @@ impl App {
             }
             WorkItemStatus::Blocked => "blocked",
             WorkItemStatus::Review => {
-                if !review_gate_findings.is_empty() {
-                    "review_with_findings"
-                } else {
+                if review_gate_findings.is_empty() {
                     "review"
+                } else {
+                    "review_with_findings"
                 }
             }
         };
@@ -7121,12 +7106,8 @@ impl App {
         };
 
         let mut events: Vec<McpEvent> = Vec::new();
-        loop {
-            match rx.try_recv() {
-                Ok(event) => events.push(event),
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-            }
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
         }
 
         for event in events {
@@ -7173,17 +7154,14 @@ impl App {
 
                     // Block transitions on derived statuses (e.g. merged PR -> Done)
                     // to prevent backend/display divergence, mirroring advance/retreat_stage.
-                    if wi_ref.map(|w| w.status_derived).unwrap_or(false) {
+                    if wi_ref.is_some_and(|w| w.status_derived) {
                         self.status_message = Some("MCP: status is derived from merged PR".into());
                         continue;
                     }
 
                     // Block all MCP transitions for review request items.
                     // Claude sessions should not drive workflow for someone else's PR.
-                    if wi_ref
-                        .map(|w| w.kind == WorkItemKind::ReviewRequest)
-                        .unwrap_or(false)
-                    {
+                    if wi_ref.is_some_and(|w| w.kind == WorkItemKind::ReviewRequest) {
                         self.status_message = Some(
                             "MCP: status transitions not supported for review request items".into(),
                         );
@@ -7199,19 +7177,19 @@ impl App {
                     // All other transitions must go through the TUI keybinds.
                     let allowed = matches!(
                         (&current_status, &new_status),
-                        (Some(WorkItemStatus::Implementing), WorkItemStatus::Review)
-                            | (Some(WorkItemStatus::Implementing), WorkItemStatus::Blocked)
-                            | (Some(WorkItemStatus::Blocked), WorkItemStatus::Implementing)
-                            | (Some(WorkItemStatus::Blocked), WorkItemStatus::Review)
-                            | (Some(WorkItemStatus::Planning), WorkItemStatus::Implementing)
+                        (
+                            Some(WorkItemStatus::Implementing | WorkItemStatus::Blocked),
+                            WorkItemStatus::Review
+                        ) | (Some(WorkItemStatus::Implementing), WorkItemStatus::Blocked)
+                            | (
+                                Some(WorkItemStatus::Blocked | WorkItemStatus::Planning),
+                                WorkItemStatus::Implementing
+                            )
                     );
                     if !allowed {
                         self.status_message = Some(format!(
                             "MCP: transition from {} to {} is not allowed",
-                            current_status
-                                .as_ref()
-                                .map(|s| s.badge_text())
-                                .unwrap_or("unknown"),
+                            current_status.map_or("unknown", |s| s.badge_text()),
                             new_status.badge_text()
                         ));
                         continue;
@@ -7220,13 +7198,13 @@ impl App {
                     // No-plan prompt: when Claude blocks because there is no
                     // implementation plan, offer the user a choice to retreat
                     // to Planning instead of staying blocked.
-                    if current_status.as_ref() == Some(&WorkItemStatus::Implementing)
+                    if let Some(current) = current_status
+                        && current == WorkItemStatus::Implementing
                         && new_status == WorkItemStatus::Blocked
                         && reason.contains("No implementation plan")
                     {
                         // Apply the block first so the item is in Blocked state.
-                        let current = current_status.unwrap();
-                        self.apply_stage_change(&wi_id, &current, &new_status, "mcp");
+                        self.apply_stage_change(&wi_id, current, new_status, "mcp");
 
                         // Enqueue for the no-plan prompt (skip duplicates).
                         if !self.no_plan_prompt_queue.contains(&wi_id) {
@@ -7263,8 +7241,14 @@ impl App {
                         continue;
                     }
                     // Non-Review transitions fall through to direct update.
-                    let current = current_status.unwrap();
-                    self.apply_stage_change(&wi_id, &current, &new_status, "mcp");
+                    // `current_status` is populated above from `wi_ref.map(...)`;
+                    // if the work item disappeared between the map and here
+                    // (it cannot, wi_ref is still live up the stack), skip
+                    // the stage change rather than panic.
+                    let Some(current) = current_status else {
+                        continue;
+                    };
+                    self.apply_stage_change(&wi_id, current, new_status, "mcp");
 
                     // Build MCP-specific status message that preserves any
                     // detail from apply_stage_change (e.g. "PR created: URL").
@@ -7348,8 +7332,8 @@ impl App {
                             Ok(record) if record.status == WorkItemStatus::Planning => {
                                 self.apply_stage_change(
                                     &wi_id,
-                                    &WorkItemStatus::Planning,
-                                    &WorkItemStatus::Implementing,
+                                    WorkItemStatus::Planning,
+                                    WorkItemStatus::Implementing,
                                     "mcp",
                                 );
                             }
@@ -7584,8 +7568,7 @@ impl App {
                         .any(|r| r.path == repo && r.git_dir_present);
                     if !repo_valid {
                         self.status_message = Some(format!(
-                            "MCP: repo '{}' not found or has no git dir",
-                            repo_path
+                            "MCP: repo '{repo_path}' not found or has no git dir"
                         ));
                         continue;
                     }
@@ -7632,9 +7615,9 @@ impl App {
 
     /// Import the currently selected unlinked PR as a work item.
     ///
-    /// Calls backend.import() then spawns a background thread to fetch the
+    /// Calls `backend.import()` then spawns a background thread to fetch the
     /// branch and create a worktree. The UI remains responsive while the
-    /// git operations run. Results are picked up by poll_worktree_creation().
+    /// git operations run. Results are picked up by `poll_worktree_creation()`.
     pub fn import_selected_unlinked(&mut self) {
         let Some(idx) = self.selected_item else {
             return;
@@ -7653,7 +7636,7 @@ impl App {
         match self.backend.import(unlinked) {
             Ok(record) => {
                 let title = record.title.clone();
-                let wi_id = record.id.clone();
+                let wi_id = record.id;
                 self.reassemble_work_items();
                 self.build_display_list();
                 self.fetcher_repos_changed = true;
@@ -7667,7 +7650,7 @@ impl App {
 
     /// Import the currently selected review-requested PR as a work item.
     ///
-    /// Calls backend.import_review_request() then spawns a background thread
+    /// Calls `backend.import_review_request()` then spawns a background thread
     /// to fetch the branch and create a worktree. The UI remains responsive
     /// while the git operations run.
     pub fn import_selected_review_request(&mut self) {
@@ -7688,7 +7671,7 @@ impl App {
         match self.backend.import_review_request(rr) {
             Ok(record) => {
                 let title = record.title.clone();
-                let wi_id = record.id.clone();
+                let wi_id = record.id;
                 self.reassemble_work_items();
                 self.build_display_list();
                 self.fetcher_repos_changed = true;
@@ -7743,7 +7726,7 @@ impl App {
     /// `open` is a local shell-out (not remote I/O), running it on the UI
     /// thread would still violate the `[ABSOLUTE]` blocking-I/O invariant
     /// in `docs/UI.md` as soon as `open` stalls for any reason (e.g. a
-    /// slow LaunchServices dispatch). The child's status and stderr are
+    /// slow `LaunchServices` dispatch). The child's status and stderr are
     /// intentionally discarded - this is a best-effort UX affordance and
     /// surfacing `open` errors would add more noise than value.
     ///
@@ -7801,8 +7784,8 @@ impl App {
                 // `as_ref()?` here is infallible defence-in-depth.
                 Some(RebaseTarget {
                     wi_id: wi.id.clone(),
-                    worktree_path: assoc.worktree_path.as_ref().cloned()?,
-                    branch: assoc.branch.as_ref().cloned()?,
+                    worktree_path: assoc.worktree_path.clone()?,
+                    branch: assoc.branch.clone()?,
                 })
             }
             DisplayEntry::UnlinkedItem(_)
@@ -7923,10 +7906,10 @@ impl App {
             // See `find_reusable_worktree` for rationale.
             let reused_wt =
                 Self::find_reusable_worktree(ws.as_ref(), &repo_path, &branch, &wt_target);
-            let (wt_result, reused) = match reused_wt {
-                Some(existing_wt) => (Ok(existing_wt), true),
-                None => (ws.create_worktree(&repo_path, &branch, &wt_target), false),
-            };
+            let (wt_result, reused) = reused_wt.map_or_else(
+                || (ws.create_worktree(&repo_path, &branch, &wt_target), false),
+                |existing_wt| (Ok(existing_wt), true),
+            );
             match wt_result {
                 Ok(wt_info) => {
                     let _ = tx.send(WorktreeCreateResult {
@@ -8079,7 +8062,7 @@ impl App {
 
         match self.backend.create(request) {
             Ok(record) => {
-                let wi_id = record.id.clone();
+                let wi_id = record.id;
                 self.reassemble_work_items();
                 self.fetcher_repos_changed = true;
                 // Set identity so build_display_list restores selection.
@@ -8118,7 +8101,7 @@ impl App {
 
         match self.backend.create(request) {
             Ok(record) => {
-                let wi_id = record.id.clone();
+                let wi_id = record.id;
                 self.reassemble_work_items();
                 self.fetcher_repos_changed = true;
                 self.selected_work_item = Some(wi_id.clone());
@@ -8138,7 +8121,7 @@ impl App {
     ///
     /// Strategy:
     /// 1. Exactly one managed repo with a git directory - use it.
-    /// 2. Multiple repos - return "MULTIPLE_REPOS" so the caller opens the
+    /// 2. Multiple repos - return "`MULTIPLE_REPOS`" so the caller opens the
     ///    creation dialog with the repo picker focused. CWD is deliberately
     ///    not consulted: when there is a real choice to make, the user should
     ///    pick explicitly every time.
@@ -8228,18 +8211,17 @@ impl App {
         }
 
         // Collect the list of repo associations that need a branch.
-        let targets: Vec<PathBuf> = match self.work_items.iter().find(|w| w.id == dlg.wi_id) {
-            Some(w) => w
-                .repo_associations
-                .iter()
-                .filter(|a| a.branch.is_none())
-                .map(|a| a.repo_path.clone())
-                .collect(),
-            None => {
+        let targets: Vec<PathBuf> =
+            if let Some(w) = self.work_items.iter().find(|w| w.id == dlg.wi_id) {
+                w.repo_associations
+                    .iter()
+                    .filter(|a| a.branch.is_none())
+                    .map(|a| a.repo_path.clone())
+                    .collect()
+            } else {
                 self.status_message = Some("Work item not found".into());
                 return;
-            }
-        };
+            };
 
         if targets.is_empty() {
             // Defensive: if the user somehow opened the dialog for an
@@ -8267,7 +8249,7 @@ impl App {
                 self.spawn_session(&dlg.wi_id);
             }
             crate::create_dialog::PendingBranchAction::Advance { from, to } => {
-                self.apply_stage_change(&dlg.wi_id, &from, &to, "user");
+                self.apply_stage_change(&dlg.wi_id, from, to, "user");
             }
         }
     }
@@ -8497,7 +8479,7 @@ impl App {
     }
 
     /// Advance the selected work item to the next workflow stage.
-    /// Persists the change via backend.update_status() and reassembles.
+    /// Persists the change via `backend.update_status()` and reassembles.
     /// When transitioning from Implementing to Review, runs the plan-based
     /// review gate if a plan exists.
     pub fn advance_stage(&mut self) {
@@ -8610,11 +8592,11 @@ impl App {
             return;
         }
 
-        self.apply_stage_change(&wi_id, &current_status, &new_status, "user");
+        self.apply_stage_change(&wi_id, current_status, new_status, "user");
     }
 
     /// Retreat the selected work item to the previous workflow stage.
-    /// Persists the change via backend.update_status() and reassembles.
+    /// Persists the change via `backend.update_status()` and reassembles.
     pub fn retreat_stage(&mut self) {
         let Some(wi_id) = self.selected_work_item_id() else {
             return;
@@ -8696,7 +8678,7 @@ impl App {
             return;
         }
 
-        self.apply_stage_change(&wi_id, &current_status, &new_status, "user");
+        self.apply_stage_change(&wi_id, current_status, new_status, "user");
     }
 
     /// Move a blocked (no-plan) work item back to Planning so that Claude
@@ -8719,7 +8701,7 @@ impl App {
         // the transition actually succeeded (the work item is now Planning).
         let current = WorkItemStatus::Blocked;
         let next = WorkItemStatus::Planning;
-        self.apply_stage_change(wi_id, &current, &next, "user");
+        self.apply_stage_change(wi_id, current, next, "user");
 
         let is_planning = self
             .work_items
@@ -8745,15 +8727,15 @@ impl App {
     pub fn apply_stage_change(
         &mut self,
         wi_id: &WorkItemId,
-        current_status: &WorkItemStatus,
-        new_status: &WorkItemStatus,
+        current_status: WorkItemStatus,
+        new_status: WorkItemStatus,
         source: &str,
     ) {
         // Merge-gate guard: Done requires a verified PR merge or a
         // submitted review.  All other callers must go through the merge
         // prompt / poll_pr_merge path (source == "pr_merge") or the review
         // submission path (source == "review_submitted").
-        if *new_status == WorkItemStatus::Done
+        if new_status == WorkItemStatus::Done
             && source != "pr_merge"
             && source != "review_submitted"
         {
@@ -8774,14 +8756,14 @@ impl App {
             self.status_message = Some(format!("Activity log error: {e}"));
         }
 
-        if let Err(e) = self.backend.update_status(wi_id, *new_status) {
+        if let Err(e) = self.backend.update_status(wi_id, new_status) {
             self.status_message = Some(format!("Stage update error: {e}"));
             return;
         }
 
         // Track when items enter/leave Done for auto-archival.
         let mut done_at_error = false;
-        if *new_status == WorkItemStatus::Done {
+        if new_status == WorkItemStatus::Done {
             match crate::side_effects::clock::system_now().duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => {
                     if let Err(e) = self.backend.set_done_at(wi_id, Some(duration.as_secs())) {
@@ -8796,7 +8778,7 @@ impl App {
                     done_at_error = true;
                 }
             }
-        } else if *current_status == WorkItemStatus::Done
+        } else if current_status == WorkItemStatus::Done
             && let Err(e) = self.backend.set_done_at(wi_id, None)
         {
             self.status_message = Some(format!("Failed to clear archive timestamp: {e}"));
@@ -8816,7 +8798,7 @@ impl App {
             .iter()
             .find(|w| w.id == *wi_id)
             .is_some_and(|w| w.kind == WorkItemKind::ReviewRequest);
-        if *new_status == WorkItemStatus::Review && !is_review_request {
+        if new_status == WorkItemStatus::Review && !is_review_request {
             self.spawn_pr_creation(wi_id);
         }
 
@@ -8871,13 +8853,11 @@ impl App {
             return;
         }
 
-        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
-            Some(w) => w,
-            None => return,
+        let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
+            return;
         };
-        let assoc = match wi.repo_associations.first() {
-            Some(a) => a,
-            None => return,
+        let Some(assoc) = wi.repo_associations.first() else {
+            return;
         };
         let branch = match assoc.branch.as_ref() {
             Some(b) => b.clone(),
@@ -8896,19 +8876,15 @@ impl App {
         // This check runs BEFORE try_begin_user_action so an early return
         // (cache miss) cannot leave an orphaned helper entry - see the
         // "desync guard" discussion in `docs/UI.md` "User action guard".
-        let (owner, repo_name) = match self
+        let Some((owner, repo_name)) = self
             .repo_data
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone())
-        {
-            Some((o, r)) => (o, r),
-            None => {
-                self.status_message = Some(
-                    "PR creation skipped: GitHub remote not yet cached (waiting for next fetch)"
-                        .into(),
-                );
-                return;
-            }
+        else {
+            self.status_message = Some(
+                "PR creation skipped: GitHub remote not yet cached (waiting for next fetch)".into(),
+            );
+            return;
         };
         let owner_repo = format!("{owner}/{repo_name}");
 
@@ -9105,26 +9081,22 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
             }
         };
-        let result = match recv_result {
-            Ok(r) => r,
-            Err(()) => {
-                self.end_user_action(&UserActionKey::PrCreate);
-                self.status_message =
-                    Some("PR creation: background thread exited unexpectedly".into());
-                // Try next pending PR creation despite the failure.
-                // Skip items that were deleted or retreated from Review.
-                while let Some(next_id) = self.pr_create_pending.pop_front() {
-                    if self
-                        .work_items
-                        .iter()
-                        .any(|w| w.id == next_id && w.status == WorkItemStatus::Review)
-                    {
-                        self.spawn_pr_creation(&next_id);
-                        break;
-                    }
+        let Ok(result) = recv_result else {
+            self.end_user_action(&UserActionKey::PrCreate);
+            self.status_message = Some("PR creation: background thread exited unexpectedly".into());
+            // Try next pending PR creation despite the failure.
+            // Skip items that were deleted or retreated from Review.
+            while let Some(next_id) = self.pr_create_pending.pop_front() {
+                if self
+                    .work_items
+                    .iter()
+                    .any(|w| w.id == next_id && w.status == WorkItemStatus::Review)
+                {
+                    self.spawn_pr_creation(&next_id);
+                    break;
                 }
-                return;
             }
+            return;
         };
 
         self.end_user_action(&UserActionKey::PrCreate);
@@ -9173,7 +9145,7 @@ impl App {
     /// Two-phase flow:
     ///
     /// 1. Pre-flight validity checks (in-memory only): `wi`, branch,
-    ///    repo_path, GitHub remote cache. Failures alert and return
+    ///    `repo_path`, GitHub remote cache. Failures alert and return
     ///    BEFORE admitting the helper slot so an early return cannot
     ///    leave an orphaned `UserActionKey::PrMerge` entry. See
     ///    `docs/UI.md` "User action guard" for the desync-guard rule.
@@ -9205,47 +9177,38 @@ impl App {
             return;
         }
 
-        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
-            Some(w) => w,
-            None => return,
+        let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
+            return;
         };
-        let assoc = match wi.repo_associations.first() {
-            Some(a) => a,
-            None => {
-                self.confirm_merge = false;
-                self.merge_wi_id = None;
-                self.alert_message = Some("Cannot merge: no repo association".into());
-                return;
-            }
+        let Some(assoc) = wi.repo_associations.first() else {
+            self.confirm_merge = false;
+            self.merge_wi_id = None;
+            self.alert_message = Some("Cannot merge: no repo association".into());
+            return;
         };
-        let branch = match assoc.branch.as_ref() {
-            Some(b) => b.clone(),
-            None => {
-                self.confirm_merge = false;
-                self.merge_wi_id = None;
-                self.alert_message = Some("Cannot merge: no branch associated".into());
-                return;
-            }
+        let branch = if let Some(b) = assoc.branch.as_ref() {
+            b.clone()
+        } else {
+            self.confirm_merge = false;
+            self.merge_wi_id = None;
+            self.alert_message = Some("Cannot merge: no branch associated".into());
+            return;
         };
         let repo_path = assoc.repo_path.clone();
 
         // Read owner/repo from the cached fetcher result rather than shelling
         // out on the UI thread. If no entry exists yet, the first fetch has
         // not completed - surface that as an alert instead of blocking.
-        let (owner, repo_name) = match self
+        let Some((owner, repo_name)) = self
             .repo_data
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone())
-        {
-            Some((o, r)) => (o, r),
-            None => {
-                self.confirm_merge = false;
-                self.merge_wi_id = None;
-                self.alert_message = Some(
-                    "Cannot merge: GitHub remote not yet cached (waiting for next fetch)".into(),
-                );
-                return;
-            }
+        else {
+            self.confirm_merge = false;
+            self.merge_wi_id = None;
+            self.alert_message =
+                Some("Cannot merge: GitHub remote not yet cached (waiting for next fetch)".into());
+            return;
         };
         let owner_repo = format!("{owner}/{repo_name}");
 
@@ -9409,19 +9372,18 @@ impl App {
             //    order; `merge_block_message` owns the user-facing
             //    wording.
             let readiness = MergeReadiness::classify(wt.as_ref(), &live_pr);
-            let msg = if let Some(reason) = readiness.merge_block_message() {
-                MergePreCheckMessage::Blocked {
-                    reason: reason.to_string(),
-                }
-            } else {
-                MergePreCheckMessage::Ready {
+            let msg = readiness.merge_block_message().map_or_else(
+                || MergePreCheckMessage::Ready {
                     wi_id: wi_id_for_thread,
                     strategy: strategy_for_thread,
                     branch: branch_for_thread,
                     repo_path: repo_path_for_thread,
                     owner_repo: owner_repo_for_thread,
-                }
-            };
+                },
+                |reason| MergePreCheckMessage::Blocked {
+                    reason: reason.to_string(),
+                },
+            );
             let _ = tx.send(msg);
         });
 
@@ -9710,16 +9672,13 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
             }
         };
-        let result = match recv_result {
-            Ok(r) => r,
-            Err(()) => {
-                self.end_user_action(&UserActionKey::PrMerge);
-                self.merge_in_progress = false;
-                self.confirm_merge = false;
-                self.merge_wi_id = None;
-                self.alert_message = Some("PR merge: background thread exited unexpectedly".into());
-                return;
-            }
+        let Ok(result) = recv_result else {
+            self.end_user_action(&UserActionKey::PrMerge);
+            self.merge_in_progress = false;
+            self.confirm_merge = false;
+            self.merge_wi_id = None;
+            self.alert_message = Some("PR merge: background thread exited unexpectedly".into());
+            return;
         };
 
         self.end_user_action(&UserActionKey::PrMerge);
@@ -9784,8 +9743,8 @@ impl App {
                 // Advance to Done.
                 self.apply_stage_change(
                     &result.wi_id,
-                    &WorkItemStatus::Review,
-                    &WorkItemStatus::Done,
+                    WorkItemStatus::Review,
+                    WorkItemStatus::Done,
                     "pr_merge",
                 );
                 self.status_message = Some(format!("PR merged ({strategy}) and moved to [DN]"));
@@ -9810,8 +9769,8 @@ impl App {
                 self.rework_reasons.insert(result.wi_id.clone(), reason);
                 self.apply_stage_change(
                     &result.wi_id,
-                    &WorkItemStatus::Review,
-                    &WorkItemStatus::Implementing,
+                    WorkItemStatus::Review,
+                    WorkItemStatus::Implementing,
                     "merge_conflict",
                 );
                 self.alert_message = Some(
@@ -9835,23 +9794,18 @@ impl App {
             return;
         }
 
-        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
-            Some(w) => w,
-            None => return,
+        let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
+            return;
         };
-        let assoc = match wi.repo_associations.first() {
-            Some(a) => a,
-            None => {
-                self.status_message = Some("Cannot submit review: no repo association".into());
-                return;
-            }
+        let Some(assoc) = wi.repo_associations.first() else {
+            self.status_message = Some("Cannot submit review: no repo association".into());
+            return;
         };
-        let branch = match assoc.branch.as_ref() {
-            Some(b) => b.clone(),
-            None => {
-                self.status_message = Some("Cannot submit review: no branch".into());
-                return;
-            }
+        let branch = if let Some(b) = assoc.branch.as_ref() {
+            b.clone()
+        } else {
+            self.status_message = Some("Cannot submit review: no branch".into());
+            return;
         };
         let repo_path = assoc.repo_path.clone();
         // Read owner/repo from the cached fetcher result rather than shelling
@@ -9860,19 +9814,16 @@ impl App {
         //
         // Early returns above run BEFORE try_begin_user_action so a
         // cache miss cannot leave an orphaned helper entry.
-        let (owner, repo_name) = match self
+        let Some((owner, repo_name)) = self
             .repo_data
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone())
-        {
-            Some((o, r)) => (o, r),
-            None => {
-                self.status_message = Some(
-                    "Cannot submit review: GitHub remote not yet cached (waiting for next fetch)"
-                        .into(),
-                );
-                return;
-            }
+        else {
+            self.status_message = Some(
+                "Cannot submit review: GitHub remote not yet cached (waiting for next fetch)"
+                    .into(),
+            );
+            return;
         };
         let owner_repo = format!("{owner}/{repo_name}");
 
@@ -9963,14 +9914,11 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
             }
         };
-        let result = match recv_result {
-            Ok(r) => r,
-            Err(()) => {
-                self.end_user_action(&UserActionKey::ReviewSubmit);
-                self.status_message =
-                    Some("Review submission: background thread exited unexpectedly".into());
-                return;
-            }
+        let Ok(result) = recv_result else {
+            self.end_user_action(&UserActionKey::ReviewSubmit);
+            self.status_message =
+                Some("Review submission: background thread exited unexpectedly".into());
+            return;
         };
 
         self.end_user_action(&UserActionKey::ReviewSubmit);
@@ -9999,8 +9947,8 @@ impl App {
 
                 self.apply_stage_change(
                     &result.wi_id,
-                    &WorkItemStatus::Review,
-                    &WorkItemStatus::Done,
+                    WorkItemStatus::Review,
+                    WorkItemStatus::Done,
                     "review_submitted",
                 );
                 // Only show success if the item actually reached Done.
@@ -10025,48 +9973,39 @@ impl App {
     /// Review with an open PR. Registers a watch so `poll_mergequeue()`
     /// will check the PR state periodically.
     pub fn enter_mergequeue(&mut self, wi_id: &WorkItemId) {
-        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
-            Some(w) => w,
-            None => return,
+        let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
+            return;
         };
-        let assoc = match wi.repo_associations.first() {
-            Some(a) => a,
-            None => {
-                self.status_message = Some("Cannot enter mergequeue: no repo association".into());
-                return;
-            }
+        let Some(assoc) = wi.repo_associations.first() else {
+            self.status_message = Some("Cannot enter mergequeue: no repo association".into());
+            return;
         };
-        let branch = match assoc.branch.as_ref() {
-            Some(b) => b.clone(),
-            None => {
-                self.status_message = Some("Cannot enter mergequeue: no branch".into());
-                return;
-            }
+        let branch = if let Some(b) = assoc.branch.as_ref() {
+            b.clone()
+        } else {
+            self.status_message = Some("Cannot enter mergequeue: no branch".into());
+            return;
         };
-        let pr_number = match assoc.pr.as_ref() {
-            Some(pr) => pr.number,
-            None => {
-                self.status_message = Some("Cannot enter mergequeue: no PR found".into());
-                return;
-            }
+        let pr_number = if let Some(pr) = assoc.pr.as_ref() {
+            pr.number
+        } else {
+            self.status_message = Some("Cannot enter mergequeue: no PR found".into());
+            return;
         };
         let repo_path = assoc.repo_path.clone();
         // Read owner/repo from the cached fetcher result - never shell out
         // on the UI thread.
-        let (owner, repo_name) = match self
+        let Some((owner, repo_name)) = self
             .repo_data
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone())
-        {
-            Some((o, r)) => (o, r),
-            None => {
-                self.status_message = Some(
-                    "Cannot enter mergequeue: GitHub remote not yet cached \
-                     (waiting for next fetch)"
-                        .into(),
-                );
-                return;
-            }
+        else {
+            self.status_message = Some(
+                "Cannot enter mergequeue: GitHub remote not yet cached \
+                 (waiting for next fetch)"
+                    .into(),
+            );
+            return;
         };
         let owner_repo = format!("{owner}/{repo_name}");
 
@@ -10084,8 +10023,8 @@ impl App {
 
         self.apply_stage_change(
             wi_id,
-            &WorkItemStatus::Review,
-            &WorkItemStatus::Mergequeue,
+            WorkItemStatus::Review,
+            WorkItemStatus::Mergequeue,
             "user",
         );
         self.status_message = Some("Entered mergequeue - polling PR until merged".into());
@@ -10185,7 +10124,7 @@ impl App {
     );
 
     impl_pr_merge_reconstruct_method!(
-        /// Reconstruct ReviewRequest merge watches from the current
+        /// Reconstruct `ReviewRequest` merge watches from the current
         /// `work_items` snapshot. Called after every reassembly so
         /// that any `ReviewRequest`-kind item in `Review` gets
         /// exactly one watch and app restarts never lose state.
@@ -10195,7 +10134,7 @@ impl App {
         /// up lazily by `poll_review_request_merges`'s Phase 1 drain
         /// (its still-eligible guard) on the next poll cycle.
         ///
-        /// ReviewRequest items almost never carry a live `assoc.pr`
+        /// `ReviewRequest` items almost never carry a live `assoc.pr`
         /// because the `--author @me` fetch filters their
         /// author-side PRs out, so reconstructions here will
         /// generally start with `pr_number = None` and rely on the
@@ -10211,8 +10150,8 @@ impl App {
     );
 
     /// Collect Done items that need PR identity backfill (have a branch but
-    /// no persisted pr_identity). Returns tuples of
-    /// (wi_id, repo_path, branch, github_owner, github_repo).
+    /// no persisted `pr_identity`). Returns tuples of
+    /// (`wi_id`, `repo_path`, branch, `github_owner`, `github_repo`).
     ///
     /// Reads owner/repo from the cached `repo_data[path].github_remote`
     /// populated by the background fetcher. When the fetcher has not
@@ -10221,7 +10160,7 @@ impl App {
     /// `worktree_service.github_remote(...)` on the UI thread.
     ///
     /// Temporary migration helper - can be removed once all existing Done
-    /// items have been backfilled (i.e. no Done items with pr_identity=None
+    /// items have been backfilled (i.e. no Done items with `pr_identity=None`
     /// remain on disk).
     pub fn collect_backfill_requests(&self) -> Vec<(WorkItemId, PathBuf, String, String, String)> {
         let records = match self.backend.list() {
@@ -10241,13 +10180,12 @@ impl App {
                     Some(b) => b.clone(),
                     None => continue,
                 };
-                let (owner, repo_name) = match self
+                let Some((owner, repo_name)) = self
                     .repo_data
                     .get(&assoc.repo_path)
                     .and_then(|rd| rd.github_remote.clone())
-                {
-                    Some((o, r)) => (o, r),
-                    None => continue,
+                else {
+                    continue;
                 };
                 requests.push((
                     record.id.clone(),
@@ -10267,9 +10205,8 @@ impl App {
     /// Temporary migration helper - can be removed once all existing Done
     /// items have been backfilled.
     pub fn drain_pr_identity_backfill(&mut self) -> bool {
-        let rx = match self.pr_identity_backfill_rx.as_ref() {
-            Some(rx) => rx,
-            None => return false,
+        let Some(rx) = self.pr_identity_backfill_rx.as_ref() else {
+            return false;
         };
         let mut changed = false;
         let mut disconnected = false;
@@ -10308,12 +10245,11 @@ impl App {
     }
 
     /// Remove the worktree directory and local branch for a work item after merge.
-    /// Uses delete_branch=true so the merged branch is cleaned up. Uses force=false
+    /// Uses `delete_branch=true` so the merged branch is cleaned up. Uses force=false
     /// because post-merge worktrees should be clean and `-d` is safe for merged branches.
     fn cleanup_worktree_for_item(&mut self, wi_id: &WorkItemId) {
-        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
-            Some(w) => w,
-            None => return,
+        let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
+            return;
         };
         for assoc in &wi.repo_associations {
             if let Some(ref wt_path) = assoc.worktree_path {
@@ -10431,19 +10367,11 @@ impl App {
         // the immutable borrow of `self.work_items` ends before the
         // mutable `start_activity` call below.
         let (title, branch, repo_path, current_pr_number, current_check_status) = {
-            let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
-                Some(wi) => wi,
-                None => {
-                    return ReviewGateSpawn::Blocked("Work item not found".into());
-                }
+            let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
+                return ReviewGateSpawn::Blocked("Work item not found".into());
             };
-            let assoc = match wi.repo_associations.first() {
-                Some(a) => a,
-                None => {
-                    return ReviewGateSpawn::Blocked(
-                        "Cannot enter Review: no repo association".into(),
-                    );
-                }
+            let Some(assoc) = wi.repo_associations.first() else {
+                return ReviewGateSpawn::Blocked("Cannot enter Review: no repo association".into());
             };
             let branch = match assoc.branch.as_ref() {
                 Some(b) => b.clone(),
@@ -10473,13 +10401,10 @@ impl App {
         // silent default. See `docs/harness-contract.md` Change Log
         // 2026-04-16 and the
         // `harness_choice_applied_to_review_gate_spawn` test.
-        let agent_backend = match self.backend_for_work_item(wi_id) {
-            Some(b) => b,
-            None => {
-                return ReviewGateSpawn::Blocked(
+        let Some(agent_backend) = self.backend_for_work_item(wi_id) else {
+            return ReviewGateSpawn::Blocked(
                     "Cannot run review gate: no harness chosen for this work item. Press c / x to pick one and re-open the session first.".into(),
                 );
-            }
         };
 
         // Resolve per-repo MCP servers up-front (UI thread) and convert
@@ -10568,10 +10493,9 @@ impl App {
                 }
             };
 
-            let default_branch = match ws.default_branch(&repo_path) {
-                Ok(b) => b,
-                Err(_) => "main".to_string(),
-            };
+            let default_branch = ws
+                .default_branch(&repo_path)
+                .unwrap_or_else(|_| "main".to_string());
 
             match crate::worktree_service::git_command()
                 .arg("-C")
@@ -10604,7 +10528,7 @@ impl App {
                     });
                     return;
                 }
-            };
+            }
 
             // Resolve GitHub remote on this background thread (blocking I/O).
             let (gh_owner, gh_repo, has_github_remote) = match ws.github_remote(&repo_path) {
@@ -10631,19 +10555,16 @@ impl App {
                     return; // Receiver dropped - gate cancelled.
                 }
 
-                let pr_num = match current_pr_number {
-                    Some(n) => Some(n),
-                    None => Self::find_pr_for_branch(&gh_owner, &gh_repo, &branch),
-                };
+                let pr_num = current_pr_number
+                    .or_else(|| Self::find_pr_for_branch(&gh_owner, &gh_repo, &branch));
 
                 if pr_num.is_none() {
                     let _ = tx.send(ReviewGateMessage::Result(ReviewGateResult {
                         work_item_id: wi_id_clone,
                         approved: false,
                         detail: format!(
-                            "No pull request found for branch '{}'. \
-                             Create a PR before requesting review.",
-                            branch
+                            "No pull request found for branch '{branch}'. \
+                             Create a PR before requesting review."
                         ),
                     }));
                     return;
@@ -10819,7 +10740,7 @@ impl App {
             }
             let rg_bridge = crate::agent_backend::McpBridgeSpec {
                 name: "workbridge".to_string(),
-                command: exe_path.clone(),
+                command: exe_path,
                 args: vec![
                     "--mcp-bridge".to_string(),
                     "--socket".to_string(),
@@ -10927,14 +10848,11 @@ impl App {
         // BEFORE `try_begin_user_action` so the 500 ms debounce does
         // not eat a repeat press - this way the user can press `c` to
         // pick a harness and immediately retry.
-        let agent_backend = match self.backend_for_work_item(&wi_id) {
-            Some(b) => b,
-            None => {
-                self.status_message = Some(
-                    "Cannot rebase: no harness chosen for this work item. Press c / x to pick one first.".into(),
-                );
-                return;
-            }
+        let Some(agent_backend) = self.backend_for_work_item(&wi_id) else {
+            self.status_message = Some(
+                "Cannot rebase: no harness chosen for this work item. Press c / x to pick one first.".into(),
+            );
+            return;
         };
 
         // Resolve per-repo MCP servers up-front (UI thread) and convert
@@ -10985,13 +10903,12 @@ impl App {
 
         // Single-flight admission. The 500 ms debounce matches
         // `Ctrl+R`: rapid presses are intentionally coalesced.
-        let activity = match self.try_begin_user_action(
+        let Some(activity) = self.try_begin_user_action(
             UserActionKey::RebaseOnMain,
             Duration::from_millis(500),
             "Rebasing onto upstream main",
-        ) {
-            Some(id) => id,
-            None => return,
+        ) else {
+            return;
         };
         // Attach the WorkItemId payload so any caller that consults
         // `user_action_work_item(&RebaseOnMain)` can find the owning
@@ -11064,10 +10981,9 @@ impl App {
             // the answer is identical to querying the main checkout, and
             // keeping the path consistent avoids a second source of
             // truth.
-            let base_branch = match ws.default_branch(&worktree_path) {
-                Ok(b) => b,
-                Err(_) => "main".to_string(),
-            };
+            let base_branch = ws
+                .default_branch(&worktree_path)
+                .unwrap_or_else(|_| "main".to_string());
 
             // Cancellation check between phase 1 and phase 2:
             // `default_branch` may shell out to git, so it is the
@@ -11137,7 +11053,7 @@ impl App {
                     Ok(SubprocessOutcome::Completed(out)) => {
                         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
                         break 'compute Some(RebaseResult::Failure {
-                            base_branch: base_branch.clone(),
+                            base_branch,
                             reason: format!("git fetch failed: {}", stderr.trim()),
                             conflicts_attempted: false,
                             activity_log_error: None,
@@ -11148,7 +11064,7 @@ impl App {
                     }
                     Err(e) => {
                         break 'compute Some(RebaseResult::Failure {
-                            base_branch: base_branch.clone(),
+                            base_branch,
                             reason: format!("git fetch could not run: {e}"),
                             conflicts_attempted: false,
                             activity_log_error: None,
@@ -11202,13 +11118,13 @@ impl App {
                     }
                     Err(e) => {
                         break 'compute Some(RebaseResult::Failure {
-                            base_branch: base_branch.clone(),
+                            base_branch,
                             reason: format!("rebase gate: could not start MCP server: {e}"),
                             conflicts_attempted: false,
                             activity_log_error: None,
                         });
                     }
-                };
+                }
 
                 // Cancellation check after starting the MCP server.
                 // The post-block cleanup will drop `gate_server`.
@@ -11220,7 +11136,7 @@ impl App {
                     Ok(p) => p,
                     Err(e) => {
                         break 'compute Some(RebaseResult::Failure {
-                            base_branch: base_branch.clone(),
+                            base_branch,
                             reason: format!("rebase gate: could not resolve exe path: {e}"),
                             conflicts_attempted: false,
                             activity_log_error: None,
@@ -11234,7 +11150,7 @@ impl App {
                 ));
                 if let Err(e) = std::fs::write(&path, &mcp_config) {
                     break 'compute Some(RebaseResult::Failure {
-                        base_branch: base_branch.clone(),
+                        base_branch,
                         reason: format!("rebase gate: could not write MCP config: {e}"),
                         conflicts_attempted: false,
                         activity_log_error: None,
@@ -11246,7 +11162,7 @@ impl App {
                 // `agent_backend::McpBridgeSpec`.
                 let rebase_bridge = crate::agent_backend::McpBridgeSpec {
                     name: "workbridge".to_string(),
-                    command: exe_path.clone(),
+                    command: exe_path,
                     args: vec![
                         "--mcp-bridge".to_string(),
                         "--socket".to_string(),
@@ -11312,16 +11228,26 @@ impl App {
                 // doc comment for the full rationale.
                 let (output_tx, output_rx) = crossbeam_channel::bounded::<SubprocessOutcome>(1);
                 {
-                    let config_path = config_path
-                        .as_ref()
-                        .expect("config_path was set just above")
-                        .clone();
+                    // `config_path` is unconditionally set by the
+                    // `config_path = Some(path)` assignment a few
+                    // lines above, before this block runs; the
+                    // `as_ref()? ... .clone()` dance lets the code
+                    // avoid a restriction-lint `expect()` without
+                    // changing behaviour (on the impossible None
+                    // path we just skip the spawn with an error).
+                    let Some(config_path) = config_path.clone() else {
+                        break 'compute Some(RebaseResult::Failure {
+                            base_branch,
+                            reason: "rebase gate: config path missing".into(),
+                            conflicts_attempted: false,
+                            activity_log_error: None,
+                        });
+                    };
                     let worktree_path = worktree_path.clone();
-                    let prompt = prompt.clone();
                     let child_pid = Arc::clone(&child_pid);
                     let cancelled = Arc::clone(&cancelled);
                     let agent_backend = Arc::clone(&agent_backend);
-                    let bridge = rebase_bridge.clone();
+                    let bridge = rebase_bridge;
                     let extra_bridges = rebase_extra_bridges.clone();
                     std::thread::spawn(move || {
                         let rw_cfg = crate::agent_backend::ReviewGateSpawnConfig {
@@ -11390,22 +11316,23 @@ impl App {
                                         let _ = tx.send(RebaseGateMessage::Progress(msg));
                                     }
                                 }
-                                Ok(_) => {
-                                    // Other MCP events (StatusUpdate, SetPlan,
-                                    // SetTitle, ...) are intentionally ignored.
-                                    // The rebase gate writes its own activity log
-                                    // entry from `poll_rebase_gate` after the
-                                    // harness exits, so the prompt does not ask
-                                    // the harness to call `workbridge_set_status`
-                                    // and we do not forward stray events here.
-                                    // Forwarding would let a misbehaving harness
-                                    // rename the work item or overwrite its plan
-                                    // as a side effect of running a rebase.
-                                }
-                                Err(_) => {
-                                    // Channel disconnected - server gone. Continue
-                                    // waiting for the child to exit; the output_rx
-                                    // arm below will fire shortly.
+                                Ok(_) | Err(_) => {
+                                    // `Ok(_)`: other MCP events (StatusUpdate,
+                                    // SetPlan, SetTitle, ...) are intentionally
+                                    // ignored. The rebase gate writes its own
+                                    // activity log entry from `poll_rebase_gate`
+                                    // after the harness exits, so the prompt does
+                                    // not ask the harness to call
+                                    // `workbridge_set_status` and we do not
+                                    // forward stray events here. Forwarding would
+                                    // let a misbehaving harness rename the work
+                                    // item or overwrite its plan as a side effect
+                                    // of running a rebase.
+                                    //
+                                    // `Err(_)`: channel disconnected - server
+                                    // gone. Continue waiting for the child to
+                                    // exit; the output_rx arm below will fire
+                                    // shortly.
                                 }
                             }
                         }
@@ -11494,11 +11421,10 @@ impl App {
                                         .arg(&worktree_path)
                                         .args(["rev-parse", "--verify", "--quiet", "REBASE_HEAD"])
                                         .output()
-                                        .map(|o| o.status.success())
-                                        .unwrap_or(false);
+                                        .is_ok_and(|o| o.status.success());
                                     if ancestry_ok && !rebase_in_progress {
                                         RebaseResult::Success {
-                                            base_branch: base_branch.clone(),
+                                            base_branch,
                                             conflicts_resolved,
                                             activity_log_error: None,
                                         }
@@ -11519,7 +11445,7 @@ impl App {
                                         // The harness left the worktree
                                         // mid-rebase.
                                         RebaseResult::Failure {
-                                            base_branch: base_branch.clone(),
+                                            base_branch,
                                             reason: "harness reported success but a rebase is still in progress (REBASE_HEAD exists)".into(),
                                             conflicts_attempted: true,
                                             activity_log_error: None,
@@ -11527,7 +11453,7 @@ impl App {
                                     }
                                 } else {
                                     RebaseResult::Failure {
-                                        base_branch: base_branch.clone(),
+                                        base_branch,
                                         reason: if detail.is_empty() {
                                             "harness reported failure".into()
                                         } else {
@@ -11540,7 +11466,7 @@ impl App {
                                 }
                             }
                             Err(e) => RebaseResult::Failure {
-                                base_branch: base_branch.clone(),
+                                base_branch,
                                 reason: format!("rebase gate: invalid JSON envelope: {e}"),
                                 conflicts_attempted: conflicts_attempted_observed,
                                 activity_log_error: None,
@@ -11550,14 +11476,14 @@ impl App {
                     Ok(output) => {
                         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                         RebaseResult::Failure {
-                            base_branch: base_branch.clone(),
+                            base_branch,
                             reason: format!("harness exited with error: {}", stderr.trim()),
                             conflicts_attempted: conflicts_attempted_observed,
                             activity_log_error: None,
                         }
                     }
                     Err(e) => RebaseResult::Failure {
-                        base_branch: base_branch.clone(),
+                        base_branch,
                         reason: format!("rebase gate: harness thread disconnected: {e}"),
                         conflicts_attempted: conflicts_attempted_observed,
                         activity_log_error: None,
@@ -11599,10 +11525,7 @@ impl App {
             // cancellation contract in C10 says cancelled gates do
             // NOT write to the activity log and do NOT send a
             // result through `tx`.
-            let result = match computed {
-                Some(r) => r,
-                None => return,
-            };
+            let Some(result) = computed else { return };
 
             // If the result is a Failure, clean up any in-progress
             // rebase the harness may have left behind. The harness
@@ -11812,7 +11735,7 @@ impl App {
     /// `OpenOptions::create(true)`. Routing every destructive call
     /// site through this helper closes that window structurally:
     /// after this returns, the gate has been removed from the map
-    /// (so its `Drop` impl has set the `cancelled` flag and SIGKILLed
+    /// (so its `Drop` impl has set the `cancelled` flag and `SIGKILLed`
     /// the harness group) and the bg thread will exit on its next
     /// phase check without writing.
     ///
@@ -11837,9 +11760,8 @@ impl App {
         let wi_ids: Vec<WorkItemId> = self.review_gates.keys().cloned().collect();
 
         for wi_id in wi_ids {
-            let gate = match self.review_gates.get(&wi_id) {
-                Some(g) => g,
-                None => continue,
+            let Some(gate) = self.review_gates.get(&wi_id) else {
+                continue;
             };
 
             // Drain all pending messages for this gate.
@@ -11912,8 +11834,7 @@ impl App {
                 let origin = self
                     .review_gates
                     .get(&wi_id)
-                    .map(|g| g.origin)
-                    .unwrap_or(ReviewGateOrigin::Mcp);
+                    .map_or(ReviewGateOrigin::Mcp, |g| g.origin);
                 self.drop_review_gate(&wi_id);
 
                 let wi_exists = self.work_items.iter().any(|w| w.id == wi_id);
@@ -11969,10 +11890,7 @@ impl App {
                 }
             }
 
-            let result = match result {
-                Some(r) => r,
-                None => continue, // Only progress this tick, no final result yet.
-            };
+            let Some(result) = result else { continue };
 
             // Gate completed - remove from map.
             debug_assert_eq!(result.work_item_id, wi_id);
@@ -11986,10 +11904,9 @@ impl App {
                 .work_items
                 .iter()
                 .find(|w| w.id == wi_id)
-                .map(|w| {
+                .is_some_and(|w| {
                     w.status == WorkItemStatus::Implementing || w.status == WorkItemStatus::Blocked
-                })
-                .unwrap_or(false);
+                });
 
             if !gate_eligible {
                 continue;
@@ -12019,13 +11936,12 @@ impl App {
                     .work_items
                     .iter()
                     .find(|w| w.id == wi_id)
-                    .map(|w| w.status)
-                    .unwrap_or(WorkItemStatus::Implementing);
+                    .map_or(WorkItemStatus::Implementing, |w| w.status);
 
                 self.apply_stage_change(
                     &wi_id,
-                    &current_status,
-                    &WorkItemStatus::Review,
+                    current_status,
+                    WorkItemStatus::Review,
                     "review_gate",
                 );
             } else {
@@ -12102,9 +12018,8 @@ impl App {
         let wi_ids: Vec<WorkItemId> = self.rebase_gates.keys().cloned().collect();
 
         for wi_id in wi_ids {
-            let gate = match self.rebase_gates.get(&wi_id) {
-                Some(g) => g,
-                None => continue,
+            let Some(gate) = self.rebase_gates.get(&wi_id) else {
+                continue;
             };
 
             let mut last_progress: Option<String> = None;
@@ -12141,10 +12056,7 @@ impl App {
                 continue;
             }
 
-            let result = match result {
-                Some(r) => r,
-                None => continue,
-            };
+            let Some(result) = result else { continue };
 
             self.drop_rebase_gate(&wi_id);
 
@@ -12186,21 +12098,22 @@ impl App {
                 }
             };
             if let Some(err) = activity_log_error {
-                status_message.push_str(&format!(" (activity log error: {err})"));
+                use std::fmt::Write as _;
+                let _ = write!(status_message, " (activity log error: {err})");
             }
             self.status_message = Some(status_message);
         }
     }
 
-    /// Get the SessionEntry for the currently selected work item, if any.
+    /// Get the `SessionEntry` for the currently selected work item, if any.
     pub fn active_session_entry(&self) -> Option<&SessionEntry> {
         let work_item_id = self.selected_work_item_id()?;
         let key = self.session_key_for(&work_item_id)?;
         self.sessions.get(&key)
     }
 
-    /// Get a mutable reference to the SessionEntry for the currently selected
-    /// work item. Needed by mouse scroll handling to update scrollback_offset.
+    /// Get a mutable reference to the `SessionEntry` for the currently selected
+    /// work item. Needed by mouse scroll handling to update `scrollback_offset`.
     pub fn active_session_entry_mut(&mut self) -> Option<&mut SessionEntry> {
         let work_item_id = self.selected_work_item_id()?;
         let key = self.session_key_for(&work_item_id)?;
@@ -12480,7 +12393,7 @@ impl App {
             let mcp_config = crate::mcp::build_mcp_config(&exe, &mcp_server.socket_path, &[]);
             let global_bridge = crate::agent_backend::McpBridgeSpec {
                 name: "workbridge".to_string(),
-                command: exe.clone(),
+                command: exe,
                 args: vec![
                     "--mcp-bridge".to_string(),
                     "--socket".to_string(),
@@ -12565,7 +12478,7 @@ impl App {
                 read_only: false,
             };
             let cmd = agent_backend.build_command(&cfg);
-            let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+            let cmd_refs: Vec<&str> = cmd.iter().map(std::string::String::as_str).collect();
 
             // Phase F: spawn the PTY session. The fork+exec is
             // normally sub-millisecond but still blocks on process
@@ -12637,68 +12550,64 @@ impl App {
             },
             None => return,
         };
-        let pending = match self.global_session_open_pending.take() {
-            Some(p) => p,
-            None => return,
+        let Some(pending) = self.global_session_open_pending.take() else {
+            return;
         };
         self.end_activity(pending.activity);
 
-        match recv_result {
-            Ok(result) => {
-                if let Some(err) = result.error {
-                    // Worker reported a fatal error. Drop MCP server
-                    // and session off the UI thread so their
-                    // destructors (socket unlink, child kill/join)
-                    // do not block the event loop.
-                    if let Some(server) = result.mcp_server {
-                        self.drop_mcp_server_off_thread(server);
-                    }
-                    if let Some(session) = result.session {
-                        std::thread::spawn(move || drop(session));
-                    }
-                    self.spawn_agent_file_cleanup(vec![pending.config_path]);
-                    self.status_message = Some(err);
-                    self.global_drawer_open = false;
-                    self.focus = pending.pre_drawer_focus;
-                    // Clear buffered keystrokes so they do not leak
-                    // into the next successful open.
-                    self.pending_global_pty_bytes.clear();
-                    return;
-                }
-
-                // Success path: move worker handles into the durable
-                // App fields. The config path was owned by the
-                // pending entry all along (not by the result) so
-                // the worker cannot be in a state where it thinks
-                // it owns the tempfile separately.
-                if let Some(session) = result.session {
-                    let parser = Arc::clone(&session.parser);
-                    self.global_session = Some(SessionEntry {
-                        parser,
-                        alive: true,
-                        session: Some(session),
-                        scrollback_offset: 0,
-                        selection: None,
-                        agent_written_files: Vec::new(),
-                    });
-                }
+        if let Ok(result) = recv_result {
+            if let Some(err) = result.error {
+                // Worker reported a fatal error. Drop MCP server
+                // and session off the UI thread so their
+                // destructors (socket unlink, child kill/join)
+                // do not block the event loop.
                 if let Some(server) = result.mcp_server {
-                    self.global_mcp_server = Some(server);
+                    self.drop_mcp_server_off_thread(server);
                 }
-                self.global_mcp_config_path = Some(pending.config_path);
-            }
-            Err(()) => {
-                // Worker thread exited without sending. The config
-                // path may or may not be on disk; route it through
-                // cleanup anyway (same rationale as the error arm
-                // above).
+                if let Some(session) = result.session {
+                    std::thread::spawn(move || drop(session));
+                }
                 self.spawn_agent_file_cleanup(vec![pending.config_path]);
-                self.status_message =
-                    Some("Global assistant: preparation worker exited unexpectedly".into());
+                self.status_message = Some(err);
                 self.global_drawer_open = false;
                 self.focus = pending.pre_drawer_focus;
+                // Clear buffered keystrokes so they do not leak
+                // into the next successful open.
                 self.pending_global_pty_bytes.clear();
+                return;
             }
+
+            // Success path: move worker handles into the durable
+            // App fields. The config path was owned by the
+            // pending entry all along (not by the result) so
+            // the worker cannot be in a state where it thinks
+            // it owns the tempfile separately.
+            if let Some(session) = result.session {
+                let parser = Arc::clone(&session.parser);
+                self.global_session = Some(SessionEntry {
+                    parser,
+                    alive: true,
+                    session: Some(session),
+                    scrollback_offset: 0,
+                    selection: None,
+                    agent_written_files: Vec::new(),
+                });
+            }
+            if let Some(server) = result.mcp_server {
+                self.global_mcp_server = Some(server);
+            }
+            self.global_mcp_config_path = Some(pending.config_path);
+        } else {
+            // Worker thread exited without sending. The config
+            // path may or may not be on disk; route it through
+            // cleanup anyway (same rationale as the error arm
+            // above).
+            self.spawn_agent_file_cleanup(vec![pending.config_path]);
+            self.status_message =
+                Some("Global assistant: preparation worker exited unexpectedly".into());
+            self.global_drawer_open = false;
+            self.focus = pending.pre_drawer_focus;
+            self.pending_global_pty_bytes.clear();
         }
     }
 
@@ -12781,8 +12690,7 @@ impl App {
                     .repo_associations
                     .first()
                     .and_then(|a| a.pr.as_ref())
-                    .map(|pr| pr.url.as_str())
-                    .unwrap_or("");
+                    .map_or("", |pr| pr.url.as_str());
                 serde_json::json!({
                     "title": wi.title,
                     "status": format!("{:?}", wi.status),
@@ -12815,13 +12723,10 @@ impl App {
     pub fn extra_branches_from_backend(&self) -> std::collections::HashMap<PathBuf, Vec<String>> {
         let mut map: std::collections::HashMap<PathBuf, Vec<String>> =
             std::collections::HashMap::new();
-        let list_result = match self.backend.list() {
-            Ok(r) => r,
-            Err(_) => {
-                // Backend list failed - the fetcher just won't have extras.
-                // The error will surface through other paths (assembly, etc.).
-                return map;
-            }
+        let Ok(list_result) = self.backend.list() else {
+            // Backend list failed - the fetcher just won't have extras.
+            // The error will surface through other paths (assembly, etc.).
+            return map;
         };
         for record in &list_result.records {
             for assoc in &record.repo_associations {
@@ -12838,7 +12743,7 @@ impl App {
 
 /// Canonicalize repo entry paths so that symlinked or non-canonical config
 /// paths resolve to the same real filesystem path. This ensures fetcher
-/// cache keys (keyed by repo_path) match assembly lookups. If canonicalization
+/// cache keys (keyed by `repo_path`) match assembly lookups. If canonicalization
 /// fails (e.g. path does not exist), the original path is kept.
 fn canonicalize_repo_entries(entries: Vec<RepoEntry>) -> Vec<RepoEntry> {
     entries
@@ -12852,7 +12757,7 @@ fn canonicalize_repo_entries(entries: Vec<RepoEntry>) -> Vec<RepoEntry> {
         .collect()
 }
 
-/// Public crate-level accessor for now_iso8601, used by the event module.
+/// Public crate-level accessor for `now_iso8601`, used by the event module.
 pub fn now_iso8601_pub() -> String {
     now_iso8601()
 }
@@ -12871,7 +12776,7 @@ fn now_iso8601() -> String {
 
 /// Returns true if a display entry can receive selection (is an item, not
 /// a header or empty state).
-pub fn is_selectable(entry: &DisplayEntry) -> bool {
+pub const fn is_selectable(entry: &DisplayEntry) -> bool {
     matches!(
         entry,
         DisplayEntry::ReviewRequestItem(_)
@@ -13042,9 +12947,6 @@ impl WorkItemBackend for StubBackend {
     fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
         None
     }
-    fn backend_type(&self) -> crate::work_item::BackendType {
-        crate::work_item::BackendType::LocalFile
-    }
 }
 
 #[cfg(test)]
@@ -13085,8 +12987,8 @@ mod tests {
     #[test]
     fn manage_unmanage_sets_fetcher_repos_changed() {
         // Setup: create a config with a base_dir containing a discovered repo.
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("repo-a/.git")).unwrap();
 
         let mut cfg = Config::default();
@@ -13132,8 +13034,8 @@ mod tests {
 
     #[test]
     fn is_inside_managed_repo_positive() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         // Create the subdirectory on disk so canonicalize succeeds.
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -13154,13 +13056,13 @@ mod tests {
 
     // -- Round 3 regression tests --
 
-    /// F-1: managed_repo_root returns repo root, not subdirectory path.
+    /// F-1: `managed_repo_root` returns repo root, not subdirectory path.
     /// Work item creation must store the repo root, not CWD when CWD is
     /// a subdirectory of a managed repo.
     #[test]
     fn managed_repo_root_returns_root_not_subdir() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join("src/deeply/nested")).unwrap();
 
@@ -13184,7 +13086,7 @@ mod tests {
         );
     }
 
-    /// F-2: fetcher_repos_changed is set after import and delete.
+    /// F-2: `fetcher_repos_changed` is set after import and delete.
     /// Import and delete change backend records, so the fetcher must
     /// be restarted to pick up new/removed extra branches.
     #[test]
@@ -13224,12 +13126,13 @@ mod tests {
             }
             fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
                 let mut records = self.records.lock().unwrap();
-                if let Some(pos) = records.iter().position(|r| r.id == *id) {
-                    records.remove(pos);
-                    Ok(())
-                } else {
-                    Err(BackendError::NotFound(id.clone()))
-                }
+                records.iter().position(|r| r.id == *id).map_or_else(
+                    || Err(BackendError::NotFound(id.clone())),
+                    |pos| {
+                        records.remove(pos);
+                        Ok(())
+                    },
+                )
             }
             fn update_status(
                 &self,
@@ -13305,9 +13208,6 @@ mod tests {
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
             }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
-            }
         }
 
         let backend = TestBackend {
@@ -13364,7 +13264,7 @@ mod tests {
         );
     }
 
-    /// F-1: fetcher_repos_changed is set after creating a work item with a
+    /// F-1: `fetcher_repos_changed` is set after creating a work item with a
     /// branch. Without this, the fetcher never picks up the new branch for
     /// issue metadata.
     #[test]
@@ -13447,9 +13347,6 @@ mod tests {
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
             }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
-            }
         }
 
         let mut app = App::with_config(Config::default(), Arc::new(CreateBackend));
@@ -13500,8 +13397,8 @@ mod tests {
         );
     }
 
-    /// FetchStarted message triggers a status bar activity, cleared on
-    /// RepoData arrival.
+    /// `FetchStarted` message triggers a status bar activity, cleared on
+    /// `RepoData` arrival.
     #[test]
     fn fetch_started_shows_activity() {
         let mut app = App::new();
@@ -13530,7 +13427,7 @@ mod tests {
         assert!(app.structural_fetch_activity.is_none());
     }
 
-    /// FetcherError also clears the fetch activity.
+    /// `FetcherError` also clears the fetch activity.
     #[test]
     fn fetch_started_cleared_on_error() {
         let mut app = App::new();
@@ -13551,7 +13448,7 @@ mod tests {
         assert!(app.structural_fetch_activity.is_none());
     }
 
-    /// Multiple FetchStarted messages should not create duplicate activities.
+    /// Multiple `FetchStarted` messages should not create duplicate activities.
     #[test]
     fn fetch_started_deduplicates() {
         let mut app = App::new();
@@ -13612,15 +13509,15 @@ mod tests {
 
     // -- Round 4 regression tests --
 
-    /// F-1: Canonicalized repo paths in active_repo_cache match fetcher
+    /// F-1: Canonicalized repo paths in `active_repo_cache` match fetcher
     /// cache keys. A symlinked repo path in config should resolve to its
-    /// canonical form so that repo_data lookups by the assembly layer
+    /// canonical form so that `repo_data` lookups by the assembly layer
     /// succeed.
     #[test]
     fn active_repo_cache_uses_canonical_paths() {
         // Create a real directory and a symlink to it.
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         let real_path = dir.join("real-repo");
         let link_path = dir.join("link-repo");
         std::fs::create_dir_all(real_path.join(".git")).unwrap();
@@ -13676,7 +13573,7 @@ mod tests {
     }
 
     /// F-2: Unmanaging a repo prunes stale fetch cache entries.
-    /// After fetcher restart, repo_data for removed repos should be
+    /// After fetcher restart, `repo_data` for removed repos should be
     /// cleared so stale data stops rendering.
     #[test]
     fn unmanage_prunes_stale_repo_data() {
@@ -13688,7 +13585,7 @@ mod tests {
         app.repo_data.insert(
             repo_a.clone(),
             crate::work_item::RepoFetchResult {
-                repo_path: repo_a.clone(),
+                repo_path: repo_a,
                 github_remote: None,
                 worktrees: Ok(vec![]),
                 prs: Ok(vec![]),
@@ -13700,7 +13597,7 @@ mod tests {
         app.repo_data.insert(
             repo_b.clone(),
             crate::work_item::RepoFetchResult {
-                repo_path: repo_b.clone(),
+                repo_path: repo_b,
                 github_remote: None,
                 worktrees: Ok(vec![]),
                 prs: Ok(vec![]),
@@ -13776,7 +13673,7 @@ mod tests {
         app.status_message = Some("other message".into());
         tx.send(FetchMessage::RepoData(Box::new(
             crate::work_item::RepoFetchResult {
-                repo_path: repo_path.clone(),
+                repo_path,
                 github_remote: None,
                 worktrees: Err(WorktreeError::GitError("still broken".into())),
                 prs: Ok(vec![]),
@@ -13797,7 +13694,7 @@ mod tests {
     // -- Round 5 regression tests --
 
     /// F-1: Selection survives reassembly when items reorder.
-    /// After backend records change order, the same WorkItemId should
+    /// After backend records change order, the same `WorkItemId` should
     /// remain selected even if its display index changes.
     #[test]
     fn selection_survives_reassembly_when_items_reorder() {
@@ -13878,9 +13775,6 @@ mod tests {
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
             }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
-            }
         }
 
         let id_a = WorkItemId::LocalFile(PathBuf::from("/data/aaa.json"));
@@ -13919,7 +13813,7 @@ mod tests {
 
         // Start with order A, B.
         let backend = OrderableBackend {
-            records: std::sync::Mutex::new(vec![record_a.clone(), record_b.clone()]),
+            records: std::sync::Mutex::new(vec![record_a, record_b]),
         };
         let mut app = App::with_config(Config::default(), Arc::new(backend));
 
@@ -13961,7 +13855,7 @@ mod tests {
             },
             crate::work_item::WorkItem {
                 display_id: None,
-                id: id_a.clone(),
+                id: id_a,
                 backend_type: crate::work_item::BackendType::LocalFile,
                 kind: crate::work_item::WorkItemKind::Own,
                 title: "Item A".into(),
@@ -13986,7 +13880,7 @@ mod tests {
         let new_selected_id = app.selected_work_item_id();
         assert_eq!(
             new_selected_id,
-            Some(id_b.clone()),
+            Some(id_b),
             "selection should still be Item B after reorder",
         );
 
@@ -13998,7 +13892,7 @@ mod tests {
         );
     }
 
-    /// Helper for ACTIVE-group sort tests: build a minimal WorkItem for
+    /// Helper for ACTIVE-group sort tests: build a minimal `WorkItem` for
     /// a given repo path and status. Title is purely informational for
     /// assertion messages.
     fn active_sort_test_item(
@@ -14074,7 +13968,6 @@ mod tests {
                 DisplayEntry::WorkItemEntry(wi_idx) => {
                     ordered_titles.push(app.work_items[*wi_idx].title.as_str());
                 }
-                DisplayEntry::GroupHeader { .. } => break,
                 _ => break,
             }
         }
@@ -14119,7 +14012,6 @@ mod tests {
                 DisplayEntry::WorkItemEntry(wi_idx) => {
                     ordered_titles.push(app.work_items[*wi_idx].title.as_str());
                 }
-                DisplayEntry::GroupHeader { .. } => break,
                 _ => break,
             }
         }
@@ -14130,13 +14022,13 @@ mod tests {
         );
     }
 
-    /// F-1: LocalFileBackend::list() returns records sorted by path for
-    /// deterministic enumeration. read_dir order is filesystem-dependent,
+    /// F-1: `LocalFileBackend::list()` returns records sorted by path for
+    /// deterministic enumeration. `read_dir` order is filesystem-dependent,
     /// so sorting ensures stable display indices.
     #[test]
     fn backend_list_returns_sorted_records() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         let backend = crate::work_item_backend::LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         // Create items with names that would sort differently than creation order.
@@ -14280,7 +14172,7 @@ mod tests {
 
     // -- Round 6 regression tests --
 
-    /// F-1: Unlinked PR selection keyed by (repo_path, branch) not just branch.
+    /// F-1: Unlinked PR selection keyed by (`repo_path`, branch) not just branch.
     /// Two repos can have unlinked PRs on the same branch name. After
     /// reassembly, selection must stay on the correct repo's PR.
     #[test]
@@ -14295,7 +14187,7 @@ mod tests {
 
         // Two unlinked PRs from different repos with the same branch name.
         app.unlinked_prs.push(crate::work_item::UnlinkedPr {
-            repo_path: repo_a.clone(),
+            repo_path: repo_a,
             pr: PrInfo {
                 number: 1,
                 title: "Update deps (alpha)".into(),
@@ -14337,7 +14229,7 @@ mod tests {
                     "should have selected beta's PR",
                 );
             }
-            other => panic!("expected UnlinkedItem, got: {:?}", other),
+            other => panic!("expected UnlinkedItem, got: {other:?}"),
         }
 
         // Verify the identity tracker stores (repo_path, branch).
@@ -14363,13 +14255,13 @@ mod tests {
                     "after rebuild, selected PR number should be 2 (beta), not 1 (alpha)",
                 );
             }
-            other => panic!("expected UnlinkedItem after rebuild, got: {:?}", other),
+            other => panic!("expected UnlinkedItem after rebuild, got: {other:?}"),
         }
     }
 
     // -- Round 7 regression tests --
 
-    /// F-2: Invalid branch_issue_pattern is caught at startup.
+    /// F-2: Invalid `branch_issue_pattern` is caught at startup.
     /// Verify that an invalid regex is detected and the pattern is reset
     /// to an empty string (disabling issue extraction) rather than crashing
     /// or causing fetcher threads to die.
@@ -14385,10 +14277,8 @@ mod tests {
         if let Err(e) = regex::Regex::new(&app.config.defaults.branch_issue_pattern) {
             let bad = app.config.defaults.branch_issue_pattern.clone();
             app.config.defaults.branch_issue_pattern = String::new();
-            let msg = format!(
-                "Invalid branch_issue_pattern '{}': {} (issue extraction disabled)",
-                bad, e,
-            );
+            let msg =
+                format!("Invalid branch_issue_pattern '{bad}': {e} (issue extraction disabled)");
             if app.status_message.is_none() {
                 app.status_message = Some(msg);
             } else {
@@ -14412,8 +14302,8 @@ mod tests {
 
     /// F-2: Disconnected fetcher channel surfaces error in status bar.
     /// When all fetcher threads exit (e.g. due to invalid regex), the
-    /// channel disconnects. drain_fetch_results should detect this and
-    /// set fetcher_disconnected = true with a status message.
+    /// channel disconnects. `drain_fetch_results` should detect this and
+    /// set `fetcher_disconnected` = true with a status message.
     #[test]
     fn disconnected_fetcher_surfaces_error() {
         let mut app = App::new();
@@ -14459,7 +14349,7 @@ mod tests {
         use crate::work_item_backend::ListResult;
         use crate::worktree_service::{WorktreeError, WorktreeInfo};
 
-        /// Mock worktree service that records create_worktree calls.
+        /// Mock worktree service that records `create_worktree` calls.
         struct MockWorktreeService {
             created: std::sync::Mutex<Vec<(PathBuf, String, PathBuf)>>,
         }
@@ -14654,9 +14544,6 @@ mod tests {
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
             }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
-            }
         }
 
         let mock_ws = Arc::new(MockWorktreeService {
@@ -14738,7 +14625,7 @@ mod tests {
         use crate::work_item_backend::ListResult;
         use crate::worktree_service::{WorktreeError, WorktreeInfo};
 
-        /// Mock worktree service where fetch_branch always fails
+        /// Mock worktree service where `fetch_branch` always fails
         /// (simulates fork PR or branch not on origin).
         struct FailFetchWorktreeService {
             created: std::sync::Mutex<Vec<(PathBuf, String, PathBuf)>>,
@@ -14935,9 +14822,6 @@ mod tests {
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
             }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
-            }
         }
 
         let mock_ws = Arc::new(FailFetchWorktreeService {
@@ -15009,9 +14893,9 @@ mod tests {
 
     // -- Round 10 regression tests --
 
-    /// F-2 regression: worktree_target_path builds the path under
-    /// repo_path/worktree_dir/sanitized_branch, not
-    /// repo_path.parent()/<repo>-wt-<branch>.
+    /// F-2 regression: `worktree_target_path` builds the path under
+    /// `repo_path/worktree_dir/sanitized_branch`, not
+    /// `repo_path.parent()`/<repo>-wt-<branch>.
     #[test]
     fn worktree_target_path_uses_config_worktree_dir() {
         let repo = PathBuf::from("/repos/myrepo");
@@ -15036,7 +14920,7 @@ mod tests {
         );
     }
 
-    /// find_reusable_worktree must only accept worktrees that live at the
+    /// `find_reusable_worktree` must only accept worktrees that live at the
     /// exact expected target path, are not the main worktree, and are on
     /// the target branch. Any other match is rejected so the caller falls
     /// through to `create_worktree` (which surfaces git's "already checked
@@ -15113,8 +14997,8 @@ mod tests {
 
         // find_reusable_worktree canonicalizes both paths, so they must
         // exist on disk. Use a temp dir with a fresh subdirectory per case.
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let root = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let wt_target = repo.join(".worktrees").join("feature-x");
@@ -15166,7 +15050,7 @@ mod tests {
         // expected .worktrees/<branch>) must be rejected.
         let mock = ListOnlyMock {
             entries: vec![WorktreeInfo {
-                path: other_target.clone(),
+                path: other_target,
                 branch: Some("feature-x".into()),
                 is_main: false,
                 ..WorktreeInfo::default()
@@ -15189,7 +15073,7 @@ mod tests {
         let missing_target = repo.join(".worktrees").join("never-existed");
         let mock = ListOnlyMock {
             entries: vec![WorktreeInfo {
-                path: wt_target.clone(),
+                path: wt_target,
                 branch: Some("feature-x".into()),
                 is_main: false,
                 ..WorktreeInfo::default()
@@ -15262,7 +15146,7 @@ mod tests {
         assert_eq!(prompt.branch, "feature/stale");
     }
 
-    /// When a recovery result arrives (stale_recovery_in_progress = true)
+    /// When a recovery result arrives (`stale_recovery_in_progress` = true)
     /// and succeeds, both the recovery flag and prompt must be cleared.
     #[test]
     fn poll_worktree_creation_clears_stale_recovery_on_success() {
@@ -15316,10 +15200,7 @@ mod tests {
         app.try_begin_user_action(UserActionKey::WorktreeCreate, Duration::ZERO, "test");
         app.attach_user_action_payload(
             &UserActionKey::WorktreeCreate,
-            UserActionPayload::WorktreeCreate {
-                rx,
-                wi_id: wi_id.clone(),
-            },
+            UserActionPayload::WorktreeCreate { rx, wi_id },
         );
 
         app.poll_worktree_creation();
@@ -15335,7 +15216,7 @@ mod tests {
     }
 
     /// When recovery fails, the recovery flag is cleared and the error is
-    /// shown via alert_message (not back through the stale prompt).
+    /// shown via `alert_message` (not back through the stale prompt).
     #[test]
     fn poll_worktree_creation_shows_alert_on_recovery_failure() {
         let mut app = App::with_config_and_worktree_service(
@@ -15373,10 +15254,7 @@ mod tests {
         app.try_begin_user_action(UserActionKey::WorktreeCreate, Duration::ZERO, "test");
         app.attach_user_action_payload(
             &UserActionKey::WorktreeCreate,
-            UserActionPayload::WorktreeCreate {
-                rx,
-                wi_id: wi_id.clone(),
-            },
+            UserActionPayload::WorktreeCreate { rx, wi_id },
         );
 
         app.poll_worktree_creation();
@@ -15399,15 +15277,15 @@ mod tests {
         );
     }
 
-    /// F-2 regression: import_selected_unlinked creates the worktree under
-    /// repo_path/worktree_dir/branch, not repo_path.parent()/<repo>-wt-<branch>.
+    /// F-2 regression: `import_selected_unlinked` creates the worktree under
+    /// `repo_path/worktree_dir/branch`, not `repo_path.parent()`/<repo>-wt-<branch>.
     #[test]
     fn import_creates_worktree_under_config_worktree_dir() {
         use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
         use crate::work_item_backend::ListResult;
         use crate::worktree_service::{WorktreeError, WorktreeInfo};
 
-        /// Mock worktree service that records create_worktree calls.
+        /// Mock worktree service that records `create_worktree` calls.
         struct MockWorktreeService {
             created: std::sync::Mutex<Vec<(PathBuf, String, PathBuf)>>,
         }
@@ -15601,9 +15479,6 @@ mod tests {
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
             }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
-            }
         }
 
         // Use a custom worktree_dir to verify it is respected.
@@ -15671,9 +15546,9 @@ mod tests {
 
     // -- Codex round regression tests --
 
-    /// F-3: create_work_item_with rejects repos where git_dir_present is false.
+    /// F-3: `create_work_item_with` rejects repos where `git_dir_present` is false.
     /// Even if a repo path is passed in the repos list, it should be filtered
-    /// out when the corresponding active_repo_cache entry has git_dir_present
+    /// out when the corresponding `active_repo_cache` entry has `git_dir_present`
     /// set to false.
     #[test]
     fn create_work_item_with_rejects_repos_without_git_dir() {
@@ -15763,9 +15638,6 @@ mod tests {
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
-            }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
             }
         }
 
@@ -15859,12 +15731,12 @@ mod tests {
         ];
         app.build_display_list();
 
-        let work_item_entries: Vec<_> = app
+        let work_item_entry_count = app
             .display_list
             .iter()
             .filter(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
-            .collect();
-        assert_eq!(work_item_entries.len(), 2, "both items should appear");
+            .count();
+        assert_eq!(work_item_entry_count, 2, "both items should appear");
 
         let group_headers: Vec<_> = app
             .display_list
@@ -16090,7 +15962,7 @@ mod tests {
         assert_eq!(headers[2], ("BACKLOGGED (alpha)", 1));
     }
 
-    /// F-3: create_work_item_with returns error when ALL repos lack git_dir.
+    /// F-3: `create_work_item_with` returns error when ALL repos lack `git_dir`.
     #[test]
     fn create_work_item_with_errors_when_all_repos_lack_git_dir() {
         let mut app = App::new();
@@ -16122,7 +15994,7 @@ mod tests {
 
     // -- Feature: merge prompt on Review -> Done --
 
-    /// advance_stage from Review sets confirm_merge instead of immediately advancing.
+    /// `advance_stage` from Review sets `confirm_merge` instead of immediately advancing.
     #[test]
     fn advance_stage_review_to_done_shows_merge_prompt() {
         let mut app = App::new();
@@ -16231,8 +16103,8 @@ mod tests {
     }
 
     /// Priority ordering contract of `MergeReadiness::classify`:
-    ///   Dirty > Untracked > Unpushed > PrConflict > CiFailing >
-    ///   BehindOnly > Clean
+    ///   Dirty > Untracked > Unpushed > `PrConflict` > `CiFailing` >
+    ///   `BehindOnly` > Clean
     ///
     /// This is the single canonical classifier used by the live
     /// merge precheck (`spawn_merge_precheck`). Any drift on the
@@ -16435,20 +16307,22 @@ mod tests {
     // pre-confirm merge modal. Never refuses; always advisory.
     // -------------------------------------------------------------------
 
-    /// Helper used by the hint tests: push a Review-stage item with a
-    /// single association whose `PrInfo` + `GitState` are fully
-    /// configurable. Mirrors `push_selected_review_item` but exposes
-    /// the state fields the hint reads.
-    #[allow(clippy::too_many_arguments)]
-    fn push_review_item_with_state(
-        app: &mut App,
-        wi_id: &WorkItemId,
+    /// Bundle of state fields consumed by `push_review_item_with_state`.
+    /// Consolidates the dirty / ahead / behind / checks / mergeable
+    /// knobs into a single struct so the helper signature stays short.
+    struct ReviewItemState {
         dirty: bool,
         ahead: u32,
         behind: u32,
         pr_checks: crate::work_item::CheckStatus,
         pr_mergeable: crate::work_item::MergeableState,
-    ) {
+    }
+
+    /// Helper used by the hint tests: push a Review-stage item with a
+    /// single association whose `PrInfo` + `GitState` are fully
+    /// configurable. Mirrors `push_selected_review_item` but exposes
+    /// the state fields the hint reads.
+    fn push_review_item_with_state(app: &mut App, wi_id: &WorkItemId, state: &ReviewItemState) {
         use crate::work_item::{GitState, PrInfo, PrState, ReviewDecision};
         let repo_path = PathBuf::from("/tmp/hint-tests-repo");
         let branch = "feature/hint-tests".to_string();
@@ -16471,15 +16345,15 @@ mod tests {
                     state: PrState::Open,
                     is_draft: false,
                     review_decision: ReviewDecision::Approved,
-                    checks: pr_checks,
-                    mergeable: pr_mergeable,
+                    checks: state.pr_checks.clone(),
+                    mergeable: state.pr_mergeable.clone(),
                     url: "https://example.com/pr/42".into(),
                 }),
                 issue: None,
                 git_state: Some(GitState {
-                    dirty,
-                    ahead,
-                    behind,
+                    dirty: state.dirty,
+                    ahead: state.ahead,
+                    behind: state.behind,
                 }),
                 stale_worktree_path: None,
             }],
@@ -16497,11 +16371,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            false,
-            0,
-            0,
-            CheckStatus::Passing,
-            MergeableState::Mergeable,
+            &ReviewItemState {
+                dirty: false,
+                ahead: 0,
+                behind: 0,
+                pr_checks: CheckStatus::Passing,
+                pr_mergeable: MergeableState::Mergeable,
+            },
         );
 
         assert_eq!(app.merge_confirm_hint(&wi_id), None);
@@ -16518,11 +16394,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            true,
-            0,
-            0,
-            CheckStatus::Passing,
-            MergeableState::Mergeable,
+            &ReviewItemState {
+                dirty: true,
+                ahead: 0,
+                behind: 0,
+                pr_checks: CheckStatus::Passing,
+                pr_mergeable: MergeableState::Mergeable,
+            },
         );
 
         assert_eq!(
@@ -16541,11 +16419,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            false,
-            3,
-            0,
-            CheckStatus::Passing,
-            MergeableState::Mergeable,
+            &ReviewItemState {
+                dirty: false,
+                ahead: 3,
+                behind: 0,
+                pr_checks: CheckStatus::Passing,
+                pr_mergeable: MergeableState::Mergeable,
+            },
         );
 
         assert_eq!(
@@ -16565,11 +16445,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            false,
-            0,
-            0,
-            CheckStatus::Passing,
-            MergeableState::Conflicting,
+            &ReviewItemState {
+                dirty: false,
+                ahead: 0,
+                behind: 0,
+                pr_checks: CheckStatus::Passing,
+                pr_mergeable: MergeableState::Conflicting,
+            },
         );
 
         assert_eq!(
@@ -16589,11 +16471,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            false,
-            0,
-            0,
-            CheckStatus::Failing,
-            MergeableState::Mergeable,
+            &ReviewItemState {
+                dirty: false,
+                ahead: 0,
+                behind: 0,
+                pr_checks: CheckStatus::Failing,
+                pr_mergeable: MergeableState::Mergeable,
+            },
         );
 
         assert_eq!(
@@ -16616,11 +16500,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            false,
-            0,
-            0,
-            CheckStatus::Pending,
-            MergeableState::Mergeable,
+            &ReviewItemState {
+                dirty: false,
+                ahead: 0,
+                behind: 0,
+                pr_checks: CheckStatus::Pending,
+                pr_mergeable: MergeableState::Mergeable,
+            },
         );
 
         assert_eq!(
@@ -16641,11 +16527,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            true,
-            0,
-            0,
-            CheckStatus::Pending,
-            MergeableState::Mergeable,
+            &ReviewItemState {
+                dirty: true,
+                ahead: 0,
+                behind: 0,
+                pr_checks: CheckStatus::Pending,
+                pr_mergeable: MergeableState::Mergeable,
+            },
         );
 
         assert_eq!(
@@ -16771,7 +16659,7 @@ mod tests {
         assert!(app.alert_message.is_none(), "{:?}", app.alert_message);
     }
 
-    /// BehindOnly is a soft warning and must NOT block the merge.
+    /// `BehindOnly` is a soft warning and must NOT block the merge.
     #[test]
     fn advance_stage_review_to_done_allows_behind_only() {
         let mut app = App::new();
@@ -16921,7 +16809,7 @@ mod tests {
         // independent of any real `gh` binary.
         let (tx, rx) = crossbeam_channel::bounded(1);
         tx.send(MergePreCheckMessage::Ready {
-            wi_id: wi_id.clone(),
+            wi_id,
             strategy: "squash".into(),
             branch: "feature/precheck-ready".into(),
             repo_path: PathBuf::from("/tmp/precheck-ready-repo"),
@@ -16970,7 +16858,7 @@ mod tests {
             .expect("helper admit should succeed in test setup");
         app.merge_in_progress = true;
         app.confirm_merge = true;
-        app.merge_wi_id = Some(wi_id.clone());
+        app.merge_wi_id = Some(wi_id);
 
         let (tx, rx) = crossbeam_channel::bounded(1);
         tx.send(MergePreCheckMessage::Blocked {
@@ -17082,8 +16970,8 @@ mod tests {
             status: WorkItemStatus::Review,
             status_derived: false,
             repo_associations: vec![crate::work_item::RepoAssociation {
-                repo_path: repo_path.clone(),
-                branch: Some(branch_name.clone()),
+                repo_path,
+                branch: Some(branch_name),
                 worktree_path: None,
                 pr: None,
                 issue: None,
@@ -17545,19 +17433,23 @@ mod tests {
     // Live remote PR precheck: conflict / CI failure / clean / error
     // -------------------------------------------------------------------
 
+    /// Bundle of knobs consumed by `install_live_pr_precheck_app`.
+    /// Groups the live-PR state, branch/repo identity, and cleanliness
+    /// cache seeds so the helper signature stays short.
+    struct LivePrPrecheckSpec<'a> {
+        live_pr_state: Option<Result<crate::github_client::LivePrState, GithubError>>,
+        branch: &'a str,
+        repo: &'a std::path::Path,
+        cache_dirty: Option<bool>,
+        cache_untracked: Option<bool>,
+        cache_unpushed: Option<u32>,
+    }
+
     /// Helper to build an `App` with both a clean-worktree stub and a
     /// configurable `MockGithubClient` driving the
     /// `fetch_live_merge_state` return. Used by the remote-precheck
     /// tests below.
-    #[allow(clippy::too_many_arguments)]
-    fn install_live_pr_precheck_app(
-        live_pr_state: Option<Result<crate::github_client::LivePrState, GithubError>>,
-        branch: &str,
-        repo: &std::path::Path,
-        cache_dirty: Option<bool>,
-        cache_untracked: Option<bool>,
-        cache_unpushed: Option<u32>,
-    ) -> (App, WorkItemId) {
+    fn install_live_pr_precheck_app(spec: LivePrPrecheckSpec<'_>) -> (App, WorkItemId) {
         use crate::config::InMemoryConfigProvider;
         use crate::github_client::MockGithubClient;
         use crate::worktree_service::{WorktreeError, WorktreeInfo};
@@ -17628,6 +17520,15 @@ mod tests {
             }
         }
 
+        let LivePrPrecheckSpec {
+            live_pr_state,
+            branch,
+            repo,
+            cache_dirty,
+            cache_untracked,
+            cache_unpushed,
+        } = spec;
+
         let github = MockGithubClient {
             prs: Vec::new(),
             review_requested_prs: Vec::new(),
@@ -17676,18 +17577,18 @@ mod tests {
 
         let repo = PathBuf::from("/tmp/exec-merge-pr-conflict");
         let branch = "feature/pr-conflict";
-        let (mut app, wi_id) = install_live_pr_precheck_app(
-            Some(Ok(LivePrState {
+        let (mut app, wi_id) = install_live_pr_precheck_app(LivePrPrecheckSpec {
+            live_pr_state: Some(Ok(LivePrState {
                 mergeable: MergeableState::Conflicting,
                 check_rollup: CheckStatus::Passing,
                 has_open_pr: true,
             })),
             branch,
-            &repo,
-            Some(false),
-            Some(false),
-            Some(0),
-        );
+            repo: &repo,
+            cache_dirty: Some(false),
+            cache_untracked: Some(false),
+            cache_unpushed: Some(0),
+        });
 
         app.execute_merge(&wi_id, "squash");
         assert!(app.is_merge_precheck_phase());
@@ -17729,18 +17630,18 @@ mod tests {
 
         let repo = PathBuf::from("/tmp/exec-merge-ci-fail");
         let branch = "feature/ci-fail";
-        let (mut app, wi_id) = install_live_pr_precheck_app(
-            Some(Ok(LivePrState {
+        let (mut app, wi_id) = install_live_pr_precheck_app(LivePrPrecheckSpec {
+            live_pr_state: Some(Ok(LivePrState {
                 mergeable: MergeableState::Mergeable,
                 check_rollup: CheckStatus::Failing,
                 has_open_pr: true,
             })),
             branch,
-            &repo,
-            Some(false),
-            Some(false),
-            Some(0),
-        );
+            repo: &repo,
+            cache_dirty: Some(false),
+            cache_untracked: Some(false),
+            cache_unpushed: Some(0),
+        });
 
         app.execute_merge(&wi_id, "squash");
 
@@ -17779,14 +17680,14 @@ mod tests {
 
         let repo = PathBuf::from("/tmp/exec-merge-no-pr");
         let branch = "feature/no-pr";
-        let (mut app, wi_id) = install_live_pr_precheck_app(
-            Some(Ok(LivePrState::no_pr())),
+        let (mut app, wi_id) = install_live_pr_precheck_app(LivePrPrecheckSpec {
+            live_pr_state: Some(Ok(LivePrState::no_pr())),
             branch,
-            &repo,
-            Some(false),
-            Some(false),
-            Some(0),
-        );
+            repo: &repo,
+            cache_dirty: Some(false),
+            cache_untracked: Some(false),
+            cache_unpushed: Some(0),
+        });
 
         app.execute_merge(&wi_id, "squash");
 
@@ -17832,16 +17733,16 @@ mod tests {
     fn execute_merge_through_live_precheck_surfaces_remote_error() {
         let repo = PathBuf::from("/tmp/exec-merge-remote-error");
         let branch = "feature/remote-error";
-        let (mut app, wi_id) = install_live_pr_precheck_app(
-            Some(Err(crate::github_client::GithubError::ApiError(
+        let (mut app, wi_id) = install_live_pr_precheck_app(LivePrPrecheckSpec {
+            live_pr_state: Some(Err(crate::github_client::GithubError::ApiError(
                 "simulated gh pr view failure".into(),
             ))),
             branch,
-            &repo,
-            Some(false),
-            Some(false),
-            Some(0),
-        );
+            repo: &repo,
+            cache_dirty: Some(false),
+            cache_untracked: Some(false),
+            cache_unpushed: Some(0),
+        });
 
         app.execute_merge(&wi_id, "squash");
 
@@ -18179,7 +18080,7 @@ mod tests {
         });
         let (tx, rx) = crossbeam_channel::bounded(1);
         tx.send(PrMergeResult {
-            wi_id: wi_id.clone(),
+            wi_id,
             branch: "feature/test".into(),
             repo_path: PathBuf::from("/tmp/repo"),
             outcome: PrMergeOutcome::Merged {
@@ -18203,7 +18104,7 @@ mod tests {
 
     // -- Feature: mergequeue polling --
 
-    /// poll_mergequeue should advance the item to Done and clear the watch
+    /// `poll_mergequeue` should advance the item to Done and clear the watch
     /// when the drained result reports the PR as MERGED.
     #[test]
     fn poll_mergequeue_merged_advances_to_done_and_clears_watch() {
@@ -18272,7 +18173,7 @@ mod tests {
         );
     }
 
-    /// poll_mergequeue should record a poll error on ERROR state and leave the
+    /// `poll_mergequeue` should record a poll error on ERROR state and leave the
     /// watch in place so the next cycle retries.
     #[test]
     fn poll_mergequeue_error_persists_on_work_item() {
@@ -18332,9 +18233,9 @@ mod tests {
         );
     }
 
-    /// When a watch has pr_number = None (the restart path, where the
+    /// When a watch has `pr_number` = None (the restart path, where the
     /// first poll has to fall back to `gh pr view <branch>`) and the
-    /// result carries a resolved pr_identity, the watch's pr_number
+    /// result carries a resolved `pr_identity`, the watch's `pr_number`
     /// must be backfilled so the next poll targets the exact PR
     /// unambiguously. This is the fix for R1-F-3: after the first
     /// branch-resolved cycle the watch is pinned and the closed-then-
@@ -18403,7 +18304,7 @@ mod tests {
 
     /// Retreating one Mergequeue item must not affect another Mergequeue
     /// item's in-flight poll. This is the regression test for the bug
-    /// the singleton mergequeue_poll_rx + activity field caused before
+    /// the singleton `mergequeue_poll_rx` + activity field caused before
     /// the refactor: with two items A and B in Mergequeue and an
     /// in-flight poll for A, retreating B used to drop A's poll and
     /// activity unconditionally.
@@ -18477,7 +18378,7 @@ mod tests {
         );
     }
 
-    /// reconstruct_mergequeue_watches should rebuild a watch from just the
+    /// `reconstruct_mergequeue_watches` should rebuild a watch from just the
     /// backend record's branch + the resolved GitHub remote from the
     /// cached `repo_data` entry (populated earlier by the background
     /// fetcher), with no live `assoc.pr` and no persisted `pr_identity`.
@@ -18521,7 +18422,7 @@ mod tests {
         app.repo_data.insert(
             repo_path.clone(),
             crate::work_item::RepoFetchResult {
-                repo_path: repo_path.clone(),
+                repo_path,
                 github_remote: Some(("owner".into(), "repo".into())),
                 worktrees: Ok(Vec::new()),
                 prs: Ok(Vec::new()),
@@ -18541,7 +18442,7 @@ mod tests {
         assert_eq!(watch.branch, "feature/z");
     }
 
-    /// reconstruct_mergequeue_watches must not call
+    /// `reconstruct_mergequeue_watches` must not call
     /// `worktree_service.github_remote` (which shells out to `git remote
     /// get-url`). When the cached `repo_data.github_remote` is missing,
     /// the watch is simply skipped this cycle and will be rebuilt on the
@@ -18581,7 +18482,7 @@ mod tests {
 
     // -- Feature: rework prompt on Review -> Implementing --
 
-    /// retreat_stage from Review sets rework_prompt_visible instead of
+    /// `retreat_stage` from Review sets `rework_prompt_visible` instead of
     /// immediately retreating.
     #[test]
     fn retreat_stage_review_to_implementing_shows_rework_prompt() {
@@ -18605,7 +18506,7 @@ mod tests {
 
         app.retreat_stage();
 
-        assert!(app.rework_prompt_visible, "should show rework prompt",);
+        assert!(app.rework_prompt_visible, "should show rework prompt");
         assert_eq!(
             app.rework_prompt_wi.as_ref(),
             Some(&wi_id),
@@ -18623,12 +18524,14 @@ mod tests {
             .insert(wi_id.clone(), "Fix the tests".into());
 
         assert_eq!(
-            app.rework_reasons.get(&wi_id).map(|s| s.as_str()),
+            app.rework_reasons
+                .get(&wi_id)
+                .map(std::string::String::as_str),
             Some("Fix the tests"),
         );
     }
 
-    /// advance_stage from non-Review stages does NOT show merge prompt.
+    /// `advance_stage` from non-Review stages does NOT show merge prompt.
     #[test]
     fn advance_stage_non_review_skips_merge_prompt() {
         let mut app = App::new();
@@ -18692,9 +18595,9 @@ mod tests {
 
     // -- Branch invariant + "Set branch name" recovery dialog --
 
-    /// Helper: spin up an App backed by a real LocalFileBackend in a
+    /// Helper: spin up an App backed by a real `LocalFileBackend` in a
     /// temp directory with one Backlog work item whose repo association
-    /// has `branch: None`. Returns (app, wi_id, tempdir_guard); the
+    /// has `branch: None`. Returns (app, `wi_id`, `tempdir_guard`); the
     /// `TempDir` must be held live by the caller (else its Drop removes
     /// the backend's on-disk directory mid-test).
     fn app_with_branchless_backlog_item(_name: &str) -> (App, WorkItemId, tempfile::TempDir) {
@@ -18702,7 +18605,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().to_path_buf();
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
         let record = backend
             .create(CreateWorkItem {
                 title: "Needs a branch".into(),
@@ -18716,7 +18619,7 @@ mod tests {
                 }],
             })
             .unwrap();
-        let wi_id = record.id.clone();
+        let wi_id = record.id;
 
         let mut app = App::with_config(Config::for_test(), Arc::new(backend));
         app.reassemble_work_items();
@@ -18728,7 +18631,7 @@ mod tests {
         (app, wi_id, tmp)
     }
 
-    /// advance_stage from a branchless Backlog item must refuse the
+    /// `advance_stage` from a branchless Backlog item must refuse the
     /// stage change and open the recovery dialog instead, so the user
     /// is not silently moved into Planning with no branch set.
     #[test]
@@ -18799,8 +18702,8 @@ mod tests {
     }
 
     /// Confirming the Set branch dialog from a spawn_session-triggered
-    /// open must persist the branch and re-enter spawn_session. Under
-    /// the StubWorktreeService, that path admits a WorktreeCreate user
+    /// open must persist the branch and re-enter `spawn_session`. Under
+    /// the `StubWorktreeService`, that path admits a `WorktreeCreate` user
     /// action (the background thread never resolves because the stub
     /// never sends on its channel, but the single-flight slot IS
     /// occupied, which is what we assert here).
@@ -18808,9 +18711,9 @@ mod tests {
     fn confirm_set_branch_dialog_persists_and_spawns_session() {
         use crate::work_item_backend::{CreateWorkItem, LocalFileBackend, RepoAssociationRecord};
 
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
         // Use Planning so spawn_session proceeds past the
         // Backlog/Done/Mergequeue early-return.
         let record = backend
@@ -18826,7 +18729,7 @@ mod tests {
                 }],
             })
             .unwrap();
-        let wi_id = record.id.clone();
+        let wi_id = record.id;
 
         let mut app = App::with_config(Config::for_test(), Arc::new(backend));
         app.reassemble_work_items();
@@ -18867,7 +18770,7 @@ mod tests {
         );
     }
 
-    /// Esc (cancel_set_branch_dialog) must not mutate anything: the
+    /// Esc (`cancel_set_branch_dialog`) must not mutate anything: the
     /// work item stays branchless and in Backlog, the backend record
     /// on disk is untouched, and there is no lingering dialog state.
     #[test]
@@ -18885,16 +18788,16 @@ mod tests {
         assert!(wi.repo_associations[0].branch.is_none());
     }
 
-    /// spawn_session on a branchless Planning item opens the dialog
+    /// `spawn_session` on a branchless Planning item opens the dialog
     /// (regression guard for the old "Set a branch name to start
     /// working" dead-end status message at the former `None =>` arm).
     #[test]
     fn spawn_session_on_branchless_item_opens_dialog_instead_of_message() {
         use crate::work_item_backend::{CreateWorkItem, LocalFileBackend, RepoAssociationRecord};
 
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
         let record = backend
             .create(CreateWorkItem {
                 title: "Dead-end fix".into(),
@@ -18908,7 +18811,7 @@ mod tests {
                 }],
             })
             .unwrap();
-        let wi_id = record.id.clone();
+        let wi_id = record.id;
 
         let mut app = App::with_config(Config::for_test(), Arc::new(backend));
         app.reassemble_work_items();
@@ -18958,13 +18861,13 @@ mod tests {
         // Lookup with Implementing stage does NOT find it.
         assert!(
             !app.sessions
-                .contains_key(&(wi_id.clone(), WorkItemStatus::Implementing))
+                .contains_key(&(wi_id, WorkItemStatus::Implementing))
         );
     }
 
     // -- Issue 7: gh availability check --
 
-    /// check_gh_available returns a bool (not a panic/error).
+    /// `check_gh_available` returns a bool (not a panic/error).
     /// We do not test for a specific value since CI may or may not have gh.
     #[test]
     fn check_gh_available_returns_bool() {
@@ -18974,7 +18877,7 @@ mod tests {
         let _ = result;
     }
 
-    /// gh_available is set in the constructor.
+    /// `gh_available` is set in the constructor.
     #[test]
     fn app_constructor_sets_gh_available() {
         let app = App::new();
@@ -19126,8 +19029,8 @@ mod tests {
         // can verify teardown actually deletes the file from disk. Use
         // a collision-free unique name under tempfile's tempdir so
         // parallel test threads cannot race on a shared path.
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let temp_path = _tmp.path().join("workbridge-teardown-test.json");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let temp_path = tmp.path().join("workbridge-teardown-test.json");
         std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
         assert!(temp_path.exists(), "precondition: temp file exists");
         app.global_mcp_config_path = Some(temp_path.clone());
@@ -19245,8 +19148,8 @@ mod tests {
         // the worker would have written by the time the user
         // cancels. Use tempfile's unique-name tempdir so parallel
         // test threads cannot collide on a shared fixed path.
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let tmp_root = _tmp.path();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp_root = tmp.path();
         let mcp_config_path = tmp_root.join("workbridge-cancel-test-mcp.json");
         let side_car_path = tmp_root.join("workbridge-cancel-test-sidecar.json");
         std::fs::write(&mcp_config_path, b"{}").expect("create mcp_config tempfile");
@@ -19366,8 +19269,8 @@ mod tests {
             agent_written_files: Vec::new(),
         });
 
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let temp_path = _tmp.path().join("workbridge-toggle-close-test.json");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let temp_path = tmp.path().join("workbridge-toggle-close-test.json");
         std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
         app.global_mcp_config_path = Some(temp_path.clone());
         app.pending_global_pty_bytes.extend_from_slice(b"leftover");
@@ -19404,7 +19307,7 @@ mod tests {
 
     // -- Feature: plan_from_branch (no-plan recovery) --
 
-    /// plan_from_branch accepts a Blocked item and applies the transition.
+    /// `plan_from_branch` accepts a Blocked item and applies the transition.
     #[test]
     fn plan_from_branch_accepts_blocked_item() {
         let mut app = App::new();
@@ -19436,7 +19339,7 @@ mod tests {
         );
     }
 
-    /// plan_from_branch rejects a work item that is not Blocked.
+    /// `plan_from_branch` rejects a work item that is not Blocked.
     #[test]
     fn plan_from_branch_rejects_non_blocked() {
         let mut app = App::new();
@@ -19543,7 +19446,7 @@ mod tests {
         );
     }
 
-    /// BLOCKED group header uses GroupHeaderKind::Blocked.
+    /// BLOCKED group header uses `GroupHeaderKind::Blocked`.
     #[test]
     fn display_list_blocked_header_kind() {
         let mut app = App::new();
@@ -19602,7 +19505,9 @@ mod tests {
             .insert(wi_id.clone(), "All plan items implemented correctly".into());
 
         assert_eq!(
-            app.review_gate_findings.get(&wi_id).map(|s| s.as_str()),
+            app.review_gate_findings
+                .get(&wi_id)
+                .map(std::string::String::as_str),
             Some("All plan items implemented correctly"),
         );
     }
@@ -19693,11 +19598,11 @@ mod tests {
     // -- Review gate regression tests --
 
     /// Helper: create an App with a single work item at the given status,
-    /// with an optional repo association (branch + repo_path).
+    /// with an optional repo association (branch + `repo_path`).
     /// Poll `poll_review_gate` in a short busy loop until the review gate
     /// for `wi_id` is no longer in-flight, or a short timeout elapses.
     ///
-    /// Tests that trigger `spawn_review_gate` via MCP/advance_stage need
+    /// Tests that trigger `spawn_review_gate` via `MCP/advance_stage` need
     /// this because the gate now runs on a real background thread - the
     /// synchronous Blocked branch was removed to keep `git diff` off the
     /// UI thread (see P0 audit #1). The background thread will immediately
@@ -19730,7 +19635,7 @@ mod tests {
     /// spuriously even though the worker is not actually wedged.
     /// 6000 iterations absorbs that jitter while still bounding a
     /// real livelock (the thread-local safety cap in
-    /// `side_effects::clock::sleep` would trip at 100_000 anyway).
+    /// `side_effects::clock::sleep` would trip at `100_000` anyway).
     fn drain_worktree_creation(app: &mut App) {
         for _ in 0..6_000 {
             app.poll_worktree_creation();
@@ -19783,19 +19688,17 @@ mod tests {
     ) -> (App, WorkItemId) {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/gate-test.json"));
-        let repo_assoc = if let Some(rp) = repo_path {
+        let repo_assoc = repo_path.map_or_else(Vec::new, |rp| {
             vec![crate::work_item::RepoAssociation {
                 repo_path: PathBuf::from(rp),
-                branch: branch.map(|b| b.to_string()),
+                branch: branch.map(std::string::ToString::to_string),
                 worktree_path: None,
                 pr: None,
                 issue: None,
                 git_state: None,
                 stale_worktree_path: None,
             }]
-        } else {
-            vec![]
-        };
+        });
         app.work_items.push(crate::work_item::WorkItem {
             display_id: None,
             id: wi_id.clone(),
@@ -19823,9 +19726,9 @@ mod tests {
         (app, wi_id)
     }
 
-    /// Test 4: MCP StatusUpdate for Review on Implementing item with no plan
+    /// Test 4: MCP `StatusUpdate` for Review on Implementing item with no plan
     /// must NOT change status to Review (gate spawn fails asynchronously),
-    /// and rework_reasons must be populated after poll_review_gate drains
+    /// and `rework_reasons` must be populated after `poll_review_gate` drains
     /// the background thread's Blocked message.
     #[test]
     fn mcp_review_gate_bypass_prevented_no_plan() {
@@ -19870,7 +19773,7 @@ mod tests {
         );
     }
 
-    /// Test 5: TUI advance_stage from Implementing with no plan must NOT
+    /// Test 5: TUI `advance_stage` from Implementing with no plan must NOT
     /// change status to Review. The gate's "no plan" check now runs on a
     /// background thread (see P0 audit #1), so we drain the gate with a
     /// short poll loop before asserting.
@@ -19972,9 +19875,9 @@ mod tests {
     }
 
     /// Regression guard for R1-F-3: Mcp-origin Blocked still runs the
-    /// full rework flow (session kill + respawn + rework_reasons).
+    /// full rework flow (session kill + respawn + `rework_reasons`).
     /// This preserves the behaviour Claude relies on when
-    /// workbridge_set_status("Review") fails - Claude sees the
+    /// `workbridge_set_status("Review`") fails - Claude sees the
     /// rejection reason in its next session prompt and iterates.
     #[test]
     fn poll_review_gate_mcp_blocked_populates_rework_reasons() {
@@ -20040,8 +19943,8 @@ mod tests {
         );
     }
 
-    /// Test 6: After poll_review_gate processes a rejection result,
-    /// rework_reasons is populated for the work item.
+    /// Test 6: After `poll_review_gate` processes a rejection result,
+    /// `rework_reasons` is populated for the work item.
     #[test]
     fn poll_review_gate_rejection_populates_rework_reasons() {
         let (mut app, wi_id) = app_with_work_item(
@@ -20077,7 +19980,7 @@ mod tests {
         );
     }
 
-    /// Test 7: poll_review_gate supports Blocked status - a Blocked work item
+    /// Test 7: `poll_review_gate` supports Blocked status - a Blocked work item
     /// can transition to Review when the gate approves.
     #[test]
     fn poll_review_gate_approves_blocked_to_review() {
@@ -20117,7 +20020,7 @@ mod tests {
         );
     }
 
-    /// Test: Progress messages update review_gate_progress without completing
+    /// Test: Progress messages update `review_gate_progress` without completing
     /// the gate.
     #[test]
     fn poll_review_gate_progress_updates_field() {
@@ -20218,7 +20121,7 @@ mod tests {
     /// `ReviewGateSpawn::Blocked` from the main thread. The MCP handler
     /// surfaces the reason in `status_message` (not `rework_reasons`);
     /// `rework_reasons` is populated only when the BACKGROUND thread
-    /// reports a Blocked result via poll_review_gate. The rework flow for
+    /// reports a Blocked result via `poll_review_gate`. The rework flow for
     /// "no plan" is exercised by `mcp_review_gate_bypass_prevented_no_plan`
     /// via the drain helper.
     #[test]
@@ -20258,8 +20161,8 @@ mod tests {
     }
 
     /// Test 9: When a review gate is already running for item A, an MCP
-    /// StatusUpdate for Review on item B should independently attempt to
-    /// spawn its own gate. With StubBackend (no plan), it fails with a
+    /// `StatusUpdate` for Review on item B should independently attempt to
+    /// spawn its own gate. With `StubBackend` (no plan), it fails with a
     /// "no plan" error and triggers the rework flow for item B.
     #[test]
     fn concurrent_gate_spawn_independent_of_other_items() {
@@ -20369,9 +20272,9 @@ mod tests {
 
     /// Test 10: A Blocked work item with no plan that fails the gate via MCP
     /// should transition to Implementing (not stay Blocked), so the
-    /// implementing_rework prompt (which has {rework_reason}) is used.
+    /// `implementing_rework` prompt (which has {`rework_reason`}) is used.
     /// The gate runs on a background thread and the Blocked outcome is
-    /// drained via poll_review_gate.
+    /// drained via `poll_review_gate`.
     #[test]
     fn blocked_gate_failure_transitions_to_implementing() {
         let (mut app, wi_id) = app_with_work_item(
@@ -20410,7 +20313,7 @@ mod tests {
         );
     }
 
-    /// Test 11: spawn_review_gate reports failures on synchronous
+    /// Test 11: `spawn_review_gate` reports failures on synchronous
     /// pre-conditions (no repo association, no branch) via the returned
     /// `ReviewGateSpawn::Blocked`. The background-thread failures (no
     /// plan, empty diff, git error) arrive asynchronously via
@@ -20482,8 +20385,8 @@ mod tests {
     }
 
     /// Test 2 (from MCP context): Blocked->Review is in the allowed
-    /// transitions in poll_mcp_status_updates. Verify by sending a
-    /// StatusUpdate from Blocked and confirming it is NOT rejected with
+    /// transitions in `poll_mcp_status_updates`. Verify by sending a
+    /// `StatusUpdate` from Blocked and confirming it is NOT rejected with
     /// "not allowed".
     #[test]
     fn mcp_blocked_to_review_is_allowed_transition() {
@@ -20528,9 +20431,9 @@ mod tests {
     fn collect_backfill_requests_returns_done_items_without_pr_identity() {
         use crate::work_item_backend::LocalFileBackend;
 
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         // Done item with branch but no pr_identity - should be returned.
         let done_record = backend
@@ -20600,7 +20503,7 @@ mod tests {
     // -- Delete resource cleanup tests --
 
     /// Delete cleans up all in-memory state keyed by the deleted work item ID:
-    /// rework_reasons, review_gate_findings, no_plan_prompt_queue, and
+    /// `rework_reasons`, `review_gate_findings`, `no_plan_prompt_queue`, and
     /// associated visibility flags.
     #[test]
     fn delete_cleans_up_memory_state() {
@@ -20638,12 +20541,13 @@ mod tests {
             }
             fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
                 let mut records = self.records.lock().unwrap();
-                if let Some(pos) = records.iter().position(|r| r.id == *id) {
-                    records.remove(pos);
-                    Ok(())
-                } else {
-                    Err(BackendError::NotFound(id.clone()))
-                }
+                records.iter().position(|r| r.id == *id).map_or_else(
+                    || Err(BackendError::NotFound(id.clone())),
+                    |pos| {
+                        records.remove(pos);
+                        Ok(())
+                    },
+                )
             }
             fn update_status(
                 &self,
@@ -20703,9 +20607,6 @@ mod tests {
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
             }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
-            }
         }
 
         let backend = TestBackend {
@@ -20749,7 +20650,7 @@ mod tests {
         app.no_plan_prompt_visible = true;
         app.rework_prompt_wi = Some(wi_id.clone());
         app.rework_prompt_visible = true;
-        app.merge_wi_id = Some(wi_id.clone());
+        app.merge_wi_id = Some(wi_id);
         app.confirm_merge = true;
 
         // Select and delete.
@@ -20801,9 +20702,9 @@ mod tests {
     // -- Shared delete test fixtures --
 
     /// A backend that returns a fixed list of records from `list()`. All
-    /// mutating operations (delete, update_status, etc.) are no-ops that
-    /// return Ok. Eliminates the need for per-test OneItemBackend /
-    /// RecordingTestBackend / etc. boilerplate.
+    /// mutating operations (delete, `update_status`, etc.) are no-ops that
+    /// return Ok. Eliminates the need for per-test `OneItemBackend` /
+    /// `RecordingTestBackend` / etc. boilerplate.
     struct FixedListBackend {
         records: Vec<crate::work_item_backend::WorkItemRecord>,
     }
@@ -20889,9 +20790,6 @@ mod tests {
         }
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
-        }
-        fn backend_type(&self) -> crate::work_item::BackendType {
-            crate::work_item::BackendType::LocalFile
         }
     }
 
@@ -20994,7 +20892,7 @@ mod tests {
         }
     }
 
-    /// open_delete_prompt must NOT call any blocking worktree check on
+    /// `open_delete_prompt` must NOT call any blocking worktree check on
     /// the UI thread. This is enforced structurally by the
     /// `WorktreeService` trait, which no longer exposes
     /// `is_worktree_dirty`, so any attempt to reintroduce a dirty check
@@ -21045,13 +20943,14 @@ mod tests {
         );
     }
 
-    /// Verify that deleting a work item calls remove_worktree and
-    /// delete_branch on the worktree service with the correct arguments.
+    /// Verify that deleting a work item calls `remove_worktree` and
+    /// `delete_branch` on the worktree service with the correct arguments.
     #[test]
     fn delete_calls_remove_worktree_and_delete_branch() {
+        use crate::config::InMemoryConfigProvider;
+
         let recording_ws = Arc::new(ConfigurableWorktreeService::recording());
 
-        use crate::config::InMemoryConfigProvider;
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
             Arc::new(FixedListBackend::one_item(
@@ -21147,7 +21046,7 @@ mod tests {
     /// instead force-deleted local resources and then only noticed the
     /// PR close failure afterward, the user would be left with an open
     /// PR and no local branch to recover from - which is exactly the
-    /// data-loss path spawn_unlinked_cleanup already guards against.
+    /// data-loss path `spawn_unlinked_cleanup` already guards against.
     #[test]
     fn delete_preserves_local_resources_when_pr_close_fails() {
         use crate::config::InMemoryConfigProvider;
@@ -21302,8 +21201,8 @@ mod tests {
 
     // -- Auto-archival tests --
 
-    /// Backend that tracks records in memory and supports set_done_at.
-    /// Used by auto-archive tests that need functional delete/update_status.
+    /// Backend that tracks records in memory and supports `set_done_at`.
+    /// Used by auto-archive tests that need functional `delete/update_status`.
     struct ArchiveTestBackend {
         records: std::sync::Mutex<Vec<crate::work_item_backend::WorkItemRecord>>,
     }
@@ -21329,12 +21228,13 @@ mod tests {
         }
         fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
             let mut records = self.records.lock().unwrap();
-            if let Some(pos) = records.iter().position(|r| r.id == *id) {
-                records.remove(pos);
-                Ok(())
-            } else {
-                Err(BackendError::NotFound(id.clone()))
-            }
+            records.iter().position(|r| r.id == *id).map_or_else(
+                || Err(BackendError::NotFound(id.clone())),
+                |pos| {
+                    records.remove(pos);
+                    Ok(())
+                },
+            )
         }
         fn update_status(
             &self,
@@ -21385,9 +21285,6 @@ mod tests {
         }
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
-        }
-        fn backend_type(&self) -> crate::work_item::BackendType {
-            crate::work_item::BackendType::LocalFile
         }
     }
 
@@ -21554,8 +21451,8 @@ mod tests {
         let wi_id = app.work_items[0].id.clone();
         app.apply_stage_change(
             &wi_id,
-            &WorkItemStatus::Review,
-            &WorkItemStatus::Done,
+            WorkItemStatus::Review,
+            WorkItemStatus::Done,
             "pr_merge",
         );
 
@@ -21589,12 +21486,7 @@ mod tests {
         app.build_display_list();
 
         let wi_id = app.work_items[0].id.clone();
-        app.apply_stage_change(
-            &wi_id,
-            &WorkItemStatus::Done,
-            &WorkItemStatus::Review,
-            "test",
-        );
+        app.apply_stage_change(&wi_id, WorkItemStatus::Done, WorkItemStatus::Review, "test");
 
         // Verify done_at was cleared.
         let records = app.backend.list().unwrap().records;
@@ -21771,16 +21663,15 @@ mod tests {
         branch: Option<&str>,
         has_commits_ahead: Option<bool>,
     ) {
-        let worktrees = match branch {
-            Some(b) => vec![crate::worktree_service::WorktreeInfo {
+        let worktrees = branch.map_or_else(Vec::new, |b| {
+            vec![crate::worktree_service::WorktreeInfo {
                 path: repo_path.join(".worktrees").join(b),
                 branch: Some(b.to_string()),
                 is_main: false,
                 has_commits_ahead,
                 ..crate::worktree_service::WorktreeInfo::default()
-            }],
-            None => Vec::new(),
-        };
+            }]
+        });
         app.repo_data.insert(
             repo_path.to_path_buf(),
             crate::work_item::RepoFetchResult {
@@ -21908,9 +21799,6 @@ mod tests {
         }
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
-        }
-        fn backend_type(&self) -> crate::work_item::BackendType {
-            crate::work_item::BackendType::LocalFile
         }
     }
 
@@ -22224,9 +22112,6 @@ mod tests {
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
         }
-        fn backend_type(&self) -> crate::work_item::BackendType {
-            crate::work_item::BackendType::LocalFile
-        }
     }
 
     #[test]
@@ -22417,9 +22302,6 @@ mod tests {
         }
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
-        }
-        fn backend_type(&self) -> crate::work_item::BackendType {
-            crate::work_item::BackendType::LocalFile
         }
     }
 
@@ -22647,8 +22529,10 @@ mod tests {
                     let Some(name_str) = name.to_str() else {
                         continue;
                     };
-                    if name_str.starts_with("workbridge-mcp-config-") && name_str.ends_with(".json")
-                    {
+                    let ext_is_json = std::path::Path::new(name_str)
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+                    if name_str.starts_with("workbridge-mcp-config-") && ext_is_json {
                         out.insert(entry.path());
                     }
                 }
@@ -22714,7 +22598,7 @@ mod tests {
         app.finish_session_open(SessionOpenPlanResult {
             wi_id: result.wi_id.clone(),
             cwd: result.cwd.clone(),
-            plan_text: result.plan_text.clone(),
+            plan_text: result.plan_text,
             read_error: None,
             server: None,
             server_error: None,
@@ -22953,8 +22837,7 @@ mod tests {
             let ready = app
                 .session_open_rx
                 .get(&wi_id)
-                .map(|entry| !entry.rx.is_empty())
-                .unwrap_or(false);
+                .is_some_and(|entry| !entry.rx.is_empty());
             if ready {
                 break;
             }
@@ -23053,8 +22936,8 @@ mod tests {
         // cancelled, not the source-string semantics.
         app.apply_stage_change(
             &wi_id,
-            &WorkItemStatus::Implementing,
-            &WorkItemStatus::Mergequeue,
+            WorkItemStatus::Implementing,
+            WorkItemStatus::Mergequeue,
             "pr_merge",
         );
 
@@ -23152,21 +23035,23 @@ mod tests {
             .toasts
             .iter()
             .find(|t| t.text.contains("no harness chosen"))
-            .map(|t| t.text.clone())
-            .unwrap_or_else(|| {
-                panic!(
-                    "abort must surface a user-visible toast; toasts were {all_toasts:?}, \
+            .map_or_else(
+                || {
+                    panic!(
+                        "abort must surface a user-visible toast; toasts were {all_toasts:?}, \
                      status_message: {:?}",
-                    app.status_message
-                )
-            });
+                        app.status_message
+                    )
+                },
+                |t| t.text.clone(),
+            );
         assert!(
             toast_text.contains("c / x"),
             "toast must name the recovery keybinding, got: {toast_text}"
         );
     }
 
-    /// A WorktreeService whose `remove_worktree` always fails. Used to
+    /// A `WorktreeService` whose `remove_worktree` always fails. Used to
     /// verify that `spawn_orphan_worktree_cleanup` surfaces failures
     /// through the per-spawn `OrphanCleanupFinished` completion message
     /// instead of dropping them.
@@ -23593,7 +23478,7 @@ mod tests {
     /// The reject path additionally kills and respawns the session,
     /// which starts its own "Opening session..." activity - so we
     /// cannot assert that `current_activity()` is None after polling.
-    /// Instead, we capture the gate's ActivityId before polling and
+    /// Instead, we capture the gate's `ActivityId` before polling and
     /// verify that exact ID is no longer in `app.activities`.
     #[test]
     fn poll_review_gate_result_ends_status_bar_activity_reject() {
@@ -24248,7 +24133,7 @@ mod tests {
         let wi_id = setup_rebase_eligible_work_item(&mut app);
         // Insert a live session for this work item.
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
-        let key = (wi_id.clone(), WorkItemStatus::Implementing);
+        let key = (wi_id, WorkItemStatus::Implementing);
         app.sessions.insert(
             key,
             SessionEntry {
@@ -24278,7 +24163,7 @@ mod tests {
         // Insert a live terminal session for this work item.
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
         app.terminal_sessions.insert(
-            wi_id.clone(),
+            wi_id,
             SessionEntry {
                 parser,
                 alive: true,
@@ -24319,7 +24204,7 @@ mod tests {
         );
         // Insert a dead terminal session.
         app.terminal_sessions.insert(
-            wi_id.clone(),
+            wi_id,
             SessionEntry {
                 parser,
                 alive: false,
@@ -24451,11 +24336,11 @@ mod tests {
         let cancelled_a = Arc::new(AtomicBool::new(false));
         let cancelled_b = Arc::new(AtomicBool::new(false));
         app.rebase_gates.insert(
-            wi_id_a.clone(),
+            wi_id_a,
             make_rebase_gate_state(Arc::clone(&cancelled_a), Arc::new(Mutex::new(None))),
         );
         app.rebase_gates.insert(
-            wi_id_b.clone(),
+            wi_id_b,
             make_rebase_gate_state(Arc::clone(&cancelled_b), Arc::new(Mutex::new(None))),
         );
         assert_eq!(app.rebase_gates.len(), 2);
@@ -24493,7 +24378,7 @@ mod tests {
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/force-kill.json"));
         let cancelled = Arc::new(AtomicBool::new(false));
         app.rebase_gates.insert(
-            wi_id.clone(),
+            wi_id,
             make_rebase_gate_state(Arc::clone(&cancelled), Arc::new(Mutex::new(None))),
         );
 
@@ -24601,12 +24486,13 @@ mod tests {
                 self.delete_call_count
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut records = self.records.lock().unwrap();
-                if let Some(pos) = records.iter().position(|r| r.id == *id) {
-                    records.remove(pos);
-                    Ok(())
-                } else {
-                    Err(BackendError::NotFound(id.clone()))
-                }
+                records.iter().position(|r| r.id == *id).map_or_else(
+                    || Err(BackendError::NotFound(id.clone())),
+                    |pos| {
+                        records.remove(pos);
+                        Ok(())
+                    },
+                )
             }
             fn update_status(
                 &self,
@@ -24649,9 +24535,6 @@ mod tests {
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<PathBuf> {
                 None
-            }
-            fn backend_type(&self) -> BackendType {
-                BackendType::LocalFile
             }
         }
 
@@ -24735,10 +24618,9 @@ mod tests {
             ActivityEntry, CreateWorkItem, LocalFileBackend, RepoAssociationRecord, WorkItemBackend,
         };
 
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
-        let backend =
-            LocalFileBackend::with_dir(dir.clone()).expect("backend must be constructable");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        let backend = LocalFileBackend::with_dir(dir).expect("backend must be constructable");
 
         // Create a work item. `LocalFileBackend::create` seeds an
         // initial `created` activity log entry, so the active log
@@ -24756,7 +24638,7 @@ mod tests {
                 }],
             })
             .expect("create must succeed");
-        let wi_id = record.id.clone();
+        let wi_id = record.id;
 
         let active_path = backend
             .activity_path_for(&wi_id)
@@ -24832,11 +24714,10 @@ mod tests {
     /// forgets to override it will fail at the first call site
     /// instead of silently regressing the orphan-active-log race.
     /// This is the round 2 fix for the PR #104 review log entry
-    /// "Default impl of append_activity_existing_only silently
+    /// "Default impl of `append_activity_existing_only` silently
     /// re-introduces the bug for any future backend".
     #[test]
     fn append_activity_existing_only_default_impl_returns_err() {
-        use crate::work_item::BackendType;
         use crate::work_item_backend::{
             ActivityEntry, BackendError, CreateWorkItem, ListResult, WorkItemBackend,
             WorkItemRecord,
@@ -24907,9 +24788,6 @@ mod tests {
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<PathBuf> {
                 None
             }
-            fn backend_type(&self) -> BackendType {
-                BackendType::LocalFile
-            }
         }
 
         let backend = NonOverridingBackend::default();
@@ -24928,7 +24806,7 @@ mod tests {
                      primitive; got: {msg}",
                 );
             }
-            other => panic!("default impl must return BackendError::Validation; got: {other:?}",),
+            other => panic!("default impl must return BackendError::Validation; got: {other:?}"),
         }
         assert!(
             backend.appended.lock().unwrap().is_empty(),
@@ -24947,7 +24825,7 @@ mod tests {
     // the test thread. See `docs/UI.md` "Blocking I/O Prohibition".
 
     /// Test backend that records every `save_pr_identity` and
-    /// `append_activity` call, and applies status / pr_identity
+    /// `append_activity` call, and applies status / `pr_identity`
     /// mutations to its in-memory records so a subsequent
     /// `assembly::reassemble` can observe them. Used to verify the
     /// merge-gate path end-to-end without touching the filesystem.
@@ -24985,12 +24863,13 @@ mod tests {
         }
         fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
             let mut records = self.records.lock().unwrap();
-            if let Some(pos) = records.iter().position(|r| r.id == *id) {
-                records.remove(pos);
-                Ok(())
-            } else {
-                Err(BackendError::NotFound(id.clone()))
-            }
+            records.iter().position(|r| r.id == *id).map_or_else(
+                || Err(BackendError::NotFound(id.clone())),
+                |pos| {
+                    records.remove(pos);
+                    Ok(())
+                },
+            )
         }
         fn update_status(
             &self,
@@ -25070,9 +24949,6 @@ mod tests {
         }
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
-        }
-        fn backend_type(&self) -> crate::work_item::BackendType {
-            crate::work_item::BackendType::LocalFile
         }
     }
 
@@ -25245,7 +25121,7 @@ mod tests {
     }
 
     /// Feeds a MERGED result. Asserts the merge-gate path ran
-    /// (activity log carries source=="pr_merge"), pr_identity was
+    /// (activity log carries `source=="pr_merge`"), `pr_identity` was
     /// saved, the watch is cleared, the backend status is Done, and
     /// the status message is the expected string.
     #[test]
@@ -25270,7 +25146,7 @@ mod tests {
             wi_id: rec_id.clone(),
             pr_state: "MERGED".into(),
             branch: "feature/rr6".into(),
-            repo_path: repo_path.clone(),
+            repo_path,
             pr_identity: Some(PrIdentityRecord {
                 number: 42,
                 title: "Merged externally".into(),
@@ -25374,7 +25250,7 @@ mod tests {
             wi_id: rec_id.clone(),
             pr_state: "MERGED".into(),
             branch: "feature/rr7".into(),
-            repo_path: repo_path.clone(),
+            repo_path,
             pr_identity: Some(PrIdentityRecord {
                 number: 101,
                 title: "Fallback check".into(),
@@ -25440,7 +25316,7 @@ mod tests {
             wi_id: rec_id.clone(),
             pr_state: "CLOSED".into(),
             branch: "feature/rr8".into(),
-            repo_path: repo_path.clone(),
+            repo_path,
             pr_identity: None,
         })
         .unwrap();
@@ -25495,7 +25371,7 @@ mod tests {
             wi_id: rec_id.clone(),
             pr_state: "ERROR: gh auth failed".into(),
             branch: "feature/rr9".into(),
-            repo_path: repo_path.clone(),
+            repo_path,
             pr_identity: None,
         })
         .unwrap();
@@ -25597,7 +25473,7 @@ mod tests {
         .unwrap();
         let activity = app.start_activity("test poll");
         app.review_request_merge_polls
-            .insert(rec_id.clone(), PrMergePollState { rx, activity });
+            .insert(rec_id, PrMergePollState { rx, activity });
 
         assert_eq!(app.review_request_merge_polls.len(), 1);
 
@@ -25616,7 +25492,7 @@ mod tests {
         );
     }
 
-    /// End-to-end: a ReviewRequest item is selected in the left list;
+    /// End-to-end: a `ReviewRequest` item is selected in the left list;
     /// after the poll auto-closes it to Done, the existing
     /// `WorkItemId`-keyed selection restoration in `build_display_list`
     /// must follow it to the DONE group.
@@ -25645,7 +25521,7 @@ mod tests {
             wi_id: rec_id.clone(),
             pr_state: "MERGED".into(),
             branch: "feature/rr10".into(),
-            repo_path: repo_path.clone(),
+            repo_path,
             pr_identity: Some(PrIdentityRecord {
                 number: 7,
                 title: "Follow selection".into(),
@@ -26156,7 +26032,7 @@ mod tests {
         // has something to kill. No PTY / Session child - the
         // `session: None` branch is specifically supported to keep
         // unit tests hermetic.
-        let session_key = (wi_id.clone(), WorkItemStatus::Implementing);
+        let session_key = (wi_id, WorkItemStatus::Implementing);
         app.sessions.insert(
             session_key.clone(),
             crate::work_item::SessionEntry {

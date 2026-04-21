@@ -25,7 +25,7 @@ pub struct CreateDialog {
     pub description_input: TextAreaState,
     /// Text input for the optional branch name.
     pub branch_input: TextInputState,
-    /// List of repos with selection state: (repo_path, selected).
+    /// List of repos with selection state: (`repo_path`, selected).
     pub repo_list: Vec<(PathBuf, bool)>,
     /// Cursor position in the repo list.
     pub repo_cursor: usize,
@@ -34,7 +34,7 @@ pub struct CreateDialog {
     /// Validation error message (shown inline, cleared on next input).
     pub error_message: Option<String>,
     /// Whether the user has manually edited the branch field.
-    /// When true, auto_fill_branch() will not overwrite their input.
+    /// When true, `auto_fill_branch()` will not overwrite their input.
     pub branch_user_edited: bool,
     /// When true, submitting the dialog creates a Planning item and spawns
     /// a Claude session immediately (quick-start mode) instead of creating
@@ -115,7 +115,7 @@ impl CreateDialog {
     }
 
     /// Close the dialog without creating anything.
-    pub fn close(&mut self) {
+    pub const fn close(&mut self) {
         self.visible = false;
     }
 
@@ -124,7 +124,7 @@ impl CreateDialog {
     /// In quick-start mode the only visible field is the repo list, so this
     /// is a no-op: Tab/BackTab must not be able to sneak focus onto an
     /// invisible Title/Description/Branch field.
-    pub fn focus_next(&mut self) {
+    pub const fn focus_next(&mut self) {
         if self.quickstart_mode {
             return;
         }
@@ -140,7 +140,7 @@ impl CreateDialog {
     ///
     /// In quick-start mode this is a no-op for the same reason as
     /// [`focus_next`].
-    pub fn focus_prev(&mut self) {
+    pub const fn focus_prev(&mut self) {
         if self.quickstart_mode {
             return;
         }
@@ -166,7 +166,7 @@ impl CreateDialog {
             let Some(was_selected) = self.repo_list.get(self.repo_cursor).map(|(_, s)| *s) else {
                 return;
             };
-            for (_, sel) in self.repo_list.iter_mut() {
+            for (_, sel) in &mut self.repo_list {
                 *sel = false;
             }
             if let Some(entry) = self.repo_list.get_mut(self.repo_cursor) {
@@ -180,12 +180,12 @@ impl CreateDialog {
     }
 
     /// Move the repo cursor up.
-    pub fn repo_up(&mut self) {
+    pub const fn repo_up(&mut self) {
         self.repo_cursor = self.repo_cursor.saturating_sub(1);
     }
 
     /// Move the repo cursor down.
-    pub fn repo_down(&mut self) {
+    pub const fn repo_down(&mut self) {
         if self.repo_cursor + 1 < self.repo_list.len() {
             self.repo_cursor += 1;
         }
@@ -227,8 +227,8 @@ impl CreateDialog {
     }
 
     /// Get the currently focused single-line text input mutably.
-    /// Returns None for Description (uses TextAreaState) and Repos.
-    pub fn focused_input_mut(&mut self) -> Option<&mut TextInputState> {
+    /// Returns None for Description (uses `TextAreaState`) and Repos.
+    pub const fn focused_input_mut(&mut self) -> Option<&mut TextInputState> {
         match self.focus_field {
             CreateDialogFocus::Title => Some(&mut self.title_input),
             CreateDialogFocus::Branch => Some(&mut self.branch_input),
@@ -255,14 +255,14 @@ impl CreateDialog {
 }
 
 /// Maximum length of the slugified portion of a branch name.
-pub(crate) const MAX_SLUG_LEN: usize = 50;
+pub const MAX_SLUG_LEN: usize = 50;
 
 /// Convert a title into a git-branch-safe slug.
 ///
 /// Lowercases, replaces whitespace/hyphens/underscores with a single hyphen,
 /// strips non-ASCII-alphanumeric characters, collapses runs of hyphens, and
 /// trims leading/trailing hyphens.
-pub(crate) fn slugify(title: &str) -> String {
+pub fn slugify(title: &str) -> String {
     let lower = title.to_lowercase();
     let mut result = String::with_capacity(lower.len());
     let mut prev_hyphen = false;
@@ -290,20 +290,19 @@ pub(crate) fn slugify(title: &str) -> String {
 /// Truncate a slug to at most `max_len` bytes, cutting at the last hyphen
 /// boundary to avoid mid-word breaks. Falls back to a hard cut when the
 /// slug contains no hyphens within the limit.
-pub(crate) fn truncate_slug(slug: &str, max_len: usize) -> String {
+pub fn truncate_slug(slug: &str, max_len: usize) -> String {
     if slug.len() <= max_len {
         return slug.to_string();
     }
     // Find last hyphen at or before max_len.
-    if let Some(pos) = slug[..max_len].rfind('-') {
-        slug[..pos].to_string()
-    } else {
-        slug[..max_len].to_string()
-    }
+    slug[..max_len].rfind('-').map_or_else(
+        || slug[..max_len].to_string(),
+        |pos| slug[..pos].to_string(),
+    )
 }
 
 /// Generate a 4-character hex suffix for branch name uniqueness.
-pub(crate) fn random_suffix() -> String {
+pub fn random_suffix() -> String {
     let bytes = uuid::Uuid::new_v4();
     let b = bytes.as_bytes();
     format!("{:02x}{:02x}", b[0], b[1])
@@ -436,7 +435,7 @@ mod tests {
         dialog.description_input.set_text(&long);
 
         let result = dialog.validate();
-        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
         let (_, description, _, _) = result.unwrap();
         assert_eq!(
             description.expect("description should be Some for non-empty text"),

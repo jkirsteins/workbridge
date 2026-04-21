@@ -1,3 +1,7 @@
+// PTY FFI boundary. Every unsafe block has a SAFETY comment; new unsafe
+// here requires reviewer sign-off per CONTRIBUTING.md "Unsafe code policy".
+#![expect(unsafe_code, reason = "PTY FFI boundary; SAFETY comment per block")]
+
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
@@ -26,8 +30,8 @@ pub const SCROLLBACK_LINES: usize = 10_000;
 ///
 /// The session owns the PTY master fd and the child process handle.
 /// A dedicated reader thread continuously reads PTY output and feeds it
-/// to a shared vt100::Parser behind an Arc<Mutex>. The UI thread never
-/// reads from PTY fds - it just locks the parser and calls .screen()
+/// to a shared `vt100::Parser` behind an Arc<Mutex>. The UI thread never
+/// reads from PTY fds - it just locks the parser and calls .`screen()`
 /// to render.
 ///
 /// When the session is dropped, the child process is killed and the
@@ -54,12 +58,7 @@ impl Session {
     ///
     /// If `cwd` is provided, the child process starts in that directory.
     /// Otherwise it inherits the parent's working directory.
-    pub fn spawn(
-        cols: u16,
-        rows: u16,
-        cwd: Option<&Path>,
-        command: &[&str],
-    ) -> io::Result<Session> {
+    pub fn spawn(cols: u16, rows: u16, cwd: Option<&Path>, command: &[&str]) -> io::Result<Self> {
         // Open a PTY master/slave pair.
         let (master_fd, slave_fd) = openpty()?;
 
@@ -163,12 +162,12 @@ impl Session {
                 let n = unsafe {
                     libc::read(
                         reader_fd.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.as_mut_ptr().cast::<libc::c_void>(),
                         buf.len(),
                     )
                 };
-                if n > 0 {
-                    match parser_clone.lock() {
+                match n.cmp(&0) {
+                    std::cmp::Ordering::Greater => match parser_clone.lock() {
                         Ok(mut parser) => {
                             parser.process(&buf[..n as usize]);
                         }
@@ -178,26 +177,28 @@ impl Session {
                             // broken state - exit the reader thread.
                             break;
                         }
+                    },
+                    std::cmp::Ordering::Equal => {
+                        // EOF - slave side closed, child exited.
+                        break;
                     }
-                } else if n == 0 {
-                    // EOF - slave side closed, child exited.
-                    break;
-                } else {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::Interrupted {
-                        // EINTR - a signal interrupted the read. This is
-                        // not a real error, just retry.
-                        continue;
+                    std::cmp::Ordering::Less => {
+                        let err = io::Error::last_os_error();
+                        if err.kind() == io::ErrorKind::Interrupted {
+                            // EINTR - a signal interrupted the read. This is
+                            // not a real error, just retry.
+                            continue;
+                        }
+                        // Real error (EBADF, EIO, etc.) - fd closed, session
+                        // dropped, or something fatal. Exit the reader thread
+                        // so the session becomes [dead].
+                        break;
                     }
-                    // Real error (EBADF, EIO, etc.) - fd closed, session
-                    // dropped, or something fatal. Exit the reader thread
-                    // so the session becomes [dead].
-                    break;
                 }
             }
         });
 
-        Ok(Session {
+        Ok(Self {
             master: master_fd,
             child: Some(child),
             parser,
@@ -207,7 +208,7 @@ impl Session {
 
     /// Write bytes to the PTY master (sends input to the child process).
     ///
-    /// The master fd is in blocking mode, so write() blocks until the kernel
+    /// The master fd is in blocking mode, so `write()` blocks until the kernel
     /// buffer has space. This is fine for interactive input which is small.
     /// Guards against zero-length writes.
     pub fn write_bytes(&self, data: &[u8]) -> io::Result<()> {
@@ -217,7 +218,7 @@ impl Session {
             let n = unsafe {
                 libc::write(
                     fd,
-                    data[offset..].as_ptr() as *const libc::c_void,
+                    data[offset..].as_ptr().cast::<libc::c_void>(),
                     data.len() - offset,
                 )
             };
@@ -252,26 +253,21 @@ impl Session {
                 self.child.take();
                 false
             }
-            Ok(None) => true, // still running
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
-                // EINTR - transient, preserve prior state (alive).
-                true
-            }
-            Err(_) => {
-                // Other error - preserve prior state rather than falsely
-                // marking dead. The child may still be alive, we just
-                // could not check. If truly dead, the next tick catches it.
-                true
-            }
+            // `Ok(None)`: still running.
+            // `Err(EINTR)`: transient; preserve prior state (alive).
+            // `Err(_)`: other error - preserve prior state rather than
+            // falsely marking dead. The child may still be alive, we just
+            // could not check. If truly dead, the next tick catches it.
+            Ok(None) | Err(_) => true,
         }
     }
 
     /// Resize the PTY and the parser to the given dimensions.
     ///
-    /// Locks the parser BEFORE calling set_winsize so that the reader
+    /// Locks the parser BEFORE calling `set_winsize` so that the reader
     /// thread cannot feed new-dimension output into an old-dimension
-    /// parser. The lock ensures: lock -> set_winsize (kernel sends
-    /// SIGWINCH) -> set_size -> unlock, so parser dimensions are always
+    /// parser. The lock ensures: lock -> `set_winsize` (kernel sends
+    /// SIGWINCH) -> `set_size` -> unlock, so parser dimensions are always
     /// in sync when the reader thread next acquires the lock.
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         if let Ok(mut parser) = self.parser.lock() {
@@ -286,8 +282,8 @@ impl Session {
     /// Used during graceful shutdown: the main loop continues running so
     /// the UI stays responsive while children handle SIGTERM at their own
     /// pace. Does not consume the child - liveness checks and reaping
-    /// happen via is_alive() on subsequent ticks.
-    pub fn send_sigterm(&mut self) {
+    /// happen via `is_alive()` on subsequent ticks.
+    pub fn send_sigterm(&self) {
         let Some(ref child) = self.child else {
             return;
         };
@@ -314,7 +310,7 @@ impl Session {
 
     /// Kill the child process group and wait for it to exit.
     ///
-    /// Sends SIGTERM first and waits up to SIGTERM_GRACE_MS before
+    /// Sends SIGTERM first and waits up to `SIGTERM_GRACE_MS` before
     /// escalating to SIGKILL. Used for single-tab deletion where a
     /// brief blocking wait is acceptable.
     pub fn kill(&mut self) {
@@ -378,8 +374,8 @@ impl Drop for Session {
     }
 }
 
-/// Set the FD_CLOEXEC flag on a file descriptor so it is automatically
-/// closed when exec() is called in child processes.
+/// Set the `FD_CLOEXEC` flag on a file descriptor so it is automatically
+/// closed when `exec()` is called in child processes.
 fn set_cloexec(fd: std::os::fd::RawFd) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
@@ -399,8 +395,8 @@ fn openpty() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut slave_raw: libc::c_int = -1;
     let rc = unsafe {
         libc::openpty(
-            &mut master_raw,
-            &mut slave_raw,
+            &raw mut master_raw,
+            &raw mut slave_raw,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -498,12 +494,12 @@ mod tests {
         );
     }
 
-    /// Regression: vt100's visible_rows() panics when scrollback_offset
+    /// Regression: vt100's `visible_rows()` panics when `scrollback_offset`
     /// exceeds terminal rows due to usize underflow at
     /// `rows_len - self.scrollback_offset`. This test documents the bug
     /// so we know when/if vt100 fixes it.
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "attempt to subtract with overflow")]
     fn scrollback_offset_exceeding_rows_panics_in_vt100() {
         let mut parser = vt100::Parser::new(24, 80, 100);
         for i in 0..200 {
@@ -515,7 +511,7 @@ mod tests {
         let _ = parser.screen().cell(0, 0);
     }
 
-    /// Verify that clamping scrollback_offset to terminal rows avoids
+    /// Verify that clamping `scrollback_offset` to terminal rows avoids
     /// the vt100 panic.
     #[test]
     fn scrollback_offset_clamped_to_rows_does_not_panic() {

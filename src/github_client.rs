@@ -23,16 +23,16 @@ pub enum GithubError {
 impl fmt::Display for GithubError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GithubError::CliNotFound => write!(f, "gh CLI not found"),
-            GithubError::AuthRequired => write!(f, "gh auth required"),
-            GithubError::ApiError(msg) => write!(f, "GitHub API error: {msg}"),
-            GithubError::ParseError(msg) => write!(f, "GitHub parse error: {msg}"),
+            Self::CliNotFound => write!(f, "gh CLI not found"),
+            Self::AuthRequired => write!(f, "gh auth required"),
+            Self::ApiError(msg) => write!(f, "GitHub API error: {msg}"),
+            Self::ParseError(msg) => write!(f, "GitHub parse error: {msg}"),
         }
     }
 }
 
 /// A raw PR as returned by the GitHub API (via gh CLI).
-/// Includes head_branch for matching against work item repo associations.
+/// Includes `head_branch` for matching against work item repo associations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GithubPr {
     pub number: u64,
@@ -42,7 +42,7 @@ pub struct GithubPr {
     pub head_branch: String,
     pub url: String,
     /// Raw review decision string from GitHub (e.g. "APPROVED",
-    /// "CHANGES_REQUESTED", "REVIEW_REQUIRED", or empty).
+    /// "`CHANGES_REQUESTED`", "`REVIEW_REQUIRED`", or empty).
     pub review_decision: String,
     /// Raw status check rollup (e.g. "SUCCESS", "PENDING", "FAILURE",
     /// or empty).
@@ -97,7 +97,7 @@ impl LivePrState {
     /// classifier skips remote checks when `has_open_pr` is false,
     /// so the `Unknown` defaults for `mergeable` / `check_rollup`
     /// never surface in a merge decision.
-    pub fn no_pr() -> Self {
+    pub const fn no_pr() -> Self {
         Self {
             mergeable: MergeableState::Unknown,
             check_rollup: CheckStatus::None,
@@ -115,8 +115,8 @@ pub struct GithubIssue {
     pub labels: Vec<String>,
 }
 
-/// Trait for interacting with GitHub. Implementations include GhCliClient
-/// (shells out to `gh`) and MockGithubClient (returns fixture data for
+/// Trait for interacting with GitHub. Implementations include `GhCliClient`
+/// (shells out to `gh`) and `MockGithubClient` (returns fixture data for
 /// tests).
 pub trait GithubClient: Send + Sync {
     /// List all open PRs for a given owner/repo.
@@ -327,7 +327,7 @@ impl GithubClient for MockGithubClient {
     /// is set (so tests can exercise the "lookup failed" branch of
     /// the fetcher), otherwise returns a stable mock login so every
     /// test that does not care about identity still gets a usable
-    /// value and the fetcher does not emit a spurious FetcherError.
+    /// value and the fetcher does not emit a spurious `FetcherError`.
     fn current_user_login(&self) -> Result<String, GithubError> {
         if let Some(ref err) = self.error {
             return Err(err.clone());
@@ -336,7 +336,7 @@ impl GithubClient for MockGithubClient {
     }
 }
 
-/// GhCliClient shells out to the `gh` CLI to interact with the GitHub API.
+/// `GhCliClient` shells out to the `gh` CLI to interact with the GitHub API.
 ///
 /// Holds a single cached value - the authenticated user's login - resolved
 /// lazily on first call to `current_user_login()` via `gh api user`. Every
@@ -357,7 +357,7 @@ impl Default for GhCliClient {
 }
 
 impl GhCliClient {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             current_user_login_cache: OnceLock::new(),
         }
@@ -365,9 +365,9 @@ impl GhCliClient {
 
     /// Run a `gh` command and return its stdout on success.
     ///
-    /// Returns GithubError::CliNotFound if the gh binary is not found,
-    /// GithubError::AuthRequired if the error output mentions authentication,
-    /// and GithubError::ApiError for other non-zero exits.
+    /// Returns `GithubError::CliNotFound` if the gh binary is not found,
+    /// `GithubError::AuthRequired` if the error output mentions authentication,
+    /// and `GithubError::ApiError` for other non-zero exits.
     fn run_gh(&self, args: &[&str]) -> Result<String, GithubError> {
         let output = Command::new("gh").args(args).output().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -599,11 +599,11 @@ impl GithubClient for GhCliClient {
 // JSON parsing helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a single PR JSON object (from gh pr list --json) into a GithubPr.
+/// Parse a single PR JSON object (from gh pr list --json) into a `GithubPr`.
 fn parse_pr_from_value(v: &Value) -> Result<GithubPr, GithubError> {
     let number = v
         .get("number")
-        .and_then(|n| n.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| GithubError::ParseError("PR missing 'number' field".into()))?;
 
     let title = v
@@ -624,7 +624,10 @@ fn parse_pr_from_value(v: &Value) -> Result<GithubPr, GithubError> {
         .unwrap_or("OPEN")
         .to_string();
 
-    let is_draft = v.get("isDraft").and_then(|d| d.as_bool()).unwrap_or(false);
+    let is_draft = v
+        .get("isDraft")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
 
     let url = v
         .get("url")
@@ -641,14 +644,14 @@ fn parse_pr_from_value(v: &Value) -> Result<GithubPr, GithubError> {
         .get("headRepositoryOwner")
         .and_then(|o| o.get("login"))
         .and_then(|l| l.as_str())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
 
     // author is an object with a "login" field, e.g. {"login": "user"}.
     let author = v
         .get("author")
         .and_then(|o| o.get("login"))
         .and_then(|l| l.as_str())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
 
     let mergeable = v
         .get("mergeable")
@@ -706,11 +709,11 @@ fn parse_review_requests(v: &Value) -> (Vec<String>, Vec<String>) {
     (logins, slugs)
 }
 
-/// Parse a single issue JSON object (from gh issue view --json) into a GithubIssue.
+/// Parse a single issue JSON object (from gh issue view --json) into a `GithubIssue`.
 fn parse_issue_from_value(v: &Value) -> Result<GithubIssue, GithubError> {
     let number = v
         .get("number")
-        .and_then(|n| n.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| GithubError::ParseError("issue missing 'number' field".into()))?;
 
     let title = v
@@ -736,7 +739,7 @@ fn parse_issue_from_value(v: &Value) -> Result<GithubIssue, GithubError> {
                         .get("name")
                         .and_then(|n| n.as_str())
                         .or_else(|| label.as_str())
-                        .map(|s| s.to_string())
+                        .map(std::string::ToString::to_string)
                 })
                 .collect()
         })
@@ -757,7 +760,7 @@ fn parse_issue_from_value(v: &Value) -> Result<GithubIssue, GithubError> {
 /// single summary string:
 /// - If the array is empty or missing: ""
 /// - If any check has conclusion "FAILURE": "FAILURE"
-/// - If any check has status "PENDING" or "IN_PROGRESS" (and none failed): "PENDING"
+/// - If any check has status "PENDING" or "`IN_PROGRESS`" (and none failed): "PENDING"
 /// - If all checks have conclusion "SUCCESS": "SUCCESS"
 /// - Otherwise: "UNKNOWN"
 fn parse_check_status_raw(v: &Value) -> String {
@@ -789,7 +792,7 @@ fn parse_check_status_raw(v: &Value) -> String {
                 match status {
                     "COMPLETED" => has_success = true,
                     "IN_PROGRESS" | "QUEUED" | "PENDING" | "WAITING" | "REQUESTED" => {
-                        has_pending = true
+                        has_pending = true;
                     }
                     _ => has_pending = true,
                 }
@@ -810,8 +813,8 @@ fn parse_check_status_raw(v: &Value) -> String {
 
 /// Extract the reviewDecision string from gh JSON output.
 ///
-/// gh returns reviewDecision as a string ("APPROVED", "CHANGES_REQUESTED",
-/// "REVIEW_REQUIRED") or an empty string / null if no review has happened.
+/// gh returns reviewDecision as a string ("APPROVED", "`CHANGES_REQUESTED`",
+/// "`REVIEW_REQUIRED`") or an empty string / null if no review has happened.
 fn parse_review_decision_raw(v: &Value) -> String {
     v.get("reviewDecision")
         .and_then(|r| r.as_str())
@@ -822,7 +825,7 @@ fn parse_review_decision_raw(v: &Value) -> String {
 /// Extract owner and repo name from a GitHub remote URL.
 ///
 /// Supports both SSH (git@github.com:owner/repo.git) and HTTPS
-/// (https://github.com/owner/repo.git) formats. Returns None for
+/// (<https://github.com/owner/repo.git>) formats. Returns None for
 /// non-GitHub URLs.
 pub fn parse_github_remote(url: &str) -> Option<(String, String)> {
     // SSH format: git@github.com:owner/repo.git
@@ -1233,7 +1236,7 @@ mod tests {
             ),
             (r#"{"reviewDecision": ""}"#, ""),
             (r#"{"reviewDecision": null}"#, ""),
-            (r#"{}"#, ""),
+            (r"{}", ""),
         ];
 
         for (json, expected) in cases {

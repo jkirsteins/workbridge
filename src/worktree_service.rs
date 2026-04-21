@@ -23,12 +23,12 @@ pub enum WorktreeError {
 impl fmt::Display for WorktreeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WorktreeError::GitError(msg) => write!(f, "git error: {msg}"),
-            WorktreeError::Io(msg) => write!(f, "worktree I/O error: {msg}"),
-            WorktreeError::InvalidRepo(path) => {
+            Self::GitError(msg) => write!(f, "git error: {msg}"),
+            Self::Io(msg) => write!(f, "worktree I/O error: {msg}"),
+            Self::InvalidRepo(path) => {
                 write!(f, "invalid git repo: {}", path.display())
             }
-            WorktreeError::BranchLockedToWorktree { branch, locked_at } => {
+            Self::BranchLockedToWorktree { branch, locked_at } => {
                 write!(
                     f,
                     "branch '{}' is locked to worktree at '{}'",
@@ -41,7 +41,7 @@ impl fmt::Display for WorktreeError {
 }
 
 /// Information about a single worktree.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorktreeInfo {
     /// Filesystem path to the worktree.
     pub path: PathBuf,
@@ -85,7 +85,7 @@ pub struct WorktreeInfo {
 }
 
 /// Trait for worktree operations. Implementations include
-/// GitWorktreeService (shells out to git CLI) and test mocks.
+/// `GitWorktreeService` (shells out to git CLI) and test mocks.
 pub trait WorktreeService: Send + Sync {
     /// List all worktrees for a repo.
     fn list_worktrees(&self, repo_path: &Path) -> Result<Vec<WorktreeInfo>, WorktreeError>;
@@ -132,7 +132,7 @@ pub trait WorktreeService: Send + Sync {
     fn fetch_branch(&self, repo_path: &Path, branch: &str) -> Result<(), WorktreeError>;
 
     /// Create a new local branch from the repo's default branch (or HEAD).
-    /// Used as a fallback when fetch_branch fails (e.g., the branch does
+    /// Used as a fallback when `fetch_branch` fails (e.g., the branch does
     /// not exist on origin yet).
     fn create_branch(&self, repo_path: &Path, branch: &str) -> Result<(), WorktreeError>;
 
@@ -144,7 +144,7 @@ pub trait WorktreeService: Send + Sync {
 
 /// Build a `Command::new("git")` with inherited git env vars cleared.
 ///
-/// Git sets GIT_DIR, GIT_WORK_TREE, etc. when running inside hooks or
+/// Git sets `GIT_DIR`, `GIT_WORK_TREE`, etc. when running inside hooks or
 /// worktrees. Clearing them ensures each command targets only the
 /// directory it's told to via `-C` or `current_dir()`.
 pub fn git_command() -> Command {
@@ -160,13 +160,13 @@ pub fn git_command() -> Command {
     cmd
 }
 
-/// GitWorktreeService shells out to the git CLI for worktree operations.
+/// `GitWorktreeService` shells out to the git CLI for worktree operations.
 pub struct GitWorktreeService;
 
 impl GitWorktreeService {
     /// Run a git command with `-C repo_path` and return stdout on success.
     ///
-    /// Clears inherited git env vars (GIT_DIR, GIT_WORK_TREE, etc.) so the
+    /// Clears inherited git env vars (`GIT_DIR`, `GIT_WORK_TREE`, etc.) so the
     /// command operates on `repo_path` rather than a parent worktree. This
     /// matters when the process runs inside a git hook (e.g. pre-push) where
     /// git sets these variables.
@@ -207,7 +207,7 @@ impl GitWorktreeService {
     }
 
     /// Parse porcelain output from `git worktree list --porcelain` into
-    /// WorktreeInfo entries.
+    /// `WorktreeInfo` entries.
     ///
     /// The porcelain format produces blocks separated by blank lines. Each
     /// block contains lines like:
@@ -298,10 +298,10 @@ impl GitWorktreeService {
             }
             if line.starts_with("??") {
                 untracked = true;
-            } else if line.starts_with("!!") {
-                // Ignored files - neither dirty nor untracked.
-                continue;
-            } else {
+            } else if !line.starts_with("!!") {
+                // Non-ignored change: `!!` is an explicitly ignored
+                // file (neither dirty nor untracked); anything else
+                // counts as a dirty tracked-file change.
                 dirty = true;
             }
         }
@@ -316,7 +316,7 @@ impl GitWorktreeService {
     /// separated by whitespace: left-side (HEAD-only) and right-side
     /// (`@{u}`-only). Left = commits that exist locally but not on the
     /// upstream = "unpushed"; right = commits on the upstream but not
-    /// local = "behind_remote".
+    /// local = "`behind_remote`".
     ///
     /// Returns `None` for any output that does not parse as two
     /// non-negative integers. Callers should only invoke this after
@@ -350,8 +350,7 @@ impl GitWorktreeService {
 
     /// Find the branch name for a worktree at the given path by looking
     /// through the list of all worktrees.
-    /// Called from remove_worktree; used in integration tests.
-    #[allow(dead_code)]
+    /// Called from `remove_worktree`; also used in integration tests.
     fn find_branch_for_worktree(
         repo_path: &Path,
         worktree_path: &Path,
@@ -408,7 +407,7 @@ impl WorktreeService for GitWorktreeService {
         // On any individual command failure the corresponding field stays
         // `None` so callers fall back to "unknown / safe default" rather
         // than retrying on the UI thread.
-        for wt in worktrees.iter_mut() {
+        for wt in &mut worktrees {
             if wt.is_main {
                 continue;
             }
@@ -608,33 +607,30 @@ impl WorktreeService for GitWorktreeService {
     }
 
     fn default_branch(&self, repo_path: &Path) -> Result<String, WorktreeError> {
-        match Self::run_git(repo_path, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
-            Ok(output) => {
-                let trimmed = output.trim();
-                // Output is like "refs/remotes/origin/main" - strip the prefix.
-                let branch = trimmed
-                    .strip_prefix("refs/remotes/origin/")
-                    .unwrap_or(trimmed);
-                Ok(branch.to_string())
+        if let Ok(output) = Self::run_git(repo_path, &["symbolic-ref", "refs/remotes/origin/HEAD"])
+        {
+            let trimmed = output.trim();
+            // Output is like "refs/remotes/origin/main" - strip the prefix.
+            let branch = trimmed
+                .strip_prefix("refs/remotes/origin/")
+                .unwrap_or(trimmed);
+            Ok(branch.to_string())
+        } else {
+            // No origin/HEAD available. Check which of "main" or "master"
+            // exists as a local branch. If both exist, prefer "main". If
+            // neither exists, fall back to "main" as a convention default.
+            let main_exists =
+                Self::run_git(repo_path, &["rev-parse", "--verify", "refs/heads/main"]).is_ok();
+            if main_exists {
+                return Ok("main".to_string());
             }
-            Err(_) => {
-                // No origin/HEAD available. Check which of "main" or "master"
-                // exists as a local branch. If both exist, prefer "main". If
-                // neither exists, fall back to "main" as a convention default.
-                let main_exists =
-                    Self::run_git(repo_path, &["rev-parse", "--verify", "refs/heads/main"]).is_ok();
-                if main_exists {
-                    return Ok("main".to_string());
-                }
-                let master_exists =
-                    Self::run_git(repo_path, &["rev-parse", "--verify", "refs/heads/master"])
-                        .is_ok();
-                if master_exists {
-                    return Ok("master".to_string());
-                }
-                // Neither exists - use "main" as convention default.
-                Ok("main".to_string())
+            let master_exists =
+                Self::run_git(repo_path, &["rev-parse", "--verify", "refs/heads/master"]).is_ok();
+            if master_exists {
+                return Ok("master".to_string());
             }
+            // Neither exists - use "main" as convention default.
+            Ok("main".to_string())
         }
     }
 
@@ -971,7 +967,7 @@ mod tests {
 /// `integration` feature so they don't run on every `cargo test`.
 /// Run with: `cargo test --features integration`
 ///
-/// These tests use environment variables (GIT_AUTHOR_EMAIL, etc.)
+/// These tests use environment variables (`GIT_AUTHOR_EMAIL`, etc.)
 /// instead of `git config` to avoid writing to any git config file.
 /// This prevents worktree config writes from poisoning the parent
 /// repo's .git/config (the root cause of the core.bare corruption).
@@ -986,7 +982,7 @@ mod integration_tests {
 
     /// Build a Command with git environment variables cleared so
     /// child git processes operate on `dir` instead of inheriting
-    /// the parent worktree's GIT_DIR/GIT_WORK_TREE.
+    /// the parent worktree's `GIT_DIR/GIT_WORK_TREE`.
     fn git_cmd(dir: &Path) -> Command {
         let mut cmd = Command::new("git");
         cmd.current_dir(dir)
@@ -1039,7 +1035,7 @@ mod integration_tests {
         }
         let output = cmd
             .output()
-            .unwrap_or_else(|e| panic!("failed to run {:?}: {e}", args));
+            .unwrap_or_else(|e| panic!("failed to run {args:?}: {e}"));
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             panic!("command {:?} failed in {}:\n{stderr}", args, dir.display());
@@ -1100,13 +1096,11 @@ mod integration_tests {
         let branches: Vec<Option<&str>> = worktrees.iter().map(|w| w.branch.as_deref()).collect();
         assert!(
             branches.contains(&Some("feature-branch")),
-            "feature-branch should be listed, got: {:?}",
-            branches,
+            "feature-branch should be listed, got: {branches:?}",
         );
         assert!(
             !branches.contains(&Some("master")),
-            "main worktree on 'master' should be filtered out, got: {:?}",
-            branches,
+            "main worktree on 'master' should be filtered out, got: {branches:?}",
         );
     }
 
@@ -1127,8 +1121,7 @@ mod integration_tests {
         // should be filtered out. No other worktrees exist.
         assert!(
             worktrees.is_empty(),
-            "main worktree on default branch should be filtered, got: {:?}",
-            worktrees,
+            "main worktree on default branch should be filtered, got: {worktrees:?}",
         );
     }
 
@@ -1342,7 +1335,7 @@ mod integration_tests {
         assert!(result.is_err());
     }
 
-    /// F-2 regression: github_remote() must propagate git errors that are
+    /// F-2 regression: `github_remote()` must propagate git errors that are
     /// NOT "no such remote". Only the specific "no such remote" error
     /// should map to Ok(None); other failures (corruption, permissions)
     /// must surface as Err.
@@ -1369,12 +1362,11 @@ mod integration_tests {
 
         assert!(
             result.is_err(),
-            "github_remote should propagate non-'no such remote' git errors, got: {:?}",
-            result,
+            "github_remote should propagate non-'no such remote' git errors, got: {result:?}",
         );
     }
 
-    /// F-1 regression: fetch_branch should fetch a branch from origin so
+    /// F-1 regression: `fetch_branch` should fetch a branch from origin so
     /// the local ref points at the correct commit, and fail when the
     /// branch does not exist on origin.
     #[test]
@@ -1467,7 +1459,7 @@ mod integration_tests {
         );
     }
 
-    /// F-1 regression: fetch_branch should fail when the branch does not
+    /// F-1 regression: `fetch_branch` should fail when the branch does not
     /// exist on origin (e.g. fork PR branch).
     #[test]
     fn fetch_branch_fails_for_nonexistent_branch() {
@@ -1502,8 +1494,7 @@ mod integration_tests {
         let result = svc.fetch_branch(&repo_dir, "nonexistent-branch");
         assert!(
             result.is_err(),
-            "fetch_branch should fail for a branch not on origin, got: {:?}",
-            result,
+            "fetch_branch should fail for a branch not on origin, got: {result:?}",
         );
     }
 
@@ -1607,8 +1598,7 @@ mod integration_tests {
         let result = svc.delete_branch(&repo_dir, "unmerged-branch", false);
         assert!(
             result.is_err(),
-            "non-force delete of unmerged branch should fail, got: {:?}",
-            result,
+            "non-force delete of unmerged branch should fail, got: {result:?}",
         );
     }
 
@@ -1639,7 +1629,7 @@ mod integration_tests {
             &repo_dir,
             &["rev-parse", "--verify", "refs/heads/unmerged-branch"],
         );
-        assert!(check.is_err(), "branch should have been force-deleted",);
+        assert!(check.is_err(), "branch should have been force-deleted");
     }
 
     #[test]
@@ -1686,8 +1676,7 @@ mod integration_tests {
         let result = svc.remove_worktree(&repo_dir, &wt_dir, false, false);
         assert!(
             result.is_err(),
-            "non-force remove of dirty worktree should fail, got: {:?}",
-            result,
+            "non-force remove of dirty worktree should fail, got: {result:?}",
         );
     }
 }

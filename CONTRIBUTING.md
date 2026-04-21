@@ -16,6 +16,103 @@ Never suppress, ignore, or work around linter or formatter errors. If clippy
 or `cargo fmt --check` complains, fix the code - do not add `#[allow(...)]`,
 `// nolint`, or similar annotations to silence warnings.
 
+### Lints configuration
+
+The `[lints]` table in `Cargo.toml` is the single source of truth for which
+clippy lint groups are enabled and which individual lints are allowed crate
+wide. The Phase 3 hygiene campaign landed the current matrix; a quick
+summary:
+
+- **Deny (P1 hygiene):** `dbg_macro`, `todo`, `unimplemented`,
+  `allow_attributes`, `allow_attributes_without_reason`,
+  `broken_intra_doc_links`.
+- **Deny (production restriction lints):** `unwrap_used`, `expect_used`,
+  `panic`. Tests carve these out via the two-invocation clippy pattern
+  implemented in `hooks/clippy-check.sh` (called from both pre-commit
+  and CI), rather than any source-level `#[allow]`. The script is the
+  single source of truth for the `-A` carve-out flag set; updating
+  the carve-out requires editing exactly one file.
+- **Warn (groups):** `rust_2018_idioms` (from `[lints.rust]`), `pedantic`,
+  `nursery` (both from `[lints.clippy]`). CI promotes warnings to errors
+  via `-D warnings`.
+- **Allow (with rationale in Cargo.toml):** CLI surface (`print_stdout`,
+  `print_stderr`, `exit`), design-doc noise (`module_name_repetitions`,
+  `missing_errors_doc`, `missing_panics_doc`, `too_many_lines`,
+  `similar_names`), TUI cast math (`cast_possible_truncation`,
+  `cast_possible_wrap`, `cast_sign_loss`, `cast_lossless`,
+  `cast_precision_loss`), and Phase-4-deferred structural lints
+  (`needless_pass_by_value`, `significant_drop_tightening`,
+  `struct_excessive_bools`, `unused_self`). Every `allow` has a
+  one-line rationale comment in `Cargo.toml`; any new allow entry
+  needs the same.
+
+**Do not add source-level `#[allow(...)]`**. The
+`clippy::allow_attributes_without_reason` lint denies them, and the
+`clippy::allow_attributes` lint denies the shorter `#[allow(...)]` form
+too. If a specific site really does need a suppression, add it to
+`[lints]` in `Cargo.toml` with a rationale comment and propose the
+diff in the PR so a reviewer can evaluate whether the category
+genuinely warrants a crate-wide allow.
+
+### Unsafe code policy
+
+`unsafe_code` is at `warn` crate-wide (promoted to a merge-blocker
+by CI's `-D warnings`) rather than `forbid` because the crate has
+two legitimate unsafe surfaces that cannot be rewritten in safe
+Rust:
+
+- `src/session.rs` - PTY FFI (`libc::openpty`, `libc::dup`,
+  `libc::fcntl`, `libc::read`/`libc::write`, raw-fd construction)
+  for the embedded terminal backend. Covered by unit and integration
+  tests. The module opts out via a single file-level
+  `#![expect(unsafe_code, reason = "...")]` attribute at the top of
+  `src/session.rs` (the entire file is the FFI boundary). The
+  file-level `#![expect]` suppresses the `unsafe_code` lint across
+  the whole module; it does NOT relieve the per-block SAFETY comment
+  requirement described below. Every `unsafe { ... }` block still
+  needs its own preceding SAFETY comment, and reviewers must flag
+  any new block that lacks one even when the file-level attribute
+  would otherwise silence the lint.
+- `src/app.rs` - two `libc::killpg(pid, SIGKILL)` blocks: one in the
+  rebase-gate drop path (`impl Drop for RebaseGateState`) and one in
+  the subprocess cancellation helper (`run_cancellable`). Each
+  enclosing function opts out via `#[expect(unsafe_code, reason =
+  "...")]` attached to the function, not to the unsafe block itself.
+
+Note that the opt-out uses `#[expect]`, NOT `#[allow]`, because
+`clippy::allow_attributes` is denied crate-wide so that no
+undocumented `#[allow(...)]` can sneak in. `#[expect]` is the
+idiomatic replacement: it behaves like allow but produces its own
+warning (`unfulfilled_lint_expectations`) if the lint would NOT have
+fired, so a future refactor that removes the unsafe block also
+removes the attribute.
+
+Every existing unsafe block carries a preceding SAFETY comment
+documenting why the block is sound. Adding a new unsafe block
+requires:
+
+1. A SAFETY comment that states the preconditions relied on and why
+   they hold at the call site.
+2. An `#[expect(unsafe_code, reason = "...")]` attribute on the
+   enclosing function (or a file-level `#![expect(...)]` for a new
+   FFI-boundary module), with a reason string that links to the
+   SAFETY comment and names the FFI surface.
+3. A reviewer-visible justification in the PR description explaining
+   why the operation cannot be expressed in safe Rust.
+4. Matching test coverage, or an explicit note in the PR stating why
+   the block is impossible to test in-process (e.g. the FFI path
+   needs a real PTY device).
+
+Reviewers must flag any new unsafe block that lacks any of the
+above. The `#[expect]` attribute is what lets the `unsafe_code`
+warning stay at merge-blocker severity for every other site while
+still permitting these two carefully-bounded exceptions.
+
+`forbid` is not an option because even a single legitimate unsafe
+block in the crate would then force suppression at the site, and
+`forbid` cannot be locally suppressed at all. `warn` plus per-site
+`#[expect]` is the enforcement path.
+
 ### Optional: nightly rustfmt for import style
 
 `rustfmt.toml` enables two nightly-only options
@@ -91,6 +188,16 @@ past its budget, bump the entry in the budget file as part of your
 PR and explain the growth in the commit message. The budget exists
 to prevent silent module bloat, not to ban growth - it wants the
 growth to be an explicit, reviewable decision.
+
+**Implicit 700-line ceiling for new top-level source files.** Tracked
+top-level `src/*.rs` files WITHOUT an explicit entry in the budget
+table are subject to an implicit 700-line ceiling. Under the ceiling
+passes silently; over the ceiling fails with a message asking the
+contributor to either shrink the file or add an explicit entry with
+a larger budget and rationale in the commit message. Nested files
+(e.g. `src/side_effects/*.rs`) are intentionally out of scope; the
+ceiling only enforces that newly-extracted top-level modules cannot
+grow silently past the point where they warrant explicit review.
 
 ## Error Handling
 

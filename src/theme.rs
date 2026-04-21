@@ -4,7 +4,7 @@ use crate::work_item::WorkItemStatus;
 
 /// All colors used by the TUI, in one place. Swap this struct to change
 /// the entire look. Every color in ui.rs comes from here - no inline
-/// Color:: literals.
+/// `Color::` literals.
 pub struct Theme {
     // -- Borders --
     /// Left panel border when focused.
@@ -163,9 +163,9 @@ pub struct Theme {
 impl Theme {
     /// Default theme. Uses Reset for text rendered against the terminal's
     /// own background (which we don't control). Absolute colors (Black,
-    /// White, DarkGray) are safe when the Theme sets both fg AND bg (e.g.,
+    /// White, `DarkGray`) are safe when the Theme sets both fg AND bg (e.g.,
     /// highlight bars, status bars) since contrast is guaranteed.
-    pub fn default_theme() -> Self {
+    pub const fn default_theme() -> Self {
         Self {
             border_focused: Color::Cyan,
             border_unfocused: Color::Reset,
@@ -307,9 +307,9 @@ impl Theme {
     }
 
     /// Background-only highlight for the List widget. Per-span fg colors
-    /// set inside ListItems are preserved; spans apply their own fg
+    /// set inside `ListItems` are preserved; spans apply their own fg
     /// (including highlight-aware overrides) instead of being forced to
-    /// a single color by Cell::set_style.
+    /// a single color by `Cell::set_style`.
     pub fn style_tab_highlight_bg(&self) -> Style {
         Style::default().bg(self.tab_highlight_bg)
     }
@@ -539,7 +539,7 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
-    pub fn style_stage_badge(&self, status: &WorkItemStatus) -> Style {
+    pub fn style_stage_badge(&self, status: WorkItemStatus) -> Style {
         let color = match status {
             WorkItemStatus::Backlog => self.badge_backlog,
             WorkItemStatus::Planning => self.badge_planning,
@@ -550,10 +550,10 @@ impl Theme {
             WorkItemStatus::Done => self.badge_done,
         };
         let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);
-        if *status == WorkItemStatus::Blocked {
+        if status == WorkItemStatus::Blocked {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        if *status == WorkItemStatus::Done {
+        if status == WorkItemStatus::Done {
             style = style.add_modifier(Modifier::DIM);
         }
         style

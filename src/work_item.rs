@@ -13,7 +13,7 @@ use crate::worktree_service::{WorktreeError, WorktreeInfo};
 ///
 /// Each variant corresponds to a backend type. The id uniquely identifies
 /// a work item across sessions and restarts. All variant fields are
-/// hashable, so WorkItemId can be used as a HashMap key.
+/// hashable, so `WorkItemId` can be used as a `HashMap` key.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WorkItemId {
     /// Stored as a JSON file on the local filesystem.
@@ -34,8 +34,8 @@ impl Hash for WorkItemId {
         // field values do not collide.
         std::mem::discriminant(self).hash(state);
         match self {
-            WorkItemId::LocalFile(path) => path.hash(state),
-            WorkItemId::GithubIssue {
+            Self::LocalFile(path) => path.hash(state),
+            Self::GithubIssue {
                 owner,
                 repo,
                 number,
@@ -44,7 +44,7 @@ impl Hash for WorkItemId {
                 repo.hash(state);
                 number.hash(state);
             }
-            WorkItemId::GithubProject { node_id } => node_id.hash(state),
+            Self::GithubProject { node_id } => node_id.hash(state),
         }
     }
 }
@@ -88,33 +88,29 @@ pub enum WorkItemStatus {
 
 impl WorkItemStatus {
     /// The next stage in the workflow, or None if at the terminal stage.
-    pub fn next_stage(&self) -> Option<WorkItemStatus> {
+    pub const fn next_stage(self) -> Option<Self> {
         match self {
             Self::Backlog => Some(Self::Planning),
             Self::Planning => Some(Self::Implementing),
-            Self::Implementing => Some(Self::Review),
-            Self::Blocked => Some(Self::Review),
-            Self::Review => Some(Self::Done),
-            Self::Mergequeue => Some(Self::Done),
+            Self::Implementing | Self::Blocked => Some(Self::Review),
+            Self::Review | Self::Mergequeue => Some(Self::Done),
             Self::Done => None,
         }
     }
 
     /// The previous stage in the workflow, or None if at the first stage.
-    pub fn prev_stage(&self) -> Option<WorkItemStatus> {
+    pub const fn prev_stage(self) -> Option<Self> {
         match self {
             Self::Backlog => None,
             Self::Planning => Some(Self::Backlog),
             Self::Implementing => Some(Self::Planning),
-            Self::Blocked => Some(Self::Implementing),
-            Self::Review => Some(Self::Implementing),
-            Self::Mergequeue => Some(Self::Review),
-            Self::Done => Some(Self::Review),
+            Self::Blocked | Self::Review => Some(Self::Implementing),
+            Self::Mergequeue | Self::Done => Some(Self::Review),
         }
     }
 
     /// Short badge text for display in the work item list.
-    pub fn badge_text(&self) -> &'static str {
+    pub const fn badge_text(self) -> &'static str {
         match self {
             Self::Backlog => "[BL]",
             Self::Planning => "[PL]",
@@ -134,7 +130,7 @@ impl WorkItemStatus {
     /// Other stages return a high value so they never displace
     /// MQ/RV/IM/PL inside the ACTIVE bucket. Ties are broken by the
     /// caller's existing order (stable sort).
-    pub fn active_group_rank(&self) -> u8 {
+    pub const fn active_group_rank(self) -> u8 {
         match self {
             Self::Mergequeue => 0,
             Self::Review => 1,
@@ -164,8 +160,7 @@ impl WorkItemStatus {
 pub fn repo_slug_from_path(repo_path: &Path) -> String {
     repo_path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "unknown".into())
+        .map_or_else(|| "unknown".into(), |n| n.to_string_lossy().into_owned())
 }
 
 /// A fully assembled work item with backend data and derived metadata.
@@ -271,13 +266,6 @@ pub enum PrState {
     Merged,
 }
 
-/// Issue open/closed state.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum IssueState {
-    Open,
-    Closed,
-}
-
 /// Derived PR information attached to a repo association.
 #[derive(Clone, Debug)]
 pub struct PrInfo {
@@ -292,21 +280,33 @@ pub struct PrInfo {
 }
 
 /// Derived issue information attached to a repo association.
-/// Populated by assembly; fields read in tests. Title used for work item
-/// title derivation. Other fields shown in detail views when added.
+/// Populated by assembly. Title used for work item title derivation;
+/// labels surface in the context bar. An open/closed state field was
+/// removed when Phase 3 of the hygiene campaign eliminated dead
+/// `#[allow(dead_code)]` attributes - no renderer ever consumed it.
+/// Re-add when issue state display lands.
 #[derive(Clone, Debug)]
 pub struct IssueInfo {
     pub number: u64,
     pub title: String,
-    /// Shown in detail views when issue state display is added.
-    #[allow(dead_code)]
-    pub state: IssueState,
     pub labels: Vec<String>,
 }
 
 /// Errors that can occur on a work item. These are orthogonal to status
 /// (a Todo item can have errors). Each error is surfaced as a badge or
 /// detail in the UI.
+///
+/// Aspirational variants were removed when Phase 3 of the hygiene
+/// campaign eliminated dead `#[allow(dead_code)]` attributes:
+///
+/// - `DetachedHead` - assembly does not produce it; detached worktrees
+///   have no branch and therefore cannot match a work item.
+/// - `CorruptBackendRecord` - `LocalFileBackend` skips corrupt files
+///   rather than surfacing them as errors.
+/// - `WorktreeGone` - no assembly pass detects missing worktrees yet.
+///
+/// Re-add them in the same commit as the producer and renderer paths
+/// when that work lands.
 #[derive(Clone, Debug)]
 pub enum WorkItemError {
     MultiplePrsForBranch {
@@ -314,31 +314,9 @@ pub enum WorkItemError {
         branch: String,
         count: usize,
     },
-    /// Kept for display completeness but no longer produced by the assembly
-    /// layer. A detached worktree has no branch, so it cannot be matched to
-    /// a work item.
-    #[allow(dead_code)]
-    DetachedHead {
-        repo_path: PathBuf,
-        worktree_path: PathBuf,
-    },
     IssueNotFound {
         repo_path: PathBuf,
         issue_number: u64,
-    },
-    /// Constructed when backend.list() encounters a parseable but invalid
-    /// record. Not triggered in v1 (LocalFileBackend skips corrupt files).
-    #[allow(dead_code)]
-    CorruptBackendRecord {
-        backend: BackendType,
-        reason: String,
-    },
-    /// Constructed when a work item references a worktree path that no
-    /// longer exists on disk. Detection deferred to a future assembly pass.
-    #[allow(dead_code)]
-    WorktreeGone {
-        repo_path: PathBuf,
-        expected_path: PathBuf,
     },
 }
 
@@ -430,7 +408,7 @@ impl SelectionState {
     /// whole reason the logic lives on the struct: the two sides must
     /// agree on where the selection starts and ends, so there is exactly
     /// one anchor-vs-current ordering rule for the whole program.
-    pub fn normalized_bounds(&self) -> (u16, u16, u16, u16) {
+    pub const fn normalized_bounds(&self) -> (u16, u16, u16, u16) {
         let (ar, ac) = self.anchor;
         let (cr, cc) = self.current;
         if ar < cr || (ar == cr && ac <= cc) {
@@ -483,7 +461,7 @@ pub struct RepoFetchResult {
     pub issues: Vec<(u64, Result<GithubIssue, GithubError>)>,
     /// The GitHub login of the currently authenticated user, resolved
     /// once per fetch tick via `gh api user` (cached inside the
-    /// github_client). None when the lookup has not yet succeeded -
+    /// `github_client`). None when the lookup has not yet succeeded -
     /// e.g. the gh CLI is missing, auth is expired, or the first call
     /// happens to hit a transient error. Lookup failures are NOT
     /// silent: the fetcher emits a `FetchMessage::FetcherError` on
@@ -507,7 +485,7 @@ pub enum FetchMessage {
 
 /// Handle to background fetcher threads. Holds a shared stop flag for
 /// clean shutdown. Threads are fully independent once spawned - we do
-/// not store JoinHandles or join on stop. Threads exit on their own
+/// not store `JoinHandles` or join on stop. Threads exit on their own
 /// when the stop flag is set or when their channel send fails.
 pub struct FetcherHandle {
     pub stop: Arc<AtomicBool>,

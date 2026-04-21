@@ -246,19 +246,20 @@ pub fn seed_dashboard(target_dir: &Path) -> Result<(), Box<dyn Error>> {
 /// `read_dir`, and catches the one failure mode that matters
 /// (pointing the seeder at the real `work-items/` directory by accident).
 fn refuse_if_populated(dir: &Path) -> Result<(), Box<dyn Error>> {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        // Nonexistent / unreadable directories are handled by the normal
-        // write path - no need to double-report here.
-        Err(_) => return Ok(()),
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        let looks_like_record = name_str.ends_with(".json");
-        let looks_like_activity = name_str.starts_with("activity-") && name_str.ends_with(".jsonl");
+        let ext = std::path::Path::new(name_str)
+            .extension()
+            .and_then(|e| e.to_str());
+        let looks_like_record = ext.is_some_and(|e| e.eq_ignore_ascii_case("json"));
+        let looks_like_activity = name_str.starts_with("activity-")
+            && ext.is_some_and(|e| e.eq_ignore_ascii_case("jsonl"));
         if looks_like_record || looks_like_activity {
             return Err(format!(
                 "target directory {} already contains workbridge work-item files \
@@ -272,7 +273,7 @@ fn refuse_if_populated(dir: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Compose a stage_change ActivityEntry with the project's canonical
+/// Compose a `stage_change` `ActivityEntry` with the project's canonical
 /// timestamp format (`{secs}Z`) and payload shape (`{from, to}`).
 fn stage_event(secs: i64, from: WorkItemStatus, to: WorkItemStatus) -> ActivityEntry {
     ActivityEntry {
@@ -293,7 +294,7 @@ fn pr_merged_event(secs: i64) -> ActivityEntry {
     }
 }
 
-fn status_label(status: WorkItemStatus) -> &'static str {
+const fn status_label(status: WorkItemStatus) -> &'static str {
     match status {
         WorkItemStatus::Backlog => "Backlog",
         WorkItemStatus::Planning => "Planning",

@@ -37,7 +37,7 @@ use worktree_service::GitWorktreeService;
 /// Handle CLI subcommands. Returns true if a subcommand was handled (caller
 /// should exit), false if the TUI should launch.
 fn handle_cli(args: &[String]) -> bool {
-    match args.get(1).map(|s| s.as_str()) {
+    match args.get(1).map(std::string::String::as_str) {
         Some("repos") => handle_repos_subcommand(args),
         Some("mcp") => handle_mcp_subcommand(args),
         Some("config") => handle_config_subcommand(args),
@@ -63,7 +63,7 @@ fn handle_seed_dashboard_subcommand(args: &[String]) {
 }
 
 fn handle_repos_subcommand(args: &[String]) {
-    match args.get(2).map(|s| s.as_str()) {
+    match args.get(2).map(std::string::String::as_str) {
         Some("add") => {
             let Some(path) = args.get(3) else {
                 eprintln!("Usage: workbridge repos add <path>");
@@ -127,7 +127,7 @@ fn handle_repos_subcommand(args: &[String]) {
 }
 
 fn handle_mcp_subcommand(args: &[String]) {
-    match args.get(2).map(|s| s.as_str()) {
+    match args.get(2).map(std::string::String::as_str) {
         Some("add") => handle_mcp_add(args),
         Some("remove") => handle_mcp_remove(args),
         Some("list") => handle_mcp_list(args),
@@ -334,13 +334,13 @@ fn handle_mcp_import(args: &[String]) {
             command: server_val
                 .get("command")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+                .map(std::string::ToString::to_string),
             args: server_val
                 .get("args")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -356,7 +356,7 @@ fn handle_mcp_import(args: &[String]) {
             url: server_val
                 .get("url")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+                .map(std::string::ToString::to_string),
         };
         entries.push(entry);
     }
@@ -370,7 +370,7 @@ fn handle_mcp_import(args: &[String]) {
 }
 
 fn handle_config_subcommand(args: &[String]) {
-    match args.get(2).map(|s| s.as_str()) {
+    match args.get(2).map(std::string::String::as_str) {
         Some("set") => handle_config_set(args),
         None => handle_config_show(),
         Some(unknown) => {
@@ -637,10 +637,7 @@ fn main() -> Result<(), AppError> {
     if let Err(e) = regex::Regex::new(&app.config.defaults.branch_issue_pattern) {
         let bad = app.config.defaults.branch_issue_pattern.clone();
         app.config.defaults.branch_issue_pattern = String::new();
-        let msg = format!(
-            "Invalid branch_issue_pattern '{}': {} (issue extraction disabled)",
-            bad, e,
-        );
+        let msg = format!("Invalid branch_issue_pattern '{bad}': {e} (issue extraction disabled)");
         // Only overwrite if no higher-priority error is already shown.
         if app.status_message.is_none() {
             app.status_message = Some(msg);
@@ -663,7 +660,7 @@ fn main() -> Result<(), AppError> {
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&signal_received))?;
 
     let mut global = Global {
-        ctx: Default::default(),
+        ctx: rat_salsa::SalsaAppContext::default(),
         theme: theme::Theme::default_theme(),
         signal_received,
         worktree_service,
@@ -714,7 +711,7 @@ mod tests {
     use super::*;
 
     fn argv(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| s.to_string()).collect()
+        args.iter().map(std::string::ToString::to_string).collect()
     }
 
     /// Pins the round-trip: `workbridge config set global-assistant-

@@ -6,19 +6,21 @@ use std::{fmt, fs};
 use serde::{Deserialize, Serialize};
 
 use crate::work_item::{
-    BackendType, ReviewRequestedPr, UnlinkedPr, WorkItemId, WorkItemKind, WorkItemStatus,
-    repo_slug_from_path,
+    ReviewRequestedPr, UnlinkedPr, WorkItemId, WorkItemKind, WorkItemStatus, repo_slug_from_path,
 };
 
 /// Errors from backend operations.
+///
+/// A `Parse` variant for parseable-but-invalid records was removed
+/// when Phase 3 of the hygiene campaign eliminated dead
+/// `#[allow(dead_code)]` attributes - `LocalFileBackend` skips corrupt
+/// files rather than surfacing them, and no other backend exists yet.
+/// Re-add the variant (and the matching `Display` arm) in the same
+/// commit as the first backend that produces it.
 #[derive(Clone, Debug)]
 pub enum BackendError {
     /// I/O error reading or writing backend storage.
     Io(String),
-    /// Failed to parse a backend record.
-    /// Not constructed by LocalFileBackend; reserved for future backends.
-    #[allow(dead_code)]
-    Parse { path: String, reason: String },
     /// The requested work item was not found.
     NotFound(WorkItemId),
     /// Failed to serialize a record for storage.
@@ -32,20 +34,17 @@ pub enum BackendError {
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BackendError::Io(msg) => write!(f, "backend I/O error: {msg}"),
-            BackendError::Parse { path, reason } => {
-                write!(f, "backend parse error in {path}: {reason}")
-            }
-            BackendError::Serialize(msg) => {
+            Self::Io(msg) => write!(f, "backend I/O error: {msg}"),
+            Self::Serialize(msg) => {
                 write!(f, "backend serialization error: {msg}")
             }
-            BackendError::NotFound(id) => {
+            Self::NotFound(id) => {
                 write!(f, "work item not found: {id:?}")
             }
-            BackendError::Validation(msg) => {
+            Self::Validation(msg) => {
                 write!(f, "validation error: {msg}")
             }
-            BackendError::UnsupportedId(id) => {
+            Self::UnsupportedId(id) => {
                 write!(f, "work item {id:?} is not managed by this backend")
             }
         }
@@ -81,7 +80,7 @@ pub struct WorkItemRecord {
     pub kind: WorkItemKind,
     /// Backend-provided, human-readable stable identifier for the work
     /// item (e.g. `"workbridge-42"`). Distinct from `id`, which is the
-    /// internal key. LocalFileBackend generates IDs as `<repo-slug>-<N>`
+    /// internal key. `LocalFileBackend` generates IDs as `<repo-slug>-<N>`
     /// at create time, with N persisted in `id-counters.json` so
     /// numbers are never reused - deletion leaves permanent gaps. This
     /// is a post-v1 addition: records created before this feature
@@ -118,7 +117,7 @@ fn placeholder_work_item_id() -> WorkItemId {
 pub struct ActivityEntry {
     /// Timestamp in ISO 8601 format (or epoch seconds with Z suffix).
     pub timestamp: String,
-    /// Type of event (e.g., "stage_change", "note", "review_gate").
+    /// Type of event (e.g., "`stage_change`", "note", "`review_gate`").
     pub event_type: String,
     /// Arbitrary JSON payload for the event.
     pub payload: serde_json::Value,
@@ -163,7 +162,7 @@ pub struct ListResult {
 
 /// Request to create a new work item. Must have at least one repo
 /// association (Invariant 1: work does not happen outside of repos).
-/// Backends must return BackendError::Validation if repo_associations
+/// Backends must return `BackendError::Validation` if `repo_associations`
 /// is empty.
 #[derive(Clone, Debug)]
 pub struct CreateWorkItem {
@@ -178,12 +177,12 @@ pub struct CreateWorkItem {
 /// persisting work item records. All derived metadata (PR status, CI
 /// checks, git state) is handled by the assembly layer, not the backend.
 ///
-/// v1 uses LocalFileBackend. Future backends include GithubIssueBackend
-/// and GithubProjectBackend.
+/// v1 uses `LocalFileBackend`. Future backends include `GithubIssueBackend`
+/// and `GithubProjectBackend`.
 pub trait WorkItemBackend: Send + Sync {
     /// List all work item records from this backend.
     ///
-    /// Returns a ListResult containing valid records and any corrupt
+    /// Returns a `ListResult` containing valid records and any corrupt
     /// entries that could not be parsed. Callers should surface corrupt
     /// entries to the user rather than silently ignoring them.
     fn list(&self) -> Result<ListResult, BackendError>;
@@ -192,7 +191,7 @@ pub trait WorkItemBackend: Send + Sync {
     fn read(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError>;
 
     /// Create a new work item and return the created record.
-    /// Must return BackendError::Validation if request.repo_associations
+    /// Must return `BackendError::Validation` if `request.repo_associations`
     /// is empty (Invariant 1: at least one repo required).
     fn create(&self, request: CreateWorkItem) -> Result<WorkItemRecord, BackendError>;
 
@@ -202,7 +201,7 @@ pub trait WorkItemBackend: Send + Sync {
     /// log warnings but continue with the delete.
     ///
     /// Default implementation is a no-op. Override in future backends
-    /// (GithubIssueBackend, GithubProjectBackend) as needed.
+    /// (`GithubIssueBackend`, `GithubProjectBackend`) as needed.
     fn pre_delete_cleanup(&self, _id: &WorkItemId) -> Result<(), BackendError> {
         Ok(())
     }
@@ -286,7 +285,7 @@ pub trait WorkItemBackend: Send + Sync {
     /// Update the title of a work item.
     ///
     /// Default implementation returns an unsupported error. Override in
-    /// backends that support title mutation (LocalFileBackend).
+    /// backends that support title mutation (`LocalFileBackend`).
     fn update_title(&self, id: &WorkItemId, _title: &str) -> Result<(), BackendError> {
         Err(BackendError::UnsupportedId(id.clone()))
     }
@@ -311,7 +310,7 @@ pub trait WorkItemBackend: Send + Sync {
     /// Read the implementation plan for a work item.
     fn read_plan(&self, id: &WorkItemId) -> Result<Option<String>, BackendError>;
 
-    /// Set or clear the done_at timestamp for a work item.
+    /// Set or clear the `done_at` timestamp for a work item.
     /// Called when a work item enters or leaves the Done state.
     fn set_done_at(&self, id: &WorkItemId, done_at: Option<u64>) -> Result<(), BackendError>;
 
@@ -329,12 +328,6 @@ pub trait WorkItemBackend: Send + Sync {
     ) -> Result<(), BackendError> {
         Ok(())
     }
-
-    /// Which backend type this implementation represents.
-    /// Not called in v1 (assembly derives it from WorkItemId); kept for
-    /// multi-backend scenarios where the caller doesn't have the id.
-    #[allow(dead_code)]
-    fn backend_type(&self) -> BackendType;
 }
 
 /// Local filesystem backend that stores each work item as a JSON file.
@@ -354,7 +347,7 @@ pub struct LocalFileBackend {
 }
 
 impl LocalFileBackend {
-    /// Create a new LocalFileBackend using the platform-specific data directory.
+    /// Create a new `LocalFileBackend` using the platform-specific data directory.
     ///
     /// macOS: ~/Library/Application Support/workbridge/work-items/
     /// Linux: ~/.local/share/workbridge/work-items/
@@ -376,7 +369,7 @@ impl LocalFileBackend {
         })
     }
 
-    /// Create a LocalFileBackend with a custom directory (for tests).
+    /// Create a `LocalFileBackend` with a custom directory (for tests).
     #[cfg(test)]
     pub fn with_dir(dir: PathBuf) -> Result<Self, BackendError> {
         fs::create_dir_all(&dir).map_err(|e| {
@@ -462,7 +455,7 @@ impl LocalFileBackend {
         let _guard = self
             .counter_lock
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut counters = self.load_counters();
         let next = counters.get(slug).copied().unwrap_or(0) + 1;
         counters.insert(slug.to_string(), next);
@@ -603,7 +596,7 @@ impl LocalFileBackend {
     /// Read-modify-write helper for a work item record.
     /// Reads the record from disk, applies the mutation, serializes, and
     /// writes back atomically. Deduplicates the boilerplate shared by
-    /// update_status and update_plan.
+    /// `update_status` and `update_plan`.
     fn modify_record(
         &self,
         id: &WorkItemId,
@@ -629,12 +622,11 @@ impl LocalFileBackend {
 /// directory and then renaming. On POSIX, rename within the same filesystem
 /// is atomic, so a crash mid-write leaves the original file intact.
 fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp_path = parent.join(format!(
         ".{}.tmp",
         path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "workitem".into())
+            .map_or_else(|| "workitem".into(), |n| n.to_string_lossy().into_owned())
     ));
     fs::write(&tmp_path, data)?;
     fs::rename(&tmp_path, path)?;
@@ -705,7 +697,6 @@ impl WorkItemBackend for LocalFileBackend {
                         path: path.clone(),
                         reason: format!("corrupt JSON: {e}"),
                     });
-                    continue;
                 }
             }
         }
@@ -772,8 +763,7 @@ impl WorkItemBackend for LocalFileBackend {
         // historical metrics lose that one entry.
         let secs = crate::side_effects::clock::system_now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let created_entry = ActivityEntry {
             timestamp: format!("{secs}Z"),
             event_type: "created".to_string(),
@@ -846,7 +836,7 @@ impl WorkItemBackend for LocalFileBackend {
         let branch = branch.to_string();
         let repo_path = repo_path.to_path_buf();
         self.modify_record(id, |record| {
-            for assoc in record.repo_associations.iter_mut() {
+            for assoc in &mut record.repo_associations {
                 if assoc.repo_path == repo_path {
                     assoc.branch = Some(branch.clone());
                 }
@@ -888,12 +878,13 @@ impl WorkItemBackend for LocalFileBackend {
     }
 
     fn append_activity(&self, id: &WorkItemId, entry: &ActivityEntry) -> Result<(), BackendError> {
+        use std::io::Write;
+
         let activity_path = self.activity_path(id)?;
         let mut line =
             serde_json::to_string(entry).map_err(|e| BackendError::Serialize(format!("{e}")))?;
         line.push('\n');
 
-        use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -926,12 +917,13 @@ impl WorkItemBackend for LocalFileBackend {
         id: &WorkItemId,
         entry: &ActivityEntry,
     ) -> Result<bool, BackendError> {
+        use std::io::Write;
+
         let activity_path = self.activity_path(id)?;
         let mut line =
             serde_json::to_string(entry).map_err(|e| BackendError::Serialize(format!("{e}")))?;
         line.push('\n');
 
-        use std::io::Write;
         let mut file = match std::fs::OpenOptions::new()
             .create(false)
             .append(true)
@@ -995,10 +987,6 @@ impl WorkItemBackend for LocalFileBackend {
             }
         })
     }
-
-    fn backend_type(&self) -> BackendType {
-        BackendType::LocalFile
-    }
 }
 
 #[cfg(test)]
@@ -1022,7 +1010,7 @@ mod tests {
     #[test]
     fn create_and_list_roundtrip() {
         let (_tmp, dir) = temp_dir("roundtrip");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let record = backend
             .create(CreateWorkItem {
@@ -1061,7 +1049,7 @@ mod tests {
     #[test]
     fn create_validates_non_empty_repos() {
         let (_tmp, dir) = temp_dir("validate-repos");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let result = backend.create(CreateWorkItem {
             title: "No repos".into(),
@@ -1087,7 +1075,7 @@ mod tests {
     #[test]
     fn delete_removes_file() {
         let (_tmp, dir) = temp_dir("delete");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let record = backend
             .create(CreateWorkItem {
@@ -1299,7 +1287,7 @@ mod tests {
     #[test]
     fn import_creates_from_pr() {
         let (_tmp, dir) = temp_dir("import");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let unlinked = UnlinkedPr {
             repo_path: PathBuf::from("/my/repo"),
@@ -1379,7 +1367,7 @@ mod tests {
     #[test]
     fn list_empty_dir() {
         let (_tmp, dir) = temp_dir("empty");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let result = backend.list().unwrap();
         assert!(result.records.is_empty());
@@ -1389,7 +1377,7 @@ mod tests {
     #[test]
     fn update_status_persists() {
         let (_tmp, dir) = temp_dir("update-status");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let record = backend
             .create(CreateWorkItem {
@@ -1443,7 +1431,7 @@ mod tests {
     #[test]
     fn update_title_persists() {
         let (_tmp, dir) = temp_dir("update-title");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let record = backend
             .create(CreateWorkItem {
@@ -1485,7 +1473,7 @@ mod tests {
     #[test]
     fn update_branch_persists() {
         let (_tmp, dir) = temp_dir("update-branch");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let record = backend
             .create(CreateWorkItem {
@@ -1534,7 +1522,7 @@ mod tests {
     #[test]
     fn update_branch_only_touches_matching_repo() {
         let (_tmp, dir) = temp_dir("update-branch-scoped");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let record = backend
             .create(CreateWorkItem {
@@ -1604,7 +1592,7 @@ mod tests {
     #[test]
     fn activity_log_append_and_read_roundtrip() {
         let (_tmp, dir) = temp_dir("activity-roundtrip");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let record = backend
             .create(CreateWorkItem {
@@ -1659,7 +1647,7 @@ mod tests {
         // `created_per_day` and in the current-backlog trailing edge
         // before any subsequent stage_change happens.
         let (_tmp, dir) = temp_dir("activity-seeded-on-create");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let record = backend
             .create(CreateWorkItem {
@@ -1700,7 +1688,7 @@ mod tests {
     #[test]
     fn plan_storage_roundtrip() {
         let (_tmp, dir) = temp_dir("plan-roundtrip");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let record = backend
             .create(CreateWorkItem {
@@ -1746,7 +1734,7 @@ mod tests {
     #[test]
     fn activity_path_for_returns_path() {
         let (_tmp, dir) = temp_dir("activity-path");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let record = backend
             .create(CreateWorkItem {
@@ -1788,13 +1776,13 @@ mod tests {
     fn serde_done_at_roundtrip() {
         let json = r#"{"id":{"LocalFile":"/tmp/test.json"},"title":"Test","status":"Done","repo_associations":[],"done_at":1712345678}"#;
         let record: WorkItemRecord = serde_json::from_str(json).unwrap();
-        assert_eq!(record.done_at, Some(1712345678));
+        assert_eq!(record.done_at, Some(1_712_345_678));
     }
 
     #[test]
     fn set_done_at_roundtrip() {
         let (_tmp, dir) = temp_dir("set-done-at");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let record = backend
             .create(CreateWorkItem {
@@ -1815,9 +1803,9 @@ mod tests {
         assert_eq!(result.records[0].done_at, None);
 
         // Set done_at.
-        backend.set_done_at(&record.id, Some(1000000)).unwrap();
+        backend.set_done_at(&record.id, Some(1_000_000)).unwrap();
         let result = backend.list().unwrap();
-        assert_eq!(result.records[0].done_at, Some(1000000));
+        assert_eq!(result.records[0].done_at, Some(1_000_000));
 
         // Clear done_at.
         backend.set_done_at(&record.id, None).unwrap();
@@ -1828,7 +1816,7 @@ mod tests {
     #[test]
     fn save_pr_identity_roundtrip() {
         let (_tmp, dir) = temp_dir("pr-identity");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let repo = PathBuf::from("/my/repo");
         let record = backend
@@ -1910,7 +1898,7 @@ mod tests {
     #[test]
     fn create_assigns_display_id() {
         let (_tmp, dir) = temp_dir("display-id-first");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let record = backend
             .create(make_request("/tmp/foo/workbridge", "first"))
@@ -1926,7 +1914,7 @@ mod tests {
     #[test]
     fn display_id_counts_per_repo() {
         let (_tmp, dir) = temp_dir("display-id-per-repo");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         // Three items in `foo`, interleaved with two in `bar`. The
         // per-slug counter must be independent: `foo` advances 1->2->3
@@ -1948,7 +1936,7 @@ mod tests {
     #[test]
     fn display_id_never_reuses_on_delete() {
         let (_tmp, dir) = temp_dir("display-id-no-reuse");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         let r1 = backend.create(make_request("/repos/foo", "one")).unwrap();
         let r2 = backend.create(make_request("/repos/foo", "two")).unwrap();
@@ -1983,7 +1971,7 @@ mod tests {
         // disk is the only shared state; if it is read on startup the
         // next ID must be foo-2, not foo-1.
         {
-            let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+            let backend = LocalFileBackend::with_dir(dir).unwrap();
             let r = backend.create(make_request("/repos/foo", "two")).unwrap();
             assert_eq!(
                 r.display_id.as_deref(),
@@ -2058,7 +2046,7 @@ mod tests {
         // the skip, every normal startup would surface a fake
         // "corrupt JSON" entry in the UI.
         let (_tmp, dir) = temp_dir("display-id-counter-skip");
-        let backend = LocalFileBackend::with_dir(dir.clone()).unwrap();
+        let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         backend.create(make_request("/repos/foo", "one")).unwrap();
 

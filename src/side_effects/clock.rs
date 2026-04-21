@@ -18,11 +18,13 @@ use std::time::{Duration, Instant, SystemTime};
 // `docs/TESTING.md` "Wall-clock in tests".
 
 #[cfg(not(test))]
+#[must_use]
 pub fn instant_now() -> Instant {
     Instant::now()
 }
 
 #[cfg(test)]
+#[must_use]
 pub fn instant_now() -> Instant {
     *MOCK_INSTANT_BASE + Duration::from_nanos(mock_offset_nanos())
 }
@@ -41,16 +43,19 @@ pub fn instant_now() -> Instant {
 /// soon as `mock_offset_nanos()` exceeds the real elapsed time since
 /// `MOCK_INSTANT_BASE` was initialized. That regression silently
 /// disables CI watchdogs that guard against livelocks.
+#[must_use]
 pub fn elapsed_since(start: Instant) -> Duration {
     instant_now().saturating_duration_since(start)
 }
 
 #[cfg(not(test))]
+#[must_use]
 pub fn system_now() -> SystemTime {
     SystemTime::now()
 }
 
 #[cfg(test)]
+#[must_use]
 pub fn system_now() -> SystemTime {
     UNIX_EPOCH
         + Duration::from_secs(MOCK_SYSTEM_BASE_SECS)
@@ -81,10 +86,7 @@ pub fn sleep(dur: Duration) {
     if calls > MOCK_SLEEP_SAFETY_CAP {
         let current = std::thread::current();
         let name = current.name().unwrap_or("<unnamed>");
-        panic!(
-            "mock clock safety cap hit on thread '{}' - polling loop likely livelocked",
-            name
-        );
+        panic!("mock clock safety cap hit on thread '{name}' - polling loop likely livelocked");
     }
     advance_mock_clock(dur);
     std::thread::yield_now();
@@ -128,7 +130,7 @@ thread_local! {
 
 #[cfg(test)]
 fn mock_offset_nanos() -> u64 {
-    MOCK_OFFSET_NANOS.with(|c| c.get())
+    MOCK_OFFSET_NANOS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -382,8 +384,7 @@ mod tests {
             main_elapsed,
             Duration::ZERO,
             "main-thread mock clock must be untouched by child-thread \
-             advances - saw {:?}, expected zero",
-            main_elapsed
+             advances - saw {main_elapsed:?}, expected zero"
         );
     }
 }

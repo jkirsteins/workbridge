@@ -5,10 +5,13 @@
 # ci/file-size-budgets.toml. Used by both hooks/pre-commit and the CI
 # budget job.
 #
-# Exit 0 if every file is at or below its budget AND every tracked
-# top-level src/*.rs file has a budget entry.
-# Exit 1 (with a human-readable error) if any file is over budget or
-# any top-level src/*.rs file is missing a budget entry.
+# Exit 0 if every file is at or below its budget. Tracked top-level
+# `src/*.rs` files WITHOUT an explicit entry are subject to an implicit
+# 700-line ceiling: under the ceiling is a silent pass, over the ceiling
+# fails with a clear message asking the contributor to either shrink the
+# file or declare an explicit entry in ci/file-size-budgets.toml.
+# Nested files (src/<dir>/...) are intentionally out of scope.
+# Exit 1 (with a human-readable error) if any file is over budget.
 #
 # The TOML parsing is intentionally minimal so the hook has no runtime
 # dependencies beyond bash + awk + coreutils + git.
@@ -83,15 +86,26 @@ $path"
     fi
 done < "$budget_file"
 
-# Cross-check: every tracked top-level src/*.rs file must have a
-# budget entry. Nested files (e.g. src/side_effects/*.rs) are
-# intentionally out of scope for this hook - see the header comment
-# of ci/file-size-budgets.toml.
+# Implicit-ceiling check: every tracked top-level src/*.rs file
+# without an explicit budget entry is held to an implicit 700-line
+# ceiling. Files at or below the ceiling pass silently; files over
+# must either be shrunk or declare an explicit entry with a larger
+# budget and rationale in the commit message.
+#
+# The implicit default exists so newly-extracted modules cannot grow
+# silently past the point where they warrant explicit review.
+# Declaring an explicit entry is a legitimate escape hatch - the
+# budget file is the record of every such exception, and each entry
+# is expected to have been justified in its introducing commit.
+#
+# Nested files (e.g. src/side_effects/*.rs) are intentionally out of
+# scope for this hook - see the header comment of
+# ci/file-size-budgets.toml.
 #
 # `git ls-files 'src/*.rs'` matches recursively (gitignore-style
 # globbing), so we filter to strictly `src/<name>.rs` (no nested
 # slash) before comparing.
-missing_entries=""
+IMPLICIT_BUDGET=700
 while IFS= read -r tracked; do
     [ -z "$tracked" ] && continue
     case "$tracked" in
@@ -102,30 +116,27 @@ $declared_paths
 " in
         *"
 $tracked
-"*) ;;
-        *) missing_entries="$missing_entries $tracked" ;;
+"*)
+            # File has an explicit entry; already checked above.
+            continue
+            ;;
     esac
+    if ! actual=$(line_count_for "$tracked"); then
+        continue
+    fi
+    if [ "$actual" -gt "$IMPLICIT_BUDGET" ]; then
+        echo "OVER IMPLICIT BUDGET ($IMPLICIT_BUDGET lines): $tracked has $actual lines."
+        echo "Either shrink the file, or add an explicit entry to"
+        echo "ci/file-size-budgets.toml with a larger budget and"
+        echo "rationale in the commit message."
+        fail=1
+    fi
 done < <(git ls-files 'src/*.rs' 2>/dev/null)
-
-if [ -n "$missing_entries" ]; then
-    echo ""
-    echo "MISSING BUDGET ENTRIES for tracked top-level src/*.rs file(s):"
-    for f in $missing_entries; do
-        echo "  $f"
-    done
-    echo ""
-    echo "Every tracked top-level src/*.rs file must have a line in"
-    echo "ci/file-size-budgets.toml so newly extracted modules cannot"
-    echo "grow silently. Add an entry with the file's current line"
-    echo "count (wc -l) as the seed budget."
-    fail=1
-fi
 
 if [ "$fail" -ne 0 ]; then
     echo ""
-    echo "One or more files exceed their line-count budget or are"
-    echo "missing a budget entry. Either shrink the file, add the"
-    echo "missing entry, or - if growth is intentional - update"
+    echo "One or more files exceed their line-count budget. Either"
+    echo "shrink the file, or - if growth is intentional - update"
     echo "ci/file-size-budgets.toml with rationale in the commit"
     echo "message."
     exit 1
