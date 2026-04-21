@@ -271,13 +271,6 @@ pub enum PrState {
     Merged,
 }
 
-/// Issue open/closed state.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum IssueState {
-    Open,
-    Closed,
-}
-
 /// Derived PR information attached to a repo association.
 #[derive(Clone, Debug)]
 pub struct PrInfo {
@@ -292,21 +285,33 @@ pub struct PrInfo {
 }
 
 /// Derived issue information attached to a repo association.
-/// Populated by assembly; fields read in tests. Title used for work item
-/// title derivation. Other fields shown in detail views when added.
+/// Populated by assembly. Title used for work item title derivation;
+/// labels surface in the context bar. An open/closed state field was
+/// removed when Phase 3 of the hygiene campaign eliminated dead
+/// `#[allow(dead_code)]` attributes - no renderer ever consumed it.
+/// Re-add when issue state display lands.
 #[derive(Clone, Debug)]
 pub struct IssueInfo {
     pub number: u64,
     pub title: String,
-    /// Shown in detail views when issue state display is added.
-    #[allow(dead_code)]
-    pub state: IssueState,
     pub labels: Vec<String>,
 }
 
 /// Errors that can occur on a work item. These are orthogonal to status
 /// (a Todo item can have errors). Each error is surfaced as a badge or
 /// detail in the UI.
+///
+/// Aspirational variants were removed when Phase 3 of the hygiene
+/// campaign eliminated dead `#[allow(dead_code)]` attributes:
+///
+/// - `DetachedHead` - assembly does not produce it; detached worktrees
+///   have no branch and therefore cannot match a work item.
+/// - `CorruptBackendRecord` - `LocalFileBackend` skips corrupt files
+///   rather than surfacing them as errors.
+/// - `WorktreeGone` - no assembly pass detects missing worktrees yet.
+///
+/// Re-add them in the same commit as the producer and renderer paths
+/// when that work lands.
 #[derive(Clone, Debug)]
 pub enum WorkItemError {
     MultiplePrsForBranch {
@@ -314,31 +319,9 @@ pub enum WorkItemError {
         branch: String,
         count: usize,
     },
-    /// Kept for display completeness but no longer produced by the assembly
-    /// layer. A detached worktree has no branch, so it cannot be matched to
-    /// a work item.
-    #[allow(dead_code)]
-    DetachedHead {
-        repo_path: PathBuf,
-        worktree_path: PathBuf,
-    },
     IssueNotFound {
         repo_path: PathBuf,
         issue_number: u64,
-    },
-    /// Constructed when backend.list() encounters a parseable but invalid
-    /// record. Not triggered in v1 (LocalFileBackend skips corrupt files).
-    #[allow(dead_code)]
-    CorruptBackendRecord {
-        backend: BackendType,
-        reason: String,
-    },
-    /// Constructed when a work item references a worktree path that no
-    /// longer exists on disk. Detection deferred to a future assembly pass.
-    #[allow(dead_code)]
-    WorktreeGone {
-        repo_path: PathBuf,
-        expected_path: PathBuf,
     },
 }
 

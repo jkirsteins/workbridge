@@ -13042,9 +13042,6 @@ impl WorkItemBackend for StubBackend {
     fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
         None
     }
-    fn backend_type(&self) -> crate::work_item::BackendType {
-        crate::work_item::BackendType::LocalFile
-    }
 }
 
 #[cfg(test)]
@@ -13305,9 +13302,6 @@ mod tests {
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
             }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
-            }
         }
 
         let backend = TestBackend {
@@ -13446,9 +13440,6 @@ mod tests {
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
-            }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
             }
         }
 
@@ -13877,9 +13868,6 @@ mod tests {
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
-            }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
             }
         }
 
@@ -14654,9 +14642,6 @@ mod tests {
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
             }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
-            }
         }
 
         let mock_ws = Arc::new(MockWorktreeService {
@@ -14934,9 +14919,6 @@ mod tests {
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
-            }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
             }
         }
 
@@ -15601,9 +15583,6 @@ mod tests {
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
             }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
-            }
         }
 
         // Use a custom worktree_dir to verify it is respected.
@@ -15763,9 +15742,6 @@ mod tests {
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
-            }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
             }
         }
 
@@ -16435,20 +16411,22 @@ mod tests {
     // pre-confirm merge modal. Never refuses; always advisory.
     // -------------------------------------------------------------------
 
-    /// Helper used by the hint tests: push a Review-stage item with a
-    /// single association whose `PrInfo` + `GitState` are fully
-    /// configurable. Mirrors `push_selected_review_item` but exposes
-    /// the state fields the hint reads.
-    #[allow(clippy::too_many_arguments)]
-    fn push_review_item_with_state(
-        app: &mut App,
-        wi_id: &WorkItemId,
+    /// Bundle of state fields consumed by `push_review_item_with_state`.
+    /// Consolidates the dirty / ahead / behind / checks / mergeable
+    /// knobs into a single struct so the helper signature stays short.
+    struct ReviewItemState {
         dirty: bool,
         ahead: u32,
         behind: u32,
         pr_checks: crate::work_item::CheckStatus,
         pr_mergeable: crate::work_item::MergeableState,
-    ) {
+    }
+
+    /// Helper used by the hint tests: push a Review-stage item with a
+    /// single association whose `PrInfo` + `GitState` are fully
+    /// configurable. Mirrors `push_selected_review_item` but exposes
+    /// the state fields the hint reads.
+    fn push_review_item_with_state(app: &mut App, wi_id: &WorkItemId, state: &ReviewItemState) {
         use crate::work_item::{GitState, PrInfo, PrState, ReviewDecision};
         let repo_path = PathBuf::from("/tmp/hint-tests-repo");
         let branch = "feature/hint-tests".to_string();
@@ -16471,15 +16449,15 @@ mod tests {
                     state: PrState::Open,
                     is_draft: false,
                     review_decision: ReviewDecision::Approved,
-                    checks: pr_checks,
-                    mergeable: pr_mergeable,
+                    checks: state.pr_checks.clone(),
+                    mergeable: state.pr_mergeable.clone(),
                     url: "https://example.com/pr/42".into(),
                 }),
                 issue: None,
                 git_state: Some(GitState {
-                    dirty,
-                    ahead,
-                    behind,
+                    dirty: state.dirty,
+                    ahead: state.ahead,
+                    behind: state.behind,
                 }),
                 stale_worktree_path: None,
             }],
@@ -16497,11 +16475,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            false,
-            0,
-            0,
-            CheckStatus::Passing,
-            MergeableState::Mergeable,
+            &ReviewItemState {
+                dirty: false,
+                ahead: 0,
+                behind: 0,
+                pr_checks: CheckStatus::Passing,
+                pr_mergeable: MergeableState::Mergeable,
+            },
         );
 
         assert_eq!(app.merge_confirm_hint(&wi_id), None);
@@ -16518,11 +16498,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            true,
-            0,
-            0,
-            CheckStatus::Passing,
-            MergeableState::Mergeable,
+            &ReviewItemState {
+                dirty: true,
+                ahead: 0,
+                behind: 0,
+                pr_checks: CheckStatus::Passing,
+                pr_mergeable: MergeableState::Mergeable,
+            },
         );
 
         assert_eq!(
@@ -16541,11 +16523,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            false,
-            3,
-            0,
-            CheckStatus::Passing,
-            MergeableState::Mergeable,
+            &ReviewItemState {
+                dirty: false,
+                ahead: 3,
+                behind: 0,
+                pr_checks: CheckStatus::Passing,
+                pr_mergeable: MergeableState::Mergeable,
+            },
         );
 
         assert_eq!(
@@ -16565,11 +16549,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            false,
-            0,
-            0,
-            CheckStatus::Passing,
-            MergeableState::Conflicting,
+            &ReviewItemState {
+                dirty: false,
+                ahead: 0,
+                behind: 0,
+                pr_checks: CheckStatus::Passing,
+                pr_mergeable: MergeableState::Conflicting,
+            },
         );
 
         assert_eq!(
@@ -16589,11 +16575,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            false,
-            0,
-            0,
-            CheckStatus::Failing,
-            MergeableState::Mergeable,
+            &ReviewItemState {
+                dirty: false,
+                ahead: 0,
+                behind: 0,
+                pr_checks: CheckStatus::Failing,
+                pr_mergeable: MergeableState::Mergeable,
+            },
         );
 
         assert_eq!(
@@ -16616,11 +16604,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            false,
-            0,
-            0,
-            CheckStatus::Pending,
-            MergeableState::Mergeable,
+            &ReviewItemState {
+                dirty: false,
+                ahead: 0,
+                behind: 0,
+                pr_checks: CheckStatus::Pending,
+                pr_mergeable: MergeableState::Mergeable,
+            },
         );
 
         assert_eq!(
@@ -16641,11 +16631,13 @@ mod tests {
         push_review_item_with_state(
             &mut app,
             &wi_id,
-            true,
-            0,
-            0,
-            CheckStatus::Pending,
-            MergeableState::Mergeable,
+            &ReviewItemState {
+                dirty: true,
+                ahead: 0,
+                behind: 0,
+                pr_checks: CheckStatus::Pending,
+                pr_mergeable: MergeableState::Mergeable,
+            },
         );
 
         assert_eq!(
@@ -17545,19 +17537,31 @@ mod tests {
     // Live remote PR precheck: conflict / CI failure / clean / error
     // -------------------------------------------------------------------
 
+    /// Bundle of knobs consumed by `install_live_pr_precheck_app`.
+    /// Groups the live-PR state, branch/repo identity, and cleanliness
+    /// cache seeds so the helper signature stays short.
+    struct LivePrPrecheckSpec<'a> {
+        live_pr_state: Option<Result<crate::github_client::LivePrState, GithubError>>,
+        branch: &'a str,
+        repo: &'a std::path::Path,
+        cache_dirty: Option<bool>,
+        cache_untracked: Option<bool>,
+        cache_unpushed: Option<u32>,
+    }
+
     /// Helper to build an `App` with both a clean-worktree stub and a
     /// configurable `MockGithubClient` driving the
     /// `fetch_live_merge_state` return. Used by the remote-precheck
     /// tests below.
-    #[allow(clippy::too_many_arguments)]
-    fn install_live_pr_precheck_app(
-        live_pr_state: Option<Result<crate::github_client::LivePrState, GithubError>>,
-        branch: &str,
-        repo: &std::path::Path,
-        cache_dirty: Option<bool>,
-        cache_untracked: Option<bool>,
-        cache_unpushed: Option<u32>,
-    ) -> (App, WorkItemId) {
+    fn install_live_pr_precheck_app(spec: LivePrPrecheckSpec<'_>) -> (App, WorkItemId) {
+        let LivePrPrecheckSpec {
+            live_pr_state,
+            branch,
+            repo,
+            cache_dirty,
+            cache_untracked,
+            cache_unpushed,
+        } = spec;
         use crate::config::InMemoryConfigProvider;
         use crate::github_client::MockGithubClient;
         use crate::worktree_service::{WorktreeError, WorktreeInfo};
@@ -17676,18 +17680,18 @@ mod tests {
 
         let repo = PathBuf::from("/tmp/exec-merge-pr-conflict");
         let branch = "feature/pr-conflict";
-        let (mut app, wi_id) = install_live_pr_precheck_app(
-            Some(Ok(LivePrState {
+        let (mut app, wi_id) = install_live_pr_precheck_app(LivePrPrecheckSpec {
+            live_pr_state: Some(Ok(LivePrState {
                 mergeable: MergeableState::Conflicting,
                 check_rollup: CheckStatus::Passing,
                 has_open_pr: true,
             })),
             branch,
-            &repo,
-            Some(false),
-            Some(false),
-            Some(0),
-        );
+            repo: &repo,
+            cache_dirty: Some(false),
+            cache_untracked: Some(false),
+            cache_unpushed: Some(0),
+        });
 
         app.execute_merge(&wi_id, "squash");
         assert!(app.is_merge_precheck_phase());
@@ -17729,18 +17733,18 @@ mod tests {
 
         let repo = PathBuf::from("/tmp/exec-merge-ci-fail");
         let branch = "feature/ci-fail";
-        let (mut app, wi_id) = install_live_pr_precheck_app(
-            Some(Ok(LivePrState {
+        let (mut app, wi_id) = install_live_pr_precheck_app(LivePrPrecheckSpec {
+            live_pr_state: Some(Ok(LivePrState {
                 mergeable: MergeableState::Mergeable,
                 check_rollup: CheckStatus::Failing,
                 has_open_pr: true,
             })),
             branch,
-            &repo,
-            Some(false),
-            Some(false),
-            Some(0),
-        );
+            repo: &repo,
+            cache_dirty: Some(false),
+            cache_untracked: Some(false),
+            cache_unpushed: Some(0),
+        });
 
         app.execute_merge(&wi_id, "squash");
 
@@ -17779,14 +17783,14 @@ mod tests {
 
         let repo = PathBuf::from("/tmp/exec-merge-no-pr");
         let branch = "feature/no-pr";
-        let (mut app, wi_id) = install_live_pr_precheck_app(
-            Some(Ok(LivePrState::no_pr())),
+        let (mut app, wi_id) = install_live_pr_precheck_app(LivePrPrecheckSpec {
+            live_pr_state: Some(Ok(LivePrState::no_pr())),
             branch,
-            &repo,
-            Some(false),
-            Some(false),
-            Some(0),
-        );
+            repo: &repo,
+            cache_dirty: Some(false),
+            cache_untracked: Some(false),
+            cache_unpushed: Some(0),
+        });
 
         app.execute_merge(&wi_id, "squash");
 
@@ -17832,16 +17836,16 @@ mod tests {
     fn execute_merge_through_live_precheck_surfaces_remote_error() {
         let repo = PathBuf::from("/tmp/exec-merge-remote-error");
         let branch = "feature/remote-error";
-        let (mut app, wi_id) = install_live_pr_precheck_app(
-            Some(Err(crate::github_client::GithubError::ApiError(
+        let (mut app, wi_id) = install_live_pr_precheck_app(LivePrPrecheckSpec {
+            live_pr_state: Some(Err(crate::github_client::GithubError::ApiError(
                 "simulated gh pr view failure".into(),
             ))),
             branch,
-            &repo,
-            Some(false),
-            Some(false),
-            Some(0),
-        );
+            repo: &repo,
+            cache_dirty: Some(false),
+            cache_untracked: Some(false),
+            cache_unpushed: Some(0),
+        });
 
         app.execute_merge(&wi_id, "squash");
 
@@ -20703,9 +20707,6 @@ mod tests {
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
                 None
             }
-            fn backend_type(&self) -> crate::work_item::BackendType {
-                crate::work_item::BackendType::LocalFile
-            }
         }
 
         let backend = TestBackend {
@@ -20889,9 +20890,6 @@ mod tests {
         }
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
-        }
-        fn backend_type(&self) -> crate::work_item::BackendType {
-            crate::work_item::BackendType::LocalFile
         }
     }
 
@@ -21385,9 +21383,6 @@ mod tests {
         }
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
-        }
-        fn backend_type(&self) -> crate::work_item::BackendType {
-            crate::work_item::BackendType::LocalFile
         }
     }
 
@@ -21909,9 +21904,6 @@ mod tests {
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
         }
-        fn backend_type(&self) -> crate::work_item::BackendType {
-            crate::work_item::BackendType::LocalFile
-        }
     }
 
     #[test]
@@ -22224,9 +22216,6 @@ mod tests {
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
         }
-        fn backend_type(&self) -> crate::work_item::BackendType {
-            crate::work_item::BackendType::LocalFile
-        }
     }
 
     #[test]
@@ -22417,9 +22406,6 @@ mod tests {
         }
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
-        }
-        fn backend_type(&self) -> crate::work_item::BackendType {
-            crate::work_item::BackendType::LocalFile
         }
     }
 
@@ -24650,9 +24636,6 @@ mod tests {
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<PathBuf> {
                 None
             }
-            fn backend_type(&self) -> BackendType {
-                BackendType::LocalFile
-            }
         }
 
         let cancelled_observer = Arc::new(AtomicBool::new(false));
@@ -24836,7 +24819,6 @@ mod tests {
     /// re-introduces the bug for any future backend".
     #[test]
     fn append_activity_existing_only_default_impl_returns_err() {
-        use crate::work_item::BackendType;
         use crate::work_item_backend::{
             ActivityEntry, BackendError, CreateWorkItem, ListResult, WorkItemBackend,
             WorkItemRecord,
@@ -24906,9 +24888,6 @@ mod tests {
             }
             fn activity_path_for(&self, _id: &WorkItemId) -> Option<PathBuf> {
                 None
-            }
-            fn backend_type(&self) -> BackendType {
-                BackendType::LocalFile
             }
         }
 
@@ -25070,9 +25049,6 @@ mod tests {
         }
         fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
             None
-        }
-        fn backend_type(&self) -> crate::work_item::BackendType {
-            crate::work_item::BackendType::LocalFile
         }
     }
 

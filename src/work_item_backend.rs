@@ -6,19 +6,21 @@ use std::{fmt, fs};
 use serde::{Deserialize, Serialize};
 
 use crate::work_item::{
-    BackendType, ReviewRequestedPr, UnlinkedPr, WorkItemId, WorkItemKind, WorkItemStatus,
-    repo_slug_from_path,
+    ReviewRequestedPr, UnlinkedPr, WorkItemId, WorkItemKind, WorkItemStatus, repo_slug_from_path,
 };
 
 /// Errors from backend operations.
+///
+/// A `Parse` variant for parseable-but-invalid records was removed
+/// when Phase 3 of the hygiene campaign eliminated dead
+/// `#[allow(dead_code)]` attributes - `LocalFileBackend` skips corrupt
+/// files rather than surfacing them, and no other backend exists yet.
+/// Re-add the variant (and the matching `Display` arm) in the same
+/// commit as the first backend that produces it.
 #[derive(Clone, Debug)]
 pub enum BackendError {
     /// I/O error reading or writing backend storage.
     Io(String),
-    /// Failed to parse a backend record.
-    /// Not constructed by LocalFileBackend; reserved for future backends.
-    #[allow(dead_code)]
-    Parse { path: String, reason: String },
     /// The requested work item was not found.
     NotFound(WorkItemId),
     /// Failed to serialize a record for storage.
@@ -33,9 +35,6 @@ impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BackendError::Io(msg) => write!(f, "backend I/O error: {msg}"),
-            BackendError::Parse { path, reason } => {
-                write!(f, "backend parse error in {path}: {reason}")
-            }
             BackendError::Serialize(msg) => {
                 write!(f, "backend serialization error: {msg}")
             }
@@ -329,12 +328,6 @@ pub trait WorkItemBackend: Send + Sync {
     ) -> Result<(), BackendError> {
         Ok(())
     }
-
-    /// Which backend type this implementation represents.
-    /// Not called in v1 (assembly derives it from WorkItemId); kept for
-    /// multi-backend scenarios where the caller doesn't have the id.
-    #[allow(dead_code)]
-    fn backend_type(&self) -> BackendType;
 }
 
 /// Local filesystem backend that stores each work item as a JSON file.
@@ -994,10 +987,6 @@ impl WorkItemBackend for LocalFileBackend {
                 }
             }
         })
-    }
-
-    fn backend_type(&self) -> BackendType {
-        BackendType::LocalFile
     }
 }
 

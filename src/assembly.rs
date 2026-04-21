@@ -5,7 +5,7 @@ use regex::Regex;
 
 use crate::github_client::{GithubIssue, GithubPr};
 use crate::work_item::{
-    CheckStatus, GitState, IssueInfo, IssueState, MergeableState, PrInfo, PrState, RepoAssociation,
+    CheckStatus, GitState, IssueInfo, MergeableState, PrInfo, PrState, RepoAssociation,
     RepoFetchResult, ReviewDecision, ReviewRequestedPr, UnlinkedPr, WorkItem, WorkItemError,
     WorkItemId, WorkItemKind, WorkItemStatus,
 };
@@ -65,16 +65,11 @@ fn convert_mergeable_state(raw: &str) -> MergeableState {
     }
 }
 
-/// Convert a raw GithubIssue into a display-ready IssueInfo.
+/// Convert a raw `GithubIssue` into a display-ready `IssueInfo`.
 fn convert_issue(issue: &GithubIssue) -> IssueInfo {
-    let state = match issue.state.to_uppercase().as_str() {
-        "CLOSED" => IssueState::Closed,
-        _ => IssueState::Open,
-    };
     IssueInfo {
         number: issue.number,
         title: issue.title.clone(),
-        state,
         labels: issue.labels.clone(),
     }
 }
@@ -574,7 +569,7 @@ mod tests {
     use super::*;
     use crate::github_client::{GithubError, GithubIssue, GithubPr};
     use crate::work_item::{
-        BackendType, CheckStatus, IssueState, MergeableState, PrState, ReviewDecision, WorkItemId,
+        BackendType, CheckStatus, MergeableState, PrState, ReviewDecision, WorkItemId,
         WorkItemKind, WorkItemStatus,
     };
     use crate::work_item_backend::{RepoAssociationRecord, WorkItemRecord};
@@ -756,7 +751,6 @@ mod tests {
         let issue_info = assoc.issue.as_ref().expect("should have issue info");
         assert_eq!(issue_info.number, 42);
         assert_eq!(issue_info.title, "Bug report");
-        assert_eq!(issue_info.state, IssueState::Open);
     }
 
     #[test]
@@ -1583,7 +1577,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_issue_states() {
+    fn convert_issue_preserves_number_title_and_labels() {
         let open_issue = GithubIssue {
             number: 1,
             title: "Open".to_string(),
@@ -1591,7 +1585,8 @@ mod tests {
             labels: vec!["bug".to_string()],
         };
         let info = convert_issue(&open_issue);
-        assert_eq!(info.state, IssueState::Open);
+        assert_eq!(info.number, 1);
+        assert_eq!(info.title, "Open");
         assert_eq!(info.labels, vec!["bug"]);
 
         let closed_issue = GithubIssue {
@@ -1601,7 +1596,8 @@ mod tests {
             labels: vec![],
         };
         let info = convert_issue(&closed_issue);
-        assert_eq!(info.state, IssueState::Closed);
+        assert_eq!(info.number, 2);
+        assert_eq!(info.title, "Closed");
     }
 
     #[test]
@@ -1697,7 +1693,8 @@ mod tests {
         let assoc = &items[0].repo_associations[0];
         assert_eq!(assoc.worktree_path, None);
         assert!(assoc.git_state.is_none());
-        // No WorktreeGone error in v1 - just None.
+        // Missing worktrees are represented as a cleared worktree
+        // path with no error variant attached; see WorkItemError.
         assert!(items[0].errors.is_empty());
     }
 

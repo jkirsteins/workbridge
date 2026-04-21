@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::{fmt, fs};
 
 use serde::{Deserialize, Serialize};
@@ -8,9 +7,8 @@ use serde::{Deserialize, Serialize};
 /// Abstracts config persistence so tests can use an in-memory store
 /// instead of writing to the real config file.
 pub trait ConfigProvider {
-    /// Load the persisted config. Used by FileConfigProvider at startup
-    /// and by InMemoryConfigProvider in tests.
-    #[allow(dead_code)]
+    /// Load the persisted config. Used by `FileConfigProvider` at
+    /// startup and by the test-only `InMemoryConfigProvider`.
     fn load(&self) -> Result<Config, ConfigError>;
     fn save(&self, config: &Config) -> Result<(), ConfigError>;
 }
@@ -34,41 +32,53 @@ impl ConfigProvider for FileConfigProvider {
     }
 }
 
-/// In-memory config provider for tests. Never touches disk.
-/// Constructed only in `#[cfg(test)]` code.
-#[allow(dead_code)]
-pub struct InMemoryConfigProvider {
-    data: Mutex<Option<String>>,
-}
+/// Test-only helpers. Gated behind `#[cfg(test)]` so the production
+/// build never sees these items, which keeps `dead_code` clean without
+/// needing source-level `#[allow]` attributes. Tests import
+/// `crate::config::InMemoryConfigProvider` via the `pub use` re-export
+/// below, so existing call sites do not need updating.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
 
-impl InMemoryConfigProvider {
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self {
-            data: Mutex::new(None),
-        }
+    use super::{Config, ConfigError, ConfigProvider};
+
+    /// In-memory config provider for tests. Never touches disk.
+    pub struct InMemoryConfigProvider {
+        data: Mutex<Option<String>>,
     }
-}
 
-impl ConfigProvider for InMemoryConfigProvider {
-    fn load(&self) -> Result<Config, ConfigError> {
-        let guard = self.data.lock().unwrap();
-        match &*guard {
-            Some(contents) => {
-                let cfg: Config = toml::from_str(contents).map_err(ConfigError::Parse)?;
-                Ok(cfg)
+    impl InMemoryConfigProvider {
+        pub fn new() -> Self {
+            Self {
+                data: Mutex::new(None),
             }
-            None => Ok(Config::default()),
         }
     }
 
-    fn save(&self, config: &Config) -> Result<(), ConfigError> {
-        let contents = toml::to_string_pretty(config).map_err(ConfigError::Serialize)?;
-        let mut guard = self.data.lock().unwrap();
-        *guard = Some(contents);
-        Ok(())
+    impl ConfigProvider for InMemoryConfigProvider {
+        fn load(&self) -> Result<Config, ConfigError> {
+            let guard = self.data.lock().unwrap();
+            match &*guard {
+                Some(contents) => {
+                    let cfg: Config = toml::from_str(contents).map_err(ConfigError::Parse)?;
+                    Ok(cfg)
+                }
+                None => Ok(Config::default()),
+            }
+        }
+
+        fn save(&self, config: &Config) -> Result<(), ConfigError> {
+            let contents = toml::to_string_pretty(config).map_err(ConfigError::Serialize)?;
+            let mut guard = self.data.lock().unwrap();
+            *guard = Some(contents);
+            Ok(())
+        }
     }
 }
+
+#[cfg(test)]
+pub use test_support::InMemoryConfigProvider;
 
 /// Get the user's home directory via the side-effects gate. Returns
 /// `None` under `cfg(test)` so tests cannot reach the real `$HOME`.

@@ -350,8 +350,7 @@ impl GitWorktreeService {
 
     /// Find the branch name for a worktree at the given path by looking
     /// through the list of all worktrees.
-    /// Called from remove_worktree; used in integration tests.
-    #[allow(dead_code)]
+    /// Called from `remove_worktree`; also used in integration tests.
     fn find_branch_for_worktree(
         repo_path: &Path,
         worktree_path: &Path,

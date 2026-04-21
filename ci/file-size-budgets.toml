@@ -28,7 +28,7 @@
 "src/app.rs"               = 26206
 "src/assembly.rs"          = 2319
 "src/click_targets.rs"     = 215
-"src/config.rs"            = 904
+"src/config.rs"            = 920
 "src/create_dialog.rs"     = 844
 "src/dashboard_seed.rs"    = 369
 "src/event.rs"             = 4850

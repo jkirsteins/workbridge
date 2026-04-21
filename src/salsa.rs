@@ -22,10 +22,14 @@ use crate::{event, fetcher, github_client, layout, ui, worktree_service};
 /// Custom event type for the application.
 ///
 /// Each variant wraps one of the event sources that rat-salsa's poll
-/// implementations produce. The From impls below satisfy the trait
-/// bounds that PollCrossterm, PollTimers, and PollRendered require.
+/// implementations produce. The `From` impls below satisfy the trait
+/// bounds that `PollCrossterm`, `PollTimers`, and `PollRendered` require.
+///
+/// An aspirational `Message(AppMessage)` variant was removed when
+/// Phase 3 of the hygiene campaign eliminated dead `#[allow(dead_code)]`
+/// attributes; re-add it (and its dispatcher arm) in the same commit
+/// as the first real producer when inter-component messaging lands.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum AppEvent {
     /// Terminal events (keyboard, mouse, resize) from crossterm.
     Crossterm(ct::event::Event),
@@ -33,21 +37,6 @@ pub enum AppEvent {
     Timer(TimeOut),
     /// Sent immediately after a frame render completes.
     Rendered,
-    /// Internal messages between components (future: dialog results).
-    #[allow(dead_code)]
-    Message(AppMessage),
-}
-
-/// Internal messages between components (for future use).
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum AppMessage {
-    CreateConfirmed {
-        title: String,
-        repos: Vec<std::path::PathBuf>,
-        branch: Option<String>,
-    },
-    CreateCancelled,
 }
 
 /// Application error type.
@@ -598,10 +587,6 @@ pub fn app_event(
             Ok(Control::Changed)
         }
         AppEvent::Rendered => Ok(Control::Continue),
-        AppEvent::Message(_msg) => {
-            // Future: handle inter-component messages (dialog results).
-            Ok(Control::Continue)
-        }
     }
 }
 

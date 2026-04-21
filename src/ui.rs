@@ -2580,38 +2580,12 @@ fn format_work_item_error(error: &WorkItemError) -> (String, Option<String>) {
             ),
             Some("Close duplicate PRs to resolve.".into()),
         ),
-        WorkItemError::DetachedHead {
-            repo_path,
-            worktree_path,
-        } => (
-            format!(
-                "Detached HEAD at {} ({})",
-                worktree_path.display(),
-                repo_path.display()
-            ),
-            Some("Check out a branch in this worktree.".into()),
-        ),
         WorkItemError::IssueNotFound {
             repo_path,
             issue_number,
         } => (
             format!("Issue #{issue_number} not found in {}", repo_path.display()),
             Some("The issue may have been deleted or the number is wrong.".into()),
-        ),
-        WorkItemError::CorruptBackendRecord { reason, backend } => (
-            format!("Corrupt {backend:?} record: {reason}"),
-            Some("Delete and re-create this work item.".into()),
-        ),
-        WorkItemError::WorktreeGone {
-            repo_path,
-            expected_path,
-        } => (
-            format!(
-                "Worktree missing: {} ({})",
-                expected_path.display(),
-                repo_path.display()
-            ),
-            Some("The worktree directory was removed from disk.".into()),
         ),
     }
 }
@@ -5888,7 +5862,6 @@ mod snapshot_tests {
         BackendType, CheckStatus, MergeableState, PrInfo, PrState, RepoAssociation, ReviewDecision,
         UnlinkedPr, WorkItem, WorkItemError, WorkItemId, WorkItemStatus,
     };
-    use crate::work_item_backend::{BackendError, CreateWorkItem, WorkItemBackend, WorkItemRecord};
 
     /// Helper: render the app into a TestBackend and return the buffer as a string.
     fn render(app: &mut App, width: u16, height: u16) -> String {
@@ -5913,71 +5886,6 @@ mod snapshot_tests {
             lines.pop();
         }
         lines.join("\n")
-    }
-
-    /// A mock backend that returns predefined records for testing the display.
-    struct MockBackend {
-        records: Vec<WorkItemRecord>,
-    }
-
-    impl WorkItemBackend for MockBackend {
-        fn read(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
-            self.records
-                .iter()
-                .find(|r| r.id == *id)
-                .cloned()
-                .ok_or_else(|| BackendError::NotFound(id.clone()))
-        }
-        fn list(&self) -> Result<crate::work_item_backend::ListResult, BackendError> {
-            Ok(crate::work_item_backend::ListResult {
-                records: self.records.clone(),
-                corrupt: Vec::new(),
-            })
-        }
-        fn create(&self, _req: CreateWorkItem) -> Result<WorkItemRecord, BackendError> {
-            Err(BackendError::Validation("not implemented".into()))
-        }
-        fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn update_status(
-            &self,
-            _id: &WorkItemId,
-            _status: WorkItemStatus,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn import(&self, _unlinked: &UnlinkedPr) -> Result<WorkItemRecord, BackendError> {
-            Err(BackendError::Validation("not implemented".into()))
-        }
-        fn import_review_request(
-            &self,
-            _rr: &crate::work_item::ReviewRequestedPr,
-        ) -> Result<WorkItemRecord, BackendError> {
-            Err(BackendError::Validation("not supported in test".into()))
-        }
-        fn append_activity(
-            &self,
-            _id: &WorkItemId,
-            _entry: &crate::work_item_backend::ActivityEntry,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
-            Ok(None)
-        }
-        fn set_done_at(&self, _id: &WorkItemId, _done_at: Option<u64>) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
-            None
-        }
-        fn backend_type(&self) -> BackendType {
-            BackendType::LocalFile
-        }
     }
 
     /// Create an App with predefined work items and unlinked PRs
@@ -6394,13 +6302,12 @@ mod snapshot_tests {
 
     #[test]
     fn work_item_with_context_bar() {
-        use crate::work_item::{IssueInfo, IssueState};
+        use crate::work_item::IssueInfo;
         let mut wi = make_work_item("ctx-1", "Fix resize bug", WorkItemStatus::Backlog, None, 1);
         // Add issue with labels to trigger the context bar.
         wi.repo_associations[0].issue = Some(IssueInfo {
             number: 42,
             title: "Fix resize bug".into(),
-            state: IssueState::Open,
             labels: vec!["bug".into(), "P1".into()],
         });
         let mut app = app_with_items(vec![wi], vec![]);
@@ -6425,12 +6332,11 @@ mod snapshot_tests {
 
     #[test]
     fn work_item_context_bar_with_status() {
-        use crate::work_item::{IssueInfo, IssueState};
+        use crate::work_item::IssueInfo;
         let mut wi = make_work_item("ctx-3", "Fix resize bug", WorkItemStatus::Backlog, None, 1);
         wi.repo_associations[0].issue = Some(IssueInfo {
             number: 42,
             title: "Fix resize bug".into(),
-            state: IssueState::Open,
             labels: vec!["bug".into()],
         });
         let mut app = app_with_items(vec![wi], vec![]);
