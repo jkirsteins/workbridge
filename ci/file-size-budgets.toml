@@ -37,7 +37,6 @@
 "src/create_dialog.rs"     = 844
 "src/dashboard_seed.rs"    = 380
 "src/event.rs"             = 4860
-"src/fetcher.rs"           = 719
 "src/github_client.rs"     = 1425
 "src/layout.rs"            = 209
 "src/main.rs"              = 810
