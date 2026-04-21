@@ -45,4 +45,3 @@
 "src/ui.rs"                = 7800
 "src/work_item.rs"         = 677
 "src/work_item_backend.rs" = 2210
-"src/worktree_service.rs"  = 1693
