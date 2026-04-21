@@ -1632,7 +1632,7 @@ pub struct App {
     /// three spawn profiles (work-item, review-gate, global) and write any
     /// backend-specific side-car files (`config.toml`, etc.).
     /// Every place that previously hard-coded `claude` flags now goes
-    /// through this trait object. See `src/agent_backend.rs` and
+    /// through this trait object. See `crate::agent_backend` and
     /// `docs/harness-contract.md`.
     pub agent_backend: Arc<dyn AgentBackend>,
     /// Per-work-item harness choice. Populated when the user presses
@@ -1660,7 +1660,7 @@ pub struct App {
     /// an agent session is spawned and handles MCP communication via a Unix
     /// socket. "Agent" is the harness-neutral name; the reference
     /// implementation today is `ClaudeCodeBackend` (see `docs/harness-
-    /// contract.md` and `src/agent_backend.rs`).
+    /// contract.md` and `crate::agent_backend`).
     pub mcp_servers: HashMap<WorkItemId, McpSocketServer>,
     /// Work item IDs where the agent has signaled it is actively working
     /// (via `workbridge_set_activity`). Cleared when the session dies.
@@ -18911,7 +18911,7 @@ mod tests {
     }
 
     // Argv-shape regression tests for the agent backend live in
-    // `src/agent_backend.rs::tests` (e.g.
+    // the per-adapter `tests` modules of `crate::agent_backend` (e.g.
     // `claude_interactive_argv_for_planning`,
     // `claude_interactive_argv_for_blocked_no_auto_start`,
     // `claude_review_gate_argv_shape`). They exercise

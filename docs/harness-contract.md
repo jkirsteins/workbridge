@@ -409,7 +409,7 @@ thread inside `App::spawn_global_session` (so the fork+exec runs
 off the UI thread). Headless mode is produced by the review gate
 worker thread, which runs the argv produced by
 `ClaudeCodeBackend::build_review_gate_command` in
-`src/agent_backend.rs` (yielding `claude --print --output-format
+the `agent_backend` module (`src/agent_backend/`) (yielding `claude --print --output-format
 json --json-schema ...`) via `std::process::Command::output()`. The
 backend is selected through the `Arc<dyn AgentBackend>` stored on
 `App::agent_backend`; the spawn sites call the trait methods and
@@ -453,7 +453,7 @@ works. No clause violation.
 ### C3 - Permissions
 
 **Claude (reference)**: `ClaudeCodeBackend::build_command` in
-`src/agent_backend.rs` pushes `--dangerously-skip-permissions` into
+the `agent_backend` module (`src/agent_backend/`) pushes `--dangerously-skip-permissions` into
 argv for every write-capable spawn; both work-item sessions
 (`App::finish_session_open`) and the global
 assistant (`App::spawn_global_session`) go
@@ -463,7 +463,7 @@ NOT pass the bypass because `claude --print` is non-interactive and
 never prompts. Interactive read-only sessions (`SpawnConfig::
 read_only = true`, no caller today) also skip the bypass flag; see
 the `claude_interactive_argv_read_only_skips_permission_flags` test
-in `src/agent_backend.rs`.
+in the `agent_backend` module (`src/agent_backend/`).
 
 **Codex (implemented)**: emits
 `--dangerously-bypass-approvals-and-sandbox` for all three spawn
@@ -537,7 +537,7 @@ CLI with `codex -c 'mcp_servers.workbridge.config="/tmp/fake.json"'
 mcp list`, which fails with "invalid transport in
 `mcp_servers.workbridge`".
 
-`CodexBackend` in `src/agent_backend.rs` therefore emits per-field
+`CodexBackend` in the `agent_backend` module (`src/agent_backend/`) therefore emits per-field
 overrides built from a structured `McpBridgeSpec` (command +
 args): `-c mcp_servers.workbridge.command="<exe>"` and `-c
 mcp_servers.workbridge.args=["--mcp-bridge","--socket","<sock>"]`.
@@ -563,7 +563,7 @@ live against the real CLI on 2026-04-16.
 ### C5 - Tool allowlist by spawn type
 
 **Claude (reference)**: `ClaudeCodeBackend::build_command` in
-`src/agent_backend.rs` passes `--allowedTools` with a comma-joined
+the `agent_backend` module (`src/agent_backend/`) passes `--allowedTools` with a comma-joined
 list from the `WORK_ITEM_ALLOWED_TOOLS` constant - the 15
 workbridge MCP tools shared between work-item and global-assistant
 profiles. Both spawn sites (`App::finish_session_open` via
@@ -596,7 +596,7 @@ builds the prompt by rendering a per-stage template
 `implementing_no_plan` / `blocked` / `review` /
 `review_with_findings`) from `src/prompts.rs`. The rendered string is
 threaded into `SpawnConfig::system_prompt`, and
-`ClaudeCodeBackend::build_command` in `src/agent_backend.rs` pushes
+`ClaudeCodeBackend::build_command` in the `agent_backend` module (`src/agent_backend/`) pushes
 `--system-prompt <string>` into argv. The review gate renders the
 `review_gate` template and passes it into
 `ReviewGateSpawnConfig::system_prompt`, which
@@ -623,7 +623,7 @@ and `ClaudeCodeBackend::build_command` appends it as the positional
 argument **before** `--mcp-config` so Claude Code does not mistake
 it for a config file path - the ordering is locked in by the
 `claude_interactive_argv_for_planning` test in
-`src/agent_backend.rs`. Blocked sessions and Review sessions
+the `agent_backend` module (`src/agent_backend/`). Blocked sessions and Review sessions
 without gate findings receive `auto_start_message: None` and the
 backend appends nothing.
 
@@ -636,7 +636,7 @@ as the `-p` / stdin payload in `codex exec`. No clause violation.
 **Claude (reference)**: Planning sessions get a second-layer
 reminder via `--settings`, installed by
 `ClaudeCodeBackend::planning_reminder_argv` in
-`src/agent_backend.rs`. The hook JSON lives in the
+the `agent_backend` module (`src/agent_backend/`). The hook JSON lives in the
 `ClaudeCodeBackend::PLANNING_REMINDER_JSON` constant in the same
 file (moved out of the inline string literal that used to sit in
 `build_claude_cmd`); the constant installs a `PostToolUse` hook on
@@ -664,7 +664,7 @@ locks the parser and renders its screen (`App::render_*` paths).
 Headless capture lives in the review gate worker - the review gate
 consumes stdout via `Command::output()` and hands the bytes to
 `ClaudeCodeBackend::parse_review_gate_stdout` in
-`src/agent_backend.rs`, which parses the top-level JSON envelope
+the `agent_backend` module (`src/agent_backend/`), which parses the top-level JSON envelope
 and reaches into `envelope["structured_output"]` for the fields.
 Moving the parsing into the backend lets a second harness (e.g.
 Codex `exec --json`) do its own event-stream extraction before
@@ -801,7 +801,7 @@ builder does not inject `"Codex"` into any UI-visible string
 `command_name() = "codex"` as argv[0] (a neutral CLI fact) and
 `display_name() = "Codex"` only via the trait method consumed by
 `agent_backend_display_name`. Pinned by
-`codex_display_name_returns_codex` in `src/agent_backend.rs::tests`
+`codex_display_name_returns_codex` in `crate::agent_backend::codex::tests`
 (trivial but load-bearing for C14 compliance).
 
 ## Reference Payloads (Claude)
@@ -824,12 +824,12 @@ claude
 ```
 
 Source: `ClaudeCodeBackend::build_command` in
-`src/agent_backend.rs`, called via `App::build_agent_cmd`
+the `agent_backend` module (`src/agent_backend/`), called via `App::build_agent_cmd`
 from `App::finish_session_open`. Cwd: the work
 item's worktree path. The positional prompt MUST precede
 `--mcp-config`; see the regression test
-`claude_interactive_argv_for_planning` in the `tests` module at
-the bottom of `src/agent_backend.rs`.
+`claude_interactive_argv_for_planning` in the `tests` module of
+`crate::agent_backend::claude_code`.
 
 ### RP2 - Headless review-gate argv
 
@@ -845,7 +845,7 @@ claude
 
 Source: argv built by
 `ClaudeCodeBackend::build_review_gate_command` in
-`src/agent_backend.rs` and handed to
+the `agent_backend` module (`src/agent_backend/`) and handed to
 `std::process::Command::new(agent_backend.command_name())` inside
 the review gate's `std::thread::spawn` worker closure.
 Cwd: inherited (unspecified). The review gate
@@ -898,7 +898,7 @@ on name collision. The socket path is produced by
 ```
 
 Source: `ClaudeCodeBackend::PLANNING_REMINDER_JSON` constant in
-`src/agent_backend.rs`, installed into argv by
+the `agent_backend` module (`src/agent_backend/`), installed into argv by
 `ClaudeCodeBackend::planning_reminder_argv` when the stage is
 `Planning`. Passed as the argument to `--settings` on Planning
 spawns only. The harness fires the command after every `TodoWrite`
@@ -922,7 +922,7 @@ The review gate parses the top-level JSON document emitted by
 ```
 
 Source: `ClaudeCodeBackend::parse_review_gate_stdout` in
-`src/agent_backend.rs`. The harness MUST produce an envelope whose
+the `agent_backend` module (`src/agent_backend/`). The harness MUST produce an envelope whose
 structured body conforms to the `--json-schema` payload in RP2;
 `parse_review_gate_stdout` uses `.as_bool()` and `.as_str()` with
 safe defaults, so absence of either field is interpreted as "not
@@ -934,7 +934,7 @@ before returning the same `ReviewGateVerdict` struct.
 ## Trait Implementation
 
 The provider-agnostic interface described by C1-C13 is implemented in
-`src/agent_backend.rs`. `ClaudeCodeBackend` is the reference adapter;
+the `agent_backend` module (`src/agent_backend/`). `ClaudeCodeBackend` is the reference adapter;
 a test-only `CodexBackend` stub in the same file proves the trait
 shape fits a second harness without editing any spawn site. The
 trait and config structs live in this one file so the entire
@@ -991,7 +991,7 @@ Arc<dyn AgentBackend>`:
 The checklist for provider-agnosticism is enforced by the review
 policy rule in `CLAUDE.md` ("Code that touches harness invocation...
 must update `docs/harness-contract.md`") and the shape stub test
-`codex_shape_compiles` in `src/agent_backend.rs::tests`, which
+`codex_shape_compiles` in `crate::agent_backend::codex::tests`, which
 forces the trait to stay harness-neutral by exercising a second
 implementation on every `cargo test` run.
 
@@ -1032,7 +1032,7 @@ All three sites go through `Session::spawn` in `src/session.rs` for
 the interactive path or `std::process::Command::output()` directly
 for the headless path; argv is built by
 `ClaudeCodeBackend::build_command` / `::build_review_gate_command` in
-`src/agent_backend.rs` via `self.agent_backend` - no spawn site
+the `agent_backend` module (`src/agent_backend/`) via `self.agent_backend` - no spawn site
 constructs a Claude-specific argv inline. `App::build_agent_cmd`
 is the thin wrapper the work-item and global
 spawn sites call. Global assistant teardown lives in
@@ -1075,7 +1075,7 @@ harness adapter is introduced, add a dated bullet here.
   table now reflects the new line numbers and the new Global cwd.
 - 2026-04-15: Trait implementation landed. The "Target Trait
   Sketch" section (illustrative `trait Harness` sketch) was
-  replaced with a pointer to `src/agent_backend.rs`, where
+  replaced with a pointer to the `agent_backend` module (`src/agent_backend/`), where
   `AgentBackend`, `ClaudeCodeBackend`, and a `#[cfg(test)]`
   `CodexBackend` now live. Every spawn site
   (`App::finish_session_open`, the review-gate thread inside
@@ -1216,7 +1216,7 @@ harness adapter is introduced, add a dated bullet here.
   first-run Ctrl+G modal. `AgentBackendKind::Codex` promoted out
   of `#[cfg(test)]` and `CodexBackend` is now a real adapter
   satisfying C1..C13 with these workarounds, all pinned by unit
-  tests in `src/agent_backend.rs::tests::codex_*`:
+  tests - the `codex_*` tests in `crate::agent_backend::codex::tests` and `crate::agent_backend::codex::extras_tests`:
   - C1: `codex` (interactive) / `codex exec --json` (headless).
   - C2: PTY sets cwd (same mechanism as Claude); `--cd` flag is
     available but not used.
@@ -1398,7 +1398,7 @@ These are the per-harness equivalents of RP1 / RP2 / RP2b for
 Codex. They are the argv that `CodexBackend::build_command` /
 `::build_review_gate_command` / `::build_headless_rw_command`
 produce for a typical Planning / review-gate / rebase-gate spawn.
-Pinned by the `codex_*` tests in `src/agent_backend.rs`.
+Pinned by the `codex_*` tests in the `agent_backend` module test suites.
 
 ### RP1c - Codex interactive work-item argv
 
@@ -1448,7 +1448,7 @@ named `workbridge` accidentally or maliciously) can clobber the
 workbridge bridge entry. Mirrors `crate::mcp::build_mcp_config`,
 which inserts the `workbridge` key into the JSON map last for the
 same reason. Pinned by `codex_extras_cannot_override_workbridge_primary`
-in `src/agent_backend.rs::tests`.
+in the `agent_backend` module test suites.
 
 Key-quoting (R3-F-2): each `<extra>` is rendered through
 `toml_quote_key` so server names containing characters outside
@@ -1550,7 +1550,7 @@ The dangerous flag parallels Claude's
 `--dangerously-skip-permissions` which already implies "no approval
 prompts and no sandbox" so Claude needs no separate flag.
 Pinned by `codex_headless_rw_argv_shape_and_mcp_pre_approval` in
-`src/agent_backend.rs`.
+the `agent_backend` module (`src/agent_backend/`).
 
 Each `mcp_servers.<extra>.*` pair is rendered for one entry of
 `SpawnConfig::extra_bridges` / `ReviewGateSpawnConfig::extra_bridges`

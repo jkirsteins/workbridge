@@ -93,14 +93,28 @@ echo "Git env check OK."
 
 echo "=== pre-commit: checking for bare agent binary spawns ==="
 # Every LLM CLI spawn must go through the AgentBackend trait in
-# src/agent_backend.rs. Hard-coding Command::new("claude") (or any
+# src/agent_backend/. Hard-coding Command::new("claude") (or any
 # future agent binary) elsewhere bypasses the trait and will not
 # work when a second backend is wired. Same enforcement pattern as
 # the Command::new("git") check above.
+#
+# The allow-list was widened from the single file
+# `src/agent_backend.rs` to any file under `src/agent_backend/` when
+# that module was decomposed into a tree (mod.rs, claude_code.rs,
+# codex.rs, codex_tests.rs, common.rs, opencode.rs). Each leaf adapter
+# owns its own binary-name literals inside its `command_name()` impl;
+# the module boundary - not a particular filename - is the real
+# trust boundary.
 bare_agent_files=""
 while IFS= read -r f; do
     [ -z "$f" ] && continue
-    # agent_backend.rs is the ONLY file allowed to mention the binary name.
+    # Any file inside the agent_backend module tree is allowed to
+    # mention the binary name. The legacy top-level `agent_backend.rs`
+    # path is kept in the predicate so the check still does the right
+    # thing on branches that pre-date the module split.
+    case "$f" in
+        src/agent_backend/*) continue ;;
+    esac
     if [ "$(basename "$f")" = "agent_backend.rs" ]; then
         continue
     fi
@@ -112,7 +126,7 @@ if [ -n "$bare_agent_files" ]; then
     echo "ERROR: These files spawn an agent binary directly:"
     echo "$bare_agent_files"
     echo "Use agent_backend.command_name() and a build_*_command() trait method instead."
-    echo "See src/agent_backend.rs and docs/harness-contract.md."
+    echo "See src/agent_backend/ and docs/harness-contract.md."
     exit 1
 fi
 echo "Agent spawn check OK."

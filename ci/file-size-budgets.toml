@@ -29,7 +29,6 @@
 # blocks, migrated static-JSON parses to the `json!` macro). Each
 # budget was bumped just enough to absorb the cleanup; none is
 # expected to grow further before the Phase 4 decomposition.
-"src/agent_backend.rs"     = 2390
 "src/app.rs"               = 26300
 "src/click_targets.rs"     = 215
 "src/dashboard_seed.rs"    = 380

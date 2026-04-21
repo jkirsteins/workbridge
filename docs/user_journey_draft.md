@@ -6,7 +6,7 @@ Status: Draft - captured from design interview
 > **Note (2026-04-15)**: This draft uses "Claude" as shorthand for the
 > running coding agent because that was the only adapter at the time of
 > writing. The actual wiring is now pluggable via the `AgentBackend`
-> trait in `src/agent_backend.rs`; the authoritative contract lives in
+> trait in `crate::agent_backend`; the authoritative contract lives in
 > `docs/harness-contract.md`. Read "Claude" in this draft as "the
 > configured agent backend" - today that's `ClaudeCodeBackend`, but a
 > second adapter (e.g. Codex) would inherit the same workflow.

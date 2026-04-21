@@ -431,7 +431,7 @@ There are two session types:
   Claude Code (reference) and Codex. See `docs/harness-contract.md` for
   the full contract
   (clauses C1..C13, reference payloads RP1..RP5) and
-  `src/agent_backend.rs` for the reference implementation.
+  `crate::agent_backend::claude_code::ClaudeCodeBackend` for the reference implementation.
 - **Terminal session** - a shell (`$SHELL`, falling back to `/bin/sh`) launched
   in the worktree directory. Spawned lazily when the user switches to the
   Terminal tab in the right panel. Available whenever the work item has a
