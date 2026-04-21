@@ -1,0 +1,9 @@
+# .git-blame-ignore-revs
+#
+# Commit hashes listed here are ignored by `git blame` when the user
+# passes `--ignore-revs-file=.git-blame-ignore-revs` or configures
+# `git config blame.ignoreRevsFile .git-blame-ignore-revs` locally.
+#
+# Phase 2 of the hygiene campaign will append the mass-reformat
+# commit hash to this file in a single commit whose sole purpose is
+# that reformat. Do not add unrelated commits here.

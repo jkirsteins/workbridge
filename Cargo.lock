@@ -2357,7 +2357,6 @@ dependencies = [
  "insta",
  "libc",
  "rat-event",
- "rat-focus",
  "rat-salsa",
  "rat-widget",
  "ratatui-core",

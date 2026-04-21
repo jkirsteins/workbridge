@@ -27,6 +27,53 @@ pre-commit hook in `hooks/` catches anything the convenience hook missed,
 so contributors without Claude Code (or without `jq`) are not affected
 in CI or at commit time.
 
+### Optional local tools
+
+The pre-commit and pre-push hooks call a few third-party cargo tools.
+They are optional locally (the hooks skip with an install hint) but
+CI runs them as hard gates. To match CI locally:
+
+```sh
+cargo install cargo-audit cargo-deny cargo-machete typos-cli
+```
+
+#### Adding another tool that internally runs git
+
+If you add a new pre-commit or pre-push step that shells out to a
+cargo tool (or any tool) whose work involves running `git` as a
+subprocess - think `cargo-deny`'s advisory-db update, `cargo-audit`'s
+RustSec sync, or any future tool that maintains a local git-backed
+database - wrap that call in a subshell that unsets the inherited git
+env vars:
+
+```sh
+(
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+    cargo some-tool check
+)
+```
+
+Otherwise the child `git` calls inherit `GIT_DIR` / `GIT_INDEX_FILE`
+from the `git commit` (or `git push`) process that invoked the hook,
+and any `git fetch` / `git reset` the tool runs against its own
+database silently operates on THIS worktree instead. The symptoms
+range from empty commit trees (staged changes vanish) to
+`fatal: cannot lock ref 'HEAD'` at commit time, and they are hard
+to diagnose because the failure is in a subprocess, not in your
+code. The existing `cargo deny` call in `hooks/pre-commit` and the
+top-of-hook unset in `hooks/pre-push` are the reference patterns;
+copy whichever fits the surrounding structure.
+
+### File-size budgets
+
+`ci/file-size-budgets.toml` declares a maximum line count per source
+file. `hooks/budget-check.sh` enforces it (locally via pre-commit and
+in CI via the `budget` job). If you legitimately need a file to grow
+past its budget, bump the entry in the budget file as part of your
+PR and explain the growth in the commit message. The budget exists
+to prevent silent module bloat, not to ban growth - it wants the
+growth to be an explicit, reviewable decision.
+
 ## Error Handling
 
 Never silently ignore errors. Every error must be either:

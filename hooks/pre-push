@@ -23,3 +23,11 @@ echo "=== pre-push: running tests ==="
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
 cargo test --all-features
 echo "All tests passed."
+
+echo "=== pre-push: cargo-audit (skipped if tool missing) ==="
+if command -v cargo-audit >/dev/null 2>&1; then
+    cargo audit
+    echo "cargo-audit OK."
+else
+    echo "cargo-audit not installed; skipping. Install with: cargo install cargo-audit"
+fi

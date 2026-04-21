@@ -1,0 +1,9 @@
+# rustfmt.toml - Phase 1 baseline.
+#
+# Contains only settings that either match rustfmt's current default
+# output or formally pin the edition. Opinionated style settings
+# (imports_granularity, group_imports, etc.) are deferred to Phase 2
+# of the hygiene campaign, which runs the reformat in a dedicated PR
+# and records the hash in .git-blame-ignore-revs.
+edition = "2024"
+max_width = 100

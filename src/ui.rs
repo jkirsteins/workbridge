@@ -521,7 +521,7 @@ fn draw_first_run_global_harness_modal(
         .title(" Pick a harness for the global assistant ")
         .border_style(theme.style_text());
 
-    let mut lines: Vec<Line> = vec![
+    let mut lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled(
             "Press the highlighted key to choose a harness for Ctrl+G.",
             theme.style_text(),
@@ -664,7 +664,7 @@ fn draw_board_view(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         // minus 2 for highlight symbol space).
         let inner_width = col_area.width.saturating_sub(2).saturating_sub(2) as usize;
 
-        let list_items: Vec<ListItem> = items
+        let list_items: Vec<ListItem<'_>> = items
             .iter()
             .enumerate()
             .map(|(row_idx, &wi_idx)| format_board_item(app, wi_idx, inner_width, theme, row_idx))
@@ -1517,7 +1517,7 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // auto-scroll. The highlight is a styling concern, the viewport a
     // state concern, and the two must stay independent for the wheel
     // scroll to work without snapping back.
-    let items: Vec<ListItem> = app
+    let items: Vec<ListItem<'_>> = app
         .display_list
         .iter()
         .enumerate()
@@ -2030,7 +2030,7 @@ fn format_unlinked_item<'a>(
         )
     };
 
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line<'_>> = Vec::new();
 
     // Line 1: margin + "? " + first branch chunk + pad + right-aligned badge.
     lines.push(Line::from(vec![
@@ -3066,7 +3066,7 @@ fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         " "
     };
 
-    let title_line: Line = if has_worktree {
+    let title_line: Line<'_> = if has_worktree {
         let (cc_style, term_style) = match app.right_panel_tab {
             RightPanelTab::ClaudeCode => (
                 theme.style_view_mode_tab_active(),

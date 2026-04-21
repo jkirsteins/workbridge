@@ -1,0 +1,44 @@
+# typos.toml - Phase 1 baseline for the `typos` spellchecker.
+# https://github.com/crate-ci/typos
+
+[default]
+# Extend the default dictionary with domain terms the spellchecker
+# doesn't know about. Add, don't override.
+[default.extend-words]
+claude = "claude"
+codex = "codex"
+ratatui = "ratatui"
+workbridge = "workbridge"
+crossterm = "crossterm"
+vt100 = "vt100"
+arboard = "arboard"
+salsa = "salsa"
+# `unparseable` is a legitimate English spelling variant used throughout
+# docs and source (alongside `unparsable`). Treat both as valid.
+unparseable = "unparseable"
+Unparseable = "Unparseable"
+# `mis` appears as a hyphen-prefix in prose ("mis-click", "mis-batching",
+# "mis-split"). typos parses these as standalone words, so we allowlist it.
+mis = "mis"
+# `fiel` / `worl` are intentional truncations that appear in TUI fixtures
+# and in comments demonstrating text-clipping behavior (e.g.
+# "hello worl" illustrating a column-cut bug).
+fiel = "fiel"
+worl = "worl"
+# `Nd` is a ratatui keybind / axis-label token documented in docs/UI.md
+# (chart axis markers `-Nd` / `-Md` / `-Kd`).
+Nd = "Nd"
+
+[files]
+# Skip generated or third-party paths.
+extend-exclude = [
+    "target/**",
+    "Cargo.lock",
+    "*.patch",
+    "assets/**",
+    "workbridge-sidebar-playground.html",
+    # insta snapshot fixtures are generated TUI renders; truncated
+    # labels caused by column clipping ("Next fiel", "hello worl") are
+    # expected artifacts, not typos.
+    "src/snapshots/**",
+]

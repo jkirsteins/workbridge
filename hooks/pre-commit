@@ -196,3 +196,57 @@ if [ -n "$bare_sideeffect_files" ]; then
     exit 1
 fi
 echo "Side-effect gate check OK."
+
+echo "=== pre-commit: file-size budgets ==="
+./hooks/budget-check.sh
+
+echo "=== pre-commit: ratatui built-in preference (warn-only) ==="
+./hooks/ratatui-builtin-check.sh
+
+echo "=== pre-commit: typos (skipped if tool missing) ==="
+if command -v typos >/dev/null 2>&1; then
+    typos --config typos.toml
+    echo "typos OK."
+else
+    echo "typos not installed; skipping. Install with: cargo install typos-cli"
+fi
+
+echo "=== pre-commit: cargo-deny (skipped if tool missing) ==="
+if command -v cargo-deny >/dev/null 2>&1; then
+    # Clear git env vars for cargo-deny's subprocess call chain.
+    #
+    # cargo-deny's advisories check updates the rustsec advisory database
+    # clone under ~/.cargo/advisory-db/ via an internal `git fetch` +
+    # `git reset --mixed FETCH_HEAD` sequence. Those internal git calls
+    # inherit the parent's git env vars - and when the parent is a
+    # pre-commit hook invoked by `git commit`, git has already set
+    # GIT_DIR and GIT_INDEX_FILE to point at THIS worktree. With those
+    # inherited, cargo-deny's advisory-db `git reset --mixed FETCH_HEAD`
+    # silently resets OUR index to match HEAD's tree, clobbering the
+    # staged changes the user is about to commit. The resulting commit
+    # object ends up with an empty tree (matching HEAD's tree) or the
+    # final `git commit` HEAD-update fails with
+    # `cannot lock ref 'HEAD'` when the inherited GIT_DIR reset moves
+    # HEAD mid-pre-commit. Either way the commit is broken.
+    #
+    # The pre-push hook already uses the same `unset` dance around
+    # `cargo test` for the analogous reason (tests that shell out to
+    # git must not touch this repo); we apply the same pattern here.
+    # The subshell `(` scopes the unset so subsequent checks in this
+    # hook are unaffected.
+    (
+        unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+        cargo deny check advisories licenses bans sources
+    )
+    echo "cargo-deny OK."
+else
+    echo "cargo-deny not installed; skipping. Install with: cargo install cargo-deny"
+fi
+
+echo "=== pre-commit: cargo-machete (skipped if tool missing) ==="
+if command -v cargo-machete >/dev/null 2>&1; then
+    cargo machete
+    echo "cargo-machete OK."
+else
+    echo "cargo-machete not installed; skipping. Install with: cargo install cargo-machete"
+fi
