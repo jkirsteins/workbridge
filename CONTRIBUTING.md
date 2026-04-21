@@ -179,25 +179,22 @@ code. The existing `cargo deny` call in `hooks/pre-commit` and the
 top-of-hook unset in `hooks/pre-push` are the reference patterns;
 copy whichever fits the surrounding structure.
 
-### File-size budgets
+### File-size budget
 
-`ci/file-size-budgets.toml` declares a maximum line count per source
-file. `hooks/budget-check.sh` enforces it (locally via pre-commit and
-in CI via the `budget` job). If you legitimately need a file to grow
-past its budget, bump the entry in the budget file as part of your
-PR and explain the growth in the commit message. The budget exists
-to prevent silent module bloat, not to ban growth - it wants the
-growth to be an explicit, reviewable decision.
+`hooks/budget-check.sh` enforces a uniform 700-line ceiling on every
+tracked `src/**/*.rs` file (at any nesting depth). It runs locally
+via pre-commit and in CI via the `budget` job. The ceiling has no
+per-file exception mechanism by design - there is no config file to
+bump, no annotation to add, no flag to flip. The only legitimate
+response to an over-budget file is to decompose it into logical
+submodules.
 
-**Implicit 700-line ceiling for new top-level source files.** Tracked
-top-level `src/*.rs` files WITHOUT an explicit entry in the budget
-table are subject to an implicit 700-line ceiling. Under the ceiling
-passes silently; over the ceiling fails with a message asking the
-contributor to either shrink the file or add an explicit entry with
-a larger budget and rationale in the commit message. Nested files
-(e.g. `src/side_effects/*.rs`) are intentionally out of scope; the
-ceiling only enforces that newly-extracted top-level modules cannot
-grow silently past the point where they warrant explicit review.
+The uniform ceiling exists because prior experience with a per-file
+budget config showed the exception list grew without bound, the
+largest file kept growing past every "temporary" bump, and review
+quality degraded. A hard ceiling with no escape hatch forces the
+structural fix. See the `[ABSOLUTE]` rule in CLAUDE.md that bans
+reintroducing any size-exception mechanism.
 
 ## Error Handling
 

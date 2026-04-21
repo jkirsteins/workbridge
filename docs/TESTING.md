@@ -238,7 +238,7 @@ on pushes to `master` with the following parallel jobs:
 - `machete` - `cargo machete` (unused dependency scan)
 - `typos` - `crate-ci/typos` action with `typos.toml`
 - `msrv` - `cargo check --all-features` pinned to the rust-version in `Cargo.toml` (1.88)
-- `budget` - `./hooks/budget-check.sh` enforcing `ci/file-size-budgets.toml`
+- `budget` - `./hooks/budget-check.sh` enforcing the uniform 700-line ceiling on every tracked `src/**/*.rs` file
 - `ratatui-builtin` - `./hooks/ratatui-builtin-check.sh` (warn-only heuristic)
 
 The `test` job uses `--all-features` deliberately so the merge gate exercises
