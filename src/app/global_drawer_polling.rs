@@ -6,8 +6,8 @@
 //! dynamic MCP context passed to the global agent
 //! (`refresh_global_mcp_context`), and collects the
 //! `extra_branches_from_backend` surface used at fetcher startup.
-//! The global assistant is the third known harness spawn path in
-//! `docs/harness-contract.md`.
+//! The global assistant is one of the four known harness spawn
+//! paths in `docs/harness-contract.md`.
 
 use std::path::PathBuf;
 use std::sync::Arc;

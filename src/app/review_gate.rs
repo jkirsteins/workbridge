@@ -3,7 +3,7 @@
 //! Holds `spawn_review_gate`, which kicks off the background
 //! review-gate job for a work item entering Review. Paired with
 //! `poll_review_gate` in `gate_polling`. The review-gate is one
-//! of the three known harness spawn paths in
+//! of the four known harness spawn paths in
 //! `docs/harness-contract.md`.
 
 use std::path::PathBuf;

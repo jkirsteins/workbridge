@@ -3,8 +3,8 @@
 //! This module is the single place where a harness-specific CLI is named
 //! and flagged. Everything outside the module talks to `dyn AgentBackend`,
 //! so adding a new harness (e.g. Codex) is a matter of writing one more
-//! `impl AgentBackend for NewBackend` - the three spawn sites in
-//! `src/app.rs` do not change.
+//! `impl AgentBackend for NewBackend` - the four known spawn sites
+//! enumerated in `docs/harness-contract.md` do not change.
 //!
 //! The contract clauses this trait satisfies (C1..C13) are specified in
 //! `docs/harness-contract.md`. Read that doc before editing this module:
@@ -16,8 +16,8 @@
 //! under this module tree (`claude_code.rs`, `codex.rs`, `codex_tests.rs`,
 //! `opencode.rs`): `CodexBackend` compiles against the trait and its
 //! `codex_shape_compiles` test asserts that it builds argv vectors for the
-//! three profiles (work-item, review-gate, global) without workbridge
-//! editing any harness-specific state file.
+//! three argv profiles (interactive, review-gate, rebase-gate) without
+//! workbridge editing any harness-specific state file.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -341,8 +341,10 @@ pub struct ReviewGateVerdict {
 /// Pluggable LLM coding harness adapter.
 ///
 /// Each implementation owns exactly one CLI (`claude`, `codex`, ...) and
-/// knows how to build argv vectors for the three spawn profiles defined
-/// in `docs/harness-contract.md` under "Known Spawn Sites". Implementors
+/// knows how to build argv vectors for the three argv profiles
+/// (interactive, headless read-only review gate, headless read-write
+/// rebase gate) that back the four known spawn sites defined in
+/// `docs/harness-contract.md` under "Known Spawn Sites". Implementors
 /// MUST satisfy every clause C1..C13 from that doc; if a clause cannot
 /// be satisfied, the implementor must say so explicitly in the doc's
 /// Implementation Map and the review is required to flag the gap (see

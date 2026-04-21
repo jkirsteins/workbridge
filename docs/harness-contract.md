@@ -467,16 +467,17 @@ the `claude_interactive_argv_read_only_skips_permission_flags` test
 in the `agent_backend` module.
 
 **Codex (implemented)**: emits
-`--dangerously-bypass-approvals-and-sandbox` for all three spawn
-paths (interactive, review gate, rebase gate). Codex's built-in
-sandbox modes (`workspace-write`, `read-only`) are incompatible
-with workbridge's linked-worktree layout; full rationale and the
-per-harness permission table live in README "Per-harness
-permission model". The flag is symmetric across the three paths to
-satisfy the harness-contract review rule against asymmetric
-protections. The review gate is included explicitly even though
-it is conceptually read-only, so review skills that shell out
-(e.g. `cargo check`) are not silently denied.
+`--dangerously-bypass-approvals-and-sandbox` for all four spawn
+paths (work-item interactive, global assistant, review gate,
+rebase gate). Codex's built-in sandbox modes (`workspace-write`,
+`read-only`) are incompatible with workbridge's linked-worktree
+layout; full rationale and the per-harness permission table live
+in README "Per-harness permission model". The flag is symmetric
+across the four paths to satisfy the harness-contract review rule
+against asymmetric protections. The review gate is included
+explicitly even though it is conceptually read-only, so review
+skills that shell out (e.g. `cargo check`) are not silently
+denied.
 
 ### C4 - MCP injection
 
@@ -770,8 +771,8 @@ an empty list (no side-car writes). Specifically:
 - MCP bridge command -> `-c mcp_servers.workbridge.command="<exe>"`
 - MCP bridge args -> `-c mcp_servers.workbridge.args=[...]`
 - permissions -> `--dangerously-bypass-approvals-and-sandbox`
-  (all three spawn paths: interactive work-capable, review gate,
-  rebase gate)
+  (all four spawn paths: work-item interactive, global assistant,
+  review gate, rebase gate)
 
 No `CODEX_MCP_CONFIG`, `CODEX_CONFIG_FILE`, `CODEX_HOME`, or any
 other env var is touched. The only filesystem writes workbridge

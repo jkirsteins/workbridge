@@ -367,7 +367,7 @@ fn display_list_blocked_header_kind() {
 // `build_agent_cmd_blocked_no_auto_start` and
 // `build_agent_cmd_review_with_findings_uses_review_auto_start` in
 // this same module. Those tests go through the same code path the
-// three spawn sites use.
+// four spawn sites use.
 
 /// Review-gate findings are stored per work item and influence prompt key.
 #[test]

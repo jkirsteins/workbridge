@@ -2,7 +2,7 @@
 //!
 //! Holds `spawn_rebase_gate`, which kicks off the background
 //! rebase-gate job when the user presses the rebase-on-main key.
-//! The rebase-gate is one of the three known harness spawn paths
+//! The rebase-gate is one of the four known harness spawn paths
 //! in `docs/harness-contract.md`; the heavy compute phase lives
 //! in the sibling `rebase_gate_compute` module.
 

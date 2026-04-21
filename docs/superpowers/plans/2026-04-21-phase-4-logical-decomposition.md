@@ -74,7 +74,7 @@ The remaining subsystems follow the same Stage-2 extraction pattern and the same
 - `docs/UI.md`, `docs/work-items.md`, `CLAUDE.md` and similar converted.
 
 **Harness/CLI contract**
-- `docs/harness-contract.md` updated in the same PR if extractions touch the three known harness spawn sites.
+- `docs/harness-contract.md` updated in the same PR if extractions touch the four known harness spawn sites.
 - `docs/cli.md` updated if CLI dispatch changes.
 
 **Hygiene-campaign phase-reference scrub**

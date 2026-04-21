@@ -615,7 +615,7 @@ fn codex_headless_rw_argv_shape_and_mcp_pre_approval() {
 /// / global, headless review gate, headless rebase gate) MUST emit
 /// `--dangerously-bypass-approvals-and-sandbox`. The review gate is
 /// included explicitly even though it is conceptually read-only,
-/// both for symmetry across the three spawn sites and so review
+/// both for symmetry across the four spawn sites and so review
 /// skills that invoke shell commands (e.g. `cargo check`) are not
 /// silently denied. A future PR that re-introduces a sandbox flag
 /// in just one builder - or drops the dangerous flag from just one

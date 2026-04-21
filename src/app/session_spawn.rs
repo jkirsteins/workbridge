@@ -4,7 +4,7 @@
 //! the work item (via `harness_choice`), writes the MCP config
 //! side-car, starts the PTY, and registers the session in the
 //! `sessions` map. The single spawn site on this subsystem is
-//! one of the three known harness spawn paths enumerated in
+//! one of the four known harness spawn paths enumerated in
 //! `docs/harness-contract.md`.
 
 use std::path::PathBuf;

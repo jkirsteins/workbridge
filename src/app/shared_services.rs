@@ -61,11 +61,12 @@ pub struct SharedServices {
     /// `GhPullRequestCloser`.
     pub pr_closer: Arc<dyn PullRequestCloser>,
     /// Pluggable LLM harness adapter that knows how to build argv
-    /// for the three spawn profiles (work-item, review-gate, global)
-    /// and write any backend-specific side-car files. Every place
-    /// that previously hard-coded `claude` flags now goes through
-    /// this trait object. See `crate::agent_backend` and
-    /// `docs/harness-contract.md`.
+    /// for the three argv profiles (interactive, review-gate,
+    /// rebase-gate) backing the four known spawn sites (work-item,
+    /// review-gate, rebase-gate, global) and write any backend-specific
+    /// side-car files. Every place that previously hard-coded `claude`
+    /// flags now goes through this trait object. See
+    /// `crate::agent_backend` and `docs/harness-contract.md`.
     pub agent_backend: Arc<dyn AgentBackend>,
     /// The loaded configuration (repo paths, base dirs, defaults).
     pub config: Config,
