@@ -58,16 +58,29 @@ genuinely warrants a crate-wide allow.
 
 ### Unsafe code policy
 
-`unsafe_code` is at `allow` crate-wide rather than `forbid` because
-the crate has two legitimate unsafe surfaces that cannot be rewritten
-in safe Rust:
+`unsafe_code` is at `warn` crate-wide (promoted to a merge-blocker
+by CI's `-D warnings`) rather than `forbid` because the crate has
+two legitimate unsafe surfaces that cannot be rewritten in safe
+Rust:
 
 - `src/session.rs` - PTY FFI (`libc::openpty`, `libc::dup`,
-  `libc::fcntl`, `libc::read`/`libc::write`, raw-fd construction) for
-  the embedded terminal backend. Covered by unit and integration
-  tests.
+  `libc::fcntl`, `libc::read`/`libc::write`, raw-fd construction)
+  for the embedded terminal backend. Covered by unit and integration
+  tests. The module opts out via a single file-level
+  `#![expect(unsafe_code, reason = "...")]` attribute at the top of
+  `src/session.rs` (the entire file is the FFI boundary).
 - `src/app.rs` - two `libc::killpg(pid, SIGKILL)` blocks in the
-  graceful-shutdown and panic-handler paths.
+  graceful-shutdown and panic-handler paths. Each enclosing function
+  opts out via `#[expect(unsafe_code, reason = "...")]` attached to
+  the function, not to the unsafe block itself.
+
+Note that the opt-out uses `#[expect]`, NOT `#[allow]`, because
+`clippy::allow_attributes` is denied crate-wide so that no
+undocumented `#[allow(...)]` can sneak in. `#[expect]` is the
+idiomatic replacement: it behaves like allow but produces its own
+warning (`unfulfilled_lint_expectations`) if the lint would NOT have
+fired, so a future refactor that removes the unsafe block also
+removes the attribute.
 
 Every existing unsafe block carries a preceding SAFETY comment
 documenting why the block is sound. Adding a new unsafe block
@@ -75,20 +88,25 @@ requires:
 
 1. A SAFETY comment that states the preconditions relied on and why
    they hold at the call site.
-2. A reviewer-visible justification in the PR description explaining
+2. An `#[expect(unsafe_code, reason = "...")]` attribute on the
+   enclosing function (or a file-level `#![expect(...)]` for a new
+   FFI-boundary module), with a reason string that links to the
+   SAFETY comment and names the FFI surface.
+3. A reviewer-visible justification in the PR description explaining
    why the operation cannot be expressed in safe Rust.
-3. Matching test coverage, or an explicit note in the PR stating why
+4. Matching test coverage, or an explicit note in the PR stating why
    the block is impossible to test in-process (e.g. the FFI path
    needs a real PTY device).
 
-Reviewers must flag any new unsafe block that lacks any of the above,
-even if clippy does not fire (the lint is at `allow`, so detection is
-human, not mechanical).
+Reviewers must flag any new unsafe block that lacks any of the
+above. The `#[expect]` attribute is what lets the `unsafe_code`
+warning stay at merge-blocker severity for every other site while
+still permitting these two carefully-bounded exceptions.
 
 `forbid` is not an option because even a single legitimate unsafe
-block in the crate would then force `#[allow(unsafe_code)]` at the
-site - and that allow is denied by `clippy::allow_attributes`. The
-review-based policy documented here is the enforcement path.
+block in the crate would then force suppression at the site, and
+`forbid` cannot be locally suppressed at all. `warn` plus per-site
+`#[expect]` is the enforcement path.
 
 ### Optional: nightly rustfmt for import style
 

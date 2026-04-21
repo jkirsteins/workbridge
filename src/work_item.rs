@@ -88,33 +88,29 @@ pub enum WorkItemStatus {
 
 impl WorkItemStatus {
     /// The next stage in the workflow, or None if at the terminal stage.
-    pub const fn next_stage(&self) -> Option<Self> {
+    pub const fn next_stage(self) -> Option<Self> {
         match self {
             Self::Backlog => Some(Self::Planning),
             Self::Planning => Some(Self::Implementing),
-            Self::Implementing => Some(Self::Review),
-            Self::Blocked => Some(Self::Review),
-            Self::Review => Some(Self::Done),
-            Self::Mergequeue => Some(Self::Done),
+            Self::Implementing | Self::Blocked => Some(Self::Review),
+            Self::Review | Self::Mergequeue => Some(Self::Done),
             Self::Done => None,
         }
     }
 
     /// The previous stage in the workflow, or None if at the first stage.
-    pub const fn prev_stage(&self) -> Option<Self> {
+    pub const fn prev_stage(self) -> Option<Self> {
         match self {
             Self::Backlog => None,
             Self::Planning => Some(Self::Backlog),
             Self::Implementing => Some(Self::Planning),
-            Self::Blocked => Some(Self::Implementing),
-            Self::Review => Some(Self::Implementing),
-            Self::Mergequeue => Some(Self::Review),
-            Self::Done => Some(Self::Review),
+            Self::Blocked | Self::Review => Some(Self::Implementing),
+            Self::Mergequeue | Self::Done => Some(Self::Review),
         }
     }
 
     /// Short badge text for display in the work item list.
-    pub const fn badge_text(&self) -> &'static str {
+    pub const fn badge_text(self) -> &'static str {
         match self {
             Self::Backlog => "[BL]",
             Self::Planning => "[PL]",
@@ -134,7 +130,7 @@ impl WorkItemStatus {
     /// Other stages return a high value so they never displace
     /// MQ/RV/IM/PL inside the ACTIVE bucket. Ties are broken by the
     /// caller's existing order (stable sort).
-    pub const fn active_group_rank(&self) -> u8 {
+    pub const fn active_group_rank(self) -> u8 {
         match self {
             Self::Mergequeue => 0,
             Self::Review => 1,

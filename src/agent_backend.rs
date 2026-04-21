@@ -1168,8 +1168,8 @@ mod tests {
         );
 
         // C4: Codex writes no session files by default in the stub.
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let cwd = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
         let files = backend.write_session_files(&cwd, "{}").unwrap();
         assert!(files.is_empty());
     }
@@ -2229,8 +2229,8 @@ mod tests {
     /// or user home. The caller prepares the temp JSON before spawning.
     #[test]
     fn codex_writes_no_session_files() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let cwd = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
         let files = CodexBackend.write_session_files(&cwd, "{}").unwrap();
         assert!(files.is_empty());
     }
@@ -2277,8 +2277,8 @@ mod tests {
         assert!(!verdict.approved);
         assert!(verdict.detail.contains("not yet implemented"));
 
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let files = backend.write_session_files(_tmp.path(), "{}").unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let files = backend.write_session_files(tmp.path(), "{}").unwrap();
         assert!(files.is_empty());
     }
 

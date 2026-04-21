@@ -295,11 +295,10 @@ pub fn truncate_slug(slug: &str, max_len: usize) -> String {
         return slug.to_string();
     }
     // Find last hyphen at or before max_len.
-    if let Some(pos) = slug[..max_len].rfind('-') {
-        slug[..pos].to_string()
-    } else {
-        slug[..max_len].to_string()
-    }
+    slug[..max_len].rfind('-').map_or_else(
+        || slug[..max_len].to_string(),
+        |pos| slug[..pos].to_string(),
+    )
 }
 
 /// Generate a 4-character hex suffix for branch name uniqueness.

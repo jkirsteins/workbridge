@@ -246,11 +246,8 @@ pub fn seed_dashboard(target_dir: &Path) -> Result<(), Box<dyn Error>> {
 /// `read_dir`, and catches the one failure mode that matters
 /// (pointing the seeder at the real `work-items/` directory by accident).
 fn refuse_if_populated(dir: &Path) -> Result<(), Box<dyn Error>> {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        // Nonexistent / unreadable directories are handled by the normal
-        // write path - no need to double-report here.
-        Err(_) => return Ok(()),
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
     };
     for entry in entries.flatten() {
         let name = entry.file_name();

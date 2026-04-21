@@ -238,6 +238,10 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
 
 /// Render callback. Called by rat-salsa when the UI needs to be redrawn.
 /// Receives a raw Buffer instead of a Frame - widgets render directly to it.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "rat-salsa `run_tui` render-callback contract requires `Result<(), E>`"
+)]
 pub fn app_render(
     area: Rect,
     buf: &mut Buffer,
@@ -251,6 +255,10 @@ pub fn app_render(
 
 /// Event callback. Dispatches crossterm events to key/resize handlers,
 /// timer events to periodic work (liveness, fetch drain, signals, shutdown).
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "rat-salsa `run_tui` event-callback contract requires `Result<Control<E>, E>`"
+)]
 pub fn app_event(
     evt: &AppEvent,
     state: &mut App,
@@ -304,6 +312,11 @@ pub fn app_event(
             Ok(Control::Changed)
         }
         AppEvent::Timer(timeout) => {
+            // The render tick fires at ~120fps (8ms).  Heavy background
+            // work only runs every BACKGROUND_TICK_DIVISOR-th tick to
+            // keep CPU usage reasonable (~200ms cadence).
+            const BACKGROUND_TICK_DIVISOR: usize = 25;
+
             // Flush any buffered PTY writes before rendering. Key events
             // that forward to the PTY buffer bytes instead of writing
             // immediately, so rapid keystrokes (e.g. drag-and-drop
@@ -313,10 +326,6 @@ pub fn app_event(
             // behavior.
             state.flush_pty_buffers();
 
-            // The render tick fires at ~120fps (8ms).  Heavy background
-            // work only runs every BACKGROUND_TICK_DIVISOR-th tick to
-            // keep CPU usage reasonable (~200ms cadence).
-            const BACKGROUND_TICK_DIVISOR: usize = 25;
             let is_background_tick = timeout.counter % BACKGROUND_TICK_DIVISOR == 0;
 
             if is_background_tick {

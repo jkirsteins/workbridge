@@ -622,7 +622,7 @@ impl LocalFileBackend {
 /// directory and then renaming. On POSIX, rename within the same filesystem
 /// is atomic, so a crash mid-write leaves the original file intact.
 fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp_path = parent.join(format!(
         ".{}.tmp",
         path.file_name()
@@ -878,12 +878,13 @@ impl WorkItemBackend for LocalFileBackend {
     }
 
     fn append_activity(&self, id: &WorkItemId, entry: &ActivityEntry) -> Result<(), BackendError> {
+        use std::io::Write;
+
         let activity_path = self.activity_path(id)?;
         let mut line =
             serde_json::to_string(entry).map_err(|e| BackendError::Serialize(format!("{e}")))?;
         line.push('\n');
 
-        use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -916,12 +917,13 @@ impl WorkItemBackend for LocalFileBackend {
         id: &WorkItemId,
         entry: &ActivityEntry,
     ) -> Result<bool, BackendError> {
+        use std::io::Write;
+
         let activity_path = self.activity_path(id)?;
         let mut line =
             serde_json::to_string(entry).map_err(|e| BackendError::Serialize(format!("{e}")))?;
         line.push('\n');
 
-        use std::io::Write;
         let mut file = match std::fs::OpenOptions::new()
             .create(false)
             .append(true)
@@ -1774,7 +1776,7 @@ mod tests {
     fn serde_done_at_roundtrip() {
         let json = r#"{"id":{"LocalFile":"/tmp/test.json"},"title":"Test","status":"Done","repo_associations":[],"done_at":1712345678}"#;
         let record: WorkItemRecord = serde_json::from_str(json).unwrap();
-        assert_eq!(record.done_at, Some(1712345678));
+        assert_eq!(record.done_at, Some(1_712_345_678));
     }
 
     #[test]
@@ -1801,9 +1803,9 @@ mod tests {
         assert_eq!(result.records[0].done_at, None);
 
         // Set done_at.
-        backend.set_done_at(&record.id, Some(1000000)).unwrap();
+        backend.set_done_at(&record.id, Some(1_000_000)).unwrap();
         let result = backend.list().unwrap();
-        assert_eq!(result.records[0].done_at, Some(1000000));
+        assert_eq!(result.records[0].done_at, Some(1_000_000));
 
         // Clear done_at.
         backend.set_done_at(&record.id, None).unwrap();

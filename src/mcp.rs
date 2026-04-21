@@ -260,9 +260,8 @@ fn handle_global_connection(
     if stream.set_nonblocking(false).is_err() {
         return;
     }
-    let reader_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
+    let Ok(reader_stream) = stream.try_clone() else {
+        return;
     };
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
@@ -299,9 +298,8 @@ fn handle_connection(
     if stream.set_nonblocking(false).is_err() {
         return;
     }
-    let reader_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
+    let Ok(reader_stream) = stream.try_clone() else {
+        return;
     };
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
@@ -333,6 +331,10 @@ fn handle_connection(
 /// NDJSON is tried first (if the first non-empty line starts with `{`),
 /// otherwise Content-Length headers are expected.
 fn read_message(reader: &mut impl BufRead) -> io::Result<Value> {
+    // Cap allocation to 16 MB to prevent a malicious or buggy
+    // Content-Length header from causing an out-of-memory condition.
+    const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
     let mut content_length: Option<usize> = None;
     loop {
         let mut line = String::new();
@@ -364,9 +366,6 @@ fn read_message(reader: &mut impl BufRead) -> io::Result<Value> {
         io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
     })?;
 
-    // Cap allocation to 16 MB to prevent a malicious or buggy
-    // Content-Length header from causing an out-of-memory condition.
-    const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
     if len > MAX_MESSAGE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -668,7 +667,10 @@ fn handle_message(
             let id = id?;
             let params = msg.get("params")?;
             let tool_name = params.get("name")?.as_str()?;
-            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
 
             // Reject mutating tool calls in read-only mode. Even if a
             // caller somehow discovers the tool name, the call is blocked.
@@ -1003,7 +1005,8 @@ fn handle_message(
                     }
                 }
                 "workbridge_get_plan" => {
-                    let ctx: Value = serde_json::from_str(context_json).unwrap_or(json!({}));
+                    let ctx: Value =
+                        serde_json::from_str(context_json).unwrap_or_else(|_| json!({}));
                     let plan = ctx
                         .get("plan")
                         .and_then(|v| v.as_str())
@@ -1218,7 +1221,10 @@ fn handle_global_message(msg: &Value, context_json: &str, tx: &Sender<McpEvent>)
             let id = id?;
             let params = msg.get("params")?;
             let tool_name = params.get("name")?.as_str()?;
-            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
 
             // Parse the dynamic context once per tool call.
             let ctx: Value = match serde_json::from_str(context_json) {
@@ -1276,7 +1282,7 @@ fn handle_global_message(msg: &Value, context_json: &str, tx: &Sender<McpEvent>)
                             })
                         })
                         .cloned()
-                        .unwrap_or(json!({"error": "repo not found in managed repos"}));
+                        .unwrap_or_else(|| json!({"error": "repo not found in managed repos"}));
 
                     let text = serde_json::to_string_pretty(&repo_info).unwrap_or_default();
                     Some(json!({
@@ -1417,9 +1423,8 @@ pub fn run_bridge(socket_path: PathBuf) {
         let mut buf = [0u8; 8192];
         loop {
             let n = match reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => n,
-                Err(_) => break,
             };
             if writer.write_all(&buf[..n]).is_err() {
                 break;
@@ -1438,9 +1443,8 @@ pub fn run_bridge(socket_path: PathBuf) {
         let mut buf = [0u8; 8192];
         loop {
             let n = match reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => n,
-                Err(_) => break,
             };
             if writer.write_all(&buf[..n]).is_err() {
                 break;

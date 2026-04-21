@@ -200,9 +200,7 @@ pub fn reassemble(
         for assoc_record in &record.repo_associations {
             let repo_path = &assoc_record.repo_path;
 
-            let branch = if let Some(b) = &assoc_record.branch {
-                b
-            } else {
+            let Some(branch) = &assoc_record.branch else {
                 // branch=None: pre-planning state, skip all matching
                 assembled_associations.push(RepoAssociation {
                     repo_path: repo_path.clone(),
@@ -371,21 +369,27 @@ pub fn reassemble(
 
         // --- Title derivation ---
         // Priority: PR title > issue title > backend title > branch > "untitled"
-        let title = if let Some(pr_title) = best_pr_title {
-            if pr_title.is_empty() {
-                derive_fallback_title(&record.title, &first_branch)
-            } else {
-                pr_title
-            }
-        } else if let Some(issue_title) = best_issue_title {
-            if issue_title.is_empty() {
-                derive_fallback_title(&record.title, &first_branch)
-            } else {
-                issue_title
-            }
-        } else {
-            derive_fallback_title(&record.title, &first_branch)
-        };
+        let title = best_pr_title.map_or_else(
+            || {
+                best_issue_title.map_or_else(
+                    || derive_fallback_title(&record.title, first_branch.as_ref()),
+                    |issue_title| {
+                        if issue_title.is_empty() {
+                            derive_fallback_title(&record.title, first_branch.as_ref())
+                        } else {
+                            issue_title
+                        }
+                    },
+                )
+            },
+            |pr_title| {
+                if pr_title.is_empty() {
+                    derive_fallback_title(&record.title, first_branch.as_ref())
+                } else {
+                    pr_title
+                }
+            },
+        );
 
         // --- Status ---
         // Done is derived: if any repo association has a merged PR, the work
@@ -460,7 +464,7 @@ pub fn reassemble(
 }
 
 /// Derive a fallback title from backend title or branch name.
-fn derive_fallback_title(backend_title: &str, first_branch: &Option<String>) -> String {
+fn derive_fallback_title(backend_title: &str, first_branch: Option<&String>) -> String {
     if !backend_title.is_empty() {
         backend_title.to_string()
     } else if let Some(branch) = first_branch {

@@ -1,3 +1,7 @@
+// PTY FFI boundary. Every unsafe block has a SAFETY comment; new unsafe
+// here requires reviewer sign-off per CONTRIBUTING.md "Unsafe code policy".
+#![expect(unsafe_code, reason = "PTY FFI boundary; SAFETY comment per block")]
+
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
@@ -162,8 +166,8 @@ impl Session {
                         buf.len(),
                     )
                 };
-                if n > 0 {
-                    match parser_clone.lock() {
+                match n.cmp(&0) {
+                    std::cmp::Ordering::Greater => match parser_clone.lock() {
                         Ok(mut parser) => {
                             parser.process(&buf[..n as usize]);
                         }
@@ -173,21 +177,23 @@ impl Session {
                             // broken state - exit the reader thread.
                             break;
                         }
+                    },
+                    std::cmp::Ordering::Equal => {
+                        // EOF - slave side closed, child exited.
+                        break;
                     }
-                } else if n == 0 {
-                    // EOF - slave side closed, child exited.
-                    break;
-                } else {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::Interrupted {
-                        // EINTR - a signal interrupted the read. This is
-                        // not a real error, just retry.
-                        continue;
+                    std::cmp::Ordering::Less => {
+                        let err = io::Error::last_os_error();
+                        if err.kind() == io::ErrorKind::Interrupted {
+                            // EINTR - a signal interrupted the read. This is
+                            // not a real error, just retry.
+                            continue;
+                        }
+                        // Real error (EBADF, EIO, etc.) - fd closed, session
+                        // dropped, or something fatal. Exit the reader thread
+                        // so the session becomes [dead].
+                        break;
                     }
-                    // Real error (EBADF, EIO, etc.) - fd closed, session
-                    // dropped, or something fatal. Exit the reader thread
-                    // so the session becomes [dead].
-                    break;
                 }
             }
         });
@@ -247,17 +253,12 @@ impl Session {
                 self.child.take();
                 false
             }
-            Ok(None) => true, // still running
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
-                // EINTR - transient, preserve prior state (alive).
-                true
-            }
-            Err(_) => {
-                // Other error - preserve prior state rather than falsely
-                // marking dead. The child may still be alive, we just
-                // could not check. If truly dead, the next tick catches it.
-                true
-            }
+            // `Ok(None)`: still running.
+            // `Err(EINTR)`: transient; preserve prior state (alive).
+            // `Err(_)`: other error - preserve prior state rather than
+            // falsely marking dead. The child may still be alive, we just
+            // could not check. If truly dead, the next tick catches it.
+            Ok(None) | Err(_) => true,
         }
     }
 

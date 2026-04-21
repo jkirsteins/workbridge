@@ -47,10 +47,10 @@ post-processing the JSON output to aggregate by lint name and by
 | `clippy::use_self` | 142 | Mechanical fix (D12). |
 | `clippy::redundant_clone` | 133 | Mechanical fix (D9). |
 | `clippy::print_stderr` | 97 | Allow; CLI surface in `main.rs`. |
-| `clippy::manual_let_else` | 94 | Mechanical fix (D10). |
+| `clippy::manual_let_else` | 94 | Mechanical fix (D10); every site converted to `let ... else`. |
 | `clippy::too_many_lines` | 90 | Allow; file-size budget is the real enforcement. |
 | `clippy::map_unwrap_or` | 78 | Mechanical fix (D7). |
-| `clippy::missing_const_for_fn` | 73 | Mechanical fix (D11). |
+| `clippy::missing_const_for_fn` | 73 | Mechanical fix (D11); two test-only fns use `#[cfg_attr(test, expect(...))]`. |
 | `clippy::redundant_closure_for_method_calls` | 72 | Mechanical fix (D8). |
 | `clippy::exit` | 66 | Allow; CLI surface in `main.rs`. |
 | `clippy::cast_possible_truncation` | 61 | Allow; TUI u16 width/height math. |
@@ -233,14 +233,50 @@ lint itself denies them.
 - **Phase-4 structural**: `needless_pass_by_value`,
   `significant_drop_tightening`, `struct_excessive_bools`,
   `unused_self`.
-- **Judgment-heavy rewrites**: `manual_let_else`, `option_if_let_else`,
-  `items_after_statements`, `match_same_arms`, `or_fun_call`,
-  `trivially_copy_pass_by_ref`, `ref_option`, `comparison_chain`,
-  `missing_const_for_fn`, `unnecessary_wraps`.
-- **Test-only patterns**: `used_underscore_binding`,
-  `unreadable_literal`.
-- **Unsafe code**: `unsafe_code = "allow"`; review-based policy
-  documented in `CONTRIBUTING.md` ("Unsafe code policy").
+
+### `unsafe_code` at warn, opted out per-site with `#[expect]`
+
+`unsafe_code` is `warn` (promoted to merge-blocker by CI's
+`-D warnings`). The two legitimate unsafe surfaces opt out locally
+via `#[expect(unsafe_code, reason = "...")]`, not `#[allow]`:
+
+- `src/session.rs`: one file-level
+  `#![expect(unsafe_code, reason = "...")]` at the top of the module
+  covers the PTY FFI boundary. Every unsafe block inside the file
+  still carries a SAFETY comment.
+- `src/app.rs`: `#[expect(unsafe_code, reason = "...")]` on each of
+  the two enclosing functions (`impl Drop for
+  RebaseGateState::drop` and `run_cancellable`) that contain a
+  `libc::killpg` call.
+
+`#[expect]` (not `#[allow]`) is mandatory because
+`clippy::allow_attributes` is denied crate-wide. The expect
+attribute doubles as a regression signal: if a future refactor
+removes the unsafe block, the attribute fires
+`unfulfilled_lint_expectations` and the refactor also removes the
+attribute.
+
+### Other per-site `#[expect(...)]` uses
+
+A small number of pedantic/nursery lints are suppressed at the
+specific site rather than crate-wide, because the finding is true
+only at that site and a crate-wide allow would over-suppress:
+
+- `src/salsa.rs`: `app_render` and `app_event` carry
+  `#[expect(clippy::unnecessary_wraps, reason = "rat-salsa run_tui
+  callback contract requires Result<..>")]`. The `Result` signature
+  is dictated by the rat-salsa `run_tui` callback contract.
+- `src/config.rs::home_dir` and `src/side_effects/clipboard.rs::copy`
+  carry `#[cfg_attr(test, expect(clippy::missing_const_for_fn,
+  reason = "..."))]`. Under `cfg(test)` these fns reduce to a
+  const-able body; under `cfg(not(test))` they call non-const
+  helpers and cannot be `const fn`.
+
+The `#[expect]` usage here is narrow-scoped, always has a `reason`
+string, and is not a regression of the "no source-level suppression"
+goal (the goal was specifically to eliminate `#[allow]`, not to
+forbid the new `#[expect]` attribute which Clippy actively
+recommends via `allow_attributes`).
 
 ### Source-level `#[allow]` attributes removed
 
@@ -272,6 +308,57 @@ attributes:
 
 After Phase C, `grep -rn '#\[allow\|#!\[allow' src/` returns zero
 source-level allow attributes.
+
+### Rework follow-up (2026-04-21)
+
+During initial review, three deviations from Plan step A2 were
+flagged and addressed in a follow-up commit:
+
+1. `unsafe_code` was set to `allow`; reverted to `warn` as the plan
+   required. Per-site opt-out is via
+   `#[expect(unsafe_code, reason = "...")]` (file-level in
+   `src/session.rs`; function-level on the two functions in
+   `src/app.rs` that contain `libc::killpg`). The original rationale
+   for the flip - "no local suppression path because
+   `clippy::allow_attributes` is denied" - was wrong: `#[expect]`
+   IS the local suppression path, and the `allow_attributes` lint
+   actively prefers it.
+2. Twelve extra crate-wide `allow` entries that were not in the
+   Plan A2 matrix (`missing_const_for_fn`, `unnecessary_wraps`,
+   `comparison_chain`, `ref_option`, `used_underscore_binding`,
+   `unreadable_literal`, `manual_let_else`, `option_if_let_else`,
+   `items_after_statements`, `match_same_arms`, `or_fun_call`,
+   `trivially_copy_pass_by_ref`) were removed. The final matrix now
+   matches Plan A2 exactly.
+3. Phases D2 / D3 / D6 / D10 / D11 were re-run against actual
+   findings (with the extra allows removed) and every site fixed
+   at source:
+   - D2 `items_after_statements`: items hoisted to the top of
+     their enclosing block.
+   - D3 `match_same_arms`: identical arms merged with `|`.
+   - D6 `option_if_let_else`: rewrote to `.map_or` /
+     `.map_or_else`.
+   - D10 `manual_let_else`: converted every `let x = match y { ...
+     diverging ... }` to `let Pattern = y else { ... }`.
+   - D11 `missing_const_for_fn`: fixed via
+     `#[cfg_attr(test, expect(clippy::missing_const_for_fn,
+     reason = "..."))]` at the two test-only sites where
+     `cfg(test)` reduces the fn body to a const-able form but
+     `cfg(not(test))` does not.
+
+The remaining mechanical-tail lints flagged by the 12-allow removal
+(`unnecessary_wraps`, `comparison_chain`, `ref_option`,
+`used_underscore_binding`, `unreadable_literal`, `or_fun_call`,
+`trivially_copy_pass_by_ref`) were also fixed at source. For the
+two rat-salsa callbacks in `src/salsa.rs` whose `Result` signatures
+are fixed by the external callback contract,
+`#[expect(clippy::unnecessary_wraps, reason = "...")]` is attached
+at the site.
+
+After the rework, `grep -rn '#\[allow\|#!\[allow' src/` still
+returns zero hits. All local lint suppressions use `#[expect(...,
+reason = "...")]`, which is the form `clippy::allow_attributes`
+recommends.
 
 ## Calibration artifact provenance
 

@@ -422,14 +422,15 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
 /// Toasts whose rect would overflow the frame are skipped (rather
 /// than clipped) so a small terminal degrades gracefully.
 fn draw_toasts(buf: &mut Buffer, toasts: &[Toast], theme: &Theme, frame_area: Rect) {
-    if toasts.is_empty() {
-        return;
-    }
     const TOAST_HEIGHT: u16 = 3; // bordered block + 1 content row
     const MAX_WIDTH: u16 = 60;
     const MIN_WIDTH: u16 = 16;
     const MARGIN_RIGHT: u16 = 2;
     const MARGIN_TOP: u16 = 1;
+
+    if toasts.is_empty() {
+        return;
+    }
 
     // Newest toast first (visually on top of the stack).
     for (index, toast) in toasts.iter().rev().enumerate() {
@@ -607,7 +608,7 @@ fn draw_board_view(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         let col_area = columns[col_idx];
         let is_selected_col = col_idx == app.board_cursor.column;
 
-        let items = app.items_for_column(status);
+        let items = app.items_for_column(*status);
         let count = items.len();
 
         // Column border style.
@@ -1237,12 +1238,12 @@ fn format_board_item<'a>(
     for (i, wl) in wrapped.into_iter().enumerate() {
         let style = if wi.status == WorkItemStatus::Blocked {
             dim_badge_style(
-                theme.style_stage_badge(&WorkItemStatus::Blocked),
+                theme.style_stage_badge(WorkItemStatus::Blocked),
                 has_session,
             )
         } else if wi.status == WorkItemStatus::Mergequeue {
             dim_badge_style(
-                theme.style_stage_badge(&WorkItemStatus::Mergequeue),
+                theme.style_stage_badge(WorkItemStatus::Mergequeue),
                 has_session,
             )
         } else if i == 0 {
@@ -1392,10 +1393,7 @@ fn predict_list_offset(
 
     // With `scroll_padding = 0` the index we must keep on screen is just the
     // selected item (falling back to the offset when nothing is selected).
-    let index_to_display = match selected {
-        Some(s) => s.min(last_valid_index),
-        None => first_visible_index,
-    };
+    let index_to_display = selected.map_or(first_visible_index, |s| s.min(last_valid_index));
 
     // If the selected item is past the current viewport, scroll down: add
     // items to the tail and drop items from the head until the selected
@@ -1437,25 +1435,26 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     };
 
     // When drilling down from board view, show the stage name in the title.
-    let title = if let Some(ref stage) = app.board_drill_stage {
-        let stage_name = match stage {
-            WorkItemStatus::Backlog => "Backlog",
-            WorkItemStatus::Planning => "Planning",
-            WorkItemStatus::Implementing => "Implementing",
-            WorkItemStatus::Blocked => "Blocked",
-            WorkItemStatus::Review => "Review",
-            WorkItemStatus::Mergequeue => "Mergequeue",
-            WorkItemStatus::Done => "Done",
-        };
-        let count = app
-            .display_list
-            .iter()
-            .filter(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
-            .count();
-        format!(" {stage_name} ({count}) ")
-    } else {
-        format!(" Work Items ({}) ", app.work_items.len())
-    };
+    let title = app.board_drill_stage.as_ref().map_or_else(
+        || format!(" Work Items ({}) ", app.work_items.len()),
+        |stage| {
+            let stage_name = match stage {
+                WorkItemStatus::Backlog => "Backlog",
+                WorkItemStatus::Planning => "Planning",
+                WorkItemStatus::Implementing => "Implementing",
+                WorkItemStatus::Blocked => "Blocked",
+                WorkItemStatus::Review => "Review",
+                WorkItemStatus::Mergequeue => "Mergequeue",
+                WorkItemStatus::Done => "Done",
+            };
+            let count = app
+                .display_list
+                .iter()
+                .filter(|e| matches!(e, DisplayEntry::WorkItemEntry(_)))
+                .count();
+            format!(" {stage_name} ({count}) ")
+        },
+    );
 
     let block = Block::default()
         .title(title)
@@ -1674,40 +1673,36 @@ fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
         let header_needed = find_current_group_header(&app.display_list, resolved_offset)
             .filter(|&h| h < resolved_offset);
 
-        match (sticky_slot, header_needed) {
-            (Some(slot), Some(header_idx)) => {
-                if let DisplayEntry::GroupHeader {
-                    ref label,
-                    count,
-                    ref kind,
-                } = app.display_list[header_idx]
-                {
-                    let text = format!("{label} ({count})");
-                    let style = match kind {
-                        GroupHeaderKind::Blocked => theme.style_sticky_header_blocked(),
-                        GroupHeaderKind::Normal => theme.style_sticky_header(),
-                    };
-                    // Fill the entire row with the sticky background so it
-                    // visually separates from the highlighted item below.
-                    let bg_style = Style::default().bg(theme.sticky_header_bg);
-                    let line = Line::from(vec![
-                        Span::styled("  ", bg_style),
-                        Span::styled(text, style),
-                    ]);
-                    Paragraph::new(line).style(bg_style).render(slot, buf);
-                }
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                // After the tentative-offset reconciliation above, the
-                // sticky decision and the post-render offset should
-                // agree. The only legitimate drift is a one-item
-                // sticky decision flip caused by the recenter shrinking
-                // the body by 1 row, in which case `header_needed`
-                // still matches `sticky_slot`. Treat any remaining
-                // mismatch as a one-frame visual glitch rather than a
-                // hard assertion - the next frame will reconcile.
-            }
-            (None, None) => {}
+        // The non-`(Some, Some)` cases are no-ops by design:
+        // `(Some, None) | (None, Some)`: after the tentative-offset
+        // reconciliation above, the sticky decision and the post-render
+        // offset should agree. The only legitimate drift is a one-item
+        // sticky decision flip caused by the recenter shrinking the body
+        // by 1 row, in which case `header_needed` still matches
+        // `sticky_slot`. Treat any remaining mismatch as a one-frame
+        // visual glitch rather than a hard assertion - the next frame
+        // will reconcile.
+        // `(None, None)`: no header needed.
+        if let (Some(slot), Some(header_idx)) = (sticky_slot, header_needed)
+            && let DisplayEntry::GroupHeader {
+                ref label,
+                count,
+                ref kind,
+            } = app.display_list[header_idx]
+        {
+            let text = format!("{label} ({count})");
+            let style = match kind {
+                GroupHeaderKind::Blocked => theme.style_sticky_header_blocked(),
+                GroupHeaderKind::Normal => theme.style_sticky_header(),
+            };
+            // Fill the entire row with the sticky background so it
+            // visually separates from the highlighted item below.
+            let bg_style = Style::default().bg(theme.sticky_header_bg);
+            let line = Line::from(vec![
+                Span::styled("  ", bg_style),
+                Span::styled(text, style),
+            ]);
+            Paragraph::new(line).style(bg_style).render(slot, buf);
         }
     }
 
@@ -2065,6 +2060,10 @@ fn format_work_item_entry<'a>(
     theme: &Theme,
     is_selected: bool,
 ) -> ListItem<'a> {
+    // Minimum number of display columns reserved for the title so it never
+    // vanishes when badges consume all available width.
+    const MIN_TITLE_BUDGET: usize = 5;
+
     let Some(wi) = app.work_items.get(idx) else {
         return ListItem::new(Line::from("<invalid>"));
     };
@@ -2223,10 +2222,6 @@ fn format_work_item_entry<'a>(
     } else {
         format!("{kind_tag}{badge}{gate_tag} ")
     };
-    // Minimum number of display columns reserved for the title so it never
-    // vanishes when badges consume all available width.
-    const MIN_TITLE_BUDGET: usize = 5;
-
     let space_for_content = content_width.saturating_sub(prefix.width());
 
     // Drop badges from the right until the title gets at least MIN_TITLE_BUDGET
@@ -2276,7 +2271,7 @@ fn format_work_item_entry<'a>(
         };
         (
             ts,
-            dim_badge_style(theme.style_stage_badge(&wi.status), has_session),
+            dim_badge_style(theme.style_stage_badge(wi.status), has_session),
             ratatui_core::style::Style::default(), // right badges have their own per-part styles
             theme.style_text_muted(),
         )
@@ -2593,6 +2588,9 @@ fn draw_work_item_detail(
     area: Rect,
     mergequeue_poll_error: Option<&str>,
 ) {
+    const LABEL_INDENT: u16 = 2; // "  " indent before every row.
+    const LABEL_WIDTH: u16 = 12; // Padded label column width.
+
     let Some(wi) = wi else {
         let text = Text::from(vec![
             Line::from(""),
@@ -2697,8 +2695,6 @@ fn draw_work_item_detail(
     // "(none)" placeholders are NOT registered as click targets (the
     // underline would be misleading - there is nothing to copy) and
     // keep the existing muted style.
-    const LABEL_INDENT: u16 = 2; // "  " indent before every row.
-    const LABEL_WIDTH: u16 = 12; // Padded label column width.
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -4009,6 +4005,9 @@ pub const DESC_TEXTAREA_HEIGHT: u16 = 6;
 const DESC_TEXTAREA_MIN_HEIGHT: u16 = 2;
 
 fn draw_create_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &Theme, area: Rect) {
+    const FIXED_INNER_ROWS_WITHOUT_REPOS: u16 = 12;
+    const CHROME_ROWS: u16 = 4;
+
     // Dim the background so the dialog is the clear focal point.
     dim_background(buf, area);
 
@@ -4036,8 +4035,6 @@ fn draw_create_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &Theme
     // `Length` down proportionally, crushing the textarea to 1-2 rows
     // and causing rat-text's cursor-follow scroll to hide the first
     // row of typed characters (the bug this layout replaced).
-    const FIXED_INNER_ROWS_WITHOUT_REPOS: u16 = 12;
-    const CHROME_ROWS: u16 = 4;
 
     let repo_list_len = dialog.repo_list.len() as u16;
     let repo_lines_preferred = repo_list_len.clamp(1, 6);
@@ -6216,10 +6213,10 @@ mod snapshot_tests {
         // aligned "PR#" badge on the same row.
         let first_row = &left_lines[item_row];
         let first_content = first_row.get(4..).unwrap_or("");
-        let first_chunk = match first_content.rfind("PR#") {
-            Some(idx) => first_content[..idx].trim_end().to_string(),
-            None => first_content.trim_end().to_string(),
-        };
+        let first_chunk = first_content.rfind("PR#").map_or_else(
+            || first_content.trim_end().to_string(),
+            |idx| first_content[..idx].trim_end().to_string(),
+        );
         let mut branch_chunks = vec![first_chunk];
 
         // Continuation rows use a 4-space indent.
@@ -6357,6 +6354,12 @@ mod snapshot_tests {
     fn settings_overlay_with_config() {
         use crate::config::Config;
 
+        // Require a minimum prefix length (see Pass 1 below) so the
+        // regex does not accidentally match `/v` or `/t` against
+        // unrelated paths; a tmp path always has the form
+        // `/<root>/<randomized dir>` which is well beyond `MIN_PREFIX`.
+        const MIN_PREFIX: usize = 6;
+
         // Use `tempfile::tempdir()` so the test stays inside the
         // process temp root, auto-cleans on drop, and cannot collide
         // with sibling test threads. The rendered base-dir path is
@@ -6421,14 +6424,9 @@ mod snapshot_tests {
         // are normalized this way.
         let tmp_str = tmp.path().display().to_string();
         // Build a regex that matches any non-empty prefix of
-        // `tmp_str` of length >= `MIN_PREFIX` chars. We require a
-        // minimum prefix length so the regex does not accidentally
-        // match `/v` or `/t` against unrelated paths; a tmp path
-        // always has the form `/<root>/<randomized dir>` which is
-        // well beyond `MIN_PREFIX`. Each character after the minimum
-        // is an optional group, so the regex matches the longest
-        // prefix available at every site.
-        const MIN_PREFIX: usize = 6;
+        // `tmp_str` of length >= `MIN_PREFIX` chars. Each character
+        // after the minimum is an optional group, so the regex matches
+        // the longest prefix available at every site.
         let chars: Vec<char> = tmp_str.chars().collect();
         let (required, optional) = if chars.len() <= MIN_PREFIX {
             (chars.as_slice(), &[] as &[char])
@@ -7548,7 +7546,7 @@ mod snapshot_tests {
             "long-url",
             "Has long URL",
             WorkItemStatus::Review,
-            Some(make_pr_info(123456, CheckStatus::Passing)),
+            Some(make_pr_info(123_456, CheckStatus::Passing)),
             1,
         );
         let long_url =

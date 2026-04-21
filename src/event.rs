@@ -607,7 +607,7 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
         // Left arrow - move to previous column
         (KeyModifiers::NONE, KeyCode::Left) if app.board_cursor.column > 0 => {
             app.board_cursor.column -= 1;
-            let items = app.items_for_column(&BOARD_COLUMNS[app.board_cursor.column]);
+            let items = app.items_for_column(BOARD_COLUMNS[app.board_cursor.column]);
             app.board_cursor.row = if items.is_empty() {
                 None
             } else {
@@ -620,7 +620,7 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
             if app.board_cursor.column < BOARD_COLUMNS.len() - 1 =>
         {
             app.board_cursor.column += 1;
-            let items = app.items_for_column(&BOARD_COLUMNS[app.board_cursor.column]);
+            let items = app.items_for_column(BOARD_COLUMNS[app.board_cursor.column]);
             app.board_cursor.row = if items.is_empty() {
                 None
             } else {
@@ -639,7 +639,7 @@ fn handle_key_board(app: &mut App, key: KeyEvent) {
         }
         // Down arrow - next item in column
         (KeyModifiers::NONE, KeyCode::Down) => {
-            let items = app.items_for_column(&BOARD_COLUMNS[app.board_cursor.column]);
+            let items = app.items_for_column(BOARD_COLUMNS[app.board_cursor.column]);
             if let Some(row) = app.board_cursor.row
                 && row + 1 < items.len()
             {
@@ -1608,9 +1608,8 @@ fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
             let reason = app.rework_prompt_input.text().trim().to_string();
             app.rework_prompt_visible = false;
             app.rework_prompt_input.clear();
-            let wi_id = match app.rework_prompt_wi.take() {
-                Some(id) => id,
-                None => return,
+            let Some(wi_id) = app.rework_prompt_wi.take() else {
+                return;
             };
 
             // Store the rework reason for the implementing_rework prompt.
@@ -1631,8 +1630,8 @@ fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
             // Complete the retreat from Review to Implementing.
             app.apply_stage_change(
                 &wi_id,
-                &crate::work_item::WorkItemStatus::Review,
-                &crate::work_item::WorkItemStatus::Implementing,
+                crate::work_item::WorkItemStatus::Review,
+                crate::work_item::WorkItemStatus::Implementing,
                 "user_rework",
             );
         }
@@ -1828,9 +1827,7 @@ fn handle_no_plan_prompt(app: &mut App, key: KeyEvent) {
             // next item automatically (no status_message needed).
         }
         (KeyModifiers::NONE, KeyCode::Char('p')) => {
-            let wi_id = if let Some(id) = app.no_plan_prompt_queue.pop_front() {
-                id
-            } else {
+            let Some(wi_id) = app.no_plan_prompt_queue.pop_front() else {
                 app.no_plan_prompt_visible = false;
                 return;
             };
@@ -2110,6 +2107,8 @@ fn mouse_target_with_size(
     row: u16,
     (cols, rows): (u16, u16),
 ) -> MouseTarget {
+    const HEADER_ROWS: u16 = 1;
+
     // Check global drawer first (it overlays everything when open).
     if app.global_drawer_open {
         let dl = layout::compute_drawer(cols, rows);
@@ -2145,7 +2144,6 @@ fn mouse_target_with_size(
     // the full area is split into a 1-row view-mode header + main_area +
     // optional bottom bars, so layout::compute is called with main_area's
     // height (rows - header - bottom_bars), not the raw terminal height.
-    const HEADER_ROWS: u16 = 1;
     let bottom_rows = u16::from(app.has_visible_status_bar())
         + u16::from(app.selected_work_item_context().is_some());
     let main_area_height = rows.saturating_sub(HEADER_ROWS).saturating_sub(bottom_rows);
@@ -2368,10 +2366,9 @@ fn handle_mouse_with_terminal_size(
         app.pending_chrome_click = None;
     }
 
-    let target = match terminal_size {
-        Some(size) => mouse_target_with_size(app, mouse.column, mouse.row, size),
-        None => MouseTarget::None,
-    };
+    let target = terminal_size.map_or(MouseTarget::None, |size| {
+        mouse_target_with_size(app, mouse.column, mouse.row, size)
+    });
 
     match target {
         MouseTarget::GlobalDrawer {
@@ -2571,10 +2568,9 @@ fn handle_chrome_click_fallback(app: &mut App, mouse: MouseEvent, action: MouseA
                 false
             }
         }
-        MouseAction::SelectDrag => {
-            // Already cleared above; nothing to do here.
-            false
-        }
+        // `SelectDrag`: already cleared above; nothing to do here.
+        // `Scroll`: chrome labels do not respond to scroll.
+        MouseAction::SelectDrag | MouseAction::Scroll { .. } => false,
         MouseAction::SelectUp => {
             let pending = app.pending_chrome_click.take();
             let hit = app
@@ -2593,7 +2589,6 @@ fn handle_chrome_click_fallback(app: &mut App, mouse: MouseEvent, action: MouseA
                 _ => false,
             }
         }
-        MouseAction::Scroll { .. } => false,
     }
 }
 
@@ -2750,9 +2745,8 @@ fn handle_scroll_right(app: &mut App, scroll_up: bool, local_col: u16, local_row
 
 /// Finalize selection on mouse-up for the global drawer session.
 fn handle_selection_up_global(app: &mut App, local_row: u16, local_col: u16) -> bool {
-    let entry = match app.global_session.as_mut() {
-        Some(e) => e,
-        None => return false,
+    let Some(entry) = app.global_session.as_mut() else {
+        return false;
     };
     let sel = match entry.selection.as_mut() {
         Some(s) if s.dragging => s,
@@ -2771,9 +2765,8 @@ fn handle_selection_up_global(app: &mut App, local_row: u16, local_col: u16) -> 
 
 /// Finalize selection on mouse-up for the right panel session.
 fn handle_selection_up_right(app: &mut App, local_row: u16, local_col: u16) -> bool {
-    let entry = match active_session_entry_mut_for_tab(app) {
-        Some(e) => e,
-        None => return false,
+    let Some(entry) = active_session_entry_mut_for_tab(app) else {
+        return false;
     };
     let sel = match entry.selection.as_mut() {
         Some(s) if s.dragging => s,
@@ -2793,9 +2786,8 @@ fn handle_selection_up_right(app: &mut App, local_row: u16, local_col: u16) -> b
 /// Extract the selected text from a session's terminal and copy it to the
 /// system clipboard.
 fn copy_selection_to_clipboard(entry: &crate::work_item::SessionEntry) {
-    let sel = match entry.selection.as_ref() {
-        Some(s) => s,
-        None => return,
+    let Some(sel) = entry.selection.as_ref() else {
+        return;
     };
 
     let Ok(mut parser) = entry.parser.lock() else {

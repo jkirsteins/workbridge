@@ -72,21 +72,22 @@ pub fn short_display(value: &str, kind: ClickKind) -> String {
         ClickKind::PrUrl => {
             // Find `/pull/` and keep everything from one segment
             // before it: e.g. `owner/repo/pull/123`.
-            if let Some(idx) = value.find("/pull/") {
-                let before = &value[..idx];
-                let owner_repo = before
-                    .rsplit('/')
-                    .take(2)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("/");
-                let tail = &value[idx..];
-                format!("{owner_repo}{tail}")
-            } else {
-                truncate_tail(value, MAX)
-            }
+            value.find("/pull/").map_or_else(
+                || truncate_tail(value, MAX),
+                |idx| {
+                    let before = &value[..idx];
+                    let owner_repo = before
+                        .rsplit('/')
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    let tail = &value[idx..];
+                    format!("{owner_repo}{tail}")
+                },
+            )
         }
         ClickKind::RepoPath => std::path::Path::new(value)
             .file_name()
@@ -607,6 +608,10 @@ pub struct RebaseGateState {
 /// `killpg` in `drop_rebase_gate`, just guaranteed for every removal
 /// path including ones we have not written yet.
 impl Drop for RebaseGateState {
+    #[expect(
+        unsafe_code,
+        reason = "libc::killpg FFI on a process-group id we spawned; SAFETY comment below"
+    )]
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::SeqCst);
         let pid_to_kill = self.child_pid.lock().ok().and_then(|mut slot| slot.take());
@@ -663,6 +668,10 @@ pub enum SubprocessOutcome {
 /// helper. The helper makes the class of bug impossible to
 /// reintroduce at new call sites because the ordering is baked
 /// into one place rather than replicated.
+#[expect(
+    unsafe_code,
+    reason = "libc::killpg FFI on a process-group id we spawned; SAFETY comment below"
+)]
 pub fn run_cancellable(
     cmd: &mut std::process::Command,
     pid_slot: &Arc<Mutex<Option<u32>>>,
@@ -2096,8 +2105,8 @@ macro_rules! impl_pr_merge_poll_method {
 
                         self.apply_stage_change(
                             &result.wi_id,
-                            &$source_stage,
-                            &WorkItemStatus::Done,
+                            $source_stage,
+                            WorkItemStatus::Done,
                             "pr_merge",
                         );
                         self.status_message = Some($merged_message.into());
@@ -2901,9 +2910,8 @@ impl App {
         // If the session ended without calling workbridge_set_status("Review"),
         // check for commits and run the gate automatically.
         for wi_id in dead_implementing {
-            let wi = match self.work_items.iter().find(|w| w.id == wi_id) {
-                Some(w) => w,
-                None => continue,
+            let Some(wi) = self.work_items.iter().find(|w| w.id == wi_id) else {
+                continue;
             };
             if wi.status != WorkItemStatus::Implementing || self.review_gates.contains_key(&wi_id) {
                 continue;
@@ -3796,9 +3804,8 @@ impl App {
                 let _ = self.backend.append_activity(wi_id, &entry);
             }
             // Reassemble again to pick up the status changes.
-            let list_result = match self.backend.list() {
-                Ok(r) => r,
-                Err(_) => return,
+            let Ok(list_result) = self.backend.list() else {
+                return;
             };
             let (items, unlinked, review_requested, _) = assembly::reassemble(
                 &list_result.records,
@@ -3960,12 +3967,11 @@ impl App {
             // running, leave the helper entry intact so
             // `poll_worktree_creation` can drain it on the next tick
             // and run its orphan-cleanup path.
-            let (thread_done, captured_orphan) = match self
+            let (thread_done, captured_orphan) = self
                 .user_actions
                 .in_flight
                 .get(&UserActionKey::WorktreeCreate)
-            {
-                Some(state) => match &state.payload {
+                .map_or((true, None), |state| match &state.payload {
                     UserActionPayload::WorktreeCreate { rx, .. } => match rx.try_recv() {
                         Ok(result) => {
                             let orphan = if !result.reused
@@ -3985,9 +3991,7 @@ impl App {
                         Err(crossbeam_channel::TryRecvError::Empty) => (false, None),
                     },
                     _ => (true, None),
-                },
-                None => (true, None),
-            };
+                });
             if let Some(orphan) = captured_orphan {
                 orphan_worktrees.push(orphan);
             }
@@ -4076,13 +4080,11 @@ impl App {
         // request. The modal's "in-progress spinner" is rendered by
         // reading `is_user_action_in_flight(&UserActionKey::UnlinkedCleanup)`
         // via the UI layer.
-        let activity_id = if let Some(aid) = self.try_begin_user_action(
+        let Some(activity_id) = self.try_begin_user_action(
             UserActionKey::UnlinkedCleanup,
             Duration::ZERO,
             "Cleaning up unlinked PR...",
-        ) {
-            aid
-        } else {
+        ) else {
             self.status_message = Some("Unlinked PR cleanup already in progress".into());
             return;
         };
@@ -4271,9 +4273,7 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
             }
         };
-        let result = if let Ok(r) = recv_result {
-            r
-        } else {
+        let Ok(result) = recv_result else {
             self.end_user_action(&UserActionKey::UnlinkedCleanup);
             self.cleanup_prompt_visible = false;
             self.cleanup_progress_pr_number = None;
@@ -4385,13 +4385,11 @@ impl App {
     ) {
         // Route single-flight admission through the user-action guard.
         // Preserves the pre-refactor alert wording verbatim on rejection.
-        let activity_id = if let Some(aid) = self.try_begin_user_action(
+        let Some(activity_id) = self.try_begin_user_action(
             UserActionKey::DeleteCleanup,
             Duration::ZERO,
             "Deleting work item resources...",
-        ) {
-            aid
-        } else {
+        ) else {
             // A previous delete cleanup is still running. Alert the user
             // so orphaned resources (worktrees, branches, open PRs) are
             // visible rather than silently dropped.
@@ -4645,9 +4643,7 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
             }
         };
-        let result = if let Ok(r) = recv_result {
-            r
-        } else {
+        let Ok(result) = recv_result else {
             self.end_user_action(&UserActionKey::DeleteCleanup);
             let sync_warnings = std::mem::take(&mut self.delete_sync_warnings);
             if self.delete_in_progress {
@@ -5067,10 +5063,7 @@ impl App {
     /// flag is deliberately NOT set on the "no further selectable item"
     /// branch, since the selection and viewport both stay put.
     pub fn select_next_item(&mut self) {
-        let start = match self.selected_item {
-            Some(idx) => idx + 1,
-            None => 0,
-        };
+        let start = self.selected_item.map_or(0, |idx| idx + 1);
         for i in start..self.display_list.len() {
             if is_selectable(&self.display_list[i]) {
                 self.selected_item = Some(i);
@@ -5131,18 +5124,18 @@ impl App {
 
     /// Get indices into `self.work_items` for items matching the given status.
     /// For the Implementing column, also includes Blocked items.
-    pub fn items_for_column(&self, status: &WorkItemStatus) -> Vec<usize> {
+    pub fn items_for_column(&self, status: WorkItemStatus) -> Vec<usize> {
         self.work_items
             .iter()
             .enumerate()
             .filter(|(_, wi)| {
-                if *status == WorkItemStatus::Implementing {
+                if status == WorkItemStatus::Implementing {
                     wi.status == WorkItemStatus::Implementing
                         || wi.status == WorkItemStatus::Blocked
-                } else if *status == WorkItemStatus::Review {
+                } else if status == WorkItemStatus::Review {
                     wi.status == WorkItemStatus::Review || wi.status == WorkItemStatus::Mergequeue
                 } else {
-                    wi.status == *status
+                    wi.status == status
                 }
             })
             .map(|(i, _)| i)
@@ -5151,7 +5144,7 @@ impl App {
 
     /// Resolve the board cursor to a `WorkItemId`.
     pub fn board_selected_work_item_id(&self) -> Option<WorkItemId> {
-        let col_status = BOARD_COLUMNS.get(self.board_cursor.column)?;
+        let col_status = *BOARD_COLUMNS.get(self.board_cursor.column)?;
         let items = self.items_for_column(col_status);
         let row = self.board_cursor.row?;
         let wi_idx = items.get(row)?;
@@ -5165,7 +5158,7 @@ impl App {
         // If we have a selected work item, try to find it in the board.
         if let Some(ref target_id) = self.selected_work_item {
             for (col_idx, status) in BOARD_COLUMNS.iter().enumerate() {
-                let items = self.items_for_column(status);
+                let items = self.items_for_column(*status);
                 for (row_idx, &wi_idx) in items.iter().enumerate() {
                     if let Some(wi) = self.work_items.get(wi_idx)
                         && wi.id == *target_id
@@ -5182,7 +5175,8 @@ impl App {
         let items = self.items_for_column(
             BOARD_COLUMNS
                 .get(self.board_cursor.column)
-                .unwrap_or(&WorkItemStatus::Backlog),
+                .copied()
+                .unwrap_or(WorkItemStatus::Backlog),
         );
         if items.is_empty() {
             self.board_cursor.row = None;
@@ -5277,10 +5271,8 @@ impl App {
             if w.branch.as_deref() != Some(branch) {
                 return false;
             }
-            match crate::config::canonicalize_path(&w.path) {
-                Ok(existing_canonical) => existing_canonical == target_canonical,
-                Err(_) => false,
-            }
+            crate::config::canonicalize_path(&w.path)
+                .is_ok_and(|existing_canonical| existing_canonical == target_canonical)
         })
     }
 
@@ -5452,10 +5444,10 @@ impl App {
                             &branch,
                             &wt_target,
                         );
-                        let (wt_result, reused) = match reused_wt {
-                            Some(existing_wt) => (Ok(existing_wt), true),
-                            None => (ws.create_worktree(&repo_path, &branch, &wt_target), false),
-                        };
+                        let (wt_result, reused) = reused_wt.map_or_else(
+                            || (ws.create_worktree(&repo_path, &branch, &wt_target), false),
+                            |existing_wt| (Ok(existing_wt), true),
+                        );
                         match wt_result {
                             Ok(wt_info) => {
                                 let _ = tx.send(WorktreeCreateResult {
@@ -5636,24 +5628,25 @@ impl App {
         let (wi_kind, context_json, repo_mcp_servers) = {
             let wi = self.work_items.iter().find(|w| w.id == *work_item_id);
             let wi_kind = wi.map(|w| format!("{:?}", w.kind)).unwrap_or_default();
-            let context_json = if let Some(wi) = wi {
-                let pr_url = wi
-                    .repo_associations
-                    .first()
-                    .and_then(|a| a.pr.as_ref())
-                    .map_or("", |pr| pr.url.as_str());
-                serde_json::json!({
-                    "work_item_id": wi_id_str,
-                    "stage": format!("{:?}", wi.status),
-                    "title": wi.title,
-                    "description": wi.description,
-                    "repo": cwd_clone.display().to_string(),
-                    "pr_url": pr_url,
-                })
-                .to_string()
-            } else {
-                "{}".to_string()
-            };
+            let context_json = wi.map_or_else(
+                || "{}".to_string(),
+                |wi| {
+                    let pr_url = wi
+                        .repo_associations
+                        .first()
+                        .and_then(|a| a.pr.as_ref())
+                        .map_or("", |pr| pr.url.as_str());
+                    serde_json::json!({
+                        "work_item_id": wi_id_str,
+                        "stage": format!("{:?}", wi.status),
+                        "title": wi.title,
+                        "description": wi.description,
+                        "repo": cwd_clone.display().to_string(),
+                        "pr_url": pr_url,
+                    })
+                    .to_string()
+                },
+            );
             let repo_mcp_servers: Vec<crate::config::McpServerEntry> = wi
                 .and_then(|w| w.repo_associations.first())
                 .map(|assoc| {
@@ -6186,9 +6179,8 @@ impl App {
         }
         let keys: Vec<WorkItemId> = self.session_spawn_rx.keys().cloned().collect();
         for wi_id in keys {
-            let pending = match self.session_spawn_rx.get(&wi_id) {
-                Some(p) => p,
-                None => continue,
+            let Some(pending) = self.session_spawn_rx.get(&wi_id) else {
+                continue;
             };
             let result = match pending.rx.try_recv() {
                 Ok(r) => r,
@@ -6311,10 +6303,8 @@ impl App {
     ///    the user has configured one.
     /// 3. `SESSION_TITLE_NONE` placeholder - never a vendor default.
     pub fn agent_backend_display_name(&self) -> &'static str {
-        match self.resolved_harness_kind() {
-            Some(kind) => kind.display_name(),
-            None => Self::SESSION_TITLE_NONE,
-        }
+        self.resolved_harness_kind()
+            .map_or(Self::SESSION_TITLE_NONE, |kind| kind.display_name())
     }
 
     /// Single source of truth for the Session tab title's harness
@@ -6456,8 +6446,8 @@ impl App {
         if current_status == Some(WorkItemStatus::Backlog) {
             self.apply_stage_change(
                 &work_item_id,
-                &WorkItemStatus::Backlog,
-                &WorkItemStatus::Planning,
+                WorkItemStatus::Backlog,
+                WorkItemStatus::Planning,
                 "user_harness_pick",
             );
             // apply_stage_change already calls spawn_session for stages
@@ -6690,9 +6680,7 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
             }
         };
-        let result = if let Ok(r) = recv_result {
-            r
-        } else {
+        let Ok(result) = recv_result else {
             self.end_user_action(&UserActionKey::WorktreeCreate);
             self.status_message =
                 Some("Worktree creation: background thread exited unexpectedly".into());
@@ -6860,10 +6848,10 @@ impl App {
 
             let reused_wt =
                 Self::find_reusable_worktree(ws.as_ref(), &repo_path, &branch, &wt_target);
-            let (wt_result, reused) = match reused_wt {
-                Some(existing) => (Ok(existing), true),
-                None => (ws.create_worktree(&repo_path, &branch, &wt_target), false),
-            };
+            let (wt_result, reused) = reused_wt.map_or_else(
+                || (ws.create_worktree(&repo_path, &branch, &wt_target), false),
+                |existing| (Ok(existing), true),
+            );
 
             match wt_result {
                 Ok(wt_info) => {
@@ -7013,13 +7001,15 @@ impl App {
                 )
             }
             WorkItemStatus::Review => {
-                let pr_line = match &pr_url {
-                    Some(url) => format!(" Pull request: {url}."),
-                    None => format!(
-                        " Note: no pull request URL is available yet (it may still be creating). \
-                         You can find it by running: gh pr list --head {branch_name}"
-                    ),
-                };
+                let pr_line = pr_url.as_ref().map_or_else(
+                    || {
+                        format!(
+                            " Note: no pull request URL is available yet (it may still be creating). \
+                             You can find it by running: gh pr list --head {branch_name}"
+                        )
+                    },
+                    |url| format!(" Pull request: {url}."),
+                );
                 if review_gate_findings.is_empty() {
                     format!(
                         "Worktree: {worktree_display}. Branch: {branch_name}. \
@@ -7116,12 +7106,8 @@ impl App {
         };
 
         let mut events: Vec<McpEvent> = Vec::new();
-        loop {
-            match rx.try_recv() {
-                Ok(event) => events.push(event),
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-            }
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
         }
 
         for event in events {
@@ -7203,9 +7189,7 @@ impl App {
                     if !allowed {
                         self.status_message = Some(format!(
                             "MCP: transition from {} to {} is not allowed",
-                            current_status
-                                .as_ref()
-                                .map_or("unknown", super::work_item::WorkItemStatus::badge_text),
+                            current_status.map_or("unknown", |s| s.badge_text()),
                             new_status.badge_text()
                         ));
                         continue;
@@ -7220,7 +7204,7 @@ impl App {
                         && reason.contains("No implementation plan")
                     {
                         // Apply the block first so the item is in Blocked state.
-                        self.apply_stage_change(&wi_id, &current, &new_status, "mcp");
+                        self.apply_stage_change(&wi_id, current, new_status, "mcp");
 
                         // Enqueue for the no-plan prompt (skip duplicates).
                         if !self.no_plan_prompt_queue.contains(&wi_id) {
@@ -7264,7 +7248,7 @@ impl App {
                     let Some(current) = current_status else {
                         continue;
                     };
-                    self.apply_stage_change(&wi_id, &current, &new_status, "mcp");
+                    self.apply_stage_change(&wi_id, current, new_status, "mcp");
 
                     // Build MCP-specific status message that preserves any
                     // detail from apply_stage_change (e.g. "PR created: URL").
@@ -7348,8 +7332,8 @@ impl App {
                             Ok(record) if record.status == WorkItemStatus::Planning => {
                                 self.apply_stage_change(
                                     &wi_id,
-                                    &WorkItemStatus::Planning,
-                                    &WorkItemStatus::Implementing,
+                                    WorkItemStatus::Planning,
+                                    WorkItemStatus::Implementing,
                                     "mcp",
                                 );
                             }
@@ -7922,10 +7906,10 @@ impl App {
             // See `find_reusable_worktree` for rationale.
             let reused_wt =
                 Self::find_reusable_worktree(ws.as_ref(), &repo_path, &branch, &wt_target);
-            let (wt_result, reused) = match reused_wt {
-                Some(existing_wt) => (Ok(existing_wt), true),
-                None => (ws.create_worktree(&repo_path, &branch, &wt_target), false),
-            };
+            let (wt_result, reused) = reused_wt.map_or_else(
+                || (ws.create_worktree(&repo_path, &branch, &wt_target), false),
+                |existing_wt| (Ok(existing_wt), true),
+            );
             match wt_result {
                 Ok(wt_info) => {
                     let _ = tx.send(WorktreeCreateResult {
@@ -8265,7 +8249,7 @@ impl App {
                 self.spawn_session(&dlg.wi_id);
             }
             crate::create_dialog::PendingBranchAction::Advance { from, to } => {
-                self.apply_stage_change(&dlg.wi_id, &from, &to, "user");
+                self.apply_stage_change(&dlg.wi_id, from, to, "user");
             }
         }
     }
@@ -8608,7 +8592,7 @@ impl App {
             return;
         }
 
-        self.apply_stage_change(&wi_id, &current_status, &new_status, "user");
+        self.apply_stage_change(&wi_id, current_status, new_status, "user");
     }
 
     /// Retreat the selected work item to the previous workflow stage.
@@ -8694,7 +8678,7 @@ impl App {
             return;
         }
 
-        self.apply_stage_change(&wi_id, &current_status, &new_status, "user");
+        self.apply_stage_change(&wi_id, current_status, new_status, "user");
     }
 
     /// Move a blocked (no-plan) work item back to Planning so that Claude
@@ -8717,7 +8701,7 @@ impl App {
         // the transition actually succeeded (the work item is now Planning).
         let current = WorkItemStatus::Blocked;
         let next = WorkItemStatus::Planning;
-        self.apply_stage_change(wi_id, &current, &next, "user");
+        self.apply_stage_change(wi_id, current, next, "user");
 
         let is_planning = self
             .work_items
@@ -8743,15 +8727,15 @@ impl App {
     pub fn apply_stage_change(
         &mut self,
         wi_id: &WorkItemId,
-        current_status: &WorkItemStatus,
-        new_status: &WorkItemStatus,
+        current_status: WorkItemStatus,
+        new_status: WorkItemStatus,
         source: &str,
     ) {
         // Merge-gate guard: Done requires a verified PR merge or a
         // submitted review.  All other callers must go through the merge
         // prompt / poll_pr_merge path (source == "pr_merge") or the review
         // submission path (source == "review_submitted").
-        if *new_status == WorkItemStatus::Done
+        if new_status == WorkItemStatus::Done
             && source != "pr_merge"
             && source != "review_submitted"
         {
@@ -8772,14 +8756,14 @@ impl App {
             self.status_message = Some(format!("Activity log error: {e}"));
         }
 
-        if let Err(e) = self.backend.update_status(wi_id, *new_status) {
+        if let Err(e) = self.backend.update_status(wi_id, new_status) {
             self.status_message = Some(format!("Stage update error: {e}"));
             return;
         }
 
         // Track when items enter/leave Done for auto-archival.
         let mut done_at_error = false;
-        if *new_status == WorkItemStatus::Done {
+        if new_status == WorkItemStatus::Done {
             match crate::side_effects::clock::system_now().duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => {
                     if let Err(e) = self.backend.set_done_at(wi_id, Some(duration.as_secs())) {
@@ -8794,7 +8778,7 @@ impl App {
                     done_at_error = true;
                 }
             }
-        } else if *current_status == WorkItemStatus::Done
+        } else if current_status == WorkItemStatus::Done
             && let Err(e) = self.backend.set_done_at(wi_id, None)
         {
             self.status_message = Some(format!("Failed to clear archive timestamp: {e}"));
@@ -8814,7 +8798,7 @@ impl App {
             .iter()
             .find(|w| w.id == *wi_id)
             .is_some_and(|w| w.kind == WorkItemKind::ReviewRequest);
-        if *new_status == WorkItemStatus::Review && !is_review_request {
+        if new_status == WorkItemStatus::Review && !is_review_request {
             self.spawn_pr_creation(wi_id);
         }
 
@@ -8869,13 +8853,11 @@ impl App {
             return;
         }
 
-        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
-            Some(w) => w,
-            None => return,
+        let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
+            return;
         };
-        let assoc = match wi.repo_associations.first() {
-            Some(a) => a,
-            None => return,
+        let Some(assoc) = wi.repo_associations.first() else {
+            return;
         };
         let branch = match assoc.branch.as_ref() {
             Some(b) => b.clone(),
@@ -8894,13 +8876,11 @@ impl App {
         // This check runs BEFORE try_begin_user_action so an early return
         // (cache miss) cannot leave an orphaned helper entry - see the
         // "desync guard" discussion in `docs/UI.md` "User action guard".
-        let (owner, repo_name) = if let Some((o, r)) = self
+        let Some((owner, repo_name)) = self
             .repo_data
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone())
-        {
-            (o, r)
-        } else {
+        else {
             self.status_message = Some(
                 "PR creation skipped: GitHub remote not yet cached (waiting for next fetch)".into(),
             );
@@ -9101,9 +9081,7 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
             }
         };
-        let result = if let Ok(r) = recv_result {
-            r
-        } else {
+        let Ok(result) = recv_result else {
             self.end_user_action(&UserActionKey::PrCreate);
             self.status_message = Some("PR creation: background thread exited unexpectedly".into());
             // Try next pending PR creation despite the failure.
@@ -9199,13 +9177,10 @@ impl App {
             return;
         }
 
-        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
-            Some(w) => w,
-            None => return,
+        let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
+            return;
         };
-        let assoc = if let Some(a) = wi.repo_associations.first() {
-            a
-        } else {
+        let Some(assoc) = wi.repo_associations.first() else {
             self.confirm_merge = false;
             self.merge_wi_id = None;
             self.alert_message = Some("Cannot merge: no repo association".into());
@@ -9224,13 +9199,11 @@ impl App {
         // Read owner/repo from the cached fetcher result rather than shelling
         // out on the UI thread. If no entry exists yet, the first fetch has
         // not completed - surface that as an alert instead of blocking.
-        let (owner, repo_name) = if let Some((o, r)) = self
+        let Some((owner, repo_name)) = self
             .repo_data
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone())
-        {
-            (o, r)
-        } else {
+        else {
             self.confirm_merge = false;
             self.merge_wi_id = None;
             self.alert_message =
@@ -9399,19 +9372,18 @@ impl App {
             //    order; `merge_block_message` owns the user-facing
             //    wording.
             let readiness = MergeReadiness::classify(wt.as_ref(), &live_pr);
-            let msg = if let Some(reason) = readiness.merge_block_message() {
-                MergePreCheckMessage::Blocked {
-                    reason: reason.to_string(),
-                }
-            } else {
-                MergePreCheckMessage::Ready {
+            let msg = readiness.merge_block_message().map_or_else(
+                || MergePreCheckMessage::Ready {
                     wi_id: wi_id_for_thread,
                     strategy: strategy_for_thread,
                     branch: branch_for_thread,
                     repo_path: repo_path_for_thread,
                     owner_repo: owner_repo_for_thread,
-                }
-            };
+                },
+                |reason| MergePreCheckMessage::Blocked {
+                    reason: reason.to_string(),
+                },
+            );
             let _ = tx.send(msg);
         });
 
@@ -9700,9 +9672,7 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
             }
         };
-        let result = if let Ok(r) = recv_result {
-            r
-        } else {
+        let Ok(result) = recv_result else {
             self.end_user_action(&UserActionKey::PrMerge);
             self.merge_in_progress = false;
             self.confirm_merge = false;
@@ -9773,8 +9743,8 @@ impl App {
                 // Advance to Done.
                 self.apply_stage_change(
                     &result.wi_id,
-                    &WorkItemStatus::Review,
-                    &WorkItemStatus::Done,
+                    WorkItemStatus::Review,
+                    WorkItemStatus::Done,
                     "pr_merge",
                 );
                 self.status_message = Some(format!("PR merged ({strategy}) and moved to [DN]"));
@@ -9799,8 +9769,8 @@ impl App {
                 self.rework_reasons.insert(result.wi_id.clone(), reason);
                 self.apply_stage_change(
                     &result.wi_id,
-                    &WorkItemStatus::Review,
-                    &WorkItemStatus::Implementing,
+                    WorkItemStatus::Review,
+                    WorkItemStatus::Implementing,
                     "merge_conflict",
                 );
                 self.alert_message = Some(
@@ -9824,13 +9794,10 @@ impl App {
             return;
         }
 
-        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
-            Some(w) => w,
-            None => return,
+        let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
+            return;
         };
-        let assoc = if let Some(a) = wi.repo_associations.first() {
-            a
-        } else {
+        let Some(assoc) = wi.repo_associations.first() else {
             self.status_message = Some("Cannot submit review: no repo association".into());
             return;
         };
@@ -9847,13 +9814,11 @@ impl App {
         //
         // Early returns above run BEFORE try_begin_user_action so a
         // cache miss cannot leave an orphaned helper entry.
-        let (owner, repo_name) = if let Some((o, r)) = self
+        let Some((owner, repo_name)) = self
             .repo_data
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone())
-        {
-            (o, r)
-        } else {
+        else {
             self.status_message = Some(
                 "Cannot submit review: GitHub remote not yet cached (waiting for next fetch)"
                     .into(),
@@ -9949,9 +9914,7 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
             }
         };
-        let result = if let Ok(r) = recv_result {
-            r
-        } else {
+        let Ok(result) = recv_result else {
             self.end_user_action(&UserActionKey::ReviewSubmit);
             self.status_message =
                 Some("Review submission: background thread exited unexpectedly".into());
@@ -9984,8 +9947,8 @@ impl App {
 
                 self.apply_stage_change(
                     &result.wi_id,
-                    &WorkItemStatus::Review,
-                    &WorkItemStatus::Done,
+                    WorkItemStatus::Review,
+                    WorkItemStatus::Done,
                     "review_submitted",
                 );
                 // Only show success if the item actually reached Done.
@@ -10010,13 +9973,10 @@ impl App {
     /// Review with an open PR. Registers a watch so `poll_mergequeue()`
     /// will check the PR state periodically.
     pub fn enter_mergequeue(&mut self, wi_id: &WorkItemId) {
-        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
-            Some(w) => w,
-            None => return,
+        let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
+            return;
         };
-        let assoc = if let Some(a) = wi.repo_associations.first() {
-            a
-        } else {
+        let Some(assoc) = wi.repo_associations.first() else {
             self.status_message = Some("Cannot enter mergequeue: no repo association".into());
             return;
         };
@@ -10035,13 +9995,11 @@ impl App {
         let repo_path = assoc.repo_path.clone();
         // Read owner/repo from the cached fetcher result - never shell out
         // on the UI thread.
-        let (owner, repo_name) = if let Some((o, r)) = self
+        let Some((owner, repo_name)) = self
             .repo_data
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone())
-        {
-            (o, r)
-        } else {
+        else {
             self.status_message = Some(
                 "Cannot enter mergequeue: GitHub remote not yet cached \
                  (waiting for next fetch)"
@@ -10065,8 +10023,8 @@ impl App {
 
         self.apply_stage_change(
             wi_id,
-            &WorkItemStatus::Review,
-            &WorkItemStatus::Mergequeue,
+            WorkItemStatus::Review,
+            WorkItemStatus::Mergequeue,
             "user",
         );
         self.status_message = Some("Entered mergequeue - polling PR until merged".into());
@@ -10222,13 +10180,12 @@ impl App {
                     Some(b) => b.clone(),
                     None => continue,
                 };
-                let (owner, repo_name) = match self
+                let Some((owner, repo_name)) = self
                     .repo_data
                     .get(&assoc.repo_path)
                     .and_then(|rd| rd.github_remote.clone())
-                {
-                    Some((o, r)) => (o, r),
-                    None => continue,
+                else {
+                    continue;
                 };
                 requests.push((
                     record.id.clone(),
@@ -10248,9 +10205,8 @@ impl App {
     /// Temporary migration helper - can be removed once all existing Done
     /// items have been backfilled.
     pub fn drain_pr_identity_backfill(&mut self) -> bool {
-        let rx = match self.pr_identity_backfill_rx.as_ref() {
-            Some(rx) => rx,
-            None => return false,
+        let Some(rx) = self.pr_identity_backfill_rx.as_ref() else {
+            return false;
         };
         let mut changed = false;
         let mut disconnected = false;
@@ -10292,9 +10248,8 @@ impl App {
     /// Uses `delete_branch=true` so the merged branch is cleaned up. Uses force=false
     /// because post-merge worktrees should be clean and `-d` is safe for merged branches.
     fn cleanup_worktree_for_item(&mut self, wi_id: &WorkItemId) {
-        let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
-            Some(w) => w,
-            None => return,
+        let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
+            return;
         };
         for assoc in &wi.repo_associations {
             if let Some(ref wt_path) = assoc.worktree_path {
@@ -10412,19 +10367,11 @@ impl App {
         // the immutable borrow of `self.work_items` ends before the
         // mutable `start_activity` call below.
         let (title, branch, repo_path, current_pr_number, current_check_status) = {
-            let wi = match self.work_items.iter().find(|w| w.id == *wi_id) {
-                Some(wi) => wi,
-                None => {
-                    return ReviewGateSpawn::Blocked("Work item not found".into());
-                }
+            let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
+                return ReviewGateSpawn::Blocked("Work item not found".into());
             };
-            let assoc = match wi.repo_associations.first() {
-                Some(a) => a,
-                None => {
-                    return ReviewGateSpawn::Blocked(
-                        "Cannot enter Review: no repo association".into(),
-                    );
-                }
+            let Some(assoc) = wi.repo_associations.first() else {
+                return ReviewGateSpawn::Blocked("Cannot enter Review: no repo association".into());
             };
             let branch = match assoc.branch.as_ref() {
                 Some(b) => b.clone(),
@@ -10454,13 +10401,10 @@ impl App {
         // silent default. See `docs/harness-contract.md` Change Log
         // 2026-04-16 and the
         // `harness_choice_applied_to_review_gate_spawn` test.
-        let agent_backend = match self.backend_for_work_item(wi_id) {
-            Some(b) => b,
-            None => {
-                return ReviewGateSpawn::Blocked(
+        let Some(agent_backend) = self.backend_for_work_item(wi_id) else {
+            return ReviewGateSpawn::Blocked(
                     "Cannot run review gate: no harness chosen for this work item. Press c / x to pick one and re-open the session first.".into(),
                 );
-            }
         };
 
         // Resolve per-repo MCP servers up-front (UI thread) and convert
@@ -10549,10 +10493,9 @@ impl App {
                 }
             };
 
-            let default_branch = match ws.default_branch(&repo_path) {
-                Ok(b) => b,
-                Err(_) => "main".to_string(),
-            };
+            let default_branch = ws
+                .default_branch(&repo_path)
+                .unwrap_or_else(|_| "main".to_string());
 
             match crate::worktree_service::git_command()
                 .arg("-C")
@@ -10612,10 +10555,8 @@ impl App {
                     return; // Receiver dropped - gate cancelled.
                 }
 
-                let pr_num = match current_pr_number {
-                    Some(n) => Some(n),
-                    None => Self::find_pr_for_branch(&gh_owner, &gh_repo, &branch),
-                };
+                let pr_num = current_pr_number
+                    .or_else(|| Self::find_pr_for_branch(&gh_owner, &gh_repo, &branch));
 
                 if pr_num.is_none() {
                     let _ = tx.send(ReviewGateMessage::Result(ReviewGateResult {
@@ -10907,9 +10848,7 @@ impl App {
         // BEFORE `try_begin_user_action` so the 500 ms debounce does
         // not eat a repeat press - this way the user can press `c` to
         // pick a harness and immediately retry.
-        let agent_backend = if let Some(b) = self.backend_for_work_item(&wi_id) {
-            b
-        } else {
+        let Some(agent_backend) = self.backend_for_work_item(&wi_id) else {
             self.status_message = Some(
                 "Cannot rebase: no harness chosen for this work item. Press c / x to pick one first.".into(),
             );
@@ -10964,13 +10903,12 @@ impl App {
 
         // Single-flight admission. The 500 ms debounce matches
         // `Ctrl+R`: rapid presses are intentionally coalesced.
-        let activity = match self.try_begin_user_action(
+        let Some(activity) = self.try_begin_user_action(
             UserActionKey::RebaseOnMain,
             Duration::from_millis(500),
             "Rebasing onto upstream main",
-        ) {
-            Some(id) => id,
-            None => return,
+        ) else {
+            return;
         };
         // Attach the WorkItemId payload so any caller that consults
         // `user_action_work_item(&RebaseOnMain)` can find the owning
@@ -11043,10 +10981,9 @@ impl App {
             // the answer is identical to querying the main checkout, and
             // keeping the path consistent avoids a second source of
             // truth.
-            let base_branch = match ws.default_branch(&worktree_path) {
-                Ok(b) => b,
-                Err(_) => "main".to_string(),
-            };
+            let base_branch = ws
+                .default_branch(&worktree_path)
+                .unwrap_or_else(|_| "main".to_string());
 
             // Cancellation check between phase 1 and phase 2:
             // `default_branch` may shell out to git, so it is the
@@ -11379,22 +11316,23 @@ impl App {
                                         let _ = tx.send(RebaseGateMessage::Progress(msg));
                                     }
                                 }
-                                Ok(_) => {
-                                    // Other MCP events (StatusUpdate, SetPlan,
-                                    // SetTitle, ...) are intentionally ignored.
-                                    // The rebase gate writes its own activity log
-                                    // entry from `poll_rebase_gate` after the
-                                    // harness exits, so the prompt does not ask
-                                    // the harness to call `workbridge_set_status`
-                                    // and we do not forward stray events here.
-                                    // Forwarding would let a misbehaving harness
-                                    // rename the work item or overwrite its plan
-                                    // as a side effect of running a rebase.
-                                }
-                                Err(_) => {
-                                    // Channel disconnected - server gone. Continue
-                                    // waiting for the child to exit; the output_rx
-                                    // arm below will fire shortly.
+                                Ok(_) | Err(_) => {
+                                    // `Ok(_)`: other MCP events (StatusUpdate,
+                                    // SetPlan, SetTitle, ...) are intentionally
+                                    // ignored. The rebase gate writes its own
+                                    // activity log entry from `poll_rebase_gate`
+                                    // after the harness exits, so the prompt does
+                                    // not ask the harness to call
+                                    // `workbridge_set_status` and we do not
+                                    // forward stray events here. Forwarding would
+                                    // let a misbehaving harness rename the work
+                                    // item or overwrite its plan as a side effect
+                                    // of running a rebase.
+                                    //
+                                    // `Err(_)`: channel disconnected - server
+                                    // gone. Continue waiting for the child to
+                                    // exit; the output_rx arm below will fire
+                                    // shortly.
                                 }
                             }
                         }
@@ -11587,10 +11525,7 @@ impl App {
             // cancellation contract in C10 says cancelled gates do
             // NOT write to the activity log and do NOT send a
             // result through `tx`.
-            let result = match computed {
-                Some(r) => r,
-                None => return,
-            };
+            let Some(result) = computed else { return };
 
             // If the result is a Failure, clean up any in-progress
             // rebase the harness may have left behind. The harness
@@ -11825,9 +11760,8 @@ impl App {
         let wi_ids: Vec<WorkItemId> = self.review_gates.keys().cloned().collect();
 
         for wi_id in wi_ids {
-            let gate = match self.review_gates.get(&wi_id) {
-                Some(g) => g,
-                None => continue,
+            let Some(gate) = self.review_gates.get(&wi_id) else {
+                continue;
             };
 
             // Drain all pending messages for this gate.
@@ -11956,10 +11890,7 @@ impl App {
                 }
             }
 
-            let result = match result {
-                Some(r) => r,
-                None => continue, // Only progress this tick, no final result yet.
-            };
+            let Some(result) = result else { continue };
 
             // Gate completed - remove from map.
             debug_assert_eq!(result.work_item_id, wi_id);
@@ -12009,8 +11940,8 @@ impl App {
 
                 self.apply_stage_change(
                     &wi_id,
-                    &current_status,
-                    &WorkItemStatus::Review,
+                    current_status,
+                    WorkItemStatus::Review,
                     "review_gate",
                 );
             } else {
@@ -12087,9 +12018,8 @@ impl App {
         let wi_ids: Vec<WorkItemId> = self.rebase_gates.keys().cloned().collect();
 
         for wi_id in wi_ids {
-            let gate = match self.rebase_gates.get(&wi_id) {
-                Some(g) => g,
-                None => continue,
+            let Some(gate) = self.rebase_gates.get(&wi_id) else {
+                continue;
             };
 
             let mut last_progress: Option<String> = None;
@@ -12126,10 +12056,7 @@ impl App {
                 continue;
             }
 
-            let result = match result {
-                Some(r) => r,
-                None => continue,
-            };
+            let Some(result) = result else { continue };
 
             self.drop_rebase_gate(&wi_id);
 
@@ -12623,9 +12550,8 @@ impl App {
             },
             None => return,
         };
-        let pending = match self.global_session_open_pending.take() {
-            Some(p) => p,
-            None => return,
+        let Some(pending) = self.global_session_open_pending.take() else {
+            return;
         };
         self.end_activity(pending.activity);
 
@@ -12797,13 +12723,10 @@ impl App {
     pub fn extra_branches_from_backend(&self) -> std::collections::HashMap<PathBuf, Vec<String>> {
         let mut map: std::collections::HashMap<PathBuf, Vec<String>> =
             std::collections::HashMap::new();
-        let list_result = match self.backend.list() {
-            Ok(r) => r,
-            Err(_) => {
-                // Backend list failed - the fetcher just won't have extras.
-                // The error will surface through other paths (assembly, etc.).
-                return map;
-            }
+        let Ok(list_result) = self.backend.list() else {
+            // Backend list failed - the fetcher just won't have extras.
+            // The error will surface through other paths (assembly, etc.).
+            return map;
         };
         for record in &list_result.records {
             for assoc in &record.repo_associations {
@@ -13064,8 +12987,8 @@ mod tests {
     #[test]
     fn manage_unmanage_sets_fetcher_repos_changed() {
         // Setup: create a config with a base_dir containing a discovered repo.
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("repo-a/.git")).unwrap();
 
         let mut cfg = Config::default();
@@ -13111,8 +13034,8 @@ mod tests {
 
     #[test]
     fn is_inside_managed_repo_positive() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         // Create the subdirectory on disk so canonicalize succeeds.
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -13138,8 +13061,8 @@ mod tests {
     /// a subdirectory of a managed repo.
     #[test]
     fn managed_repo_root_returns_root_not_subdir() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join("src/deeply/nested")).unwrap();
 
@@ -13203,12 +13126,13 @@ mod tests {
             }
             fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
                 let mut records = self.records.lock().unwrap();
-                if let Some(pos) = records.iter().position(|r| r.id == *id) {
-                    records.remove(pos);
-                    Ok(())
-                } else {
-                    Err(BackendError::NotFound(id.clone()))
-                }
+                records.iter().position(|r| r.id == *id).map_or_else(
+                    || Err(BackendError::NotFound(id.clone())),
+                    |pos| {
+                        records.remove(pos);
+                        Ok(())
+                    },
+                )
             }
             fn update_status(
                 &self,
@@ -13592,8 +13516,8 @@ mod tests {
     #[test]
     fn active_repo_cache_uses_canonical_paths() {
         // Create a real directory and a symlink to it.
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         let real_path = dir.join("real-repo");
         let link_path = dir.join("link-repo");
         std::fs::create_dir_all(real_path.join(".git")).unwrap();
@@ -14044,7 +13968,6 @@ mod tests {
                 DisplayEntry::WorkItemEntry(wi_idx) => {
                     ordered_titles.push(app.work_items[*wi_idx].title.as_str());
                 }
-                DisplayEntry::GroupHeader { .. } => break,
                 _ => break,
             }
         }
@@ -14089,7 +14012,6 @@ mod tests {
                 DisplayEntry::WorkItemEntry(wi_idx) => {
                     ordered_titles.push(app.work_items[*wi_idx].title.as_str());
                 }
-                DisplayEntry::GroupHeader { .. } => break,
                 _ => break,
             }
         }
@@ -14105,8 +14027,8 @@ mod tests {
     /// so sorting ensures stable display indices.
     #[test]
     fn backend_list_returns_sorted_records() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         let backend = crate::work_item_backend::LocalFileBackend::with_dir(dir.clone()).unwrap();
 
         // Create items with names that would sort differently than creation order.
@@ -15075,8 +14997,8 @@ mod tests {
 
         // find_reusable_worktree canonicalizes both paths, so they must
         // exist on disk. Use a temp dir with a fresh subdirectory per case.
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let root = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let wt_target = repo.join(".worktrees").join("feature-x");
@@ -17528,14 +17450,6 @@ mod tests {
     /// `fetch_live_merge_state` return. Used by the remote-precheck
     /// tests below.
     fn install_live_pr_precheck_app(spec: LivePrPrecheckSpec<'_>) -> (App, WorkItemId) {
-        let LivePrPrecheckSpec {
-            live_pr_state,
-            branch,
-            repo,
-            cache_dirty,
-            cache_untracked,
-            cache_unpushed,
-        } = spec;
         use crate::config::InMemoryConfigProvider;
         use crate::github_client::MockGithubClient;
         use crate::worktree_service::{WorktreeError, WorktreeInfo};
@@ -17605,6 +17519,15 @@ mod tests {
                 Ok(())
             }
         }
+
+        let LivePrPrecheckSpec {
+            live_pr_state,
+            branch,
+            repo,
+            cache_dirty,
+            cache_untracked,
+            cache_unpushed,
+        } = spec;
 
         let github = MockGithubClient {
             prs: Vec::new(),
@@ -18788,8 +18711,8 @@ mod tests {
     fn confirm_set_branch_dialog_persists_and_spawns_session() {
         use crate::work_item_backend::{CreateWorkItem, LocalFileBackend, RepoAssociationRecord};
 
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         let backend = LocalFileBackend::with_dir(dir).unwrap();
         // Use Planning so spawn_session proceeds past the
         // Backlog/Done/Mergequeue early-return.
@@ -18872,8 +18795,8 @@ mod tests {
     fn spawn_session_on_branchless_item_opens_dialog_instead_of_message() {
         use crate::work_item_backend::{CreateWorkItem, LocalFileBackend, RepoAssociationRecord};
 
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         let backend = LocalFileBackend::with_dir(dir).unwrap();
         let record = backend
             .create(CreateWorkItem {
@@ -19106,8 +19029,8 @@ mod tests {
         // can verify teardown actually deletes the file from disk. Use
         // a collision-free unique name under tempfile's tempdir so
         // parallel test threads cannot race on a shared path.
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let temp_path = _tmp.path().join("workbridge-teardown-test.json");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let temp_path = tmp.path().join("workbridge-teardown-test.json");
         std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
         assert!(temp_path.exists(), "precondition: temp file exists");
         app.global_mcp_config_path = Some(temp_path.clone());
@@ -19225,8 +19148,8 @@ mod tests {
         // the worker would have written by the time the user
         // cancels. Use tempfile's unique-name tempdir so parallel
         // test threads cannot collide on a shared fixed path.
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let tmp_root = _tmp.path();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp_root = tmp.path();
         let mcp_config_path = tmp_root.join("workbridge-cancel-test-mcp.json");
         let side_car_path = tmp_root.join("workbridge-cancel-test-sidecar.json");
         std::fs::write(&mcp_config_path, b"{}").expect("create mcp_config tempfile");
@@ -19346,8 +19269,8 @@ mod tests {
             agent_written_files: Vec::new(),
         });
 
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let temp_path = _tmp.path().join("workbridge-toggle-close-test.json");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let temp_path = tmp.path().join("workbridge-toggle-close-test.json");
         std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
         app.global_mcp_config_path = Some(temp_path.clone());
         app.pending_global_pty_bytes.extend_from_slice(b"leftover");
@@ -19765,7 +19688,7 @@ mod tests {
     ) -> (App, WorkItemId) {
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/gate-test.json"));
-        let repo_assoc = if let Some(rp) = repo_path {
+        let repo_assoc = repo_path.map_or_else(Vec::new, |rp| {
             vec![crate::work_item::RepoAssociation {
                 repo_path: PathBuf::from(rp),
                 branch: branch.map(std::string::ToString::to_string),
@@ -19775,9 +19698,7 @@ mod tests {
                 git_state: None,
                 stale_worktree_path: None,
             }]
-        } else {
-            vec![]
-        };
+        });
         app.work_items.push(crate::work_item::WorkItem {
             display_id: None,
             id: wi_id.clone(),
@@ -20510,8 +20431,8 @@ mod tests {
     fn collect_backfill_requests_returns_done_items_without_pr_identity() {
         use crate::work_item_backend::LocalFileBackend;
 
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         let backend = LocalFileBackend::with_dir(dir).unwrap();
 
         // Done item with branch but no pr_identity - should be returned.
@@ -20620,12 +20541,13 @@ mod tests {
             }
             fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
                 let mut records = self.records.lock().unwrap();
-                if let Some(pos) = records.iter().position(|r| r.id == *id) {
-                    records.remove(pos);
-                    Ok(())
-                } else {
-                    Err(BackendError::NotFound(id.clone()))
-                }
+                records.iter().position(|r| r.id == *id).map_or_else(
+                    || Err(BackendError::NotFound(id.clone())),
+                    |pos| {
+                        records.remove(pos);
+                        Ok(())
+                    },
+                )
             }
             fn update_status(
                 &self,
@@ -21025,9 +20947,10 @@ mod tests {
     /// `delete_branch` on the worktree service with the correct arguments.
     #[test]
     fn delete_calls_remove_worktree_and_delete_branch() {
+        use crate::config::InMemoryConfigProvider;
+
         let recording_ws = Arc::new(ConfigurableWorktreeService::recording());
 
-        use crate::config::InMemoryConfigProvider;
         let mut app = App::with_config_and_worktree_service(
             Config::default(),
             Arc::new(FixedListBackend::one_item(
@@ -21305,12 +21228,13 @@ mod tests {
         }
         fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
             let mut records = self.records.lock().unwrap();
-            if let Some(pos) = records.iter().position(|r| r.id == *id) {
-                records.remove(pos);
-                Ok(())
-            } else {
-                Err(BackendError::NotFound(id.clone()))
-            }
+            records.iter().position(|r| r.id == *id).map_or_else(
+                || Err(BackendError::NotFound(id.clone())),
+                |pos| {
+                    records.remove(pos);
+                    Ok(())
+                },
+            )
         }
         fn update_status(
             &self,
@@ -21527,8 +21451,8 @@ mod tests {
         let wi_id = app.work_items[0].id.clone();
         app.apply_stage_change(
             &wi_id,
-            &WorkItemStatus::Review,
-            &WorkItemStatus::Done,
+            WorkItemStatus::Review,
+            WorkItemStatus::Done,
             "pr_merge",
         );
 
@@ -21562,12 +21486,7 @@ mod tests {
         app.build_display_list();
 
         let wi_id = app.work_items[0].id.clone();
-        app.apply_stage_change(
-            &wi_id,
-            &WorkItemStatus::Done,
-            &WorkItemStatus::Review,
-            "test",
-        );
+        app.apply_stage_change(&wi_id, WorkItemStatus::Done, WorkItemStatus::Review, "test");
 
         // Verify done_at was cleared.
         let records = app.backend.list().unwrap().records;
@@ -21744,16 +21663,15 @@ mod tests {
         branch: Option<&str>,
         has_commits_ahead: Option<bool>,
     ) {
-        let worktrees = match branch {
-            Some(b) => vec![crate::worktree_service::WorktreeInfo {
+        let worktrees = branch.map_or_else(Vec::new, |b| {
+            vec![crate::worktree_service::WorktreeInfo {
                 path: repo_path.join(".worktrees").join(b),
                 branch: Some(b.to_string()),
                 is_main: false,
                 has_commits_ahead,
                 ..crate::worktree_service::WorktreeInfo::default()
-            }],
-            None => Vec::new(),
-        };
+            }]
+        });
         app.repo_data.insert(
             repo_path.to_path_buf(),
             crate::work_item::RepoFetchResult {
@@ -23018,8 +22936,8 @@ mod tests {
         // cancelled, not the source-string semantics.
         app.apply_stage_change(
             &wi_id,
-            &WorkItemStatus::Implementing,
-            &WorkItemStatus::Mergequeue,
+            WorkItemStatus::Implementing,
+            WorkItemStatus::Mergequeue,
             "pr_merge",
         );
 
@@ -24568,12 +24486,13 @@ mod tests {
                 self.delete_call_count
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut records = self.records.lock().unwrap();
-                if let Some(pos) = records.iter().position(|r| r.id == *id) {
-                    records.remove(pos);
-                    Ok(())
-                } else {
-                    Err(BackendError::NotFound(id.clone()))
-                }
+                records.iter().position(|r| r.id == *id).map_or_else(
+                    || Err(BackendError::NotFound(id.clone())),
+                    |pos| {
+                        records.remove(pos);
+                        Ok(())
+                    },
+                )
             }
             fn update_status(
                 &self,
@@ -24699,8 +24618,8 @@ mod tests {
             ActivityEntry, CreateWorkItem, LocalFileBackend, RepoAssociationRecord, WorkItemBackend,
         };
 
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         let backend = LocalFileBackend::with_dir(dir).expect("backend must be constructable");
 
         // Create a work item. `LocalFileBackend::create` seeds an
@@ -24944,12 +24863,13 @@ mod tests {
         }
         fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
             let mut records = self.records.lock().unwrap();
-            if let Some(pos) = records.iter().position(|r| r.id == *id) {
-                records.remove(pos);
-                Ok(())
-            } else {
-                Err(BackendError::NotFound(id.clone()))
-            }
+            records.iter().position(|r| r.id == *id).map_or_else(
+                || Err(BackendError::NotFound(id.clone())),
+                |pos| {
+                    records.remove(pos);
+                    Ok(())
+                },
+            )
         }
         fn update_status(
             &self,

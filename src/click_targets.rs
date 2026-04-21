@@ -63,8 +63,7 @@ impl ClickTarget {
     /// Rect in absolute frame coordinates, regardless of variant.
     pub const fn rect(&self) -> Rect {
         match self {
-            Self::Copy { rect, .. } => *rect,
-            Self::WorkItemRow { rect, .. } => *rect,
+            Self::Copy { rect, .. } | Self::WorkItemRow { rect, .. } => *rect,
         }
     }
 }

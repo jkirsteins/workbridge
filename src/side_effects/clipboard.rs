@@ -68,6 +68,13 @@ use std::io::Write;
 /// drag-select handler) because ratatui's frame writes also go through
 /// the same `stdout` handle. We flush after the write so the sequence
 /// reaches the terminal before the next draw.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "under cfg(test) the body reduces to returning `false`; under cfg(not(test)) it writes to stdout / calls `arboard` and cannot be const"
+    )
+)]
 #[must_use]
 pub fn copy(text: &str) -> bool {
     #[cfg(test)]

@@ -539,7 +539,7 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
-    pub fn style_stage_badge(&self, status: &WorkItemStatus) -> Style {
+    pub fn style_stage_badge(&self, status: WorkItemStatus) -> Style {
         let color = match status {
             WorkItemStatus::Backlog => self.badge_backlog,
             WorkItemStatus::Planning => self.badge_planning,
@@ -550,10 +550,10 @@ impl Theme {
             WorkItemStatus::Done => self.badge_done,
         };
         let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);
-        if *status == WorkItemStatus::Blocked {
+        if status == WorkItemStatus::Blocked {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        if *status == WorkItemStatus::Done {
+        if status == WorkItemStatus::Done {
             style = style.add_modifier(Modifier::DIM);
         }
         style

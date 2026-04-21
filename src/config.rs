@@ -82,6 +82,13 @@ pub use test_support::InMemoryConfigProvider;
 
 /// Get the user's home directory via the side-effects gate. Returns
 /// `None` under `cfg(test)` so tests cannot reach the real `$HOME`.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "delegates to a side-effects gate that is `const` only under cfg(test); under cfg(not(test)) the body calls a non-const user-dirs helper and cannot be const"
+    )
+)]
 fn home_dir() -> Option<PathBuf> {
     crate::side_effects::paths::home_dir()
 }
@@ -569,7 +576,7 @@ impl Config {
 /// directory and then renaming. On POSIX, rename within the same filesystem
 /// is atomic, so a crash mid-write leaves the original file intact.
 fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp_path = parent.join(format!(
         ".{}.tmp",
         path.file_name()
@@ -640,8 +647,8 @@ mod tests {
 
     #[test]
     fn save_and_load_roundtrip() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         let path = dir.join("config.toml");
 
         let config = Config {
@@ -660,8 +667,8 @@ mod tests {
 
     #[test]
     fn discover_repos_finds_git_dirs() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         fs::create_dir_all(dir.join("repo-a/.git")).unwrap();
         fs::create_dir_all(dir.join("repo-b/.git")).unwrap();
         fs::create_dir_all(dir.join("not-a-repo")).unwrap();
@@ -674,8 +681,8 @@ mod tests {
 
     #[test]
     fn discover_repos_empty_dir() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
 
         let found = discover_git_repos_in(&dir);
         assert!(found.is_empty());
@@ -689,8 +696,8 @@ mod tests {
 
     #[test]
     fn add_repo_validates_git_dir() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         fs::create_dir_all(dir.join(".git")).unwrap();
 
         let mut config = Config::default();
@@ -701,8 +708,8 @@ mod tests {
 
     #[test]
     fn add_repo_rejects_non_repo() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
 
         let mut config = Config::default();
         let result = config.add_repo(dir.to_str().unwrap());
@@ -711,8 +718,8 @@ mod tests {
 
     #[test]
     fn add_base_dir_accepts_directory() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         fs::create_dir_all(dir.join("child-repo/.git")).unwrap();
 
         let mut config = Config::default();
@@ -898,8 +905,8 @@ mod tests {
 
     #[test]
     fn remove_path_removes_repo() {
-        let _tmp = tempfile::tempdir().expect("tempdir");
-        let dir = _tmp.path().to_path_buf();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
         fs::create_dir_all(dir.join(".git")).unwrap();
 
         let mut config = Config::default();
