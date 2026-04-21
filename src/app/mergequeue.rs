@@ -252,7 +252,7 @@ impl super::App {
     /// Temporary migration helper - can be removed once all existing Done
     /// items have been backfilled.
     pub fn drain_pr_identity_backfill(&mut self) -> bool {
-        let Some(rx) = self.pr_identity_backfill_rx.as_ref() else {
+        let Some(rx) = self.pr_identity_backfill.rx.as_ref() else {
             return false;
         };
         let mut changed = false;
@@ -283,11 +283,8 @@ impl super::App {
                 }
             }
         }
-        if disconnected {
-            self.pr_identity_backfill_rx = None;
-            if let Some(aid) = self.pr_identity_backfill_activity.take() {
-                self.activities.end(aid);
-            }
+        if disconnected && let Some(aid) = self.pr_identity_backfill.take_activity_on_disconnect() {
+            self.activities.end(aid);
         }
         changed
     }

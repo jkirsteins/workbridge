@@ -190,11 +190,9 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
     // on the Disconnected branch.
     let backfill_requests = state.collect_backfill_requests();
     if !backfill_requests.is_empty() {
-        state.pr_identity_backfill_activity = Some(
-            state
-                .activities
-                .start("Backfilling merged PR identities..."),
-        );
+        let activity = state
+            .activities
+            .start("Backfilling merged PR identities...");
         let gc = Arc::clone(&ctx.github_client);
         let (tx, rx) = crossbeam_channel::unbounded();
         std::thread::spawn(move || {
@@ -233,7 +231,7 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
                 }
             }
         });
-        state.pr_identity_backfill_rx = Some(rx);
+        state.pr_identity_backfill.install(rx, activity);
     }
 
     Ok(())

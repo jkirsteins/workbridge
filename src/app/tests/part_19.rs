@@ -426,9 +426,8 @@ fn drain_pr_identity_backfill_ends_activity_on_disconnect() {
     let (tx, rx) =
         crossbeam_channel::unbounded::<Result<crate::app::PrIdentityBackfillResult, String>>();
     drop(tx);
-    app.pr_identity_backfill_rx = Some(rx);
     let aid = app.activities.start("Backfilling merged PR identities...");
-    app.pr_identity_backfill_activity = Some(aid);
+    app.pr_identity_backfill.install(rx, aid);
 
     let changed = app.drain_pr_identity_backfill();
 
@@ -437,11 +436,11 @@ fn drain_pr_identity_backfill_ends_activity_on_disconnect() {
         "no Ok messages were sent so changed must be false",
     );
     assert!(
-        app.pr_identity_backfill_rx.is_none(),
+        app.pr_identity_backfill.rx.is_none(),
         "Disconnected branch must drop the receiver",
     );
     assert!(
-        app.pr_identity_backfill_activity.is_none(),
+        app.pr_identity_backfill.activity.is_none(),
         "Disconnected branch must take the ActivityId",
     );
     assert!(

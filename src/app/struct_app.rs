@@ -363,16 +363,12 @@ pub struct App {
     pub review_request_merge_poll_errors: HashMap<WorkItemId, String>,
 
     // -- PR identity backfill --
-    /// Receiver for background PR identity backfill results (one-time startup).
-    pub pr_identity_backfill_rx:
-        Option<crossbeam_channel::Receiver<Result<PrIdentityBackfillResult, String>>>,
-    /// Status-bar activity ID for the PR identity backfill spawned in
-    /// `app_init` (see `salsa.rs`). Kept on `App` so
-    /// `drain_pr_identity_backfill` can end it when the background thread
-    /// finishes. Following the `docs/UI.md` "Activity indicator placement"
-    /// rule: this is a system-initiated startup migration and therefore
-    /// owes the user a status-bar spinner (not a blocking dialog).
-    pub pr_identity_backfill_activity: Option<ActivityId>,
+    /// `PrIdentityBackfill` subsystem: owns the startup-only
+    /// migration's receiver + status-bar activity as a single pair
+    /// (so the two `Option`s can no longer drift out of lockstep).
+    /// Replaces `pr_identity_backfill_rx` / `pr_identity_backfill_activity`.
+    /// See `app::PrIdentityBackfill`.
+    pub pr_identity_backfill: PrIdentityBackfill,
 
     // -- Async session-open plan read --
     /// Pending background plan reads, keyed by work item ID. Each entry
