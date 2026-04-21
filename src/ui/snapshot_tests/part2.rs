@@ -32,7 +32,7 @@
             ..Config::for_test()
         };
         let mut app = App::with_config(config, Arc::new(StubBackend));
-        app.show_settings = true;
+        app.settings.visible = true;
         let raw_output = render(&mut app, 80, 24);
 
         // The tempdir root differs per platform (`/var/folders/...`

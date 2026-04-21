@@ -142,7 +142,7 @@ pub fn handle_key_board(app: &mut App, key: KeyEvent) {
         }
         // ? - toggle settings overlay
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
-            app.show_settings = !app.show_settings;
+            app.settings.toggle();
         }
         _ => {}
     }
@@ -182,7 +182,7 @@ pub fn handle_key_dashboard(app: &mut App, key: KeyEvent) {
         }
         // ?/Shift+? - settings overlay toggle (parity with handle_key_board).
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
-            app.show_settings = !app.show_settings;
+            app.settings.toggle();
         }
         _ => {}
     }
@@ -340,7 +340,7 @@ pub fn handle_key_left(app: &mut App, key: KeyEvent) {
         }
         // ? - toggle settings overlay
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) => {
-            app.show_settings = !app.show_settings;
+            app.settings.toggle();
         }
         // c / x - open a session on the selected work item using the
         // chosen harness. `c` is Claude, `x` is Codex. On a work-item

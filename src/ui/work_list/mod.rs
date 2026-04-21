@@ -124,7 +124,7 @@ pub fn predict_list_offset(
 pub fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // When the settings overlay is open, dim background panels so the
     // overlay is the clear focal point.
-    let border_style = if app.show_settings {
+    let border_style = if app.settings.visible {
         theme.style_border_unfocused()
     } else if app.shell.focus == FocusPanel::Left {
         theme.style_border_focused()

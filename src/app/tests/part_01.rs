@@ -30,8 +30,8 @@ fn manage_unmanage_sets_fetcher_repos_changed() {
     assert!(!app.fetcher_repos_changed);
 
     // Manage a repo from the available list.
-    app.settings_list_focus = SettingsListFocus::Available;
-    app.settings_available_selected = 0;
+    app.settings.list_focus = SettingsListFocus::Available;
+    app.settings.available_selected = 0;
     app.manage_selected_repo();
     assert!(
         app.fetcher_repos_changed,
@@ -40,7 +40,7 @@ fn manage_unmanage_sets_fetcher_repos_changed() {
 
     // Reset and test unmanage.
     app.fetcher_repos_changed = false;
-    app.settings_list_focus = SettingsListFocus::Managed;
+    app.settings.list_focus = SettingsListFocus::Managed;
     // The managed repo that is discovered (not explicit) can be unmanaged.
     // Find the discovered repo in the managed list.
     let discovered_idx = app
@@ -48,7 +48,7 @@ fn manage_unmanage_sets_fetcher_repos_changed() {
         .iter()
         .position(|e| e.source == RepoSource::Discovered)
         .expect("should have a discovered managed repo");
-    app.settings_repo_selected = discovered_idx;
+    app.settings.repo_selected = discovered_idx;
     app.unmanage_selected_repo();
     assert!(
         app.fetcher_repos_changed,

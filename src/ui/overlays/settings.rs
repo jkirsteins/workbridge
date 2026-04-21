@@ -57,7 +57,7 @@ pub fn draw_settings_overlay(buf: &mut Buffer, app: &mut App, theme: &Theme, are
         .areas(inner);
 
     // Tab bar.
-    let tab_selected = match app.settings_tab {
+    let tab_selected = match app.settings.tab {
         SettingsTab::Repos => 0,
         SettingsTab::ReviewGate => 1,
         SettingsTab::Keybindings => 2,
@@ -75,7 +75,7 @@ pub fn draw_settings_overlay(buf: &mut Buffer, app: &mut App, theme: &Theme, are
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .areas(body_area);
 
-    match app.settings_tab {
+    match app.settings.tab {
         SettingsTab::Keybindings => {
             draw_settings_keybindings_tab(buf, app, theme, content_area);
             let hint = Line::styled(
@@ -86,7 +86,7 @@ pub fn draw_settings_overlay(buf: &mut Buffer, app: &mut App, theme: &Theme, are
         }
         SettingsTab::ReviewGate => {
             draw_settings_review_gate_tab(buf, app, theme, content_area);
-            let hint = if app.settings_review_skill_editing {
+            let hint = if app.settings.review_skill_editing {
                 Line::styled("Enter: save   Esc: cancel", theme.style_text_muted())
             } else {
                 Line::styled(
@@ -197,7 +197,7 @@ pub fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area:
         .split(sections[2]);
 
     // Managed repos list (left).
-    let managed_border = if app.settings_list_focus == SettingsListFocus::Managed {
+    let managed_border = if app.settings.list_focus == SettingsListFocus::Managed {
         theme.style_border_focused()
     } else {
         theme.style_border_subtle()
@@ -219,9 +219,10 @@ pub fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area:
             .highlight_style(theme.style_tab_highlight())
             .highlight_symbol("> ");
         let mut state = ListState::default();
-        if app.settings_list_focus == SettingsListFocus::Managed {
+        if app.settings.list_focus == SettingsListFocus::Managed {
             state.select(Some(
-                app.settings_repo_selected
+                app.settings
+                    .repo_selected
                     .min(managed_count.saturating_sub(1)),
             ));
         }
@@ -229,7 +230,7 @@ pub fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area:
     }
 
     // Available repos list (right).
-    let available_border = if app.settings_list_focus == SettingsListFocus::Available {
+    let available_border = if app.settings.list_focus == SettingsListFocus::Available {
         theme.style_border_focused()
     } else {
         theme.style_border_subtle()
@@ -251,9 +252,10 @@ pub fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area:
             .highlight_style(theme.style_tab_highlight())
             .highlight_symbol("> ");
         let mut state = ListState::default();
-        if app.settings_list_focus == SettingsListFocus::Available {
+        if app.settings.list_focus == SettingsListFocus::Available {
             state.select(Some(
-                app.settings_available_selected
+                app.settings
+                    .available_selected
                     .min(available_count.saturating_sub(1)),
             ));
         }
@@ -295,15 +297,15 @@ pub fn draw_settings_review_gate_tab(buf: &mut Buffer, app: &mut App, theme: &Th
     let label = Line::styled("Skill (slash command):", theme.style_text());
     Paragraph::new(label).render(rows[2], buf);
 
-    if app.settings_review_skill_editing {
+    if app.settings.review_skill_editing {
         // Render with rat-widget's TextInput so the caret is drawn by the
         // same stateful widget used by the Create Work Item dialog.
-        app.settings_review_skill_input.focus.set(true);
+        app.settings.review_skill_input.focus.set(true);
         StatefulWidget::render(
             TextInput::new().styles(create_dialog_text_style(theme)),
             rows[3],
             buf,
-            &mut app.settings_review_skill_input,
+            &mut app.settings.review_skill_input,
         );
     } else {
         // Show the current value; mirror the unfocused single-line style.
@@ -398,6 +400,6 @@ pub fn draw_settings_keybindings_tab(buf: &mut Buffer, app: &App, theme: &Theme,
     ];
 
     Paragraph::new(Text::from(lines))
-        .scroll((app.settings_keybindings_scroll, 0))
+        .scroll((app.settings.keybindings_scroll, 0))
         .render(area, buf);
 }

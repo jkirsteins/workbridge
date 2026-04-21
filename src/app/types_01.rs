@@ -193,16 +193,18 @@ pub const BOARD_COLUMNS: &[WorkItemStatus] = &[
 ];
 
 /// Which top-level tab is active inside the settings overlay.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SettingsTab {
+    #[default]
     Repos,
     ReviewGate,
     Keybindings,
 }
 
 /// Which column has focus inside the Repos tab of the settings overlay.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SettingsListFocus {
+    #[default]
     Managed,
     Available,
 }

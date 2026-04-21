@@ -154,7 +154,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
     }
 
     // Settings overlay (rendered on top of everything).
-    if app.show_settings {
+    if app.settings.visible {
         draw_settings_overlay(buf, app, theme, area);
     }
 

@@ -41,7 +41,7 @@ pub fn is_ctrl_symbol(key: KeyEvent, symbol: char) -> bool {
 /// modal will not reliably swallow paste and mouse events.
 pub fn any_modal_visible(app: &App) -> bool {
     app.create_dialog.visible
-        || app.show_settings
+        || app.settings.visible
         || app.rework_prompt_visible
         || app.no_plan_prompt_visible
         || app.branch_gone_prompt.is_some()

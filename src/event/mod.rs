@@ -295,49 +295,42 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // When the settings overlay is open, handle overlay-specific keys.
-    if app.show_settings {
+    if app.settings.visible {
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) | (_, KeyCode::Esc)
-                if !app.settings_review_skill_editing =>
+                if !app.settings.review_skill_editing =>
             {
-                app.show_settings = false;
-                app.settings_tab = SettingsTab::Repos;
-                app.settings_repo_selected = 0;
-                app.settings_available_selected = 0;
-                app.settings_list_focus = SettingsListFocus::Managed;
-                app.settings_keybindings_scroll = 0;
-                app.settings_review_skill_editing = false;
-                app.settings_review_skill_input.clear();
+                app.settings.close();
             }
-            (_, KeyCode::Tab) if !app.settings_review_skill_editing => {
-                app.settings_tab = match app.settings_tab {
+            (_, KeyCode::Tab) if !app.settings.review_skill_editing => {
+                app.settings.tab = match app.settings.tab {
                     SettingsTab::Repos => SettingsTab::ReviewGate,
                     SettingsTab::ReviewGate => SettingsTab::Keybindings,
                     SettingsTab::Keybindings => SettingsTab::Repos,
                 };
                 // Reset editing state when leaving ReviewGate tab.
-                app.settings_review_skill_editing = false;
-                app.settings_review_skill_input.clear();
+                app.settings.review_skill_editing = false;
+                app.settings.review_skill_input.clear();
             }
-            (_, KeyCode::Left) if app.settings_tab == SettingsTab::Repos => {
-                app.settings_list_focus = SettingsListFocus::Managed;
+            (_, KeyCode::Left) if app.settings.tab == SettingsTab::Repos => {
+                app.settings.list_focus = SettingsListFocus::Managed;
             }
-            (_, KeyCode::Right) if app.settings_tab == SettingsTab::Repos => {
-                app.settings_list_focus = SettingsListFocus::Available;
+            (_, KeyCode::Right) if app.settings.tab == SettingsTab::Repos => {
+                app.settings.list_focus = SettingsListFocus::Available;
             }
             // ReviewGate tab: editing mode routes keys to the text input.
             (_, KeyCode::Esc)
-                if app.settings_tab == SettingsTab::ReviewGate
-                    && app.settings_review_skill_editing =>
+                if app.settings.tab == SettingsTab::ReviewGate
+                    && app.settings.review_skill_editing =>
             {
-                app.settings_review_skill_editing = false;
-                app.settings_review_skill_input.clear();
+                app.settings.review_skill_editing = false;
+                app.settings.review_skill_input.clear();
             }
             (_, KeyCode::Enter)
-                if app.settings_tab == SettingsTab::ReviewGate
-                    && app.settings_review_skill_editing =>
+                if app.settings.tab == SettingsTab::ReviewGate
+                    && app.settings.review_skill_editing =>
             {
-                let new_value = app.settings_review_skill_input.text().trim().to_string();
+                let new_value = app.settings.review_skill_input.text().trim().to_string();
                 let old_value = app.services.config.defaults.review_skill.clone();
                 app.services
                     .config
@@ -351,103 +344,103 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 } else {
                     app.shell.status_message = Some(format!("Review skill set to: {new_value}"));
                 }
-                app.settings_review_skill_editing = false;
-                app.settings_review_skill_input.clear();
+                app.settings.review_skill_editing = false;
+                app.settings.review_skill_input.clear();
             }
-            (_, KeyCode::Enter) if app.settings_tab == SettingsTab::ReviewGate => {
+            (_, KeyCode::Enter) if app.settings.tab == SettingsTab::ReviewGate => {
                 // Start editing with the current config value.
                 let current = app.services.config.defaults.review_skill.clone();
-                app.settings_review_skill_input.set_text(&current);
-                app.settings_review_skill_editing = true;
+                app.settings.review_skill_input.set_text(&current);
+                app.settings.review_skill_editing = true;
             }
             (_, KeyCode::Char(c))
-                if app.settings_tab == SettingsTab::ReviewGate
-                    && app.settings_review_skill_editing
+                if app.settings.tab == SettingsTab::ReviewGate
+                    && app.settings.review_skill_editing
                     && !key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                app.settings_review_skill_input.insert_char(c);
+                app.settings.review_skill_input.insert_char(c);
             }
             (_, KeyCode::Backspace)
-                if app.settings_tab == SettingsTab::ReviewGate
-                    && app.settings_review_skill_editing =>
+                if app.settings.tab == SettingsTab::ReviewGate
+                    && app.settings.review_skill_editing =>
             {
-                app.settings_review_skill_input.delete_prev_char();
+                app.settings.review_skill_input.delete_prev_char();
             }
             (_, KeyCode::Delete)
-                if app.settings_tab == SettingsTab::ReviewGate
-                    && app.settings_review_skill_editing =>
+                if app.settings.tab == SettingsTab::ReviewGate
+                    && app.settings.review_skill_editing =>
             {
-                app.settings_review_skill_input.delete_next_char();
+                app.settings.review_skill_input.delete_next_char();
             }
             (_, KeyCode::Left)
-                if app.settings_tab == SettingsTab::ReviewGate
-                    && app.settings_review_skill_editing =>
+                if app.settings.tab == SettingsTab::ReviewGate
+                    && app.settings.review_skill_editing =>
             {
-                app.settings_review_skill_input.move_left(false);
+                app.settings.review_skill_input.move_left(false);
             }
             (_, KeyCode::Right)
-                if app.settings_tab == SettingsTab::ReviewGate
-                    && app.settings_review_skill_editing =>
+                if app.settings.tab == SettingsTab::ReviewGate
+                    && app.settings.review_skill_editing =>
             {
-                app.settings_review_skill_input.move_right(false);
+                app.settings.review_skill_input.move_right(false);
             }
             (_, KeyCode::Home)
-                if app.settings_tab == SettingsTab::ReviewGate
-                    && app.settings_review_skill_editing =>
+                if app.settings.tab == SettingsTab::ReviewGate
+                    && app.settings.review_skill_editing =>
             {
-                app.settings_review_skill_input.move_to_line_start(false);
+                app.settings.review_skill_input.move_to_line_start(false);
             }
             (_, KeyCode::End)
-                if app.settings_tab == SettingsTab::ReviewGate
-                    && app.settings_review_skill_editing =>
+                if app.settings.tab == SettingsTab::ReviewGate
+                    && app.settings.review_skill_editing =>
             {
-                app.settings_review_skill_input.move_to_line_end(false);
+                app.settings.review_skill_input.move_to_line_end(false);
             }
-            (_, KeyCode::Up) => match app.settings_tab {
-                SettingsTab::Repos => match app.settings_list_focus {
+            (_, KeyCode::Up) => match app.settings.tab {
+                SettingsTab::Repos => match app.settings.list_focus {
                     SettingsListFocus::Managed => {
-                        app.settings_repo_selected = app.settings_repo_selected.saturating_sub(1);
+                        app.settings.repo_selected = app.settings.repo_selected.saturating_sub(1);
                     }
                     SettingsListFocus::Available => {
-                        app.settings_available_selected =
-                            app.settings_available_selected.saturating_sub(1);
+                        app.settings.available_selected =
+                            app.settings.available_selected.saturating_sub(1);
                     }
                 },
                 SettingsTab::ReviewGate => {}
                 SettingsTab::Keybindings => {
-                    app.settings_keybindings_scroll =
-                        app.settings_keybindings_scroll.saturating_sub(1);
+                    app.settings.keybindings_scroll =
+                        app.settings.keybindings_scroll.saturating_sub(1);
                 }
             },
-            (_, KeyCode::Down) => match app.settings_tab {
-                SettingsTab::Repos => match app.settings_list_focus {
+            (_, KeyCode::Down) => match app.settings.tab {
+                SettingsTab::Repos => match app.settings.list_focus {
                     SettingsListFocus::Managed => {
                         let max = app.total_repos().saturating_sub(1);
-                        if app.settings_repo_selected < max {
-                            app.settings_repo_selected += 1;
+                        if app.settings.repo_selected < max {
+                            app.settings.repo_selected += 1;
                         }
                     }
                     SettingsListFocus::Available => {
                         let max = app.available_repos().len().saturating_sub(1);
-                        if app.settings_available_selected < max {
-                            app.settings_available_selected += 1;
+                        if app.settings.available_selected < max {
+                            app.settings.available_selected += 1;
                         }
                     }
                 },
                 SettingsTab::ReviewGate => {}
                 SettingsTab::Keybindings => {
-                    app.settings_keybindings_scroll += 1;
+                    app.settings.keybindings_scroll += 1;
                 }
             },
             (_, KeyCode::Enter)
-                if app.settings_tab == SettingsTab::Repos
-                    && app.settings_list_focus == SettingsListFocus::Managed =>
+                if app.settings.tab == SettingsTab::Repos
+                    && app.settings.list_focus == SettingsListFocus::Managed =>
             {
                 app.unmanage_selected_repo();
             }
             (_, KeyCode::Enter)
-                if app.settings_tab == SettingsTab::Repos
-                    && app.settings_list_focus == SettingsListFocus::Available =>
+                if app.settings.tab == SettingsTab::Repos
+                    && app.settings.list_focus == SettingsListFocus::Available =>
             {
                 app.manage_selected_repo();
             }

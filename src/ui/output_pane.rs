@@ -18,7 +18,7 @@ use crate::work_item::WorkItemStatus;
 
 pub fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // When the settings overlay is open, dim background panels.
-    let border_style = if app.show_settings {
+    let border_style = if app.settings.visible {
         theme.style_border_unfocused()
     } else if app.shell.focus == FocusPanel::Right {
         theme.style_border_input()

@@ -104,8 +104,9 @@ pub fn route_paste_to_modal_input(app: &mut App, data: &str) -> bool {
     }
 
     // 4. Settings review-skill input (single-line, only while editing).
-    if app.show_settings && app.settings_review_skill_editing {
-        app.settings_review_skill_input
+    if app.settings.visible && app.settings.review_skill_editing {
+        app.settings
+            .review_skill_input
             .insert_str(flatten_paste_for_single_line(data));
         return true;
     }
@@ -357,10 +358,10 @@ mod tests {
     #[test]
     fn paste_into_settings_review_skill_input_inserts_text() {
         let mut app = App::new();
-        app.show_settings = true;
-        app.settings_tab = SettingsTab::ReviewGate;
-        app.settings_review_skill_editing = true;
-        app.settings_review_skill_input.clear();
+        app.settings.visible = true;
+        app.settings.tab = SettingsTab::ReviewGate;
+        app.settings.review_skill_editing = true;
+        app.settings.review_skill_input.clear();
 
         let changed = handle_paste(&mut app, "claude-toolkit:principled-review");
         assert!(
@@ -368,7 +369,7 @@ mod tests {
             "paste into settings review-skill input should return true",
         );
         assert_eq!(
-            app.settings_review_skill_input.text(),
+            app.settings.review_skill_input.text(),
             "claude-toolkit:principled-review",
         );
     }
@@ -378,17 +379,17 @@ mod tests {
     #[test]
     fn paste_into_settings_without_edit_mode_is_noop() {
         let mut app = App::new();
-        app.show_settings = true;
-        app.settings_tab = SettingsTab::ReviewGate;
-        app.settings_review_skill_editing = false;
-        app.settings_review_skill_input.clear();
+        app.settings.visible = true;
+        app.settings.tab = SettingsTab::ReviewGate;
+        app.settings.review_skill_editing = false;
+        app.settings.review_skill_input.clear();
 
         let changed = handle_paste(&mut app, "stray paste");
         assert!(
             !changed,
             "settings overlay without edit mode must swallow paste",
         );
-        assert_eq!(app.settings_review_skill_input.text(), "");
+        assert_eq!(app.settings.review_skill_input.text(), "");
     }
 
     /// Regression guard: with no modal visible and focus on the left

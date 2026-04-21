@@ -149,15 +149,8 @@ impl super::App {
             stale_recovery_in_progress: false,
             no_plan_prompt_visible: false,
             no_plan_prompt_queue: VecDeque::new(),
-            show_settings: false,
+            settings: SettingsOverlay::new(),
             active_repo_cache,
-            settings_repo_selected: 0,
-            settings_available_selected: 0,
-            settings_tab: SettingsTab::Repos,
-            settings_list_focus: SettingsListFocus::Managed,
-            settings_keybindings_scroll: 0,
-            settings_review_skill_input: rat_widget::text_input::TextInputState::new(),
-            settings_review_skill_editing: false,
             create_dialog: CreateDialog::new(),
             work_items: Vec::new(),
             unlinked_prs: Vec::new(),
@@ -492,7 +485,8 @@ impl super::App {
             return;
         }
         let idx = self
-            .settings_repo_selected
+            .settings
+            .repo_selected
             .min(self.active_repo_cache.len().saturating_sub(1));
         let entry = &self.active_repo_cache[idx];
         if entry.source == RepoSource::Explicit {
@@ -513,10 +507,11 @@ impl super::App {
         self.refresh_repo_cache();
         // Adjust cursor if it went past the end.
         if self.active_repo_cache.is_empty() {
-            self.settings_repo_selected = 0;
+            self.settings.repo_selected = 0;
         } else {
-            self.settings_repo_selected = self
-                .settings_repo_selected
+            self.settings.repo_selected = self
+                .settings
+                .repo_selected
                 .min(self.active_repo_cache.len() - 1);
         }
     }
@@ -530,7 +525,8 @@ impl super::App {
             return;
         }
         let idx = self
-            .settings_available_selected
+            .settings
+            .available_selected
             .min(available.len().saturating_sub(1));
         let path = available[idx].path.display().to_string();
         self.services.config.include_repo(&path);
@@ -547,9 +543,9 @@ impl super::App {
         let new_available = self.available_repos();
         let new_len = new_available.len();
         if new_len > 0 {
-            self.settings_available_selected = self.settings_available_selected.min(new_len - 1);
+            self.settings.available_selected = self.settings.available_selected.min(new_len - 1);
         } else {
-            self.settings_available_selected = 0;
+            self.settings.available_selected = 0;
         }
     }
 }

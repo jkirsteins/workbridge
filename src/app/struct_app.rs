@@ -121,25 +121,20 @@ pub struct App {
     /// takes `&mut SharedServices` instead of `&mut App` when only
     /// services are needed. See `app::SharedServices`.
     pub services: SharedServices,
-    /// Whether to show the settings overlay.
-    pub show_settings: bool,
+    /// Settings overlay subsystem (the `?` key view). Owns the
+    /// visible flag, both cursors, the active tab, the Repos-tab
+    /// focus column, the keybindings scroll, and the Review-Gate tab
+    /// review-skill text input + editing flag. Replaces eight
+    /// previously sibling fields on `App`. See
+    /// `app::SettingsOverlay`.
+    pub settings: SettingsOverlay,
     /// Cached active repo entries (explicit + included). Rebuilt when
     /// inclusions change, not on every frame or keypress.
+    ///
+    /// Lives on `App`, NOT inside `SettingsOverlay`, because every
+    /// reassembly / spawn site / display read consults it. The
+    /// settings overlay only renders it.
     pub active_repo_cache: Vec<RepoEntry>,
-    /// Cursor position in the managed repos list.
-    pub settings_repo_selected: usize,
-    /// Cursor position in the available repos list.
-    pub settings_available_selected: usize,
-    /// Which top-level tab is active in the settings overlay.
-    pub settings_tab: SettingsTab,
-    /// Which column has focus inside the Repos tab.
-    pub settings_list_focus: SettingsListFocus,
-    /// Scroll offset for the keybindings tab in the settings overlay.
-    pub settings_keybindings_scroll: u16,
-    /// Text input for editing the review skill in the Review Gate tab.
-    pub settings_review_skill_input: rat_widget::text_input::TextInputState,
-    /// Whether the review skill text input is in editing mode.
-    pub settings_review_skill_editing: bool,
     /// State for the work item creation modal dialog.
     pub create_dialog: CreateDialog,
 
