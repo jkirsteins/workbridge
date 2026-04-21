@@ -4,6 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+// Use the crossterm event type re-exported by rat-event, which matches
+// the version that rat-salsa's PollCrossterm expects (crossterm 0.29 via
+// ratatui-crossterm). The project's direct crossterm dependency (0.28)
+// is used by the existing event loop and will be migrated in a later phase.
+pub use rat_event::crossterm as ct;
 use rat_salsa::event::RenderedEvent;
 use rat_salsa::timer::{TimeOut, TimerDef};
 use rat_salsa::{Control, SalsaAppContext, SalsaContext};
@@ -11,19 +16,8 @@ use ratatui_core::buffer::Buffer;
 use ratatui_core::layout::Rect;
 
 use crate::app::App;
-use crate::event;
-use crate::fetcher;
-use crate::github_client;
-use crate::layout;
 use crate::theme::Theme;
-use crate::ui;
-use crate::worktree_service;
-
-// Use the crossterm event type re-exported by rat-event, which matches
-// the version that rat-salsa's PollCrossterm expects (crossterm 0.29 via
-// ratatui-crossterm). The project's direct crossterm dependency (0.28)
-// is used by the existing event loop and will be migrated in a later phase.
-pub use rat_event::crossterm as ct;
+use crate::{event, fetcher, github_client, layout, ui, worktree_service};
 
 /// Custom event type for the application.
 ///

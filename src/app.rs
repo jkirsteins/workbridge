@@ -4,8 +4,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::agent_backend::{
@@ -13050,9 +13049,10 @@ impl WorkItemBackend for StubBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::work_item::BackendType;
-    use std::path::PathBuf;
 
     /// Poll-wait for a path to be removed from disk, bounded by
     /// `timeout`. Used in tests that drive teardown paths whose file

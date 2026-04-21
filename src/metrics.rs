@@ -480,9 +480,10 @@ pub fn spawn_metrics_aggregator(data_dir: PathBuf) -> crossbeam_channel::Receive
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    use super::*;
 
     /// Allocate a fresh tempdir for a test. Returns both the `TempDir`
     /// guard (which removes the directory on drop) and a concrete

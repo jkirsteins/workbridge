@@ -978,10 +978,11 @@ mod tests {
 #[cfg(test)]
 #[cfg(feature = "integration")]
 mod integration_tests {
-    use super::*;
     use std::fs;
     use std::path::Path;
     use std::process::Command;
+
+    use super::*;
 
     /// Build a Command with git environment variables cleared so
     /// child git processes operate on `dir` instead of inheriting

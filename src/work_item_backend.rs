@@ -1,8 +1,7 @@
 use std::collections::HashMap;
-use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::{fmt, fs};
 
 use serde::{Deserialize, Serialize};
 

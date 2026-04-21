@@ -1530,8 +1530,9 @@ impl BridgeArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crossbeam_channel::unbounded;
+
+    use super::*;
 
     fn make_tx() -> Sender<McpEvent> {
         let (tx, _rx) = unbounded();
@@ -1895,8 +1896,9 @@ mod tests {
 
     #[test]
     fn build_mcp_config_includes_extra_servers() {
-        use crate::config::McpServerEntry;
         use std::collections::BTreeMap;
+
+        use crate::config::McpServerEntry;
         let exe = PathBuf::from("/usr/local/bin/workbridge");
         let sock = PathBuf::from("/tmp/test.sock");
         let extra = vec![McpServerEntry {
@@ -1927,8 +1929,9 @@ mod tests {
 
     #[test]
     fn build_mcp_config_workbridge_key_always_wins() {
-        use crate::config::McpServerEntry;
         use std::collections::BTreeMap;
+
+        use crate::config::McpServerEntry;
         let exe = PathBuf::from("/usr/local/bin/workbridge");
         let sock = PathBuf::from("/tmp/test.sock");
         // User tries to register a server named "workbridge".

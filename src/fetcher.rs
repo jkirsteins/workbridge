@@ -262,9 +262,9 @@ impl FetcherHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::Path;
 
+    use super::*;
     use crate::github_client::{GithubIssue, GithubPr, MockGithubClient};
     use crate::worktree_service::{WorktreeError, WorktreeInfo};
 

@@ -2,25 +2,20 @@ use rat_widget::scrolled::Scroll;
 use rat_widget::text::TextStyle;
 use rat_widget::text_input::TextInput;
 use rat_widget::textarea::{TextArea, TextWrap};
-use ratatui_core::{
-    buffer::Buffer,
-    layout::{Constraint, Direction, Layout, Margin, Position, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{StatefulWidget, Widget},
-};
-use ratatui_widgets::{
-    barchart::{Bar, BarChart, BarGroup},
-    block::Block,
-    borders::{BorderType, Borders},
-    clear::Clear,
-    list::{List, ListItem, ListState},
-    paragraph::{Paragraph, Wrap},
-    scrollbar::{Scrollbar, ScrollbarOrientation, ScrollbarState},
-    sparkline::Sparkline,
-    tabs::Tabs,
-};
-
+use ratatui_core::buffer::Buffer;
+use ratatui_core::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
+use ratatui_core::style::{Color, Modifier, Style};
+use ratatui_core::text::{Line, Span, Text};
+use ratatui_core::widgets::{StatefulWidget, Widget};
+use ratatui_widgets::barchart::{Bar, BarChart, BarGroup};
+use ratatui_widgets::block::Block;
+use ratatui_widgets::borders::{BorderType, Borders};
+use ratatui_widgets::clear::Clear;
+use ratatui_widgets::list::{List, ListItem, ListState};
+use ratatui_widgets::paragraph::{Paragraph, Wrap};
+use ratatui_widgets::scrollbar::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui_widgets::sparkline::Sparkline;
+use ratatui_widgets::tabs::Tabs;
 use tui_term::widget::PseudoTerminal;
 use unicode_width::UnicodeWidthStr;
 
@@ -30,15 +25,14 @@ use crate::app::{
     is_selectable,
 };
 use crate::click_targets::ClickKind;
-use crate::config;
 use crate::create_dialog::{CreateDialog, CreateDialogFocus};
-use crate::layout;
 use crate::metrics::{MetricsSnapshot, StuckItem, secs_to_day};
 use crate::theme::Theme;
 use crate::work_item::{
     BackendType, CheckStatus, MergeableState, PrState, ReviewDecision, SelectionState,
     WorkItemError, WorkItemKind, WorkItemStatus,
 };
+use crate::{config, layout};
 
 /// Braille-dot spinner frames for the activity indicator.
 /// 10 frames at 200ms per tick = 2-second full rotation.
@@ -4873,8 +4867,9 @@ mod wrap_tests {
 
 #[cfg(test)]
 mod wrap_variant_tests {
-    use super::{wrap_text_flat, wrap_two_widths};
     use unicode_width::UnicodeWidthStr;
+
+    use super::{wrap_text_flat, wrap_two_widths};
 
     #[test]
     fn wrap_text_flat_no_indent_on_continuation() {
@@ -4922,13 +4917,15 @@ mod wrap_variant_tests {
 
 #[cfg(test)]
 mod format_entry_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use unicode_width::UnicodeWidthStr;
+
     use super::format_work_item_entry;
     use crate::app::{App, StubBackend};
     use crate::theme::Theme;
     use crate::work_item::*;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use unicode_width::UnicodeWidthStr;
 
     /// Render a ListItem to a string by putting it in a List widget and
     /// rendering to a buffer.
@@ -5395,9 +5392,11 @@ mod format_entry_tests {
     /// and the helper must not leak DIM or DarkGray into the output.
     #[test]
     fn work_item_badge_undimmed_when_session_attached() {
-        use crate::work_item::SessionEntry;
-        use ratatui_core::style::{Color, Modifier};
         use std::sync::{Arc, Mutex};
+
+        use ratatui_core::style::{Color, Modifier};
+
+        use crate::work_item::SessionEntry;
 
         let wi = review_state_work_item();
         let id = wi.id.clone();
@@ -5613,15 +5612,14 @@ mod sticky_header_tests {
     // simulation and ratatui's actual math (e.g. if a future ratatui
     // version changes the algorithm).
 
-    use super::predict_list_offset;
-    use ratatui_core::{
-        backend::TestBackend,
-        layout::Rect,
-        terminal::Terminal,
-        text::{Line, Text},
-        widgets::StatefulWidget,
-    };
+    use ratatui_core::backend::TestBackend;
+    use ratatui_core::layout::Rect;
+    use ratatui_core::terminal::Terminal;
+    use ratatui_core::text::{Line, Text};
+    use ratatui_core::widgets::StatefulWidget;
     use ratatui_widgets::list::{List, ListItem, ListState};
+
+    use super::predict_list_offset;
 
     /// Build a `Vec<ListItem>` where item `i` has `item_heights[i]` rows.
     /// Each row is a short, unique placeholder line so ratatui sees the
@@ -5874,6 +5872,12 @@ mod sticky_header_tests {
 
 #[cfg(test)]
 mod snapshot_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use ratatui_core::backend::TestBackend;
+    use ratatui_core::terminal::Terminal;
+
     use super::draw_to_buffer;
     use crate::app::{
         App, DisplayEntry, FocusPanel, ReviewGateOrigin, ReviewGateState, StubBackend,
@@ -5885,9 +5889,6 @@ mod snapshot_tests {
         UnlinkedPr, WorkItem, WorkItemError, WorkItemId, WorkItemStatus,
     };
     use crate::work_item_backend::{BackendError, CreateWorkItem, WorkItemBackend, WorkItemRecord};
-    use ratatui_core::{backend::TestBackend, terminal::Terminal};
-    use std::path::PathBuf;
-    use std::sync::Arc;
 
     /// Helper: render the app into a TestBackend and return the buffer as a string.
     fn render(app: &mut App, width: u16, height: u16) -> String {
@@ -6393,8 +6394,7 @@ mod snapshot_tests {
 
     #[test]
     fn work_item_with_context_bar() {
-        use crate::work_item::IssueInfo;
-        use crate::work_item::IssueState;
+        use crate::work_item::{IssueInfo, IssueState};
         let mut wi = make_work_item("ctx-1", "Fix resize bug", WorkItemStatus::Backlog, None, 1);
         // Add issue with labels to trigger the context bar.
         wi.repo_associations[0].issue = Some(IssueInfo {
@@ -6425,8 +6425,7 @@ mod snapshot_tests {
 
     #[test]
     fn work_item_context_bar_with_status() {
-        use crate::work_item::IssueInfo;
-        use crate::work_item::IssueState;
+        use crate::work_item::{IssueInfo, IssueState};
         let mut wi = make_work_item("ctx-3", "Fix resize bug", WorkItemStatus::Backlog, None, 1);
         wi.repo_associations[0].issue = Some(IssueInfo {
             number: 42,

@@ -1,9 +1,9 @@
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::{fmt, fs};
+
+use serde::{Deserialize, Serialize};
 
 /// Abstracts config persistence so tests can use an in-memory store
 /// instead of writing to the real config file.
@@ -589,8 +589,9 @@ fn discover_git_repos_in(dir: &Path) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
+
+    use super::*;
 
     #[test]
     fn expand_tilde_with_home() {

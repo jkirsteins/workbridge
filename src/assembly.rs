@@ -569,6 +569,8 @@ fn collect_review_requested_prs(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::github_client::{GithubError, GithubIssue, GithubPr};
     use crate::work_item::{
@@ -577,7 +579,6 @@ mod tests {
     };
     use crate::work_item_backend::{RepoAssociationRecord, WorkItemRecord};
     use crate::worktree_service::WorktreeInfo;
-    use std::path::PathBuf;
 
     // -----------------------------------------------------------------------
     // Test helpers

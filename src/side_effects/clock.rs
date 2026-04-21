@@ -1,7 +1,6 @@
-use std::time::{Duration, Instant, SystemTime};
-
 #[cfg(test)]
 use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, SystemTime};
 
 // Mock-clock scope note (tests only)
 // ================================================================
@@ -97,10 +96,9 @@ pub fn advance_mock_clock(dur: Duration) {
 }
 
 #[cfg(test)]
-use std::sync::LazyLock;
-
-#[cfg(test)]
 use std::cell::Cell;
+#[cfg(test)]
+use std::sync::LazyLock;
 
 #[cfg(test)]
 const MOCK_SYSTEM_BASE_SECS: u64 = 1_700_000_000;

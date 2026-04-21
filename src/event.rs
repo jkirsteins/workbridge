@@ -1,8 +1,3 @@
-use crate::salsa::ct::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-use crate::work_item::SelectionState;
-
 use crate::app::{
     App, BOARD_COLUMNS, DashboardWindow, DisplayEntry, FocusPanel, RightPanelTab,
     SettingsListFocus, SettingsTab, UserActionKey, ViewMode,
@@ -10,6 +5,10 @@ use crate::app::{
 use crate::click_targets::ClickTarget;
 use crate::create_dialog::CreateDialogFocus;
 use crate::layout;
+use crate::salsa::ct::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use crate::work_item::SelectionState;
 
 /// Returns true if `c` is the character that crossterm 0.28's legacy
 /// keyboard parser reports for `Ctrl+<symbol>`. Crossterm maps the raw
@@ -2889,9 +2888,10 @@ fn handle_first_run_global_harness_modal(app: &mut App, key: KeyEvent) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::salsa::ct::event::{KeyCode, KeyEvent, KeyModifiers};
-    use std::path::PathBuf;
 
     /// `is_ctrl_symbol_char` must accept both the literal symbol and
     /// crossterm 0.28's legacy numeric form for every Ctrl+<symbol>
@@ -3209,11 +3209,12 @@ mod tests {
     /// works regardless of session liveness.
     #[test]
     fn ctrl_backslash_on_dead_terminal_cycles_to_claude_code() {
+        use std::sync::{Arc, Mutex};
+
         use crate::work_item::{
             BackendType, RepoAssociation, SessionEntry, WorkItem, WorkItemId, WorkItemKind,
             WorkItemStatus,
         };
-        use std::sync::{Arc, Mutex};
 
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/tab-dead-terminal.json"));
@@ -3299,11 +3300,12 @@ mod tests {
     /// fork a real shell.
     #[test]
     fn ctrl_backslash_on_dead_claude_code_cycles_to_terminal() {
+        use std::sync::{Arc, Mutex};
+
         use crate::work_item::{
             BackendType, RepoAssociation, SessionEntry, WorkItem, WorkItemId, WorkItemKind,
             WorkItemStatus,
         };
-        use std::sync::{Arc, Mutex};
 
         let mut app = App::new();
         let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/tab-dead-claude.json"));
@@ -3772,8 +3774,9 @@ mod tests {
     /// would never get set and no toast would be pushed.
     #[test]
     fn chrome_click_inside_right_panel_still_fires() {
-        use crate::click_targets::ClickKind;
         use ratatui_core::layout::Rect;
+
+        use crate::click_targets::ClickKind;
 
         let mut app = App::new();
         // Register a target that overlaps the right-panel inner area.
@@ -3831,8 +3834,9 @@ mod tests {
     /// check that forgets to honour the drag-cancel invariant.
     #[test]
     fn chrome_click_drag_inside_right_panel_cancels() {
-        use crate::click_targets::ClickKind;
         use ratatui_core::layout::Rect;
+
+        use crate::click_targets::ClickKind;
 
         let mut app = App::new();
         {
@@ -3872,8 +3876,9 @@ mod tests {
     /// registry loosely (e.g. "any click in the area arms").
     #[test]
     fn right_panel_click_without_registry_hit_does_not_arm_chrome_click() {
-        use crate::click_targets::ClickKind;
         use ratatui_core::layout::Rect;
+
+        use crate::click_targets::ClickKind;
 
         let mut app = App::new();
         // Register a target somewhere on the same row, but NOT at
@@ -3924,8 +3929,9 @@ mod tests {
     /// drawer and seeding a target in its inner area.
     #[test]
     fn chrome_click_inside_global_drawer_still_fires() {
-        use crate::click_targets::ClickKind;
         use ratatui_core::layout::Rect;
+
+        use crate::click_targets::ClickKind;
 
         let mut app = App::new();
         app.global_drawer_open = true;
@@ -3987,8 +3993,9 @@ mod tests {
     /// toast is pushed, since there was no fresh down on A.
     #[test]
     fn unmatched_select_up_clears_stale_pending_chrome_click() {
-        use crate::click_targets::ClickKind;
         use ratatui_core::layout::Rect;
+
+        use crate::click_targets::ClickKind;
 
         let mut app = App::new();
         {
@@ -4731,10 +4738,11 @@ mod selection_clipboard_tests {
     /// the same cells, not compensate for each other.
     #[test]
     fn highlight_cell_count_matches_clipboard_chars() {
-        use crate::ui::render_selection_overlay;
         use ratatui_core::buffer::Buffer;
         use ratatui_core::layout::{Position, Rect};
         use ratatui_core::style::Modifier;
+
+        use crate::ui::render_selection_overlay;
 
         /// Count cells in `buf` that have `REVERSED` set - i.e. cells
         /// the selection overlay marked as highlighted.
