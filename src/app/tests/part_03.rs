@@ -106,9 +106,9 @@ fn invalid_branch_issue_pattern_caught_at_startup() {
     let mut app = App::with_config(cfg, Arc::new(StubBackend));
 
     // Replicate the main.rs validation logic.
-    if let Err(e) = regex::Regex::new(&app.config.defaults.branch_issue_pattern) {
-        let bad = app.config.defaults.branch_issue_pattern.clone();
-        app.config.defaults.branch_issue_pattern = String::new();
+    if let Err(e) = regex::Regex::new(&app.services.config.defaults.branch_issue_pattern) {
+        let bad = app.services.config.defaults.branch_issue_pattern.clone();
+        app.services.config.defaults.branch_issue_pattern = String::new();
         let msg = format!("Invalid branch_issue_pattern '{bad}': {e} (issue extraction disabled)");
         if app.status_message.is_none() {
             app.status_message = Some(msg);
@@ -119,7 +119,7 @@ fn invalid_branch_issue_pattern_caught_at_startup() {
 
     // The pattern should have been replaced with empty string.
     assert_eq!(
-        app.config.defaults.branch_issue_pattern, "",
+        app.services.config.defaults.branch_issue_pattern, "",
         "invalid pattern should be replaced with empty string",
     );
 

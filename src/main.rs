@@ -117,9 +117,9 @@ fn main() -> Result<(), AppError> {
     // disconnects and background updates stop permanently). Catch it
     // early, show an error, and fall back to an empty pattern (which
     // disables issue extraction but keeps the fetcher alive).
-    if let Err(e) = regex::Regex::new(&app.config.defaults.branch_issue_pattern) {
-        let bad = app.config.defaults.branch_issue_pattern.clone();
-        app.config.defaults.branch_issue_pattern = String::new();
+    if let Err(e) = regex::Regex::new(&app.services.config.defaults.branch_issue_pattern) {
+        let bad = app.services.config.defaults.branch_issue_pattern.clone();
+        app.services.config.defaults.branch_issue_pattern = String::new();
         let msg = format!("Invalid branch_issue_pattern '{bad}': {e} (issue extraction disabled)");
         // Only overwrite if no higher-priority error is already shown.
         if app.status_message.is_none() {

@@ -8,7 +8,7 @@ fn stage_transition_without_harness_choice_surfaces_error() {
     // silent fallbacks to a default harness are P0. Previously
     // `spawn_session` -> `begin_session_open` -> `finish_session_open`
     // would resolve the per-work-item backend via
-    // `backend_for_work_item(id).unwrap_or_else(|| self.agent_backend)`
+    // `backend_for_work_item(id).unwrap_or_else(|| self.services.agent_backend)`
     // which silently ran Claude against the user's code even when
     // they had never picked a harness (or picked Codex and lost
     // the choice on restart). The fix is an abort-with-toast at

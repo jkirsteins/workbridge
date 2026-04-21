@@ -3,7 +3,7 @@
 use super::*;
 
 /// Pins that once a harness choice is committed, the display
-/// name follows that choice (not the static `self.agent_backend`).
+/// name follows that choice (not the static `self.services.agent_backend`).
 #[test]
 fn agent_backend_display_name_follows_harness_choice() {
     let mut app = App::new();
@@ -127,7 +127,7 @@ fn permission_marker_falls_through_to_global_drawer_when_item_has_no_harness_cho
 
     // Seed the config with global_assistant_harness = "codex"
     // so `global_assistant_harness_kind()` returns Some(Codex).
-    app.config.defaults.global_assistant_harness = Some("codex".into());
+    app.services.config.defaults.global_assistant_harness = Some("codex".into());
 
     // Seed a selected work item WITHOUT inserting a
     // harness_choice entry for it - this is the state right
@@ -193,7 +193,13 @@ fn permission_marker_falls_through_to_global_drawer_when_item_has_no_harness_cho
 fn ctrl_g_with_unset_harness_opens_first_run_modal_when_available() {
     let mut app = App::new();
     // Precondition: config has no global_assistant_harness.
-    assert!(app.config.defaults.global_assistant_harness.is_none());
+    assert!(
+        app.services
+            .config
+            .defaults
+            .global_assistant_harness
+            .is_none()
+    );
 
     app.handle_ctrl_g();
 
@@ -229,7 +235,7 @@ fn ctrl_g_with_unset_harness_opens_first_run_modal_when_available() {
 #[test]
 fn ctrl_g_with_set_harness_opens_drawer_directly() {
     let mut app = App::new();
-    app.config.defaults.global_assistant_harness = Some("claude".into());
+    app.services.config.defaults.global_assistant_harness = Some("claude".into());
 
     assert!(!app.global_drawer_open);
     app.handle_ctrl_g();
@@ -272,11 +278,15 @@ fn first_run_modal_pick_persists_to_config_provider() {
     assert!(app.global_drawer_open);
     // Config has the canonical name.
     assert_eq!(
-        app.config.defaults.global_assistant_harness.as_deref(),
+        app.services
+            .config
+            .defaults
+            .global_assistant_harness
+            .as_deref(),
         Some("claude")
     );
     // Reload via the provider to confirm it was persisted.
-    let reloaded = app.config_provider.load().unwrap();
+    let reloaded = app.services.config_provider.load().unwrap();
     assert_eq!(
         reloaded.defaults.global_assistant_harness.as_deref(),
         Some("claude")
@@ -303,8 +313,14 @@ fn first_run_modal_esc_does_not_persist() {
 
     assert!(app.first_run_global_harness_modal.is_none());
     assert!(!app.global_drawer_open);
-    assert!(app.config.defaults.global_assistant_harness.is_none());
-    let reloaded = app.config_provider.load().unwrap();
+    assert!(
+        app.services
+            .config
+            .defaults
+            .global_assistant_harness
+            .is_none()
+    );
+    let reloaded = app.services.config_provider.load().unwrap();
     assert!(reloaded.defaults.global_assistant_harness.is_none());
 }
 

@@ -26,7 +26,7 @@ fn apply_stage_change_clears_done_at_on_retreat() {
     app.apply_stage_change(&wi_id, WorkItemStatus::Done, WorkItemStatus::Review, "test");
 
     // Verify done_at was cleared.
-    let records = app.backend.list().unwrap().records;
+    let records = app.services.backend.list().unwrap().records;
     assert_eq!(records.len(), 1);
     assert_eq!(
         records[0].done_at, None,
@@ -339,7 +339,7 @@ fn spawn_review_gate_does_not_touch_worktree_service_synchronously() {
     // thread is the ONLY place `default_branch` / `github_remote` /
     // `git diff` may run. Against the pre-fix master version this
     // assertion would fail: `spawn_review_gate` called
-    // `self.worktree_service.default_branch(&repo_path)` on the UI
+    // `self.services.worktree_service.default_branch(&repo_path)` on the UI
     // thread after reading the plan, bumping the counter to 1.
     let ws = CountingWorktreeService::new();
     let mut app = App::with_config_and_worktree_service(

@@ -1,8 +1,10 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Review-gate subsystem - async review-gate spawn.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Holds `spawn_review_gate`, which kicks off the background
+//! review-gate job for a work item entering Review. Paired with
+//! `poll_review_gate` in `gate_polling`. The review-gate is one
+//! of the three known harness spawn paths in
+//! `docs/harness-contract.md`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -97,7 +99,7 @@ impl super::App {
             usize,
         ) = {
             let repo_display = crate::config::collapse_home(&repo_path);
-            let entries = self.config.mcp_servers_for_repo(&repo_display);
+            let entries = self.services.config.mcp_servers_for_repo(&repo_display);
             let http_count = entries.iter().filter(|e| e.server_type == "http").count();
             let bridges: Vec<crate::agent_backend::McpBridgeSpec> = entries
                 .into_iter()
@@ -132,8 +134,8 @@ impl super::App {
         // Clone the worktree service and backend for the background thread so
         // that `default_branch()`/`github_remote()` (which shell out to git)
         // and `read_plan()` (filesystem read) execute off the main UI thread.
-        let ws = Arc::clone(&self.worktree_service);
-        let backend = Arc::clone(&self.backend);
+        let ws = Arc::clone(&self.services.worktree_service);
+        let backend = Arc::clone(&self.services.backend);
 
         // Spawn the review gate in a background thread with three phases:
         // 1. PR existence check (if GitHub remote exists)
@@ -143,7 +145,7 @@ impl super::App {
         // queue before the main thread polls.
         let (tx, rx) = crossbeam_channel::unbounded();
         let wi_id_clone = wi_id.clone();
-        let review_skill = self.config.defaults.review_skill.clone();
+        let review_skill = self.services.config.defaults.review_skill.clone();
         let gate_mcp_tx = self.mcp_tx.clone();
 
         std::thread::spawn(move || {

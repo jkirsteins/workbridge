@@ -1,8 +1,14 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Fetcher bridge subsystem.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Drains the background fetcher channel each tick
+//! (`drain_fetch_results`), drains queued fetch-error status
+//! messages (`drain_pending_fetch_errors`), and rebuilds the
+//! assembled `work_items` vector from the latest backend records +
+//! fetcher snapshot (`reassemble_work_items`). Also owns the tiny
+//! `selected_work_item_has_worktree` and
+//! `buffer_bytes_to_right_panel` cross-cutting helpers because
+//! both reach across multiple subsystems (selection, sessions,
+//! terminal) in a single predicate/dispatch.
 
 use std::sync::mpsc;
 
@@ -221,7 +227,7 @@ impl super::App {
     /// layer to produce `work_items` and `unlinked_prs`. Surfaces any
     /// corrupt backend records to the user via the status bar.
     pub fn reassemble_work_items(&mut self) {
-        let list_result = match self.backend.list() {
+        let list_result = match self.services.backend.list() {
             Ok(r) => r,
             Err(e) => {
                 self.status_message = Some(format!("Backend error: {e}"));
@@ -238,12 +244,12 @@ impl super::App {
             ));
         }
 
-        let issue_pattern = &self.config.defaults.branch_issue_pattern;
+        let issue_pattern = &self.services.config.defaults.branch_issue_pattern;
         let (items, unlinked, review_requested, mut reopen_ids) = assembly::reassemble(
             &list_result.records,
             &self.repo_data,
             issue_pattern,
-            &self.config.defaults.worktree_dir,
+            &self.services.config.defaults.worktree_dir,
         );
         self.work_items = items;
         self.unlinked_prs = unlinked;
@@ -251,7 +257,7 @@ impl super::App {
 
         // Start the archival clock for items that became Done through PR merge
         // (derived status) but don't yet have a done_at timestamp.
-        if self.config.defaults.archive_after_days > 0 {
+        if self.services.config.defaults.archive_after_days > 0 {
             match crate::side_effects::clock::system_now().duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => {
                     let epoch = duration.as_secs();
@@ -261,7 +267,8 @@ impl super::App {
                             && let Some(wi) = self.work_items.iter().find(|w| w.id == record.id)
                             && wi.status == WorkItemStatus::Done
                             && wi.status_derived
-                            && let Err(e) = self.backend.set_done_at(&record.id, Some(epoch))
+                            && let Err(e) =
+                                self.services.backend.set_done_at(&record.id, Some(epoch))
                         {
                             self.status_message =
                                 Some(format!("Failed to set archive timestamp: {e}"));
@@ -284,12 +291,16 @@ impl super::App {
         // Re-open Done ReviewRequest items that have been re-requested.
         if !reopen_ids.is_empty() {
             for wi_id in &reopen_ids {
-                if let Err(e) = self.backend.update_status(wi_id, WorkItemStatus::Review) {
+                if let Err(e) = self
+                    .services
+                    .backend
+                    .update_status(wi_id, WorkItemStatus::Review)
+                {
                     self.status_message = Some(format!("Re-open error: {e}"));
                     continue;
                 }
                 // Clear done_at so auto-archive won't delete the re-opened item.
-                if let Err(e) = self.backend.set_done_at(wi_id, None) {
+                if let Err(e) = self.services.backend.set_done_at(wi_id, None) {
                     self.status_message =
                         Some(format!("Failed to clear archive timestamp on re-open: {e}"));
                 }
@@ -302,17 +313,17 @@ impl super::App {
                         "source": "review_re_requested"
                     }),
                 };
-                let _ = self.backend.append_activity(wi_id, &entry);
+                let _ = self.services.backend.append_activity(wi_id, &entry);
             }
             // Reassemble again to pick up the status changes.
-            let Ok(list_result) = self.backend.list() else {
+            let Ok(list_result) = self.services.backend.list() else {
                 return;
             };
             let (items, unlinked, review_requested, _) = assembly::reassemble(
                 &list_result.records,
                 &self.repo_data,
                 issue_pattern,
-                &self.config.defaults.worktree_dir,
+                &self.services.config.defaults.worktree_dir,
             );
             self.work_items = items;
             self.unlinked_prs = unlinked;
@@ -326,19 +337,19 @@ impl super::App {
         // This runs AFTER re-open detection so that re-opened items have their
         // done_at cleared and won't be incorrectly archived.
         // Skip entirely when archive is disabled (archive_after_days == 0).
-        if self.config.defaults.archive_after_days > 0 {
-            match self.backend.list() {
+        if self.services.config.defaults.archive_after_days > 0 {
+            match self.services.backend.list() {
                 Ok(pre_archive_list) => {
                     let pre_archive_count = pre_archive_list.records.len();
                     let kept = self.auto_archive_done_items(pre_archive_list.records);
                     if kept.len() < pre_archive_count {
                         // Items were archived; reassemble to update display state.
-                        let pattern = &self.config.defaults.branch_issue_pattern;
+                        let pattern = &self.services.config.defaults.branch_issue_pattern;
                         let (items, unlinked, review_requested, _) = assembly::reassemble(
                             &kept,
                             &self.repo_data,
                             pattern,
-                            &self.config.defaults.worktree_dir,
+                            &self.services.config.defaults.worktree_dir,
                         );
                         self.work_items = items;
                         self.unlinked_prs = unlinked;
@@ -392,7 +403,7 @@ impl super::App {
     /// `spawn_delete_cleanup` can delete the stale branch ref too
     /// (dropping it would leak the branch - master deleted it inline
     /// before the async refactor). This function MUST NOT call
-    /// `self.worktree_service.remove_worktree(...)` directly - it runs
+    /// `self.services.worktree_service.remove_worktree(...)` directly - it runs
     /// on the UI thread (either the MCP tick handler or the modal
     /// confirm handler) where blocking I/O is forbidden by
     /// `docs/UI.md` "Blocking I/O Prohibition".
@@ -422,10 +433,10 @@ impl super::App {
         self.abort_background_ops_for_work_item(wi_id);
 
         // -- Phase 2: Backend cleanup (fatal on delete failure) --
-        if let Err(e) = self.backend.pre_delete_cleanup(wi_id) {
+        if let Err(e) = self.services.backend.pre_delete_cleanup(wi_id) {
             warnings.push(format!("pre-delete cleanup: {e}"));
         }
-        self.backend.delete(wi_id)?;
+        self.services.backend.delete(wi_id)?;
 
         // -- Phase 3: Kill session and clean up MCP --
         self.cleanup_session_state_for(wi_id);

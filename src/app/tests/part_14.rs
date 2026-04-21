@@ -175,7 +175,7 @@ fn collect_backfill_requests_returns_done_items_without_pr_identity() {
         .unwrap();
 
     let mut app = App::with_config(Config::default(), Arc::new(backend));
-    app.worktree_service = Arc::new(StubWorktreeService);
+    app.services.worktree_service = Arc::new(StubWorktreeService);
 
     let requests = app.collect_backfill_requests();
 

@@ -1,8 +1,11 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Stage transition subsystem - advance/retreat/apply + delete.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Owns the cross-cutting `advance_stage`, `retreat_stage`, and
+//! `apply_stage_change` methods that every stage change goes
+//! through, plus `plan_from_branch` (auto-derive a plan title
+//! from the branch name when promoting Backlog -> Planning) and
+//! `confirm_delete_from_prompt` which finalizes the modal delete
+//! started in `work_item_ops::open_delete_prompt`.
 
 use std::path::PathBuf;
 
@@ -427,7 +430,7 @@ impl super::App {
         }
 
         // Clear the plan so the planning session starts fresh.
-        if let Err(e) = self.backend.update_plan(wi_id, "") {
+        if let Err(e) = self.services.backend.update_plan(wi_id, "") {
             self.status_message = Some(format!("Could not clear plan: {e}"));
         }
     }
@@ -465,11 +468,11 @@ impl super::App {
                 "source": source
             }),
         };
-        if let Err(e) = self.backend.append_activity(wi_id, &entry) {
+        if let Err(e) = self.services.backend.append_activity(wi_id, &entry) {
             self.status_message = Some(format!("Activity log error: {e}"));
         }
 
-        if let Err(e) = self.backend.update_status(wi_id, new_status) {
+        if let Err(e) = self.services.backend.update_status(wi_id, new_status) {
             self.status_message = Some(format!("Stage update error: {e}"));
             return;
         }
@@ -479,7 +482,11 @@ impl super::App {
         if new_status == WorkItemStatus::Done {
             match crate::side_effects::clock::system_now().duration_since(std::time::UNIX_EPOCH) {
                 Ok(duration) => {
-                    if let Err(e) = self.backend.set_done_at(wi_id, Some(duration.as_secs())) {
+                    if let Err(e) = self
+                        .services
+                        .backend
+                        .set_done_at(wi_id, Some(duration.as_secs()))
+                    {
                         self.status_message = Some(format!("Failed to set archive timestamp: {e}"));
                         done_at_error = true;
                     }
@@ -492,7 +499,7 @@ impl super::App {
                 }
             }
         } else if current_status == WorkItemStatus::Done
-            && let Err(e) = self.backend.set_done_at(wi_id, None)
+            && let Err(e) = self.services.backend.set_done_at(wi_id, None)
         {
             self.status_message = Some(format!("Failed to clear archive timestamp: {e}"));
             done_at_error = true;

@@ -1,8 +1,11 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Session spawn subsystem - the main work-item session opener.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Holds `spawn_session`, which routes to the current harness for
+//! the work item (via `harness_choice`), writes the MCP config
+//! side-car, starts the PTY, and registers the session in the
+//! `sessions` map. The single spawn site on this subsystem is
+//! one of the three known harness spawn paths enumerated in
+//! `docs/harness-contract.md`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,7 +73,7 @@ impl super::App {
                     let wt_target = Self::worktree_target_path(
                         &repo_path,
                         &branch,
-                        &self.config.defaults.worktree_dir,
+                        &self.services.config.defaults.worktree_dir,
                     );
 
                     // Admit the user action BEFORE spawning the
@@ -94,7 +97,7 @@ impl super::App {
                         return;
                     }
 
-                    let ws = Arc::clone(&self.worktree_service);
+                    let ws = Arc::clone(&self.services.worktree_service);
                     let wi_id_clone = work_item_id.clone();
 
                     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -269,7 +272,7 @@ impl super::App {
             return;
         };
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let backend = Arc::clone(&self.backend);
+        let backend = Arc::clone(&self.services.backend);
         let wi_id_clone = work_item_id.clone();
         let cwd_clone = cwd.to_path_buf();
 
@@ -341,7 +344,8 @@ impl super::App {
                 .and_then(|w| w.repo_associations.first())
                 .map(|assoc| {
                     let repo_display = crate::config::collapse_home(&assoc.repo_path);
-                    self.config
+                    self.services
+                        .config
                         .mcp_servers_for_repo(&repo_display)
                         .into_iter()
                         .cloned()
@@ -377,7 +381,7 @@ impl super::App {
         // `LocalFileBackend` (no filesystem I/O); kept here on the UI
         // thread to avoid cloning the whole `Arc<dyn WorkItemBackend>`
         // into the worker purely for a path join.
-        let activity_log_path = self.backend.activity_path_for(work_item_id);
+        let activity_log_path = self.services.backend.activity_path_for(work_item_id);
         let mcp_tx = self.mcp_tx.clone();
         let socket_path_for_worker = socket_path;
 

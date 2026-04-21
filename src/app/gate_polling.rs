@@ -1,8 +1,13 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Review-gate + rebase-gate polling + session navigation.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Drains review-gate and rebase-gate results every tick
+//! (`poll_review_gate`, `poll_rebase_gate`) and routes the
+//! outcome back into the stage-transition layer. Also owns the
+//! cross-cutting session navigation accessors
+//! (`active_session_entry`, `active_session_entry_mut`,
+//! `has_any_session`) and the global-drawer toggle
+//! (`toggle_global_drawer`) because the drawer's open/close
+//! gesture is the primary way users exit a session view.
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -208,6 +213,7 @@ impl super::App {
                             .map(|w| w.status);
                         if wi_status == Some(WorkItemStatus::Blocked) {
                             let _ = self
+                                .services
                                 .backend
                                 .update_status(&wi_id, WorkItemStatus::Implementing);
                             self.reassemble_work_items();
@@ -261,7 +267,7 @@ impl super::App {
                         "response": result.detail
                     }),
                 };
-                if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
+                if let Err(e) = self.services.backend.append_activity(&wi_id, &entry) {
                     self.status_message = Some(format!("Activity log error: {e}"));
                 }
 
@@ -293,7 +299,7 @@ impl super::App {
                         "reason": result.detail
                     }),
                 };
-                if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
+                if let Err(e) = self.services.backend.append_activity(&wi_id, &entry) {
                     self.status_message = Some(format!("Activity log error: {e}"));
                 }
                 // Store the rejection reason so the next Claude session uses the
@@ -314,6 +320,7 @@ impl super::App {
                         .map(|w| w.status);
                     if wi_status == Some(WorkItemStatus::Blocked) {
                         let _ = self
+                            .services
                             .backend
                             .update_status(&wi_id, WorkItemStatus::Implementing);
                         self.reassemble_work_items();

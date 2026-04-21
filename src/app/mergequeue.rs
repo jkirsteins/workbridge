@@ -1,8 +1,13 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Mergequeue + PR identity backfill subsystem.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Owns `enter_mergequeue` (route a Review item into Mergequeue
+//! after a PR merge confirmation), `collect_backfill_requests`
+//! and `drain_pr_identity_backfill` (one-time startup migration
+//! for Done items missing `pr_identity`), plus the
+//! macro-generated `poll_mergequeue` and
+//! `reconstruct_mergequeue_watches` methods (macro expansion
+//! lives in `mod.rs`). The `ReviewRequest` sibling of this poller
+//! pair lives in the same file for symmetry.
 
 use std::path::PathBuf;
 
@@ -205,7 +210,7 @@ impl super::App {
     /// items have been backfilled (i.e. no Done items with `pr_identity=None`
     /// remain on disk).
     pub fn collect_backfill_requests(&self) -> Vec<(WorkItemId, PathBuf, String, String, String)> {
-        let records = match self.backend.list() {
+        let records = match self.services.backend.list() {
             Ok(lr) => lr.records,
             Err(_) => return vec![],
         };
@@ -256,7 +261,7 @@ impl super::App {
             match rx.try_recv() {
                 Ok(msg) => match msg {
                     Ok(result) => {
-                        if let Err(e) = self.backend.save_pr_identity(
+                        if let Err(e) = self.services.backend.save_pr_identity(
                             &result.wi_id,
                             &result.repo_path,
                             &result.identity,
@@ -295,17 +300,20 @@ impl super::App {
         };
         for assoc in &wi.repo_associations {
             if let Some(ref wt_path) = assoc.worktree_path {
-                if let Err(e) =
-                    self.worktree_service
-                        .remove_worktree(&assoc.repo_path, wt_path, true, false)
-                {
+                if let Err(e) = self.services.worktree_service.remove_worktree(
+                    &assoc.repo_path,
+                    wt_path,
+                    true,
+                    false,
+                ) {
                     self.status_message = Some(format!("Worktree cleanup warning: {e}"));
                 }
             } else if let Some(ref branch) = assoc.branch {
                 // No worktree but a branch exists - still clean up the branch.
-                if let Err(e) = self
-                    .worktree_service
-                    .delete_branch(&assoc.repo_path, branch, false)
+                if let Err(e) =
+                    self.services
+                        .worktree_service
+                        .delete_branch(&assoc.repo_path, branch, false)
                 {
                     self.status_message = Some(format!("Branch cleanup warning: {e}"));
                 }

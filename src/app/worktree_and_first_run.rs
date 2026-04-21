@@ -1,8 +1,13 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Worktree creation + first-run global-harness modal subsystem.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Drains the async worktree-creation channel
+//! (`poll_worktree_creation`), spawns the stale-worktree recovery
+//! background thread (`spawn_stale_worktree_recovery`), and handles
+//! the first-run Ctrl+G modal that asks the user to pick a harness
+//! for the global assistant (`handle_ctrl_g`,
+//! `finish_first_run_global_pick`, `cancel_first_run_global_pick`).
+//! Grouped together because both operations gate on the same
+//! pre-conditions (no session open yet, explicit user intent).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,12 +53,12 @@ impl super::App {
     /// harness keybindings inside the modal.
     pub fn finish_first_run_global_pick(&mut self, kind: AgentBackendKind) {
         self.first_run_global_harness_modal = None;
-        self.config.defaults.global_assistant_harness = Some(kind.canonical_name().into());
+        self.services.config.defaults.global_assistant_harness = Some(kind.canonical_name().into());
         // Persist via the configured provider. The helper swallows
         // errors as toasts so a read-only config dir does not take
         // down the UI; the in-memory value still reflects the pick
         // for this TUI session.
-        if let Err(e) = self.config_provider.save(&self.config) {
+        if let Err(e) = self.services.config_provider.save(&self.services.config) {
             self.toasts.push(format!("could not save config: {e}"));
         }
         self.toggle_global_drawer();
@@ -65,7 +70,7 @@ impl super::App {
         self.first_run_global_harness_modal = None;
     }
 
-    /// Test-only thin wrapper over `build_agent_cmd_with(self.agent_backend, ...)`.
+    /// Test-only thin wrapper over `build_agent_cmd_with(self.services.agent_backend, ...)`.
     /// Exists so legacy tests can assert argv-shape without stitching
     /// a per-work-item backend; new production call sites use
     /// `build_agent_cmd_with` directly so the per-work-item harness
@@ -79,7 +84,7 @@ impl super::App {
         force_auto_start: bool,
     ) -> Vec<String> {
         self.build_agent_cmd_with(
-            self.agent_backend.as_ref(),
+            self.services.agent_backend.as_ref(),
             status,
             system_prompt,
             McpInjection {
@@ -300,8 +305,8 @@ impl super::App {
             return;
         }
 
-        let ws = Arc::clone(&self.worktree_service);
-        let wt_dir = self.config.defaults.worktree_dir.clone();
+        let ws = Arc::clone(&self.services.worktree_service);
+        let wt_dir = self.services.config.defaults.worktree_dir.clone();
         let (tx, rx) = crossbeam_channel::bounded(1);
 
         std::thread::spawn(move || {

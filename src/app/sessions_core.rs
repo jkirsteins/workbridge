@@ -1,8 +1,12 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Sessions + PTY lifecycle subsystem.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Owns the per-tick liveness sweep (`check_liveness`), the PTY
+//! pane resize handshake (`resize_pty_panes`), SIGTERM broadcast /
+//! force-kill (`send_sigterm_all`, `all_dead`, `force_kill_all`),
+//! terminal-session spawn and byte buffering, and the
+//! `session_key_for` lookup helper used by every spawn path. Also
+//! drains the PTY byte buffers each tick
+//! (`flush_pty_buffers`).
 
 use std::path::PathBuf;
 use std::sync::Arc;

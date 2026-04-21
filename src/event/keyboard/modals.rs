@@ -74,7 +74,7 @@ pub fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
                 event_type: "rework_requested".to_string(),
                 payload: serde_json::json!({ "reason": reason }),
             };
-            if let Err(e) = app.backend.append_activity(&wi_id, &log_entry) {
+            if let Err(e) = app.services.backend.append_activity(&wi_id, &log_entry) {
                 app.status_message = Some(format!("Activity log error: {e}"));
             }
 

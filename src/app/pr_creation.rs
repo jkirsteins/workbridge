@@ -1,8 +1,12 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! PR creation + merge-execution subsystem (Phase 1).
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Drains the background PR-creation channel
+//! (`poll_pr_creation`), admits a merge action
+//! (`execute_merge`) through the `UserActionKey::PrMerge` guard,
+//! and exposes the small `is_merge_precheck_phase` /
+//! `merge_confirm_hint` predicates used by the merge modal
+//! renderer. The actual merge polling lives in
+//! `pr_merge_and_review`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -88,8 +92,8 @@ impl super::App {
         // Clone the Arc'd backend and worktree service so the background
         // thread can run `read_plan` (filesystem) and `default_branch`
         // (git subprocess) off the UI thread.
-        let backend = Arc::clone(&self.backend);
-        let ws = Arc::clone(&self.worktree_service);
+        let backend = Arc::clone(&self.services.backend);
+        let ws = Arc::clone(&self.services.worktree_service);
 
         let (tx, rx) = crossbeam_channel::bounded(1);
         let helper_wi_id = wi_id.clone();
@@ -283,7 +287,11 @@ impl super::App {
                 event_type: "pr_created".to_string(),
                 payload: serde_json::json!({ "url": url }),
             };
-            if let Err(e) = self.backend.append_activity(&result.wi_id, &log_entry) {
+            if let Err(e) = self
+                .services
+                .backend
+                .append_activity(&result.wi_id, &log_entry)
+            {
                 self.status_message = Some(format!("Activity log error: {e}"));
             }
         }
@@ -488,8 +496,8 @@ impl super::App {
         owner_repo: String,
     ) {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let ws = Arc::clone(&self.worktree_service);
-        let github = Arc::clone(&self.github_client);
+        let ws = Arc::clone(&self.services.worktree_service);
+        let github = Arc::clone(&self.services.github_client);
         let wi_id_for_thread = wi_id;
         let strategy_for_thread = strategy;
         let repo_path_for_thread = repo_path;

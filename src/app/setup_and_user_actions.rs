@@ -1,8 +1,17 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! App construction and user-action admission helpers.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Holds the three `App` constructors (`new`, `with_config`,
+//! `with_config_worktree_and_github`) and the user-action guard
+//! admission API (`try_begin_user_action`, `attach_user_action_payload`,
+//! `end_user_action`, etc.). Also carries the small `has_visible_status_bar`
+//! cross-cutting helper because its truth value combines two subsystem
+//! states (shell-level `status_message` + the `Activities` queue) and
+//! no single subsystem owns it.
+//!
+//! The methods here are the "top of the graph" for almost every
+//! other subsystem: every spawn site goes through
+//! `try_begin_user_action` for single-flight admission, and every
+//! test spins up the app via `new`.
 
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
@@ -100,8 +109,17 @@ impl super::App {
         let (mcp_tx, mcp_rx) = crossbeam_channel::unbounded();
         let (orphan_cleanup_finished_tx, orphan_cleanup_finished_rx) =
             crossbeam_channel::unbounded();
-        let mut app = Self {
+        let services = SharedServices {
+            backend,
+            worktree_service,
+            github_client,
             pr_closer: crate::pr_service::default_pr_closer(),
+            agent_backend: Arc::new(ClaudeCodeBackend),
+            config,
+            config_provider,
+        };
+        let mut app = Self {
+            services,
             should_quit: false,
             focus: FocusPanel::Left,
             status_message: None,
@@ -138,8 +156,6 @@ impl super::App {
             shutdown_started: None,
             pane_cols: 80,
             pane_rows: 24,
-            config,
-            config_provider,
             show_settings: false,
             active_repo_cache,
             settings_repo_selected: 0,
@@ -150,9 +166,6 @@ impl super::App {
             settings_review_skill_input: rat_widget::text_input::TextInputState::new(),
             settings_review_skill_editing: false,
             create_dialog: CreateDialog::new(),
-            backend,
-            worktree_service,
-            github_client,
             work_items: Vec::new(),
             unlinked_prs: Vec::new(),
             review_requested_prs: Vec::new(),
@@ -187,7 +200,6 @@ impl super::App {
             pending_fetch_errors: Vec::new(),
             fetcher_disconnected: false,
             fetcher_handle: None,
-            agent_backend: Arc::new(ClaudeCodeBackend),
             harness_choice: HashMap::new(),
             last_k_press: None,
             first_run_global_harness_modal: None,
@@ -432,7 +444,7 @@ impl super::App {
     /// Canonicalizes paths so fetcher cache keys and assembly lookups
     /// use the same resolved paths, even if config paths go through symlinks.
     pub(super) fn refresh_repo_cache(&mut self) {
-        self.active_repo_cache = canonicalize_repo_entries(self.config.active_repos());
+        self.active_repo_cache = canonicalize_repo_entries(self.services.config.active_repos());
     }
 
     /// Total number of active repos for scroll bounds.
@@ -444,7 +456,8 @@ impl super::App {
     /// Used by the settings overlay to show what can be managed.
     pub fn available_repos(&self) -> Vec<RepoEntry> {
         let active_paths: Vec<_> = self.active_repo_cache.iter().map(|e| &e.path).collect();
-        self.config
+        self.services
+            .config
             .all_repos()
             .into_iter()
             .filter(|entry| !active_paths.contains(&&entry.path))
@@ -505,10 +518,10 @@ impl super::App {
             return;
         }
         let path = entry.path.display().to_string();
-        self.config.uninclude_repo(&path);
-        if let Err(e) = self.config_provider.save(&self.config) {
+        self.services.config.uninclude_repo(&path);
+        if let Err(e) = self.services.config_provider.save(&self.services.config) {
             // Rollback: re-add the inclusion since save failed.
-            self.config.include_repo(&path);
+            self.services.config.include_repo(&path);
             self.status_message = Some(format!("Error saving config: {e}"));
             return;
         }
@@ -537,10 +550,10 @@ impl super::App {
             .settings_available_selected
             .min(available.len().saturating_sub(1));
         let path = available[idx].path.display().to_string();
-        self.config.include_repo(&path);
-        if let Err(e) = self.config_provider.save(&self.config) {
+        self.services.config.include_repo(&path);
+        if let Err(e) = self.services.config_provider.save(&self.services.config) {
             // Rollback: remove the inclusion since save failed.
-            self.config.uninclude_repo(&path);
+            self.services.config.uninclude_repo(&path);
             self.status_message = Some(format!("Error saving config: {e}"));
             return;
         }

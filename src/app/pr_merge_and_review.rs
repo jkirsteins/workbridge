@@ -1,8 +1,10 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! PR merge polling + review submission subsystem.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Drains the background merge-precheck channel
+//! (`poll_merge_precheck`), drains the main PR-merge channel
+//! (`poll_pr_merge`), and owns the review-submission flow
+//! (`spawn_review_submission` / `poll_review_submission`) for
+//! the reviewer role.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -246,9 +248,11 @@ impl super::App {
             } => {
                 // Persist PR identity to backend so it survives reassembly.
                 if let Some(identity) = pr_identity
-                    && let Err(e) =
-                        self.backend
-                            .save_pr_identity(&result.wi_id, &result.repo_path, identity)
+                    && let Err(e) = self.services.backend.save_pr_identity(
+                        &result.wi_id,
+                        &result.repo_path,
+                        identity,
+                    )
                 {
                     self.status_message = Some(format!("PR identity save error: {e}"));
                 }
@@ -262,7 +266,11 @@ impl super::App {
                         "branch": result.branch
                     }),
                 };
-                if let Err(e) = self.backend.append_activity(&result.wi_id, &log_entry) {
+                if let Err(e) = self
+                    .services
+                    .backend
+                    .append_activity(&result.wi_id, &log_entry)
+                {
                     self.status_message = Some(format!("Activity log error: {e}"));
                 }
 
@@ -302,7 +310,11 @@ impl super::App {
                         "stderr": stderr.trim()
                     }),
                 };
-                if let Err(e) = self.backend.append_activity(&result.wi_id, &conflict_entry) {
+                if let Err(e) = self
+                    .services
+                    .backend
+                    .append_activity(&result.wi_id, &conflict_entry)
+                {
                     self.status_message = Some(format!("Activity log error: {e}"));
                 }
                 let reason = "Merge failed due to conflicts. Rebase onto the base branch and resolve all conflicts.".to_string();
@@ -476,7 +488,11 @@ impl super::App {
                     event_type: "review_submitted".to_string(),
                     payload: serde_json::json!({ "action": result.action }),
                 };
-                if let Err(e) = self.backend.append_activity(&result.wi_id, &log_entry) {
+                if let Err(e) = self
+                    .services
+                    .backend
+                    .append_activity(&result.wi_id, &log_entry)
+                {
                     self.status_message = Some(format!("Activity log error: {e}"));
                 }
 

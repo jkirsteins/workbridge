@@ -1,8 +1,14 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Cleanup subsystem - unlinked PR close, delete cleanup, orphan
+//! worktree cleanup, metrics poll.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Groups every background cleanup operation behind one logical
+//! surface: `spawn_unlinked_cleanup` / `poll_unlinked_cleanup`
+//! for the unlinked-PR close flow, `spawn_delete_cleanup` /
+//! `poll_delete_cleanup` for work-item deletion, and
+//! `poll_orphan_cleanup_finished` for the background orphan-
+//! worktree sweep spawned at startup / after delete. Also owns
+//! `poll_metrics_snapshot` because metrics aggregation is a
+//! background drain with the same lifecycle shape.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,7 +66,7 @@ impl super::App {
         self.selected_unlinked_branch = None;
 
         let reason_owned: Option<String> = reason.map(std::string::ToString::to_string);
-        let ws = Arc::clone(&self.worktree_service);
+        let ws = Arc::clone(&self.services.worktree_service);
         let (tx, rx) = crossbeam_channel::bounded(1);
 
         std::thread::spawn(move || {
@@ -372,8 +378,8 @@ impl super::App {
             self.activities.end(activity_id);
         }
 
-        let ws = Arc::clone(&self.worktree_service);
-        let pr_closer = Arc::clone(&self.pr_closer);
+        let ws = Arc::clone(&self.services.worktree_service);
+        let pr_closer = Arc::clone(&self.services.pr_closer);
         let (tx, rx) = crossbeam_channel::bounded(1);
 
         std::thread::spawn(move || {
@@ -491,7 +497,7 @@ impl super::App {
         if paths.is_empty() {
             return;
         }
-        let backend = Arc::clone(&self.agent_backend);
+        let backend = Arc::clone(&self.services.agent_backend);
         std::thread::spawn(move || {
             backend.cleanup_session_files(&paths);
         });
@@ -530,7 +536,7 @@ impl super::App {
             "Cleaning up orphan worktree {}",
             worktree_path.display()
         ));
-        let ws = Arc::clone(&self.worktree_service);
+        let ws = Arc::clone(&self.services.worktree_service);
         let finished_tx = self.orphan_cleanup_finished_tx.clone();
         std::thread::spawn(move || {
             let mut warnings: Vec<String> = Vec::new();

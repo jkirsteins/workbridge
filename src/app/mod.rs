@@ -110,7 +110,7 @@ macro_rules! impl_pr_merge_poll_method {
                         // the next fetch cycle clears any transient
                         // data.
                         if let Some(identity) = &result.pr_identity
-                            && let Err(e) = self.backend.save_pr_identity(
+                            && let Err(e) = self.services.backend.save_pr_identity(
                                 &result.wi_id,
                                 &result.repo_path,
                                 identity,
@@ -129,7 +129,7 @@ macro_rules! impl_pr_merge_poll_method {
                             }),
                         };
                         if let Err(e) =
-                            self.backend.append_activity(&result.wi_id, &log_entry)
+                            self.services.backend.append_activity(&result.wi_id, &log_entry)
                         {
                             self.status_message =
                                 Some(format!("Activity log error: {e}"));
@@ -304,28 +304,36 @@ macro_rules! impl_pr_merge_reconstruct_method {
 }
 
 // === Submodule declarations ===
+//
+// Phase 4 logical decomposition: subsystem structs (`Toasts`,
+// `Activities`, `ClickTracking`, `UserActionGuard`) live in their
+// own owning-struct modules. The remainder of `impl App` is split
+// into subsystem-named files below. Methods are grouped by the
+// subsystem concern they serve - NOT by line-count budget. Each
+// file's doc comment names the subsystem it implements. Moving
+// methods between files is a logical-ownership change, not a
+// mechanical one.
 mod activities;
+mod cleanup;
 mod click_tracking;
+mod display_list;
+mod fetcher_bridge;
+mod gate_polling;
+mod global_drawer;
+mod harness;
 mod helpers;
-mod impl_01;
-mod impl_02;
-mod impl_03;
-mod impl_04;
-mod impl_05;
-mod impl_06;
-mod impl_07;
-mod impl_08;
-mod impl_09;
-mod impl_10;
-mod impl_11;
-mod impl_12;
-mod impl_13;
-mod impl_14;
-mod impl_15;
-mod impl_16;
-mod impl_17;
-mod impl_18;
+mod mcp_bridge_and_imports;
+mod mergequeue;
+mod pr_creation;
+mod pr_merge_and_review;
 mod rebase_gate_compute;
+mod rebase_gate_spawn;
+mod review_gate;
+mod session_spawn;
+mod sessions_core;
+mod setup_and_user_actions;
+mod shared_services;
+mod stage_transitions;
 mod struct_app;
 #[cfg(test)]
 mod stubs;
@@ -335,12 +343,15 @@ mod toasts;
 mod types_01;
 mod types_02;
 mod user_actions;
+mod work_item_ops;
+mod worktree_and_first_run;
 
 // Re-exports so `super::<Type>` / `super::<helper>` paths in sibling
 // submodules keep resolving without changing the import shape.
 pub use activities::*;
 pub use click_tracking::*;
 pub use helpers::*;
+pub use shared_services::*;
 pub use struct_app::*;
 #[cfg(test)]
 pub use stubs::*;

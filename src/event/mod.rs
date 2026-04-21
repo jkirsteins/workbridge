@@ -334,11 +334,15 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                     && app.settings_review_skill_editing =>
             {
                 let new_value = app.settings_review_skill_input.text().trim().to_string();
-                let old_value = app.config.defaults.review_skill.clone();
-                app.config.defaults.review_skill.clone_from(&new_value);
-                if let Err(e) = app.config_provider.save(&app.config) {
+                let old_value = app.services.config.defaults.review_skill.clone();
+                app.services
+                    .config
+                    .defaults
+                    .review_skill
+                    .clone_from(&new_value);
+                if let Err(e) = app.services.config_provider.save(&app.services.config) {
                     // Rollback on save failure.
-                    app.config.defaults.review_skill = old_value;
+                    app.services.config.defaults.review_skill = old_value;
                     app.status_message = Some(format!("Error saving config: {e}"));
                 } else {
                     app.status_message = Some(format!("Review skill set to: {new_value}"));
@@ -348,7 +352,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             }
             (_, KeyCode::Enter) if app.settings_tab == SettingsTab::ReviewGate => {
                 // Start editing with the current config value.
-                let current = app.config.defaults.review_skill.clone();
+                let current = app.services.config.defaults.review_skill.clone();
                 app.settings_review_skill_input.set_text(&current);
                 app.settings_review_skill_editing = true;
             }

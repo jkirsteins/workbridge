@@ -1,8 +1,13 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! MCP bridge subsystem + unlinked/review-request import.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Drains MCP socket-server events on every tick
+//! (`poll_mcp_status_updates`) so work-item agent-working state
+//! stays in sync with live tool-call activity. Also owns the
+//! import operations that promote a fetched unlinked-PR or
+//! review-request row into a tracked work item
+//! (`import_selected_unlinked`, `import_selected_review_request`,
+//! `selected_pr_target`). Grouped because both surfaces read the
+//! same selection-derived PR identity.
 
 use std::path::PathBuf;
 
@@ -206,7 +211,7 @@ impl super::App {
                         event_type,
                         payload,
                     };
-                    if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
+                    if let Err(e) = self.services.backend.append_activity(&wi_id, &entry) {
                         self.status_message = Some(format!("Activity log error: {e}"));
                     }
                 }
@@ -221,7 +226,7 @@ impl super::App {
                             continue;
                         }
                     };
-                    if let Err(e) = self.backend.update_plan(&wi_id, &plan) {
+                    if let Err(e) = self.services.backend.update_plan(&wi_id, &plan) {
                         self.status_message = Some(format!("Plan update error: {e}"));
                     } else {
                         // Log the plan set event to the activity log.
@@ -233,7 +238,7 @@ impl super::App {
                                 "plan_length": plan.len()
                             }),
                         };
-                        if let Err(e) = self.backend.append_activity(&wi_id, &entry) {
+                        if let Err(e) = self.services.backend.append_activity(&wi_id, &entry) {
                             self.status_message = Some(format!("Activity log error: {e}"));
                         } else {
                             self.status_message = Some("Plan saved by Claude".to_string());
@@ -243,7 +248,7 @@ impl super::App {
                         // Read authoritative status from disk rather than the
                         // in-memory cache, which may be stale. The orphan cleanup
                         // in check_liveness will kill the Planning session.
-                        match self.backend.read(&wi_id) {
+                        match self.services.backend.read(&wi_id) {
                             Ok(record) if record.status == WorkItemStatus::Planning => {
                                 self.apply_stage_change(
                                     &wi_id,
@@ -271,7 +276,7 @@ impl super::App {
                             continue;
                         }
                     };
-                    if let Err(e) = self.backend.update_title(&wi_id, &title) {
+                    if let Err(e) = self.services.backend.update_title(&wi_id, &title) {
                         self.status_message = Some(format!("Title update error: {e}"));
                     } else {
                         self.reassemble_work_items();
@@ -504,7 +509,7 @@ impl super::App {
                         }],
                     };
 
-                    match self.backend.create(request) {
+                    match self.services.backend.create(request) {
                         Ok(record) => {
                             let wi_id = record.id.clone();
                             self.reassemble_work_items();
@@ -548,7 +553,7 @@ impl super::App {
         let repo_path = unlinked.repo_path.clone();
         let branch = unlinked.branch.clone();
 
-        match self.backend.import(unlinked) {
+        match self.services.backend.import(unlinked) {
             Ok(record) => {
                 let title = record.title.clone();
                 let wi_id = record.id;
@@ -583,7 +588,7 @@ impl super::App {
         let repo_path = rr.repo_path.clone();
         let branch = rr.branch.clone();
 
-        match self.backend.import_review_request(rr) {
+        match self.services.backend.import_review_request(rr) {
             Ok(record) => {
                 let title = record.title.clone();
                 let wi_id = record.id;

@@ -172,7 +172,7 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
             active_repos,
             Arc::clone(&ctx.worktree_service),
             Arc::clone(&ctx.github_client),
-            state.config.defaults.branch_issue_pattern.clone(),
+            state.services.config.defaults.branch_issue_pattern.clone(),
             extra_branches,
         );
         state.fetch_rx = Some(rx);
@@ -586,7 +586,7 @@ pub fn app_event(
                             new_repos,
                             Arc::clone(&ctx.worktree_service),
                             Arc::clone(&ctx.github_client),
-                            state.config.defaults.branch_issue_pattern.clone(),
+                            state.services.config.defaults.branch_issue_pattern.clone(),
                             new_extra,
                         );
                         state.fetch_rx = Some(rx);

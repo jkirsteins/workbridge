@@ -330,7 +330,7 @@ fn merge_conflict_detection_logic() {
 #[test]
 fn build_agent_cmd_delegates_to_backend() {
     // Integration-level smoke test: the App-level helper assembles
-    // a SpawnConfig and hands it to `self.agent_backend`. If a
+    // a SpawnConfig and hands it to `self.services.agent_backend`. If a
     // future refactor starts injecting Claude-specific flags here,
     // this test catches it - everything that is not command-name
     // or MCP path must come from the backend.
@@ -342,7 +342,7 @@ fn build_agent_cmd_delegates_to_backend() {
         Some(&mcp_path),
         false,
     );
-    assert_eq!(cmd[0], app.agent_backend.command_name());
+    assert_eq!(cmd[0], app.services.agent_backend.command_name());
     assert!(
         cmd.iter().any(|s| s == "stage prompt"),
         "system prompt must be forwarded to the backend"

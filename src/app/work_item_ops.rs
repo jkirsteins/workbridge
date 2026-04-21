@@ -1,8 +1,14 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Work-item operations subsystem - PR open, rebase start, create,
+//! set-branch recovery, delete prompt.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Covers the user-action-level work-item commands that do NOT
+//! belong to a more specific subsystem:
+//! `open_selected_pr_in_browser`, `start_rebase_on_main`,
+//! `create_work_item_with` and its quickstart variants, the
+//! `set_branch` recovery dialog (`open_set_branch_dialog`,
+//! `cancel_set_branch_dialog`, `confirm_set_branch_dialog`), and
+//! the delete-prompt dialog (`open_delete_prompt`,
+//! `cancel_delete_prompt`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -169,8 +175,8 @@ impl super::App {
             return;
         }
 
-        let wt_dir = self.config.defaults.worktree_dir.clone();
-        let ws = Arc::clone(&self.worktree_service);
+        let wt_dir = self.services.config.defaults.worktree_dir.clone();
+        let ws = Arc::clone(&self.services.worktree_service);
         let wi_id_clone = wi_id.clone();
         let title_clone = title.clone();
 
@@ -313,7 +319,7 @@ impl super::App {
             repo_associations,
         };
 
-        match self.backend.create(request) {
+        match self.services.backend.create(request) {
             Ok(_record) => {
                 self.reassemble_work_items();
                 self.build_display_list();
@@ -355,7 +361,7 @@ impl super::App {
             }],
         };
 
-        match self.backend.create(request) {
+        match self.services.backend.create(request) {
             Ok(record) => {
                 let wi_id = record.id;
                 self.reassemble_work_items();
@@ -394,7 +400,7 @@ impl super::App {
             }],
         };
 
-        match self.backend.create(request) {
+        match self.services.backend.create(request) {
             Ok(record) => {
                 let wi_id = record.id;
                 self.reassemble_work_items();
@@ -526,7 +532,11 @@ impl super::App {
             self.status_message = Some("Branch already set".into());
         } else {
             for repo_path in &targets {
-                if let Err(e) = self.backend.update_branch(&dlg.wi_id, repo_path, &branch) {
+                if let Err(e) = self
+                    .services
+                    .backend
+                    .update_branch(&dlg.wi_id, repo_path, &branch)
+                {
                     self.status_message = Some(format!("Failed to set branch: {e}"));
                     // Restore the dialog so the user can retry.
                     self.set_branch_dialog = Some(dlg);

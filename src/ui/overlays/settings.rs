@@ -148,10 +148,10 @@ pub fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area:
     let repos_section_height = repos_visible + 2; // +2 for block borders
 
     // Count base_dirs lines.
-    let base_dirs_lines: u16 = if app.config.base_dirs.is_empty() {
+    let base_dirs_lines: u16 = if app.services.config.base_dirs.is_empty() {
         1
     } else {
-        app.config.base_dirs.len() as u16
+        app.services.config.base_dirs.len() as u16
     };
 
     let source_height = 2;
@@ -173,16 +173,16 @@ pub fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area:
     // Section 0: Config source.
     let source_text = Text::from(vec![
         Line::styled("Config source:", theme.style_heading()),
-        Line::from(format!("  {}", app.config.source)),
+        Line::from(format!("  {}", app.services.config.source)),
     ]);
     Paragraph::new(source_text).render(sections[0], buf);
 
     // Section 1: Base directories.
     let mut base_lines = vec![Line::styled("Base directories:", theme.style_heading())];
-    if app.config.base_dirs.is_empty() {
+    if app.services.config.base_dirs.is_empty() {
         base_lines.push(Line::styled("  (none)", theme.style_text_muted()));
     } else {
-        for dir in &app.config.base_dirs {
+        for dir in &app.services.config.base_dirs {
             let expanded = config::expand_tilde(dir);
             let marker = if expanded.is_dir() { "+" } else { "-" };
             base_lines.push(Line::from(format!("  {marker} {dir}")));
@@ -265,11 +265,11 @@ pub fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area:
         Line::styled("Defaults:", theme.style_heading()),
         Line::from(format!(
             "  worktree_dir: {}",
-            app.config.defaults.worktree_dir
+            app.services.config.defaults.worktree_dir
         )),
         Line::from(format!(
             "  branch_issue_pattern: {}",
-            app.config.defaults.branch_issue_pattern
+            app.services.config.defaults.branch_issue_pattern
         )),
     ]);
     Paragraph::new(defaults_text).render(sections[4], buf);
@@ -310,7 +310,7 @@ pub fn draw_settings_review_gate_tab(buf: &mut Buffer, app: &mut App, theme: &Th
         let value = Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                app.config.defaults.review_skill.as_str(),
+                app.services.config.defaults.review_skill.as_str(),
                 theme.style_text(),
             ),
         ]);

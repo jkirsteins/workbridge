@@ -1,8 +1,13 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Global assistant drawer subsystem.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Drains the async global-session spawn channel
+//! (`poll_global_session_open`), buffers/flushes PTY bytes to the
+//! global session (`send_bytes_to_global`), refreshes the
+//! dynamic MCP context passed to the global agent
+//! (`refresh_global_mcp_context`), and collects the
+//! `extra_branches_from_backend` surface used at fetcher startup.
+//! The global assistant is the third known harness spawn path in
+//! `docs/harness-contract.md`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -97,7 +102,7 @@ impl super::App {
         // opens the first-run modal in that case and only calls
         // `toggle_global_drawer` after a pick. Abort loudly (toast +
         // close drawer) rather than silently falling back to
-        // `self.agent_backend`: CLAUDE.md has an [ABSOLUTE] rule
+        // `self.services.agent_backend`: CLAUDE.md has an [ABSOLUTE] rule
         // against silent default-harness substitution, and this is
         // the last line of defence for any future bypass of
         // `handle_ctrl_g`'s guard.
@@ -504,7 +509,7 @@ impl super::App {
     pub fn extra_branches_from_backend(&self) -> std::collections::HashMap<PathBuf, Vec<String>> {
         let mut map: std::collections::HashMap<PathBuf, Vec<String>> =
             std::collections::HashMap::new();
-        let Ok(list_result) = self.backend.list() else {
+        let Ok(list_result) = self.services.backend.list() else {
             // Backend list failed - the fetcher just won't have extras.
             // The error will surface through other paths (assembly, etc.).
             return map;

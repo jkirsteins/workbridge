@@ -1,8 +1,12 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Display list + selection + board subsystem.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Rebuilds the flat display list from the assembled `work_items`
+//! (`build_display_list`), restores selection identity across
+//! reassembly (`sync_selection_identity`), drives keyboard
+//! navigation (`select_next_item`, `select_prev_item`), and
+//! handles the board view cursor sync. Also owns
+//! `open_session_for_selected` because it is the primary Enter
+//! dispatch off the selection layer.
 
 use std::path::PathBuf;
 
@@ -31,7 +35,7 @@ impl super::App {
         &mut self,
         records: Vec<crate::work_item_backend::WorkItemRecord>,
     ) -> Vec<crate::work_item_backend::WorkItemRecord> {
-        let archive_days = self.config.defaults.archive_after_days;
+        let archive_days = self.services.config.defaults.archive_after_days;
         if archive_days == 0 {
             return records;
         }

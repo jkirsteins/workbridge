@@ -196,11 +196,11 @@ fn delete_preserves_local_resources_when_pr_close_fails() {
         Box::new(InMemoryConfigProvider::new()),
     );
     // Replace the production gh-based closer with the failing stub
-    // before driving the delete. The delete path reads `app.pr_closer`
+    // before driving the delete. The delete path reads `app.services.pr_closer`
     // once inside `spawn_delete_cleanup` and Arc::clones it into the
     // background thread, so this assignment must happen before
     // `confirm_delete_from_prompt`.
-    app.pr_closer = failing_closer.clone();
+    app.services.pr_closer = failing_closer.clone();
 
     // Inject cached RepoFetchResult so gather_delete_cleanup_infos
     // finds both the worktree path AND an open PR. The combination
@@ -563,7 +563,7 @@ fn apply_stage_change_sets_done_at() {
     );
 
     // Verify done_at was set on the backend record.
-    let records = app.backend.list().unwrap().records;
+    let records = app.services.backend.list().unwrap().records;
     assert_eq!(records.len(), 1);
     assert!(
         records[0].done_at.is_some(),

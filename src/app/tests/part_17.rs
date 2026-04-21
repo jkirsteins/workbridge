@@ -267,7 +267,7 @@ fn stage_system_prompt_never_reads_plan_on_ui_thread() {
     // `backend.read_plan(...)` itself. Against the pre-fix code
     // this assertion would fail: the UI-thread call of
     // `stage_system_prompt` unconditionally invoked
-    // `self.backend.read_plan(work_item_id)` before building the
+    // `self.services.backend.read_plan(work_item_id)` before building the
     // prompt, bumping the counter to 1.
     let backend = Arc::new(CountingPlanBackend::default());
     let mut app = App::with_config_and_worktree_service(

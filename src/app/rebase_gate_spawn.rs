@@ -1,8 +1,10 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Rebase-gate subsystem - async rebase-gate spawn.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Holds `spawn_rebase_gate`, which kicks off the background
+//! rebase-gate job when the user presses the rebase-on-main key.
+//! The rebase-gate is one of the three known harness spawn paths
+//! in `docs/harness-contract.md`; the heavy compute phase lives
+//! in the sibling `rebase_gate_compute` module.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,7 +53,7 @@ impl super::App {
         // them into `McpBridgeSpec` so the background harness sub-thread
         // can pass them through to Codex via per-key `-c` overrides
         // alongside the workbridge bridge. Computing here (rather than
-        // inside the thread) keeps `self.config` reads on the UI thread,
+        // inside the thread) keeps `self.services.config` reads on the UI thread,
         // matching how `begin_session_open` does it. HTTP entries are
         // skipped: Codex's `mcp_servers.<name>` schema requires command
         // + args. See `agent_backend::McpBridgeSpec`. R3-F-3: count the
@@ -68,7 +70,7 @@ impl super::App {
             .and_then(|w| w.repo_associations.first())
             .map(|assoc| {
                 let repo_display = crate::config::collapse_home(&assoc.repo_path);
-                let entries = self.config.mcp_servers_for_repo(&repo_display);
+                let entries = self.services.config.mcp_servers_for_repo(&repo_display);
                 let http_count = entries.iter().filter(|e| e.server_type == "http").count();
                 let bridges: Vec<crate::agent_backend::McpBridgeSpec> = entries
                     .into_iter()
@@ -112,8 +114,8 @@ impl super::App {
             },
         );
 
-        let ws = Arc::clone(&self.worktree_service);
-        let backend = Arc::clone(&self.backend);
+        let ws = Arc::clone(&self.services.worktree_service);
+        let backend = Arc::clone(&self.services.backend);
         let (tx, rx) = crossbeam_channel::unbounded::<RebaseGateMessage>();
         let wi_id_clone = wi_id.clone();
         // Shared PID slot for the harness child. The outer thread
@@ -156,7 +158,7 @@ impl super::App {
 
         // `agent_backend` was resolved at the top of this function
         // from `harness_choice`; reuse it here rather than reading
-        // `self.agent_backend` again.
+        // `self.services.agent_backend` again.
         std::thread::spawn(move || {
             // Cancellation check at the very start of the thread.
             // If `drop_rebase_gate` ran between the insert above and

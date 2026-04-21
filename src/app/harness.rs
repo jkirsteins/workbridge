@@ -1,8 +1,13 @@
-//! Subset of `impl App` methods extracted from `src/app/mod.rs`.
+//! Harness subsystem - per-item LLM harness choice + session
+//! open/close polling.
 //!
-//! The `impl App { ... }` is split across sibling files solely to
-//! keep every file within the 700-line ceiling. Methods behave
-//! identically to the original single-file layout.
+//! Owns the `harness_choice` map and every read of it: the
+//! `backend_for_work_item` resolver (which every spawn site
+//! funnels through), `agent_backend_display_name` and its
+//! permission-marker variant, the `kk` double-press session-end
+//! gesture, and the global-assistant harness-kind lookup. Also
+//! drains the async session-open pipeline
+//! (`poll_session_opens`, `poll_session_spawns`).
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -391,7 +396,7 @@ impl super::App {
     /// forbidden from falling back to a hardcoded vendor default. If
     /// no harness is committed for the current context, it returns
     /// the neutral `SESSION_TITLE_NONE` placeholder. Returning
-    /// `self.agent_backend.kind().display_name()` as a fallback would
+    /// `self.services.agent_backend.kind().display_name()` as a fallback would
     /// mean the tab title reads "Claude Code" for a user who has
     /// picked Codex but not yet spawned the session - a user-facing
     /// lie because no harness is running in the pane at all.
@@ -483,7 +488,7 @@ impl super::App {
     /// Returns `Some` only if the user has already pressed `c` / `x` /
     /// `o` for this item (i.e. there is a `harness_choice` entry). The
     /// spawn sites surface the `None` case as a toast and bail rather
-    /// than silently defaulting to `self.agent_backend` - that was the
+    /// than silently defaulting to `self.services.agent_backend` - that was the
     /// "abort rather than default to claude" rule pinned by the plan
     /// (Milestone 3, review/rebase-gate bullet). See also
     /// `docs/harness-contract.md` Change Log 2026-04-16.
@@ -634,7 +639,12 @@ impl super::App {
     /// Returns the configured kind if one is set, otherwise `None`
     /// to signal "show the first-run modal".
     pub fn global_assistant_harness_kind(&self) -> Option<AgentBackendKind> {
-        let name = self.config.defaults.global_assistant_harness.as_deref()?;
+        let name = self
+            .services
+            .config
+            .defaults
+            .global_assistant_harness
+            .as_deref()?;
         AgentBackendKind::from_str(name).ok()
     }
 }

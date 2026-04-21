@@ -6,16 +6,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 
 use super::*;
-use crate::agent_backend::{AgentBackend, AgentBackendKind};
-use crate::config::{Config, ConfigProvider, RepoEntry};
+use crate::agent_backend::AgentBackendKind;
+use crate::config::RepoEntry;
 use crate::create_dialog::CreateDialog;
 use crate::mcp::{McpEvent, McpSocketServer};
 use crate::work_item::{
     FetchMessage, FetcherHandle, RepoFetchResult, ReviewRequestedPr, SessionEntry, UnlinkedPr,
     WorkItem, WorkItemId, WorkItemStatus,
 };
-use crate::work_item_backend::WorkItemBackend;
-use crate::worktree_service::WorktreeService;
 
 /// App holds the entire application state.
 pub struct App {
@@ -127,10 +125,13 @@ pub struct App {
     pub pane_cols: u16,
     /// The terminal rows available for the right panel (PTY pane).
     pub pane_rows: u16,
-    /// The loaded configuration (repo paths, base dirs, defaults).
-    pub config: Config,
-    /// Abstracts config persistence so tests use an in-memory store.
-    pub config_provider: Box<dyn ConfigProvider>,
+    /// App-wide service aggregate: `backend`, `worktree_service`,
+    /// `github_client`, `pr_closer`, `agent_backend`, `config`,
+    /// `config_provider`. Replaces seven previously sibling fields on
+    /// `App` with a single owning struct so every subsystem method
+    /// takes `&mut SharedServices` instead of `&mut App` when only
+    /// services are needed. See `app::SharedServices`.
+    pub services: SharedServices,
     /// Whether to show the settings overlay.
     pub show_settings: bool,
     /// Cached active repo entries (explicit + included). Rebuilt when
@@ -154,29 +155,6 @@ pub struct App {
     pub create_dialog: CreateDialog,
 
     // -- Work item state --
-    /// Backend for persisting work item records. Held as `Arc` rather than
-    /// `Box` so background threads (PR creation, review gate, delete
-    /// cleanup) can clone the handle and perform backend I/O off the UI
-    /// thread - see `docs/UI.md` "Blocking I/O Prohibition" for why
-    /// `backend.read_plan(...)` and similar calls must not run on the
-    /// main thread.
-    pub backend: Arc<dyn WorkItemBackend>,
-    /// Worktree service for creating/listing worktrees.
-    pub worktree_service: Arc<dyn WorktreeService + Send + Sync>,
-    /// GitHub client used by the merge precheck to re-fetch the live
-    /// PR mergeable flag and CI rollup before admitting a merge.
-    /// Injected via the trait so tests can drive the conflict /
-    /// CI-failing / no-PR / error branches without shelling out to
-    /// `gh`. Production threads a `GhCliClient` in via
-    /// `App::with_config_worktree_and_github`; the test-only default
-    /// constructor swaps in `StubGithubClient` which always reports
-    /// "no open PR" so the precheck classifier falls through to the
-    /// worktree-only classification.
-    pub github_client: Arc<dyn crate::github_client::GithubClient + Send + Sync>,
-    /// GitHub pull-request closer, injected via trait so the background
-    /// delete-cleanup thread can be exercised in tests without shelling
-    /// out to `gh`. Production uses `GhPullRequestCloser`.
-    pub pr_closer: Arc<dyn crate::pr_service::PullRequestCloser>,
     /// Assembled work items (from backend records + repo data).
     pub work_items: Vec<WorkItem>,
     /// PRs not linked to any work item (only the user's own).
@@ -290,13 +268,6 @@ pub struct App {
     /// when repos change or when the app shuts down. Managed by the
     /// rat-salsa event callback in salsa.rs.
     pub fetcher_handle: Option<FetcherHandle>,
-    /// Pluggable LLM harness adapter that knows how to build argv for the
-    /// three spawn profiles (work-item, review-gate, global) and write any
-    /// backend-specific side-car files (`config.toml`, etc.).
-    /// Every place that previously hard-coded `claude` flags now goes
-    /// through this trait object. See `crate::agent_backend` and
-    /// `docs/harness-contract.md`.
-    pub agent_backend: Arc<dyn AgentBackend>,
     /// Per-work-item harness choice. Populated when the user presses
     /// `c` / `x` / `o` on a work-item row (see
     /// `App::open_session_with_harness`); read back by every spawn site

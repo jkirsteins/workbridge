@@ -562,7 +562,7 @@ fn harness_choice_applied_to_rebase_gate_spawn() {
 /// Pins C14 (harness-contract.md): `agent_backend_display_name`
 /// returns the neutral `SESSION_TITLE_NONE` placeholder when no
 /// harness is committed to the current context. The UI tab
-/// title previously fell through to `self.agent_backend.kind()`
+/// title previously fell through to `self.services.agent_backend.kind()`
 /// which is hardcoded `ClaudeCodeBackend`, causing the tab to
 /// read "Claude Code" for users who had picked Codex (or no
 /// harness at all). That was a user-facing lie; the rule is
@@ -575,7 +575,13 @@ fn agent_backend_display_name_is_neutral_without_committed_harness() {
     assert!(app.selected_work_item_id().is_none());
     assert!(app.harness_choice.is_empty());
     assert!(!app.global_drawer_open);
-    assert!(app.config.defaults.global_assistant_harness.is_none());
+    assert!(
+        app.services
+            .config
+            .defaults
+            .global_assistant_harness
+            .is_none()
+    );
 
     assert_eq!(
         app.agent_backend_display_name(),
