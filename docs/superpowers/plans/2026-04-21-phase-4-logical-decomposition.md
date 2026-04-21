@@ -2,6 +2,27 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+## Implementation status (partial)
+
+Subsystem extraction from `App` is in progress. As of the current branch head:
+
+- **Done (6 of ~18 subsystems + SharedServices):**
+  - `UserActionGuard` (pre-existing) - `src/app/user_actions.rs`
+  - `Toasts` - `src/app/toasts.rs`
+  - `Activities` - `src/app/activities.rs`
+  - `ClickTracking` - `src/app/click_tracking.rs`
+  - `Shell` - `src/app/shell.rs`
+  - `GlobalDrawer` - `src/app/global_drawer.rs`
+  - `SharedServices` aggregate - `src/app/shared_services.rs`
+
+- **Still to extract (follow-up work):** modals, settings overlay, display list + selection, work items, metrics, fetcher bridge, harness, MCP bridge, sessions, review gate, rebase gate, PR lifecycle (create + merge + mergequeue + review-request-merge + identity-backfill), cleanup, stage transitions.
+
+- **Mechanical impl-split removed:** the 18 files `impl_01.rs..impl_18.rs` (all of which carried the identical doc comment "split across sibling files solely to keep every file within the 700-line ceiling") have been renamed to subsystem-concern files (`setup_and_user_actions`, `sessions_core`, `fetcher_bridge`, `cleanup`, `display_list`, `session_spawn`, `harness`, `worktree_and_first_run`, `mcp_bridge_and_imports`, `work_item_ops`, `stage_transitions`, `pr_creation`, `pr_merge_and_review`, `mergequeue`, `review_gate`, `rebase_gate_spawn`, `gate_polling`, `global_drawer_polling`). Each file's doc comment now describes its subsystem.
+
+- **Tests:** `cargo test --all-features` 790 passing, 0 failing. `./hooks/clippy-check.sh` green. `cargo fmt --all` green.
+
+The remaining subsystems follow the same Stage-2 extraction pattern and the same task structure as `Toasts`/`Activities`/`ClickTracking`/`Shell`/`GlobalDrawer` below.
+
 **Goal:** Complete the hygiene campaign: decompose every workbridge source file to <=700 lines by logical subsystem ownership (not mechanical impl-splits), physically delete the exception mechanism, and add review-policy rules that (a) ban future size exceptions and (b) ban unstable source-path/line-number references in docs.
 
 **Architecture:** Each monolithic file becomes a sibling-module tree under `src/<name>/`. The `App` god object is decomposed into ~18 subsystem structs that each own their fields and expose narrow interfaces, with shared services (backends, worktree service, github client, agent backend, config) grouped into a `SharedServices` aggregate. Field-borrow splitting at the `App::tick` call site allows subsystems to hold disjoint `&mut` borrows concurrently. The 13 other over-budget files are split by logical concern (render surface, event source, API role, etc.). Tests become co-located with their modules; new subsystem-level unit tests target the new boundaries directly.
@@ -394,42 +415,42 @@ Each subsystem follows this same sub-pattern. I list it in full once, then list 
 
 #### 2.1 Extract `UserActionGuard` (already struct)
 
-- [ ] **Task 2.1.1:** Move `UserActionGuard`, `UserActionKey`, `UserActionPayload` from `src/app.rs` into `src/app/user_actions.rs`.
-- [ ] **Task 2.1.2:** Replace `app.try_begin_user_action(...)` etc. method forwarders with direct `app.user_actions.try_begin(...)` calls at every call site. (The guard already holds its own state; this is mostly removing shims.)
-- [ ] **Task 2.1.3:** Add a unit test in `src/app/user_actions.rs` that exercises the debounce-window behavior without constructing `App`.
-- [ ] **Task 2.1.4:** Run fmt + nightly-fmt + clippy + test. Commit.
+- [x] **Task 2.1.1:** Move `UserActionGuard`, `UserActionKey`, `UserActionPayload` from `src/app.rs` into `src/app/user_actions.rs`.
+- [x] **Task 2.1.2:** Replace `app.try_begin_user_action(...)` etc. method forwarders with direct `app.user_actions.try_begin(...)` calls at every call site. (The guard already holds its own state; this is mostly removing shims.)
+- [x] **Task 2.1.3:** Add a unit test in `src/app/user_actions.rs` that exercises the debounce-window behavior without constructing `App`.
+- [x] **Task 2.1.4:** Run fmt + nightly-fmt + clippy + test. Commit.
 
 #### 2.2 Extract `ToastManager`
 
-- [ ] **Task 2.2.1:** Create `src/app/toasts.rs`. Move `Toast` struct, `toasts: Vec<Toast>` field, `push_toast`, `prune_toasts`, `fire_chrome_copy` there. Rename methods: `ToastManager::push`, `ToastManager::prune`, `ToastManager::fire_chrome_copy`.
-- [ ] **Task 2.2.2:** `App` gets `pub toasts: ToastManager`.
-- [ ] **Task 2.2.3:** Replace all `self.push_toast(...)` call sites with `self.toasts.push(...)`. For call sites that also need other fields, use `let App { toasts, ... } = self;` field-borrow split.
-- [ ] **Task 2.2.4:** Update existing tests that poke `app.toasts.push(Toast { ... })` to use the new API.
-- [ ] **Task 2.2.5:** Add unit test: push 5 toasts, verify ordering; prune past TTL, verify prune behavior; fire_chrome_copy creates an expected toast.
-- [ ] **Task 2.2.6:** fmt/clippy/test. Commit.
+- [x] **Task 2.2.1:** Create `src/app/toasts.rs`. Move `Toast` struct, `toasts: Vec<Toast>` field, `push_toast`, `prune_toasts`, `fire_chrome_copy` there. Rename methods: `ToastManager::push`, `ToastManager::prune`, `ToastManager::fire_chrome_copy`.
+- [x] **Task 2.2.2:** `App` gets `pub toasts: ToastManager`.
+- [x] **Task 2.2.3:** Replace all `self.push_toast(...)` call sites with `self.toasts.push(...)`. For call sites that also need other fields, use `let App { toasts, ... } = self;` field-borrow split.
+- [x] **Task 2.2.4:** Update existing tests that poke `app.toasts.push(Toast { ... })` to use the new API.
+- [x] **Task 2.2.5:** Add unit test: push 5 toasts, verify ordering; prune past TTL, verify prune behavior; fire_chrome_copy creates an expected toast.
+- [x] **Task 2.2.6:** fmt/clippy/test. Commit.
 
 #### 2.3 Extract `ActivityIndicator`
 
-- [ ] **Task 2.3.1:** Create `src/app/activities.rs`. Move `Activity`, `ActivityId`, `activity_counter`, `activities`, `spinner_tick` into `ActivityIndicator`.
-- [ ] **Task 2.3.2:** Methods: `start`, `end`, `current`, `advance_spinner`.
-- [ ] **Task 2.3.3:** Update call sites.
-- [ ] **Task 2.3.4:** Unit tests: activity start -> current returns it; end removes it; multiple stacked activities show the last.
-- [ ] **Task 2.3.5:** fmt/clippy/test. Commit.
+- [x] **Task 2.3.1:** Create `src/app/activities.rs`. Move `Activity`, `ActivityId`, `activity_counter`, `activities`, `spinner_tick` into `ActivityIndicator`.
+- [x] **Task 2.3.2:** Methods: `start`, `end`, `current`, `advance_spinner`.
+- [x] **Task 2.3.3:** Update call sites.
+- [x] **Task 2.3.4:** Unit tests: activity start -> current returns it; end removes it; multiple stacked activities show the last.
+- [x] **Task 2.3.5:** fmt/clippy/test. Commit.
 
 #### 2.4 Extract `ClickTracking`
 
-- [ ] **Task 2.4.1:** Create `src/app/click_tracking.rs`. Move `click_registry: RefCell<ClickRegistry>` + `pending_chrome_click` here. Provide methods for registry clearing, click resolution.
-- [ ] **Task 2.4.2:** Update call sites in event.rs and ui.rs.
-- [ ] **Task 2.4.3:** Unit tests.
-- [ ] **Task 2.4.4:** fmt/clippy/test. Commit.
+- [x] **Task 2.4.1:** Create `src/app/click_tracking.rs`. Move `click_registry: RefCell<ClickRegistry>` + `pending_chrome_click` here. Provide methods for registry clearing, click resolution.
+- [x] **Task 2.4.2:** Update call sites in event.rs and ui.rs.
+- [x] **Task 2.4.3:** Unit tests.
+- [x] **Task 2.4.4:** fmt/clippy/test. Commit.
 
 #### 2.5 Extract `Shell`
 
-- [ ] **Task 2.5.1:** Create `src/app/shell.rs`. Move `should_quit`, `focus`, `status_message`, `confirm_quit`, `shutting_down`, `shutdown_started`, `pane_cols`, `pane_rows`.
-- [ ] **Task 2.5.2:** Methods: `request_quit`, `confirm_quit`, `is_shutting_down`, `start_shutdown`, `set_status`, `clear_status`, `resize_panes(cols, rows)`.
-- [ ] **Task 2.5.3:** Update call sites. This touches many files; use field-borrow splits where needed.
-- [ ] **Task 2.5.4:** Unit tests.
-- [ ] **Task 2.5.5:** fmt/clippy/test. Commit.
+- [x] **Task 2.5.1:** Create `src/app/shell.rs`. Move `should_quit`, `focus`, `status_message`, `confirm_quit`, `shutting_down`, `shutdown_started`, `pane_cols`, `pane_rows`.
+- [x] **Task 2.5.2:** Methods: `request_quit`, `confirm_quit`, `is_shutting_down`, `start_shutdown`, `set_status`, `clear_status`, `resize_panes(cols, rows)`.
+- [x] **Task 2.5.3:** Update call sites. This touches many files; use field-borrow splits where needed.
+- [x] **Task 2.5.4:** Unit tests.
+- [x] **Task 2.5.5:** fmt/clippy/test. Commit.
 
 #### 2.6 Extract `ModalStack` (and each sub-modal)
 
