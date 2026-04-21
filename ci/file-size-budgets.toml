@@ -39,7 +39,6 @@
 "src/event.rs"             = 4860
 "src/github_client.rs"     = 1425
 "src/layout.rs"            = 209
-"src/main.rs"              = 810
 "src/mcp.rs"               = 2280
 "src/metrics.rs"           = 1030
 "src/pr_service.rs"        = 45
