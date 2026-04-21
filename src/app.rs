@@ -13378,7 +13378,7 @@ mod tests {
     fn pr_list_limit_is_500() {
         // Read the source to verify the limit. This is a safeguard
         // against regressions back to 100.
-        let source = include_str!("github_client.rs");
+        let source = include_str!("github_client/real.rs");
         assert!(
             source.contains(r#""500""#) && source.contains(r#""--limit""#),
             "PR list limit should be 500 to avoid silent truncation in busy repos",
@@ -13390,7 +13390,7 @@ mod tests {
     /// return foreign PRs and may not include the user's own.
     #[test]
     fn pr_list_uses_author_me() {
-        let source = include_str!("github_client.rs");
+        let source = include_str!("github_client/real.rs");
         assert!(
             source.contains(r#""--author""#) && source.contains(r#""@me""#),
             "PR list calls should include --author @me to filter to user's PRs",

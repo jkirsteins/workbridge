@@ -35,7 +35,6 @@
 "src/click_targets.rs"     = 215
 "src/dashboard_seed.rs"    = 380
 "src/event.rs"             = 4860
-"src/github_client.rs"     = 1425
 "src/layout.rs"            = 209
 "src/mcp.rs"               = 2280
 "src/pr_service.rs"        = 45
