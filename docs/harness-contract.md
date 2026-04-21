@@ -978,7 +978,7 @@ pub trait AgentBackend: Send + Sync {
 }
 ```
 
-The three spawn sites consume this trait via `App::agent_backend:
+The four spawn sites consume this trait via `App::agent_backend:
 Arc<dyn AgentBackend>`:
 
 - `App::finish_session_open` builds an interactive work-item spawn
@@ -986,6 +986,9 @@ Arc<dyn AgentBackend>`:
 - The review-gate thread in `App::run_review_gate` (spawned from
   `review_gates` handling) clones `agent_backend` and calls
   `build_review_gate_command` + `parse_review_gate_stdout`.
+- `App::spawn_rebase_gate`'s compute thread calls
+  `build_headless_rw_command` with the rebase prompt and MCP
+  bridge spec.
 - `App::spawn_global_session` calls `build_command` directly with
   `stage: Implementing` and `auto_start_message: None`.
 
@@ -1029,7 +1032,7 @@ the UI thread builds the command (pure CPU). The global worker is
 `poll_global_session_open`). The review gate worker is
 `App::spawn_review_gate` (its own closure).
 
-All three sites go through `Session::spawn` for
+All four sites go through `Session::spawn` for
 the interactive path or `std::process::Command::output()` directly
 for the headless path; argv is built by
 `ClaudeCodeBackend::build_command` / `::build_review_gate_command` in

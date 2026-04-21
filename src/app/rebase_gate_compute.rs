@@ -1,6 +1,7 @@
 //! Rebase-gate compute phase, extracted from `spawn_rebase_gate`'s
-//! background thread body in `impl_16.rs` so each file stays within
-//! the 700-line ceiling. The labeled block `'compute: { ... }` is
+//! background thread body (`App::spawn_rebase_gate` in the sibling
+//! `rebase_gate_spawn` module) so each file stays within the
+//! 700-line ceiling. The labeled block `'compute: { ... }` is
 //! wrapped in a function. Local mutable state (`gate_server`,
 //! `config_path`, `conflicts_attempted_observed`) is owned by the
 //! function and returned in `CompDone` so the calling thread body

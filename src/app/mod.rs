@@ -1,9 +1,13 @@
-//! App aggregator module. Types live in `types_NN`, the `App` struct
-//! in `struct_app`, helpers in `helpers`, test stubs in `stubs` (cfg test),
-//! per-subsystem impl blocks in `impl_NN`, and the `spawn_rebase_gate`
-//! background compute phase in `rebase_gate_compute`. Submodule re-exports
-//! keep existing `super::App` / `super::RebaseResult` / etc. import paths
-//! working without changes in sibling submodules.
+//! App aggregator module. Types live in `types_01` / `types_02`, the
+//! `App` struct in `struct_app`, helpers in `helpers`, test stubs in
+//! `stubs` (cfg test), per-subsystem `impl App` blocks in
+//! subsystem-named sibling modules (for example `review_gate`,
+//! `rebase_gate_spawn`, `session_spawn`, `mergequeue`), and the
+//! `spawn_rebase_gate` background compute phase in
+//! `rebase_gate_compute`. The full list of sibling modules is the
+//! `mod ...;` declarations below. Submodule re-exports keep existing
+//! `super::App` / `super::RebaseResult` / etc. import paths working
+//! without changes in sibling submodules.
 
 /// Generate a `poll_*` method that drives one PR-merge poller instance.
 ///

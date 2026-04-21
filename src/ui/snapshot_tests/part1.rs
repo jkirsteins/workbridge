@@ -1,3 +1,8 @@
+//! Snapshot tests: empty app, work-item list panel, session indicators.
+//! See `src/ui/snapshot_tests/mod.rs` for shared helpers.
+
+use super::*;
+
 #[test]
 fn empty_app_default_view() {
     let mut app = App::new();
@@ -234,7 +239,7 @@ fn unlinked_pr_long_branch_wraps() {
     // continuation line + 1 repo-dir meta line).
     let theme = Theme::default_theme();
     let max_width = 23_usize; // matches the left-panel inner width at term=80
-    let item = super::work_list::format_unlinked_item(&app, 0, max_width, &theme, false);
+    let item = crate::ui::work_list::format_unlinked_item(&app, 0, max_width, &theme, false);
     assert!(
         item.height() >= 3,
         "expected long-branch unlinked item to render as >=3 lines, got {}",

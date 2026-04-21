@@ -16,7 +16,7 @@ use crate::work_item::{
 };
 
 /// Helper: render the app into a `TestBackend` and return the buffer as a string.
-fn render(app: &mut App, width: u16, height: u16) -> String {
+pub(super) fn render(app: &mut App, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     let theme = Theme::default_theme();
@@ -42,7 +42,7 @@ fn render(app: &mut App, width: u16, height: u16) -> String {
 
 /// Create an App with predefined work items and unlinked PRs
 /// without going through the backend.
-fn app_with_items(work_items: Vec<WorkItem>, unlinked_prs: Vec<UnlinkedPr>) -> App {
+pub(super) fn app_with_items(work_items: Vec<WorkItem>, unlinked_prs: Vec<UnlinkedPr>) -> App {
     let mut app = App::new();
     app.work_items = work_items;
     app.unlinked_prs = unlinked_prs;
@@ -50,7 +50,7 @@ fn app_with_items(work_items: Vec<WorkItem>, unlinked_prs: Vec<UnlinkedPr>) -> A
     app
 }
 
-fn make_work_item(
+pub(super) fn make_work_item(
     id_suffix: &str,
     title: &str,
     status: WorkItemStatus,
@@ -83,7 +83,7 @@ fn make_work_item(
     }
 }
 
-fn make_pr_info(number: u64, checks: CheckStatus) -> PrInfo {
+pub(super) fn make_pr_info(number: u64, checks: CheckStatus) -> PrInfo {
     PrInfo {
         number,
         title: format!("PR #{number}"),
@@ -96,7 +96,7 @@ fn make_pr_info(number: u64, checks: CheckStatus) -> PrInfo {
     }
 }
 
-fn make_unlinked_pr(branch: &str, number: u64, is_draft: bool) -> UnlinkedPr {
+pub(super) fn make_unlinked_pr(branch: &str, number: u64, is_draft: bool) -> UnlinkedPr {
     UnlinkedPr {
         repo_path: PathBuf::from("/repo/unlinked"),
         pr: PrInfo {
@@ -113,7 +113,7 @@ fn make_unlinked_pr(branch: &str, number: u64, is_draft: bool) -> UnlinkedPr {
     }
 }
 
-include!("part1.rs");
-include!("part2.rs");
-include!("part3.rs");
-include!("part4.rs");
+mod part1;
+mod part2;
+mod part3;
+mod part4;
