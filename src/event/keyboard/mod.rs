@@ -423,7 +423,7 @@ pub fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
     if let Some(entry) = app.active_terminal_entry_mut() {
         entry.selection = None;
     }
-    if let Some(entry) = app.global_session.as_mut() {
+    if let Some(entry) = app.global_drawer.session.as_mut() {
         entry.selection = None;
     }
 

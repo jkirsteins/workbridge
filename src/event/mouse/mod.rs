@@ -57,7 +57,7 @@ pub fn mouse_target_with_size(
     const HEADER_ROWS: u16 = 1;
 
     // Check global drawer first (it overlays everything when open).
-    if app.global_drawer_open {
+    if app.global_drawer.open {
         let dl = layout::compute_drawer(cols, rows);
         // Drawer origin matches the render code in ui.rs:
         // drawer_x = 2, drawer_y = rows - drawer_height
@@ -232,7 +232,7 @@ pub fn handle_mouse_with_terminal_size(
         if let Some(target) = dispatch {
             match target {
                 ClickTarget::WorkItemRow { index, .. } => {
-                    if !app.global_drawer_open {
+                    if !app.global_drawer.open {
                         return handle_work_item_row_click(app, index, action);
                     }
                     // Fall through: drawer is open, let the geometric
@@ -282,7 +282,7 @@ pub fn handle_mouse_with_terminal_size(
                 if child_wants_mouse_global(app) {
                     return false;
                 }
-                if let Some(entry) = app.global_session.as_mut() {
+                if let Some(entry) = app.global_drawer.session.as_mut() {
                     entry.selection = Some(SelectionState {
                         anchor: (local_row, local_col),
                         current: (local_row, local_col),
@@ -292,7 +292,7 @@ pub fn handle_mouse_with_terminal_size(
                 true
             }
             MouseAction::SelectDrag => {
-                if let Some(entry) = app.global_session.as_mut()
+                if let Some(entry) = app.global_drawer.session.as_mut()
                     && entry.selection.as_ref().is_some_and(|s| s.dragging)
                 {
                     if let Some(sel) = entry.selection.as_mut() {

@@ -56,13 +56,15 @@ pub fn encode_mouse_scroll(
 pub fn child_wants_mouse_global(app: &App) -> bool {
     // In scrollback mode, always intercept for selection.
     if app
-        .global_session
+        .global_drawer
+        .session
         .as_ref()
         .is_some_and(|e| e.scrollback_offset > 0)
     {
         return false;
     }
-    app.global_session
+    app.global_drawer
+        .session
         .as_ref()
         .filter(|s| s.alive)
         .and_then(|s| s.parser.lock().ok())
@@ -116,7 +118,7 @@ pub fn handle_scroll_global(
     // Clamp to the terminal row count because vt100's visible_rows()
     // panics if scrollback_offset > rows (usize underflow).
     if scroll_up {
-        if let Some(entry) = app.global_session.as_mut() {
+        if let Some(entry) = app.global_drawer.session.as_mut() {
             let max = entry
                 .parser
                 .lock()
@@ -127,7 +129,7 @@ pub fn handle_scroll_global(
         return true;
     }
     // Scroll-down while in scrollback: decrement offset locally.
-    if let Some(entry) = app.global_session.as_mut()
+    if let Some(entry) = app.global_drawer.session.as_mut()
         && entry.scrollback_offset > 0
     {
         entry.scrollback_offset = entry.scrollback_offset.saturating_sub(3);
@@ -135,7 +137,8 @@ pub fn handle_scroll_global(
     }
     // Scroll-down while NOT in scrollback: forward to PTY as before.
     let proto = app
-        .global_session
+        .global_drawer
+        .session
         .as_ref()
         .filter(|s| s.alive)
         .and_then(|s| {
@@ -210,7 +213,7 @@ pub fn handle_scroll_right(app: &mut App, scroll_up: bool, local_col: u16, local
 
 /// Finalize selection on mouse-up for the global drawer session.
 pub fn handle_selection_up_global(app: &mut App, local_row: u16, local_col: u16) -> bool {
-    let Some(entry) = app.global_session.as_mut() else {
+    let Some(entry) = app.global_drawer.session.as_mut() else {
         return false;
     };
     let sel = match entry.selection.as_mut() {

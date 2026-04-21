@@ -32,7 +32,7 @@ pub fn handle_work_item_list_scroll(app: &App, scroll_up: bool) -> bool {
 ///
 /// Called from the click-registry priority path when a
 /// `ClickTarget::WorkItemRow` is hit and the global drawer is not
-/// open (the caller gates on `!app.global_drawer_open` to keep row
+/// open (the caller gates on `!app.global_drawer.open` to keep row
 /// selection from silently mutating behind the drawer). Select-down
 /// is a no-op (we wait for the release so the user can abort by
 /// dragging off); select-up actually changes the selection, mirrors

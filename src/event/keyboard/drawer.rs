@@ -16,13 +16,13 @@ pub fn handle_global_drawer_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // Clear any active text selection on keypress.
-    if let Some(entry) = app.global_session.as_mut() {
+    if let Some(entry) = app.global_drawer.session.as_mut() {
         entry.selection = None;
     }
 
     // Exit scrollback mode on any keypress. The key is still forwarded
     // to the PTY so the user seamlessly resumes typing.
-    if let Some(entry) = app.global_session.as_mut()
+    if let Some(entry) = app.global_drawer.session.as_mut()
         && entry.scrollback_offset > 0
     {
         entry.scrollback_offset = 0;
@@ -30,9 +30,9 @@ pub fn handle_global_drawer_key(app: &mut App, key: KeyEvent) -> bool {
 
     // For any other key, check if the global session is alive. If dead,
     // close the drawer rather than forwarding to a defunct PTY.
-    if app.global_session.as_ref().is_none_or(|s| !s.alive) {
-        app.global_drawer_open = false;
-        app.shell.focus = app.pre_drawer_focus;
+    if app.global_drawer.session.as_ref().is_none_or(|s| !s.alive) {
+        app.global_drawer.open = false;
+        app.shell.focus = app.global_drawer.pre_drawer_focus;
         app.shell.status_message = Some("Global assistant session ended".into());
         sync_layout(app);
         return true;
@@ -48,8 +48,8 @@ pub fn handle_global_drawer_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char(c)
             if key.modifiers.contains(KeyModifiers::CONTROL) && is_ctrl_symbol_char(c, ']') =>
         {
-            app.global_drawer_open = false;
-            app.shell.focus = app.pre_drawer_focus;
+            app.global_drawer.open = false;
+            app.shell.focus = app.global_drawer.pre_drawer_focus;
             return true;
         }
         // Forward all other keys to the global session PTY via buffer.

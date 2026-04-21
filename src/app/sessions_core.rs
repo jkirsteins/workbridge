@@ -106,14 +106,14 @@ impl super::App {
         }
 
         // Check global assistant session liveness.
-        if let Some(ref mut entry) = self.global_session {
+        if let Some(ref mut entry) = self.global_drawer.session {
             if let Some(ref mut session) = entry.session {
                 entry.alive = session.is_alive();
             } else {
                 entry.alive = false;
             }
             if !entry.alive {
-                self.global_mcp_server = None;
+                self.global_drawer.mcp_server = None;
                 // Symmetric with `teardown_global_session`: when the
                 // assistant child dies on its own (crash, OOM,
                 // `/exit`), the `--mcp-config` tempfile it was using
@@ -121,7 +121,7 @@ impl super::App {
                 // to `/tmp` until the next workbridge run. Route
                 // the removal through `spawn_agent_file_cleanup` so
                 // the `std::fs::remove_file` runs off the UI thread.
-                if let Some(path) = self.global_mcp_config_path.take() {
+                if let Some(path) = self.global_drawer.mcp_config_path.take() {
                     self.spawn_agent_file_cleanup(vec![path]);
                 }
             }
@@ -213,7 +213,7 @@ impl super::App {
     pub fn cleanup_all_mcp(&mut self) {
         self.mcp_servers.clear();
         self.agent_working.clear();
-        self.global_mcp_server = None;
+        self.global_drawer.mcp_server = None;
         // Route every tempfile removal off the UI thread.
         // `cleanup_all_mcp` runs during graceful shutdown but the
         // event loop is still alive for up to 10 seconds (waiting
@@ -241,10 +241,10 @@ impl super::App {
         // `spawn_agent_file_cleanup` removes them asynchronously
         // on the same background thread.
         let mut files_to_clean: Vec<PathBuf> = Vec::new();
-        if let Some(path) = self.global_mcp_config_path.take() {
+        if let Some(path) = self.global_drawer.mcp_config_path.take() {
             files_to_clean.push(path);
         }
-        if let Some(pending) = self.global_session_open_pending.take() {
+        if let Some(pending) = self.global_drawer.session_open_pending.take() {
             pending.cancelled.store(true, Ordering::Release);
             // Drain any queued result so its handles are disposed
             // off the UI thread.
@@ -328,9 +328,10 @@ impl super::App {
             }
         }
         // Resize global assistant session to its own drawer dimensions.
-        if let Some(ref entry) = self.global_session
+        if let Some(ref entry) = self.global_drawer.session
             && let Some(ref session) = entry.session
-            && let Err(e) = session.resize(self.global_pane_cols, self.global_pane_rows)
+            && let Err(e) =
+                session.resize(self.global_drawer.pane_cols, self.global_drawer.pane_rows)
             && first_error.is_none()
         {
             first_error = Some(e);
@@ -375,7 +376,7 @@ impl super::App {
                 session.send_sigterm();
             }
         }
-        if let Some(ref mut entry) = self.global_session
+        if let Some(ref mut entry) = self.global_drawer.session
             && entry.alive
             && let Some(ref mut session) = entry.session
         {
@@ -415,7 +416,7 @@ impl super::App {
     /// drop through with rebase gates still alive.
     pub fn all_dead(&self) -> bool {
         self.sessions.values().all(|entry| !entry.alive)
-            && self.global_session.as_ref().is_none_or(|s| !s.alive)
+            && self.global_drawer.session.as_ref().is_none_or(|s| !s.alive)
             && self.terminal_sessions.values().all(|entry| !entry.alive)
             && self.rebase_gates.is_empty()
     }
@@ -449,13 +450,13 @@ impl super::App {
         for key in rebase_keys {
             self.drop_rebase_gate(&key);
         }
-        if let Some(ref mut entry) = self.global_session {
+        if let Some(ref mut entry) = self.global_drawer.session {
             if let Some(ref mut session) = entry.session {
                 session.force_kill();
             }
             entry.alive = false;
         }
-        self.global_mcp_server = None;
+        self.global_drawer.mcp_server = None;
         for entry in self.terminal_sessions.values_mut() {
             if let Some(ref mut session) = entry.session {
                 session.force_kill();
@@ -480,7 +481,7 @@ impl super::App {
 
     /// Buffer bytes for the global assistant PTY session.
     pub fn buffer_bytes_to_global(&mut self, data: &[u8]) {
-        self.pending_global_pty_bytes.extend_from_slice(data);
+        self.global_drawer.pending_pty_bytes.extend_from_slice(data);
     }
 
     /// Flush buffered PTY bytes to their respective sessions as single
@@ -506,13 +507,14 @@ impl super::App {
             let data = std::mem::take(&mut self.pending_active_pty_bytes);
             self.send_bytes_to_active(&data);
         }
-        if !self.pending_global_pty_bytes.is_empty()
+        if !self.global_drawer.pending_pty_bytes.is_empty()
             && self
-                .global_session
+                .global_drawer
+                .session
                 .as_ref()
                 .is_some_and(|e| e.alive && e.session.is_some())
         {
-            let data = std::mem::take(&mut self.pending_global_pty_bytes);
+            let data = std::mem::take(&mut self.global_drawer.pending_pty_bytes);
             self.send_bytes_to_global(&data);
         }
         if !self.pending_terminal_pty_bytes.is_empty() && self.has_alive_terminal_session() {

@@ -435,7 +435,7 @@ impl super::App {
         {
             return Some(*kind);
         }
-        if self.global_drawer_open {
+        if self.global_drawer.open {
             return self.global_assistant_harness_kind();
         }
         None

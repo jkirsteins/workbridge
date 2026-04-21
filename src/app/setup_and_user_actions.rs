@@ -16,7 +16,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
@@ -218,18 +218,8 @@ impl super::App {
             session_spawn_rx: HashMap::new(),
             orphan_cleanup_finished_tx,
             orphan_cleanup_finished_rx,
-            global_drawer_open: false,
-            global_session: None,
-            global_mcp_server: None,
-            global_mcp_context: Arc::new(Mutex::new("{}".to_string())),
-            pre_drawer_focus: FocusPanel::Left,
-            global_pane_cols: 80,
-            global_pane_rows: 24,
-            global_mcp_config_path: None,
-            global_session_open_pending: None,
-            global_mcp_context_dirty: false,
+            global_drawer: GlobalDrawer::new(),
             pending_active_pty_bytes: Vec::new(),
-            pending_global_pty_bytes: Vec::new(),
             right_panel_tab: RightPanelTab::ClaudeCode,
             terminal_sessions: HashMap::new(),
             pending_terminal_pty_bytes: Vec::new(),

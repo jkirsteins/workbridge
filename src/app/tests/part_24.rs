@@ -162,7 +162,7 @@ fn permission_marker_falls_through_to_global_drawer_when_item_has_no_harness_cho
 
     // Open the Ctrl+G drawer directly (bypassing the first-run
     // modal path) so `global_drawer_open` is true.
-    app.global_drawer_open = true;
+    app.global_drawer.open = true;
 
     // Name resolution falls through item -> global -> "Codex".
     assert_eq!(
@@ -207,7 +207,7 @@ fn ctrl_g_with_unset_harness_opens_first_run_modal_when_available() {
     // on PATH, a toast surfaces the "no supported harnesses"
     // hint. Either way, the drawer must NOT open directly.
     assert!(
-        !app.global_drawer_open,
+        !app.global_drawer.open,
         "Ctrl+G with unset harness must not open the drawer directly"
     );
     let any_available = AgentBackendKind::all()
@@ -237,7 +237,7 @@ fn ctrl_g_with_set_harness_opens_drawer_directly() {
     let mut app = App::new();
     app.services.config.defaults.global_assistant_harness = Some("claude".into());
 
-    assert!(!app.global_drawer_open);
+    assert!(!app.global_drawer.open);
     app.handle_ctrl_g();
 
     assert!(
@@ -245,7 +245,7 @@ fn ctrl_g_with_set_harness_opens_drawer_directly() {
         "configured harness must not open the modal"
     );
     assert!(
-        app.global_drawer_open,
+        app.global_drawer.open,
         "configured harness must open the drawer directly"
     );
 }
@@ -275,7 +275,7 @@ fn first_run_modal_pick_persists_to_config_provider() {
 
     // Modal closed; drawer open.
     assert!(app.first_run_global_harness_modal.is_none());
-    assert!(app.global_drawer_open);
+    assert!(app.global_drawer.open);
     // Config has the canonical name.
     assert_eq!(
         app.services
@@ -312,7 +312,7 @@ fn first_run_modal_esc_does_not_persist() {
     app.cancel_first_run_global_pick();
 
     assert!(app.first_run_global_harness_modal.is_none());
-    assert!(!app.global_drawer_open);
+    assert!(!app.global_drawer.open);
     assert!(
         app.services
             .config

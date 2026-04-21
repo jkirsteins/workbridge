@@ -575,7 +575,7 @@ fn agent_backend_display_name_is_neutral_without_committed_harness() {
     // no global drawer, no global-assistant harness configured.
     assert!(app.selected_work_item_id().is_none());
     assert!(app.harness_choice.is_empty());
-    assert!(!app.global_drawer_open);
+    assert!(!app.global_drawer.open);
     assert!(
         app.services
             .config

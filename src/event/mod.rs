@@ -75,7 +75,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // When the global assistant drawer is open, route all keys to it.
-    if app.global_drawer_open {
+    if app.global_drawer.open {
         return handle_global_drawer_key(app, key);
     }
 

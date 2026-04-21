@@ -425,7 +425,7 @@ fn teardown_global_session_clears_all_state() {
     // teardown helper skips the `session.kill()` branch when the
     // inner session is None and still runs the rest of the cleanup.
     let parser = Arc::new(std::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
-    app.global_session = Some(SessionEntry {
+    app.global_drawer.session = Some(SessionEntry {
         parser,
         alive: true,
         session: None,
@@ -442,29 +442,30 @@ fn teardown_global_session_clears_all_state() {
     let temp_path = tmp.path().join("workbridge-teardown-test.json");
     std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
     assert!(temp_path.exists(), "precondition: temp file exists");
-    app.global_mcp_config_path = Some(temp_path.clone());
+    app.global_drawer.mcp_config_path = Some(temp_path.clone());
 
     // Pre-populate buffered PTY keystrokes that must NOT leak into a
     // freshly-spawned replacement session.
-    app.pending_global_pty_bytes
+    app.global_drawer
+        .pending_pty_bytes
         .extend_from_slice(b"stale-keys");
 
     app.teardown_global_session();
 
     assert!(
-        app.global_session.is_none(),
+        app.global_drawer.session.is_none(),
         "global_session must be cleared",
     );
     assert!(
-        app.global_mcp_server.is_none(),
+        app.global_drawer.mcp_server.is_none(),
         "global_mcp_server must be cleared",
     );
     assert!(
-        app.global_mcp_config_path.is_none(),
+        app.global_drawer.mcp_config_path.is_none(),
         "global_mcp_config_path must be cleared",
     );
     assert!(
-        app.pending_global_pty_bytes.is_empty(),
+        app.global_drawer.pending_pty_bytes.is_empty(),
         "pending_global_pty_bytes must be drained so stale keystrokes \
          don't leak into the next session",
     );
@@ -490,16 +491,16 @@ fn teardown_global_session_clears_all_state() {
 #[test]
 fn teardown_global_session_is_idempotent_on_empty_state() {
     let mut app = App::new();
-    assert!(app.global_session.is_none());
-    assert!(app.global_mcp_config_path.is_none());
-    assert!(app.pending_global_pty_bytes.is_empty());
+    assert!(app.global_drawer.session.is_none());
+    assert!(app.global_drawer.mcp_config_path.is_none());
+    assert!(app.global_drawer.pending_pty_bytes.is_empty());
 
     app.teardown_global_session();
 
-    assert!(app.global_session.is_none());
-    assert!(app.global_mcp_server.is_none());
-    assert!(app.global_mcp_config_path.is_none());
-    assert!(app.pending_global_pty_bytes.is_empty());
+    assert!(app.global_drawer.session.is_none());
+    assert!(app.global_drawer.mcp_server.is_none());
+    assert!(app.global_drawer.mcp_config_path.is_none());
+    assert!(app.global_drawer.pending_pty_bytes.is_empty());
 }
 
 /// Regression guard for the post-async-spawn keystroke-loss bug:
@@ -516,13 +517,13 @@ fn teardown_global_session_is_idempotent_on_empty_state() {
 #[test]
 fn flush_pty_buffers_preserves_global_bytes_when_no_session() {
     let mut app = App::new();
-    assert!(app.global_session.is_none());
+    assert!(app.global_drawer.session.is_none());
 
     // User types something while the drawer is opening but
     // before the worker has installed the session.
     app.buffer_bytes_to_global(b"hello");
     assert_eq!(
-        app.pending_global_pty_bytes, b"hello",
+        app.global_drawer.pending_pty_bytes, b"hello",
         "buffer_bytes_to_global should accumulate bytes on the buffer",
     );
 
@@ -533,7 +534,7 @@ fn flush_pty_buffers_preserves_global_bytes_when_no_session() {
     app.flush_pty_buffers();
 
     assert_eq!(
-        app.pending_global_pty_bytes, b"hello",
+        app.global_drawer.pending_pty_bytes, b"hello",
         "flush_pty_buffers must NOT drain the global buffer when \
          there is no live global_session yet - the keystrokes \
          would be lost otherwise",

@@ -100,7 +100,7 @@ fn flush_pty_buffers_drains_global_bytes_once_session_alive() {
     // drained in this half-installed state. This guards
     // against a regression where the gate is too loose.
     let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
-    app.global_session = Some(SessionEntry {
+    app.global_drawer.session = Some(SessionEntry {
         parser,
         alive: true,
         session: None,
@@ -112,7 +112,7 @@ fn flush_pty_buffers_drains_global_bytes_once_session_alive() {
     app.flush_pty_buffers();
 
     assert_eq!(
-        app.pending_global_pty_bytes, b"hello",
+        app.global_drawer.pending_pty_bytes, b"hello",
         "flush_pty_buffers must keep the buffer when the session \
          entry exists but has no PTY handle",
     );
@@ -127,11 +127,11 @@ fn toggle_global_drawer_close_tears_down_session() {
     let mut app = App::new();
 
     // Simulate a drawer that is already open with live state.
-    app.global_drawer_open = true;
-    app.pre_drawer_focus = app.shell.focus;
+    app.global_drawer.open = true;
+    app.global_drawer.pre_drawer_focus = app.shell.focus;
 
     let parser = Arc::new(std::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
-    app.global_session = Some(SessionEntry {
+    app.global_drawer.session = Some(SessionEntry {
         parser,
         alive: true,
         session: None,
@@ -143,27 +143,29 @@ fn toggle_global_drawer_close_tears_down_session() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let temp_path = tmp.path().join("workbridge-toggle-close-test.json");
     std::fs::write(&temp_path, b"{}").expect("create temp mcp config");
-    app.global_mcp_config_path = Some(temp_path.clone());
-    app.pending_global_pty_bytes.extend_from_slice(b"leftover");
+    app.global_drawer.mcp_config_path = Some(temp_path.clone());
+    app.global_drawer
+        .pending_pty_bytes
+        .extend_from_slice(b"leftover");
 
     // Close branch: no spawn involved, so this is safe in any test env.
     app.toggle_global_drawer();
 
-    assert!(!app.global_drawer_open, "drawer must be closed");
+    assert!(!app.global_drawer.open, "drawer must be closed");
     assert!(
-        app.global_session.is_none(),
+        app.global_drawer.session.is_none(),
         "close must clear global_session",
     );
     assert!(
-        app.global_mcp_server.is_none(),
+        app.global_drawer.mcp_server.is_none(),
         "close must clear global_mcp_server",
     );
     assert!(
-        app.global_mcp_config_path.is_none(),
+        app.global_drawer.mcp_config_path.is_none(),
         "close must clear global_mcp_config_path",
     );
     assert!(
-        app.pending_global_pty_bytes.is_empty(),
+        app.global_drawer.pending_pty_bytes.is_empty(),
         "close must drain pending_global_pty_bytes",
     );
     // Mirrors the `teardown_global_session_clears_all_state`

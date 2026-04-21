@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::mpsc;
 
 use super::*;
 use crate::agent_backend::AgentBackendKind;
@@ -410,47 +410,20 @@ pub struct App {
     /// Receiver paired with `orphan_cleanup_finished_tx`.
     pub orphan_cleanup_finished_rx: crossbeam_channel::Receiver<OrphanCleanupFinished>,
 
-    /// Whether the global assistant drawer is open.
-    pub global_drawer_open: bool,
-    /// The global assistant PTY session (lazy, persistent).
-    pub global_session: Option<SessionEntry>,
-    /// MCP socket server for the global assistant.
-    pub global_mcp_server: Option<McpSocketServer>,
-    /// Dynamic context for the global MCP server, updated on each tick.
-    pub global_mcp_context: Arc<Mutex<String>>,
-    /// Which panel had focus before the drawer opened (restored on close).
-    pub pre_drawer_focus: FocusPanel,
-    /// PTY columns for the global assistant drawer (differs from main pane).
-    pub global_pane_cols: u16,
-    /// PTY rows for the global assistant drawer.
-    pub global_pane_rows: u16,
-    /// Path to the temp MCP config file for the global assistant.
-    /// Tracked so it can be cleaned up on shutdown or respawn.
-    pub global_mcp_config_path: Option<PathBuf>,
-    /// In-flight preparation for the global assistant session.
-    /// Populated by `spawn_global_session` while a background worker
-    /// runs `McpSocketServer::start_global`, `std::fs::write` on the
-    /// `--mcp-config` tempfile, `std::fs::create_dir_all` on the
-    /// scratch cwd, and `Session::spawn` itself. Drained by
-    /// `poll_global_session_open` on each background tick, which
-    /// moves the worker's result into the three durable fields
-    /// (`global_session`, `global_mcp_server`, `global_mcp_config_path`)
-    /// or restores the drawer state on failure. Kept as a named
-    /// struct (rather than a tuple) so the activity ID cannot be
-    /// accidentally dropped and leak a permanent spinner.
-    pub global_session_open_pending: Option<GlobalSessionOpenPending>,
-    /// True when repo/work-item data has changed since the last
-    /// `refresh_global_mcp_context` call. Set by `drain_fetch_results`
-    /// returning true; cleared after the refresh runs.
-    pub global_mcp_context_dirty: bool,
-    /// Buffered bytes destined for the active PTY session. Key events
-    /// that forward to the PTY push here instead of writing immediately.
-    /// Flushed as a single write on the next timer tick so the child
-    /// process receives all characters in one `read()` - matching how a
-    /// native terminal delivers drag-and-drop or fast paste.
+    /// Global assistant drawer state: open flag, PTY session, MCP
+    /// server, config tempfile path, pane geometry, pre-drawer focus,
+    /// spawn lifecycle, context dirty flag, and the PTY write buffer.
+    /// Replaces eleven previously sibling fields on App with a single
+    /// owning struct so drawer open/close/spawn/teardown can be
+    /// reasoned about in one place. See `app::GlobalDrawer`.
+    pub global_drawer: GlobalDrawer,
+    /// Buffered bytes destined for the active (work-item) PTY
+    /// session. Key events that forward to the PTY push here instead
+    /// of writing immediately. Flushed as a single write on the next
+    /// timer tick so the child process receives all characters in one
+    /// `read()` - matching how a native terminal delivers drag-and-
+    /// drop or fast paste.
     pub pending_active_pty_bytes: Vec<u8>,
-    /// Same buffer for the global assistant session.
-    pub pending_global_pty_bytes: Vec<u8>,
 
     /// Which tab is active in the right panel (Claude Code or Terminal).
     pub right_panel_tab: RightPanelTab,

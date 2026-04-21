@@ -231,7 +231,7 @@ fn chrome_click_inside_global_drawer_still_fires() {
     use crate::click_targets::ClickKind;
 
     let mut app = App::new();
-    app.global_drawer_open = true;
+    app.global_drawer.open = true;
 
     // Pick a drawer-inside coordinate. `compute_drawer(120, 40)`
     // produces a drawer wide enough that (col=10, row=30) is
@@ -549,7 +549,7 @@ fn drawer_open_suppresses_work_item_row_click() {
             3,
         );
     }
-    app.global_drawer_open = true;
+    app.global_drawer.open = true;
     app.selected_item = Some(0);
     let initial_tab = app.right_panel_tab;
     app.recenter_viewport_on_selection.set(false);

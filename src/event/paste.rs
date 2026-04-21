@@ -36,7 +36,7 @@ pub fn handle_paste(app: &mut App, data: &str) -> bool {
 
     // No modal: PTY routing as before.
     let bracketed = format!("\x1b[200~{data}\x1b[201~");
-    if app.global_drawer_open {
+    if app.global_drawer.open {
         app.send_bytes_to_global(bracketed.as_bytes());
         return true;
     }

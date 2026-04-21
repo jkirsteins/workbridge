@@ -320,6 +320,7 @@ mod display_list;
 mod fetcher_bridge;
 mod gate_polling;
 mod global_drawer;
+mod global_drawer_polling;
 mod harness;
 mod helpers;
 mod mcp_bridge_and_imports;
@@ -351,6 +352,7 @@ mod worktree_and_first_run;
 // submodules keep resolving without changing the import shape.
 pub use activities::*;
 pub use click_tracking::*;
+pub use global_drawer::*;
 pub use helpers::*;
 pub use shared_services::*;
 pub use shell::*;

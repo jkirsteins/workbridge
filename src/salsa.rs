@@ -149,8 +149,8 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
 
         // Compute global drawer PTY dimensions via shared helper.
         let dl = layout::compute_drawer(size.width, size.height);
-        state.global_pane_cols = dl.pane_cols;
-        state.global_pane_rows = dl.pane_rows;
+        state.global_drawer.pane_cols = dl.pane_cols;
+        state.global_drawer.pane_rows = dl.pane_rows;
     }
 
     // Initial reassembly + display list build (already done in App::new,
@@ -382,7 +382,7 @@ pub fn app_event(
                     }
                     state.reassemble_work_items();
                     state.build_display_list();
-                    state.global_mcp_context_dirty = true;
+                    state.global_drawer.mcp_context_dirty = true;
                 }
 
                 // Drain PR identity backfill results (one-time startup
@@ -390,15 +390,16 @@ pub fn app_event(
                 if state.drain_pr_identity_backfill() {
                     state.reassemble_work_items();
                     state.build_display_list();
-                    state.global_mcp_context_dirty = true;
+                    state.global_drawer.mcp_context_dirty = true;
                 }
 
                 // Refresh dynamic context for the global MCP server only
                 // when underlying data has changed, avoiding redundant
                 // JSON serialization on every tick.
-                if state.global_mcp_context_dirty && state.global_mcp_server.is_some() {
+                if state.global_drawer.mcp_context_dirty && state.global_drawer.mcp_server.is_some()
+                {
                     state.refresh_global_mcp_context();
-                    state.global_mcp_context_dirty = false;
+                    state.global_drawer.mcp_context_dirty = false;
                 }
 
                 // Poll async operations. Capture status bar visibility

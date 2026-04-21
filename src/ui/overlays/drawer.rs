@@ -30,7 +30,8 @@ pub fn draw_global_drawer(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect
     Clear.render(drawer_rect, buf);
 
     let drawer_in_scrollback = app
-        .global_session
+        .global_drawer
+        .session
         .as_ref()
         .is_some_and(|e| e.scrollback_offset > 0);
     let drawer_title = if drawer_in_scrollback {
@@ -48,7 +49,7 @@ pub fn draw_global_drawer(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect
     block.render(drawer_rect, buf);
 
     // 4. Render the global session PTY or a placeholder.
-    match &app.global_session {
+    match &app.global_drawer.session {
         Some(entry) if entry.alive => {
             if let Ok(mut parser) = entry.parser.lock() {
                 // Same clamp as draw_pane_output - see comment there.

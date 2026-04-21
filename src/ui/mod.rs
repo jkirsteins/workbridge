@@ -409,7 +409,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
     }
 
     // Global assistant drawer (rendered on top, below create dialog).
-    if app.global_drawer_open {
+    if app.global_drawer.open {
         draw_global_drawer(buf, app, theme, area);
     }
 

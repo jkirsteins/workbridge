@@ -526,8 +526,8 @@ impl super::App {
                             self.build_display_list();
 
                             // Close the global drawer and spawn the planning session.
-                            self.global_drawer_open = false;
-                            self.shell.focus = self.pre_drawer_focus;
+                            self.global_drawer.open = false;
+                            self.shell.focus = self.global_drawer.pre_drawer_focus;
                             self.spawn_session(&wi_id);
                             self.shell.status_message = Some(format!("Created work item: {title}"));
                         }

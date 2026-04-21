@@ -470,7 +470,7 @@ impl super::App {
     /// Returns true if any session is alive (including the global session).
     pub fn has_any_session(&self) -> bool {
         self.sessions.values().any(|e| e.alive)
-            || self.global_session.as_ref().is_some_and(|s| s.alive)
+            || self.global_drawer.session.as_ref().is_some_and(|s| s.alive)
             || self.terminal_sessions.values().any(|e| e.alive)
     }
 
@@ -483,11 +483,11 @@ impl super::App {
     /// drops the MCP server, removes the temp MCP config file, and drops
     /// any buffered keystrokes) so no state leaks into the next opening.
     pub fn toggle_global_drawer(&mut self) {
-        if self.global_drawer_open {
+        if self.global_drawer.open {
             // Close drawer, restore previous focus, and tear down the
             // session so the next open starts from a blank slate.
-            self.global_drawer_open = false;
-            self.shell.focus = self.pre_drawer_focus;
+            self.global_drawer.open = false;
+            self.shell.focus = self.global_drawer.pre_drawer_focus;
             self.teardown_global_session();
         } else {
             // Open drawer. Defensively tear down any lingering session
@@ -497,8 +497,8 @@ impl super::App {
             // time so the user always sees an empty PTY with no prior
             // conversation or scrollback.
             self.teardown_global_session();
-            self.pre_drawer_focus = self.shell.focus;
-            self.global_drawer_open = true;
+            self.global_drawer.pre_drawer_focus = self.shell.focus;
+            self.global_drawer.open = true;
             self.spawn_global_session();
         }
     }
@@ -542,7 +542,7 @@ impl super::App {
         // `Session` and `McpSocketServer` handles run their own
         // `Drop` impls and clean themselves up).
         let mut files_to_clean: Vec<PathBuf> = Vec::new();
-        if let Some(pending) = self.global_session_open_pending.take() {
+        if let Some(pending) = self.global_drawer.session_open_pending.take() {
             pending.cancelled.store(true, Ordering::Release);
             // If the worker already sent a result, drain it so
             // Session::Drop and McpSocketServer::Drop do not run
@@ -559,25 +559,25 @@ impl super::App {
             files_to_clean.push(pending.config_path);
         }
 
-        if let Some(ref mut entry) = self.global_session
+        if let Some(ref mut entry) = self.global_drawer.session
             && let Some(ref mut session) = entry.session
         {
             session.kill();
         }
         // Drop Session off the UI thread: its Drop can join the
         // reader thread and kill the child.
-        if let Some(entry) = self.global_session.take() {
+        if let Some(entry) = self.global_drawer.session.take() {
             std::thread::spawn(move || drop(entry));
         }
         // Drop MCP server off the UI thread: its Drop unlinks the
         // socket file.
-        if let Some(server) = self.global_mcp_server.take() {
+        if let Some(server) = self.global_drawer.mcp_server.take() {
             self.drop_mcp_server_off_thread(server);
         }
-        if let Some(path) = self.global_mcp_config_path.take() {
+        if let Some(path) = self.global_drawer.mcp_config_path.take() {
             files_to_clean.push(path);
         }
         self.spawn_agent_file_cleanup(files_to_clean);
-        self.pending_global_pty_bytes.clear();
+        self.global_drawer.pending_pty_bytes.clear();
     }
 }
