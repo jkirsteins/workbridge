@@ -38,7 +38,6 @@
 "src/github_client.rs"     = 1425
 "src/layout.rs"            = 209
 "src/mcp.rs"               = 2280
-"src/metrics.rs"           = 1030
 "src/pr_service.rs"        = 45
 "src/prompts.rs"           = 460
 "src/salsa.rs"             = 672
