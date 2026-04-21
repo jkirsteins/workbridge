@@ -100,7 +100,8 @@ fn main() -> Result<(), AppError> {
     // the same data dir LocalFileBackend uses; if that dir cannot be
     // resolved we silently skip - the Dashboard renders a placeholder.
     if let Some(data_dir) = metrics::default_data_dir() {
-        app.metrics_rx = Some(metrics::spawn_metrics_aggregator(data_dir));
+        app.metrics
+            .set_rx(metrics::spawn_metrics_aggregator(data_dir));
     }
     // Surface config/backend load errors in the TUI status bar so the user sees them.
     if let Some(msg) = config_error {

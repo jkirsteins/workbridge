@@ -217,14 +217,13 @@ pub struct App {
     /// Rolling time window currently selected in the Dashboard view.
     /// Not persisted to disk; resets to Month on each launch.
     pub dashboard_window: DashboardWindow,
-    /// Latest metrics snapshot produced by the background aggregator. None
-    /// on startup until the first aggregation completes. The Dashboard
-    /// renders a "computing..." placeholder while None.
-    pub metrics_snapshot: Option<crate::metrics::MetricsSnapshot>,
-    /// Receiver for fresh `MetricsSnapshot` values from the background
-    /// metrics aggregator thread. Polled (non-blocking `try_recv`) from
-    /// the UI timer tick. See `docs/UI.md` "Blocking I/O Prohibition".
-    pub metrics_rx: Option<crossbeam_channel::Receiver<crate::metrics::MetricsSnapshot>>,
+    /// Metrics subsystem: owns the latest aggregated metrics snapshot
+    /// plus the receiver that feeds it from the background aggregator
+    /// thread. Replaces the two previously sibling fields
+    /// (`metrics_snapshot`, `metrics_rx`) with a single owning struct
+    /// so the poll / disconnect / snapshot-cache dance lives in one
+    /// place. See `app::Metrics`.
+    pub metrics: Metrics,
     /// Set when manage/unmanage changes active repos. The main loop checks
     /// this flag and restarts the background fetcher with the updated repo
     /// list so newly managed repos get fetched and removed repos stop.

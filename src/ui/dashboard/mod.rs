@@ -33,7 +33,7 @@ pub fn draw_dashboard_view(buf: &mut Buffer, app: &App, theme: &Theme, area: Rec
     let inner = outer.inner(area);
     outer.render(area, buf);
 
-    let Some(snapshot) = app.metrics_snapshot.as_ref() else {
+    let Some(snapshot) = app.metrics.snapshot.as_ref() else {
         Paragraph::new(
             "Computing metrics...\n\nThe background aggregator scans the activity log on first launch. Charts will appear shortly.",
         )

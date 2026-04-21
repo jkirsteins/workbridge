@@ -185,32 +185,13 @@ impl super::App {
     }
 
     /// Poll the async unlinked-item cleanup thread for a result. Called on each timer tick.
-    /// Drain the metrics channel, keeping only the latest snapshot. Called
-    /// from the salsa timer tick. Non-blocking; never touches disk. The
-    /// background thread produces a fresh snapshot every ~60s, so multiple
-    /// pending values are rare but the drain-to-latest pattern keeps the
-    /// dashboard truthful even if the consumer briefly lags.
+    /// Delegate to `Metrics::poll`. Left here as a thin forwarder so
+    /// `salsa::app_event` keeps calling `app.poll_metrics_snapshot()`
+    /// without having to reach through the subsystem. The heavy
+    /// lifting (drain-to-latest, disconnect handling) lives on
+    /// `Metrics::poll`.
     pub fn poll_metrics_snapshot(&mut self) {
-        let Some(rx) = self.metrics_rx.as_ref() else {
-            return;
-        };
-        let mut latest: Option<crate::metrics::MetricsSnapshot> = None;
-        loop {
-            match rx.try_recv() {
-                Ok(snap) => latest = Some(snap),
-                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    // The aggregator thread has exited - drop the receiver
-                    // so we stop polling. The dashboard will keep showing
-                    // the last snapshot we received.
-                    self.metrics_rx = None;
-                    break;
-                }
-            }
-        }
-        if let Some(snap) = latest {
-            self.metrics_snapshot = Some(snap);
-        }
+        self.metrics.poll();
     }
 
     pub fn poll_unlinked_cleanup(&mut self) {
