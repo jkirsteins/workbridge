@@ -8,12 +8,20 @@
 # src/app.rs, its budget ratchets down and extracted modules get
 # their own entries.
 #
+# Implicit default: tracked top-level `src/*.rs` files WITHOUT an
+# entry in this table are subject to an implicit 700-line ceiling.
+# Under the ceiling passes silently; over the ceiling fails with a
+# message asking the contributor to either shrink the file or add
+# an explicit entry here with a larger budget and rationale in the
+# commit message. Nested files (e.g. src/side_effects/*.rs) are
+# intentionally out of scope.
+#
 # Note: the plan included a placeholder entry for "src/clipboard.rs"
 # at seed time. That file does not exist in the current tree (the
 # clipboard gate lives under src/side_effects/clipboard.rs which is
 # not a top-level src/*.rs file), so the entry was omitted. If a
-# clipboard.rs ever lands at the top level, add it here with its
-# seed line count.
+# clipboard.rs ever lands at the top level, it is subject to the
+# 700-line implicit ceiling unless an explicit entry is added below.
 
 [budgets]
 "src/agent_backend.rs"     = 2383

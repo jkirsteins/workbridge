@@ -30,7 +30,16 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # Two-invocation pattern: production code is denied
+      # unwrap/expect/panic; tests are allowed to use those idiomatically.
+      # The carve-out is done via `-A` flags at the CLI, not via any
+      # source-level `#[allow]` (which `clippy::allow_attributes` denies
+      # crate-wide). See docs/hygiene-campaign/phase-3-calibration.md
+      # for the full rationale.
+      # `--bins` (no `--lib`; workbridge has no library target today);
+      # tests ship their own invocation below.
+      - run: cargo clippy --bins --all-features -- -D warnings
+      - run: cargo clippy --tests --all-features -- -D warnings -A clippy::unwrap_used -A clippy::expect_used -A clippy::panic
 
   test:
     runs-on: ubuntu-latest
