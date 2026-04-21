@@ -31,7 +31,6 @@
 # expected to grow further before the Phase 4 decomposition.
 "src/agent_backend.rs"     = 2390
 "src/app.rs"               = 26300
-"src/assembly.rs"          = 2319
 "src/click_targets.rs"     = 215
 "src/dashboard_seed.rs"    = 380
 "src/event.rs"             = 4860
