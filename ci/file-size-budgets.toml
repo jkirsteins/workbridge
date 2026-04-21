@@ -3,11 +3,6 @@
 # Max line count per source file. Enforced by hooks/budget-check.sh
 # (pre-commit) and the corresponding CI job.
 #
-# Initial values freeze the current line count so no file grows. As
-# Phase 4 of the hygiene campaign extracts subsystems out of
-# src/app.rs, its budget ratchets down and extracted modules get
-# their own entries.
-#
 # Implicit default: tracked top-level `src/*.rs` files WITHOUT an
 # entry in this table are subject to an implicit 700-line ceiling.
 # Under the ceiling passes silently; over the ceiling fails with a
@@ -24,15 +19,9 @@
 # 700-line implicit ceiling unless an explicit entry is added below.
 
 [budgets]
-# Phase 3 hygiene cleanup added a handful of lines to most of these
-# files (added doc comments, widened `match` arms into `let ... else`
-# blocks, migrated static-JSON parses to the `json!` macro). Each
-# budget was bumped just enough to absorb the cleanup; none is
-# expected to grow further before the Phase 4 decomposition.
 "src/app.rs"               = 26300
 "src/click_targets.rs"     = 215
 "src/dashboard_seed.rs"    = 380
-"src/event.rs"             = 4860
 "src/layout.rs"            = 209
 "src/pr_service.rs"        = 45
 "src/prompts.rs"           = 460
