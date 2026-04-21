@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 
+use super::*;
 use crate::agent_backend::{AgentBackend, AgentBackendKind};
 use crate::click_targets::{ClickKind, ClickRegistry};
 use crate::config::{Config, ConfigProvider, RepoEntry};
@@ -16,8 +17,6 @@ use crate::work_item::{
 };
 use crate::work_item_backend::WorkItemBackend;
 use crate::worktree_service::WorktreeService;
-
-use super::*;
 
 /// App holds the entire application state.
 pub struct App {
@@ -346,14 +345,13 @@ pub struct App {
     pub rebase_gates: HashMap<WorkItemId, RebaseGateState>,
 
     // -- Activity indicator --
-    /// Monotonic counter for generating unique `ActivityId` values.
-    pub activity_counter: u64,
-    /// Currently running activities. The last entry is displayed in the
-    /// status bar. When empty, the normal `status_message` shows through.
-    pub activities: Vec<Activity>,
-    /// Spinner frame index, advanced on each 200ms timer tick when
-    /// activities are present.
-    pub spinner_tick: usize,
+    /// Owns the status-bar spinner state, the activity queue, and
+    /// the structural-fetch bookkeeping. Replaces the five previous
+    /// sibling fields (`activity_counter`, `activities`,
+    /// `spinner_tick`, `structural_fetch_activity`,
+    /// `pending_fetch_count`) so the "exactly one spinner at a
+    /// time" invariant lives inside one owning type.
+    pub activities: Activities,
 
     // -- User action guard (single-flight admission for remote I/O) --
     /// Owns the in-flight slot + debounce timestamps for every action
@@ -361,20 +359,6 @@ pub struct App {
     /// "User action guard" for the contract. Replaces seven separate
     /// `Option<Receiver>` + sibling `Option<ActivityId>` triplets.
     pub user_actions: UserActionGuard,
-
-    // -- Background fetch indicator --
-    /// Activity ID for an in-flight GitHub fetch that was NOT initiated
-    /// via the `GithubRefresh` user-action guard - i.e. a structural
-    /// fetcher restart (newly managed repo, work item created, delete
-    /// cleanup completed). Started when a `FetchStarted` message arrives
-    /// and the user-action guard does not already own the spinner;
-    /// cleared when `pending_fetch_count` returns to zero. The invariant
-    /// is "exactly one fetch spinner at a time": either this field or
-    /// the `UserActionKey::GithubRefresh` entry owns it, never both.
-    pub structural_fetch_activity: Option<ActivityId>,
-    /// Number of repos currently fetching. The activity spinner is shown
-    /// while this is > 0 and cleared when it returns to 0.
-    pub pending_fetch_count: usize,
 
     // -- PR creation queue (bespoke, outside the user-action guard) --
     /// Queued work item IDs waiting for PR creation when a creation is
@@ -528,7 +512,9 @@ pub struct App {
     /// absolute frame coordinates.
     pub pending_chrome_click: Option<(u16, u16, ClickKind, String)>,
 
-    /// Transient top-right toast notifications. Newest is at the end of
-    /// the vector. Pruned each tick by `prune_toasts`.
-    pub toasts: Vec<Toast>,
+    /// Transient top-right toast notifications. Owned by the `Toasts`
+    /// subsystem so the rest of `App` cannot reach the vector directly;
+    /// every mutation goes through `self.toasts.push(...)` /
+    /// `self.toasts.prune()`.
+    pub toasts: Toasts,
 }

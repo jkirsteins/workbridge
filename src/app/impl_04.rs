@@ -8,9 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::mcp::McpSocketServer;
-
 use super::*;
+use crate::mcp::McpSocketServer;
 
 impl super::App {
     /// Keep the dialog open in progress mode and spawn a background thread to
@@ -43,7 +42,7 @@ impl super::App {
         // mislead the user. Drop the visible activity but leave the
         // helper map entry intact so `is_user_action_in_flight` still
         // reports the true state to the modal / event / ui layers.
-        self.end_activity(activity_id);
+        self.activities.end(activity_id);
 
         // Extract github remote before leaving the main thread.
         let github_remote = self
@@ -370,7 +369,7 @@ impl super::App {
         // single-flight admission (and `is_user_action_in_flight`
         // reads) still work.
         if !show_status_activity {
-            self.end_activity(activity_id);
+            self.activities.end(activity_id);
         }
 
         let ws = Arc::clone(&self.worktree_service);
@@ -527,7 +526,7 @@ impl super::App {
         worktree_path: PathBuf,
         branch: Option<String>,
     ) {
-        let activity = self.start_activity(format!(
+        let activity = self.activities.start(format!(
             "Cleaning up orphan worktree {}",
             worktree_path.display()
         ));
@@ -570,7 +569,7 @@ impl super::App {
     pub fn poll_orphan_cleanup_finished(&mut self) {
         let mut warnings: Vec<String> = Vec::new();
         while let Ok(msg) = self.orphan_cleanup_finished_rx.try_recv() {
-            self.end_activity(msg.activity);
+            self.activities.end(msg.activity);
             warnings.extend(msg.warnings);
         }
         if !warnings.is_empty() {

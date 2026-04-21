@@ -10,16 +10,14 @@ use ratatui_core::text::{Line, Span, Text};
 use ratatui_core::widgets::{StatefulWidget, Widget};
 use ratatui_widgets::block::Block;
 use ratatui_widgets::borders::Borders;
-use ratatui_widgets::paragraph::Paragraph;
-
-use crate::app::{App, DisplayEntry, FocusPanel, GroupHeaderKind, is_selectable};
-use crate::theme::Theme;
-use crate::work_item::WorkItemStatus;
-
 use ratatui_widgets::list::{List, ListItem, ListState};
+use ratatui_widgets::paragraph::Paragraph;
 use ratatui_widgets::scrollbar::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 pub use self::format_items::*;
+use crate::app::{App, DisplayEntry, FocusPanel, GroupHeaderKind, is_selectable};
+use crate::theme::Theme;
+use crate::work_item::WorkItemStatus;
 
 pub fn find_current_group_header(display_list: &[DisplayEntry], offset: usize) -> Option<usize> {
     if display_list.is_empty() {

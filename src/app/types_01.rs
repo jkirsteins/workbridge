@@ -10,10 +10,6 @@ use crate::agent_backend::AgentBackendKind;
 use crate::click_targets::ClickKind;
 use crate::work_item::{WorkItemId, WorkItemStatus};
 
-use super::*;
-
-pub use user_actions::{UserActionPayload, UserActionState};
-
 /// A transient top-right notification shown after a click-to-copy
 /// action. Auto-dismisses when `expires_at` is reached. Rendered by
 /// `ui::draw_toasts` on top of everything else, including the global

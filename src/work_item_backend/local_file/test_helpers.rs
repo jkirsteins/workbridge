@@ -2,8 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::work_item::WorkItemKind;
-use crate::work_item::WorkItemStatus;
+use crate::work_item::{WorkItemKind, WorkItemStatus};
 use crate::work_item_backend::{CreateWorkItem, RepoAssociationRecord};
 
 /// Allocate a fresh tempdir for a test. Returns both the `TempDir`

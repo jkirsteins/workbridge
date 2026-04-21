@@ -32,7 +32,7 @@ fn cancel_session_open_entry_cleans_committed_side_car_files() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let committed_files = Arc::new(Mutex::new(vec![side_car_path.clone()]));
     let (_tx, rx) = crossbeam_channel::bounded::<SessionOpenPlanResult>(1);
-    let activity = app.start_activity("Opening session...");
+    let activity = app.activities.start("Opening session...");
     app.session_open_rx.insert(
         wi_id.clone(),
         SessionOpenPending {
@@ -388,8 +388,8 @@ fn review_gate_findings_stored_per_work_item() {
 #[test]
 fn start_activity_returns_unique_ids() {
     let mut app = App::new();
-    let id1 = app.start_activity("First");
-    let id2 = app.start_activity("Second");
+    let id1 = app.activities.start("First");
+    let id2 = app.activities.start("Second");
     assert_ne!(id1, id2);
     assert_eq!(app.activities.len(), 2);
 }
@@ -397,52 +397,52 @@ fn start_activity_returns_unique_ids() {
 #[test]
 fn end_activity_removes_by_id() {
     let mut app = App::new();
-    let id1 = app.start_activity("First");
-    let id2 = app.start_activity("Second");
-    app.end_activity(id1);
+    let id1 = app.activities.start("First");
+    let id2 = app.activities.start("Second");
+    app.activities.end(id1);
     assert_eq!(app.activities.len(), 1);
-    assert_eq!(app.current_activity(), Some("Second"));
-    app.end_activity(id2);
+    assert_eq!(app.activities.current(), Some("Second"));
+    app.activities.end(id2);
     assert!(app.activities.is_empty());
-    assert_eq!(app.current_activity(), None);
+    assert_eq!(app.activities.current(), None);
 }
 
 #[test]
 fn end_activity_noop_for_unknown_id() {
     let mut app = App::new();
-    let id = app.start_activity("Test");
-    app.end_activity(ActivityId(999));
+    let id = app.activities.start("Test");
+    app.activities.end(ActivityId(999));
     assert_eq!(app.activities.len(), 1);
-    app.end_activity(id);
+    app.activities.end(id);
     assert!(app.activities.is_empty());
 }
 
 #[test]
 fn current_activity_returns_last() {
     let mut app = App::new();
-    assert_eq!(app.current_activity(), None);
-    app.start_activity("First");
-    assert_eq!(app.current_activity(), Some("First"));
-    app.start_activity("Second");
-    assert_eq!(app.current_activity(), Some("Second"));
+    assert_eq!(app.activities.current(), None);
+    app.activities.start("First");
+    assert_eq!(app.activities.current(), Some("First"));
+    app.activities.start("Second");
+    assert_eq!(app.activities.current(), Some("Second"));
 }
 
 #[test]
 fn current_activity_pops_to_previous_on_end() {
     let mut app = App::new();
-    let _id1 = app.start_activity("First");
-    let id2 = app.start_activity("Second");
-    app.end_activity(id2);
-    assert_eq!(app.current_activity(), Some("First"));
+    let _id1 = app.activities.start("First");
+    let id2 = app.activities.start("Second");
+    app.activities.end(id2);
+    assert_eq!(app.activities.current(), Some("First"));
 }
 
 #[test]
 fn has_visible_status_bar_with_activity() {
     let mut app = App::new();
     assert!(!app.has_visible_status_bar());
-    let id = app.start_activity("Working...");
+    let id = app.activities.start("Working...");
     assert!(app.has_visible_status_bar());
-    app.end_activity(id);
+    app.activities.end(id);
     assert!(!app.has_visible_status_bar());
 }
 
@@ -457,11 +457,11 @@ fn has_visible_status_bar_with_message() {
 fn has_visible_status_bar_activity_overrides_message() {
     let mut app = App::new();
     app.status_message = Some("test".into());
-    let id = app.start_activity("Working...");
+    let id = app.activities.start("Working...");
     assert!(app.has_visible_status_bar());
     // Activity takes precedence in rendering, but bar is visible either way.
-    assert_eq!(app.current_activity(), Some("Working..."));
-    app.end_activity(id);
+    assert_eq!(app.activities.current(), Some("Working..."));
+    app.activities.end(id);
     // Status message still keeps bar visible.
     assert!(app.has_visible_status_bar());
 }
@@ -539,7 +539,7 @@ pub fn insert_test_review_gate(
     rx: crossbeam_channel::Receiver<ReviewGateMessage>,
     origin: ReviewGateOrigin,
 ) {
-    let activity = app.start_activity("test review gate");
+    let activity = app.activities.start("test review gate");
     app.review_gates.insert(
         wi_id,
         ReviewGateState {

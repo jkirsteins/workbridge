@@ -12,11 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Sender;
 
+use super::{RebaseGateMessage, RebaseResult, SubprocessOutcome, run_cancellable};
 use crate::agent_backend::{AgentBackend, McpBridgeSpec};
 use crate::mcp::{McpEvent, McpSocketServer};
 use crate::work_item::WorkItemId;
-
-use super::{RebaseGateMessage, RebaseResult, SubprocessOutcome, run_cancellable};
 
 pub(super) struct ComputeInputs<'a> {
     pub tx: &'a Sender<RebaseGateMessage>,

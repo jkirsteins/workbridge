@@ -5,12 +5,11 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use super::*;
 use crate::mcp::McpSocketServer;
 use crate::session::Session;
 use crate::work_item::{WorkItemId, WorkItemStatus};
 use crate::work_item_backend::PrIdentityRecord;
-
-use super::*;
 
 /// Outcome of an asynchronous PR merge operation.
 pub enum PrMergeOutcome {

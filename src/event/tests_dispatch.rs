@@ -360,7 +360,7 @@ fn ctrl_r_rapid_double_press_through_handle_key_is_gated() {
     // reads and resets it once per tick when the restart block
     // runs). We do NOT reset the helper entry - a tight double-
     // press happens BEFORE `drain_fetch_results` has observed any
-    // `FetchStarted`, so `pending_fetch_count` is still 0 and the
+    // `FetchStarted`, so `activities.pending_fetch_count` is still 0 and the
     // only protection is the helper's in-flight check.
     app.fetcher_repos_changed = false;
 
@@ -380,10 +380,10 @@ fn ctrl_r_rapid_double_press_through_handle_key_is_gated() {
     );
 }
 
-/// Ctrl+R while `pending_fetch_count > 0`: the hard gate in
+/// Ctrl+R while `activities.pending_fetch_count > 0`: the hard gate in
 /// `handle_key` rejects the press regardless of helper state. This
 /// test exercises the exact pre-check added by R1-F-1 - seeding
-/// `pending_fetch_count = 1` without touching the helper entry so
+/// `activities.pending_fetch_count = 1` without touching the helper entry so
 /// only the count gate can cause the rejection.
 #[test]
 fn ctrl_r_rejected_while_pending_fetch_count_nonzero() {
@@ -391,7 +391,7 @@ fn ctrl_r_rejected_while_pending_fetch_count_nonzero() {
     // Seed as if a prior tick's `drain_fetch_results` had counted
     // one `FetchStarted`. No helper entry is inserted, so the
     // in-flight check alone would admit this press.
-    app.pending_fetch_count = 1;
+    app.activities.pending_fetch_count = 1;
     assert!(!app.is_user_action_in_flight(&UserActionKey::GithubRefresh));
 
     let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);

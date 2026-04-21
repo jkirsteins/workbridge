@@ -24,18 +24,11 @@ mod snapshot_tests;
 // Every internal helper stays private to the `ui` module tree. The
 // `render_selection_overlay` re-export is used only by the PTY-selection
 // unit tests in `event::mouse::selection`, hence the `cfg(test)` gate.
-#[cfg(test)]
-pub use self::selection::render_selection_overlay;
-
 use ratatui_core::buffer::Buffer;
 use ratatui_core::layout::{Constraint, Direction, Layout, Rect};
 use ratatui_core::text::{Line, Span};
 use ratatui_core::widgets::Widget;
 use ratatui_widgets::paragraph::Paragraph;
-
-use crate::app::{App, UserActionKey, ViewMode};
-use crate::layout;
-use crate::theme::Theme;
 
 use self::board::draw_board_view;
 use self::common::{SPINNER_FRAMES, truncate_str};
@@ -49,7 +42,12 @@ use self::output_pane::draw_pane_output;
 use self::overlays::context_bar::draw_context_bar;
 use self::overlays::drawer::draw_global_drawer;
 use self::overlays::settings::draw_settings_overlay;
+#[cfg(test)]
+pub use self::selection::render_selection_overlay;
 use self::work_list::draw_work_item_list;
+use crate::app::{App, UserActionKey, ViewMode};
+use crate::layout;
+use crate::theme::Theme;
 
 /// Render the entire UI: left panel (work item list) and right panel
 /// (session output), plus optional context bar and status bar at the bottom.
@@ -132,8 +130,8 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
 
     // Status bar: activity indicator overrides transient messages.
     if let Some(area) = status_area {
-        if let Some(activity_msg) = app.current_activity() {
-            let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+        if let Some(activity_msg) = app.activities.current() {
+            let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
             let count_suffix = if app.activities.len() > 1 {
                 format!(" (+{})", app.activities.len() - 1)
             } else {
@@ -165,7 +163,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
     // chain (cleanup_reason_input_active before cleanup_prompt_visible).
     if app.confirm_merge {
         if app.merge_in_progress {
-            let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+            let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
             // While the live merge precheck is in flight we show a
             // "Refreshing remote state..." body so the user knows
             // that workbridge is re-verifying both the local
@@ -261,7 +259,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
     } else if app.cleanup_prompt_visible {
         if app.is_user_action_in_flight(&UserActionKey::UnlinkedCleanup) {
             let pr_num = app.cleanup_progress_pr_number.unwrap_or(0);
-            let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+            let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
             draw_prompt_dialog(
                 buf,
                 theme,
@@ -313,7 +311,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
         );
     } else if app.stale_recovery_in_progress {
         // Recovery in flight - show spinner, no key options.
-        let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+        let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
         draw_prompt_dialog(
             buf,
             theme,
@@ -344,7 +342,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
         );
     } else if app.delete_prompt_visible {
         if app.delete_in_progress {
-            let spinner = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+            let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
             draw_prompt_dialog(
                 buf,
                 theme,

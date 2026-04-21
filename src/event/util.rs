@@ -1,6 +1,5 @@
 use crate::app::{App, UserActionKey};
-use crate::salsa::ct::event::KeyCode;
-use crate::salsa::ct::event::{KeyEvent, KeyModifiers};
+use crate::salsa::ct::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Returns true if `c` is the character that crossterm 0.28's legacy
 /// keyboard parser reports for `Ctrl+<symbol>`. Crossterm maps the raw

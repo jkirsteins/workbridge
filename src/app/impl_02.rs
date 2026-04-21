@@ -8,10 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use super::*;
 use crate::session::Session;
 use crate::work_item::{SessionEntry, WorkItemId, WorkItemStatus};
-
-use super::*;
 
 impl super::App {
     /// Check liveness (`try_wait`) on all sessions. Called on periodic ticks.
@@ -201,7 +200,7 @@ impl super::App {
                     std::thread::spawn(move || drop(session));
                 }
             }
-            self.end_activity(pending.activity);
+            self.activities.end(pending.activity);
         }
     }
 
@@ -253,7 +252,7 @@ impl super::App {
                     std::thread::spawn(move || drop(session));
                 }
             }
-            self.end_activity(pending.activity);
+            self.activities.end(pending.activity);
             files_to_clean.push(pending.config_path);
         }
         let pending_wi_ids: Vec<WorkItemId> = self.session_open_rx.keys().cloned().collect();
@@ -267,7 +266,7 @@ impl super::App {
                 {
                     self.drop_mcp_server_off_thread(server);
                 }
-                self.end_activity(entry.activity);
+                self.activities.end(entry.activity);
                 // Drain side-car files the worker already wrote.
                 // Symmetric with `cancel_session_open_entry`'s
                 // cleanup so shutdown does not leak them.
@@ -297,7 +296,7 @@ impl super::App {
                         std::thread::spawn(move || drop(session));
                     }
                 }
-                self.end_activity(pending.activity);
+                self.activities.end(pending.activity);
             }
         }
         // 5. Live work-item sessions: drain agent_written_files

@@ -2,13 +2,12 @@
 
 use std::path::PathBuf;
 
+use super::*;
 use crate::config::RepoEntry;
 use crate::work_item::{UnlinkedPr, WorkItemId, WorkItemStatus};
 use crate::work_item_backend::{
     ActivityEntry, BackendError, CreateWorkItem, PrIdentityRecord, WorkItemBackend,
 };
-
-use super::*;
 
 /// Spawn a background thread that runs
 /// `gh pr view <target> --repo <owner/repo> --json state,number,title,url`

@@ -9,14 +9,17 @@ use ratatui_widgets::clear::Clear;
 use ratatui_widgets::paragraph::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::Toast;
+use crate::app::Toasts;
 use crate::theme::Theme;
 
 /// Draw the top-right transient toast stack. Each toast is a small
 /// bordered block; multiple stack vertically with the newest on top.
 /// Toasts whose rect would overflow the frame are skipped (rather
 /// than clipped) so a small terminal degrades gracefully.
-pub fn draw_toasts(buf: &mut Buffer, toasts: &[Toast], theme: &Theme, frame_area: Rect) {
+///
+/// Takes the `Toasts` subsystem (not a raw `&[Toast]`) so the render
+/// path talks to the same narrow API as the mutators.
+pub fn draw_toasts(buf: &mut Buffer, toasts: &Toasts, theme: &Theme, frame_area: Rect) {
     const TOAST_HEIGHT: u16 = 3; // bordered block + 1 content row
     const MAX_WIDTH: u16 = 60;
     const MIN_WIDTH: u16 = 16;

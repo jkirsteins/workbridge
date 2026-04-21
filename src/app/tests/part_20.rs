@@ -37,7 +37,7 @@ fn poll_review_gate_result_ends_status_bar_activity_approve() {
         "Result gate must be dropped",
     );
     assert!(
-        !app.activities.iter().any(|a| a.id == gate_aid),
+        !app.activities.entries.iter().any(|a| a.id == gate_aid),
         "Result arm of poll_review_gate must end the gate's specific \
          ActivityId via drop_review_gate",
     );
@@ -54,10 +54,10 @@ fn user_action_try_begin_then_end_roundtrip() {
         .try_begin_user_action(UserActionKey::PrCreate, Duration::ZERO, "Creating PR...")
         .expect("first admit must succeed");
     assert!(app.is_user_action_in_flight(&UserActionKey::PrCreate));
-    assert!(app.activities.iter().any(|a| a.id == aid));
+    assert!(app.activities.entries.iter().any(|a| a.id == aid));
     app.end_user_action(&UserActionKey::PrCreate);
     assert!(!app.is_user_action_in_flight(&UserActionKey::PrCreate));
-    assert!(!app.activities.iter().any(|a| a.id == aid));
+    assert!(!app.activities.entries.iter().any(|a| a.id == aid));
 }
 
 /// Calling `try_begin_user_action` twice without an intermediate
@@ -71,7 +71,7 @@ fn user_action_try_begin_rejects_second_concurrent_call() {
     let second = app.try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging...");
     assert!(second.is_none(), "second concurrent admit must return None");
     // First activity is still owned by the helper.
-    assert!(app.activities.iter().any(|a| a.id == first));
+    assert!(app.activities.entries.iter().any(|a| a.id == first));
 }
 
 /// A debounce window blocks a fresh admit even after the previous
@@ -137,7 +137,7 @@ fn user_action_end_is_idempotent() {
 /// Unit test for `try_begin_user_action`: a second admit on the
 /// same key while the first is still in flight is rejected. This
 /// only covers the helper-level in-flight check; the full Ctrl+R
-/// dispatch path (including the `pending_fetch_count` hard gate
+/// dispatch path (including the `activities.pending_fetch_count` hard gate
 /// and the status message wiring) is exercised by
 /// `ctrl_r_rapid_double_press_through_handle_key_is_gated` in
 /// `src/event.rs`.
@@ -166,9 +166,9 @@ fn user_action_second_admit_rejected_while_in_flight() {
 /// salsa.rs `fetcher_repos_changed` block). It must reset three
 /// invariants together:
 ///   1. drop `fetch_rx`
-///   2. zero `pending_fetch_count`
+///   2. zero `activities.pending_fetch_count`
 ///   3. end both possible spinner owners (the `GithubRefresh`
-///      helper entry AND `structural_fetch_activity`)
+///      helper entry AND `activities.structural_fetch`)
 ///
 /// This test seeds the derived state as if two `FetchStarted`
 /// messages had been counted but their paired terminal messages
@@ -192,11 +192,11 @@ fn reset_fetch_state_clears_all_fetcher_derived_state() {
     // paired with `RepoData`/`FetcherError`. These are exactly
     // the messages that would be stranded when the old channel is
     // dropped by the restart.
-    app.pending_fetch_count = 2;
+    app.activities.pending_fetch_count = 2;
 
     // Sanity-check the seeded state.
     assert!(app.is_user_action_in_flight(&UserActionKey::GithubRefresh));
-    assert_eq!(app.pending_fetch_count, 2);
+    assert_eq!(app.activities.pending_fetch_count, 2);
     assert!(!app.activities.is_empty());
 
     // Simulate the salsa restart block.
@@ -208,8 +208,8 @@ fn reset_fetch_state_clears_all_fetcher_derived_state() {
         "fetch_rx must be dropped by reset_fetch_state",
     );
     assert_eq!(
-        app.pending_fetch_count, 0,
-        "pending_fetch_count must be reset to 0 - otherwise the Ctrl+R \
+        app.activities.pending_fetch_count, 0,
+        "activities.pending_fetch_count must be reset to 0 - otherwise the Ctrl+R \
          hard gate in src/event.rs permanently locks out refresh",
     );
     assert!(
@@ -217,8 +217,8 @@ fn reset_fetch_state_clears_all_fetcher_derived_state() {
         "GithubRefresh helper entry must be cleared",
     );
     assert!(
-        app.structural_fetch_activity.is_none(),
-        "structural_fetch_activity must be cleared",
+        app.activities.structural_fetch.is_none(),
+        "activities.structural_fetch must be cleared",
     );
     assert!(
         app.activities.is_empty(),
@@ -230,7 +230,7 @@ fn reset_fetch_state_clears_all_fetcher_derived_state() {
 /// ownership path: when `FetchStarted` arrived without a prior
 /// Ctrl+R admit (manage/unmanage, work-item create, delete
 /// cleanup, etc.), the spinner is owned by
-/// `structural_fetch_activity` rather than the helper entry. The
+/// `activities.structural_fetch` rather than the helper entry. The
 /// reset must end that activity too, not just the helper.
 #[test]
 fn reset_fetch_state_ends_structural_fetch_activity() {
@@ -238,18 +238,18 @@ fn reset_fetch_state_ends_structural_fetch_activity() {
     // Simulate `drain_fetch_results` on the structural-restart
     // path: no helper entry, but a counted FetchStarted and an
     // owned structural activity.
-    let id = app.start_activity("Refreshing GitHub data");
-    app.structural_fetch_activity = Some(id);
-    app.pending_fetch_count = 1;
+    let id = app.activities.start("Refreshing GitHub data");
+    app.activities.structural_fetch = Some(id);
+    app.activities.pending_fetch_count = 1;
     assert!(!app.is_user_action_in_flight(&UserActionKey::GithubRefresh));
 
     app.reset_fetch_state();
 
-    assert_eq!(app.pending_fetch_count, 0);
-    assert!(app.structural_fetch_activity.is_none());
+    assert_eq!(app.activities.pending_fetch_count, 0);
+    assert!(app.activities.structural_fetch.is_none());
     assert!(
         app.activities.is_empty(),
-        "structural_fetch_activity id must be removed from the activity list",
+        "activities.structural_fetch id must be removed from the activity list",
     );
 }
 

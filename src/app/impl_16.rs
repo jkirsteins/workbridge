@@ -9,10 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::*;
 use crate::agent_backend::AgentBackendKind;
 use crate::work_item_backend::ActivityEntry;
-
-use super::*;
 
 impl super::App {
     /// Spawn the async rebase-onto-main background gate for the given
@@ -89,7 +88,7 @@ impl super::App {
             })
             .unwrap_or_default();
         if agent_backend.kind() == AgentBackendKind::Codex && http_skipped_for_rebase > 0 {
-            self.push_toast(format!(
+            self.toasts.push(format!(
                 "Codex: {http_skipped_for_rebase} HTTP MCP server(s) skipped (Codex requires stdio)"
             ));
         }

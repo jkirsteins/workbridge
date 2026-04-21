@@ -399,5 +399,5 @@ fn begin_session_open_defers_backend_read_plan_to_background_thread() {
     );
     // End the spinner activity since `poll_session_opens` was
     // bypassed by the manual drain above.
-    app.end_activity(entry.activity);
+    app.activities.end(entry.activity);
 }

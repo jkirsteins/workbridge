@@ -1,4 +1,5 @@
 //! Modal prompt dialog: key-choice / text-input / alert variants.
+use rat_widget::text_input::TextInput;
 use ratatui_core::buffer::Buffer;
 use ratatui_core::layout::{Constraint, Direction, Layout, Rect};
 use ratatui_core::text::{Line, Span};
@@ -8,12 +9,9 @@ use ratatui_widgets::borders::{BorderType, Borders};
 use ratatui_widgets::clear::Clear;
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
-use crate::theme::Theme;
-
-use rat_widget::text_input::TextInput;
-
 use super::super::common::{centered_rect_fixed, dim_background, wrap_text_flat};
 use super::create_dialog::create_dialog_text_style;
+use crate::theme::Theme;
 
 /// Content variants for prompt dialogs.
 ///

@@ -8,12 +8,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::*;
 use crate::agent_backend::{self, AgentBackend, SpawnConfig, WORK_ITEM_ALLOWED_TOOLS};
 use crate::mcp::McpSocketServer;
 use crate::session::Session;
 use crate::work_item::{SessionEntry, WorkItemStatus};
-
-use super::*;
 
 impl super::App {
     /// Spawn the global assistant agent session.
@@ -105,7 +104,7 @@ impl super::App {
         let Some(kind) = self.global_assistant_harness_kind() else {
             self.global_drawer_open = false;
             self.focus = self.pre_drawer_focus;
-            self.push_toast(
+            self.toasts.push(
                 "Cannot open global assistant: no harness configured. Press Ctrl+G again to pick one."
                     .into(),
             );
@@ -303,7 +302,7 @@ impl super::App {
             let _ = tx.send(result);
         });
 
-        let activity = self.start_activity("Opening global assistant...");
+        let activity = self.activities.start("Opening global assistant...");
         self.global_session_open_pending = Some(GlobalSessionOpenPending {
             rx,
             activity,
@@ -335,7 +334,7 @@ impl super::App {
         let Some(pending) = self.global_session_open_pending.take() else {
             return;
         };
-        self.end_activity(pending.activity);
+        self.activities.end(pending.activity);
 
         if let Ok(result) = recv_result {
             if let Some(err) = result.error {

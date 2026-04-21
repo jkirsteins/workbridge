@@ -10,13 +10,12 @@ use ratatui_widgets::block::Block;
 use ratatui_widgets::borders::{BorderType, Borders};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
-use crate::app::App;
-use crate::metrics::secs_to_day;
-use crate::theme::Theme;
-
 pub use self::board_stats::*;
 pub use self::kpis::*;
 pub use self::metrics::*;
+use crate::app::App;
+use crate::metrics::secs_to_day;
+use crate::theme::Theme;
 
 /// Render the global metrics Dashboard. All data comes from
 /// `App.metrics_snapshot`, populated by the background aggregator thread.

@@ -2,15 +2,13 @@
 //! unlinked PRs, and work items. Each returns a multi-line `ListItem`
 //! sized for the panel width passed in by the caller.
 use ratatui_core::text::{Line, Span};
+use ratatui_widgets::list::ListItem;
 use unicode_width::UnicodeWidthStr;
 
+use super::super::common::{SPINNER_FRAMES, dim_badge_style, wrap_text, wrap_two_widths};
 use crate::app::App;
 use crate::theme::Theme;
 use crate::work_item::{CheckStatus, MergeableState, PrState, WorkItemKind, WorkItemStatus};
-
-use ratatui_widgets::list::ListItem;
-
-use super::super::common::{SPINNER_FRAMES, dim_badge_style, wrap_text, wrap_two_widths};
 
 /// Format a review-requested PR entry for the left panel list.
 pub fn format_review_request_item<'a>(
@@ -249,7 +247,7 @@ pub fn format_work_item_entry<'a>(
     let at_review_gate = app.review_gates.contains_key(&wi.id);
     let is_working = app.agent_working.contains(&wi.id) || at_review_gate;
     let (margin_text, margin_style): (String, ratatui_core::style::Style) = if is_working {
-        let frame = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+        let frame = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
         // On a highlighted row the list's bg is already Cyan, so a Cyan
         // spinner fg is invisible. Match the selection caret/title styling
         // (Black fg on Cyan bg, BOLD) so the spinner stays readable.

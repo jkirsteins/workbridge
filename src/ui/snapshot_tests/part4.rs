@@ -55,7 +55,7 @@
         app.confirm_merge = true;
         app.merge_in_progress = true;
         app.merge_wi_id = Some(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
-        app.spinner_tick = 3;
+        app.activities.spinner_tick = 3;
         insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 
@@ -119,9 +119,9 @@
                 "Cleaning up unlinked PR...",
             )
             .expect("helper admit should succeed");
-        app.end_activity(aid);
+        app.activities.end(aid);
         app.cleanup_progress_pr_number = Some(42);
-        app.spinner_tick = 3; // deterministic spinner frame
+        app.activities.spinner_tick = 3; // deterministic spinner frame
         insta::assert_snapshot!(render(&mut app, 80, 24));
     }
 

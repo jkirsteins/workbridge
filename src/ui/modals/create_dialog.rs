@@ -1,4 +1,8 @@
 //! The "Create Work Item" dialog + quickstart variant + text-style helper.
+use rat_widget::scrolled::Scroll;
+use rat_widget::text::TextStyle;
+use rat_widget::text_input::TextInput;
+use rat_widget::textarea::{TextArea, TextWrap};
 use ratatui_core::buffer::Buffer;
 use ratatui_core::layout::{Constraint, Direction, Layout, Rect};
 use ratatui_core::text::Line;
@@ -6,18 +10,12 @@ use ratatui_core::widgets::{StatefulWidget, Widget};
 use ratatui_widgets::block::Block;
 use ratatui_widgets::borders::Borders;
 use ratatui_widgets::clear::Clear;
+use ratatui_widgets::list::{List, ListItem, ListState};
 use ratatui_widgets::paragraph::{Paragraph, Wrap};
 
+use super::super::common::{centered_rect_fixed, dim_background, ensure_rendered_cursor};
 use crate::create_dialog::{CreateDialog, CreateDialogFocus};
 use crate::theme::Theme;
-
-use rat_widget::scrolled::Scroll;
-use rat_widget::text::TextStyle;
-use rat_widget::text_input::TextInput;
-use rat_widget::textarea::{TextArea, TextWrap};
-use ratatui_widgets::list::{List, ListItem, ListState};
-
-use super::super::common::{centered_rect_fixed, dim_background, ensure_rendered_cursor};
 
 pub const DESC_TEXTAREA_HEIGHT: u16 = 6;
 

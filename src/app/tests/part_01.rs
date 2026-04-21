@@ -426,8 +426,8 @@ fn fetch_started_shows_activity() {
     tx.send(FetchMessage::FetchStarted).unwrap();
 
     app.drain_fetch_results();
-    assert!(app.structural_fetch_activity.is_some());
-    assert!(app.current_activity().is_some());
+    assert!(app.activities.structural_fetch.is_some());
+    assert!(app.activities.current().is_some());
 
     // Sending RepoData should clear the activity.
     tx.send(FetchMessage::RepoData(Box::new(RepoFetchResult {
@@ -442,7 +442,7 @@ fn fetch_started_shows_activity() {
     .unwrap();
 
     app.drain_fetch_results();
-    assert!(app.structural_fetch_activity.is_none());
+    assert!(app.activities.structural_fetch.is_none());
 }
 
 /// `FetcherError` also clears the fetch activity.
@@ -454,7 +454,7 @@ fn fetch_started_cleared_on_error() {
 
     tx.send(FetchMessage::FetchStarted).unwrap();
     app.drain_fetch_results();
-    assert!(app.structural_fetch_activity.is_some());
+    assert!(app.activities.structural_fetch.is_some());
 
     tx.send(FetchMessage::FetcherError {
         repo_path: PathBuf::from("/repo"),
@@ -463,7 +463,7 @@ fn fetch_started_cleared_on_error() {
     .unwrap();
 
     app.drain_fetch_results();
-    assert!(app.structural_fetch_activity.is_none());
+    assert!(app.activities.structural_fetch.is_none());
 }
 
 /// Multiple `FetchStarted` messages should not create duplicate activities.
@@ -491,7 +491,7 @@ fn fetch_activity_persists_until_all_repos_finish() {
     tx.send(FetchMessage::FetchStarted).unwrap();
     tx.send(FetchMessage::FetchStarted).unwrap();
     app.drain_fetch_results();
-    assert!(app.structural_fetch_activity.is_some());
+    assert!(app.activities.structural_fetch.is_some());
 
     // First repo finishes - spinner should persist.
     tx.send(FetchMessage::RepoData(Box::new(RepoFetchResult {
@@ -506,7 +506,7 @@ fn fetch_activity_persists_until_all_repos_finish() {
     .unwrap();
     app.drain_fetch_results();
     assert!(
-        app.structural_fetch_activity.is_some(),
+        app.activities.structural_fetch.is_some(),
         "spinner should persist while second repo is still fetching",
     );
 
@@ -522,7 +522,7 @@ fn fetch_activity_persists_until_all_repos_finish() {
     })))
     .unwrap();
     app.drain_fetch_results();
-    assert!(app.structural_fetch_activity.is_none());
+    assert!(app.activities.structural_fetch.is_none());
 }
 
 // -- Round 4 regression tests --

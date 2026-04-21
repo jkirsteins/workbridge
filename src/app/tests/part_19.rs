@@ -73,7 +73,7 @@ fn stage_transition_without_harness_choice_surfaces_error() {
         "aborted session-open must not reach the Phase 2 spawn receiver"
     );
     assert!(
-        app.current_activity().is_none(),
+        app.activities.current().is_none(),
         "aborted session-open must not leave a spinner behind"
     );
 
@@ -218,7 +218,7 @@ fn spawn_orphan_worktree_cleanup_surfaces_failures_via_status_message() {
     // Spawning must register a status-bar activity per
     // `docs/UI.md` "Activity indicator placement".
     assert!(
-        app.current_activity().is_some(),
+        app.activities.current().is_some(),
         "spawn_orphan_worktree_cleanup must register a status-bar activity",
     );
 
@@ -263,7 +263,7 @@ fn spawn_orphan_worktree_cleanup_surfaces_failures_via_status_message() {
         "status message must include the branch name, got: {msg}",
     );
     assert!(
-        app.current_activity().is_none(),
+        app.activities.current().is_none(),
         "poll_orphan_cleanup_finished must end the spawned activity even on failure",
     );
 }
@@ -312,7 +312,7 @@ fn spawn_orphan_worktree_cleanup_ends_activity_on_success() {
     );
 
     assert!(
-        app.current_activity().is_some(),
+        app.activities.current().is_some(),
         "spawn_orphan_worktree_cleanup must register a status-bar activity",
     );
 
@@ -341,7 +341,7 @@ fn spawn_orphan_worktree_cleanup_ends_activity_on_success() {
     app.poll_orphan_cleanup_finished();
 
     assert!(
-        app.current_activity().is_none(),
+        app.activities.current().is_none(),
         "poll_orphan_cleanup_finished must end the spawned activity on success",
     );
     assert!(
@@ -393,12 +393,12 @@ fn cleanup_session_state_ends_spinner_for_pending_open() {
 
     let cwd = PathBuf::from("/tmp/r2f3-cleanup-wt");
     app.begin_session_open(&wi_id, &cwd);
-    assert!(app.current_activity().is_some());
+    assert!(app.activities.current().is_some());
 
     // Delete-flavour cleanup: spinner must be cleared.
     app.cleanup_session_state_for(&wi_id);
     assert!(
-        app.current_activity().is_none(),
+        app.activities.current().is_none(),
         "cleanup_session_state_for must end the session-open spinner",
     );
     assert!(
@@ -426,7 +426,7 @@ fn drain_pr_identity_backfill_ends_activity_on_disconnect() {
         crossbeam_channel::unbounded::<Result<crate::app::PrIdentityBackfillResult, String>>();
     drop(tx);
     app.pr_identity_backfill_rx = Some(rx);
-    let aid = app.start_activity("Backfilling merged PR identities...");
+    let aid = app.activities.start("Backfilling merged PR identities...");
     app.pr_identity_backfill_activity = Some(aid);
 
     let changed = app.drain_pr_identity_backfill();
@@ -444,7 +444,7 @@ fn drain_pr_identity_backfill_ends_activity_on_disconnect() {
         "Disconnected branch must take the ActivityId",
     );
     assert!(
-        app.current_activity().is_none(),
+        app.activities.current().is_none(),
         "drain_pr_identity_backfill must end the status-bar activity \
          on Disconnected so the spinner does not leak",
     );
@@ -467,7 +467,7 @@ fn poll_review_gate_disconnect_ends_status_bar_activity() {
     insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Mcp);
 
     assert!(
-        app.current_activity().is_some(),
+        app.activities.current().is_some(),
         "test gate must register an activity to begin with",
     );
 
@@ -478,7 +478,7 @@ fn poll_review_gate_disconnect_ends_status_bar_activity() {
         "Disconnected gate must be dropped",
     );
     assert!(
-        app.current_activity().is_none(),
+        app.activities.current().is_none(),
         "Disconnected arm of poll_review_gate must end the gate activity",
     );
 }
@@ -504,7 +504,7 @@ fn poll_review_gate_blocked_ends_status_bar_activity() {
     .unwrap();
     insert_test_review_gate(&mut app, wi_id.clone(), rx, ReviewGateOrigin::Tui);
 
-    assert!(app.current_activity().is_some());
+    assert!(app.activities.current().is_some());
 
     app.poll_review_gate();
 
@@ -513,7 +513,7 @@ fn poll_review_gate_blocked_ends_status_bar_activity() {
         "Blocked gate must be dropped",
     );
     assert!(
-        app.current_activity().is_none(),
+        app.activities.current().is_none(),
         "Blocked arm of poll_review_gate must end the gate activity",
     );
 }
@@ -524,7 +524,7 @@ fn poll_review_gate_blocked_ends_status_bar_activity() {
 ///
 /// The reject path additionally kills and respawns the session,
 /// which starts its own "Opening session..." activity - so we
-/// cannot assert that `current_activity()` is None after polling.
+/// cannot assert that `activities.current()` is None after polling.
 /// Instead, we capture the gate's `ActivityId` before polling and
 /// verify that exact ID is no longer in `app.activities`.
 #[test]
@@ -557,7 +557,7 @@ fn poll_review_gate_result_ends_status_bar_activity_reject() {
         "Result gate must be dropped",
     );
     assert!(
-        !app.activities.iter().any(|a| a.id == gate_aid),
+        !app.activities.entries.iter().any(|a| a.id == gate_aid),
         "Result arm of poll_review_gate must end the gate's specific \
          ActivityId via drop_review_gate",
     );

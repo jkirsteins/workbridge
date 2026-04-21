@@ -1,4 +1,5 @@
 //! Settings overlay and its per-tab rendering helpers.
+use rat_widget::text_input::TextInput;
 use ratatui_core::buffer::Buffer;
 use ratatui_core::layout::{Constraint, Direction, Layout, Rect};
 use ratatui_core::text::{Line, Span, Text};
@@ -6,18 +7,15 @@ use ratatui_core::widgets::{StatefulWidget, Widget};
 use ratatui_widgets::block::Block;
 use ratatui_widgets::borders::Borders;
 use ratatui_widgets::clear::Clear;
-use ratatui_widgets::paragraph::Paragraph;
-
-use crate::app::{App, SettingsListFocus, SettingsTab};
-use crate::config;
-use crate::theme::Theme;
-
-use rat_widget::text_input::TextInput;
 use ratatui_widgets::list::{List, ListItem, ListState};
+use ratatui_widgets::paragraph::Paragraph;
 use ratatui_widgets::tabs::Tabs;
 
 use super::super::common::{centered_rect, dim_background};
 use super::super::modals::create_dialog::create_dialog_text_style;
+use crate::app::{App, SettingsListFocus, SettingsTab};
+use crate::config;
+use crate::theme::Theme;
 
 const REPOS_LIST_MAX_ROWS: u16 = 6;
 

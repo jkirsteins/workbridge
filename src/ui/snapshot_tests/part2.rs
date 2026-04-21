@@ -234,7 +234,7 @@
     /// the gate in this test, so no messages ever need to flow.
     fn mark_at_review_gate(app: &mut App, wi_id: &WorkItemId) {
         let (_tx, rx) = crossbeam_channel::unbounded();
-        let activity = app.start_activity("test review gate");
+        let activity = app.activities.start("test review gate");
         app.review_gates.insert(
             wi_id.clone(),
             ReviewGateState {

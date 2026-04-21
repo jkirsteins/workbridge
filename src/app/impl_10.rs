@@ -8,10 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::*;
 use crate::work_item::{WorkItemId, WorkItemKind, WorkItemStatus};
 use crate::work_item_backend::{CreateWorkItem, RepoAssociationRecord};
-
-use super::*;
 
 impl super::App {
     /// Open the currently selected entry's PR in the default browser via

@@ -7,10 +7,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
+use super::*;
 use crate::work_item::{SessionEntry, WorkItemId, WorkItemStatus};
 use crate::work_item_backend::ActivityEntry;
-
-use super::*;
 
 impl super::App {
     /// Drop a rebase gate and end its status-bar activity. Mirrors
@@ -45,7 +44,7 @@ impl super::App {
             // RebaseGateState` when `state` falls out of scope at
             // the end of this block. We do NOT need to manually
             // signal them here.
-            self.end_activity(state.activity);
+            self.activities.end(state.activity);
         }
 
         // Only clear the user-action slot if it is owned by the
@@ -548,7 +547,7 @@ impl super::App {
                     std::thread::spawn(move || drop(session));
                 }
             }
-            self.end_activity(pending.activity);
+            self.activities.end(pending.activity);
             files_to_clean.push(pending.config_path);
         }
 

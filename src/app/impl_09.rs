@@ -6,11 +6,10 @@
 
 use std::path::PathBuf;
 
+use super::*;
 use crate::mcp::McpEvent;
 use crate::work_item::{WorkItemId, WorkItemKind, WorkItemStatus};
 use crate::work_item_backend::{ActivityEntry, CreateWorkItem, RepoAssociationRecord};
-
-use super::*;
 
 impl super::App {
     /// Drain MCP events from the crossbeam channel.

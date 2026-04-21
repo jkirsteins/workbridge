@@ -5,16 +5,14 @@ use ratatui_core::text::{Line, Span, Text};
 use ratatui_core::widgets::{StatefulWidget, Widget};
 use ratatui_widgets::block::Block;
 use ratatui_widgets::borders::Borders;
+use ratatui_widgets::list::{List, ListItem, ListState};
 use ratatui_widgets::paragraph::Paragraph;
 
+use super::common::{SPINNER_FRAMES, dim_badge_style, wrap_text};
 use crate::app::{App, BOARD_COLUMNS};
 use crate::layout;
 use crate::theme::Theme;
 use crate::work_item::{CheckStatus, MergeableState, WorkItemStatus};
-
-use ratatui_widgets::list::{List, ListItem, ListState};
-
-use super::common::{SPINNER_FRAMES, dim_badge_style, wrap_text};
 
 /// Render the board (Kanban) view: four vertical columns for Backlog,
 /// Planning, Implementing, and Review. Done items are hidden.
@@ -152,7 +150,7 @@ pub fn format_board_item<'a>(
     let mut indicators: Vec<Span<'a>> = Vec::new();
     let is_working = app.agent_working.contains(&wi.id);
     if is_working {
-        let frame = SPINNER_FRAMES[app.spinner_tick % SPINNER_FRAMES.len()];
+        let frame = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
         indicators.push(Span::styled(
             frame.to_string(),
             theme.style_badge_session_working(),

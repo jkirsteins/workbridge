@@ -6,10 +6,9 @@
 
 use std::path::PathBuf;
 
+use super::*;
 use crate::work_item::{WorkItemId, WorkItemKind, WorkItemStatus};
 use crate::work_item_backend::ActivityEntry;
-
-use super::*;
 
 impl super::App {
     /// Execute the delete once the user has confirmed via the modal.
@@ -379,7 +378,7 @@ impl super::App {
             self.mergequeue_watches.retain(|w| w.wi_id != wi_id);
             self.mergequeue_poll_errors.remove(&wi_id);
             if let Some(state) = self.mergequeue_polls.remove(&wi_id) {
-                self.end_activity(state.activity);
+                self.activities.end(state.activity);
             }
         }
 

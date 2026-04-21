@@ -117,11 +117,11 @@ fn chrome_click_inside_right_panel_still_fires() {
         app.pending_chrome_click.is_none(),
         "Up(Left) must clear the pending click",
     );
-    assert_eq!(app.toasts.len(), 1, "one toast must be queued");
+    assert_eq!(app.toasts.entries.len(), 1, "one toast must be queued");
     assert!(
-        app.toasts[0].text.contains("feat/my-branch"),
+        app.toasts.entries[0].text.contains("feat/my-branch"),
         "toast text must mention the copied value, got {:?}",
-        app.toasts[0].text,
+        app.toasts.entries[0].text,
     );
 }
 
@@ -266,11 +266,11 @@ fn chrome_click_inside_global_drawer_still_fires() {
         "priority check must also rescue drawer-area clicks",
     );
     assert!(handle_mouse_with_terminal_size(&mut app, up, TEST_SIZE));
-    assert_eq!(app.toasts.len(), 1, "one toast must be queued");
+    assert_eq!(app.toasts.entries.len(), 1, "one toast must be queued");
     assert!(
-        app.toasts[0].text.contains("workbridge"),
+        app.toasts.entries[0].text.contains("workbridge"),
         "toast text must mention the copied value, got {:?}",
-        app.toasts[0].text,
+        app.toasts.entries[0].text,
     );
 }
 

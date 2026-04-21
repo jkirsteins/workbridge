@@ -57,7 +57,7 @@ macro_rules! impl_pr_merge_poll_method {
             }
             for wi_id in &to_remove {
                 if let Some(state) = self.$polls_field.remove(wi_id) {
-                    self.end_activity(state.activity);
+                    self.activities.end(state.activity);
                 }
             }
 
@@ -211,7 +211,7 @@ macro_rules! impl_pr_merge_poll_method {
                     repo_path,
                 );
                 let activity =
-                    self.start_activity(format!("{} ({branch})", $poll_label_prefix));
+                    self.activities.start(format!("{} ({branch})", $poll_label_prefix));
                 self.$polls_field
                     .insert(wi_id.clone(), PrMergePollState { rx, activity });
                 if let Some(w) = self
@@ -304,6 +304,7 @@ macro_rules! impl_pr_merge_reconstruct_method {
 }
 
 // === Submodule declarations ===
+mod activities;
 mod helpers;
 mod impl_01;
 mod impl_02;
@@ -329,16 +330,19 @@ mod struct_app;
 mod stubs;
 #[cfg(test)]
 mod tests;
+mod toasts;
 mod types_01;
 mod types_02;
 mod user_actions;
 
 // Re-exports so `super::<Type>` / `super::<helper>` paths in sibling
 // submodules keep resolving without changing the import shape.
+pub use activities::*;
 pub use helpers::*;
 pub use struct_app::*;
 #[cfg(test)]
 pub use stubs::*;
+pub use toasts::*;
 pub use types_01::*;
 pub use types_02::*;
 pub use user_actions::*;

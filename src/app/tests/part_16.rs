@@ -394,7 +394,7 @@ fn spawn_review_gate_does_not_touch_worktree_service_synchronously() {
     // visible BEFORE we drop the gate so the spinner is observable
     // in the live system, not just after teardown.
     assert!(
-        app.current_activity().is_some(),
+        app.activities.current().is_some(),
         "spawn_review_gate must register a status-bar activity",
     );
 
@@ -405,7 +405,7 @@ fn spawn_review_gate_does_not_touch_worktree_service_synchronously() {
     drop(gate);
     app.drop_review_gate(&wi_id);
     assert!(
-        app.current_activity().is_none(),
+        app.activities.current().is_none(),
         "drop_review_gate must end the review gate activity",
     );
 }

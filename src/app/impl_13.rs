@@ -7,10 +7,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use super::*;
 use crate::work_item::{WorkItemId, WorkItemStatus};
 use crate::work_item_backend::{ActivityEntry, PrIdentityRecord};
-
-use super::*;
 
 impl super::App {
     /// Drain the live merge precheck receiver on the background tick.

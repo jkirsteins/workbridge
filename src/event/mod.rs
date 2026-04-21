@@ -487,13 +487,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         // `fetcher::stop` only flips an atomic flag - it does NOT kill
         // the in-flight `gh` subprocess, so a naive "restart on every
         // press" still accumulates concurrent TLS handshakes under key
-        // spam. Gating on `pending_fetch_count` (the count of repos
+        // spam. Gating on `activities.pending_fetch_count` (the count of repos
         // whose `FetchStarted` has been observed but whose `RepoData` /
         // `FetcherError` has not) guarantees we never admit a second
         // refresh while the previous cycle's subprocesses are still
         // talking to github.com. The 500ms debounce below still applies
         // as a secondary guard against pre-FetchStarted spam windows.
-        if app.pending_fetch_count > 0 {
+        if app.activities.pending_fetch_count > 0 {
             app.status_message = Some("Refresh already in progress".into());
             return true;
         }

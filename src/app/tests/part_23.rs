@@ -36,7 +36,7 @@ fn poll_review_request_merges_merged_advances_to_done_and_clears_watch() {
         }),
     })
     .unwrap();
-    let activity = app.start_activity("test poll");
+    let activity = app.activities.start("test poll");
     app.review_request_merge_polls
         .insert(rec_id.clone(), PrMergePollState { rx, activity });
 
@@ -140,7 +140,7 @@ fn poll_review_request_merges_merged_persists_pr_identity_for_fallback() {
         }),
     })
     .unwrap();
-    let activity = app.start_activity("test poll");
+    let activity = app.activities.start("test poll");
     app.review_request_merge_polls
         .insert(rec_id.clone(), PrMergePollState { rx, activity });
 
@@ -202,7 +202,7 @@ fn poll_review_request_merges_closed_does_not_transition() {
         pr_identity: None,
     })
     .unwrap();
-    let activity = app.start_activity("test poll");
+    let activity = app.activities.start("test poll");
     app.review_request_merge_polls
         .insert(rec_id.clone(), PrMergePollState { rx, activity });
 
@@ -257,7 +257,7 @@ fn poll_review_request_merges_error_persists_on_work_item() {
         pr_identity: None,
     })
     .unwrap();
-    let activity = app.start_activity("test poll");
+    let activity = app.activities.start("test poll");
     app.review_request_merge_polls
         .insert(rec_id.clone(), PrMergePollState { rx, activity });
 
@@ -312,7 +312,7 @@ fn poll_review_request_merges_discards_result_when_item_moved_away() {
         pr_identity: None,
     })
     .unwrap();
-    let activity = app.start_activity("test poll");
+    let activity = app.activities.start("test poll");
     app.review_request_merge_polls
         .insert(rec_id.clone(), PrMergePollState { rx, activity });
 
@@ -353,7 +353,7 @@ fn poll_review_request_merges_does_not_shell_out_on_ui_thread() {
         pr_identity: None,
     })
     .unwrap();
-    let activity = app.start_activity("test poll");
+    let activity = app.activities.start("test poll");
     app.review_request_merge_polls
         .insert(rec_id, PrMergePollState { rx, activity });
 
@@ -411,7 +411,7 @@ fn reviewrequest_in_review_stays_selected_after_auto_close_to_done() {
         }),
     })
     .unwrap();
-    let activity = app.start_activity("test poll");
+    let activity = app.activities.start("test poll");
     app.review_request_merge_polls
         .insert(rec_id.clone(), PrMergePollState { rx, activity });
 

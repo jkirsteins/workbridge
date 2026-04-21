@@ -127,7 +127,7 @@ fn poll_mergequeue_merged_advances_to_done_and_clears_watch() {
         }),
     })
     .unwrap();
-    let activity = app.start_activity("test poll");
+    let activity = app.activities.start("test poll");
     app.mergequeue_polls
         .insert(wi_id.clone(), PrMergePollState { rx, activity });
 
@@ -188,7 +188,7 @@ fn poll_mergequeue_error_persists_on_work_item() {
         pr_identity: None,
     })
     .unwrap();
-    let activity = app.start_activity("test poll");
+    let activity = app.activities.start("test poll");
     app.mergequeue_polls
         .insert(wi_id.clone(), PrMergePollState { rx, activity });
 
@@ -263,7 +263,7 @@ fn poll_mergequeue_backfills_pr_number_on_first_success() {
         }),
     })
     .unwrap();
-    let activity = app.start_activity("test poll");
+    let activity = app.activities.start("test poll");
     app.mergequeue_polls
         .insert(wi_id.clone(), PrMergePollState { rx, activity });
 
@@ -325,7 +325,7 @@ fn retreat_one_mergequeue_item_does_not_disturb_another_in_flight_poll() {
     // channel - we only need the entry to exist; we are not calling
     // poll_mergequeue so the rx is never drained.
     let (_tx_a, rx_a) = crossbeam_channel::bounded(1);
-    let activity_a = app.start_activity("polling A");
+    let activity_a = app.activities.start("polling A");
     app.mergequeue_polls.insert(
         wi_a.clone(),
         PrMergePollState {
@@ -344,7 +344,7 @@ fn retreat_one_mergequeue_item_does_not_disturb_another_in_flight_poll() {
         "retreating B must not drop A's in-flight poll",
     );
     assert!(
-        app.activities.iter().any(|a| a.id == activity_a),
+        app.activities.entries.iter().any(|a| a.id == activity_a),
         "retreating B must not end A's polling activity",
     );
     assert!(

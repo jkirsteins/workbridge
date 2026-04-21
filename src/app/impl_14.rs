@@ -6,10 +6,9 @@
 
 use std::path::PathBuf;
 
+use super::*;
 use crate::work_item::{WorkItemId, WorkItemKind, WorkItemStatus};
 use crate::work_item_backend::ActivityEntry;
-
-use super::*;
 
 impl super::App {
     /// Enter the Mergequeue state for a work item. The item must be in
@@ -281,7 +280,7 @@ impl super::App {
         if disconnected {
             self.pr_identity_backfill_rx = None;
             if let Some(aid) = self.pr_identity_backfill_activity.take() {
-                self.end_activity(aid);
+                self.activities.end(aid);
             }
         }
         changed

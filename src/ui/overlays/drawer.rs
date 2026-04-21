@@ -7,14 +7,12 @@ use ratatui_widgets::block::Block;
 use ratatui_widgets::borders::Borders;
 use ratatui_widgets::clear::Clear;
 use ratatui_widgets::paragraph::Paragraph;
-
-use crate::app::App;
-use crate::theme::Theme;
-
 use tui_term::widget::PseudoTerminal;
 
 use super::super::common::dim_background;
 use super::super::selection::render_selection_overlay;
+use crate::app::App;
+use crate::theme::Theme;
 
 pub fn draw_global_drawer(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // 1. Dim every cell in the buffer to push the background behind the drawer.

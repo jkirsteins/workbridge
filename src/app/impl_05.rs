@@ -6,10 +6,9 @@
 
 use std::path::PathBuf;
 
+use super::*;
 use crate::work_item::{WorkItem, WorkItemId, WorkItemStatus};
 use crate::worktree_service::WorktreeService;
-
-use super::*;
 
 impl super::App {
     /// Remove recently-closed PRs from cached `repo_data`. Called after
@@ -635,7 +634,8 @@ impl super::App {
         // the new keybinding without taking a silent-default action
         // the user did not request.
         if !self.harness_choice.contains_key(&work_item_id) {
-            self.push_toast("press c / x to open this work item with a specific harness".into());
+            self.toasts
+                .push("press c / x to open this work item with a specific harness".into());
             return;
         }
 

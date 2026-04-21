@@ -7,10 +7,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::*;
 use crate::agent_backend::{AgentBackendKind, ReviewGateSpawnConfig};
 use crate::work_item::{CheckStatus, WorkItemId};
-
-use super::*;
 
 impl super::App {
     /// Attempt to spawn the async review gate for the given work item.
@@ -117,7 +116,7 @@ impl super::App {
             (bridges, http_count)
         };
         if agent_backend.kind() == AgentBackendKind::Codex && http_skipped_for_review > 0 {
-            self.push_toast(format!(
+            self.toasts.push(format!(
                 "Codex: {http_skipped_for_review} HTTP MCP server(s) skipped (Codex requires stdio)"
             ));
         }
@@ -127,7 +126,9 @@ impl super::App {
         // system-initiated background work and must own a status-bar
         // spinner. The ID lives on `ReviewGateState` so every drop site
         // ends it via `drop_review_gate`.
-        let activity = self.start_activity(format!("Running review gate for '{title}'"));
+        let activity = self
+            .activities
+            .start(format!("Running review gate for '{title}'"));
         // Clone the worktree service and backend for the background thread so
         // that `default_branch()`/`github_remote()` (which shell out to git)
         // and `read_plan()` (filesystem read) execute off the main UI thread.
@@ -496,7 +497,7 @@ impl super::App {
     /// indicator placement".
     pub(super) fn drop_review_gate(&mut self, wi_id: &WorkItemId) {
         if let Some(state) = self.review_gates.remove(wi_id) {
-            self.end_activity(state.activity);
+            self.activities.end(state.activity);
         }
     }
 }

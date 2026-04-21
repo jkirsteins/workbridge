@@ -8,10 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::*;
 use crate::work_item::{WorkItemId, WorkItemStatus};
 use crate::work_item_backend::ActivityEntry;
-
-use super::*;
 
 impl super::App {
     /// Best-effort async PR creation when entering Review.
@@ -413,7 +412,7 @@ impl super::App {
         // source of truth for `is_user_action_in_flight(&PrMerge)`.
         if let Some(state) = self.user_actions.in_flight.get(&UserActionKey::PrMerge) {
             let aid = state.activity_id;
-            self.end_activity(aid);
+            self.activities.end(aid);
         }
 
         // Modal renders the spinner from the moment the user pressed

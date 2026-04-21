@@ -10,11 +10,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use super::*;
 use crate::agent_backend::{self, AgentBackend, AgentBackendKind};
 use crate::session::Session;
 use crate::work_item::{SessionEntry, WorkItemId, WorkItemStatus};
-
-use super::*;
 
 impl super::App {
     /// Cancel a pending `session_open_rx` entry: signal the worker to
@@ -68,7 +67,7 @@ impl super::App {
             }
             files_to_clean.push(entry.mcp_config_path);
             self.spawn_agent_file_cleanup(files_to_clean);
-            self.end_activity(entry.activity);
+            self.activities.end(entry.activity);
         }
     }
 
@@ -204,7 +203,7 @@ impl super::App {
                 self.drop_mcp_server_off_thread(server);
             }
             self.spawn_agent_file_cleanup(written_files);
-            self.push_toast(
+            self.toasts.push(
                 "Cannot open session: no harness chosen for this work item. Press c / x to pick one first."
                     .into(),
             );
@@ -267,7 +266,7 @@ impl super::App {
             }
         });
 
-        let activity = self.start_activity("Spawning agent session...");
+        let activity = self.activities.start("Spawning agent session...");
         self.session_spawn_rx
             .insert(work_item_id.clone(), SessionSpawnPending { rx, activity });
     }
@@ -291,7 +290,7 @@ impl super::App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     // Worker thread died without sending.
                     if let Some(pending) = self.session_spawn_rx.remove(&wi_id) {
-                        self.end_activity(pending.activity);
+                        self.activities.end(pending.activity);
                     }
                     self.status_message =
                         Some("Session spawn: background thread exited unexpectedly".into());
@@ -299,7 +298,7 @@ impl super::App {
                 }
             };
             if let Some(pending) = self.session_spawn_rx.remove(&wi_id) {
-                self.end_activity(pending.activity);
+                self.activities.end(pending.activity);
             }
 
             // Guard: the work item may have been deleted or
@@ -509,7 +508,8 @@ impl super::App {
         // PATH availability check before recording the choice. A failed
         // press must NOT silently clobber a valid previous selection.
         if !agent_backend::is_available(kind) {
-            self.push_toast(format!("{}: command not found", kind.binary_name()));
+            self.toasts
+                .push(format!("{}: command not found", kind.binary_name()));
             return;
         }
 
@@ -525,7 +525,8 @@ impl super::App {
                 .get(&existing_key)
                 .is_some_and(|entry| entry.alive);
             if is_alive {
-                self.push_toast("session already running - press kk to end first".into());
+                self.toasts
+                    .push("session already running - press kk to end first".into());
                 return;
             }
         }
@@ -602,10 +603,11 @@ impl super::App {
             // is harmless. See the Milestone 3 acceptance-criteria
             // notes.
             self.last_k_press = None;
-            self.push_toast("session ended".into());
+            self.toasts.push("session ended".into());
         } else {
             self.last_k_press = Some((work_item_id, now));
-            self.push_toast("press k again within 1.5s to end session".into());
+            self.toasts
+                .push("press k again within 1.5s to end session".into());
         }
     }
 

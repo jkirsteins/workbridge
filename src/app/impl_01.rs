@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::*;
 use crate::agent_backend::ClaudeCodeBackend;
 use crate::click_targets::{ClickKind, ClickRegistry};
 use crate::config::{Config, ConfigProvider, RepoEntry, RepoSource};
@@ -17,8 +18,6 @@ use crate::create_dialog::CreateDialog;
 use crate::work_item::WorkItemId;
 use crate::work_item_backend::WorkItemBackend;
 use crate::worktree_service::WorktreeService;
-
-use super::*;
 
 impl super::App {
     /// Check if the `gh` CLI is available by running `gh --version`.
@@ -199,12 +198,8 @@ impl super::App {
             mcp_tx,
             review_gates: HashMap::new(),
             rebase_gates: HashMap::new(),
-            activity_counter: 0,
-            activities: Vec::new(),
-            spinner_tick: 0,
+            activities: Activities::new(),
             user_actions: UserActionGuard::default(),
-            structural_fetch_activity: None,
-            pending_fetch_count: 0,
             pr_create_pending: VecDeque::new(),
             review_reopen_suppress: std::collections::HashSet::new(),
             mergequeue_watches: Vec::new(),
@@ -236,34 +231,11 @@ impl super::App {
             pending_terminal_pty_bytes: Vec::new(),
             click_registry: RefCell::new(ClickRegistry::default()),
             pending_chrome_click: None,
-            toasts: Vec::new(),
+            toasts: Toasts::new(),
         };
         app.reassemble_work_items();
         app.build_display_list();
         app
-    }
-
-    // -- Toast API --
-
-    /// Show a transient top-right toast for ~2 seconds. Newest toasts
-    /// stack at the top of the column. Multiple calls in quick
-    /// succession produce a visible stack; each auto-dismisses
-    /// independently. Called from `fire_chrome_copy` and any other
-    /// handler that wants to surface a short confirmation without
-    /// hijacking the status bar.
-    pub fn push_toast(&mut self, text: String) {
-        self.toasts.push(Toast {
-            text,
-            expires_at: crate::side_effects::clock::instant_now() + Duration::from_secs(2),
-        });
-    }
-
-    /// Drop any toasts whose deadline has passed. Cheap - called from
-    /// the per-tick hook in `salsa::app_event`. Keeps the vector from
-    /// growing unbounded and is the only thing that removes toasts.
-    pub fn prune_toasts(&mut self) {
-        let now = crate::side_effects::clock::instant_now();
-        self.toasts.retain(|t| t.expires_at > now);
     }
 
     /// Fire a click-to-copy action: write `value` to the clipboard via
@@ -292,37 +264,18 @@ impl super::App {
         } else {
             format!("Copy failed: {short}")
         };
-        self.push_toast(text);
+        self.toasts.push(text);
     }
 
     // -- Activity indicator API --
 
-    /// Start a new activity. Returns its ID for later removal.
-    /// The most recently started activity is displayed in the status bar.
-    pub fn start_activity(&mut self, message: impl Into<String>) -> ActivityId {
-        self.activity_counter += 1;
-        let id = ActivityId(self.activity_counter);
-        self.activities.push(Activity {
-            id,
-            message: message.into(),
-        });
-        id
-    }
-
-    /// End an activity by its ID. No-op if already ended.
-    pub fn end_activity(&mut self, id: ActivityId) {
-        self.activities.retain(|a| a.id != id);
-    }
-
-    /// Returns the activity message to display, or None if idle.
-    pub fn current_activity(&self) -> Option<&str> {
-        self.activities.last().map(|a| a.message.as_str())
-    }
-
     /// Whether the status bar row should be visible. True when either
-    /// a status message or an activity indicator is present.
+    /// a status message or an activity indicator is present. Lives on
+    /// `App` (not on `Activities`) because it combines state from two
+    /// subsystems (shell-level `status_message` + activities queue).
+    #[must_use]
     pub const fn has_visible_status_bar(&self) -> bool {
-        self.status_message.is_some() || !self.activities.is_empty()
+        self.status_message.is_some() || !self.activities.entries.is_empty()
     }
 
     // -- User action guard API --
@@ -361,7 +314,7 @@ impl super::App {
             return None;
         }
         self.user_actions.last_attempted.insert(key.clone(), now);
-        let activity_id = self.start_activity(message);
+        let activity_id = self.activities.start(message);
         self.user_actions.in_flight.insert(
             key,
             UserActionState {
@@ -407,7 +360,7 @@ impl super::App {
     /// retreat) use this as a best-effort cleanup.
     pub fn end_user_action(&mut self, key: &UserActionKey) {
         if let Some(state) = self.user_actions.in_flight.remove(key) {
-            self.end_activity(state.activity_id);
+            self.activities.end(state.activity_id);
         }
     }
 
@@ -444,21 +397,21 @@ impl super::App {
     /// paired `RepoData` / `FetcherError` terminal messages. Without
     /// resetting the derived state, any `FetchStarted` whose count was
     /// already incremented on a prior tick (via `drain_fetch_results`)
-    /// would be stranded forever: `pending_fetch_count` would stay
+    /// would be stranded forever: `activities.pending_fetch_count` would stay
     /// non-zero for the rest of the process lifetime, which the Ctrl+R
     /// hard gate in `src/event.rs` interprets as "a fetch cycle is
     /// still running" and rejects every user-initiated refresh from
-    /// that point on. The dangling `structural_fetch_activity` id would
+    /// that point on. The dangling `activities.structural_fetch` id would
     /// similarly leave a stuck spinner on the status bar.
     ///
     /// This helper groups the three invariants that must always move
     /// together on a structural restart:
     ///   1. `fetch_rx = None` - the channel the old threads write into
     ///      is torn down.
-    ///   2. `pending_fetch_count = 0` - any counted-but-unpaired
+    ///   2. `activities.pending_fetch_count = 0` - any counted-but-unpaired
     ///      `FetchStarted` from the old channel is reset so the Ctrl+R
     ///      gate does not permanently lock out the user.
-    ///   3. `structural_fetch_activity` / `UserActionKey::GithubRefresh`
+    ///   3. `activities.structural_fetch` / `UserActionKey::GithubRefresh`
     ///      activities are ended so no stuck spinner remains.
     ///
     /// Keeping them in a single method makes the structural ownership
@@ -472,12 +425,12 @@ impl super::App {
         // 2. Reset the count so any previously-counted `FetchStarted`
         //    whose paired `RepoData` / `FetcherError` will never
         //    arrive cannot strand the Ctrl+R gate.
-        self.pending_fetch_count = 0;
+        self.activities.pending_fetch_count = 0;
         // 3. End both possible owners of the current fetch spinner.
         //    Both are idempotent no-ops when already clear.
         self.end_user_action(&UserActionKey::GithubRefresh);
-        if let Some(id) = self.structural_fetch_activity.take() {
-            self.end_activity(id);
+        if let Some(id) = self.activities.structural_fetch.take() {
+            self.activities.end(id);
         }
     }
 

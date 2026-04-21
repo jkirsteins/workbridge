@@ -396,8 +396,8 @@ fn activity_indicator_overrides_status_message() {
     let mut app = app_with_items(items, vec![]);
     app.selected_item = app.display_list.iter().position(is_selectable);
     app.status_message = Some("This should be hidden".into());
-    app.start_activity("Creating pull request...");
-    app.spinner_tick = 3; // Pick a specific frame for deterministic snapshot.
+    app.activities.start("Creating pull request...");
+    app.activities.spinner_tick = 3; // Pick a specific frame for deterministic snapshot.
     insta::assert_snapshot!(render(&mut app, 80, 24));
 }
 
@@ -412,8 +412,8 @@ fn activity_indicator_with_count() {
     )];
     let mut app = app_with_items(items, vec![]);
     app.selected_item = app.display_list.iter().position(is_selectable);
-    app.start_activity("Running review gate...");
-    app.start_activity("Creating pull request...");
-    app.spinner_tick = 0;
+    app.activities.start("Running review gate...");
+    app.activities.start("Creating pull request...");
+    app.activities.spinner_tick = 0;
     insta::assert_snapshot!(render(&mut app, 80, 24));
 }

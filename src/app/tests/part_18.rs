@@ -139,7 +139,7 @@ fn finish_session_open_does_not_write_mcp_json_into_worktree() {
         &entry.rx,
         "background plan-read must deliver a result",
     );
-    app.end_activity(entry.activity);
+    app.activities.end(entry.activity);
 
     // This is the function under test. The surfaced status
     // message (from either the MCP config temp-write or the
@@ -328,7 +328,7 @@ fn begin_session_open_surfaces_activity_spinner_for_feedback() {
     // path returned silently from `begin_session_open`, so a slow
     // backend made the TUI look hung between Enter and the next
     // 200ms poll tick. `begin_session_open` must register an
-    // activity so `current_activity()` surfaces feedback
+    // activity so `activities.current()` surfaces feedback
     // immediately. The activity must also be ended in every
     // terminal path of `poll_session_opens` - here we verify the
     // happy path.
@@ -367,7 +367,7 @@ fn begin_session_open_surfaces_activity_spinner_for_feedback() {
         .insert(wi_id.clone(), AgentBackendKind::ClaudeCode);
 
     // No spinner before the call.
-    assert!(app.current_activity().is_none());
+    assert!(app.activities.current().is_none());
 
     let cwd = PathBuf::from("/tmp/r2f3-worktree");
     app.begin_session_open(&wi_id, &cwd);
@@ -376,7 +376,8 @@ fn begin_session_open_surfaces_activity_spinner_for_feedback() {
     // background thread to finish. This is the entire point of the
     // R2-F-3 fix.
     let activity_msg = app
-        .current_activity()
+        .activities
+        .current()
         .expect("R2-F-3 regression: begin_session_open must start an activity spinner");
     assert_eq!(activity_msg, "Opening session...");
     assert!(
@@ -421,10 +422,10 @@ fn begin_session_open_surfaces_activity_spinner_for_feedback() {
         &entry.rx,
         "background plan-read thread must deliver a result",
     );
-    app.end_activity(entry.activity);
+    app.activities.end(entry.activity);
 
     assert!(
-        app.current_activity().is_none(),
+        app.activities.current().is_none(),
         "R2-F-3 regression: spinner must be cleared after the result is drained",
     );
 }
@@ -481,7 +482,7 @@ fn apply_stage_change_cancels_pending_session_open() {
         "begin_session_open must register a pending receiver",
     );
     assert!(
-        app.current_activity().is_some(),
+        app.activities.current().is_some(),
         "begin_session_open must start an activity spinner",
     );
 
@@ -502,7 +503,7 @@ fn apply_stage_change_cancels_pending_session_open() {
          finish_session_open would later spawn Claude for the new stage",
     );
     assert!(
-        app.current_activity().is_none(),
+        app.activities.current().is_none(),
         "stage change must end the 'Opening session...' spinner",
     );
 }

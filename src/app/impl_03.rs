@@ -6,12 +6,11 @@
 
 use std::sync::mpsc;
 
+use super::*;
 use crate::assembly;
 use crate::github_client::GithubError;
 use crate::work_item::{FetchMessage, WorkItemId, WorkItemStatus};
 use crate::work_item_backend::ActivityEntry;
-
-use super::*;
 
 impl super::App {
     /// Route buffered bytes to whichever right-panel tab is active.
@@ -85,28 +84,29 @@ impl super::App {
                     // start a second one. Otherwise (structural restart
                     // path: manage/unmanage, quickstart create, delete
                     // cleanup, etc.) own the spinner locally via
-                    // `structural_fetch_activity` so the single-spinner
+                    // `activities.structural_fetch` so the single-spinner
                     // invariant holds.
-                    self.pending_fetch_count += 1;
+                    self.activities.pending_fetch_count += 1;
                     let helper_owns_it =
                         self.is_user_action_in_flight(&UserActionKey::GithubRefresh);
-                    if !helper_owns_it && self.structural_fetch_activity.is_none() {
-                        let id = self.start_activity("Refreshing GitHub data");
-                        self.structural_fetch_activity = Some(id);
+                    if !helper_owns_it && self.activities.structural_fetch.is_none() {
+                        let id = self.activities.start("Refreshing GitHub data");
+                        self.activities.structural_fetch = Some(id);
                     }
                 }
                 FetchMessage::RepoData(result) => {
                     received_any = true;
-                    self.pending_fetch_count = self.pending_fetch_count.saturating_sub(1);
+                    self.activities.pending_fetch_count =
+                        self.activities.pending_fetch_count.saturating_sub(1);
                     // End both possible owners of the fetch spinner:
                     // the Ctrl+R helper entry (if it started this
                     // cycle) and the structural fallback (if the
                     // restart path started it). Exactly one of them
                     // actually holds an activity at any given time.
-                    if self.pending_fetch_count == 0 {
+                    if self.activities.pending_fetch_count == 0 {
                         self.end_user_action(&UserActionKey::GithubRefresh);
-                        if let Some(id) = self.structural_fetch_activity.take() {
-                            self.end_activity(id);
+                        if let Some(id) = self.activities.structural_fetch.take() {
+                            self.activities.end(id);
                         }
                     }
                     // Surface worktree errors in the status bar. One-time
@@ -162,17 +162,18 @@ impl super::App {
                     // reported back.  In multi-repo setups, clearing on every
                     // single RepoData arrival lets an early repo's stale data
                     // re-open items that were just reviewed in a later repo.
-                    if self.pending_fetch_count == 0 {
+                    if self.activities.pending_fetch_count == 0 {
                         self.review_reopen_suppress.clear();
                     }
                 }
                 FetchMessage::FetcherError { repo_path, error } => {
                     received_any = true;
-                    self.pending_fetch_count = self.pending_fetch_count.saturating_sub(1);
-                    if self.pending_fetch_count == 0 {
+                    self.activities.pending_fetch_count =
+                        self.activities.pending_fetch_count.saturating_sub(1);
+                    if self.activities.pending_fetch_count == 0 {
                         self.end_user_action(&UserActionKey::GithubRefresh);
-                        if let Some(id) = self.structural_fetch_activity.take() {
-                            self.end_activity(id);
+                        if let Some(id) = self.activities.structural_fetch.take() {
+                            self.activities.end(id);
                         }
                         // Clear re-open suppression when all repos have
                         // reported back, even if they all failed.  This
@@ -519,7 +520,7 @@ impl super::App {
         self.mergequeue_watches.retain(|w| w.wi_id != *wi_id);
         self.mergequeue_poll_errors.remove(wi_id);
         if let Some(state) = self.mergequeue_polls.remove(wi_id) {
-            self.end_activity(state.activity);
+            self.activities.end(state.activity);
         }
 
         // -- Phase 6: In-memory state cleanup --

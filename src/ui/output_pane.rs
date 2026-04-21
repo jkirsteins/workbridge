@@ -6,17 +6,15 @@ use ratatui_core::widgets::Widget;
 use ratatui_widgets::block::Block;
 use ratatui_widgets::borders::Borders;
 use ratatui_widgets::paragraph::Paragraph;
-
-use crate::app::{App, DisplayEntry, FocusPanel, RightPanelTab, UserActionKey};
-use crate::theme::Theme;
-use crate::work_item::WorkItemStatus;
-
 use tui_term::widget::PseudoTerminal;
 
 use super::detail_pane::{
     ImportablePrDetail, draw_importable_pr_detail, draw_work_item_detail, format_work_item_error,
 };
 use super::selection::render_selection_overlay;
+use crate::app::{App, DisplayEntry, FocusPanel, RightPanelTab, UserActionKey};
+use crate::theme::Theme;
+use crate::work_item::WorkItemStatus;
 
 pub fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
     // When the settings overlay is open, dim background panels.
@@ -135,7 +133,7 @@ pub fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) 
 
             if rebase_gate_active {
                 let spinner_chars = [b'|', b'/', b'-', b'\\'];
-                let frame = app.spinner_tick % spinner_chars.len();
+                let frame = app.activities.spinner_tick % spinner_chars.len();
                 let spinner = spinner_chars[frame] as char;
                 let progress_text = app
                     .work_items
@@ -164,7 +162,7 @@ pub fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) 
 
             if review_gate_active {
                 let spinner_chars = [b'|', b'/', b'-', b'\\'];
-                let frame = app.spinner_tick % spinner_chars.len();
+                let frame = app.activities.spinner_tick % spinner_chars.len();
                 let spinner = spinner_chars[frame] as char;
                 let progress_text = app
                     .work_items
@@ -239,7 +237,7 @@ pub fn draw_pane_output(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) 
 
                     if worktree_creating {
                         let spinner_chars = [b'|', b'/', b'-', b'\\'];
-                        let frame = app.spinner_tick % spinner_chars.len();
+                        let frame = app.activities.spinner_tick % spinner_chars.len();
                         let spinner = spinner_chars[frame] as char;
                         let text = Text::from(vec![
                             Line::from(""),

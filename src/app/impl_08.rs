@@ -7,12 +7,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::*;
 use crate::agent_backend::{
     self, AgentBackend, AgentBackendKind, SpawnConfig, WORK_ITEM_ALLOWED_TOOLS,
 };
 use crate::work_item::{WorkItemId, WorkItemStatus};
-
-use super::*;
 
 impl super::App {
     /// Handle a Ctrl+G keypress. If the config already has a chosen
@@ -32,7 +31,7 @@ impl super::App {
             .collect();
 
         if available.is_empty() {
-            self.push_toast(
+            self.toasts.push(
                 "no supported harnesses on PATH - install claude or codex to use Ctrl+G".into(),
             );
             return;
@@ -55,7 +54,7 @@ impl super::App {
         // down the UI; the in-memory value still reflects the pick
         // for this TUI session.
         if let Err(e) = self.config_provider.save(&self.config) {
-            self.push_toast(format!("could not save config: {e}"));
+            self.toasts.push(format!("could not save config: {e}"));
         }
         self.toggle_global_drawer();
     }

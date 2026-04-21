@@ -9,11 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::*;
 use crate::agent_backend::AgentBackendKind;
 use crate::mcp::McpSocketServer;
 use crate::work_item::{WorkItemId, WorkItemStatus};
-
-use super::*;
 
 impl super::App {
     /// Spawn a fresh Claude session for a work item in its current stage.
@@ -263,7 +262,7 @@ impl super::App {
         // their code. Mirrors the `spawn_review_gate` /
         // `spawn_rebase_gate` handling.
         let Some(agent_backend) = self.backend_for_work_item(work_item_id) else {
-            self.push_toast(
+            self.toasts.push(
                 "Cannot open session: no harness chosen for this work item. Press c / x to pick one first."
                     .into(),
             );
@@ -369,7 +368,7 @@ impl super::App {
                 .filter(|e| e.server_type == "http")
                 .count();
             if http_skipped > 0 {
-                self.push_toast(format!(
+                self.toasts.push(format!(
                     "Codex: {http_skipped} HTTP MCP server(s) skipped (Codex requires stdio)"
                 ));
             }
@@ -578,7 +577,7 @@ impl super::App {
         // the next `poll_session_opens` tick (200ms). The spinner is
         // ended in `poll_session_opens` for every terminal arm
         // (success, read_error, disconnect) via `drop_session_open_entry`.
-        let activity = self.start_activity("Opening session...");
+        let activity = self.activities.start("Opening session...");
         self.session_open_rx.insert(
             work_item_id.clone(),
             SessionOpenPending {
@@ -601,7 +600,7 @@ impl super::App {
     /// `cancel_session_open_entry` for the abort paths.
     pub(super) fn drop_session_open_entry(&mut self, wi_id: &WorkItemId) {
         if let Some(entry) = self.session_open_rx.remove(wi_id) {
-            self.end_activity(entry.activity);
+            self.activities.end(entry.activity);
         }
     }
 }

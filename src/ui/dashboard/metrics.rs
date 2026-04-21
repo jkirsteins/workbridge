@@ -4,14 +4,13 @@ use ratatui_core::layout::Rect;
 use ratatui_core::style::{Color, Style};
 use ratatui_core::text::{Line, Span};
 use ratatui_core::widgets::Widget;
+use ratatui_widgets::barchart::{Bar, BarChart, BarGroup};
 use ratatui_widgets::block::Block;
 use ratatui_widgets::borders::Borders;
+use ratatui_widgets::sparkline::Sparkline;
 
 use crate::metrics::MetricsSnapshot;
 use crate::theme::Theme;
-
-use ratatui_widgets::barchart::{Bar, BarChart, BarGroup};
-use ratatui_widgets::sparkline::Sparkline;
 
 /// Color palette for the Dashboard charts. High-contrast pair for the
 /// Done-vs-PRs-merged chart (green overlay line on magenta bar) and

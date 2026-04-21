@@ -190,8 +190,11 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
     // on the Disconnected branch.
     let backfill_requests = state.collect_backfill_requests();
     if !backfill_requests.is_empty() {
-        state.pr_identity_backfill_activity =
-            Some(state.start_activity("Backfilling merged PR identities..."));
+        state.pr_identity_backfill_activity = Some(
+            state
+                .activities
+                .start("Backfilling merged PR identities..."),
+        );
         let gc = Arc::clone(&ctx.github_client);
         let (tx, rx) = crossbeam_channel::unbounded();
         std::thread::spawn(move || {
@@ -344,16 +347,16 @@ pub fn app_event(
                     || !state.agent_working.is_empty()
                     || modal_in_progress
                 {
-                    state.spinner_tick = state.spinner_tick.wrapping_add(1);
+                    state.activities.advance_spinner();
                 }
 
                 // Drop expired click-to-copy toasts. Cheap in-memory
                 // retain; runs every tick so the stack auto-clears
                 // ~2 seconds after the most recent copy.
-                state.prune_toasts();
+                state.toasts.prune();
 
                 // Expire the `kk` double-press window. The hint toast
-                // auto-dismisses via `prune_toasts`, but the armed
+                // auto-dismisses via `Toasts::prune`, but the armed
                 // flag itself lives in `App::last_k_press` and must
                 // time out independently so a stale arm from a
                 // minute-ago press does not combine with a fresh `k`
@@ -555,12 +558,12 @@ pub fn app_event(
                     // cycles on a different repo set. `reset_fetch_state`
                     // groups the three invariants that must always move
                     // together here - drop `fetch_rx`, zero
-                    // `pending_fetch_count`, and end any owner of the
+                    // `activities.pending_fetch_count`, and end any owner of the
                     // current spinner (either the `GithubRefresh` helper
-                    // entry or the `structural_fetch_activity` fallback).
+                    // entry or the `activities.structural_fetch` fallback).
                     // Without this reset, a counted-but-unpaired
                     // `FetchStarted` from the old channel would strand
-                    // `pending_fetch_count > 0` forever, which the
+                    // `activities.pending_fetch_count > 0` forever, which the
                     // Ctrl+R hard gate in `src/event.rs` would then read
                     // as "a fetch cycle is still running" and
                     // permanently lock out the user.

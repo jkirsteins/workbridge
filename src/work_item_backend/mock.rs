@@ -12,12 +12,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::work_item::{ReviewRequestedPr, UnlinkedPr, WorkItemId, WorkItemKind, WorkItemStatus};
-
 use super::{
     ActivityEntry, BackendError, CreateWorkItem, ListResult, PrIdentityRecord,
     RepoAssociationRecord, WorkItemBackend, WorkItemRecord,
 };
+use crate::work_item::{ReviewRequestedPr, UnlinkedPr, WorkItemId, WorkItemKind, WorkItemStatus};
 
 /// In-memory backend that stores work items in a `Mutex<Vec<_>>`.
 ///

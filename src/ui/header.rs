@@ -4,11 +4,10 @@ use ratatui_core::layout::{Constraint, Direction, Layout, Rect};
 use ratatui_core::text::Span;
 use ratatui_core::widgets::Widget;
 use ratatui_widgets::paragraph::Paragraph;
+use ratatui_widgets::tabs::Tabs;
 
 use crate::app::{App, ViewMode};
 use crate::theme::Theme;
-
-use ratatui_widgets::tabs::Tabs;
 
 /// Draw the view mode header: a segmented tab bar showing
 /// List / Board / Dashboard with contextual keybinding hints on the right.
