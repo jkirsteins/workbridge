@@ -447,13 +447,13 @@ fn create_work_item_with_rejects_repos_without_git_dir() {
 
     // Attempt to create with both repos selected.
     let result = app.create_work_item_with(
-        "Test item".into(),
+        "Test item",
         None,
         vec![
             PathBuf::from("/repos/with-git"),
             PathBuf::from("/repos/no-git"),
         ],
-        "feature/test".into(),
+        "feature/test",
     );
     assert!(result.is_ok(), "create should succeed for valid repos");
 

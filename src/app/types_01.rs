@@ -230,7 +230,7 @@ pub struct WorkItemContext {
 }
 
 /// Visual style variant for group headers.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupHeaderKind {
     Normal,
     Blocked,

@@ -340,7 +340,7 @@ impl super::App {
             list.push(DisplayEntry::GroupHeader {
                 label: format!("{label} ({repo})"),
                 count: items.len(),
-                kind: kind.clone(),
+                kind,
             });
             for &i in items {
                 list.push(DisplayEntry::WorkItemEntry(i));

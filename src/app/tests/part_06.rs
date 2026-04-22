@@ -177,10 +177,10 @@ fn create_work_item_with_errors_when_all_repos_lack_git_dir() {
     }];
 
     let result = app.create_work_item_with(
-        "Test item".into(),
+        "Test item",
         None,
         vec![PathBuf::from("/repos/no-git")],
-        "feature/test".into(),
+        "feature/test",
     );
     assert!(
         result.is_err(),

@@ -22,12 +22,12 @@ use crate::worktree_service::WorktreeService;
 /// 6. Sleeps for 120 seconds in 1-second increments, checking the stop flag
 pub(super) fn fetcher_loop(
     repo_path: PathBuf,
-    tx: mpsc::Sender<FetchMessage>,
-    stop: Arc<AtomicBool>,
-    worktree_service: Arc<dyn WorktreeService + Send + Sync>,
-    github_client: Arc<dyn GithubClient + Send + Sync>,
+    tx: &mpsc::Sender<FetchMessage>,
+    stop: &Arc<AtomicBool>,
+    worktree_service: &Arc<dyn WorktreeService + Send + Sync>,
+    github_client: &Arc<dyn GithubClient + Send + Sync>,
     issue_pattern: &str,
-    extra_branches: Vec<String>,
+    extra_branches: &[String],
 ) {
     let re = match Regex::new(issue_pattern) {
         Ok(r) => r,
@@ -65,7 +65,7 @@ pub(super) fn fetcher_loop(
                     break;
                 }
                 // Sleep and retry next iteration
-                if !interruptible_sleep(&stop, 120) {
+                if !interruptible_sleep(stop, 120) {
                     break;
                 }
                 continue;
@@ -142,7 +142,7 @@ pub(super) fn fetcher_loop(
 
             // Also extract issue numbers from extra branches (backend
             // records that have a branch but no worktree).
-            for branch in &extra_branches {
+            for branch in extra_branches {
                 for cap in re.captures_iter(branch) {
                     if let Some(m) = cap.get(1)
                         && let Ok(num) = m.as_str().parse::<u64>()
@@ -172,7 +172,7 @@ pub(super) fn fetcher_loop(
         }
 
         // Step 6: sleep 120s in 1s increments, checking stop flag
-        if !interruptible_sleep(&stop, 120) {
+        if !interruptible_sleep(stop, 120) {
             break;
         }
     }

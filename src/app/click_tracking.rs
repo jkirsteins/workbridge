@@ -55,9 +55,9 @@ impl ClickTracking {
     /// Takes `&mut Toasts` explicitly rather than reaching through
     /// `App`, making the cross-subsystem borrow structural rather
     /// than a hidden dependency.
-    pub fn fire_copy(&self, toasts: &mut Toasts, value: String, kind: ClickKind) {
-        let ok = crate::side_effects::clipboard::copy(&value);
-        let short = short_display(&value, kind);
+    pub fn fire_copy(toasts: &mut Toasts, value: &str, kind: ClickKind) {
+        let ok = crate::side_effects::clipboard::copy(value);
+        let short = short_display(value, kind);
         let text = if ok {
             format!("Copied: {short}")
         } else {
@@ -99,9 +99,9 @@ mod tests {
         // failed: ...". The test doesn't assert which branch because
         // the clipboard backend under `cfg(test)` is a no-op; it
         // only checks that a toast landed at all.
-        let ct = ClickTracking::new();
+        let _ct = ClickTracking::new();
         let mut toasts = Toasts::new();
-        ct.fire_copy(&mut toasts, "feat/foo".into(), ClickKind::Branch);
+        ClickTracking::fire_copy(&mut toasts, "feat/foo", ClickKind::Branch);
         assert_eq!(toasts.entries.len(), 1);
         let text = &toasts.entries[0].text;
         assert!(

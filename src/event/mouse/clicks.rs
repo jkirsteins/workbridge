@@ -1,4 +1,4 @@
-use crate::app::{App, RightPanelTab};
+use crate::app::{App, ClickTracking, RightPanelTab};
 use crate::click_targets::ClickTarget;
 use crate::event::layout::sync_layout;
 use crate::event::mouse::MouseAction;
@@ -142,11 +142,11 @@ pub fn handle_chrome_click_fallback(app: &mut App, mouse: MouseEvent, action: Mo
                     // can push a confirmation toast without holding
                     // a borrow on the rest of `App`.
                     let App {
-                        click_tracking,
+                        click_tracking: _,
                         toasts,
                         ..
                     } = app;
-                    click_tracking.fire_copy(&mut *toasts, pending_value, pending_kind);
+                    ClickTracking::fire_copy(&mut *toasts, &pending_value, pending_kind);
                     true
                 }
                 _ => false,

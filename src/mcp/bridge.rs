@@ -19,8 +19,8 @@ use serde_json::json;
 
 /// Run the MCP bridge mode: pipe stdin/stdout to/from the Unix socket.
 /// This is what Claude Code spawns as an MCP server process.
-pub fn run_bridge(socket_path: PathBuf) {
-    let stream = match UnixStream::connect(&socket_path) {
+pub fn run_bridge(socket_path: &Path) {
+    let stream = match UnixStream::connect(socket_path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!(

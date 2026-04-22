@@ -86,11 +86,11 @@ impl super::App {
         mcp_config_path: Option<&std::path::Path>,
         force_auto_start: bool,
     ) -> Vec<String> {
-        self.build_agent_cmd_with(
+        Self::build_agent_cmd_with(
             self.services.agent_backend.as_ref(),
             status,
             system_prompt,
-            McpInjection {
+            &McpInjection {
                 config_path: mcp_config_path,
                 primary_bridge: None,
                 extra_bridges: &[],
@@ -105,14 +105,13 @@ impl super::App {
     /// `finish_session_open` so the per-work-item harness choice
     /// (recorded in `App::harness_choice`) is honored.
     pub(super) fn build_agent_cmd_with(
-        &self,
         backend: &dyn AgentBackend,
         status: WorkItemStatus,
         system_prompt: Option<&str>,
-        mcp: McpInjection<'_>,
+        mcp: &McpInjection<'_>,
         force_auto_start: bool,
     ) -> Vec<String> {
-        let auto_start_message = self.auto_start_message_for_stage(status, force_auto_start);
+        let auto_start_message = Self::auto_start_message_for_stage(status, force_auto_start);
         let cfg = SpawnConfig {
             stage: status,
             system_prompt,
@@ -134,7 +133,6 @@ impl super::App {
     /// and `auto_start_review` keys so it can be edited without
     /// recompiling.
     pub(super) fn auto_start_message_for_stage(
-        &self,
         status: WorkItemStatus,
         force_auto_start: bool,
     ) -> Option<String> {
@@ -405,7 +403,7 @@ impl super::App {
         &mut self,
         work_item_id: &WorkItemId,
         cwd: &std::path::Path,
-        plan_text: String,
+        plan_text: &str,
     ) -> Option<String> {
         use std::collections::HashMap;
 
@@ -557,7 +555,7 @@ impl super::App {
         vars.insert("title", &title);
         vars.insert("description", &description_var);
         vars.insert("situation", &situation);
-        vars.insert("plan", &plan_text);
+        vars.insert("plan", plan_text);
         vars.insert("rework_reason", &rework_reason);
         vars.insert("review_gate_findings", &review_gate_findings);
 

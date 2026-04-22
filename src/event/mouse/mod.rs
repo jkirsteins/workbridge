@@ -148,6 +148,7 @@ pub fn mouse_target_with_size(
 /// and its helpers (`handle_chrome_click_fallback`) to share the
 /// classification logic without having to inspect
 /// `MouseEventKind` in multiple places.
+#[derive(Clone, Copy, Debug)]
 pub enum MouseAction {
     Scroll { up: bool },
     SelectDown,

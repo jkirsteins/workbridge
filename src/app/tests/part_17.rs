@@ -306,7 +306,7 @@ fn stage_system_prompt_never_reads_plan_on_ui_thread() {
     let cwd = PathBuf::from("/tmp/p0-stage-prompt-worktree");
     // The caller passes the plan text as a parameter - the
     // function itself must NEVER consult the backend.
-    let _ = app.stage_system_prompt(&wi_id, &cwd, "pre-read plan body".into());
+    let _ = app.stage_system_prompt(&wi_id, &cwd, "pre-read plan body");
     assert_eq!(
         backend.load(),
         0,

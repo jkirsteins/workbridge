@@ -169,10 +169,10 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
     if !active_repos.is_empty() {
         let (rx, handle) = fetcher::start_with_extra_branches(
             active_repos,
-            Arc::clone(&ctx.worktree_service),
-            Arc::clone(&ctx.github_client),
-            state.services.config.defaults.branch_issue_pattern.clone(),
-            extra_branches,
+            &ctx.worktree_service,
+            &ctx.github_client,
+            &state.services.config.defaults.branch_issue_pattern,
+            &extra_branches,
         );
         state.fetch_rx = Some(rx);
         state.fetcher_handle = Some(handle);
@@ -582,10 +582,10 @@ pub fn app_event(
                         let new_extra = state.extra_branches_from_backend();
                         let (rx, handle) = fetcher::start_with_extra_branches(
                             new_repos,
-                            Arc::clone(&ctx.worktree_service),
-                            Arc::clone(&ctx.github_client),
-                            state.services.config.defaults.branch_issue_pattern.clone(),
-                            new_extra,
+                            &ctx.worktree_service,
+                            &ctx.github_client,
+                            &state.services.config.defaults.branch_issue_pattern,
+                            &new_extra,
                         );
                         state.fetch_rx = Some(rx);
                         state.fetcher_handle = Some(handle);

@@ -18,6 +18,7 @@ use crate::agent_backend::{AgentBackend, McpBridgeSpec};
 use crate::mcp::{McpEvent, McpSocketServer};
 use crate::work_item::WorkItemId;
 
+#[derive(Clone, Copy)]
 pub(super) struct ComputeInputs<'a> {
     pub tx: &'a Sender<RebaseGateMessage>,
     pub wi_id_clone: &'a WorkItemId,

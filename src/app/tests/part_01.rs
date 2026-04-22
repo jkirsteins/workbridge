@@ -381,10 +381,10 @@ fn create_with_branch_sets_fetcher_repos_changed() {
     // Create with a branch - flag should be set.
     assert!(!app.fetcher_flags.repos_changed);
     let result = app.create_work_item_with(
-        "With branch".into(),
+        "With branch",
         None,
         vec![PathBuf::from("/repo")],
-        "feature/test".into(),
+        "feature/test",
     );
     assert!(result.is_ok());
     assert!(

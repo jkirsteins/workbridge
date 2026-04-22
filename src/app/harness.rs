@@ -62,7 +62,7 @@ impl super::App {
             if let Ok(result) = entry.rx.try_recv()
                 && let Some(server) = result.server
             {
-                self.drop_mcp_server_off_thread(server);
+                Self::drop_mcp_server_off_thread(server);
             }
             // Drain any side-car files the worker has already
             // committed to disk. The lock is held briefly inside
@@ -181,7 +181,7 @@ impl super::App {
             .map(|w| w.status)
         else {
             if let Some(server) = mcp_server {
-                self.drop_mcp_server_off_thread(server);
+                Self::drop_mcp_server_off_thread(server);
             }
             self.spawn_agent_file_cleanup(written_files);
             return;
@@ -189,7 +189,7 @@ impl super::App {
 
         let session_key = (work_item_id.clone(), work_item_status);
         let has_gate_findings = self.review_gate_findings.contains_key(work_item_id);
-        let system_prompt = self.stage_system_prompt(work_item_id, cwd, plan_text);
+        let system_prompt = self.stage_system_prompt(work_item_id, cwd, &plan_text);
 
         // Resolve the per-work-item harness choice. CLAUDE.md has an
         // [ABSOLUTE] rule: silent fallbacks to a default harness are
@@ -207,7 +207,7 @@ impl super::App {
             // Clean up the MCP server and side-car files the worker
             // prepared; the session will not be spawned.
             if let Some(server) = mcp_server {
-                self.drop_mcp_server_off_thread(server);
+                Self::drop_mcp_server_off_thread(server);
             }
             self.spawn_agent_file_cleanup(written_files);
             self.toasts.push(
@@ -216,11 +216,11 @@ impl super::App {
             );
             return;
         };
-        let cmd = self.build_agent_cmd_with(
+        let cmd = Self::build_agent_cmd_with(
             wi_backend.as_ref(),
             work_item_status,
             system_prompt.as_deref(),
-            McpInjection {
+            &McpInjection {
                 config_path: mcp_config_path.as_deref(),
                 primary_bridge: mcp_bridge.as_ref(),
                 extra_bridges: &extra_mcp_bridges,
@@ -350,7 +350,7 @@ impl super::App {
                     // unlinks the socket.
                     std::thread::spawn(move || drop(session));
                     if let Some(server) = result.mcp_server {
-                        self.drop_mcp_server_off_thread(server);
+                        Self::drop_mcp_server_off_thread(server);
                     }
                     self.spawn_agent_file_cleanup(result.written_files);
                 }
@@ -358,7 +358,7 @@ impl super::App {
                     // Session spawn failed. Drop the MCP server off
                     // the UI thread and clean up side-car files.
                     if let Some(server) = result.mcp_server {
-                        self.drop_mcp_server_off_thread(server);
+                        Self::drop_mcp_server_off_thread(server);
                     }
                     self.spawn_agent_file_cleanup(result.written_files);
                     self.shell.status_message = Some(e);
@@ -366,7 +366,7 @@ impl super::App {
                 (None, None) => {
                     // Should not happen, but handle gracefully.
                     if let Some(server) = result.mcp_server {
-                        self.drop_mcp_server_off_thread(server);
+                        Self::drop_mcp_server_off_thread(server);
                     }
                     self.spawn_agent_file_cleanup(result.written_files);
                     self.shell.status_message =

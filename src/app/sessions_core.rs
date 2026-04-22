@@ -195,7 +195,7 @@ impl super::App {
             // on the UI thread when the receiver is dropped.
             if let Ok(result) = pending.rx.try_recv() {
                 if let Some(server) = result.mcp_server {
-                    self.drop_mcp_server_off_thread(server);
+                    Self::drop_mcp_server_off_thread(server);
                 }
                 self.spawn_agent_file_cleanup(result.written_files);
                 // Session::Drop must also run off the UI thread -
@@ -250,7 +250,7 @@ impl super::App {
             // off the UI thread.
             if let Ok(result) = pending.rx.try_recv() {
                 if let Some(server) = result.mcp_server {
-                    self.drop_mcp_server_off_thread(server);
+                    Self::drop_mcp_server_off_thread(server);
                 }
                 if let Some(session) = result.session {
                     std::thread::spawn(move || drop(session));
@@ -268,7 +268,7 @@ impl super::App {
                 if let Ok(result) = entry.rx.try_recv()
                     && let Some(server) = result.server
                 {
-                    self.drop_mcp_server_off_thread(server);
+                    Self::drop_mcp_server_off_thread(server);
                 }
                 self.activities.end(entry.activity);
                 // Drain side-car files the worker already wrote.
@@ -293,7 +293,7 @@ impl super::App {
                 // disposed off the UI thread.
                 if let Ok(result) = pending.rx.try_recv() {
                     if let Some(server) = result.mcp_server {
-                        self.drop_mcp_server_off_thread(server);
+                        Self::drop_mcp_server_off_thread(server);
                     }
                     files_to_clean.extend(result.written_files);
                     if let Some(session) = result.session {

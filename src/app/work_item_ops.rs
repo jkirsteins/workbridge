@@ -148,7 +148,7 @@ impl super::App {
         wi_id: WorkItemId,
         repo_path: PathBuf,
         branch: String,
-        title: String,
+        title: &str,
     ) {
         if self.is_user_action_in_flight(&UserActionKey::WorktreeCreate) {
             self.shell.status_message = Some(format!(
@@ -181,7 +181,7 @@ impl super::App {
         let wt_dir = self.services.config.defaults.worktree_dir.clone();
         let ws = Arc::clone(&self.services.worktree_service);
         let wi_id_clone = wi_id.clone();
-        let title_clone = title.clone();
+        let title_clone = title.to_string();
 
         let (tx, rx) = crossbeam_channel::bounded(1);
 
@@ -276,10 +276,10 @@ impl super::App {
     /// name (required).
     pub fn create_work_item_with(
         &mut self,
-        title: String,
+        title: &str,
         description: Option<String>,
         repos: Vec<PathBuf>,
-        branch: String,
+        branch: &str,
     ) -> Result<(), String> {
         if repos.is_empty() {
             let msg = "No repos selected".to_string();
@@ -309,13 +309,13 @@ impl super::App {
             .into_iter()
             .map(|repo_path| RepoAssociationRecord {
                 repo_path,
-                branch: Some(branch.clone()),
+                branch: Some(branch.to_string()),
                 pr_identity: None,
             })
             .collect();
 
         let request = CreateWorkItem {
-            title: title.clone(),
+            title: title.to_string(),
             description,
             status: WorkItemStatus::Backlog,
             kind: WorkItemKind::Own,

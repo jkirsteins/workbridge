@@ -552,7 +552,7 @@ impl super::App {
             // on the UI thread when the receiver is dropped.
             if let Ok(result) = pending.rx.try_recv() {
                 if let Some(server) = result.mcp_server {
-                    self.drop_mcp_server_off_thread(server);
+                    Self::drop_mcp_server_off_thread(server);
                 }
                 if let Some(session) = result.session {
                     std::thread::spawn(move || drop(session));
@@ -575,7 +575,7 @@ impl super::App {
         // Drop MCP server off the UI thread: its Drop unlinks the
         // socket file.
         if let Some(server) = self.global_drawer.mcp_server.take() {
-            self.drop_mcp_server_off_thread(server);
+            Self::drop_mcp_server_off_thread(server);
         }
         if let Some(path) = self.global_drawer.mcp_config_path.take() {
             files_to_clean.push(path);

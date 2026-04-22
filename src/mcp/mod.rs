@@ -125,7 +125,7 @@ impl McpSocketServer {
                 activity_log_path,
                 read_only,
             };
-            accept_loop(listener, &cfg, &tx, &stop_clone);
+            accept_loop(&listener, &cfg, &tx, &stop_clone);
             // Clean up the socket file when the accept loop exits.
             let _ = std::fs::remove_file(&path_clone);
         });
@@ -152,7 +152,7 @@ impl McpSocketServer {
         let path_clone = socket_path.clone();
 
         std::thread::spawn(move || {
-            global_accept_loop(listener, &context, &tx, &stop_clone);
+            global_accept_loop(&listener, &context, &tx, &stop_clone);
             let _ = std::fs::remove_file(&path_clone);
         });
 
@@ -198,7 +198,7 @@ struct SessionMcpConfig {
 /// on loaded CI, replace the polling loop with a proper non-blocking
 /// accept driven by a signal/eventfd the stop path writes to.
 fn accept_loop(
-    listener: UnixListener,
+    listener: &UnixListener,
     cfg: &SessionMcpConfig,
     tx: &Sender<McpEvent>,
     stop: &AtomicBool,
@@ -241,7 +241,7 @@ fn accept_loop(
 /// Passes the shared context mutex to each connection handler so that
 /// tool calls always read the latest context (not a stale snapshot).
 fn global_accept_loop(
-    listener: UnixListener,
+    listener: &UnixListener,
     context: &Arc<Mutex<String>>,
     tx: &Sender<McpEvent>,
     stop: &AtomicBool,

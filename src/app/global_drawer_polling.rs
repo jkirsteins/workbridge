@@ -348,7 +348,7 @@ impl super::App {
                 // destructors (socket unlink, child kill/join)
                 // do not block the event loop.
                 if let Some(server) = result.mcp_server {
-                    self.drop_mcp_server_off_thread(server);
+                    Self::drop_mcp_server_off_thread(server);
                 }
                 if let Some(session) = result.session {
                     std::thread::spawn(move || drop(session));

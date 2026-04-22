@@ -470,7 +470,7 @@ impl super::App {
     /// `Drop` impl (which calls `std::fs::remove_file` on the
     /// socket path) never blocks the UI thread. See `docs/UI.md`
     /// "Blocking I/O Prohibition".
-    pub(super) fn drop_mcp_server_off_thread(&self, server: McpSocketServer) {
+    pub(super) fn drop_mcp_server_off_thread(server: McpSocketServer) {
         std::thread::spawn(move || {
             drop(server);
         });

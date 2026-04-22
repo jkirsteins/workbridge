@@ -390,7 +390,7 @@ pub fn handle_create_dialog(app: &mut App, key: KeyEvent) {
                 Ok((title, description, repos, branch)) => {
                     let had_status = app.has_visible_status_bar();
                     let had_context = app.selected_work_item_context().is_some();
-                    match app.create_work_item_with(title, description, repos, branch) {
+                    match app.create_work_item_with(&title, description, repos, &branch) {
                         Ok(()) => {
                             app.create_dialog.close();
                             if app.has_visible_status_bar() != had_status

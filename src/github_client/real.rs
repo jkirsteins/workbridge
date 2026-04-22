@@ -42,7 +42,7 @@ impl GhCliClient {
     /// Returns `GithubError::CliNotFound` if the gh binary is not found,
     /// `GithubError::AuthRequired` if the error output mentions authentication,
     /// and `GithubError::ApiError` for other non-zero exits.
-    fn run_gh(&self, args: &[&str]) -> Result<String, GithubError> {
+    fn run_gh(args: &[&str]) -> Result<String, GithubError> {
         let output = Command::new("gh").args(args).output().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 GithubError::CliNotFound
@@ -68,7 +68,7 @@ impl GithubClient for GhCliClient {
     fn list_open_prs(&self, owner: &str, repo: &str) -> Result<Vec<GithubPr>, GithubError> {
         let repo_arg = format!("{owner}/{repo}");
         let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner,author,mergeable";
-        let stdout = self.run_gh(&[
+        let stdout = Self::run_gh(&[
             "pr",
             "list",
             "--repo",
@@ -102,7 +102,7 @@ impl GithubClient for GhCliClient {
         // is also requested so the review-request row can show the
         // same conflict indicator as the user's own PRs.
         let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner,author,mergeable,reviewRequests";
-        let stdout = self.run_gh(&[
+        let stdout = Self::run_gh(&[
             "pr",
             "list",
             "--repo",
@@ -127,7 +127,7 @@ impl GithubClient for GhCliClient {
         if let Some(cached) = self.current_user_login_cache.get() {
             return Ok(cached.clone());
         }
-        let stdout = self.run_gh(&["api", "user", "--jq", ".login"])?;
+        let stdout = Self::run_gh(&["api", "user", "--jq", ".login"])?;
         let login = stdout.trim().to_string();
         if login.is_empty() {
             return Err(GithubError::ParseError(
@@ -145,7 +145,7 @@ impl GithubClient for GhCliClient {
     fn get_issue(&self, owner: &str, repo: &str, number: u64) -> Result<GithubIssue, GithubError> {
         let repo_arg = format!("{owner}/{repo}");
         let number_str = number.to_string();
-        let stdout = self.run_gh(&[
+        let stdout = Self::run_gh(&[
             "issue",
             "view",
             &number_str,
@@ -164,7 +164,7 @@ impl GithubClient for GhCliClient {
     fn list_merged_prs(&self, owner: &str, repo: &str) -> Result<Vec<GithubPr>, GithubError> {
         let repo_arg = format!("{owner}/{repo}");
         let json_fields = "number,title,headRefName,state,isDraft,reviewDecision,statusCheckRollup,url,headRepositoryOwner";
-        let stdout = self.run_gh(&[
+        let stdout = Self::run_gh(&[
             "pr",
             "list",
             "--repo",
@@ -196,7 +196,7 @@ impl GithubClient for GhCliClient {
         // signals in a single gh call. `state` is fetched so the
         // "no open PR" fallback can distinguish "branch exists but
         // its PR was closed/merged" from the actual error path.
-        let result = self.run_gh(&[
+        let result = Self::run_gh(&[
             "pr",
             "view",
             branch,

@@ -22,16 +22,16 @@ mod loop_impl;
 #[cfg(test)]
 pub fn start(
     repos: Vec<PathBuf>,
-    worktree_service: Arc<dyn WorktreeService + Send + Sync>,
-    github_client: Arc<dyn GithubClient + Send + Sync>,
-    issue_pattern: String,
+    worktree_service: &Arc<dyn WorktreeService + Send + Sync>,
+    github_client: &Arc<dyn GithubClient + Send + Sync>,
+    issue_pattern: &str,
 ) -> (mpsc::Receiver<FetchMessage>, FetcherHandle) {
     start_with_extra_branches(
         repos,
         worktree_service,
         github_client,
         issue_pattern,
-        HashMap::new(),
+        &HashMap::new(),
     )
 }
 
@@ -39,10 +39,10 @@ pub fn start(
 /// branches are included in issue extraction alongside worktree branches.
 pub fn start_with_extra_branches(
     repos: Vec<PathBuf>,
-    worktree_service: Arc<dyn WorktreeService + Send + Sync>,
-    github_client: Arc<dyn GithubClient + Send + Sync>,
-    issue_pattern: String,
-    extra_branches: HashMap<PathBuf, Vec<String>>,
+    worktree_service: &Arc<dyn WorktreeService + Send + Sync>,
+    github_client: &Arc<dyn GithubClient + Send + Sync>,
+    issue_pattern: &str,
+    extra_branches: &HashMap<PathBuf, Vec<String>>,
 ) -> (mpsc::Receiver<FetchMessage>, FetcherHandle) {
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
@@ -50,16 +50,16 @@ pub fn start_with_extra_branches(
     for repo_path in repos {
         let tx = tx.clone();
         let stop = Arc::clone(&stop);
-        let ws = Arc::clone(&worktree_service);
-        let gc = Arc::clone(&github_client);
-        let pattern = issue_pattern.clone();
+        let ws = Arc::clone(worktree_service);
+        let gc = Arc::clone(github_client);
+        let pattern = issue_pattern.to_string();
         let extras = extra_branches.get(&repo_path).cloned().unwrap_or_default();
 
         // Threads are fully independent - we don't store JoinHandles.
         // They exit on their own when the stop flag is set or when the
         // channel receiver is dropped (send returns Err).
         std::thread::spawn(move || {
-            loop_impl::fetcher_loop(repo_path, tx, stop, ws, gc, &pattern, extras);
+            loop_impl::fetcher_loop(repo_path, &tx, &stop, &ws, &gc, &pattern, &extras);
         });
     }
 
@@ -179,18 +179,13 @@ mod tests {
 
     #[test]
     fn fetcher_sends_fetch_started_before_data() {
-        let ws = Arc::new(MockWorktreeService {
+        let ws: Arc<dyn WorktreeService + Send + Sync> = Arc::new(MockWorktreeService {
             worktrees: vec![],
             github_remote: Some(("owner".to_string(), "repo".to_string())),
         });
-        let gc = Arc::new(MockGithubClient::new());
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient::new());
 
-        let (rx, handle) = start(
-            vec![PathBuf::from("/tmp/test-repo")],
-            ws,
-            gc,
-            r"^(\d+)-".to_string(),
-        );
+        let (rx, handle) = start(vec![PathBuf::from("/tmp/test-repo")], &ws, &gc, r"^(\d+)-");
 
         // First message must be FetchStarted.
         let first = crate::side_effects::clock::bounded_recv(&rx, "fetcher first-message waiter");
@@ -211,7 +206,7 @@ mod tests {
 
     #[test]
     fn fetcher_sends_results() {
-        let ws = Arc::new(MockWorktreeService {
+        let ws: Arc<dyn WorktreeService + Send + Sync> = Arc::new(MockWorktreeService {
             worktrees: vec![WorktreeInfo {
                 path: PathBuf::from("/tmp/wt-feature"),
                 branch: Some("42-fix-bug".to_string()),
@@ -221,7 +216,7 @@ mod tests {
             github_remote: Some(("owner".to_string(), "repo".to_string())),
         });
 
-        let gc = Arc::new(MockGithubClient {
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient {
             prs: vec![GithubPr {
                 number: 10,
                 title: "A PR".into(),
@@ -249,12 +244,7 @@ mod tests {
             live_pr_state: None,
         });
 
-        let (rx, handle) = start(
-            vec![PathBuf::from("/tmp/test-repo")],
-            ws,
-            gc,
-            r"^(\d+)-".to_string(),
-        );
+        let (rx, handle) = start(vec![PathBuf::from("/tmp/test-repo")], &ws, &gc, r"^(\d+)-");
 
         let msg = recv_data(&rx);
 
@@ -292,15 +282,10 @@ mod tests {
 
     #[test]
     fn fetcher_stops_cleanly() {
-        let ws = Arc::new(MockWorktreeService::new());
-        let gc = Arc::new(MockGithubClient::new());
+        let ws: Arc<dyn WorktreeService + Send + Sync> = Arc::new(MockWorktreeService::new());
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient::new());
 
-        let (_rx, handle) = start(
-            vec![PathBuf::from("/tmp/test-repo")],
-            ws,
-            gc,
-            r"^(\d+)-".to_string(),
-        );
+        let (_rx, handle) = start(vec![PathBuf::from("/tmp/test-repo")], &ws, &gc, r"^(\d+)-");
 
         // Immediately stop - threads should join without hanging.
         handle.stop();
@@ -308,7 +293,7 @@ mod tests {
 
     #[test]
     fn fetcher_handles_no_github_remote() {
-        let ws = Arc::new(MockWorktreeService {
+        let ws: Arc<dyn WorktreeService + Send + Sync> = Arc::new(MockWorktreeService {
             worktrees: vec![WorktreeInfo {
                 path: PathBuf::from("/tmp/wt-local"),
                 branch: Some("local-branch".to_string()),
@@ -318,13 +303,13 @@ mod tests {
             github_remote: None,
         });
 
-        let gc = Arc::new(MockGithubClient::new());
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient::new());
 
         let (rx, handle) = start(
             vec![PathBuf::from("/tmp/no-github-repo")],
-            ws,
-            gc,
-            r"^(\d+)-".to_string(),
+            &ws,
+            &gc,
+            r"^(\d+)-",
         );
 
         let msg = recv_data(&rx);
@@ -357,12 +342,12 @@ mod tests {
     fn fetcher_extracts_issues_from_extra_branches() {
         // F-4 regression: backend-recorded branches without worktrees should
         // still get their issue numbers extracted and fetched.
-        let ws = Arc::new(MockWorktreeService {
+        let ws: Arc<dyn WorktreeService + Send + Sync> = Arc::new(MockWorktreeService {
             worktrees: vec![], // no worktrees at all
             github_remote: Some(("owner".to_string(), "repo".to_string())),
         });
 
-        let gc = Arc::new(MockGithubClient {
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient {
             prs: vec![],
             review_requested_prs: vec![],
 
@@ -380,13 +365,8 @@ mod tests {
         let mut extra = std::collections::HashMap::new();
         extra.insert(repo_path.clone(), vec!["55-fix-thing".to_string()]);
 
-        let (rx, handle) = start_with_extra_branches(
-            vec![repo_path.clone()],
-            ws,
-            gc,
-            r"^(\d+)-".to_string(),
-            extra,
-        );
+        let (rx, handle) =
+            start_with_extra_branches(vec![repo_path.clone()], &ws, &gc, r"^(\d+)-", &extra);
 
         let msg = recv_data(&rx);
 
@@ -423,18 +403,13 @@ mod tests {
     /// can classify review-request rows as direct-to-you vs. team.
     #[test]
     fn fetcher_populates_current_user_login() {
-        let ws = Arc::new(MockWorktreeService {
+        let ws: Arc<dyn WorktreeService + Send + Sync> = Arc::new(MockWorktreeService {
             worktrees: vec![],
             github_remote: Some(("owner".to_string(), "repo".to_string())),
         });
-        let gc = Arc::new(MockGithubClient::new());
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient::new());
 
-        let (rx, handle) = start(
-            vec![PathBuf::from("/tmp/test-repo")],
-            ws,
-            gc,
-            r"^(\d+)-".to_string(),
-        );
+        let (rx, handle) = start(vec![PathBuf::from("/tmp/test-repo")], &ws, &gc, r"^(\d+)-");
 
         match recv_data(&rx) {
             FetchMessage::RepoData(result) => {
@@ -464,11 +439,11 @@ mod tests {
     /// and issues are independent of the login lookup.
     #[test]
     fn fetcher_emits_error_when_current_user_login_fails() {
-        let ws = Arc::new(MockWorktreeService {
+        let ws: Arc<dyn WorktreeService + Send + Sync> = Arc::new(MockWorktreeService {
             worktrees: vec![],
             github_remote: Some(("owner".to_string(), "repo".to_string())),
         });
-        let gc = Arc::new(MockGithubClient {
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient {
             prs: vec![],
             review_requested_prs: vec![],
             issues: vec![],
@@ -478,12 +453,7 @@ mod tests {
             live_pr_state: None,
         });
 
-        let (rx, handle) = start(
-            vec![PathBuf::from("/tmp/test-repo")],
-            ws,
-            gc,
-            r"^(\d+)-".to_string(),
-        );
+        let (rx, handle) = start(vec![PathBuf::from("/tmp/test-repo")], &ws, &gc, r"^(\d+)-");
 
         // Collect every message from the first tick until we have
         // seen both the login FetcherError and the RepoData, or the

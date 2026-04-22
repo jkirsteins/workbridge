@@ -571,7 +571,7 @@ impl super::App {
                 self.reassemble_work_items();
                 self.build_display_list();
                 self.fetcher_flags.repos_changed = true;
-                self.spawn_import_worktree(wi_id, repo_path, branch, title);
+                self.spawn_import_worktree(wi_id, repo_path, branch, &title);
             }
             Err(e) => {
                 self.shell.status_message = Some(format!("Import error: {e}"));
@@ -606,7 +606,7 @@ impl super::App {
                 self.reassemble_work_items();
                 self.build_display_list();
                 self.fetcher_flags.repos_changed = true;
-                self.spawn_import_worktree(wi_id, repo_path, branch, title);
+                self.spawn_import_worktree(wi_id, repo_path, branch, &title);
             }
             Err(e) => {
                 self.shell.status_message = Some(format!("Import error: {e}"));

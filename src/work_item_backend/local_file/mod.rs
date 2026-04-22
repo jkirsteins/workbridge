@@ -277,7 +277,7 @@ impl LocalFileBackend {
     /// field existed (which deserialize with a placeholder via
     /// `#[serde(default)]`) and records whose file was moved after
     /// write both end up with the correct on-disk path as the id.
-    fn read_record(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
+    fn read_record(id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
         match id {
             WorkItemId::LocalFile(path) => {
                 if !path.exists() {
@@ -301,11 +301,10 @@ impl LocalFileBackend {
     /// writes back atomically. Deduplicates the boilerplate shared by
     /// `update_status` and `update_plan`.
     fn modify_record(
-        &self,
         id: &WorkItemId,
         f: impl FnOnce(&mut WorkItemRecord),
     ) -> Result<(), BackendError> {
-        let mut record = self.read_record(id)?;
+        let mut record = Self::read_record(id)?;
         f(&mut record);
         match id {
             WorkItemId::LocalFile(path) => {
@@ -338,7 +337,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 impl WorkItemBackend for LocalFileBackend {
     fn read(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
-        self.read_record(id)
+        Self::read_record(id)
     }
 
     fn list(&self) -> Result<ListResult, BackendError> {
@@ -518,14 +517,14 @@ impl WorkItemBackend for LocalFileBackend {
     }
 
     fn update_status(&self, id: &WorkItemId, status: WorkItemStatus) -> Result<(), BackendError> {
-        self.modify_record(id, |record| {
+        Self::modify_record(id, |record| {
             record.status = status;
         })
     }
 
     fn update_title(&self, id: &WorkItemId, title: &str) -> Result<(), BackendError> {
         let title = title.to_string();
-        self.modify_record(id, |record| {
+        Self::modify_record(id, |record| {
             record.title = title;
         })
     }
@@ -538,7 +537,7 @@ impl WorkItemBackend for LocalFileBackend {
     ) -> Result<(), BackendError> {
         let branch = branch.to_string();
         let repo_path = repo_path.to_path_buf();
-        self.modify_record(id, |record| {
+        Self::modify_record(id, |record| {
             for assoc in &mut record.repo_associations {
                 if assoc.repo_path == repo_path {
                     assoc.branch = Some(branch.clone());
@@ -656,17 +655,17 @@ impl WorkItemBackend for LocalFileBackend {
 
     fn update_plan(&self, id: &WorkItemId, plan: &str) -> Result<(), BackendError> {
         let plan = plan.to_string();
-        self.modify_record(id, |record| {
+        Self::modify_record(id, |record| {
             record.plan = Some(plan);
         })
     }
 
     fn read_plan(&self, id: &WorkItemId) -> Result<Option<String>, BackendError> {
-        Ok(self.read_record(id)?.plan)
+        Ok(Self::read_record(id)?.plan)
     }
 
     fn set_done_at(&self, id: &WorkItemId, done_at: Option<u64>) -> Result<(), BackendError> {
-        self.modify_record(id, |record| {
+        Self::modify_record(id, |record| {
             record.done_at = done_at;
         })
     }
@@ -682,7 +681,7 @@ impl WorkItemBackend for LocalFileBackend {
         pr_identity: &PrIdentityRecord,
     ) -> Result<(), BackendError> {
         let pr_identity = pr_identity.clone();
-        self.modify_record(id, |record| {
+        Self::modify_record(id, |record| {
             for assoc in &mut record.repo_associations {
                 if assoc.repo_path == repo_path {
                     assoc.pr_identity = Some(pr_identity.clone());

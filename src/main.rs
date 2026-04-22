@@ -56,7 +56,7 @@ fn main() -> Result<(), AppError> {
             eprintln!("Usage: workbridge --mcp-bridge --socket <path>");
             std::process::exit(1);
         });
-        mcp::run_bridge(bridge_args.socket_path);
+        mcp::run_bridge(&bridge_args.socket_path);
         return Ok(());
     }
 
