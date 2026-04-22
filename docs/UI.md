@@ -548,8 +548,9 @@ and board views but not inside open dialogs or overlays.
   mutating config. Subsequent Ctrl+G presses use the persisted value
   directly. The same field is settable non-interactively via
   `workbridge config set global-assistant-harness <name>`. See
-  `docs/harness-contract.md` Change Log 2026-04-16 for the rationale
-  and the Codex reference payloads.
+  `docs/harness-contract.md` "Reference Payloads (Codex)" for the argv
+  details and CLAUDE.md's `[ABSOLUTE]` silent-fallback rule for the
+  rationale.
 
 ## Focus Model
 

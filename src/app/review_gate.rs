@@ -79,9 +79,9 @@ impl super::App {
         // claude" - review gates only run after an interactive session
         // has existed (the c/x entry point records the choice), so a
         // missing `harness_choice` entry is a user-facing error, not a
-        // silent default. See `docs/harness-contract.md` Change Log
-        // 2026-04-16 and the
-        // `harness_choice_applied_to_review_gate_spawn` test.
+        // silent default. See CLAUDE.md's `[ABSOLUTE]` silent-fallback
+        // rule and the `harness_choice_applied_to_review_gate_spawn`
+        // test.
         let Some(agent_backend) = self.backend_for_work_item(wi_id) else {
             return ReviewGateSpawn::Blocked(
                     "Cannot run review gate: no harness chosen for this work item. Press c / x to pick one and re-open the session first.".into(),

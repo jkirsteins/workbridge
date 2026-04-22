@@ -9,9 +9,10 @@ use super::{
     SpawnConfig,
 };
 
-/// Real adapter for the `OpenAI` Codex CLI (`codex`). Satisfies C1..C13 per
+/// Real adapter for the `OpenAI` Codex CLI (`codex`). Satisfies C1..C14 per
 /// `docs/harness-contract.md`; see the "Codex" column of the
-/// Implementation Map for the per-clause workaround details.
+/// Adapter Compatibility Matrix and the Codex adapter notes below the
+/// matrix for per-clause workaround details.
 ///
 /// Argv shape summary:
 ///
@@ -208,7 +209,8 @@ impl AgentBackend for CodexBackend {
         // reminder is embedded in the system prompt (the caller renders
         // the planning prompt with the reminder baked in). This is
         // strictly weaker than Claude's hook because it cannot re-fire
-        // on each TodoWrite; documented in the Implementation Map.
+        // on each TodoWrite; documented in the C8 note of the
+        // Adapter Compatibility Matrix.
         // C7: Auto-start message goes as the trailing positional
         // argument. Unlike Claude, Codex does not conflate positionals
         // with config files, so ordering vs `--config` flags does not

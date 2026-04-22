@@ -493,7 +493,7 @@ impl super::App {
     /// than silently defaulting to `self.services.agent_backend` - that was the
     /// "abort rather than default to claude" rule pinned by the plan
     /// (Milestone 3, review/rebase-gate bullet). See also
-    /// `docs/harness-contract.md` Change Log 2026-04-16.
+    /// CLAUDE.md's `[ABSOLUTE]` silent-fallback rule.
     pub fn backend_for_work_item(
         &self,
         work_item_id: &WorkItemId,

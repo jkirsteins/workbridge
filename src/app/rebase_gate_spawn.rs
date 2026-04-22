@@ -40,7 +40,7 @@ impl super::App {
         // default to claude" - the rebase gate only runs after an
         // interactive session has existed, so a missing harness choice
         // is a user-facing error rather than a silent default. See
-        // `docs/harness-contract.md` Change Log 2026-04-16 and the
+        // CLAUDE.md's `[ABSOLUTE]` silent-fallback rule and the
         // `harness_choice_applied_to_rebase_gate_spawn` test. We bail
         // BEFORE `try_begin_user_action` so the 500 ms debounce does
         // not eat a repeat press - this way the user can press `c` to

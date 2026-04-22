@@ -345,10 +345,11 @@ pub struct ReviewGateVerdict {
 /// (interactive, headless read-only review gate, headless read-write
 /// rebase gate) that back the four known spawn sites defined in
 /// `docs/harness-contract.md` under "Known Spawn Sites". Implementors
-/// MUST satisfy every clause C1..C13 from that doc; if a clause cannot
+/// MUST satisfy every clause C1..C14 from that doc; if a clause cannot
 /// be satisfied, the implementor must say so explicitly in the doc's
-/// Implementation Map and the review is required to flag the gap (see
-/// `CLAUDE.md` severity overrides).
+/// Adapter Compatibility Matrix (marking the cell `workaround` or
+/// `not implemented` with a note) and the review is required to flag
+/// the gap (see `CLAUDE.md` severity overrides).
 ///
 /// # Writing a new backend
 ///
@@ -366,9 +367,11 @@ pub struct ReviewGateVerdict {
 ///    into the worktree (pollutes git state), do NOT set environment
 ///    variables (C13), and do NOT mutate the user's dotfiles (see the
 ///    file-injection prohibition in the review policy).
-/// 3. Update `docs/harness-contract.md` "Implementation Map" with a new
-///    per-clause entry for the backend, and the "Known Spawn Sites" line
-///    numbers if any moved.
+/// 3. Update `docs/harness-contract.md` Adapter Compatibility Matrix
+///    with a new column for the backend (cells: `supported` /
+///    `workaround` / `not implemented`), add per-cell notes below the
+///    table for anything non-obvious, and refresh the "Known Spawn
+///    Sites" table if any spawn paths changed.
 /// 4. Promote the `#[cfg(test)]` variant to a real variant and wire
 ///    `App::agent_backend` to select it based on config.
 pub trait AgentBackend: Send + Sync {

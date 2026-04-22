@@ -28,8 +28,9 @@ impl ClaudeCodeBackend {
     /// Claude sees on its next turn. See RP4 and C8 in the contract doc.
     ///
     /// This is the C8 delivery mechanism for Claude Code. Backends that
-    /// do not have a hook system (Codex, per its Implementation Map entry)
-    /// return an empty argv fragment from `planning_reminder_argv` and
+    /// do not have a hook system (Codex, per the C8 note in the
+    /// Adapter Compatibility Matrix) return an empty argv fragment from
+    /// `planning_reminder_argv` and
     /// rely on the system-prompt-embedded reminder alone; that path is
     /// strictly weaker because it cannot re-fire after the first turn.
     const PLANNING_REMINDER_JSON: &'static str = r#"{"hooks":{"PostToolUse":[{"matcher":"TodoWrite","hooks":[{"type":"command","command":"bash -c 'cat | grep -q workbridge_set_plan || echo \"REMINDER: Your plan MUST include a step to call workbridge_set_plan MCP tool to persist the plan. Add this as the FIRST step.\" >&2; true'"}]}]}}"#;
