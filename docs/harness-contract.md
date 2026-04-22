@@ -437,10 +437,12 @@ consulted by any spawn path.
 **Codex (implemented)**: **supported**. Interactive
 corresponds to plain `codex`; headless corresponds to `codex exec
 --json` (non-interactive mode with a newline-delimited event
-stream). The review gate would need a final-message extractor
-because Codex's JSON stream is a series of events rather than a
-single structured document, but that is parsing glue, not a clause
-violation.
+stream). The review gate's final-message extractor is implemented
+in `CodexBackend::parse_review_gate_stdout`, which iterates the
+event stream, selects the last `agent_message` event, and parses
+its `content` JSON into the standard `ReviewGateVerdict` schema;
+the parser returns a diagnostic unapproved verdict when the stream
+is empty or the content is not valid JSON. No clause violation.
 
 ### C2 - Working directory
 
@@ -695,9 +697,12 @@ returning a `ReviewGateVerdict`.
 **Codex (implemented)**: **supported**. Interactive
 mode produces a byte stream on the PTY exactly like any other CLI.
 For headless, `codex exec --json` emits a stream of events rather
-than one final document; an adapter would keep only the last
-`agent_message` event (or equivalent). The PTY path is unchanged.
-No clause violation.
+than one final document; `CodexBackend::parse_review_gate_stdout`
+keeps only the last `agent_message` event and parses its `content`
+field with the standard `ReviewGateVerdict` schema, falling back
+to a diagnostic unapproved verdict if the stream is empty or the
+content is not valid JSON. The PTY path is unchanged. No clause
+violation.
 
 ### C10 - Lifecycle and cancellation
 
