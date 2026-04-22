@@ -946,18 +946,33 @@ before returning the same `ReviewGateVerdict` struct.
 
 ## Trait Implementation
 
-The provider-agnostic interface described by C1-C13 is implemented in
-the `agent_backend` module (`src/agent_backend/`). `ClaudeCodeBackend` is the reference adapter;
-a test-only `CodexBackend` stub in the same file proves the trait
-shape fits a second harness without editing any spawn site. The
-trait and config structs live in this one file so the entire
-harness-specific knowledge surface is grep-able and self-contained.
+The provider-agnostic interface described by C1-C13 is implemented
+in the `agent_backend` module tree. The tree aggregates per-adapter
+submodules: `ClaudeCodeBackend` (reference adapter, Anthropic Claude
+Code CLI) and `CodexBackend` (real production adapter, OpenAI Codex
+CLI) each live in their own submodule and satisfy every clause
+C1..C13; `OpenCodeBackend` is a future-work stub reachable through
+the `backend_for_kind` factory but intentionally excluded from
+`AgentBackendKind::all()`, `FromStr`, and any keybinding, so no
+user-facing path selects it. The `AgentBackend` trait, the
+`AgentBackendKind` discriminant, the `SpawnConfig` /
+`ReviewGateSpawnConfig` / `ReviewGateVerdict` / `McpBridgeSpec`
+structs, and the `backend_for_kind` factory live in the module
+aggregator (the `agent_backend` module root); each adapter's
+`impl AgentBackend` lives beside it in its own submodule. Shape
+parity across harnesses is pinned by the `codex_shape_compiles`
+test in the Codex-tests submodule (at module path
+`crate::agent_backend::codex::tests`), which exercises
+`CodexBackend` through the same trait surface as `ClaudeCodeBackend`
+to force the trait to stay harness-neutral on every `cargo test`
+run.
 
-The trait surface (abridged, doc comments stripped; see the file for
-the full signatures and per-method clause mappings):
+The trait surface (abridged, doc comments stripped; see the
+module's trait and config structs for the full signatures and
+per-method clause mappings):
 
 ```rust
-pub enum AgentBackendKind { ClaudeCode, /* #[cfg(test)] Codex */ }
+pub enum AgentBackendKind { ClaudeCode, Codex, OpenCode }
 
 pub struct SpawnConfig<'a> {
     pub stage: WorkItemStatus,
