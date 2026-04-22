@@ -34,7 +34,9 @@ pub fn draw_view_mode_header(buf: &mut Buffer, app: &App, theme: &Theme, area: R
     };
 
     // Split header: tabs on left, hints on right.
-    let hints_width = hints.len() as u16 + 1; // +1 for trailing space
+    let hints_width = u16::try_from(hints.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(1); // +1 for trailing space
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(hints_width)])

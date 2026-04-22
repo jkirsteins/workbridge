@@ -23,7 +23,8 @@ pub fn draw_first_run_global_harness_modal(
     frame_area: Rect,
 ) {
     let body_line_count = 3 + modal.available_harnesses.len() + 2;
-    let inner_height = body_line_count.min(12) as u16;
+    // min(12) bounds the value safely within u16.
+    let inner_height = u16::try_from(body_line_count.min(12)).unwrap_or(12);
     let height = (inner_height + 2).min(frame_area.height);
     let width: u16 = 64.min(frame_area.width);
     let area = Rect {

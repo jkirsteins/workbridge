@@ -49,7 +49,7 @@ pub fn draw_prompt_dialog(buf: &mut Buffer, theme: &Theme, area: Rect, kind: Pro
             options,
         } => {
             // body(1) + blank(1) + options(N) + blank(1)
-            let h = 1u16 + 1 + options.len() as u16 + 1;
+            let h = 1u16 + 1 + u16::try_from(options.len()).unwrap_or(u16::MAX) + 1;
             (*title, *body, h)
         }
         PromptDialogKind::TextInput {
@@ -69,19 +69,21 @@ pub fn draw_prompt_dialog(buf: &mut Buffer, theme: &Theme, area: Rect, kind: Pro
 
     // Minimum width: longest line + 2 (padding) + 2 (border).
     // Clamp between 40 and 60, further clamped to terminal width.
-    let min_content_width = body.len().max(title.len() + 4) as u16;
+    let min_content_width = u16::try_from(body.len().max(title.len() + 4)).unwrap_or(u16::MAX);
     let dialog_width = (min_content_width + 4).clamp(40, 60).min(area.width);
 
     // For Alert dialogs, compute body line count based on actual word-wrapping.
     let inner_height = if matches!(kind, PromptDialogKind::Alert { .. }) {
         // Usable content width: dialog - 2 (border) - 2 (padding).
-        let content_width = dialog_width.saturating_sub(4).max(1) as usize;
+        let content_width = usize::from(dialog_width.saturating_sub(4).max(1));
         let body_lines = if body.is_empty() {
             1u16
         } else {
             // Use word-wrap simulation to get accurate line count.
             // wrap_text_flat breaks at word boundaries like ratatui's Wrap.
-            (wrap_text_flat(body, content_width).len() as u16).max(1)
+            u16::try_from(wrap_text_flat(body, content_width).len())
+                .unwrap_or(u16::MAX)
+                .max(1)
         };
         // body(N) + blank(1) + hint(1) + blank(1)
         body_lines + 1 + 1 + 1
@@ -189,12 +191,14 @@ pub fn draw_prompt_dialog(buf: &mut Buffer, theme: &Theme, area: Rect, kind: Pro
         }
         PromptDialogKind::Alert { body, .. } => {
             // Compute wrapped body line count for layout.
-            let content_w = inner.width.max(1) as usize;
+            let content_w = usize::from(inner.width.max(1));
             let body_lines = if body.is_empty() {
                 1u16
             } else {
                 // Use word-wrap simulation for accurate line count.
-                (wrap_text_flat(body, content_w).len() as u16).max(1)
+                u16::try_from(wrap_text_flat(body, content_w).len())
+                    .unwrap_or(u16::MAX)
+                    .max(1)
             };
             // Rows: body (may wrap to multiple lines), blank, hint.
             let rows = Layout::default()

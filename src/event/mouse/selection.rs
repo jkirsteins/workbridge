@@ -42,10 +42,12 @@ pub fn encode_mouse_scroll(
             // Coordinates > 222 cannot be encoded (would exceed printable byte range).
             let cx = local_col + 1 + 32;
             let cy = local_row + 1 + 32;
-            if cx > 255 || cy > 255 {
-                return None;
-            }
-            Some(vec![0x1b, b'[', b'M', button + 32, cx as u8, cy as u8])
+            // Guard so the u8 narrowing below cannot truncate.
+            let (cx_u8, cy_u8) = match (u8::try_from(cx), u8::try_from(cy)) {
+                (Ok(x), Ok(y)) => (x, y),
+                _ => return None,
+            };
+            Some(vec![0x1b, b'[', b'M', button + 32, cx_u8, cy_u8])
         }
     }
 }

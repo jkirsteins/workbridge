@@ -51,7 +51,8 @@ pub fn seed_dashboard(target_dir: &Path) -> Result<(), Box<dyn Error>> {
 
     let now = crate::side_effects::clock::system_now()
         .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs() as i64;
+        .as_secs()
+        .cast_signed();
     let day = 86_400_i64;
 
     let mut written_items = 0usize;

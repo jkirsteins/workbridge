@@ -54,7 +54,7 @@ pub fn draw_dashboard_done_vs_merged(
 ) {
     let done = slice_per_day(&snapshot.done_per_day, from_day, today);
     let merged = slice_per_day(&snapshot.prs_merged_per_day, from_day, today);
-    let days = (today - from_day + 1).max(1) as usize;
+    let days = usize::try_from((today - from_day + 1).max(1)).unwrap_or(1);
 
     // Aggregation choice per window. The bar/gap sizing is tuned so the
     // visible chart fills most of a ~90-char-wide inner area without
@@ -217,7 +217,7 @@ pub fn draw_bottom_axis_labels(buf: &mut Buffer, area: Rect, days: i64) {
         } else {
             format!(" -{days_ago}d ")
         };
-        let label_len = label_text.chars().count() as i64;
+        let label_len = i64::try_from(label_text.chars().count()).unwrap_or(i64::MAX);
 
         // Block-based widget mapping gives data point `i` the column
         // range `[i*w/n, (i+1)*w/n)`. The center column of that range
@@ -236,7 +236,12 @@ pub fn draw_bottom_axis_labels(buf: &mut Buffer, area: Rect, days: i64) {
             .max(i64::from(x_start))
             .min(i64::from(x_end) - label_len);
         for (i, ch) in label_text.chars().enumerate() {
-            let cx = (clamped + i as i64) as u16;
+            // `clamped` is in [x_start, x_end - label_len]; adding at most
+            // label_len keeps the result in x_start..x_end, well within u16.
+            let offset = i64::try_from(i).unwrap_or(i64::MAX);
+            let Ok(cx) = u16::try_from(clamped + offset) else {
+                break;
+            };
             if cx >= x_end {
                 break;
             }

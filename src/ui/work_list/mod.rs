@@ -334,7 +334,7 @@ pub fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rec
             if y >= end_y {
                 break;
             }
-            let row_height = (*h as u16).min(end_y - y);
+            let row_height = u16::try_from(*h).unwrap_or(u16::MAX).min(end_y - y);
             if row_height == 0 {
                 break;
             }
@@ -471,7 +471,7 @@ pub fn draw_work_item_list(buf: &mut Buffer, app: &App, theme: &Theme, area: Rec
                 (row_of_selection.saturating_mul(body_area.height as usize - 1)) / denom;
             let marker_row = marker_row.min(body_area.height as usize - 1);
             let marker_x = area.x + area.width - 1;
-            let marker_y = body_area.y + marker_row as u16;
+            let marker_y = body_area.y + u16::try_from(marker_row).unwrap_or(u16::MAX);
             if marker_x < buf.area.x + buf.area.width && marker_y < buf.area.y + buf.area.height {
                 let cell = &mut buf[(marker_x, marker_y)];
                 cell.set_symbol("\u{2588}");

@@ -15,6 +15,14 @@ use crate::work_item::{
     BackendType, CheckStatus, PrState, ReviewDecision, WorkItemError, WorkItemStatus,
 };
 
+/// Saturating narrow `usize` -> `u16` for layout geometry. Values that
+/// overflow `u16::MAX` are clamped; real TUI widths never exceed
+/// `u16::MAX` in practice, so this is effectively a total conversion
+/// without reaching for an `as` cast.
+fn usize_to_u16_sat(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
 /// Format a `WorkItemError` into a user-facing message and optional suggestion.
 pub fn format_work_item_error(error: &WorkItemError) -> (String, Option<String>) {
     match error {
@@ -177,7 +185,7 @@ pub fn draw_work_item_detail(
         )));
     } else {
         let title_value = wi.title.clone();
-        let title_width = UnicodeWidthStr::width(title_value.as_str()) as u16;
+        let title_width = usize_to_u16_sat(UnicodeWidthStr::width(title_value.as_str()));
         registry.push_copy(
             Rect {
                 x: inner.x.saturating_add(LABEL_INDENT),
@@ -212,11 +220,11 @@ pub fn draw_work_item_detail(
 
     // Repo row (interactive).
     {
-        let line_index = lines.len() as u16;
+        let line_index = usize_to_u16_sat(lines.len());
         if repo_str == "(none)" {
             lines.push(plain_row("Repo", &repo_str));
         } else {
-            let value_width = UnicodeWidthStr::width(repo_str.as_str()) as u16;
+            let value_width = usize_to_u16_sat(UnicodeWidthStr::width(repo_str.as_str()));
             registry.push_copy(
                 Rect {
                     x: inner.x.saturating_add(LABEL_INDENT + LABEL_WIDTH),
@@ -236,11 +244,11 @@ pub fn draw_work_item_detail(
 
     // Branch row (interactive).
     {
-        let line_index = lines.len() as u16;
+        let line_index = usize_to_u16_sat(lines.len());
         if branch_str == "(none)" {
             lines.push(plain_row("Branch", branch_str));
         } else {
-            let value_width = UnicodeWidthStr::width(branch_str) as u16;
+            let value_width = usize_to_u16_sat(UnicodeWidthStr::width(branch_str));
             registry.push_copy(
                 Rect {
                     x: inner.x.saturating_add(LABEL_INDENT + LABEL_WIDTH),
@@ -267,9 +275,9 @@ pub fn draw_work_item_detail(
     if let Some(url) = pr_url {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("  PR URL", label_style)));
-        let line_index = lines.len() as u16;
+        let line_index = usize_to_u16_sat(lines.len());
         let url_value = url.clone();
-        let url_width = UnicodeWidthStr::width(url_value.as_str()) as u16;
+        let url_width = usize_to_u16_sat(UnicodeWidthStr::width(url_value.as_str()));
         registry.push_copy(
             Rect {
                 x: inner.x.saturating_add(LABEL_INDENT),

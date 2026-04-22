@@ -143,7 +143,9 @@ pub fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area:
     let repos_visible = if max_count == 0 {
         1
     } else {
-        (max_count as u16).min(REPOS_LIST_MAX_ROWS)
+        u16::try_from(max_count)
+            .unwrap_or(u16::MAX)
+            .min(REPOS_LIST_MAX_ROWS)
     };
     let repos_section_height = repos_visible + 2; // +2 for block borders
 
@@ -151,7 +153,7 @@ pub fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area:
     let base_dirs_lines: u16 = if app.services.config.base_dirs.is_empty() {
         1
     } else {
-        app.services.config.base_dirs.len() as u16
+        u16::try_from(app.services.config.base_dirs.len()).unwrap_or(u16::MAX)
     };
 
     let source_height = 2;

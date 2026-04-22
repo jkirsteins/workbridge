@@ -44,7 +44,7 @@ pub fn draw_dashboard_kpis(
         .get(&from_day)
         .copied()
         .unwrap_or(backlog_now);
-    let delta = backlog_now as i32 - backlog_then as i32;
+    let delta = i64::from(backlog_now) - i64::from(backlog_then);
     let delta_str = if delta >= 0 {
         format!("+{delta}")
     } else {

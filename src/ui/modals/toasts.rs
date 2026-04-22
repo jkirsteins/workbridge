@@ -32,9 +32,11 @@ pub fn draw_toasts(buf: &mut Buffer, toasts: &Toasts, theme: &Theme, frame_area:
 
     // Newest toast first (visually on top of the stack).
     for (index, toast) in toasts.iter().rev().enumerate() {
-        let index_u16 = index as u16;
+        let index_u16 = u16::try_from(index).unwrap_or(u16::MAX);
         // `value.len() + 4` = text + two borders + two pad cells.
-        let desired = (UnicodeWidthStr::width(toast.text.as_str()) as u16).saturating_add(4);
+        let desired = u16::try_from(UnicodeWidthStr::width(toast.text.as_str()))
+            .unwrap_or(u16::MAX)
+            .saturating_add(4);
         let width = desired.clamp(MIN_WIDTH, MAX_WIDTH);
 
         // Frame too narrow for even the minimum toast width: bail.

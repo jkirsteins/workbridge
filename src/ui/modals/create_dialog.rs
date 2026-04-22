@@ -60,7 +60,7 @@ pub fn draw_create_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &T
     // and causing rat-text's cursor-follow scroll to hide the first
     // row of typed characters (the bug this layout replaced).
 
-    let repo_list_len = dialog.repo_list.len() as u16;
+    let repo_list_len = u16::try_from(dialog.repo_list.len()).unwrap_or(u16::MAX);
     let repo_lines_preferred = repo_list_len.clamp(1, 6);
     let preferred_with_max_repos =
         FIXED_INNER_ROWS_WITHOUT_REPOS + repo_lines_preferred + DESC_TEXTAREA_HEIGHT + CHROME_ROWS;
@@ -295,7 +295,8 @@ pub fn draw_quickstart_dialog(buf: &mut Buffer, dialog: &CreateDialog, theme: &T
     // Compute dialog height: border(1) + padding(1) + Repos label(1)
     //   + repo_lines + blank(1) + error(1) + hint(1) + padding(1) + border(1).
     // Allow up to 8 visible repo rows (the dialog is otherwise small).
-    let repo_lines = dialog.repo_list.len().clamp(1, 8) as u16;
+    // clamp(1, 8) guarantees the result fits in u16.
+    let repo_lines = u16::try_from(dialog.repo_list.len().clamp(1, 8)).unwrap_or(8);
     let dialog_height = 1 + 1 + 1 + repo_lines + 1 + 1 + 1 + 1 + 1;
     let dialog_width = (area.width * 60 / 100).max(40).min(area.width);
 

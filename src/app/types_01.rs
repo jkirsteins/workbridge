@@ -488,7 +488,7 @@ impl Drop for RebaseGateState {
             // process-group id. `ESRCH` after a freshly-reaped group
             // is harmless.
             unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                libc::killpg(pid.cast_signed(), libc::SIGKILL);
             }
         }
     }
@@ -560,7 +560,7 @@ pub fn run_cancellable(
         // `process_group(0)` so its PID equals its process-group
         // id. `ESRCH` after a freshly-reaped group is harmless.
         unsafe {
-            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            libc::killpg(pid.cast_signed(), libc::SIGKILL);
         }
         let _ = child.wait();
         return Ok(SubprocessOutcome::Cancelled);

@@ -267,14 +267,17 @@ fn reconstruct_backlog_per_day(
     let mut result = BTreeMap::new();
     for day in from_day..=to_day {
         let eod = (day + 1) * SECS_PER_DAY - 1;
-        let count = all_intervals
-            .iter()
-            .filter(|intervals| {
-                intervals
-                    .iter()
-                    .any(|iv| iv.start <= eod && iv.end.is_none_or(|e| e > eod))
-            })
-            .count() as u32;
+        let count = u32::try_from(
+            all_intervals
+                .iter()
+                .filter(|intervals| {
+                    intervals
+                        .iter()
+                        .any(|iv| iv.start <= eod && iv.end.is_none_or(|e| e > eod))
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
         result.insert(day, count);
     }
     result
@@ -286,7 +289,7 @@ fn reconstruct_backlog_per_day(
 pub fn aggregate_from_activity_logs(data_dir: &Path) -> MetricsSnapshot {
     let now_secs = crate::side_effects::clock::system_now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
+        .map_or(0, |d| d.as_secs().cast_signed());
 
     let per_item = load_per_item(data_dir);
 
