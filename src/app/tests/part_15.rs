@@ -46,7 +46,10 @@ fn open_delete_prompt_does_not_touch_backend() {
     app.sync_selection_identity();
 
     app.open_delete_prompt();
-    assert!(app.delete_prompt_visible, "delete prompt should be visible");
+    assert!(
+        app.delete_flow.prompt_visible,
+        "delete prompt should be visible"
+    );
     assert_eq!(app.delete_target_title.as_deref(), Some("Prompt test item"),);
 
     // Opening the prompt must not touch the backend.

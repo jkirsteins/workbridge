@@ -295,7 +295,7 @@ fn app_constructor_sets_gh_available() {
     let app = App::new();
     // The field should be initialized (to whatever the system has).
     // Just verify the field exists and can be read.
-    let _ = app.gh_available;
+    let _ = app.gh_status.available;
 }
 
 // -- Issue 5: merge conflict detection --

@@ -31,19 +31,19 @@ fn manage_unmanage_sets_fetcher_repos_changed() {
     let mut app = App::with_config(cfg, Arc::new(StubBackend));
 
     // Initially false.
-    assert!(!app.fetcher_repos_changed);
+    assert!(!app.fetcher_flags.repos_changed);
 
     // Manage a repo from the available list.
     app.settings.list_focus = SettingsListFocus::Available;
     app.settings.available_selected = 0;
     app.manage_selected_repo();
     assert!(
-        app.fetcher_repos_changed,
+        app.fetcher_flags.repos_changed,
         "fetcher_repos_changed should be true after manage"
     );
 
     // Reset and test unmanage.
-    app.fetcher_repos_changed = false;
+    app.fetcher_flags.repos_changed = false;
     app.settings.list_focus = SettingsListFocus::Managed;
     // The managed repo that is discovered (not explicit) can be unmanaged.
     // Find the discovered repo in the managed list.
@@ -55,7 +55,7 @@ fn manage_unmanage_sets_fetcher_repos_changed() {
     app.settings.repo_selected = discovered_idx;
     app.unmanage_selected_repo();
     assert!(
-        app.fetcher_repos_changed,
+        app.fetcher_flags.repos_changed,
         "fetcher_repos_changed should be true after unmanage"
     );
 }
@@ -265,15 +265,15 @@ fn import_and_delete_set_fetcher_repos_changed() {
         .expect("should have an unlinked item in display list");
     app.selected_item = Some(unlinked_idx);
 
-    assert!(!app.fetcher_repos_changed);
+    assert!(!app.fetcher_flags.repos_changed);
     app.import_selected_unlinked();
     assert!(
-        app.fetcher_repos_changed,
+        app.fetcher_flags.repos_changed,
         "fetcher_repos_changed should be true after import",
     );
 
     // Reset and test delete.
-    app.fetcher_repos_changed = false;
+    app.fetcher_flags.repos_changed = false;
     // Select the now-imported work item.
     let work_item_idx = app
         .display_list
@@ -285,7 +285,7 @@ fn import_and_delete_set_fetcher_repos_changed() {
     app.open_delete_prompt();
     app.confirm_delete_from_prompt();
     assert!(
-        app.fetcher_repos_changed,
+        app.fetcher_flags.repos_changed,
         "fetcher_repos_changed should be true after delete",
     );
 }
@@ -379,7 +379,7 @@ fn create_with_branch_sets_fetcher_repos_changed() {
     }];
 
     // Create with a branch - flag should be set.
-    assert!(!app.fetcher_repos_changed);
+    assert!(!app.fetcher_flags.repos_changed);
     let result = app.create_work_item_with(
         "With branch".into(),
         None,
@@ -388,7 +388,7 @@ fn create_with_branch_sets_fetcher_repos_changed() {
     );
     assert!(result.is_ok());
     assert!(
-        app.fetcher_repos_changed,
+        app.fetcher_flags.repos_changed,
         "fetcher_repos_changed should be true after creating with a branch",
     );
 }

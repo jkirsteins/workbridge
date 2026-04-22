@@ -52,7 +52,7 @@ fn board_view_item_in_every_column_120x40() {
 #[test]
 fn merge_prompt_dialog() {
     let mut app = App::new();
-    app.confirm_merge = true;
+    app.merge_flow.confirm = true;
     app.merge_wi_id = Some(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
     insta::assert_snapshot!(render(&mut app, 80, 24));
 }
@@ -60,8 +60,8 @@ fn merge_prompt_dialog() {
 #[test]
 fn merge_progress_dialog() {
     let mut app = App::new();
-    app.confirm_merge = true;
-    app.merge_in_progress = true;
+    app.merge_flow.confirm = true;
+    app.merge_flow.in_progress = true;
     app.merge_wi_id = Some(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
     app.activities.spinner_tick = 3;
     insta::assert_snapshot!(render(&mut app, 80, 24));
@@ -70,7 +70,7 @@ fn merge_progress_dialog() {
 #[test]
 fn rework_prompt_dialog() {
     let mut app = App::new();
-    app.rework_prompt_visible = true;
+    app.prompt_flags.rework_visible = true;
     app.rework_prompt_wi = Some(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
     app.rework_prompt_input
         .set_text("needs more error handling");
@@ -80,7 +80,7 @@ fn rework_prompt_dialog() {
 #[test]
 fn no_plan_prompt_dialog() {
     let mut app = App::new();
-    app.no_plan_prompt_visible = true;
+    app.prompt_flags.no_plan_visible = true;
     app.no_plan_prompt_queue
         .push_back(WorkItemId::LocalFile(PathBuf::from("/tmp/test.json")));
     insta::assert_snapshot!(render(&mut app, 80, 24));
@@ -89,7 +89,7 @@ fn no_plan_prompt_dialog() {
 #[test]
 fn cleanup_confirm_dialog() {
     let mut app = App::new();
-    app.cleanup_prompt_visible = true;
+    app.cleanup_flow.prompt_visible = true;
     app.cleanup_unlinked_target =
         Some((PathBuf::from("/tmp/repo"), "feature-branch".to_string(), 42));
     insta::assert_snapshot!(render(&mut app, 80, 24));
@@ -98,8 +98,8 @@ fn cleanup_confirm_dialog() {
 #[test]
 fn cleanup_reason_dialog() {
     let mut app = App::new();
-    app.cleanup_prompt_visible = true;
-    app.cleanup_reason_input_active = true;
+    app.cleanup_flow.prompt_visible = true;
+    app.cleanup_flow.reason_input_active = true;
     app.cleanup_unlinked_target =
         Some((PathBuf::from("/tmp/repo"), "feature-branch".to_string(), 42));
     app.cleanup_reason_input.set_text("closing - abandoned");
@@ -109,7 +109,7 @@ fn cleanup_reason_dialog() {
 #[test]
 fn cleanup_progress_dialog() {
     let mut app = App::new();
-    app.cleanup_prompt_visible = true;
+    app.cleanup_flow.prompt_visible = true;
     // Simulate an in-flight unlinked cleanup by admitting the
     // helper entry directly and then ending the visible
     // status-bar activity. This mirrors spawn_unlinked_cleanup,

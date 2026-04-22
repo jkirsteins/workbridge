@@ -88,7 +88,7 @@ pub fn route_paste_to_modal_input(app: &mut App, data: &str) -> bool {
     }
 
     // 2. Rework reason prompt (single-line input).
-    if app.rework_prompt_visible {
+    if app.prompt_flags.rework_visible {
         app.rework_prompt_input
             .insert_str(flatten_paste_for_single_line(data));
         return true;
@@ -97,7 +97,7 @@ pub fn route_paste_to_modal_input(app: &mut App, data: &str) -> bool {
     // 3. Cleanup reason input (single-line input). Only active after the
     //    confirmation prompt has transitioned to "Enter reason" mode; the
     //    plain cleanup_prompt_visible state has no text input target.
-    if app.cleanup_reason_input_active {
+    if app.cleanup_flow.reason_input_active {
         app.cleanup_reason_input
             .insert_str(flatten_paste_for_single_line(data));
         return true;
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn paste_into_rework_prompt_inserts_text() {
         let mut app = App::new();
-        app.rework_prompt_visible = true;
+        app.prompt_flags.rework_visible = true;
         app.rework_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
             "/tmp/test.json",
         )));
@@ -294,8 +294,8 @@ mod tests {
     #[test]
     fn paste_into_cleanup_reason_input_inserts_text() {
         let mut app = App::new();
-        app.cleanup_prompt_visible = true;
-        app.cleanup_reason_input_active = true;
+        app.cleanup_flow.prompt_visible = true;
+        app.cleanup_flow.reason_input_active = true;
 
         let changed = handle_paste(&mut app, "abandoned\nsee ticket");
         assert!(
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn paste_into_cleanup_prompt_before_reason_input_is_noop() {
         let mut app = App::new();
-        app.cleanup_prompt_visible = true;
+        app.cleanup_flow.prompt_visible = true;
         // cleanup_reason_input_active stays false.
 
         let changed = handle_paste(&mut app, "stray paste");

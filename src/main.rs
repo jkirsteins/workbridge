@@ -108,7 +108,7 @@ fn main() -> Result<(), AppError> {
         app.shell.status_message = Some(msg);
     } else if let Some(msg) = backend_error {
         app.shell.status_message = Some(msg);
-    } else if !app.gh_available {
+    } else if !app.gh_status.available {
         app.shell.status_message =
             Some("Warning: 'gh' CLI not found. PR creation and merge features require it.".into());
     }

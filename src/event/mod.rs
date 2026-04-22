@@ -108,7 +108,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // When the rework reason prompt is visible, route keys to it.
-    if app.rework_prompt_visible {
+    if app.prompt_flags.rework_visible {
         handle_rework_prompt(app, key);
         return true;
     }
@@ -116,7 +116,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // When the cleanup reason text input is active, route keys to it.
     // This must be checked before cleanup_prompt_visible because both flags
     // are true during text input.
-    if app.cleanup_reason_input_active {
+    if app.cleanup_flow.reason_input_active {
         handle_cleanup_reason_input(app, key);
         return true;
     }
@@ -147,13 +147,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // When the unlinked cleanup confirmation prompt is visible, route keys.
-    if app.cleanup_prompt_visible {
+    if app.cleanup_flow.prompt_visible {
         handle_cleanup_prompt(app, key);
         return true;
     }
 
     // When the no-plan prompt is visible, route keys to it.
-    if app.no_plan_prompt_visible {
+    if app.prompt_flags.no_plan_visible {
         handle_no_plan_prompt(app, key);
         return true;
     }
@@ -195,7 +195,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         // While recovery is in progress, swallow all keys (modal spinner).
         // Q/Ctrl+Q still triggers force-quit so a hung recovery never traps
         // the user.
-        if app.stale_recovery_in_progress {
+        if app.prompt_flags.stale_recovery_in_progress {
             if matches!(
                 (key.modifiers, key.code),
                 (
@@ -239,7 +239,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // Q/Ctrl+Q still triggers force-quit so a hung delete never traps
     // the user. Must come before delete_prompt_visible because both
     // flags are true during in-progress.
-    if app.delete_in_progress {
+    if app.delete_flow.in_progress {
         if matches!(
             (key.modifiers, key.code),
             (
@@ -261,14 +261,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 
     // Delete confirmation modal: route keys to it while the prompt is
     // visible but the background thread has not yet started.
-    if app.delete_prompt_visible {
+    if app.delete_flow.prompt_visible {
         handle_delete_prompt(app, key);
         return true;
     }
 
     // When a merge is in progress (background thread running), swallow
     // most keys - the dialog shows a spinner and cannot be interacted with.
-    if app.merge_in_progress {
+    if app.merge_flow.in_progress {
         if matches!(
             (key.modifiers, key.code),
             (
@@ -289,7 +289,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // When the merge strategy prompt is visible, handle it.
-    if app.confirm_merge {
+    if app.merge_flow.confirm {
         handle_merge_prompt(app, key);
         return true;
     }
@@ -506,7 +506,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             )
             .is_some()
         {
-            app.fetcher_repos_changed = true;
+            app.fetcher_flags.repos_changed = true;
         } else if app.is_user_action_in_flight(&UserActionKey::GithubRefresh) {
             // Only distinguish the "already in flight" case; the
             // debounce rejection is intentionally silent so normal

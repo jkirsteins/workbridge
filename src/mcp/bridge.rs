@@ -57,6 +57,7 @@ pub fn run_bridge(socket_path: PathBuf) {
                 break;
             }
         }
+        drop(reader);
     });
 
     // Thread 2: socket -> stdout

@@ -137,7 +137,7 @@ impl Session {
                     // stdio setup (dup2 + close). Stdin is guaranteed to
                     // point to the slave PTY at this point. The argument 0
                     // means "don't steal from another session".
-                    if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                    if libc::ioctl(0, libc::c_ulong::from(libc::TIOCSCTTY), 0) < 0 {
                         return Err(io::Error::last_os_error());
                     }
                     Ok(())

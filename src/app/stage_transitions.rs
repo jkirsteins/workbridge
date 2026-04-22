@@ -113,7 +113,7 @@ impl super::App {
         let old_idx = self.selected_item;
         self.reassemble_work_items();
         self.build_display_list();
-        self.fetcher_repos_changed = true;
+        self.fetcher_flags.repos_changed = true;
 
         // Try to keep cursor near the old position instead of jumping to
         // the first item. If the old index is still valid, prefer it.
@@ -142,7 +142,7 @@ impl super::App {
         // Spawn the background cleanup thread. Keep the modal visible and
         // flip it into the in-progress state; poll_delete_cleanup closes
         // it on completion and surfaces the final status/alert.
-        self.delete_in_progress = true;
+        self.delete_flow.in_progress = true;
         if cleanup_infos.is_empty() {
             // No git/GitHub cleanup needed (e.g. work item never had a
             // worktree). Still go through finish_delete_cleanup so the
@@ -174,8 +174,8 @@ impl super::App {
         closed_pr_branches: Vec<(PathBuf, String)>,
         mut pre_warnings: Vec<String>,
     ) {
-        self.delete_in_progress = false;
-        self.delete_prompt_visible = false;
+        self.delete_flow.in_progress = false;
+        self.delete_flow.prompt_visible = false;
         self.delete_target_wi_id = None;
         self.delete_target_title = None;
 
@@ -300,7 +300,7 @@ impl super::App {
         // an alert if it blocks. `BehindOnly` and `Clean` continue to
         // proceed to the merge as before.
         if current_status == WorkItemStatus::Review && new_status == WorkItemStatus::Done {
-            self.confirm_merge = true;
+            self.merge_flow.confirm = true;
             self.merge_wi_id = Some(wi_id);
             return;
         }
@@ -361,8 +361,8 @@ impl super::App {
             && self.is_user_action_in_flight(&UserActionKey::PrMerge)
         {
             self.end_user_action(&UserActionKey::PrMerge);
-            self.merge_in_progress = false;
-            self.confirm_merge = false;
+            self.merge_flow.in_progress = false;
+            self.merge_flow.confirm = false;
             self.merge_wi_id = None;
         }
 
@@ -392,7 +392,7 @@ impl super::App {
         // Rework prompt: when retreating from Review to Implementing,
         // show a text input for the rework reason instead of retreating directly.
         if current_status == WorkItemStatus::Review && new_status == WorkItemStatus::Implementing {
-            self.rework_prompt_visible = true;
+            self.prompt_flags.rework_visible = true;
             self.rework_prompt_input.clear();
             self.rework_prompt_wi = Some(wi_id);
             return;

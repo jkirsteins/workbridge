@@ -67,7 +67,14 @@ pub fn percentile_days(sorted_secs: &[i64], pct: u32) -> i64 {
     if sorted_secs.is_empty() {
         return 0;
     }
-    let idx = ((pct as f64 / 100.0) * (sorted_secs.len() - 1) as f64).round() as usize;
-    let v = sorted_secs[idx.min(sorted_secs.len() - 1)];
+    // Integer arithmetic with round-half-up: idx = round(pct * (len-1) / 100).
+    // Using u128 intermediate to avoid overflow on very large slices.
+    let last = sorted_secs.len() - 1;
+    // usize -> u128 via try_from (From is not impl'd because usize width is target-dependent).
+    let last_u128 = u128::try_from(last).unwrap_or(u128::MAX);
+    let numerator = u128::from(pct) * last_u128;
+    let idx_u128 = (numerator + 50) / 100;
+    let idx = usize::try_from(idx_u128).unwrap_or(last).min(last);
+    let v = sorted_secs[idx];
     (v + 43_200) / 86_400 // round to nearest whole day
 }

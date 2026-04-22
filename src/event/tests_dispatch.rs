@@ -231,7 +231,7 @@ fn alert_dialog_swallows_other_keys() {
 #[test]
 fn cleanup_in_progress_swallows_keys() {
     let mut app = App::new();
-    app.cleanup_prompt_visible = true;
+    app.cleanup_flow.prompt_visible = true;
     app.try_begin_user_action(
         UserActionKey::UnlinkedCleanup,
         std::time::Duration::ZERO,
@@ -243,7 +243,7 @@ fn cleanup_in_progress_swallows_keys() {
     handle_key(&mut app, esc);
 
     assert!(
-        app.cleanup_prompt_visible,
+        app.cleanup_flow.prompt_visible,
         "dialog should stay open during progress"
     );
     assert!(
@@ -256,14 +256,14 @@ fn cleanup_in_progress_swallows_keys() {
 #[test]
 fn delete_prompt_esc_cancels() {
     let mut app = App::new();
-    app.delete_prompt_visible = true;
+    app.delete_flow.prompt_visible = true;
     app.delete_target_title = Some("Test item".into());
 
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(&mut app, esc);
 
     assert!(
-        !app.delete_prompt_visible,
+        !app.delete_flow.prompt_visible,
         "Esc should dismiss the delete prompt"
     );
     assert!(
@@ -278,7 +278,7 @@ fn delete_prompt_esc_cancels() {
 #[test]
 fn delete_prompt_swallows_other_keys() {
     let mut app = App::new();
-    app.delete_prompt_visible = true;
+    app.delete_flow.prompt_visible = true;
 
     for ch in ['a', 'n', 'q', ' ', '\u{1b}'] {
         if ch == '\u{1b}' {
@@ -287,7 +287,7 @@ fn delete_prompt_swallows_other_keys() {
         let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
         handle_key(&mut app, key);
         assert!(
-            app.delete_prompt_visible,
+            app.delete_flow.prompt_visible,
             "prompt should still be visible after pressing '{ch}'"
         );
     }
@@ -299,8 +299,8 @@ fn delete_prompt_swallows_other_keys() {
 #[test]
 fn delete_in_progress_swallows_keys() {
     let mut app = App::new();
-    app.delete_prompt_visible = true;
-    app.delete_in_progress = true;
+    app.delete_flow.prompt_visible = true;
+    app.delete_flow.in_progress = true;
 
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(&mut app, esc);
@@ -310,11 +310,11 @@ fn delete_in_progress_swallows_keys() {
     handle_key(&mut app, enter);
 
     assert!(
-        app.delete_prompt_visible,
+        app.delete_flow.prompt_visible,
         "dialog must stay open while cleanup is running"
     );
     assert!(
-        app.delete_in_progress,
+        app.delete_flow.in_progress,
         "in-progress flag must not clear on stray keys"
     );
 }
@@ -326,12 +326,12 @@ fn delete_in_progress_swallows_keys() {
 #[test]
 fn ctrl_r_first_press_flips_fetcher_repos_changed() {
     let mut app = App::new();
-    assert!(!app.fetcher_repos_changed);
+    assert!(!app.fetcher_flags.repos_changed);
     let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
     let changed = handle_key(&mut app, ctrl_r);
     assert!(changed, "Ctrl+R must report state changed");
     assert!(
-        app.fetcher_repos_changed,
+        app.fetcher_flags.repos_changed,
         "Ctrl+R must set fetcher_repos_changed",
     );
     assert!(
@@ -354,7 +354,7 @@ fn ctrl_r_rapid_double_press_through_handle_key_is_gated() {
 
     // First press admits.
     handle_key(&mut app, ctrl_r);
-    assert!(app.fetcher_repos_changed);
+    assert!(app.fetcher_flags.repos_changed);
 
     // Simulate the salsa tick consuming the flag (the scheduler
     // reads and resets it once per tick when the restart block
@@ -362,7 +362,7 @@ fn ctrl_r_rapid_double_press_through_handle_key_is_gated() {
     // press happens BEFORE `drain_fetch_results` has observed any
     // `FetchStarted`, so `activities.pending_fetch_count` is still 0 and the
     // only protection is the helper's in-flight check.
-    app.fetcher_repos_changed = false;
+    app.fetcher_flags.repos_changed = false;
 
     // Second press within the debounce window: the helper's
     // in-flight check rejects, so `fetcher_repos_changed` stays
@@ -370,7 +370,7 @@ fn ctrl_r_rapid_double_press_through_handle_key_is_gated() {
     let changed = handle_key(&mut app, ctrl_r);
     assert!(changed, "handler still returns true on reject path");
     assert!(
-        !app.fetcher_repos_changed,
+        !app.fetcher_flags.repos_changed,
         "second Ctrl+R must not re-flip fetcher_repos_changed",
     );
     assert_eq!(
@@ -398,7 +398,7 @@ fn ctrl_r_rejected_while_pending_fetch_count_nonzero() {
     let changed = handle_key(&mut app, ctrl_r);
     assert!(changed, "handler returns true even on reject path");
     assert!(
-        !app.fetcher_repos_changed,
+        !app.fetcher_flags.repos_changed,
         "count gate must block the fetcher restart",
     );
     assert!(

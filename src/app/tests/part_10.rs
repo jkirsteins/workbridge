@@ -490,7 +490,7 @@ fn retreat_stage_review_to_implementing_shows_rework_prompt() {
 
     app.retreat_stage();
 
-    assert!(app.rework_prompt_visible, "should show rework prompt");
+    assert!(app.prompt_flags.rework_visible, "should show rework prompt");
     assert_eq!(
         app.rework_prompt_wi.as_ref(),
         Some(&wi_id),
@@ -539,7 +539,7 @@ fn advance_stage_non_review_skips_merge_prompt() {
     app.advance_stage();
 
     assert!(
-        !app.confirm_merge,
+        !app.merge_flow.confirm,
         "merge prompt should not appear for Backlog -> Planning",
     );
 }

@@ -181,7 +181,7 @@ impl super::App {
         // If this result came from a stale-worktree recovery, clear the
         // recovery modal. On success the prompt is dismissed; on failure
         // the error arm below will re-display the appropriate alert.
-        if self.stale_recovery_in_progress {
+        if self.prompt_flags.stale_recovery_in_progress {
             self.clear_stale_recovery();
         }
 
@@ -273,7 +273,7 @@ impl super::App {
     /// clearing one but not the other (which would leave a stuck spinner).
     pub(super) fn clear_stale_recovery(&mut self) {
         self.stale_worktree_prompt = None;
-        self.stale_recovery_in_progress = false;
+        self.prompt_flags.stale_recovery_in_progress = false;
     }
 
     /// Spawn a background thread that force-removes a stale worktree,
@@ -294,7 +294,7 @@ impl super::App {
 
         // Re-populate the prompt so the UI can render the spinner modal.
         self.stale_worktree_prompt = Some(prompt);
-        self.stale_recovery_in_progress = true;
+        self.prompt_flags.stale_recovery_in_progress = true;
 
         if self
             .try_begin_user_action(

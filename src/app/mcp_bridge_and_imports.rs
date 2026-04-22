@@ -135,8 +135,8 @@ impl super::App {
                         if !self.no_plan_prompt_queue.contains(&wi_id) {
                             self.no_plan_prompt_queue.push_back(wi_id);
                         }
-                        if !self.no_plan_prompt_visible {
-                            self.no_plan_prompt_visible = true;
+                        if !self.prompt_flags.no_plan_visible {
+                            self.prompt_flags.no_plan_visible = true;
                         }
                         continue;
                     }
@@ -414,7 +414,7 @@ impl super::App {
                     let old_idx = self.selected_item;
                     self.reassemble_work_items();
                     self.build_display_list();
-                    self.fetcher_repos_changed = true;
+                    self.fetcher_flags.repos_changed = true;
 
                     // Re-sync cursor position.
                     if let Some(old) = old_idx {
@@ -524,7 +524,7 @@ impl super::App {
                         Ok(record) => {
                             let wi_id = record.id.clone();
                             self.reassemble_work_items();
-                            self.fetcher_repos_changed = true;
+                            self.fetcher_flags.repos_changed = true;
                             self.selected_work_item = Some(wi_id.clone());
                             self.build_display_list();
 
@@ -570,7 +570,7 @@ impl super::App {
                 let wi_id = record.id;
                 self.reassemble_work_items();
                 self.build_display_list();
-                self.fetcher_repos_changed = true;
+                self.fetcher_flags.repos_changed = true;
                 self.spawn_import_worktree(wi_id, repo_path, branch, title);
             }
             Err(e) => {
@@ -605,7 +605,7 @@ impl super::App {
                 let wi_id = record.id;
                 self.reassemble_work_items();
                 self.build_display_list();
-                self.fetcher_repos_changed = true;
+                self.fetcher_flags.repos_changed = true;
                 self.spawn_import_worktree(wi_id, repo_path, branch, title);
             }
             Err(e) => {

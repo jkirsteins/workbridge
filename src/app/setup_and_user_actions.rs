@@ -20,8 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    Activities, ActivityId, BoardCursor, ClickTracking, DashboardWindow, DisplayEntry,
-    GlobalDrawer, Metrics, OrphanCleanup, PrIdentityBackfill, RightPanelTab, SettingsOverlay,
+    Activities, ActivityId, BoardCursor, CleanupFlowFlags, ClickTracking, DashboardWindow,
+    DeleteFlowFlags, DisplayEntry, FetcherFlags, GhStatusFlags, GlobalDrawer, MergeFlowFlags,
+    Metrics, OrphanCleanup, PrIdentityBackfill, PromptFlags, RightPanelTab, SettingsOverlay,
     SharedServices, Shell, Toasts, UserActionGuard, UserActionKey, UserActionPayload,
     UserActionState, ViewMode, WorkItemContext, canonicalize_repo_entries,
 };
@@ -126,22 +127,18 @@ impl super::App {
         let mut app = Self {
             services,
             shell: Shell::new(),
-            delete_prompt_visible: false,
+            delete_flow: DeleteFlowFlags::default(),
             delete_target_wi_id: None,
             delete_target_title: None,
-            delete_in_progress: false,
             delete_sync_warnings: Vec::new(),
             set_branch_dialog: None,
-            confirm_merge: false,
+            merge_flow: MergeFlowFlags::default(),
             merge_wi_id: None,
-            merge_in_progress: false,
-            rework_prompt_visible: false,
             rework_prompt_input: rat_widget::text_input::TextInputState::new(),
             rework_prompt_wi: None,
             rework_reasons: HashMap::new(),
             review_gate_findings: HashMap::new(),
-            cleanup_prompt_visible: false,
-            cleanup_reason_input_active: false,
+            cleanup_flow: CleanupFlowFlags::default(),
             cleanup_reason_input: rat_widget::text_input::TextInputState::new(),
             cleanup_unlinked_target: None,
             cleanup_progress_pr_number: None,
@@ -151,8 +148,7 @@ impl super::App {
             alert_message: None,
             branch_gone_prompt: None,
             stale_worktree_prompt: None,
-            stale_recovery_in_progress: false,
-            no_plan_prompt_visible: false,
+            prompt_flags: PromptFlags::default(),
             no_plan_prompt_queue: VecDeque::new(),
             settings: SettingsOverlay::new(),
             active_repo_cache,
@@ -164,9 +160,11 @@ impl super::App {
             sessions: HashMap::new(),
             repo_data: HashMap::new(),
             fetch_rx: None,
-            gh_available: Self::check_gh_available(),
-            gh_cli_not_found_shown: false,
-            gh_auth_required_shown: false,
+            gh_status: GhStatusFlags {
+                available: Self::check_gh_available(),
+                cli_not_found_shown: false,
+                auth_required_shown: false,
+            },
             worktree_errors_shown: std::collections::HashSet::new(),
             selected_item: None,
             list_scroll_offset: Cell::new(0),
@@ -183,12 +181,11 @@ impl super::App {
             dashboard_window: DashboardWindow::Month,
             metrics: Metrics::new(),
             board_drill_stage: None,
-            fetcher_repos_changed: false,
+            fetcher_flags: FetcherFlags::default(),
             selected_work_item: None,
             selected_unlinked_branch: None,
             selected_review_request_branch: None,
             pending_fetch_errors: Vec::new(),
-            fetcher_disconnected: false,
             fetcher_handle: None,
             harness_choice: HashMap::new(),
             last_k_press: None,
@@ -505,7 +502,7 @@ impl super::App {
             return;
         }
         self.shell.status_message = Some(format!("Unmanaged: {path}"));
-        self.fetcher_repos_changed = true;
+        self.fetcher_flags.repos_changed = true;
         self.refresh_repo_cache();
         // Adjust cursor if it went past the end.
         if self.active_repo_cache.is_empty() {
@@ -539,7 +536,7 @@ impl super::App {
             return;
         }
         self.shell.status_message = Some(format!("Managed: {path}"));
-        self.fetcher_repos_changed = true;
+        self.fetcher_flags.repos_changed = true;
         self.refresh_repo_cache();
         // Adjust cursor if it went past the end.
         let new_available = self.available_repos();

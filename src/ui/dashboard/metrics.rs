@@ -198,7 +198,7 @@ pub fn draw_bottom_axis_labels(buf: &mut Buffer, area: Rect, days: i64) {
     if x_end <= x_start {
         return;
     }
-    let inner_width = (x_end - x_start) as i64;
+    let inner_width = i64::from(x_end - x_start);
 
     let n = days.max(1); // number of data points = window size
     let max_ago = n - 1; // oldest day-offset shown in the chart
@@ -228,11 +228,13 @@ pub fn draw_bottom_axis_labels(buf: &mut Buffer, area: Rect, days: i64) {
         // leftmost label, right-aligned for `now`, center-aligned on
         // the block center for the intermediate labels.
         let start_x = match label_idx {
-            0 => x_start as i64,
-            3 => x_end as i64 - label_len,
-            _ => (x_start as i64 + block_center_rel) - label_len / 2,
+            0 => i64::from(x_start),
+            3 => i64::from(x_end) - label_len,
+            _ => (i64::from(x_start) + block_center_rel) - label_len / 2,
         };
-        let clamped = start_x.max(x_start as i64).min(x_end as i64 - label_len);
+        let clamped = start_x
+            .max(i64::from(x_start))
+            .min(i64::from(x_end) - label_len);
         for (i, ch) in label_text.chars().enumerate() {
             let cx = (clamped + i as i64) as u16;
             if cx >= x_end {

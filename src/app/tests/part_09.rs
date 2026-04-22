@@ -122,7 +122,7 @@ pub fn install_live_pr_precheck_app(spec: LivePrPrecheckSpec<'_>) -> (App, WorkI
     );
     let wi_id = WorkItemId::LocalFile(repo.join(format!("{}.json", branch.replace('/', "-"))));
     push_selected_review_item(&mut app, &wi_id, repo, branch);
-    app.confirm_merge = true;
+    app.merge_flow.confirm = true;
     app.merge_wi_id = Some(wi_id.clone());
 
     (app, wi_id)
@@ -172,8 +172,8 @@ fn execute_merge_through_live_precheck_blocks_on_pr_conflict() {
         !app.is_user_action_in_flight(&UserActionKey::PrMerge),
         "conflicting PR must release the PrMerge slot",
     );
-    assert!(!app.merge_in_progress);
-    assert!(!app.confirm_merge);
+    assert!(!app.merge_flow.in_progress);
+    assert!(!app.merge_flow.confirm);
     let msg = app.alert_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("PR has conflicts"),
@@ -280,7 +280,7 @@ fn execute_merge_through_live_precheck_passes_with_no_open_pr() {
         app.alert_message,
     );
     assert!(
-        app.confirm_merge,
+        app.merge_flow.confirm,
         "merge modal must stay open through the handoff to the merge thread",
     );
 }
@@ -325,8 +325,8 @@ fn execute_merge_through_live_precheck_surfaces_remote_error() {
         !app.is_user_action_in_flight(&UserActionKey::PrMerge),
         "errored remote check must release the PrMerge slot",
     );
-    assert!(!app.merge_in_progress);
-    assert!(!app.confirm_merge);
+    assert!(!app.merge_flow.in_progress);
+    assert!(!app.merge_flow.confirm);
     let msg = app.alert_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("remote merge-state check failed"),
@@ -444,7 +444,7 @@ fn execute_merge_through_live_precheck_dirty_wins_over_pr_conflict() {
     );
     let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/exec-merge-dirty-over-conflict.json"));
     push_selected_review_item(&mut app, &wi_id, &repo, &branch);
-    app.confirm_merge = true;
+    app.merge_flow.confirm = true;
     app.merge_wi_id = Some(wi_id.clone());
 
     app.execute_merge(&wi_id, "squash");

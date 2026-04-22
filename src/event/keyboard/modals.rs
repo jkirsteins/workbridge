@@ -20,19 +20,19 @@ pub fn handle_merge_prompt(app: &mut App, key: KeyEvent) {
             }
         }
         (_, KeyCode::Char('p')) => {
-            app.confirm_merge = false;
+            app.merge_flow.confirm = false;
             if let Some(wi_id) = app.merge_wi_id.take() {
                 app.enter_mergequeue(&wi_id);
             }
         }
         (_, KeyCode::Esc) => {
-            app.confirm_merge = false;
+            app.merge_flow.confirm = false;
             app.merge_wi_id = None;
             app.shell.status_message = None;
         }
         _ => {
             // Unrecognized key - cancel.
-            app.confirm_merge = false;
+            app.merge_flow.confirm = false;
             app.merge_wi_id = None;
             app.shell.status_message = None;
         }
@@ -50,14 +50,14 @@ pub fn handle_rework_prompt(app: &mut App, key: KeyEvent) {
     let had_status = app.has_visible_status_bar();
     match (key.modifiers, key.code) {
         (_, KeyCode::Esc) => {
-            app.rework_prompt_visible = false;
+            app.prompt_flags.rework_visible = false;
             app.rework_prompt_input.clear();
             app.rework_prompt_wi = None;
             app.shell.status_message = None;
         }
         (_, KeyCode::Enter) => {
             let reason = app.rework_prompt_input.text().trim().to_string();
-            app.rework_prompt_visible = false;
+            app.prompt_flags.rework_visible = false;
             app.rework_prompt_input.clear();
             let Some(wi_id) = app.rework_prompt_wi.take() else {
                 return;
@@ -187,7 +187,7 @@ pub fn handle_cleanup_prompt(app: &mut App, key: KeyEvent) {
     match (key.modifiers, key.code) {
         (_, KeyCode::Enter) => {
             // Transition to reason text input.
-            app.cleanup_reason_input_active = true;
+            app.cleanup_flow.reason_input_active = true;
             app.cleanup_reason_input.clear();
         }
         (_, KeyCode::Char('d')) => {
@@ -196,7 +196,7 @@ pub fn handle_cleanup_prompt(app: &mut App, key: KeyEvent) {
         }
         (_, KeyCode::Esc) => {
             // Cancel on explicit Esc only.
-            app.cleanup_prompt_visible = false;
+            app.cleanup_flow.prompt_visible = false;
             app.cleanup_unlinked_target = None;
             app.shell.status_message = None;
         }
@@ -218,8 +218,8 @@ pub fn handle_cleanup_reason_input(app: &mut App, key: KeyEvent) {
     match (key.modifiers, key.code) {
         (_, KeyCode::Esc) => {
             // Cancel the entire cleanup.
-            app.cleanup_prompt_visible = false;
-            app.cleanup_reason_input_active = false;
+            app.cleanup_flow.prompt_visible = false;
+            app.cleanup_flow.reason_input_active = false;
             app.cleanup_reason_input.clear();
             app.cleanup_unlinked_target = None;
             app.shell.status_message = None;
@@ -271,7 +271,7 @@ pub fn handle_no_plan_prompt(app: &mut App, key: KeyEvent) {
             // Dismiss the current item (stay blocked), advance to next queued.
             app.no_plan_prompt_queue.pop_front();
             if app.no_plan_prompt_queue.is_empty() {
-                app.no_plan_prompt_visible = false;
+                app.prompt_flags.no_plan_visible = false;
                 app.shell.status_message = None;
             }
             // If queue still has items, the dialog stays visible with the
@@ -279,14 +279,14 @@ pub fn handle_no_plan_prompt(app: &mut App, key: KeyEvent) {
         }
         (KeyModifiers::NONE, KeyCode::Char('p')) => {
             let Some(wi_id) = app.no_plan_prompt_queue.pop_front() else {
-                app.no_plan_prompt_visible = false;
+                app.prompt_flags.no_plan_visible = false;
                 return;
             };
             app.plan_from_branch(&wi_id);
             // Clear prompt if queue is empty; otherwise dialog stays for
             // the next item (plan_from_branch may set status_message - keep it).
             if app.no_plan_prompt_queue.is_empty() {
-                app.no_plan_prompt_visible = false;
+                app.prompt_flags.no_plan_visible = false;
             }
         }
         _ => {}

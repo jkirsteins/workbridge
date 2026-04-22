@@ -260,7 +260,7 @@ pub fn handle_key_left(app: &mut App, key: KeyEvent) {
                     let pr_number = ul.pr.number;
                     app.cleanup_unlinked_target =
                         Some((ul.repo_path.clone(), ul.branch.clone(), pr_number));
-                    app.cleanup_prompt_visible = true;
+                    app.cleanup_flow.prompt_visible = true;
                 }
             }
         }

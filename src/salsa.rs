@@ -337,8 +337,8 @@ pub fn app_event(
                 // modal-flag branch the delete/merge/cleanup modal
                 // spinners would freeze as soon as no status-bar
                 // activity or Claude session is running.
-                let modal_in_progress = state.delete_in_progress
-                    || state.merge_in_progress
+                let modal_in_progress = state.delete_flow.in_progress
+                    || state.merge_flow.in_progress
                     || state.is_user_action_in_flight(&crate::app::UserActionKey::UnlinkedCleanup);
                 if !state.activities.is_empty()
                     || !state.agent_working.is_empty()
@@ -538,9 +538,9 @@ pub fn app_event(
 
                 // Restart the background fetcher if repo management
                 // changed.
-                if state.fetcher_repos_changed {
-                    state.fetcher_repos_changed = false;
-                    state.fetcher_disconnected = false;
+                if state.fetcher_flags.repos_changed {
+                    state.fetcher_flags.repos_changed = false;
+                    state.fetcher_flags.disconnected = false;
                     // Stop the old fetcher. `handle.stop()` only flips
                     // an atomic flag - it does NOT kill an in-flight
                     // `gh` subprocess. Any thread mid-network-I/O will

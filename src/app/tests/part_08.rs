@@ -47,7 +47,7 @@ fn delete_work_item_drops_merge_precheck_payload() {
     // Precheck-phase state: slot admitted, payload swapped.
     app.try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging PR...")
         .expect("helper admit should succeed in test setup");
-    app.merge_in_progress = true;
+    app.merge_flow.in_progress = true;
     app.merge_wi_id = Some(wi_id.clone());
     let (_tx_keep_alive, rx) = crossbeam_channel::bounded::<MergePreCheckMessage>(1);
     app.attach_user_action_payload(
@@ -68,7 +68,7 @@ fn delete_work_item_drops_merge_precheck_payload() {
         !app.is_merge_precheck_phase(),
         "releasing the slot must structurally drop the precheck payload",
     );
-    assert!(!app.merge_in_progress);
+    assert!(!app.merge_flow.in_progress);
 }
 
 /// `poll_merge_precheck` must be a no-op when the helper slot
@@ -193,14 +193,14 @@ fn execute_merge_through_live_precheck_clears_stale_dirty() {
     );
     let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/exec-merge-live-clean.json"));
     push_selected_review_item(&mut app, &wi_id, &repo, &branch);
-    app.confirm_merge = true;
+    app.merge_flow.confirm = true;
     app.merge_wi_id = Some(wi_id.clone());
 
     app.execute_merge(&wi_id, "squash");
 
     assert!(app.is_merge_precheck_phase());
     assert!(app.is_user_action_in_flight(&UserActionKey::PrMerge));
-    assert!(app.merge_in_progress);
+    assert!(app.merge_flow.in_progress);
 
     // Drive the background thread via a polling loop. Bounded by a
     // 2s timeout so a regression cannot wedge CI forever.
@@ -227,14 +227,14 @@ fn execute_merge_through_live_precheck_clears_stale_dirty() {
         app.is_user_action_in_flight(&UserActionKey::PrMerge),
         "the merge slot must stay reserved across the precheck->merge handoff",
     );
-    assert!(app.merge_in_progress);
+    assert!(app.merge_flow.in_progress);
     assert!(
         app.alert_message.is_none(),
         "live-clean precheck must not surface an alert; got: {:?}",
         app.alert_message,
     );
     assert!(
-        app.confirm_merge,
+        app.merge_flow.confirm,
         "merge modal must stay open through the handoff to the merge thread",
     );
 }
@@ -323,7 +323,7 @@ fn execute_merge_through_live_precheck_surfaces_error() {
     );
     let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/exec-merge-live-error.json"));
     push_selected_review_item(&mut app, &wi_id, &repo, &branch);
-    app.confirm_merge = true;
+    app.merge_flow.confirm = true;
     app.merge_wi_id = Some(wi_id.clone());
 
     app.execute_merge(&wi_id, "squash");
@@ -349,8 +349,8 @@ fn execute_merge_through_live_precheck_surfaces_error() {
         !app.is_user_action_in_flight(&UserActionKey::PrMerge),
         "an errored precheck must release the PrMerge slot",
     );
-    assert!(!app.merge_in_progress);
-    assert!(!app.confirm_merge);
+    assert!(!app.merge_flow.in_progress);
+    assert!(!app.merge_flow.confirm);
     let msg = app.alert_message.as_deref().unwrap_or("");
     assert!(
         msg.contains("working-tree check failed"),
@@ -452,7 +452,7 @@ fn execute_merge_through_live_precheck_allows_no_worktree() {
     );
     let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/exec-merge-no-worktree.json"));
     push_selected_review_item(&mut app, &wi_id, &repo, &branch);
-    app.confirm_merge = true;
+    app.merge_flow.confirm = true;
     app.merge_wi_id = Some(wi_id.clone());
 
     app.execute_merge(&wi_id, "squash");
@@ -487,7 +487,7 @@ fn execute_merge_through_live_precheck_allows_no_worktree() {
         "no-worktree case must hand off to the merge phase, keeping the slot reserved",
     );
     assert!(
-        app.confirm_merge,
+        app.merge_flow.confirm,
         "merge modal must stay open through the handoff to the merge thread",
     );
 }

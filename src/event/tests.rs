@@ -76,7 +76,7 @@ fn ctrl_n_blocked_during_shutdown() {
 #[test]
 fn merge_prompt_esc_cancels() {
     let mut app = App::new();
-    app.confirm_merge = true;
+    app.merge_flow.confirm = true;
     app.merge_wi_id = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
         "/tmp/test.json",
     )));
@@ -85,7 +85,7 @@ fn merge_prompt_esc_cancels() {
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(&mut app, esc);
 
-    assert!(!app.confirm_merge, "confirm_merge should be cleared");
+    assert!(!app.merge_flow.confirm, "confirm_merge should be cleared");
     assert!(app.merge_wi_id.is_none(), "merge_wi_id should be cleared");
     assert!(
         app.shell.status_message.is_none(),
@@ -97,7 +97,7 @@ fn merge_prompt_esc_cancels() {
 #[test]
 fn merge_prompt_unknown_key_cancels() {
     let mut app = App::new();
-    app.confirm_merge = true;
+    app.merge_flow.confirm = true;
     app.merge_wi_id = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
         "/tmp/test.json",
     )));
@@ -106,7 +106,7 @@ fn merge_prompt_unknown_key_cancels() {
     let key_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
     handle_key(&mut app, key_x);
 
-    assert!(!app.confirm_merge, "confirm_merge should be cleared");
+    assert!(!app.merge_flow.confirm, "confirm_merge should be cleared");
     assert!(app.merge_wi_id.is_none(), "merge_wi_id should be cleared");
 }
 
@@ -114,7 +114,7 @@ fn merge_prompt_unknown_key_cancels() {
 #[test]
 fn rework_prompt_esc_cancels() {
     let mut app = App::new();
-    app.rework_prompt_visible = true;
+    app.prompt_flags.rework_visible = true;
     app.rework_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
         "/tmp/test.json",
     )));
@@ -124,7 +124,7 @@ fn rework_prompt_esc_cancels() {
     handle_key(&mut app, esc);
 
     assert!(
-        !app.rework_prompt_visible,
+        !app.prompt_flags.rework_visible,
         "rework_prompt_visible should be cleared",
     );
     assert!(
@@ -141,7 +141,7 @@ fn rework_prompt_esc_cancels() {
 #[test]
 fn rework_prompt_typing_updates_input() {
     let mut app = App::new();
-    app.rework_prompt_visible = true;
+    app.prompt_flags.rework_visible = true;
     app.rework_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
         "/tmp/test.json",
     )));
@@ -150,7 +150,10 @@ fn rework_prompt_typing_updates_input() {
     let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
     handle_key(&mut app, key_a);
 
-    assert!(app.rework_prompt_visible, "prompt should still be visible");
+    assert!(
+        app.prompt_flags.rework_visible,
+        "prompt should still be visible"
+    );
     assert_eq!(app.rework_prompt_input.text(), "a");
     // Input is shown in the dialog overlay, not the status bar.
 }
@@ -159,7 +162,7 @@ fn rework_prompt_typing_updates_input() {
 #[test]
 fn rework_prompt_blocks_other_keys() {
     let mut app = App::new();
-    app.rework_prompt_visible = true;
+    app.prompt_flags.rework_visible = true;
     app.rework_prompt_wi = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
         "/tmp/test.json",
     )));
@@ -182,7 +185,7 @@ fn rework_prompt_blocks_other_keys() {
 #[test]
 fn no_plan_prompt_esc_dismisses() {
     let mut app = App::new();
-    app.no_plan_prompt_visible = true;
+    app.prompt_flags.no_plan_visible = true;
     app.no_plan_prompt_queue
         .push_back(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
             "/tmp/test.json",
@@ -194,7 +197,7 @@ fn no_plan_prompt_esc_dismisses() {
     handle_key(&mut app, esc);
 
     assert!(
-        !app.no_plan_prompt_visible,
+        !app.prompt_flags.no_plan_visible,
         "no_plan_prompt_visible should be cleared",
     );
     assert!(
@@ -211,7 +214,7 @@ fn no_plan_prompt_esc_dismisses() {
 #[test]
 fn no_plan_prompt_esc_advances_queue() {
     let mut app = App::new();
-    app.no_plan_prompt_visible = true;
+    app.prompt_flags.no_plan_visible = true;
     app.no_plan_prompt_queue
         .push_back(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
             "/tmp/first.json",
@@ -225,7 +228,7 @@ fn no_plan_prompt_esc_advances_queue() {
     handle_key(&mut app, esc);
 
     assert!(
-        app.no_plan_prompt_visible,
+        app.prompt_flags.no_plan_visible,
         "prompt should remain visible with queued items",
     );
     assert_eq!(
@@ -241,7 +244,7 @@ fn no_plan_prompt_esc_advances_queue() {
 #[test]
 fn no_plan_prompt_blocks_other_keys() {
     let mut app = App::new();
-    app.no_plan_prompt_visible = true;
+    app.prompt_flags.no_plan_visible = true;
     app.no_plan_prompt_queue
         .push_back(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
             "/tmp/test.json",
@@ -257,7 +260,7 @@ fn no_plan_prompt_blocks_other_keys() {
         "should not quit while no-plan prompt is open",
     );
     assert!(
-        app.no_plan_prompt_visible,
+        app.prompt_flags.no_plan_visible,
         "prompt should still be visible after unrecognized key",
     );
 }
@@ -266,7 +269,7 @@ fn no_plan_prompt_blocks_other_keys() {
 #[test]
 fn merge_prompt_blocks_during_active() {
     let mut app = App::new();
-    app.confirm_merge = true;
+    app.merge_flow.confirm = true;
     app.merge_wi_id = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
         "/tmp/test.json",
     )));
@@ -280,7 +283,7 @@ fn merge_prompt_blocks_during_active() {
         "should not quit while merge prompt is open"
     );
     assert!(
-        !app.confirm_merge,
+        !app.merge_flow.confirm,
         "merge should be cancelled by unknown key"
     );
 }
@@ -289,8 +292,8 @@ fn merge_prompt_blocks_during_active() {
 #[test]
 fn merge_in_progress_swallows_keys() {
     let mut app = App::new();
-    app.confirm_merge = true;
-    app.merge_in_progress = true;
+    app.merge_flow.confirm = true;
+    app.merge_flow.in_progress = true;
     app.merge_wi_id = Some(crate::work_item::WorkItemId::LocalFile(PathBuf::from(
         "/tmp/test.json",
     )));
@@ -298,9 +301,12 @@ fn merge_in_progress_swallows_keys() {
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(&mut app, esc);
 
-    assert!(app.confirm_merge, "dialog should stay open during progress");
     assert!(
-        app.merge_in_progress,
+        app.merge_flow.confirm,
+        "dialog should stay open during progress"
+    );
+    assert!(
+        app.merge_flow.in_progress,
         "in-progress flag must not clear on Esc"
     );
     assert!(

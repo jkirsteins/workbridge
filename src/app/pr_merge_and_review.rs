@@ -54,9 +54,9 @@ impl super::App {
                 // helper slot (which drops the receiver), clear the
                 // modal state, and surface a generic error so the
                 // user can retry.
-                self.confirm_merge = false;
+                self.merge_flow.confirm = false;
                 self.merge_wi_id = None;
-                self.merge_in_progress = false;
+                self.merge_flow.in_progress = false;
                 self.end_user_action(&UserActionKey::PrMerge);
                 self.alert_message = Some("Merge precheck thread terminated unexpectedly".into());
                 return;
@@ -86,9 +86,9 @@ impl super::App {
                 // dirty / untracked / unpushed / PR-conflict /
                 // CI-failing cases comes from
                 // `MergeReadiness::merge_block_message`.
-                self.confirm_merge = false;
+                self.merge_flow.confirm = false;
                 self.merge_wi_id = None;
-                self.merge_in_progress = false;
+                self.merge_flow.in_progress = false;
                 self.end_user_action(&UserActionKey::PrMerge);
                 self.alert_message = Some(reason);
             }
@@ -219,16 +219,16 @@ impl super::App {
         };
         let Ok(result) = recv_result else {
             self.end_user_action(&UserActionKey::PrMerge);
-            self.merge_in_progress = false;
-            self.confirm_merge = false;
+            self.merge_flow.in_progress = false;
+            self.merge_flow.confirm = false;
             self.merge_wi_id = None;
             self.alert_message = Some("PR merge: background thread exited unexpectedly".into());
             return;
         };
 
         self.end_user_action(&UserActionKey::PrMerge);
-        self.merge_in_progress = false;
-        self.confirm_merge = false;
+        self.merge_flow.in_progress = false;
+        self.merge_flow.confirm = false;
         self.merge_wi_id = None;
 
         // Guard: if the item's status changed while the merge was in-flight

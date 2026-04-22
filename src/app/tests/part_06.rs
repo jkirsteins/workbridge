@@ -220,7 +220,7 @@ fn advance_stage_review_to_done_shows_merge_prompt() {
 
     app.advance_stage();
 
-    assert!(app.confirm_merge, "should show merge prompt");
+    assert!(app.merge_flow.confirm, "should show merge prompt");
     assert_eq!(
         app.merge_wi_id.as_ref(),
         Some(&wi_id),

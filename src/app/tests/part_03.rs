@@ -149,13 +149,13 @@ fn disconnected_fetcher_surfaces_error() {
     app.fetch_rx = Some(rx);
     drop(tx);
 
-    assert!(!app.fetcher_disconnected);
+    assert!(!app.fetcher_flags.disconnected);
 
     let received = app.drain_fetch_results();
     // No data was received, but disconnect was detected.
     assert!(!received, "no actual data should have been received");
     assert!(
-        app.fetcher_disconnected,
+        app.fetcher_flags.disconnected,
         "fetcher_disconnected should be true after channel disconnect",
     );
 

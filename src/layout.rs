@@ -51,7 +51,12 @@ pub struct DrawerLayout {
 pub fn compute_drawer(cols: u16, rows: u16) -> DrawerLayout {
     let drawer_width = cols.saturating_sub(4);
     // Cast to u32 to prevent overflow when rows > 1092 (rows * 60 > u16::MAX).
-    let drawer_height = ((rows as u32 * 60 / 100).max(5) as u16).min(rows);
+    // The result of (u32 * 60 / 100).max(5) is at most rows (a u16), so the
+    // narrowing back to u16 is always safe; use try_from with saturation to
+    // avoid an `as` cast.
+    let drawer_height = u16::try_from((u32::from(rows) * 60 / 100).max(5))
+        .unwrap_or(u16::MAX)
+        .min(rows);
     let pane_cols = drawer_width.saturating_sub(2).max(1);
     let pane_rows = drawer_height.saturating_sub(2).max(1);
     DrawerLayout {

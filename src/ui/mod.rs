@@ -161,8 +161,8 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
     // Prompt dialogs: blocking choice/input prompts rendered as centered modal
     // dialogs with dimmed backgrounds. Order matches the handle_key() intercept
     // chain (cleanup_reason_input_active before cleanup_prompt_visible).
-    if app.confirm_merge {
-        if app.merge_in_progress {
+    if app.merge_flow.confirm {
+        if app.merge_flow.in_progress {
             let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
             // While the live merge precheck is in flight we show a
             // "Refreshing remote state..." body so the user knows
@@ -232,7 +232,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
                 hint: "Enter: confirm   Esc: cancel",
             },
         );
-    } else if app.rework_prompt_visible {
+    } else if app.prompt_flags.rework_visible {
         draw_prompt_dialog(
             buf,
             theme,
@@ -244,7 +244,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
                 hint: "Enter: Submit   Esc: Cancel",
             },
         );
-    } else if app.cleanup_reason_input_active {
+    } else if app.cleanup_flow.reason_input_active {
         draw_prompt_dialog(
             buf,
             theme,
@@ -256,7 +256,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
                 hint: "Enter: Submit   Esc: Cancel",
             },
         );
-    } else if app.cleanup_prompt_visible {
+    } else if app.cleanup_flow.prompt_visible {
         if app.is_user_action_in_flight(&UserActionKey::UnlinkedCleanup) {
             let pr_num = app.cleanup_progress_pr_number.unwrap_or(0);
             let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
@@ -287,7 +287,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
                 },
             );
         }
-    } else if app.no_plan_prompt_visible {
+    } else if app.prompt_flags.no_plan_visible {
         draw_prompt_dialog(
             buf,
             theme,
@@ -309,7 +309,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
                 options: &[("[d]", "Delete work item"), ("[Esc]", "Dismiss")],
             },
         );
-    } else if app.stale_recovery_in_progress {
+    } else if app.prompt_flags.stale_recovery_in_progress {
         // Recovery in flight - show spinner, no key options.
         let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
         draw_prompt_dialog(
@@ -340,8 +340,8 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
                 ],
             },
         );
-    } else if app.delete_prompt_visible {
-        if app.delete_in_progress {
+    } else if app.delete_flow.prompt_visible {
+        if app.delete_flow.in_progress {
             let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
             draw_prompt_dialog(
                 buf,

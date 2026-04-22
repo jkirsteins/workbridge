@@ -6,11 +6,12 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 
 use super::{
-    Activities, BoardCursor, ClickTracking, DashboardWindow, DisplayEntry,
-    FirstRunGlobalHarnessModal, GlobalDrawer, Metrics, OrphanCleanup, PrIdentityBackfill,
-    PrMergePollState, PrMergeWatch, RebaseGateState, ReviewGateState, RightPanelTab,
-    SessionOpenPending, SessionSpawnPending, SettingsOverlay, SharedServices, Shell,
-    StaleWorktreePrompt, Toasts, UserActionGuard, ViewMode,
+    Activities, BoardCursor, CleanupFlowFlags, ClickTracking, DashboardWindow, DeleteFlowFlags,
+    DisplayEntry, FetcherFlags, FirstRunGlobalHarnessModal, GhStatusFlags, GlobalDrawer,
+    MergeFlowFlags, Metrics, OrphanCleanup, PrIdentityBackfill, PrMergePollState, PrMergeWatch,
+    PromptFlags, RebaseGateState, ReviewGateState, RightPanelTab, SessionOpenPending,
+    SessionSpawnPending, SettingsOverlay, SharedServices, Shell, StaleWorktreePrompt, Toasts,
+    UserActionGuard, ViewMode,
 };
 use crate::agent_backend::AgentBackendKind;
 use crate::config::RepoEntry;
@@ -28,17 +29,15 @@ pub struct App {
     /// lifecycle. Owned by the `Shell` subsystem so the state
     /// machine lives in one place. See `app::Shell`.
     pub shell: Shell,
-    /// True when the delete confirmation modal is visible.
-    pub delete_prompt_visible: bool,
+    /// Delete-flow booleans (prompt visibility + in-progress spinner).
+    /// Grouped into a substate so `struct_excessive_bools` stays quiet
+    /// on `App`.
+    pub delete_flow: DeleteFlowFlags,
     /// Identity of the work item targeted by the open delete modal. Stored
     /// by identity (not display index) so it survives list reassembly.
     pub delete_target_wi_id: Option<WorkItemId>,
     /// Title of the targeted work item, shown in the dialog body.
     pub delete_target_title: Option<String>,
-    /// True while the async delete cleanup thread is running on behalf of
-    /// the user-initiated (modal) delete path. The dialog stays visible
-    /// with a spinner and the event loop swallows all keys except Q/Ctrl+Q.
-    pub delete_in_progress: bool,
     /// Warnings collected synchronously during the modal delete's
     /// `delete_work_item_by_id` call (Phase 2 backend pre-delete hook,
     /// Phase 5 inline orphan-worktree cleanup). Stashed here so
@@ -52,21 +51,17 @@ pub struct App {
     /// on a branchless item, or `advance_stage` called on a branchless
     /// Backlog item). See `docs/UI.md` "Set branch recovery dialog".
     pub set_branch_dialog: Option<crate::create_dialog::SetBranchDialog>,
-    /// True when the merge strategy prompt is visible (Review -> Done).
-    pub confirm_merge: bool,
+    /// Merge-flow booleans (prompt visibility + in-progress spinner).
+    /// See `MergeFlowFlags`. `confirm` is set the moment the merge
+    /// strategy prompt opens; `in_progress` is set the moment
+    /// `execute_merge` admits the `UserActionKey::PrMerge` slot, so
+    /// the modal renders the "Refreshing remote state..." spinner
+    /// during the precheck phase as well as the actual `gh pr merge`
+    /// phase. Cleared in `poll_pr_merge` / `poll_merge_precheck` on
+    /// every terminal arm.
+    pub merge_flow: MergeFlowFlags,
     /// The work item ID that the merge prompt applies to.
     pub merge_wi_id: Option<WorkItemId>,
-    /// True while the merge background thread is running.
-    /// The dialog stays open with a spinner in this state.
-    ///
-    /// Set the moment `execute_merge` admits the `UserActionKey::PrMerge`
-    /// slot, so the modal renders the "Refreshing remote state..."
-    /// spinner during the precheck phase as well as the actual
-    /// `gh pr merge` phase. Cleared in `poll_pr_merge` /
-    /// `poll_merge_precheck` on every terminal arm.
-    pub merge_in_progress: bool,
-    /// True when the rework reason text input is visible (Review -> Implementing).
-    pub rework_prompt_visible: bool,
     /// Text input for the rework reason.
     pub rework_prompt_input: rat_widget::text_input::TextInputState,
     /// The work item ID that the rework prompt applies to.
@@ -78,11 +73,9 @@ pub struct App {
     /// approves, consumed one-shot by `stage_system_prompt` to select the
     /// "`review_with_findings`" prompt template and inject the assessment.
     pub review_gate_findings: HashMap<WorkItemId, String>,
-    /// True when the unlinked-item cleanup confirmation prompt is visible.
-    pub cleanup_prompt_visible: bool,
-    /// True when the cleanup reason text input is active (user pressed Enter
-    /// from the confirmation prompt to type an optional close reason).
-    pub cleanup_reason_input_active: bool,
+    /// Cleanup-flow booleans (unlinked-PR confirmation prompt +
+    /// reason-input active). See `CleanupFlowFlags`.
+    pub cleanup_flow: CleanupFlowFlags,
     /// Text input for the optional close reason.
     pub cleanup_reason_input: rat_widget::text_input::TextInputState,
     /// Identity of the unlinked PR being cleaned up: (`repo_path`, branch, `pr_number`).
@@ -108,13 +101,11 @@ pub struct App {
     /// Stale-worktree recovery dialog. Shown when worktree creation fails
     /// because the branch is locked to a stale/corrupt worktree.
     pub stale_worktree_prompt: Option<StaleWorktreePrompt>,
-    /// True while the background recovery thread is running (force-remove,
-    /// prune, recreate). The dialog switches to a spinner with no key
-    /// options so the user cannot interact until recovery completes.
-    pub stale_recovery_in_progress: bool,
-    /// True when the no-plan prompt is visible (offered when Claude blocks
-    /// because no implementation plan exists).
-    pub no_plan_prompt_visible: bool,
+    /// Prompt-visibility and recovery-in-progress flags that each
+    /// only need one bool of state. See `PromptFlags`. Groups the
+    /// rework prompt, no-plan prompt, and stale-worktree recovery
+    /// spinner so `struct_excessive_bools` stays quiet on `App`.
+    pub prompt_flags: PromptFlags,
     /// Queue of work item IDs awaiting no-plan prompt resolution.
     /// When multiple items block with "No implementation plan" concurrently,
     /// all are queued. The front item is shown to the user; resolving it
@@ -165,14 +156,9 @@ pub struct App {
     pub repo_data: HashMap<PathBuf, RepoFetchResult>,
     /// Receiver for background fetch messages.
     pub fetch_rx: Option<mpsc::Receiver<FetchMessage>>,
-    /// True once a "gh CLI not found" message has been shown. Prevents
-    /// spamming the status bar on every fetch cycle.
-    pub gh_cli_not_found_shown: bool,
-    /// True once a "gh auth required" message has been shown. Prevents
-    /// spamming the status bar on every fetch cycle.
-    pub gh_auth_required_shown: bool,
-    /// True if the `gh` CLI is available at startup.
-    pub gh_available: bool,
+    /// Grouped gh-CLI availability / one-shot status flags. See
+    /// `GhStatusFlags`.
+    pub gh_status: GhStatusFlags,
     /// Repo paths for which a worktree fetch error has already been shown.
     /// Prevents flooding the status bar when every fetch cycle for the
     /// same repo returns an error.
@@ -230,10 +216,9 @@ pub struct App {
     /// so the poll / disconnect / snapshot-cache dance lives in one
     /// place. See `app::Metrics`.
     pub metrics: Metrics,
-    /// Set when manage/unmanage changes active repos. The main loop checks
-    /// this flag and restarts the background fetcher with the updated repo
-    /// list so newly managed repos get fetched and removed repos stop.
-    pub fetcher_repos_changed: bool,
+    /// Grouped background-fetcher flags (`repos_changed` + `disconnected`).
+    /// See `FetcherFlags`.
+    pub fetcher_flags: FetcherFlags,
     /// Tracks the `WorkItemId` of the currently selected work item so that
     /// selection survives reassembly even when display indices change.
     /// After `build_display_list`, the matching entry is found and
@@ -249,10 +234,6 @@ pub struct App {
     /// Fetch errors that could not be shown because the status bar was
     /// occupied. Drained on the next tick when `status_message` is None.
     pub pending_fetch_errors: Vec<String>,
-    /// True when the fetcher channel has disconnected unexpectedly (all
-    /// sender threads exited). Surfaced in the status bar so the user
-    /// knows background updates have stopped.
-    pub fetcher_disconnected: bool,
     /// Handle to the background fetcher threads. Used to stop the fetcher
     /// when repos change or when the app shuts down. Managed by the
     /// rat-salsa event callback in salsa.rs.

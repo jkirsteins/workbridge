@@ -144,10 +144,12 @@ pub fn handle_scroll_global(
         .and_then(|s| {
             let parser = s.parser.lock().ok()?;
             let screen = parser.screen();
-            Some((
+            let out = (
                 screen.mouse_protocol_mode(),
                 screen.mouse_protocol_encoding(),
-            ))
+            );
+            drop(parser);
+            Some(out)
         });
     if let Some((mode, encoding)) = proto
         && let Some(data) = encode_mouse_scroll(scroll_up, local_col, local_row, mode, encoding)
@@ -194,10 +196,12 @@ pub fn handle_scroll_right(app: &mut App, scroll_up: bool, local_col: u16, local
     let proto = entry_ref.filter(|s| s.alive).and_then(|s| {
         let parser = s.parser.lock().ok()?;
         let screen = parser.screen();
-        Some((
+        let out = (
             screen.mouse_protocol_mode(),
             screen.mouse_protocol_encoding(),
-        ))
+        );
+        drop(parser);
+        Some(out)
     });
     if let Some((mode, encoding)) = proto
         && let Some(data) = encode_mouse_scroll(scroll_up, local_col, local_row, mode, encoding)

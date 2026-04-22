@@ -95,28 +95,33 @@ exit = "allow"
 
 # Noise allows. Each has been judged pure noise for this crate's style.
 module_name_repetitions = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-too_many_lines = "allow"   # File-size budget is the real enforcement.
 similar_names = "allow"    # False-positive-heavy in TUI / event code.
 
-# TUI cast allows: the ratatui geometry surface is u16 width/height;
-# almost every cast the lint flags is u16<->u32<->usize arithmetic on
-# those inputs, which is safe for realistic terminal sizes.
-cast_possible_truncation = "allow"
-cast_possible_wrap = "allow"
-cast_sign_loss = "allow"
-cast_lossless = "allow"
-cast_precision_loss = "allow"
+# Doc-coverage lints: deny so new functions must document their error
+# and panic conditions.
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
 
-# Structural lints deferred until the app-module decomposition stabilises.
-# The remaining sites are concentrated in the `app` module tree and the
-# cleanup requires further structural refactoring; flip these back to warn
-# once that work lands.
-needless_pass_by_value = "allow"
-significant_drop_tightening = "allow"
-struct_excessive_bools = "allow"
-unused_self = "allow"
+# Function size: deny so overly-long functions have to be decomposed
+# (same philosophy as the 700-line file budget, one level down).
+too_many_lines = "deny"
+
+# Cast lints: deny so every cast between integer widths is deliberate.
+# Legitimate casts of u16 ratatui geometry to larger widths are always
+# safe and can use `u32::from(...)` / `usize::from(...)` instead of `as`.
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+cast_lossless = "deny"
+cast_precision_loss = "deny"
+
+# Structural lints: deny so unnecessary owned pass-by-value, premature
+# drop tightening, boolean-bag structs, and unused-self methods are all
+# surfaced as review friction rather than silently accumulating.
+needless_pass_by_value = "deny"
+significant_drop_tightening = "deny"
+struct_excessive_bools = "deny"
+unused_self = "deny"
 
 [lints.rustdoc]
 # No existing crate-level docs to break; safe to deny from day one.

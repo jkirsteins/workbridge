@@ -337,11 +337,11 @@ fn delete_cleans_up_memory_state() {
     app.review_gate_findings
         .insert(wi_id.clone(), "some findings".into());
     app.no_plan_prompt_queue.push_back(wi_id.clone());
-    app.no_plan_prompt_visible = true;
+    app.prompt_flags.no_plan_visible = true;
     app.rework_prompt_wi = Some(wi_id.clone());
-    app.rework_prompt_visible = true;
+    app.prompt_flags.rework_visible = true;
     app.merge_wi_id = Some(wi_id);
-    app.confirm_merge = true;
+    app.merge_flow.confirm = true;
 
     // Select and delete.
     let work_item_idx = app
@@ -368,7 +368,7 @@ fn delete_cleans_up_memory_state() {
         "no_plan_prompt_queue should be empty after delete"
     );
     assert!(
-        !app.no_plan_prompt_visible,
+        !app.prompt_flags.no_plan_visible,
         "no_plan_prompt_visible should be false after delete"
     );
     assert!(
@@ -376,7 +376,7 @@ fn delete_cleans_up_memory_state() {
         "rework_prompt_wi should be None after delete"
     );
     assert!(
-        !app.rework_prompt_visible,
+        !app.prompt_flags.rework_visible,
         "rework_prompt_visible should be false after delete"
     );
     assert!(
@@ -384,7 +384,7 @@ fn delete_cleans_up_memory_state() {
         "merge_wi_id should be None after delete"
     );
     assert!(
-        !app.confirm_merge,
+        !app.merge_flow.confirm,
         "confirm_merge should be false after delete"
     );
 }

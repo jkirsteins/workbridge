@@ -368,7 +368,7 @@ impl super::App {
             return;
         };
         let Some(assoc) = wi.repo_associations.first() else {
-            self.confirm_merge = false;
+            self.merge_flow.confirm = false;
             self.merge_wi_id = None;
             self.alert_message = Some("Cannot merge: no repo association".into());
             return;
@@ -376,7 +376,7 @@ impl super::App {
         let branch = if let Some(b) = assoc.branch.as_ref() {
             b.clone()
         } else {
-            self.confirm_merge = false;
+            self.merge_flow.confirm = false;
             self.merge_wi_id = None;
             self.alert_message = Some("Cannot merge: no branch associated".into());
             return;
@@ -391,7 +391,7 @@ impl super::App {
             .get(&repo_path)
             .and_then(|rd| rd.github_remote.clone())
         else {
-            self.confirm_merge = false;
+            self.merge_flow.confirm = false;
             self.merge_wi_id = None;
             self.alert_message =
                 Some("Cannot merge: GitHub remote not yet cached (waiting for next fetch)".into());
@@ -433,7 +433,7 @@ impl super::App {
         // request...". The renderer in `src/ui.rs` keys off
         // `App::is_merge_precheck_phase()` to pick the right body,
         // which checks the helper slot's `UserActionPayload` variant.
-        self.merge_in_progress = true;
+        self.merge_flow.in_progress = true;
 
         self.spawn_merge_precheck(
             wi_id.clone(),

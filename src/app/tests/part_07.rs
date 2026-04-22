@@ -206,7 +206,7 @@ fn advance_stage_review_to_done_opens_modal_when_cache_dirty() {
     app.advance_stage();
 
     assert!(
-        app.confirm_merge,
+        app.merge_flow.confirm,
         "merge modal must open even when cache says dirty - the live precheck in execute_merge is the only authority",
     );
     assert_eq!(
@@ -253,7 +253,7 @@ fn advance_stage_review_to_done_opens_modal_when_cache_untracked() {
 
     app.advance_stage();
 
-    assert!(app.confirm_merge);
+    assert!(app.merge_flow.confirm);
     assert!(app.alert_message.is_none(), "{:?}", app.alert_message);
 }
 
@@ -278,7 +278,7 @@ fn advance_stage_review_to_done_opens_modal_when_cache_unpushed() {
 
     app.advance_stage();
 
-    assert!(app.confirm_merge);
+    assert!(app.merge_flow.confirm);
     assert!(app.alert_message.is_none(), "{:?}", app.alert_message);
 }
 
@@ -303,7 +303,7 @@ fn advance_stage_review_to_done_allows_behind_only() {
     app.advance_stage();
 
     assert!(
-        app.confirm_merge,
+        app.merge_flow.confirm,
         "BehindOnly must fall through to the merge modal",
     );
     assert!(
@@ -333,7 +333,10 @@ fn advance_stage_review_to_done_allows_clean() {
 
     app.advance_stage();
 
-    assert!(app.confirm_merge, "clean worktree must open merge modal");
+    assert!(
+        app.merge_flow.confirm,
+        "clean worktree must open merge modal"
+    );
     assert!(app.alert_message.is_none());
 }
 
@@ -380,7 +383,7 @@ fn execute_merge_with_stale_dirty_cache_admits_precheck_slot() {
     push_selected_review_item(&mut app, &wi_id, &repo, branch);
     // Open the merge modal so we can verify it stays open across the
     // precheck transition.
-    app.confirm_merge = true;
+    app.merge_flow.confirm = true;
     app.merge_wi_id = Some(wi_id.clone());
 
     app.execute_merge(&wi_id, "squash");
@@ -395,7 +398,7 @@ fn execute_merge_with_stale_dirty_cache_admits_precheck_slot() {
         "execute_merge must admit the PrMerge slot for the precheck phase",
     );
     assert!(
-        app.merge_in_progress,
+        app.merge_flow.in_progress,
         "merge_in_progress must be set so the modal spinner renders during precheck",
     );
     assert!(
@@ -403,7 +406,7 @@ fn execute_merge_with_stale_dirty_cache_admits_precheck_slot() {
         "spawn_merge_precheck must attach a PrMergePrecheck payload",
     );
     assert!(
-        app.confirm_merge,
+        app.merge_flow.confirm,
         "merge confirm modal must stay open across the precheck transition",
     );
 }
@@ -423,8 +426,8 @@ fn poll_merge_precheck_ready_hands_off_without_alert() {
     // execute_merge does immediately before spawn_merge_precheck.
     app.try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging PR...")
         .expect("helper admit should succeed in test setup");
-    app.merge_in_progress = true;
-    app.confirm_merge = true;
+    app.merge_flow.in_progress = true;
+    app.merge_flow.confirm = true;
     app.merge_wi_id = Some(wi_id.clone());
 
     // Inject a Ready message via a synthetic channel - skips the
@@ -455,11 +458,11 @@ fn poll_merge_precheck_ready_hands_off_without_alert() {
         "Ready hand-off must keep the PrMerge slot reserved for the merge thread",
     );
     assert!(
-        app.merge_in_progress,
+        app.merge_flow.in_progress,
         "merge_in_progress must stay true while the merge thread runs",
     );
     assert!(
-        app.confirm_merge,
+        app.merge_flow.confirm,
         "merge confirm modal must stay open while the merge thread runs",
     );
     assert!(
@@ -479,8 +482,8 @@ fn poll_merge_precheck_blocked_releases_slot_and_alerts() {
 
     app.try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging PR...")
         .expect("helper admit should succeed in test setup");
-    app.merge_in_progress = true;
-    app.confirm_merge = true;
+    app.merge_flow.in_progress = true;
+    app.merge_flow.confirm = true;
     app.merge_wi_id = Some(wi_id);
 
     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -503,8 +506,8 @@ fn poll_merge_precheck_blocked_releases_slot_and_alerts() {
         !app.is_merge_precheck_phase(),
         "the precheck payload must be gone after Blocked",
     );
-    assert!(!app.merge_in_progress);
-    assert!(!app.confirm_merge);
+    assert!(!app.merge_flow.in_progress);
+    assert!(!app.merge_flow.confirm);
     assert!(app.merge_wi_id.is_none());
     let msg = app.alert_message.as_deref().unwrap_or("");
     assert!(
@@ -543,8 +546,8 @@ fn retreat_stage_drops_merge_precheck_payload() {
     // never-completing receiver.
     app.try_begin_user_action(UserActionKey::PrMerge, Duration::ZERO, "Merging PR...")
         .expect("helper admit should succeed in test setup");
-    app.merge_in_progress = true;
-    app.confirm_merge = true;
+    app.merge_flow.in_progress = true;
+    app.merge_flow.confirm = true;
     app.merge_wi_id = Some(wi_id.clone());
     let (_tx_keep_alive, rx) = crossbeam_channel::bounded::<MergePreCheckMessage>(1);
     app.attach_user_action_payload(
@@ -562,7 +565,7 @@ fn retreat_stage_drops_merge_precheck_payload() {
         !app.is_merge_precheck_phase(),
         "releasing the slot must structurally drop the precheck payload",
     );
-    assert!(!app.merge_in_progress);
-    assert!(!app.confirm_merge);
+    assert!(!app.merge_flow.in_progress);
+    assert!(!app.merge_flow.confirm);
     assert!(app.merge_wi_id.is_none());
 }

@@ -540,7 +540,7 @@ fn poll_worktree_creation_clears_stale_recovery_on_success() {
     );
 
     let wi_id = WorkItemId::LocalFile(PathBuf::from("/tmp/recovery-test.json"));
-    app.stale_recovery_in_progress = true;
+    app.prompt_flags.stale_recovery_in_progress = true;
     app.stale_worktree_prompt = Some(StaleWorktreePrompt {
         wi_id: wi_id.clone(),
         error: "test error".into(),
@@ -588,7 +588,7 @@ fn poll_worktree_creation_clears_stale_recovery_on_success() {
     app.poll_worktree_creation();
 
     assert!(
-        !app.stale_recovery_in_progress,
+        !app.prompt_flags.stale_recovery_in_progress,
         "stale_recovery_in_progress must be cleared after successful recovery",
     );
     assert!(

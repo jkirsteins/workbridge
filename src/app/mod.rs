@@ -321,6 +321,7 @@ mod cleanup;
 mod click_tracking;
 mod display_list;
 mod fetcher_bridge;
+mod flags;
 mod gate_polling;
 mod global_drawer;
 mod global_drawer_polling;
@@ -359,6 +360,7 @@ mod worktree_and_first_run;
 // submodules keep resolving without changing the import shape.
 pub use activities::*;
 pub use click_tracking::*;
+pub use flags::*;
 pub use global_drawer::*;
 pub use helpers::*;
 pub use metrics::*;

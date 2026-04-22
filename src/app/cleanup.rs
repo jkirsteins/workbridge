@@ -60,7 +60,7 @@ impl super::App {
 
         // Transition to in-progress: clear the input fields but keep the dialog
         // open. The UI renders a spinner + "Please wait." instead of key options.
-        self.cleanup_reason_input_active = false;
+        self.cleanup_flow.reason_input_active = false;
         self.cleanup_reason_input.clear();
         self.cleanup_progress_pr_number = Some(pr_number);
         self.cleanup_progress_repo_path = Some(repo_path.clone());
@@ -213,7 +213,7 @@ impl super::App {
         };
         let Ok(result) = recv_result else {
             self.end_user_action(&UserActionKey::UnlinkedCleanup);
-            self.cleanup_prompt_visible = false;
+            self.cleanup_flow.prompt_visible = false;
             self.cleanup_progress_pr_number = None;
             self.cleanup_progress_repo_path = None;
             self.cleanup_progress_branch = None;
@@ -222,7 +222,7 @@ impl super::App {
         };
 
         self.end_user_action(&UserActionKey::UnlinkedCleanup);
-        self.cleanup_prompt_visible = false;
+        self.cleanup_flow.prompt_visible = false;
 
         // Track the closed branch so stale fetch results (from in-flight
         // fetches that started before the close) don't re-add the PR.
@@ -239,7 +239,7 @@ impl super::App {
 
         self.reassemble_work_items();
         self.build_display_list();
-        self.fetcher_repos_changed = true;
+        self.fetcher_flags.repos_changed = true;
 
         if result.warnings.is_empty() {
             self.shell.status_message = Some("Unlinked item closed".into());
@@ -343,7 +343,7 @@ impl super::App {
             // still gates modal rendering and key input in the
             // current code, so both flags must clear together on
             // the rejection arm.
-            self.delete_in_progress = false;
+            self.delete_flow.in_progress = false;
             self.alert_message = Some(
                 "Delete cleanup skipped: a previous cleanup is still in progress. \
                  Worktrees, branches, and open PRs for this item may need manual cleanup."
@@ -585,9 +585,9 @@ impl super::App {
         let Ok(result) = recv_result else {
             self.end_user_action(&UserActionKey::DeleteCleanup);
             let sync_warnings = std::mem::take(&mut self.delete_sync_warnings);
-            if self.delete_in_progress {
-                self.delete_in_progress = false;
-                self.delete_prompt_visible = false;
+            if self.delete_flow.in_progress {
+                self.delete_flow.in_progress = false;
+                self.delete_flow.prompt_visible = false;
                 self.delete_target_wi_id = None;
                 self.delete_target_title = None;
             }
@@ -609,7 +609,7 @@ impl super::App {
         // Drain delete_sync_warnings so Phase 2/Phase 5 warnings collected
         // on the UI thread (e.g. pre-delete hook failure, inline orphan
         // worktree cleanup) are folded into the final status/alert.
-        if self.delete_in_progress {
+        if self.delete_flow.in_progress {
             let sync_warnings = std::mem::take(&mut self.delete_sync_warnings);
             self.finish_delete_cleanup(result.warnings, result.closed_pr_branches, sync_warnings);
             return;

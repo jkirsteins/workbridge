@@ -326,7 +326,7 @@ impl super::App {
             Ok(_record) => {
                 self.reassemble_work_items();
                 self.build_display_list();
-                self.fetcher_repos_changed = true;
+                self.fetcher_flags.repos_changed = true;
                 self.shell.status_message = Some(format!("Created: {title}"));
                 Ok(())
             }
@@ -368,7 +368,7 @@ impl super::App {
             Ok(record) => {
                 let wi_id = record.id;
                 self.reassemble_work_items();
-                self.fetcher_repos_changed = true;
+                self.fetcher_flags.repos_changed = true;
                 // Set identity so build_display_list restores selection.
                 self.selected_work_item = Some(wi_id.clone());
                 self.build_display_list();
@@ -407,7 +407,7 @@ impl super::App {
             Ok(record) => {
                 let wi_id = record.id;
                 self.reassemble_work_items();
-                self.fetcher_repos_changed = true;
+                self.fetcher_flags.repos_changed = true;
                 self.selected_work_item = Some(wi_id.clone());
                 self.build_display_list();
                 self.spawn_session(&wi_id);
@@ -548,7 +548,7 @@ impl super::App {
             }
             self.reassemble_work_items();
             self.build_display_list();
-            self.fetcher_repos_changed = true;
+            self.fetcher_flags.repos_changed = true;
         }
 
         // Re-drive the pending action that opened the dialog.
@@ -594,14 +594,14 @@ impl super::App {
         let title = target.title.clone();
         self.delete_target_wi_id = Some(work_item_id);
         self.delete_target_title = Some(title);
-        self.delete_prompt_visible = true;
+        self.delete_flow.prompt_visible = true;
     }
 
     /// Dismiss the delete confirmation modal without deleting anything.
     /// Safe to call when the modal is not visible; it just clears any
     /// residual target state.
     pub fn cancel_delete_prompt(&mut self) {
-        self.delete_prompt_visible = false;
+        self.delete_flow.prompt_visible = false;
         self.delete_target_wi_id = None;
         self.delete_target_title = None;
     }

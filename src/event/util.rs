@@ -42,17 +42,17 @@ pub fn is_ctrl_symbol(key: KeyEvent, symbol: char) -> bool {
 pub fn any_modal_visible(app: &App) -> bool {
     app.create_dialog.visible
         || app.settings.visible
-        || app.rework_prompt_visible
-        || app.no_plan_prompt_visible
+        || app.prompt_flags.rework_visible
+        || app.prompt_flags.no_plan_visible
         || app.branch_gone_prompt.is_some()
         || app.stale_worktree_prompt.is_some()
-        || app.stale_recovery_in_progress
-        || app.confirm_merge
-        || app.cleanup_prompt_visible
+        || app.prompt_flags.stale_recovery_in_progress
+        || app.merge_flow.confirm
+        || app.cleanup_flow.prompt_visible
         || app.is_user_action_in_flight(&UserActionKey::UnlinkedCleanup)
-        || app.merge_in_progress
-        || app.delete_prompt_visible
-        || app.delete_in_progress
+        || app.merge_flow.in_progress
+        || app.delete_flow.prompt_visible
+        || app.delete_flow.in_progress
         || app.alert_message.is_some()
         || app.set_branch_dialog.is_some()
 }

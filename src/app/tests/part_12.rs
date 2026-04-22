@@ -527,7 +527,7 @@ pub fn drain_worktree_creation(app: &mut App) {
 pub fn drain_delete_cleanup(app: &mut App) {
     for _ in 0..6_000 {
         app.poll_delete_cleanup();
-        if !app.delete_in_progress {
+        if !app.delete_flow.in_progress {
             return;
         }
         crate::side_effects::clock::sleep(std::time::Duration::from_millis(1));

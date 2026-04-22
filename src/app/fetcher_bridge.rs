@@ -131,15 +131,15 @@ impl super::App {
                     if let Err(ref e) = result.prs {
                         match e {
                             GithubError::CliNotFound => {
-                                if !self.gh_cli_not_found_shown {
-                                    self.gh_cli_not_found_shown = true;
+                                if !self.gh_status.cli_not_found_shown {
+                                    self.gh_status.cli_not_found_shown = true;
                                     self.shell.status_message =
                                         Some("gh CLI not found - GitHub features disabled".into());
                                 }
                             }
                             GithubError::AuthRequired => {
-                                if !self.gh_auth_required_shown {
-                                    self.gh_auth_required_shown = true;
+                                if !self.gh_status.auth_required_shown {
+                                    self.gh_status.auth_required_shown = true;
                                     self.shell.status_message =
                                         Some("gh auth required - run 'gh auth login'".into());
                                 }
@@ -196,8 +196,8 @@ impl super::App {
             }
         }
 
-        if disconnected && !self.fetcher_disconnected {
-            self.fetcher_disconnected = true;
+        if disconnected && !self.fetcher_flags.disconnected {
+            self.fetcher_flags.disconnected = true;
             let msg = "Background fetcher stopped unexpectedly".to_string();
             if self.shell.status_message.is_none() {
                 self.shell.status_message = Some(msg);
@@ -523,7 +523,7 @@ impl super::App {
             // store their receivers structurally inside the helper
             // entry, so no sibling clears are required.
             self.end_user_action(&UserActionKey::PrMerge);
-            self.merge_in_progress = false;
+            self.merge_flow.in_progress = false;
         }
         if self.user_action_work_item(&UserActionKey::ReviewSubmit) == Some(wi_id) {
             self.end_user_action(&UserActionKey::ReviewSubmit);
@@ -540,15 +540,15 @@ impl super::App {
         self.review_reopen_suppress.remove(wi_id);
         self.no_plan_prompt_queue.retain(|id| id != wi_id);
         if self.no_plan_prompt_queue.is_empty() {
-            self.no_plan_prompt_visible = false;
+            self.prompt_flags.no_plan_visible = false;
         }
         if self.rework_prompt_wi.as_ref() == Some(wi_id) {
             self.rework_prompt_wi = None;
-            self.rework_prompt_visible = false;
+            self.prompt_flags.rework_visible = false;
         }
         if self.merge_wi_id.as_ref() == Some(wi_id) {
             self.merge_wi_id = None;
-            self.confirm_merge = false;
+            self.merge_flow.confirm = false;
         }
         self.drop_review_gate(wi_id);
         // The rebase gate was already torn down in Phase 1 via
