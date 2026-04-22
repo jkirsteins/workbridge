@@ -3,10 +3,12 @@
 ## Purpose
 
 Workbridge drives an external LLM coding harness to make progress on
-work items. Today there is exactly one harness in use (`claude`), wired
-directly into the `app`, `session`, and `mcp` modules. That
-makes the harness surface invisible: the only way to understand what
-workbridge expects from a harness is to read every call site.
+work items. Two harnesses are wired through the `agent_backend` module
+tree today: Claude Code (`claude`, the reference adapter) and Codex
+(`codex`, a real production adapter selectable per work item and as the
+global-assistant harness). A third stub (`opencode`) exists in the
+`agent_backend` factory but is intentionally excluded from every
+user-facing selection path and is not a production adapter.
 
 This document is the single authoritative spec for what **any** LLM
 harness must do to be plugged into workbridge. It is written in
@@ -14,10 +16,14 @@ harness-neutral language (the clauses say "harness", not "claude") so
 that a future second or third harness can be added by satisfying the
 clauses rather than by copying `claude`-specific behaviour.
 
-The reference implementation is `claude`. A secondary, not-implemented
-target (`codex`) is used as a sanity check that the contract is
-harness-neutral. If a clause cannot be written without naming a vendor,
-the clause is wrong.
+The reference implementation is `claude`: the contract text is written
+against it, and every clause cites its spawn sites and argv builders by
+Rust identifier. `codex` is the implemented secondary adapter that
+stress-tests the contract's harness-neutrality in production; the
+`codex_shape_compiles` test in the `agent_backend::codex::tests` module
+additionally forces the trait surface itself to stay harness-neutral on
+every `cargo test` run. If a clause cannot be written without naming a
+vendor, the clause is wrong.
 
 ## Scope
 
@@ -393,8 +399,8 @@ whole point of the modal).
 ## Implementation Map
 
 Each subsection cites the reference implementation by Rust module
-path / identifier and gives a one-paragraph assessment for the Codex
-secondary target. The
+path / identifier and gives a one-paragraph assessment for the
+implemented Codex adapter. The
 Codex column is marked **supported** (clause is satisfiable with
 documented CLI flags), **workaround** (clause needs a shim or
 non-obvious config), or **not supported** (clause cannot be met with
@@ -428,7 +434,7 @@ the `claude` binary name directly except via
 field is retained for test stubs and non-spawn helpers but is NOT
 consulted by any spawn path.
 
-**Codex (secondary, not implemented)**: **supported**. Interactive
+**Codex (implemented)**: **supported**. Interactive
 corresponds to plain `codex`; headless corresponds to `codex exec
 --json` (non-interactive mode with a newline-delimited event
 stream). The review gate would need a final-message extractor
@@ -458,7 +464,7 @@ child) but the harness child for `claude --print` is spawned with
 the default cwd because the gate only needs MCP access to fetch the
 plan.
 
-**Codex (secondary, not implemented)**: **supported**. Codex accepts
+**Codex (implemented)**: **supported**. Codex accepts
 a `--cd <path>` flag as well as inheriting the parent's cwd; either
 works. No clause violation.
 
@@ -589,7 +595,7 @@ only the 4 read-only tools (see the `tools/list` handling in the
 `mcp` module and the `read_only_mode_exposes_only_read_tools` test in
 the `mcp` module).
 
-**Codex (secondary, not implemented)**: **workaround**. Codex does
+**Codex (implemented)**: **workaround**. Codex does
 not expose a fine-grained MCP tool allowlist at the CLI level; its
 closest concepts are `--sandbox` (filesystem/network policy) and
 `--approval-policy`. A Codex adapter would have to rely on the
@@ -616,10 +622,12 @@ threaded into `SpawnConfig::system_prompt`, and
 `ClaudeCodeBackend::build_review_gate_command` forwards via the
 same flag.
 
-**Codex (secondary, not implemented)**: **workaround**. Codex does
-not have a dedicated `--system-prompt` flag. The harness-neutral
-escape hatch is to prepend the stage prompt as an initial user
-message (via stdin or the positional prompt argument). This is
+**Codex (implemented)**: **workaround**. Codex does
+not have a dedicated `--system-prompt` flag. `CodexBackend::build_command`
+delivers the stage prompt via `--config instructions=<prompt>`
+(TOML-quoted so prompts with special characters survive Codex's
+TOML parser). The review gate builder reuses the same mechanism
+through `CodexBackend::build_review_gate_command`. This is
 observably different from a true system-prompt because the model
 may treat it as lower priority, but the clause (per-stage prompt
 injection at spawn time) is still met.
@@ -640,7 +648,7 @@ the `agent_backend` module. Blocked sessions and Review sessions
 without gate findings receive `auto_start_message: None` and the
 backend appends nothing.
 
-**Codex (secondary, not implemented)**: **supported**. Codex accepts
+**Codex (implemented)**: **supported**. Codex accepts
 an initial prompt as a positional argument in interactive mode and
 as the `-p` / stdin payload in `codex exec`. No clause violation.
 
@@ -658,14 +666,15 @@ and, if missing, writes a reminder to stderr so Claude sees it on
 the next turn. Non-Planning stages use only the system-prompt-
 embedded reminder from the templates in the `prompts` module.
 
-**Codex (secondary, not implemented)**: **workaround**. Codex does
+**Codex (implemented)**: **workaround**. Codex does
 not have a hook system matching Claude Code's `PostToolUse`
-matcher. The fallback is to embed the reminder into the system
-prompt (or the initial user message under C6) and rely on the
-model to comply. C8 is explicit that the delivery mechanism is
-unspecified, so this is a valid adapter choice, but it is strictly
-weaker than the hook-based reminder because it cannot re-fire after
-the first turn.
+matcher. `CodexBackend` embeds the reminder into the stage prompt
+that C6 delivers via `--config instructions=<prompt>` (the caller
+renders the Planning template with the reminder text baked in) and
+relies on the model to comply. C8 is explicit that the delivery
+mechanism is unspecified, so this is a valid adapter choice, but it
+is strictly weaker than the hook-based reminder because it cannot
+re-fire after the first turn.
 
 ### C9 - Output capture
 
@@ -683,7 +692,7 @@ Moving the parsing into the backend lets a second harness (e.g.
 Codex `exec --json`) do its own event-stream extraction before
 returning a `ReviewGateVerdict`.
 
-**Codex (secondary, not implemented)**: **supported**. Interactive
+**Codex (implemented)**: **supported**. Interactive
 mode produces a byte stream on the PTY exactly like any other CLI.
 For headless, `codex exec --json` emits a stream of events rather
 than one final document; an adapter would keep only the last
@@ -720,7 +729,7 @@ drains any buffered keystrokes - symmetric with the work-item
 cleanup path so new global-assistant state cannot leak across
 opens.
 
-**Codex (secondary, not implemented)**: **supported**. The
+**Codex (implemented)**: **supported**. The
 lifecycle contract is a POSIX process-group protocol, not a
 harness-specific one. As long as Codex does not install a SIGTERM
 handler that swallows the signal (it does not, as of the public CLI
@@ -737,7 +746,7 @@ mutating `tools/call`. The unit tests
 `read_only_mode_rejects_mutating_tool_calls` (in the `mcp` module)
 pin the contract.
 
-**Codex (secondary, not implemented)**: **supported**. Read-only
+**Codex (implemented)**: **supported**. Read-only
 enforcement is entirely inside the workbridge MCP server, which is
 harness-agnostic. A Codex adapter just sets the same flag.
 
@@ -757,7 +766,7 @@ every drawer open via `App::toggle_global_drawer` calling
 see also `docs/UI.md` "Global assistant
 drawer session lifetime".
 
-**Codex (secondary, not implemented)**: **supported**. Identity is
+**Codex (implemented)**: **supported**. Identity is
 owned by workbridge; the harness only needs to exit when signalled.
 A Codex adapter that uses Codex's own session-resume feature MUST
 defeat it at spawn time so workbridge's fresh-session invariant is
