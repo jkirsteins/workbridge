@@ -370,7 +370,7 @@ CLAUDE.md `[ABSOLUTE]` "Session titles downstream of live harness
 state"). Adding a new adapter does not change this rule: the
 single source of truth for display-name rendering is
 `App::agent_backend_display_name`, which does
-not consult the static `self.agent_backend`.
+not consult the static `self.services.agent_backend`.
 
 Adapters themselves MUST NOT:
 - Inject their vendor name into prompt text, status messages, or
@@ -412,10 +412,21 @@ worker thread, which runs the argv produced by
 `ClaudeCodeBackend::build_review_gate_command` in
 the `agent_backend` module (yielding `claude --print --output-format
 json --json-schema ...`) via `std::process::Command::output()`. The
-backend is selected through the `Arc<dyn AgentBackend>` stored on
-`App::agent_backend`; the spawn sites call the trait methods and
-never reference the `claude` binary name directly except via
-`AgentBackend::command_name`.
+backend used by each spawn site is resolved per call: work-item,
+review-gate, and rebase-gate spawns look up
+`App::backend_for_work_item(wi_id)` - which reads the per-item
+`harness_choice: HashMap<WorkItemId, AgentBackendKind>` map and
+returns `Some(agent_backend::backend_for_kind(kind))` or `None` -
+and fail closed with a user-visible toast if absent; global-
+assistant spawns resolve `agent_backend::backend_for_kind` from
+`self.global_assistant_harness_kind()` (backed by
+`config.defaults.global_assistant_harness`). The resolved
+`Arc<dyn AgentBackend>` exposes `command_name` / `build_command` /
+etc.; the spawn sites call the trait methods and never reference
+the `claude` binary name directly except via
+`AgentBackend::command_name`. The `App::services::agent_backend`
+field is retained for test stubs and non-spawn helpers but is NOT
+consulted by any spawn path.
 
 **Codex (secondary, not implemented)**: **supported**. Interactive
 corresponds to plain `codex`; headless corresponds to `codex exec
@@ -979,19 +990,39 @@ pub trait AgentBackend: Send + Sync {
 }
 ```
 
-The four spawn sites consume this trait via `App::agent_backend:
-Arc<dyn AgentBackend>`:
+The four spawn sites resolve the backend per call - there is no
+singleton resolver. Work-item, review-gate, and rebase-gate spawns
+read the per-item `harness_choice: HashMap<WorkItemId,
+AgentBackendKind>` via `App::backend_for_work_item(wi_id) ->
+Option<Arc<dyn AgentBackend>>` and fail closed with a user-visible
+toast on `None` (no silent default). The global-assistant spawn
+resolves `agent_backend::backend_for_kind(kind)` where `kind` comes
+from `App::global_assistant_harness_kind()` (reading
+`config.defaults.global_assistant_harness`). The
+`App::services::agent_backend` field still exists but is retained
+for test stubs and non-spawn helpers - it is NOT consulted by any
+spawn path:
 
-- `App::finish_session_open` builds an interactive work-item spawn
-  via `App::build_agent_cmd` (thin wrapper) -> `build_command`.
-- The review-gate thread in `App::run_review_gate` (spawned from
-  `review_gates` handling) clones `agent_backend` and calls
-  `build_review_gate_command` + `parse_review_gate_stdout`.
-- `App::spawn_rebase_gate`'s compute thread calls
-  `build_headless_rw_command` with the rebase prompt and MCP
-  bridge spec.
-- `App::spawn_global_session` calls `build_command` directly with
-  `stage: Implementing` and `auto_start_message: None`.
+- `App::finish_session_open` resolves the backend via
+  `self.backend_for_work_item(&wi_id)` and bails with the
+  "Cannot open session: no harness chosen..." toast if the entry
+  is missing; on `Some`, it builds an interactive work-item spawn
+  via `App::build_agent_cmd_with(wi_backend.as_ref(), ...)` (a
+  thin wrapper over `AgentBackend::build_command`).
+- `App::spawn_review_gate` resolves the backend via
+  `self.backend_for_work_item(wi_id)` and bails on `None`; the
+  worker thread it spawns calls `build_review_gate_command` +
+  `parse_review_gate_stdout` on the resolved trait object.
+- `App::spawn_rebase_gate` resolves the backend via
+  `self.backend_for_work_item(&wi_id)` and bails on `None`; the
+  compute thread calls `build_review_gate_command` on the
+  resolved trait object with the rebase prompt and MCP bridge
+  spec (the rebase gate is a headless RW flow sharing the
+  review-gate argv builder).
+- `App::spawn_global_session` resolves the backend via
+  `agent_backend::backend_for_kind(self.global_assistant_harness_kind()?)`
+  and calls `build_command` with `stage: Implementing` and
+  `auto_start_message: None`.
 
 The checklist for provider-agnosticism is enforced by the review
 policy rule in `CLAUDE.md` ("Code that touches harness invocation...
@@ -1036,11 +1067,16 @@ the UI thread builds the command (pure CPU). The global worker is
 All four sites go through `Session::spawn` for
 the interactive path or `std::process::Command::output()` directly
 for the headless path; argv is built by
-`ClaudeCodeBackend::build_command` / `::build_review_gate_command` in
-the `agent_backend` module via `self.agent_backend` - no spawn site
-constructs a Claude-specific argv inline. `App::build_agent_cmd`
-is the thin wrapper the work-item and global
-spawn sites call. Global assistant teardown lives in
+`ClaudeCodeBackend::build_command` / `::build_review_gate_command`
+in the `agent_backend` module on the per-call-resolved
+`Arc<dyn AgentBackend>` (from `App::backend_for_work_item` for the
+work-item / review-gate / rebase-gate paths, or from
+`agent_backend::backend_for_kind` + `global_assistant_harness_kind`
+for the global path) - no spawn site constructs a Claude-specific
+argv inline and no spawn site consults the singleton
+`App::services::agent_backend`. `App::build_agent_cmd_with` is the
+thin wrapper the work-item and global spawn sites call on the
+resolved trait object. Global assistant teardown lives in
 `App::teardown_global_session`; see C10 and C12
 for why each drawer open spawns a fresh session and each close
 fully tears it down. Teardown drops any in-flight
