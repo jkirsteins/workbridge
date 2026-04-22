@@ -1,6 +1,11 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    AgentBackendKind, App, Arc, BackendType, Config, CountingPlanBackend, PathBuf,
+    ReviewGateMessage, ReviewGateOrigin, ReviewGateResult, StubBackend, StubWorktreeService,
+    WorkItemBackend, WorkItemId, WorkItemStatus, WorktreeService, app_with_work_item,
+    insert_test_review_gate,
+};
 
 #[test]
 fn stage_transition_without_harness_choice_surfaces_error() {

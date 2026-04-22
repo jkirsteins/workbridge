@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use super::*;
+use super::{ActivityId, FocusPanel};
 use crate::mcp::McpSocketServer;
 use crate::session::Session;
 use crate::work_item::{WorkItemId, WorkItemStatus};

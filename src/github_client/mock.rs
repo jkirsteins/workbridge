@@ -107,7 +107,8 @@ impl GithubClient for MockGithubClient {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::{GithubClient, GithubError, GithubIssue, GithubPr};
+    use super::MockGithubClient;
 
     #[test]
     fn mock_client_returns_fixture_prs() {

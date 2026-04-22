@@ -9,7 +9,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::*;
+use super::{
+    ReviewGateMessage, ReviewGateOrigin, ReviewGateResult, ReviewGateSpawn, ReviewGateState,
+};
 use crate::agent_backend::{AgentBackendKind, ReviewGateSpawnConfig};
 use crate::work_item::{CheckStatus, WorkItemId};
 

@@ -63,9 +63,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::super::{
-        McpBridgeSpec, ReviewGateSpawnConfig, SpawnConfig, WORK_ITEM_ALLOWED_TOOLS,
+        AgentBackend, AgentBackendKind, McpBridgeSpec, ReviewGateSpawnConfig, SpawnConfig,
+        WORK_ITEM_ALLOWED_TOOLS,
     };
-    use super::*;
+    use super::OpenCodeBackend;
     use crate::work_item::WorkItemStatus;
 
     fn fake_bridge() -> McpBridgeSpec {

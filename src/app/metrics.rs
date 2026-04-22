@@ -90,7 +90,7 @@ impl Metrics {
 mod tests {
     use crossbeam_channel::unbounded;
 
-    use super::*;
+    use super::{Metrics, MetricsSnapshot};
 
     fn empty_snapshot() -> MetricsSnapshot {
         MetricsSnapshot::default()

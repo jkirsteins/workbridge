@@ -1,6 +1,9 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    App, Arc, Config, PathBuf, SessionEntry, UserActionKey, WorkItemBackend, WorkItemId,
+    WorkItemStatus, wait_until_file_removed,
+};
 
 // -- Branch invariant + "Set branch name" recovery dialog --
 

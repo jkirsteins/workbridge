@@ -1,6 +1,10 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    App, Arc, BackendType, Config, Duration, LivePrPrecheckSpec, PathBuf, StubBackend,
+    UserActionKey, WorkItemId, WorkItemStatus, WorktreeService,
+    install_cached_repo_with_cleanliness, push_selected_review_item,
+};
 
 /// Helper to build an `App` with both a clean-worktree stub and a
 /// configurable `MockGithubClient` driving the

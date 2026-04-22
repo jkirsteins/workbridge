@@ -84,7 +84,7 @@ impl Default for GlobalDrawer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::GlobalDrawer;
 
     #[test]
     fn new_global_drawer_is_closed() {

@@ -1,6 +1,10 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    ActivityId, App, Arc, AtomicBool, BackendType, Config, DisplayEntry, Mutex, Ordering,
+    OrphanWorktree, PathBuf, RebaseGateMessage, RebaseGateState, SessionEntry, StubWorktreeService,
+    WorkItem, WorkItemBackend, WorkItemId, WorkItemStatus,
+};
 
 /// Helper: insert a work item with a worktree+branch into `app` and
 /// select it, returning the `WorkItemId`. For use by tests that need

@@ -120,8 +120,9 @@ pub(super) fn discover_git_repos_in(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod path_tests {
     use std::fs;
+    use std::path::{Path, PathBuf};
 
-    use super::*;
+    use super::{discover_git_repos_in, expand_tilde};
 
     #[test]
     fn expand_tilde_with_home() {

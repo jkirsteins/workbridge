@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use super::*;
+use super::{
+    FocusPanel, McpInjection, SessionOpenPlanResult, SessionSpawnPending, SessionSpawnResult,
+};
 use crate::agent_backend::{self, AgentBackend, AgentBackendKind};
 use crate::session::Session;
 use crate::work_item::{SessionEntry, WorkItemId, WorkItemStatus};

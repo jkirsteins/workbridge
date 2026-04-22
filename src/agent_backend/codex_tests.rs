@@ -1,9 +1,11 @@
-//! Core argv-shape tests for `CodexBackend`. See
-//! `codex_extras_tests.rs` for the rest of the suite.
+//! Core argv-shape tests for `CodexBackend`. See `codex_extras_tests.rs` for the rest.
 use std::path::PathBuf;
 
-use super::super::{McpBridgeSpec, ReviewGateSpawnConfig, SpawnConfig, WORK_ITEM_ALLOWED_TOOLS};
-use super::*;
+use super::super::{
+    AgentBackend, AgentBackendKind, McpBridgeSpec, ReviewGateSpawnConfig, SpawnConfig,
+    WORK_ITEM_ALLOWED_TOOLS,
+};
+use super::CodexBackend;
 use crate::work_item::WorkItemStatus;
 
 fn fake_bridge() -> McpBridgeSpec {
@@ -38,11 +40,9 @@ fn codex_shape_compiles() {
     };
     let argv = backend.build_command(&cfg);
     assert_eq!(argv.first().map(String::as_str), Some("codex"));
-    // Interactive write-capable Codex uses
-    // `--dangerously-bypass-approvals-and-sandbox`. The linked-
-    // worktree layout is incompatible with Codex's built-in
-    // `workspace-write` sandbox; see README "Per-harness permission
-    // model" for the full rationale.
+    // Interactive write-capable Codex uses `--dangerously-bypass-approvals-and-sandbox`.
+    // The linked-worktree layout is incompatible with Codex's built-in `workspace-write`
+    // sandbox; see README "Per-harness permission model" for the full rationale.
     assert!(
         argv.iter()
             .any(|s| s == "--dangerously-bypass-approvals-and-sandbox"),

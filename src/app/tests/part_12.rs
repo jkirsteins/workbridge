@@ -1,6 +1,11 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    ActivityId, AgentBackendKind, App, Arc, AtomicBool, BackendType, DisplayEntry, GroupHeaderKind,
+    Mutex, Ordering, PathBuf, ReviewGateMessage, ReviewGateOrigin, ReviewGateState, SessionEntry,
+    SessionOpenPending, SessionOpenPlanResult, UserActionKey, WorkItemId, WorkItemStatus,
+    wait_until_file_removed,
+};
 
 /// Regression guard for the side-car file leak on cancellation.
 /// `cancel_session_open_entry` must drain the worker's

@@ -1,7 +1,12 @@
 //! Snapshot tests: board view, dialogs, sticky header, PR-specific rendering.
 //! See `src/ui/snapshot_tests/mod.rs` for shared helpers.
 
-use super::*;
+use std::path::PathBuf;
+
+use super::{
+    App, CheckStatus, DisplayEntry, UserActionKey, ViewMode, WorkItemId, WorkItemStatus,
+    app_with_items, is_selectable, make_pr_info, make_work_item, render,
+};
 
 #[test]
 fn board_view_item_in_every_column_120x40() {

@@ -11,7 +11,9 @@
 
 use std::path::PathBuf;
 
-use super::*;
+use super::{
+    CiCheck, PrMergePollResult, PrMergePollState, PrMergeWatch, now_iso8601, spawn_gh_pr_view_poll,
+};
 use crate::work_item::{WorkItemId, WorkItemKind, WorkItemStatus};
 use crate::work_item_backend::ActivityEntry;
 

@@ -1,6 +1,10 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    AgentBackendKind, App, Arc, BackendType, McpEvent, PathBuf, ReviewGateMessage,
+    ReviewGateOrigin, ReviewGateResult, SessionEntry, WorkItemId, WorkItemStatus,
+    app_with_work_item, drain_review_gate_with_timeout, insert_test_review_gate,
+};
 
 /// Test 4: MCP `StatusUpdate` for Review on Implementing item with no plan
 /// must NOT change status to Review (gate spawn fails asynchronously),

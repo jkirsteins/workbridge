@@ -1,6 +1,9 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    ActivityEntry, App, Arc, BackendError, Config, CreateWorkItem, PathBuf, PrIdentityRecord,
+    RepoAssociationRecord, WorkItemBackend, WorkItemId, WorkItemStatus,
+};
 
 /// Structural fix for the orphan-active-log race: the rebase
 /// gate's background thread calls

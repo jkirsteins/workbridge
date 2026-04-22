@@ -11,7 +11,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::*;
+use super::{
+    RebaseGateMessage, RebaseGateState, RebaseResult, RebaseTarget, UserActionKey,
+    UserActionPayload, now_iso8601, run_cancellable,
+};
 use crate::agent_backend::AgentBackendKind;
 use crate::work_item_backend::ActivityEntry;
 

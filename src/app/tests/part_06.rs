@@ -1,6 +1,9 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    App, BackendType, DisplayEntry, MergeReadiness, PathBuf, RepoEntry, RepoSource, UnlinkedPr,
+    WorkItemId, WorkItemStatus, make_work_item,
+};
 
 #[test]
 fn display_list_unlinked_with_grouped_items() {

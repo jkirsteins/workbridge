@@ -71,7 +71,7 @@ impl Toasts {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Duration, Toasts};
 
     #[test]
     fn new_toasts_is_empty() {

@@ -64,7 +64,7 @@ impl Default for OrphanCleanup {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{OrphanCleanup, OrphanCleanupFinished};
     use crate::app::ActivityId;
 
     fn fake_activity(id: u64) -> ActivityId {

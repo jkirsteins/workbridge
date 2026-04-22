@@ -1,6 +1,11 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    App, Arc, ArchiveTestBackend, BackendType, Config, DisplayEntry, Duration, PathBuf,
+    PrIdentityRecord, PrMergeOutcome, PrMergePollResult, PrMergePollState, PrMergeResult,
+    PrMergeWatch, RepoAssociationRecord, UserActionKey, UserActionPayload, WorkItemId,
+    WorkItemStatus,
+};
 
 #[test]
 fn poll_pr_merge_no_pr_blocks_done() {

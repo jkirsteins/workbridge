@@ -155,8 +155,9 @@ pub fn route_paste_to_modal_input(app: &mut App, data: &str) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use super::*;
-    use crate::app::SettingsTab;
+    use super::{any_modal_visible, flatten_paste_for_single_line, handle_paste};
+    use crate::app::{App, FocusPanel, SettingsTab};
+    use crate::create_dialog::CreateDialogFocus;
 
     /// `flatten_paste_for_single_line` must collapse CRLF to a single
     /// space, not two. Without the explicit `\r\n` -> ` ` pass (ordered

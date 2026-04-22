@@ -260,7 +260,9 @@ impl CreateDialog {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::PathBuf;
+
+    use super::{CreateDialog, CreateDialogFocus, MAX_SLUG_LEN};
 
     // -- Dialog tests --
 

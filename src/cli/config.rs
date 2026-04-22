@@ -142,7 +142,7 @@ fn handle_config_set(args: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ConfigSetOutcome, apply_config_set, config};
     use crate::config::{ConfigProvider, InMemoryConfigProvider};
 
     fn argv(args: &[&str]) -> Vec<String> {

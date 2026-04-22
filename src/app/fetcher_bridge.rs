@@ -12,7 +12,7 @@
 
 use std::sync::mpsc;
 
-use super::*;
+use super::{OrphanWorktree, RightPanelTab, UserActionKey, UserActionPayload, now_iso8601};
 use crate::assembly;
 use crate::github_client::GithubError;
 use crate::work_item::{FetchMessage, WorkItemId, WorkItemStatus};

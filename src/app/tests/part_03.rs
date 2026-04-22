@@ -1,6 +1,10 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    ActivityEntry, App, Arc, BackendError, Config, CreateWorkItem, DisplayEntry, FetchMessage,
+    PathBuf, RepoAssociationRecord, StubBackend, WorkItemBackend, WorkItemId, WorkItemStatus,
+    WorktreeService, drain_worktree_creation,
+};
 
 // -- Round 6 regression tests --
 

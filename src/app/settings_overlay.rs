@@ -95,7 +95,7 @@ impl SettingsOverlay {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{SettingsListFocus, SettingsOverlay, SettingsTab};
 
     #[test]
     fn new_overlay_is_closed() {

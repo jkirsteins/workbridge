@@ -80,12 +80,13 @@ impl FetcherHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
-    use super::*;
+    use super::{FetchMessage, start, start_with_extra_branches};
     use crate::github_client::{GithubIssue, GithubPr, MockGithubClient};
-    use crate::worktree_service::{WorktreeError, WorktreeInfo};
+    use crate::worktree_service::{WorktreeError, WorktreeInfo, WorktreeService};
 
     /// Mock worktree service for fetcher tests.
     struct MockWorktreeService {

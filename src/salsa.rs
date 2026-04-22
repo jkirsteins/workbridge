@@ -616,7 +616,7 @@ pub fn app_error(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{App, AppError, Global, SalsaAppContext, Theme, app_error};
 
     /// F-1: `app_error` re-raises I/O errors instead of swallowing them.
     /// Terminal and poll failures must propagate so rat-salsa exits

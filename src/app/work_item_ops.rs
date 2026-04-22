@@ -14,7 +14,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::*;
+use super::{
+    DisplayEntry, QUICKSTART_TITLE, RebaseTarget, UserActionKey, UserActionPayload,
+    WorktreeCreateResult,
+};
 use crate::work_item::{WorkItemId, WorkItemKind, WorkItemStatus};
 use crate::work_item_backend::{CreateWorkItem, RepoAssociationRecord};
 

@@ -227,7 +227,13 @@ fn parse_review_decision_raw(v: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use serde_json::Value;
+
+    use super::super::super::GithubPr;
+    use super::{
+        parse_check_status_raw, parse_issue_from_value, parse_pr_from_value,
+        parse_review_decision_raw,
+    };
 
     #[test]
     fn parse_pr_all_fields_populated() {

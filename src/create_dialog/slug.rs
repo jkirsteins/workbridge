@@ -56,7 +56,7 @@ pub fn random_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{random_suffix, slugify, truncate_slug};
 
     // -- slugify tests --
 

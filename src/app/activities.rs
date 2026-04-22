@@ -104,7 +104,7 @@ impl Activities {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Activities, ActivityId};
 
     #[test]
     fn new_activities_is_empty() {

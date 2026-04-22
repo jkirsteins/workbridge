@@ -1,6 +1,11 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    App, Arc, BackendType, Config, CountingPlanBackend, Duration, GithubError,
+    MergePreCheckMessage, OrphanWorktree, PathBuf, StubBackend, StubWorktreeService, UserActionKey,
+    UserActionPayload, WorkItemBackend, WorkItemId, WorkItemStatus, WorktreeService,
+    install_cached_repo_with_cleanliness, push_selected_review_item,
+};
 
 /// Regression: `delete_work_item_by_id` (Phase 5 in-flight
 /// cleanup) must drop the in-flight precheck receiver in the

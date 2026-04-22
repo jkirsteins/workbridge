@@ -1,6 +1,10 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    App, BackendType, DisplayEntry, Duration, GroupHeaderKind, PathBuf, ReviewGateMessage,
+    ReviewGateOrigin, ReviewGateResult, UserActionKey, WorkItem, WorkItemId, WorkItemStatus,
+    app_with_work_item, insert_test_review_gate,
+};
 
 /// Gap 3 regression: same property on the approve path. The
 /// approve path advances the work item to Review and spawns a

@@ -1,6 +1,10 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    ActivityEntry, AgentBackendKind, App, Arc, ArchiveTestBackend, BackendError, BackendType,
+    Config, CreateWorkItem, PathBuf, ReviewGateOrigin, ReviewGateSpawn, StubBackend, UnlinkedPr,
+    UserActionKey, WorkItemBackend, WorkItemId, WorkItemStatus, make_archive_record,
+};
 
 #[test]
 fn apply_stage_change_clears_done_at_on_retreat() {

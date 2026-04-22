@@ -1,7 +1,15 @@
 //! Snapshot tests: settings overlay, grouped work-item list, create-dialog views.
 //! See `src/ui/snapshot_tests/mod.rs` for shared helpers.
 
-use super::*;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use super::{
+    App, BackendType, CheckStatus, MergeableState, PrInfo, PrState, RepoAssociation,
+    ReviewDecision, ReviewGateOrigin, ReviewGateState, StubBackend, WorkItem, WorkItemError,
+    WorkItemId, WorkItemStatus, app_with_items, is_selectable, make_pr_info, make_unlinked_pr,
+    make_work_item, render,
+};
 
 #[test]
 fn settings_overlay_with_config() {

@@ -69,7 +69,7 @@ impl ClickTracking {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ClickKind, ClickTracking, Toasts};
 
     #[test]
     fn new_click_tracking_has_no_pending_gesture() {

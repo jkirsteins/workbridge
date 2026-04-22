@@ -116,7 +116,7 @@ const fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ClickKind, ClickRegistry, ClickTarget, Rect};
 
     fn rect(x: u16, y: u16, w: u16, h: u16) -> Rect {
         Rect {

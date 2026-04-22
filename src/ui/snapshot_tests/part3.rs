@@ -1,7 +1,17 @@
 //! Snapshot tests: create-dialog layout, list scrollbar, board-view layout.
 //! See `src/ui/snapshot_tests/mod.rs` for shared helpers.
 
-use super::*;
+use std::path::PathBuf;
+
+use ratatui_core::backend::TestBackend;
+use ratatui_core::terminal::Terminal;
+
+use super::{
+    App, CheckStatus, ViewMode, WorkItem, WorkItemStatus, app_with_items, is_selectable,
+    make_pr_info, make_work_item, render,
+};
+use crate::theme::Theme;
+use crate::ui::draw_to_buffer;
 
 /// Regression for the "typed characters hidden on first row of
 /// description" bug.

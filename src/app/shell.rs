@@ -67,7 +67,7 @@ impl Default for Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{FocusPanel, Shell};
 
     #[test]
     fn new_shell_is_in_left_focus_not_quitting() {

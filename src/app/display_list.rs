@@ -10,7 +10,10 @@
 
 use std::path::PathBuf;
 
-use super::*;
+use super::{
+    BOARD_COLUMNS, DisplayEntry, FocusPanel, GroupHeaderKind, OrphanWorktree, ViewMode,
+    is_selectable,
+};
 use crate::work_item::{WorkItem, WorkItemId, WorkItemStatus};
 use crate::worktree_service::WorktreeService;
 

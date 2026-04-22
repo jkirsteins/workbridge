@@ -151,7 +151,12 @@ pub(super) fn parse_locked_worktree_path(msg: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::PathBuf;
+
+    use super::{
+        parse_locked_worktree_path, parse_porcelain, parse_rev_list_left_right,
+        parse_status_porcelain,
+    };
 
     // -----------------------------------------------------------------------
     // parse_porcelain tests (pure unit tests, no git CLI)

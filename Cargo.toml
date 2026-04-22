@@ -118,15 +118,6 @@ significant_drop_tightening = "allow"
 struct_excessive_bools = "allow"
 unused_self = "allow"
 
-# Wildcard imports are used inside the `app` module tree to let each
-# sibling submodule (types_NN, impl_NN, helpers, stubs, tests parts)
-# pick up the shared item namespace via `use super::*;`. Each file
-# listing every type it touches explicitly would add 30+ lines of
-# boilerplate per file without improving clarity - the aggregator is
-# the parent `mod.rs`, which is the only thing that needs to be audited
-# for what is exported.
-wildcard_imports = "allow"
-
 [lints.rustdoc]
 # No existing crate-level docs to break; safe to deny from day one.
 broken_intra_doc_links = "deny"

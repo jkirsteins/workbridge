@@ -1,6 +1,11 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    AgentBackendKind, App, Config, DisplayEntry, PathBuf, PrIdentityRecord, PrMergePollResult,
+    PrMergePollState, PrMergeWatch, RebaseTarget, ReviewGateOrigin, ReviewGateSpawn,
+    WorkItemBackend, WorkItemId, WorkItemStatus, install_cached_repo, make_rr_record,
+    push_review_work_item, seed_rr_app,
+};
 
 /// Feeds a MERGED result. Asserts the merge-gate path ran
 /// (activity log carries `source=="pr_merge`"), `pr_identity` was

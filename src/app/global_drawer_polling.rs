@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::*;
+use super::{GlobalSessionOpenPending, GlobalSessionPrepResult};
 use crate::agent_backend::{self, AgentBackend, SpawnConfig, WORK_ITEM_ALLOWED_TOOLS};
 use crate::mcp::McpSocketServer;
 use crate::session::Session;

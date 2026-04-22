@@ -3,14 +3,23 @@
 //! Extracted from the previously-inline `mod tests { ... }` block so
 //! each individual test file stays at or below the 700-line ceiling
 //! enforced by `hooks/budget-check.sh`. Shared imports and helpers
-//! live in this file and propagate to submodules via `use super::*;`.
+//! live in this file; each submodule pulls in the specific names it
+//! needs via explicit `use super::{...}` lines.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::*;
+use super::{
+    ActivityId, App, DeleteCleanupInfo, DisplayEntry, FirstRunGlobalHarnessModal, GroupHeaderKind,
+    MergePreCheckMessage, MergeReadiness, OrphanWorktree, PrMergeOutcome, PrMergePollResult,
+    PrMergePollState, PrMergeResult, PrMergeWatch, RebaseGateMessage, RebaseGateState,
+    RebaseTarget, ReviewGateMessage, ReviewGateOrigin, ReviewGateResult, ReviewGateSpawn,
+    ReviewGateState, SessionOpenPending, SessionOpenPlanResult, SettingsListFocus,
+    StaleWorktreePrompt, StubBackend, StubWorktreeService, UserActionKey, UserActionPayload,
+    WorktreeCreateResult,
+};
 use crate::agent_backend::AgentBackendKind;
 use crate::config::{Config, RepoEntry, RepoSource};
 use crate::github_client::GithubError;

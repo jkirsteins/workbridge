@@ -9,8 +9,10 @@
 use std::path::PathBuf;
 
 use super::super::common::toml_quote_key;
-use super::super::{McpBridgeSpec, ReviewGateSpawnConfig, SpawnConfig, WORK_ITEM_ALLOWED_TOOLS};
-use super::*;
+use super::super::{
+    AgentBackend, McpBridgeSpec, ReviewGateSpawnConfig, SpawnConfig, WORK_ITEM_ALLOWED_TOOLS,
+};
+use super::CodexBackend;
 use crate::work_item::WorkItemStatus;
 
 fn fake_bridge() -> McpBridgeSpec {

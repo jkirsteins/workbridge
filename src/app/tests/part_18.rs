@@ -1,6 +1,10 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    AgentBackendKind, App, Arc, BackendType, Config, CountingPlanBackend, DeleteCleanupInfo,
+    Duration, OrphanWorktree, PathBuf, SessionOpenPlanResult, StubWorktreeService, UserActionKey,
+    UserActionPayload, WorkItemBackend, WorkItemId, WorkItemStatus, WorktreeCreateResult,
+};
 
 #[test]
 fn finish_session_open_does_not_write_mcp_json_into_worktree() {

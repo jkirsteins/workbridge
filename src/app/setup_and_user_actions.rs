@@ -19,7 +19,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::*;
+use super::{
+    Activities, ActivityId, BoardCursor, ClickTracking, DashboardWindow, DisplayEntry,
+    GlobalDrawer, Metrics, OrphanCleanup, PrIdentityBackfill, RightPanelTab, SettingsOverlay,
+    SharedServices, Shell, Toasts, UserActionGuard, UserActionKey, UserActionPayload,
+    UserActionState, ViewMode, WorkItemContext, canonicalize_repo_entries,
+};
+#[cfg(test)]
+use super::{StubBackend, StubWorktreeService};
 use crate::agent_backend::ClaudeCodeBackend;
 use crate::config::{Config, ConfigProvider, RepoEntry, RepoSource};
 use crate::create_dialog::CreateDialog;

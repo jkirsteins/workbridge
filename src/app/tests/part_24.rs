@@ -1,6 +1,12 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use super::{
+    AgentBackendKind, App, BackendType, Config, DisplayEntry, FirstRunGlobalHarnessModal,
+    StubBackend, WorkItem, WorkItemId, WorkItemKind, WorkItemStatus, app_with_work_item,
+};
 
 /// Pins that once a harness choice is committed, the display
 /// name follows that choice (not the static `self.services.agent_backend`).

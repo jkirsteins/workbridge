@@ -428,7 +428,7 @@ fn set_winsize(fd: std::os::fd::RawFd, cols: u16, rows: u16) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::Session;
 
     #[test]
     fn kill_is_idempotent() {

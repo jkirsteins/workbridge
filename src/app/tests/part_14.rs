@@ -1,6 +1,11 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    ActivityEntry, App, Arc, BackendError, Config, CreateWorkItem, DisplayEntry, McpEvent, PathBuf,
+    RepoAssociationRecord, ReviewGateOrigin, ReviewGateSpawn, StubWorktreeService, WorkItemBackend,
+    WorkItemId, WorkItemStatus, WorktreeService, app_with_work_item,
+    drain_review_gate_with_timeout,
+};
 
 /// Test 11: `spawn_review_gate` reports failures on synchronous
 /// pre-conditions (no repo association, no branch) via the returned

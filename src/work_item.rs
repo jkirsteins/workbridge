@@ -497,7 +497,12 @@ impl Drop for FetcherHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::PathBuf;
+
+    use super::{
+        CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision, ReviewRequestedPr,
+        WorkItemStatus,
+    };
 
     #[test]
     fn next_stage_progression() {

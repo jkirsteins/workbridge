@@ -1,6 +1,10 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    ActivityEntry, App, Arc, BackendError, Config, ConfigurableWorktreeService, CreateWorkItem,
+    DisplayEntry, FixedListBackend, PathBuf, RepoAssociationRecord, WorkItemBackend, WorkItemId,
+    WorkItemStatus, drain_delete_cleanup,
+};
 
 /// `open_delete_prompt` must NOT call any blocking worktree check on
 /// the UI thread. This is enforced structurally by the

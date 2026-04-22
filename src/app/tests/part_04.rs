@@ -1,6 +1,11 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    ActivityEntry, App, Arc, BackendError, BackendType, Config, CreateWorkItem, DisplayEntry,
+    Duration, PathBuf, RepoAssociationRecord, StaleWorktreePrompt, StubBackend,
+    StubWorktreeService, UserActionKey, UserActionPayload, WorkItemBackend, WorkItemId,
+    WorkItemStatus, WorktreeCreateResult, WorktreeService, drain_worktree_creation,
+};
 
 /// F-1 regression: importing a PR whose branch cannot be fetched from
 /// origin must NOT create a worktree (to avoid creating from wrong

@@ -443,7 +443,9 @@ pub trait AgentBackend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::str::FromStr;
+
+    use super::{AgentBackendKind, backend_for_kind, is_available};
 
     /// Pins `FromStr` for the CLI subcommand: only the two user-
     /// selectable canonical names parse; "opencode" and anything else

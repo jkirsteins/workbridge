@@ -1,6 +1,9 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    ActivityEntry, App, Arc, BackendError, BackendType, Config, CreateWorkItem, DisplayEntry,
+    FetchMessage, PathBuf, RepoAssociationRecord, WorkItemBackend, WorkItemId, WorkItemStatus,
+};
 
 /// F-2: Unmanaging a repo prunes stale fetch cache entries.
 /// After fetcher restart, `repo_data` for removed repos should be

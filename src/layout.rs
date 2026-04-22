@@ -78,7 +78,7 @@ pub fn compute_board(cols: u16) -> BoardLayout {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{compute, compute_board, compute_drawer};
 
     #[test]
     fn standard_terminal_80x24() {

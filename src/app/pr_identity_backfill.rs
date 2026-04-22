@@ -72,7 +72,7 @@ impl PrIdentityBackfill {
 mod tests {
     use crossbeam_channel::unbounded;
 
-    use super::*;
+    use super::{ActivityId, PrIdentityBackfill};
 
     #[test]
     fn new_is_inactive() {

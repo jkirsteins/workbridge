@@ -12,7 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::*;
+use super::{
+    SessionOpenPending, SessionOpenPlanResult, UserActionKey, UserActionPayload,
+    WorktreeCreateResult,
+};
 use crate::agent_backend::AgentBackendKind;
 use crate::mcp::McpSocketServer;
 use crate::work_item::{WorkItemId, WorkItemStatus};

@@ -1,6 +1,11 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    ActivityEntry, AgentBackendKind, App, Arc, BackendError, BackendType, Config,
+    CountingWorktreeService, CreateWorkItem, DoneRecordBackend, PathBuf, StubWorktreeService,
+    UnlinkedPr, WorkItemBackend, WorkItemId, WorkItemStatus, app_with_counting_ws,
+    install_cached_repo,
+};
 
 impl WorkItemBackend for DoneRecordBackend {
     fn read(

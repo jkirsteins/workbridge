@@ -210,9 +210,10 @@ impl From<std::io::Error> for ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
-    use super::*;
+    use super::{Config, McpServerEntry};
 
     #[test]
     fn load_missing_file_returns_default() {

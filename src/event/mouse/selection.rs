@@ -316,7 +316,7 @@ pub fn selection_to_vt100_bounds(sel: &SelectionState, cols: u16) -> (u16, u16, 
 
 #[cfg(test)]
 mod encoding_tests {
-    use super::*;
+    use super::encode_mouse_scroll;
 
     /// SGR encoding produces correct escape sequences for scroll up.
     #[test]

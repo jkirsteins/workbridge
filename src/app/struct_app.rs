@@ -5,7 +5,13 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use super::*;
+use super::{
+    Activities, BoardCursor, ClickTracking, DashboardWindow, DisplayEntry,
+    FirstRunGlobalHarnessModal, GlobalDrawer, Metrics, OrphanCleanup, PrIdentityBackfill,
+    PrMergePollState, PrMergeWatch, RebaseGateState, ReviewGateState, RightPanelTab,
+    SessionOpenPending, SessionSpawnPending, SettingsOverlay, SharedServices, Shell,
+    StaleWorktreePrompt, Toasts, UserActionGuard, ViewMode,
+};
 use crate::agent_backend::AgentBackendKind;
 use crate::config::RepoEntry;
 use crate::create_dialog::CreateDialog;

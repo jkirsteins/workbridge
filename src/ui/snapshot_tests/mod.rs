@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use ratatui_core::backend::TestBackend;
 use ratatui_core::terminal::Terminal;

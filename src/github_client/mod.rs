@@ -219,7 +219,7 @@ pub fn parse_github_remote(url: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::parse_github_remote;
 
     #[test]
     fn parse_ssh_url() {

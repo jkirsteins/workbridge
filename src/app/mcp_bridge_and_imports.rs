@@ -11,7 +11,10 @@
 
 use std::path::PathBuf;
 
-use super::*;
+use super::{
+    DeleteCleanupInfo, DisplayEntry, FocusPanel, OrphanWorktree, ReviewGateOrigin, ReviewGateSpawn,
+    UserActionKey, is_selectable, now_iso8601,
+};
 use crate::mcp::McpEvent;
 use crate::work_item::{WorkItemId, WorkItemKind, WorkItemStatus};
 use crate::work_item_backend::{ActivityEntry, CreateWorkItem, RepoAssociationRecord};

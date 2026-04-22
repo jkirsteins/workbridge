@@ -12,7 +12,10 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use super::*;
+use super::{
+    RebaseGateMessage, RebaseResult, ReviewGateMessage, ReviewGateOrigin, ReviewGateResult,
+    UserActionKey, now_iso8601,
+};
 use crate::work_item::{SessionEntry, WorkItemId, WorkItemStatus};
 use crate::work_item_backend::ActivityEntry;
 

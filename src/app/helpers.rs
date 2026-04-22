@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use super::*;
+use super::{DisplayEntry, PrMergePollResult};
 use crate::config::RepoEntry;
 use crate::work_item::{UnlinkedPr, WorkItemId, WorkItemStatus};
 use crate::work_item_backend::{

@@ -14,7 +14,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::*;
+use super::{
+    CleanupResult, DeleteCleanupInfo, OrphanCleanupFinished, UserActionKey, UserActionPayload,
+};
 use crate::mcp::McpSocketServer;
 
 impl super::App {

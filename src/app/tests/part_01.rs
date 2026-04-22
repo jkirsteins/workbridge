@@ -1,6 +1,10 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    ActivityEntry, App, Arc, BackendError, Config, CreateWorkItem, DisplayEntry, FetchMessage,
+    PathBuf, RepoAssociationRecord, RepoEntry, RepoFetchResult, RepoSource, SettingsListFocus,
+    StubBackend, WorkItemBackend, WorkItemId, WorkItemStatus,
+};
 
 // The wall-clock-free bounded-receive helper lives in
 // `crate::side_effects::clock::bounded_recv` and works with both

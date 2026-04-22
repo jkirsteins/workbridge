@@ -1,6 +1,10 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
-use super::*;
+use super::{
+    App, Duration, MergePreCheckMessage, PathBuf, ReviewItemState, UserActionKey,
+    UserActionPayload, WorkItemId, WorkItemStatus, install_cached_repo_with_cleanliness,
+    push_review_item_with_state, push_selected_review_item,
+};
 
 /// Live-recheck hint when `git_state.dirty` is set, even if the
 /// PR is mergeable and CI passes.

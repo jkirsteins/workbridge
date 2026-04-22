@@ -12,7 +12,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::*;
+use super::{
+    FirstRunGlobalHarnessModal, McpInjection, QUICKSTART_TITLE, StaleWorktreePrompt, UserActionKey,
+    UserActionPayload, WorktreeCreateResult,
+};
 use crate::agent_backend::{
     self, AgentBackend, AgentBackendKind, SpawnConfig, WORK_ITEM_ALLOWED_TOOLS,
 };
