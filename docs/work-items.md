@@ -172,15 +172,23 @@ Stage restrictions for ReviewRequest items:
   still-eligible guard, the `pr_number` backfill, and the merge-gate
   dispatch cannot drift between the two stages. Per-stage deltas
   (source stage, kind filter, strategy tag, status messages, whether
-  the merged branch runs `cleanup_worktree_for_item`) are passed as
-  macro arguments. When the PR is detected as merged, the item
-  auto-transitions to Done through the merge-gate invariant (`source
-  == "pr_merge"`) and the merged PR's identity is persisted to
-  `pr_identity` so the assembly fallback keeps the merged-PR link
-  visible afterwards. The coding agent review session is killed by the
-  transition (same behavior as every other Review -> Done transition in
-  the codebase); the worktree is left on disk and cleaned up later by
-  auto-archive (default 7 days) or immediately by the user with Ctrl+D.
+  the merged branch schedules `spawn_post_merge_worktree_cleanup`) are
+  passed as macro arguments. When the PR is detected as merged, the
+  item auto-transitions to Done through the merge-gate invariant
+  (`source == "pr_merge"`) and the merged PR's identity is persisted
+  to `pr_identity` so the assembly fallback keeps the merged-PR link
+  visible afterwards. The coding agent review session is killed by
+  the transition (same behavior as every other Review -> Done
+  transition in the codebase). The Mergequeue poller (author-side
+  merges) schedules `spawn_post_merge_worktree_cleanup`, which
+  dispatches the worktree + branch cleanup to a background thread
+  per-association and reports completion through the shared
+  orphan-cleanup channel - no git subprocess runs on the UI thread.
+  The ReviewRequest poller (reviewer-side merges of someone else's
+  PR) intentionally does NOT schedule cleanup: the author may still
+  be iterating locally, so the worktree is left on disk and cleaned
+  up later by auto-archive (default 7 days) or immediately by the
+  user with Ctrl+D.
   A closed-without-merge PR is NOT auto-closed (it would bypass the
   merge-gate invariant) - a warning is surfaced instead and the user
   can Ctrl+D to clean up. `gh pr view` failures are stored in the

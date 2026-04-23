@@ -300,13 +300,19 @@ pub struct PrIdentityBackfillResult {
     pub identity: PrIdentityRecord,
 }
 
-/// One completion message per `spawn_orphan_worktree_cleanup` thread.
-/// Always sent exactly once when the background closure finishes -
-/// success or failure. Carries the `ActivityId` so the main thread can
-/// end the matching status-bar spinner, and any warnings so they can
-/// be surfaced via `status_message`. Per `docs/UI.md` "Activity
-/// indicator placement", the orphan cleanup is system-initiated
-/// fire-and-forget background work and therefore owes the user a
+/// One completion message per background worktree-cleanup thread.
+/// Sent by both `spawn_orphan_worktree_cleanup` (worktree-create race
+/// orphans) and `spawn_post_merge_worktree_cleanup` (mergequeue +
+/// reviewer-initiated PR merges); they share this channel because
+/// both produce the same `{ activity, warnings }` shape from the same
+/// `worktree_service` primitives. The `OrphanCleanup` name is
+/// historical (orphan cleanup was the first producer). Always sent
+/// exactly once when the background closure finishes - success or
+/// failure. Carries the `ActivityId` so the main thread can end the
+/// matching status-bar spinner, and any warnings so they can be
+/// surfaced via `status_message`. Per `docs/UI.md` "Activity
+/// indicator placement", both cleanup flows are system-initiated
+/// fire-and-forget background work and therefore owe the user a
 /// status-bar spinner; the per-spawn `ActivityId` is the structural
 /// owner of that spinner.
 pub struct OrphanCleanupFinished {

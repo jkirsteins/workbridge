@@ -1,12 +1,25 @@
 //! `OrphanCleanup` subsystem - the completion-message channel for
-//! background orphan-worktree cleanup threads.
+//! background worktree-cleanup threads.
+//!
+//! Two producers feed this channel today:
+//! - `App::spawn_orphan_worktree_cleanup` - reaps worktrees abandoned
+//!   by a worktree-create thread whose owning work item was deleted
+//!   in flight (force=true, because orphans may be dirty).
+//! - `App::spawn_post_merge_worktree_cleanup` - schedules
+//!   post-merge cleanup for a Mergequeue or PR-merge transition
+//!   (force=false, safe for merged branches).
+//!
+//! Both produce the same `OrphanCleanupFinished { activity, warnings }`
+//! shape from the same `worktree_service` primitives. The channel
+//! name is historical (orphan cleanup was the first producer); the
+//! channel itself is a generic worktree-cleanup completion channel.
 //!
 //! `App` used to own `orphan_cleanup_finished_tx` and
 //! `orphan_cleanup_finished_rx` as two
 //! sibling fields (one always-open sender cloned into each background
 //! thread, one receiver drained by the timer tick). Their ownership is
 //! coupled - the pair is created together at `App::new`, never
-//! replaced, and outlives every individual orphan-cleanup thread - so
+//! replaced, and outlives every individual cleanup thread - so
 //! grouping them in an owning struct drops the two sibling fields on
 //! `App` to one.
 //!
@@ -18,12 +31,15 @@
 
 use super::OrphanCleanupFinished;
 
-/// Owns the completion-message channel pair for background
-/// `spawn_orphan_worktree_cleanup` threads. The sender is cloned into
-/// every spawned closure; the receiver is drained by the timer tick.
+/// Owns the completion-message channel pair shared by background
+/// worktree-cleanup threads from both `spawn_orphan_worktree_cleanup`
+/// (orphan reaping) and `spawn_post_merge_worktree_cleanup`
+/// (post-merge cleanup). The sender is cloned into every spawned
+/// closure; the receiver is drained by the timer tick.
 #[derive(Debug)]
 pub struct OrphanCleanup {
-    /// Sender cloned into each background orphan-cleanup thread. The
+    /// Sender cloned into each background worktree-cleanup thread
+    /// (both orphan reaping and post-merge cleanup producers). The
     /// closure sends exactly one `OrphanCleanupFinished` when it
     /// finishes (success or failure).
     pub tx: crossbeam_channel::Sender<OrphanCleanupFinished>,
