@@ -10,9 +10,10 @@
 //! pair lives in the same file for symmetry.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::{
-    CiCheck, PrMergePollState, PrMergeWatch, collect_due_pr_merge_watches,
+    CiCheck, OrphanCleanupFinished, PrMergePollState, PrMergeWatch, collect_due_pr_merge_watches,
     drain_pr_merge_poll_results, pr_merge_poll_still_eligible, spawn_gh_pr_view_poll,
 };
 use crate::work_item::{WorkItemId, WorkItemKind, WorkItemStatus};
@@ -130,13 +131,17 @@ impl super::App {
         /// metrics tell reviewer-side merges apart from author-side
         /// Mergequeue merges.
         ///
-        /// This path must NOT call `cleanup_worktree_for_item`:
-        /// `worktree_service.remove_worktree` is a blocking I/O
-        /// operation and would freeze the UI from the timer tick
-        /// (see `docs/UI.md` "Blocking I/O Prohibition"). The
-        /// worktree is left on disk and cleaned up later by
-        /// auto-archive (default 7 days) or immediately by the user
-        /// with Ctrl+D.
+        /// This path intentionally does NOT schedule
+        /// `spawn_post_merge_worktree_cleanup` (the macro's
+        /// `cleanup_worktree_on_merge = false` below). Reviewer-side
+        /// merges should leave the author's worktree in place - the
+        /// author may still be iterating locally, and auto-archive
+        /// (default 7 days) or the user's explicit Ctrl+D will clean
+        /// it up when it is actually stale. This is a design decision,
+        /// not a blocking-I/O constraint: the cleanup helper is async
+        /// so calling it from here would be safe for the UI thread;
+        /// the opt-out is about preserving the author's worktree,
+        /// not about thread safety.
         fn poll_review_request_merges,
         watches = review_request_merge_watches,
         polls = review_request_merge_polls,
@@ -291,33 +296,82 @@ impl super::App {
         changed
     }
 
-    /// Remove the worktree directory and local branch for a work item after merge.
-    /// Uses `delete_branch=true` so the merged branch is cleaned up. Uses force=false
-    /// because post-merge worktrees should be clean and `-d` is safe for merged branches.
-    pub(super) fn cleanup_worktree_for_item(&mut self, wi_id: &WorkItemId) {
-        let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
-            return;
+    /// Schedule worktree + branch cleanup for a work item after a PR
+    /// merge. Each associated (repo, worktree, branch) tuple is handed
+    /// to a detached background thread that runs
+    /// `worktree_service.remove_worktree(delete_branch=true, force=false)`
+    /// (or `delete_branch(force=false)` when there is no worktree) off
+    /// the UI thread.
+    ///
+    /// This MUST stay async: every call site is on a timer-driven poll
+    /// path (`finalize_pr_merge_poll_merged` called from the
+    /// `impl_pr_merge_poll_method!`-generated `poll_mergequeue`, and
+    /// `handle_pr_merge_merged` called from `poll_pr_merge`). A
+    /// synchronous implementation would freeze the TUI for the
+    /// duration of `git worktree remove` + `git branch -d`, which is
+    /// the exact `[ABSOLUTE]` blocking-I/O-on-UI-thread violation the
+    /// review policy forbids (see `docs/UI.md` "Blocking I/O
+    /// Prohibition" and `CLAUDE.md` `[ABSOLUTE]` rule).
+    ///
+    /// Completion messages flow through the shared `orphan_cleanup`
+    /// channel (`OrphanCleanupFinished`); `poll_orphan_cleanup_finished`
+    /// drains both orphan-cleanup completions and post-merge-cleanup
+    /// completions, ends the matching status-bar activity, and
+    /// surfaces any warnings as a joined `status_message`. The channel
+    /// is shared because both flows produce the same shape of result
+    /// (`{ activity, warnings }`) from the same `worktree_service`
+    /// primitives; the "orphan" name is historical.
+    ///
+    /// `force=false` is deliberate: post-merge worktrees should be
+    /// clean, and `-d` (non-force) branch deletion refuses to delete
+    /// unmerged branches, which is the safety we want here. Orphan
+    /// cleanup (via `spawn_orphan_worktree_cleanup`) uses `force=true`
+    /// because orphaned worktrees may carry uncommitted state.
+    pub(super) fn spawn_post_merge_worktree_cleanup(&mut self, wi_id: &WorkItemId) {
+        // Collect the per-association cleanup targets first so the
+        // borrow of `self.work_items` is released before we spawn
+        // threads that need to clone `self.services.worktree_service`.
+        let cleanups: Vec<(PathBuf, Option<PathBuf>, Option<String>)> = {
+            let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
+                return;
+            };
+            wi.repo_associations
+                .iter()
+                .filter_map(|assoc| {
+                    if assoc.worktree_path.is_none() && assoc.branch.is_none() {
+                        return None;
+                    }
+                    Some((
+                        assoc.repo_path.clone(),
+                        assoc.worktree_path.clone(),
+                        assoc.branch.clone(),
+                    ))
+                })
+                .collect()
         };
-        for assoc in &wi.repo_associations {
-            if let Some(ref wt_path) = assoc.worktree_path {
-                if let Err(e) = self.services.worktree_service.remove_worktree(
-                    &assoc.repo_path,
-                    wt_path,
-                    true,
-                    false,
-                ) {
-                    self.shell.status_message = Some(format!("Worktree cleanup warning: {e}"));
+
+        for (repo_path, worktree_path, branch) in cleanups {
+            let activity = self.activities.start("Cleaning up merged worktree");
+            let ws = Arc::clone(&self.services.worktree_service);
+            let finished_tx = self.orphan_cleanup.tx.clone();
+            std::thread::spawn(move || {
+                let mut warnings: Vec<String> = Vec::new();
+                if let Some(ref wt_path) = worktree_path {
+                    if let Err(e) = ws.remove_worktree(&repo_path, wt_path, true, false) {
+                        warnings.push(format!("Worktree cleanup warning: {e}"));
+                    }
+                } else if let Some(ref br) = branch {
+                    // No worktree but a branch exists - still clean up the branch.
+                    if let Err(e) = ws.delete_branch(&repo_path, br, false) {
+                        warnings.push(format!("Branch cleanup warning: {e}"));
+                    }
                 }
-            } else if let Some(ref branch) = assoc.branch {
-                // No worktree but a branch exists - still clean up the branch.
-                if let Err(e) =
-                    self.services
-                        .worktree_service
-                        .delete_branch(&assoc.repo_path, branch, false)
-                {
-                    self.shell.status_message = Some(format!("Branch cleanup warning: {e}"));
-                }
-            }
+                // Always send exactly one completion message so the
+                // main thread can end the matching activity even on
+                // the success path. Receiver dropped (App torn down)
+                // is a silent no-op.
+                let _ = finished_tx.send(OrphanCleanupFinished { activity, warnings });
+            });
         }
     }
 

@@ -308,8 +308,11 @@ impl super::App {
             return;
         }
 
-        // Clean up worktree directory.
-        self.cleanup_worktree_for_item(&result.wi_id);
+        // Schedule worktree cleanup on a background thread. `poll_pr_merge`
+        // runs on the UI timer tick, so a synchronous git worktree remove
+        // here would freeze the TUI for the duration of the git command
+        // (ABSOLUTE rule: no blocking I/O on the UI thread).
+        self.spawn_post_merge_worktree_cleanup(&result.wi_id);
 
         // Advance to Done.
         self.apply_stage_change(

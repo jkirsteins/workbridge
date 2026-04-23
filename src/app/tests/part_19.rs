@@ -1,10 +1,10 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
 use super::{
-    AgentBackendKind, App, Arc, BackendType, Config, CountingPlanBackend, PathBuf,
-    ReviewGateMessage, ReviewGateOrigin, ReviewGateResult, StubBackend, StubWorktreeService,
-    WorkItemBackend, WorkItemId, WorkItemStatus, WorktreeService, app_with_work_item,
-    insert_test_review_gate,
+    AgentBackendKind, App, Arc, BackendType, Config, ConfigurableWorktreeService,
+    CountingPlanBackend, FixedListBackend, PathBuf, ReviewGateMessage, ReviewGateOrigin,
+    ReviewGateResult, StubBackend, StubWorktreeService, WorkItemBackend, WorkItemId,
+    WorkItemStatus, WorktreeService, app_with_work_item, insert_test_review_gate,
 };
 
 #[test]
@@ -565,5 +565,136 @@ fn poll_review_gate_result_ends_status_bar_activity_reject() {
         !app.activities.entries.iter().any(|a| a.id == gate_aid),
         "Result arm of poll_review_gate must end the gate's specific \
          ActivityId via drop_review_gate",
+    );
+}
+
+/// Codex adversarial-review finding: `finalize_pr_merge_poll_merged`
+/// (called from the timer-driven `poll_mergequeue` via the
+/// `impl_pr_merge_poll_method!` macro, and from `poll_pr_merge` via
+/// `handle_pr_merge_merged`) previously called
+/// `cleanup_worktree_for_item` synchronously, which in turn called
+/// `worktree_service.remove_worktree` / `delete_branch` - both of
+/// which shell out to `git` and block on the UI thread. That is the
+/// exact `[ABSOLUTE]` blocking-I/O-on-UI-thread violation the review
+/// policy forbids.
+///
+/// The fix renamed the helper to `spawn_post_merge_worktree_cleanup`
+/// and changed its body to dispatch each association's git cleanup
+/// onto a background thread that sends a completion message through
+/// the shared `orphan_cleanup` channel. This test pins the contract:
+///
+/// 1. The call returns without the background `remove_worktree`
+///    having happened yet (async dispatch, not sync cleanup).
+/// 2. A status-bar activity is started per association so the user
+///    sees the cleanup in progress.
+/// 3. The background thread eventually calls `remove_worktree` with
+///    `delete_branch=true, force=false` (post-merge cleanup is safe
+///    without force; `-d` refuses to delete unmerged branches).
+/// 4. `poll_orphan_cleanup_finished` drains the completion and ends
+///    the matching activity.
+#[test]
+fn spawn_post_merge_worktree_cleanup_dispatches_git_off_ui_thread() {
+    let recording_ws = Arc::new(ConfigurableWorktreeService::recording());
+    let mut app = App::with_config_and_worktree_service(
+        Config::default(),
+        Arc::new(FixedListBackend::one_item(
+            "/tmp/post-merge-cleanup-test.json",
+            "Post-merge cleanup test item",
+            "/tmp/post-merge-repo",
+            "feature/post-merge",
+        )),
+        Arc::clone(&recording_ws) as Arc<dyn WorktreeService + Send + Sync>,
+        Box::new(crate::config::InMemoryConfigProvider::new()),
+    );
+
+    // Inject a worktree path so the cleanup has something to
+    // schedule. `FixedListBackend::one_item` creates the work item
+    // with a branch but no worktree_path; the post-merge cleanup
+    // needs the worktree_path branch to hit `remove_worktree`.
+    assert_eq!(app.work_items.len(), 1);
+    app.work_items[0].repo_associations[0].worktree_path =
+        Some(PathBuf::from("/tmp/post-merge-repo/.worktrees/post-merge"));
+    let wi_id = app.work_items[0].id.clone();
+
+    // Drain any pre-existing activity / status so assertions are
+    // unambiguous.
+    let pre_activity_count = app.activities.entries.len();
+
+    // Trigger the async cleanup.
+    app.spawn_post_merge_worktree_cleanup(&wi_id);
+
+    // Contract 1: the call is async. Immediately after it returns,
+    // `remove_worktree` has NOT been recorded. We poll for a short
+    // while because the background thread could race.
+    assert_eq!(
+        recording_ws.remove_worktree_calls.lock().unwrap().len(),
+        0,
+        "spawn_post_merge_worktree_cleanup must return BEFORE the \
+         background git work runs - it MUST NOT block the UI thread \
+         on `worktree_service.remove_worktree`",
+    );
+
+    // Contract 2: a status-bar activity was started per association.
+    assert!(
+        app.activities.entries.len() > pre_activity_count,
+        "spawn_post_merge_worktree_cleanup must start an activity \
+         per association so the user sees cleanup in progress",
+    );
+
+    // Contract 3: the background thread eventually runs
+    // `remove_worktree` with the expected arguments. Wait for the
+    // completion channel to receive one message.
+    let recv_start = crate::side_effects::clock::instant_now();
+    loop {
+        if !app.orphan_cleanup.rx.is_empty() {
+            break;
+        }
+        if crate::side_effects::clock::elapsed_since(recv_start)
+            > std::time::Duration::from_secs(60)
+        {
+            panic!(
+                "post-merge cleanup background thread did not enqueue a \
+                 completion message - async dispatch is broken",
+            );
+        }
+        crate::side_effects::clock::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let rw_calls = recording_ws.remove_worktree_calls.lock().unwrap();
+    assert_eq!(
+        rw_calls.len(),
+        1,
+        "background thread must call remove_worktree exactly once",
+    );
+    let (repo, wt, delete_branch, force) = &rw_calls[0];
+    assert_eq!(repo, &PathBuf::from("/tmp/post-merge-repo"));
+    assert_eq!(
+        wt,
+        &PathBuf::from("/tmp/post-merge-repo/.worktrees/post-merge")
+    );
+    assert!(
+        *delete_branch,
+        "post-merge cleanup must set delete_branch=true so the \
+         merged branch is cleaned up alongside the worktree"
+    );
+    assert!(
+        !*force,
+        "post-merge cleanup must set force=false - `-d` (non-force) \
+         is the safe deletion flag for merged branches; force=true \
+         would silently delete unmerged work",
+    );
+    drop(rw_calls);
+
+    // Contract 4: poll_orphan_cleanup_finished drains the completion
+    // and ends the activity. The shared channel is named after its
+    // original consumer (orphan cleanup) but also carries post-merge
+    // completions - they produce the same `OrphanCleanupFinished`
+    // shape.
+    let before_poll_count = app.activities.entries.len();
+    app.poll_orphan_cleanup_finished();
+    assert!(
+        app.activities.entries.len() < before_poll_count,
+        "poll_orphan_cleanup_finished must end the post-merge cleanup \
+         activity when the background thread reports completion",
     );
 }

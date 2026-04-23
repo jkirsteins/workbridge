@@ -14,8 +14,8 @@
 /// `poll_mergequeue` and `poll_review_request_merges` differ only in
 /// which `App` fields they touch (watches / in-flight polls / errors),
 /// which stage they treat as "eligible", and a few static data bits
-/// (strategy tag, status messages, whether the merged branch runs
-/// `cleanup_worktree_for_item`). Everything else - the Phase 1 drain
+/// (strategy tag, status messages, whether the merged branch schedules
+/// `spawn_post_merge_worktree_cleanup`). Everything else - the Phase 1 drain
 /// loop, the still-eligible guard, the `pr_number` backfill, the merge-
 /// gate dispatch, the Phase 2 cooldown, the subprocess spawn - is
 /// identical. Expressing both via a macro keeps the two methods on one
@@ -286,7 +286,7 @@ impl App {
         }
 
         if cleanup_worktree {
-            self.cleanup_worktree_for_item(&result.wi_id);
+            self.spawn_post_merge_worktree_cleanup(&result.wi_id);
         }
 
         self.apply_stage_change(
