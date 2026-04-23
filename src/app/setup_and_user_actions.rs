@@ -31,6 +31,7 @@ use super::{StubBackend, StubWorktreeService};
 use crate::agent_backend::ClaudeCodeBackend;
 use crate::config::{Config, ConfigProvider, RepoEntry, RepoSource};
 use crate::create_dialog::CreateDialog;
+use crate::mcp::McpEvent;
 use crate::work_item::WorkItemId;
 use crate::work_item_backend::WorkItemBackend;
 use crate::worktree_service::WorktreeService;
@@ -124,7 +125,23 @@ impl super::App {
             config,
             config_provider,
         };
-        let mut app = Self {
+        let mut app = Self::new_from_parts(services, active_repo_cache, mcp_tx, mcp_rx);
+        app.reassemble_work_items();
+        app.build_display_list();
+        app
+    }
+
+    /// Build the `App` struct from its already-prepared shared services,
+    /// repo cache, and MCP channels. Kept private so every public
+    /// constructor (`with_config_worktree_and_github` and any future
+    /// variants) routes through the same field-initialization list.
+    fn new_from_parts(
+        services: SharedServices,
+        active_repo_cache: Vec<RepoEntry>,
+        mcp_tx: crossbeam_channel::Sender<McpEvent>,
+        mcp_rx: crossbeam_channel::Receiver<McpEvent>,
+    ) -> Self {
+        Self {
             services,
             shell: Shell::new(),
             delete_flow: DeleteFlowFlags::default(),
@@ -217,10 +234,7 @@ impl super::App {
             pending_terminal_pty_bytes: Vec::new(),
             click_tracking: ClickTracking::new(),
             toasts: Toasts::new(),
-        };
-        app.reassemble_work_items();
-        app.build_display_list();
-        app
+        }
     }
 
     // -- Activity indicator API --

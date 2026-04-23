@@ -134,7 +134,18 @@ pub fn draw_create_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &T
         ])
         .split(inner);
 
-    // Title label
+    render_create_dialog_title_and_description(buf, dialog, theme, &sections);
+    render_create_dialog_repos(buf, dialog, theme, &sections);
+    render_create_dialog_branch_and_footer(buf, dialog, theme, &sections);
+}
+
+/// Render the Title label + input and Description label + textarea.
+fn render_create_dialog_title_and_description(
+    buf: &mut Buffer,
+    dialog: &mut CreateDialog,
+    theme: &Theme,
+    sections: &[Rect],
+) {
     let title_label_style = if dialog.focus_field == CreateDialogFocus::Title {
         theme.style_heading()
     } else {
@@ -155,7 +166,6 @@ pub fn draw_create_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &T
         &mut dialog.title_input,
     );
 
-    // Description label
     let desc_label_style = if dialog.focus_field == CreateDialogFocus::Description {
         theme.style_heading()
     } else {
@@ -182,8 +192,15 @@ pub fn draw_create_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &T
         buf,
         &mut dialog.description_input,
     );
+}
 
-    // Repos label
+/// Render the Repos label and the (possibly empty) repo checklist.
+fn render_create_dialog_repos(
+    buf: &mut Buffer,
+    dialog: &CreateDialog,
+    theme: &Theme,
+    sections: &[Rect],
+) {
     let repos_label_style = if dialog.focus_field == CreateDialogFocus::Repos {
         theme.style_heading()
     } else {
@@ -191,7 +208,6 @@ pub fn draw_create_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &T
     };
     Paragraph::new(Line::styled("Repos:", repos_label_style)).render(sections[6], buf);
 
-    // Repos list
     if dialog.repo_list.is_empty() {
         let msg = Line::styled("  (no repos configured)", theme.style_text_muted());
         Paragraph::new(msg).render(sections[7], buf);
@@ -217,8 +233,16 @@ pub fn draw_create_dialog(buf: &mut Buffer, dialog: &mut CreateDialog, theme: &T
 
         StatefulWidget::render(list, sections[7], buf, &mut state);
     }
+}
 
-    // Branch label
+/// Render the Branch label + input, the optional error line, and the
+/// footer hint line.
+fn render_create_dialog_branch_and_footer(
+    buf: &mut Buffer,
+    dialog: &mut CreateDialog,
+    theme: &Theme,
+    sections: &[Rect],
+) {
     let branch_label_style = if dialog.focus_field == CreateDialogFocus::Branch {
         theme.style_heading()
     } else {

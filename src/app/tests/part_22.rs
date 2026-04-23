@@ -338,6 +338,7 @@ impl WorkItemBackend for RrTestBackend {
         {
             assoc.pr_identity = Some(pr_identity.clone());
         }
+        drop(records);
         Ok(())
     }
     fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {

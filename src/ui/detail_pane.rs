@@ -85,66 +85,9 @@ pub fn draw_work_item_detail(
     let inner = block.inner(area);
     let mut registry = app.click_tracking.registry.borrow_mut();
 
-    let first_assoc = wi.repo_associations.first();
     let label_style = theme.style_heading();
     let none_style = theme.style_text_muted();
-
-    let status_str = match wi.status {
-        WorkItemStatus::Backlog => "Backlog",
-        WorkItemStatus::Planning => "Planning",
-        WorkItemStatus::Implementing => "Implementing",
-        WorkItemStatus::Blocked => "Blocked",
-        WorkItemStatus::Review => "Review",
-        WorkItemStatus::Mergequeue => "Mergequeue",
-        WorkItemStatus::Done => "Done",
-    };
-
-    let backend_str = match wi.backend_type {
-        BackendType::LocalFile => "Local file",
-        BackendType::GithubIssue => "GitHub issue",
-        BackendType::GithubProject => "GitHub project",
-    };
-
-    let repo_str = first_assoc.map_or_else(
-        || "(none)".to_string(),
-        |a| a.repo_path.display().to_string(),
-    );
-
-    let branch_str = first_assoc
-        .and_then(|a| a.branch.as_deref())
-        .unwrap_or("(none)");
-
-    let worktree_str = first_assoc
-        .and_then(|a| a.worktree_path.as_ref())
-        .map_or_else(|| "(none)".to_string(), |p| p.display().to_string());
-
-    let pr_str = first_assoc.and_then(|a| a.pr.as_ref()).map_or_else(
-        || "(none)".to_string(),
-        |pr| format!("#{} - {}", pr.number, pr.title),
-    );
-
-    // PR URL is rendered on its own dedicated line below the field block
-    // (not as a regular `label  value` row) so that the URL gets the full
-    // inner width of the panel instead of just the few columns left after
-    // the label prefix. Long real-world URLs (`/<long-org>/<long-repo>/
-    // pull/<n>`) would silently truncate at the panel edge inside the
-    // single-line `Paragraph` otherwise.
-    let pr_url = first_assoc.and_then(|a| a.pr.as_ref()).map(|pr| &pr.url);
-
-    let issue_str = first_assoc.and_then(|a| a.issue.as_ref()).map_or_else(
-        || "(none)".to_string(),
-        |issue| format!("#{} - {}", issue.number, issue.title),
-    );
-
-    let errors_str = if wi.errors.is_empty() {
-        "(none)".to_string()
-    } else {
-        wi.errors
-            .iter()
-            .map(|e| format_work_item_error(e).0)
-            .collect::<Vec<_>>()
-            .join("; ")
-    };
+    let rows = build_detail_rows(wi);
 
     // Helper: style a value as muted if it is "(none)", otherwise default.
     let val_style = |s: &str| -> ratatui_core::style::Style {
@@ -172,6 +115,195 @@ pub fn draw_work_item_detail(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
+    // Render detail rows in the historical order. Repo and Branch
+    // are the two interactive rows; everything else is rendered as a
+    // non-interactive "  Label       value" row.
+    let plain_row = |label: &str, value: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("  {label:<12}"), label_style),
+            Span::styled(value.to_string(), val_style(value)),
+        ])
+    };
+
+    push_detail_title(&mut lines, &mut registry, theme, inner, wi);
+
+    // lines[2]: blank separator
+    lines.push(Line::from(""));
+
+    lines.push(plain_row("Status", rows.status));
+    lines.push(plain_row("Backend", rows.backend));
+
+    push_interactive_value_row(
+        &mut lines,
+        &mut registry,
+        theme,
+        &plain_row,
+        inner,
+        InteractiveValueRow {
+            label: "Repo",
+            value: &rows.repo,
+            click_kind: ClickKind::RepoPath,
+            value_x_offset: LABEL_INDENT + LABEL_WIDTH,
+        },
+    );
+    push_interactive_value_row(
+        &mut lines,
+        &mut registry,
+        theme,
+        &plain_row,
+        inner,
+        InteractiveValueRow {
+            label: "Branch",
+            value: &rows.branch,
+            click_kind: ClickKind::Branch,
+            value_x_offset: LABEL_INDENT + LABEL_WIDTH,
+        },
+    );
+
+    lines.push(plain_row("Worktree", &rows.worktree));
+    lines.push(plain_row("PR", &rows.pr));
+    lines.push(plain_row("Issue", &rows.issue));
+    lines.push(plain_row("Errors", &rows.errors));
+
+    push_pr_url_block(
+        &mut lines,
+        &mut registry,
+        theme,
+        inner,
+        label_style,
+        rows.pr_url.as_ref(),
+        LABEL_INDENT,
+    );
+
+    lines.push(Line::from(""));
+    let hint_lines: &[&str] = stage_hint_lines(wi);
+    for hint in hint_lines {
+        lines.push(Line::from(Span::styled(*hint, none_style)));
+    }
+
+    if let Some(err) = mergequeue_poll_error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  Last poll error: {err}"),
+            theme.style_error(),
+        )));
+    }
+
+    // Drop the registry borrow before rendering. Rendering does not
+    // touch the registry, but explicitly ending the borrow here keeps
+    // the lifetime obvious and guards against a future render path
+    // that might try to borrow it again.
+    drop(registry);
+
+    let text = Text::from(lines);
+    let paragraph = Paragraph::new(text).block(block);
+    paragraph.render(area, buf);
+}
+
+/// Pre-formatted strings for every row of the work-item detail view.
+/// Computed once at the top of `draw_work_item_detail` so the
+/// renderer does not re-derive them per row.
+struct DetailRowStrings {
+    status: &'static str,
+    backend: &'static str,
+    repo: String,
+    branch: String,
+    worktree: String,
+    pr: String,
+    pr_url: Option<String>,
+    issue: String,
+    errors: String,
+}
+
+/// Derive all of the detail-view value strings from `wi`. Each field
+/// collapses to `"(none)"` when the underlying data is absent so the
+/// renderer can uniformly style those rows as muted.
+fn build_detail_rows(wi: &crate::work_item::WorkItem) -> DetailRowStrings {
+    let first_assoc = wi.repo_associations.first();
+
+    let status = match wi.status {
+        WorkItemStatus::Backlog => "Backlog",
+        WorkItemStatus::Planning => "Planning",
+        WorkItemStatus::Implementing => "Implementing",
+        WorkItemStatus::Blocked => "Blocked",
+        WorkItemStatus::Review => "Review",
+        WorkItemStatus::Mergequeue => "Mergequeue",
+        WorkItemStatus::Done => "Done",
+    };
+
+    let backend = match wi.backend_type {
+        BackendType::LocalFile => "Local file",
+        BackendType::GithubIssue => "GitHub issue",
+        BackendType::GithubProject => "GitHub project",
+    };
+
+    let repo = first_assoc.map_or_else(
+        || "(none)".to_string(),
+        |a| a.repo_path.display().to_string(),
+    );
+
+    let branch = first_assoc
+        .and_then(|a| a.branch.as_deref())
+        .map_or_else(|| "(none)".to_string(), std::string::ToString::to_string);
+
+    let worktree = first_assoc
+        .and_then(|a| a.worktree_path.as_ref())
+        .map_or_else(|| "(none)".to_string(), |p| p.display().to_string());
+
+    let pr = first_assoc.and_then(|a| a.pr.as_ref()).map_or_else(
+        || "(none)".to_string(),
+        |pr| format!("#{} - {}", pr.number, pr.title),
+    );
+
+    // PR URL is rendered on its own dedicated line below the field block
+    // (not as a regular `label  value` row) so that the URL gets the full
+    // inner width of the panel instead of just the few columns left after
+    // the label prefix. Long real-world URLs (`/<long-org>/<long-repo>/
+    // pull/<n>`) would silently truncate at the panel edge inside the
+    // single-line `Paragraph` otherwise.
+    let pr_url = first_assoc
+        .and_then(|a| a.pr.as_ref())
+        .map(|pr| pr.url.clone());
+
+    let issue = first_assoc.and_then(|a| a.issue.as_ref()).map_or_else(
+        || "(none)".to_string(),
+        |issue| format!("#{} - {}", issue.number, issue.title),
+    );
+
+    let errors = if wi.errors.is_empty() {
+        "(none)".to_string()
+    } else {
+        wi.errors
+            .iter()
+            .map(|e| format_work_item_error(e).0)
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    DetailRowStrings {
+        status,
+        backend,
+        repo,
+        branch,
+        worktree,
+        pr,
+        pr_url,
+        issue,
+        errors,
+    }
+}
+
+/// Push the work item's title row (lines 0-1) into `lines`. When
+/// the title is non-empty the full title value is registered as a
+/// click-to-copy target.
+fn push_detail_title(
+    lines: &mut Vec<Line<'static>>,
+    registry: &mut crate::click_targets::ClickRegistry,
+    theme: &Theme,
+    inner: Rect,
+    wi: &crate::work_item::WorkItem,
+) {
+    const LABEL_INDENT: u16 = 2;
     // lines[0]: blank
     lines.push(Line::from(""));
 
@@ -201,101 +333,101 @@ pub fn draw_work_item_detail(
             Span::styled(title_value, theme.style_interactive()),
         ]));
     }
+}
 
-    // lines[2]: blank separator
-    lines.push(Line::from(""));
+/// Inputs to `push_interactive_value_row`. Bundled so the helper
+/// does not exceed clippy's `too_many_arguments` threshold.
+#[derive(Clone, Copy)]
+struct InteractiveValueRow<'a> {
+    label: &'a str,
+    value: &'a str,
+    click_kind: ClickKind,
+    value_x_offset: u16,
+}
 
-    // Render detail rows in the historical order. Repo and Branch
-    // are the two interactive rows; everything else is rendered as a
-    // non-interactive "  Label       value" row.
-    let plain_row = |label: &str, value: &str| -> Line<'static> {
-        Line::from(vec![
-            Span::styled(format!("  {label:<12}"), label_style),
-            Span::styled(value.to_string(), val_style(value)),
-        ])
-    };
-
-    lines.push(plain_row("Status", status_str));
-    lines.push(plain_row("Backend", backend_str));
-
-    // Repo row (interactive).
-    {
-        let line_index = usize_to_u16_sat(lines.len());
-        if repo_str == "(none)" {
-            lines.push(plain_row("Repo", &repo_str));
-        } else {
-            let value_width = usize_to_u16_sat(UnicodeWidthStr::width(repo_str.as_str()));
-            registry.push_copy(
-                Rect {
-                    x: inner.x.saturating_add(LABEL_INDENT + LABEL_WIDTH),
-                    y: inner.y.saturating_add(line_index),
-                    width: value_width,
-                    height: 1,
-                },
-                ClickKind::RepoPath,
-                repo_str.clone(),
-            );
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {:<12}", "Repo"), label_style),
-                Span::styled(repo_str.clone(), theme.style_interactive()),
-            ]));
-        }
-    }
-
-    // Branch row (interactive).
-    {
-        let line_index = usize_to_u16_sat(lines.len());
-        if branch_str == "(none)" {
-            lines.push(plain_row("Branch", branch_str));
-        } else {
-            let value_width = usize_to_u16_sat(UnicodeWidthStr::width(branch_str));
-            registry.push_copy(
-                Rect {
-                    x: inner.x.saturating_add(LABEL_INDENT + LABEL_WIDTH),
-                    y: inner.y.saturating_add(line_index),
-                    width: value_width,
-                    height: 1,
-                },
-                ClickKind::Branch,
-                branch_str.to_string(),
-            );
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {:<12}", "Branch"), label_style),
-                Span::styled(branch_str.to_string(), theme.style_interactive()),
-            ]));
-        }
-    }
-
-    lines.push(plain_row("Worktree", &worktree_str));
-    lines.push(plain_row("PR", &pr_str));
-    lines.push(plain_row("Issue", &issue_str));
-    lines.push(plain_row("Errors", &errors_str));
-
-    // PR URL on its own line so it gets the full inner width.
-    if let Some(url) = pr_url {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("  PR URL", label_style)));
-        let line_index = usize_to_u16_sat(lines.len());
-        let url_value = url.clone();
-        let url_width = usize_to_u16_sat(UnicodeWidthStr::width(url_value.as_str()));
+/// Push an interactive value row (Repo / Branch) with an
+/// underline-styled value span and a click-to-copy registration. When
+/// the value is `"(none)"`, falls back to the plain non-interactive
+/// row via `plain_row_fn` (no underline, no registration).
+fn push_interactive_value_row(
+    lines: &mut Vec<Line<'static>>,
+    registry: &mut crate::click_targets::ClickRegistry,
+    theme: &Theme,
+    plain_row_fn: &dyn Fn(&str, &str) -> Line<'static>,
+    inner: Rect,
+    row: InteractiveValueRow<'_>,
+) {
+    let InteractiveValueRow {
+        label,
+        value,
+        click_kind,
+        value_x_offset,
+    } = row;
+    let line_index = usize_to_u16_sat(lines.len());
+    if value == "(none)" {
+        lines.push(plain_row_fn(label, value));
+    } else {
+        let value_width = usize_to_u16_sat(UnicodeWidthStr::width(value));
         registry.push_copy(
             Rect {
-                x: inner.x.saturating_add(LABEL_INDENT),
+                x: inner.x.saturating_add(value_x_offset),
                 y: inner.y.saturating_add(line_index),
-                width: url_width,
+                width: value_width,
                 height: 1,
             },
-            ClickKind::PrUrl,
-            url_value.clone(),
+            click_kind,
+            value.to_string(),
         );
         lines.push(Line::from(vec![
-            Span::styled("  ".to_string(), theme.style_text()),
-            Span::styled(url_value, theme.style_interactive()),
+            Span::styled(format!("  {label:<12}"), theme.style_heading()),
+            Span::styled(value.to_string(), theme.style_interactive()),
         ]));
     }
+}
 
+/// Append the "PR URL" block: a blank separator, a label line, then
+/// the URL on its own full-width line so long URLs are not truncated
+/// by the value column. The URL is registered as a click-to-copy
+/// target. No-op when `pr_url` is `None`.
+fn push_pr_url_block(
+    lines: &mut Vec<Line<'static>>,
+    registry: &mut crate::click_targets::ClickRegistry,
+    theme: &Theme,
+    inner: Rect,
+    label_style: ratatui_core::style::Style,
+    pr_url: Option<&String>,
+    label_indent: u16,
+) {
+    let Some(url) = pr_url else {
+        return;
+    };
     lines.push(Line::from(""));
-    let hint_lines: &[&str] = match wi.status {
+    lines.push(Line::from(Span::styled("  PR URL", label_style)));
+    let line_index = usize_to_u16_sat(lines.len());
+    let url_value = url.clone();
+    let url_width = usize_to_u16_sat(UnicodeWidthStr::width(url_value.as_str()));
+    registry.push_copy(
+        Rect {
+            x: inner.x.saturating_add(label_indent),
+            y: inner.y.saturating_add(line_index),
+            width: url_width,
+            height: 1,
+        },
+        ClickKind::PrUrl,
+        url_value.clone(),
+    );
+    lines.push(Line::from(vec![
+        Span::styled("  ".to_string(), theme.style_text()),
+        Span::styled(url_value, theme.style_interactive()),
+    ]));
+}
+
+/// Pick the stage-specific hint shown below the detail rows. The
+/// Planning / Implementing / Blocked / Review bucket branches on
+/// whether any repo association has a stale worktree (so the hint
+/// can steer the user toward recovery instead of a fresh session).
+fn stage_hint_lines(wi: &crate::work_item::WorkItem) -> &'static [&'static str] {
+    match wi.status {
         WorkItemStatus::Backlog => &["  Press c (Claude) or x (Codex) to", "  begin planning."],
         WorkItemStatus::Done => &["  Done."],
         WorkItemStatus::Mergequeue => &[
@@ -317,28 +449,7 @@ pub fn draw_work_item_detail(
                 &["  Press c (Claude) or x (Codex) to start a session."]
             }
         }
-    };
-    for hint in hint_lines {
-        lines.push(Line::from(Span::styled(*hint, none_style)));
     }
-
-    if let Some(err) = mergequeue_poll_error {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("  Last poll error: {err}"),
-            theme.style_error(),
-        )));
-    }
-
-    // Drop the registry borrow before rendering. Rendering does not
-    // touch the registry, but explicitly ending the borrow here keeps
-    // the lifetime obvious and guards against a future render path
-    // that might try to borrow it again.
-    drop(registry);
-
-    let text = Text::from(lines);
-    let paragraph = Paragraph::new(text).block(block);
-    paragraph.render(area, buf);
 }
 
 /// Detail fields for rendering an importable PR in the right panel.

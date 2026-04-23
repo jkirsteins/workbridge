@@ -20,6 +20,29 @@ fn fake_bridge() -> McpBridgeSpec {
     }
 }
 
+/// Assert that none of the legacy sandboxed-mode flags appear anywhere
+/// in a Codex argv list. Used by both the interactive and the gate
+/// (review / rebase) argv shape tests so the expectation stays in one
+/// place.
+fn assert_no_sandbox_flags(argv: &[String], context: &str) {
+    assert!(
+        !argv.iter().any(|s| s == "--sandbox"),
+        "{context} must NOT emit --sandbox"
+    );
+    assert!(
+        !argv.iter().any(|s| s == "workspace-write"),
+        "{context} must NOT emit workspace-write"
+    );
+    assert!(
+        !argv.iter().any(|s| s == "--ask-for-approval"),
+        "{context} must NOT emit --ask-for-approval"
+    );
+    assert!(
+        !argv.iter().any(|s| s == "--full-auto"),
+        "{context} must NOT use --full-auto"
+    );
+}
+
 #[test]
 fn codex_shape_compiles() {
     let backend: Box<dyn AgentBackend> = Box::new(CodexBackend);
@@ -48,23 +71,7 @@ fn codex_shape_compiles() {
             .any(|s| s == "--dangerously-bypass-approvals-and-sandbox"),
         "interactive Codex must emit --dangerously-bypass-approvals-and-sandbox, got {argv:?}"
     );
-    // The old sandboxed-mode flags MUST be absent.
-    assert!(
-        !argv.iter().any(|s| s == "--sandbox"),
-        "interactive Codex must NOT emit --sandbox"
-    );
-    assert!(
-        !argv.iter().any(|s| s == "workspace-write"),
-        "interactive Codex must NOT emit workspace-write"
-    );
-    assert!(
-        !argv.iter().any(|s| s == "--ask-for-approval"),
-        "interactive Codex must NOT emit --ask-for-approval"
-    );
-    assert!(
-        !argv.iter().any(|s| s == "--full-auto"),
-        "interactive Codex must NOT use --full-auto"
-    );
+    assert_no_sandbox_flags(&argv, "interactive Codex");
     // Per-server approval pre-approve must be emitted for the
     // workbridge primary.
     assert!(
@@ -97,11 +104,7 @@ fn codex_shape_compiles() {
     );
     assert!(rg_argv.iter().any(|s| s == "exec"));
     assert!(rg_argv.iter().any(|s| s == "--json"));
-    // Old sandboxed flags MUST be absent on the review gate path too.
-    assert!(!rg_argv.iter().any(|s| s == "--sandbox"));
-    assert!(!rg_argv.iter().any(|s| s == "workspace-write"));
-    assert!(!rg_argv.iter().any(|s| s == "--ask-for-approval"));
-    assert!(!rg_argv.iter().any(|s| s == "--full-auto"));
+    assert_no_sandbox_flags(&rg_argv, "review gate");
 
     // Headless read-write (rebase gate) shape.
     let rw_cfg = ReviewGateSpawnConfig {
@@ -133,11 +136,7 @@ fn codex_shape_compiles() {
         dangerous_idx < exec_idx,
         "--dangerously-bypass-approvals-and-sandbox must precede `exec`"
     );
-    // Old sandboxed flags MUST be absent on the rebase gate path.
-    assert!(!rw_argv.iter().any(|s| s == "--sandbox"));
-    assert!(!rw_argv.iter().any(|s| s == "workspace-write"));
-    assert!(!rw_argv.iter().any(|s| s == "--ask-for-approval"));
-    assert!(!rw_argv.iter().any(|s| s == "--full-auto"));
+    assert_no_sandbox_flags(&rw_argv, "rebase gate");
     assert!(
         rw_argv
             .iter()

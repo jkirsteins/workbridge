@@ -54,6 +54,8 @@ fn wait_until_file_removed(path: &std::path::Path, timeout: std::time::Duration)
     }
 }
 
+mod shared;
+
 mod part_01;
 mod part_02;
 mod part_03;

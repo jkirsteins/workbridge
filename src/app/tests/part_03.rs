@@ -1,9 +1,8 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
 use super::{
-    ActivityEntry, App, Arc, BackendError, Config, CreateWorkItem, DisplayEntry, FetchMessage,
-    PathBuf, RepoAssociationRecord, StubBackend, WorkItemBackend, WorkItemId, WorkItemStatus,
-    WorktreeService, drain_worktree_creation,
+    App, Arc, Config, DisplayEntry, FetchMessage, PathBuf, StubBackend, WorktreeService,
+    drain_worktree_creation,
 };
 
 // -- Round 6 regression tests --
@@ -181,205 +180,9 @@ fn disconnected_fetcher_surfaces_error() {
 #[test]
 fn import_creates_worktree_for_branch() {
     use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
-    use crate::work_item_backend::ListResult;
-    use crate::worktree_service::{WorktreeError, WorktreeInfo};
 
-    /// Mock worktree service that records `create_worktree` calls.
-    struct MockWorktreeService {
-        created: std::sync::Mutex<Vec<(PathBuf, String, PathBuf)>>,
-    }
-
-    impl WorktreeService for MockWorktreeService {
-        fn list_worktrees(
-            &self,
-            _repo_path: &std::path::Path,
-        ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
-            Ok(Vec::new())
-        }
-
-        fn create_worktree(
-            &self,
-            repo_path: &std::path::Path,
-            branch: &str,
-            target_dir: &std::path::Path,
-        ) -> Result<WorktreeInfo, WorktreeError> {
-            self.created.lock().unwrap().push((
-                repo_path.to_path_buf(),
-                branch.to_string(),
-                target_dir.to_path_buf(),
-            ));
-            Ok(WorktreeInfo {
-                path: target_dir.to_path_buf(),
-                branch: Some(branch.to_string()),
-                is_main: false,
-                has_commits_ahead: Some(false),
-                ..WorktreeInfo::default()
-            })
-        }
-
-        fn remove_worktree(
-            &self,
-            _repo_path: &std::path::Path,
-            _worktree_path: &std::path::Path,
-            _delete_branch: bool,
-            _force: bool,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-
-        fn delete_branch(
-            &self,
-            _repo_path: &std::path::Path,
-            _branch: &str,
-            _force: bool,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-
-        fn default_branch(&self, _repo_path: &std::path::Path) -> Result<String, WorktreeError> {
-            Ok("main".to_string())
-        }
-
-        fn github_remote(
-            &self,
-            _repo_path: &std::path::Path,
-        ) -> Result<Option<(String, String)>, WorktreeError> {
-            Ok(None)
-        }
-
-        fn fetch_branch(
-            &self,
-            _repo_path: &std::path::Path,
-            _branch: &str,
-        ) -> Result<(), WorktreeError> {
-            // Mock: fetch always succeeds (branch exists on origin).
-            Ok(())
-        }
-
-        fn create_branch(
-            &self,
-            _repo_path: &std::path::Path,
-            _branch: &str,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-
-        fn prune_worktrees(&self, _repo_path: &std::path::Path) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-    }
-
-    /// Test backend that supports import.
-    struct TestBackend {
-        records: std::sync::Mutex<Vec<crate::work_item_backend::WorkItemRecord>>,
-    }
-
-    impl WorkItemBackend for TestBackend {
-        fn read(
-            &self,
-            id: &WorkItemId,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            self.records
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|r| r.id == *id)
-                .cloned()
-                .ok_or_else(|| BackendError::NotFound(id.clone()))
-        }
-        fn list(&self) -> Result<ListResult, BackendError> {
-            Ok(ListResult {
-                records: self.records.lock().unwrap().clone(),
-                corrupt: Vec::new(),
-            })
-        }
-        fn create(
-            &self,
-            _req: CreateWorkItem,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            Err(BackendError::Validation("not used".into()))
-        }
-        fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn update_status(
-            &self,
-            _id: &WorkItemId,
-            _status: WorkItemStatus,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn import(
-            &self,
-            unlinked: &crate::work_item::UnlinkedPr,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            let record = crate::work_item_backend::WorkItemRecord {
-                display_id: None,
-                id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported.json")),
-                title: unlinked.pr.title.clone(),
-                description: None,
-                status: WorkItemStatus::Implementing,
-                kind: crate::work_item::WorkItemKind::Own,
-                repo_associations: vec![RepoAssociationRecord {
-                    repo_path: unlinked.repo_path.clone(),
-                    branch: Some(unlinked.branch.clone()),
-                    pr_identity: None,
-                }],
-                plan: None,
-                done_at: None,
-            };
-            self.records.lock().unwrap().push(record.clone());
-            Ok(record)
-        }
-        fn import_review_request(
-            &self,
-            rr: &crate::work_item::ReviewRequestedPr,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            let record = crate::work_item_backend::WorkItemRecord {
-                display_id: None,
-                id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported-rr.json")),
-                title: rr.pr.title.clone(),
-                status: WorkItemStatus::Review,
-                kind: crate::work_item::WorkItemKind::ReviewRequest,
-                repo_associations: vec![RepoAssociationRecord {
-                    repo_path: rr.repo_path.clone(),
-                    branch: Some(rr.branch.clone()),
-                    pr_identity: None,
-                }],
-                plan: None,
-                description: None,
-                done_at: None,
-            };
-            self.records.lock().unwrap().push(record.clone());
-            Ok(record)
-        }
-        fn append_activity(
-            &self,
-            _id: &WorkItemId,
-            _entry: &ActivityEntry,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
-            Ok(None)
-        }
-        fn set_done_at(&self, _id: &WorkItemId, _done_at: Option<u64>) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
-            None
-        }
-    }
-
-    let mock_ws = Arc::new(MockWorktreeService {
-        created: std::sync::Mutex::new(Vec::new()),
-    });
-    let backend = TestBackend {
-        records: std::sync::Mutex::new(Vec::new()),
-    };
+    let mock_ws = super::shared::ImportMockWorktreeService::new();
+    let backend = super::shared::ImportTestBackend::new();
     let mut app = App::with_config_and_worktree_service(
         Config::default(),
         Arc::new(backend),
@@ -434,6 +237,7 @@ fn import_creates_worktree_for_branch() {
         PathBuf::from("/repos/myrepo/.worktrees/fix-bug"),
         "worktree should use config.defaults.worktree_dir, not parent dir",
     );
+    drop(created);
 
     // Verify status message indicates success with worktree.
     let msg = app.shell.status_message.as_deref().unwrap_or("");

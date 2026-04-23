@@ -126,102 +126,130 @@ pub fn draw_prompt_dialog(buf: &mut Buffer, theme: &Theme, area: Rect, kind: Pro
     // 6. Render content rows using a vertical layout.
     match kind {
         PromptDialogKind::KeyChoice { body, options, .. } => {
-            // Rows: body, blank, option*N, blank.
-            let mut constraints = vec![
-                Constraint::Length(1), // body
-                Constraint::Length(1), // blank
-            ];
-            for _ in options {
-                constraints.push(Constraint::Length(1));
-            }
-            constraints.push(Constraint::Min(0)); // remaining space
-
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(constraints)
-                .split(inner);
-
-            Paragraph::new(body)
-                .style(theme.style_text())
-                .render(rows[0], buf);
-            // rows[1] is blank.
-            for (i, (key_label, description)) in options.iter().enumerate() {
-                let line = Line::from(vec![
-                    Span::styled(*key_label, theme.style_heading()),
-                    Span::raw("  "),
-                    Span::styled(*description, theme.style_text()),
-                ]);
-                Paragraph::new(line).render(rows[2 + i], buf);
-            }
+            render_prompt_key_choice(buf, theme, inner, body, options);
         }
         PromptDialogKind::TextInput {
             body, input, hint, ..
         } => {
-            // Rows: body, blank, input, blank, hint.
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1), // body
-                    Constraint::Length(1), // blank
-                    Constraint::Length(1), // input field
-                    Constraint::Length(1), // blank
-                    Constraint::Length(1), // hint
-                    Constraint::Min(0),    // remaining
-                ])
-                .split(inner);
-
-            Paragraph::new(body)
-                .style(theme.style_text())
-                .render(rows[0], buf);
-            // rows[1] is blank.
-            // Focused prompt input: render with rat-widget's TextInput so
-            // the caret is drawn by the same stateful widget used by the
-            // Create Work Item dialog (no custom single-line widget).
-            input.focus.set(true);
-            StatefulWidget::render(
-                TextInput::new().styles(create_dialog_text_style(theme)),
-                rows[2],
-                buf,
-                input,
-            );
-            // rows[3] is blank.
-            Paragraph::new(hint)
-                .style(theme.style_text_muted())
-                .render(rows[4], buf);
+            render_prompt_text_input(buf, theme, inner, body, input, hint);
         }
         PromptDialogKind::Alert { body, .. } => {
-            // Compute wrapped body line count for layout.
-            let content_w = usize::from(inner.width.max(1));
-            let body_lines = if body.is_empty() {
-                1u16
-            } else {
-                // Use word-wrap simulation for accurate line count.
-                u16::try_from(wrap_text_flat(body, content_w).len())
-                    .unwrap_or(u16::MAX)
-                    .max(1)
-            };
-            // Rows: body (may wrap to multiple lines), blank, hint.
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(body_lines), // body
-                    Constraint::Length(1),          // blank
-                    Constraint::Length(1),          // hint
-                    Constraint::Min(0),             // remaining
-                ])
-                .split(inner);
-
-            Paragraph::new(body)
-                .style(theme.style_error())
-                .wrap(Wrap { trim: false })
-                .render(rows[0], buf);
-            // rows[1] is blank.
-            let hint_line = Line::from(vec![
-                Span::styled("[Enter/Esc]", theme.style_heading()),
-                Span::raw("  "),
-                Span::styled("OK", theme.style_text()),
-            ]);
-            Paragraph::new(hint_line).render(rows[2], buf);
+            render_prompt_alert(buf, theme, inner, body);
         }
     }
+}
+
+/// Render the `KeyChoice` body: prompt text, blank line, then one line
+/// per (key, description) option.
+fn render_prompt_key_choice(
+    buf: &mut Buffer,
+    theme: &Theme,
+    inner: Rect,
+    body: &str,
+    options: &[(&str, &str)],
+) {
+    let mut constraints = vec![
+        Constraint::Length(1), // body
+        Constraint::Length(1), // blank
+    ];
+    for _ in options {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(0)); // remaining space
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    Paragraph::new(body)
+        .style(theme.style_text())
+        .render(rows[0], buf);
+    // rows[1] is blank.
+    for (i, (key_label, description)) in options.iter().enumerate() {
+        let line = Line::from(vec![
+            Span::styled(*key_label, theme.style_heading()),
+            Span::raw("  "),
+            Span::styled(*description, theme.style_text()),
+        ]);
+        Paragraph::new(line).render(rows[2 + i], buf);
+    }
+}
+
+/// Render the `TextInput` body: prompt text, a focused rat-widget text
+/// input, and a hint line below.
+fn render_prompt_text_input(
+    buf: &mut Buffer,
+    theme: &Theme,
+    inner: Rect,
+    body: &str,
+    input: &mut rat_widget::text_input::TextInputState,
+    hint: &str,
+) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // body
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // input field
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // hint
+            Constraint::Min(0),    // remaining
+        ])
+        .split(inner);
+
+    Paragraph::new(body)
+        .style(theme.style_text())
+        .render(rows[0], buf);
+    // rows[1] is blank.
+    // Focused prompt input: render with rat-widget's TextInput so
+    // the caret is drawn by the same stateful widget used by the
+    // Create Work Item dialog (no custom single-line widget).
+    input.focus.set(true);
+    StatefulWidget::render(
+        TextInput::new().styles(create_dialog_text_style(theme)),
+        rows[2],
+        buf,
+        input,
+    );
+    // rows[3] is blank.
+    Paragraph::new(hint)
+        .style(theme.style_text_muted())
+        .render(rows[4], buf);
+}
+
+/// Render the `Alert` body: word-wrapped error text and a standard
+/// `[Enter/Esc] OK` hint line.
+fn render_prompt_alert(buf: &mut Buffer, theme: &Theme, inner: Rect, body: &str) {
+    let content_w = usize::from(inner.width.max(1));
+    let body_lines = if body.is_empty() {
+        1u16
+    } else {
+        // Use word-wrap simulation for accurate line count.
+        u16::try_from(wrap_text_flat(body, content_w).len())
+            .unwrap_or(u16::MAX)
+            .max(1)
+    };
+    // Rows: body (may wrap to multiple lines), blank, hint.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(body_lines), // body
+            Constraint::Length(1),          // blank
+            Constraint::Length(1),          // hint
+            Constraint::Min(0),             // remaining
+        ])
+        .split(inner);
+
+    Paragraph::new(body)
+        .style(theme.style_error())
+        .wrap(Wrap { trim: false })
+        .render(rows[0], buf);
+    // rows[1] is blank.
+    let hint_line = Line::from(vec![
+        Span::styled("[Enter/Esc]", theme.style_heading()),
+        Span::raw("  "),
+        Span::styled("OK", theme.style_text()),
+    ]);
+    Paragraph::new(hint_line).render(rows[2], buf);
 }

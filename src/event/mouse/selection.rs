@@ -43,9 +43,8 @@ pub fn encode_mouse_scroll(
             let cx = local_col + 1 + 32;
             let cy = local_row + 1 + 32;
             // Guard so the u8 narrowing below cannot truncate.
-            let (cx_u8, cy_u8) = match (u8::try_from(cx), u8::try_from(cy)) {
-                (Ok(x), Ok(y)) => (x, y),
-                _ => return None,
+            let (Ok(cx_u8), Ok(cy_u8)) = (u8::try_from(cx), u8::try_from(cy)) else {
+                return None;
             };
             Some(vec![0x1b, b'[', b'M', button + 32, cx_u8, cy_u8])
         }

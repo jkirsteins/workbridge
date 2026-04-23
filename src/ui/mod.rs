@@ -130,27 +130,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
 
     // Status bar: activity indicator overrides transient messages.
     if let Some(area) = status_area {
-        if let Some(activity_msg) = app.activities.current() {
-            let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
-            let count_suffix = if app.activities.len() > 1 {
-                format!(" (+{})", app.activities.len() - 1)
-            } else {
-                String::new()
-            };
-            let line = Line::from(vec![
-                Span::styled(format!(" {spinner} "), theme.style_activity_spinner()),
-                Span::styled(activity_msg, theme.style_activity()),
-                Span::styled(count_suffix, theme.style_text_muted()),
-            ]);
-            Paragraph::new(line).render(area, buf);
-        } else if let Some(msg) = &app.shell.status_message {
-            let style = if app.shell.shutting_down {
-                theme.style_status_shutdown()
-            } else {
-                theme.style_status()
-            };
-            Paragraph::new(msg.as_str()).style(style).render(area, buf);
-        }
+        render_status_bar(buf, app, theme, area);
     }
 
     // Settings overlay (rendered on top of everything).
@@ -161,65 +141,83 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
     // Prompt dialogs: blocking choice/input prompts rendered as centered modal
     // dialogs with dimmed backgrounds. Order matches the handle_key() intercept
     // chain (cleanup_reason_input_active before cleanup_prompt_visible).
-    if app.merge_flow.confirm {
-        if app.merge_flow.in_progress {
-            let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
-            // While the live merge precheck is in flight we show a
-            // "Refreshing remote state..." body so the user knows
-            // that workbridge is re-verifying both the local
-            // worktree AND the remote PR state (mergeable flag + CI
-            // rollup) before shelling out to `gh pr merge`. As soon
-            // as `poll_merge_precheck` swaps the helper slot's
-            // payload from `PrMergePrecheck` to `PrMerge`, the next
-            // render switches to the "Merging pull request..." body
-            // without re-laying out the dialog (same `KeyChoice`
-            // shape, same spinner).
-            let body = if app.is_merge_precheck_phase() {
-                format!("{spinner} Refreshing remote state... Please wait.")
-            } else {
-                format!("{spinner} Merging pull request... Please wait.")
-            };
-            draw_prompt_dialog(
-                buf,
-                theme,
-                area,
-                PromptDialogKind::KeyChoice {
-                    title: "Merge Strategy",
-                    body: &body,
-                    options: &[],
-                },
-            );
+    draw_prompt_overlays(buf, app, theme, area);
+
+    // Alert dialog (renders above prompt dialogs, below global drawer and create dialog).
+    if let Some(ref msg) = app.alert_message {
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::Alert {
+                title: "Error",
+                body: msg,
+            },
+        );
+    }
+
+    // First-run Ctrl+G harness picker modal (rendered above alerts so
+    // a transient error does not hide the picker, but below the global
+    // drawer - which cannot be open at the same time). The modal is
+    // opened by `App::handle_ctrl_g` when
+    // `config.defaults.global_assistant_harness` is unset, and
+    // dismissed by `App::finish_first_run_global_pick` or
+    // `App::cancel_first_run_global_pick`. See `docs/UI.md`
+    // "First-run Ctrl+G modal".
+    if let Some(ref modal) = app.first_run_global_harness_modal {
+        draw_first_run_global_harness_modal(buf, modal, theme, area);
+    }
+
+    // Global assistant drawer (rendered on top, below create dialog).
+    if app.global_drawer.open {
+        draw_global_drawer(buf, app, theme, area);
+    }
+
+    // Create dialog overlay (rendered on top of everything).
+    // Uses `&mut app.create_dialog` because the rat-widget `TextInput` /
+    // `TextArea` stateful widgets need `&mut State` to render.
+    if app.create_dialog.visible {
+        draw_create_dialog(buf, &mut app.create_dialog, theme, area);
+    }
+
+    // Top-right toast stack. Rendered LAST so it sits on top of
+    // every other overlay including the global drawer and settings.
+    draw_toasts(buf, &app.toasts, theme, area);
+}
+
+/// Render the bottom status-bar row: shows the current activity and a
+/// spinner when any background activity is in flight, otherwise shows
+/// the transient `status_message` (coloured red during shutdown).
+fn render_status_bar(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+    if let Some(activity_msg) = app.activities.current() {
+        let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
+        let count_suffix = if app.activities.len() > 1 {
+            format!(" (+{})", app.activities.len() - 1)
         } else {
-            // Soft hint: if the cached repo state already hints that
-            // the live precheck may block (worktree dirty / unpushed
-            // / PR conflict / CI failing), append a dim reassurance
-            // line so the user knows the authoritative check is
-            // still ahead. Never refuses at the entry point based on
-            // stale cache - see `App::merge_confirm_hint` for the
-            // rationale.
-            let base = "Merge PR?";
-            let hint = app
-                .merge_wi_id
-                .as_ref()
-                .and_then(|wi_id| app.merge_confirm_hint(wi_id));
-            let body_owned = hint.map(|h| format!("{base}\n\n{h}"));
-            let body_str: &str = body_owned.as_deref().unwrap_or(base);
-            draw_prompt_dialog(
-                buf,
-                theme,
-                area,
-                PromptDialogKind::KeyChoice {
-                    title: "Merge Strategy",
-                    body: body_str,
-                    options: &[
-                        ("[s]", "Squash (default)"),
-                        ("[m]", "Merge"),
-                        ("[p]", "Poll (mergequeue)"),
-                        ("[Esc]", "Cancel"),
-                    ],
-                },
-            );
-        }
+            String::new()
+        };
+        let line = Line::from(vec![
+            Span::styled(format!(" {spinner} "), theme.style_activity_spinner()),
+            Span::styled(activity_msg, theme.style_activity()),
+            Span::styled(count_suffix, theme.style_text_muted()),
+        ]);
+        Paragraph::new(line).render(area, buf);
+    } else if let Some(msg) = &app.shell.status_message {
+        let style = if app.shell.shutting_down {
+            theme.style_status_shutdown()
+        } else {
+            theme.style_status()
+        };
+        Paragraph::new(msg.as_str()).style(style).render(area, buf);
+    }
+}
+
+/// Render the blocking-prompt overlay chain. The order mirrors the
+/// `handle_key` modal-routing chain so the overlay the user sees
+/// matches the overlay that captures their keypress.
+fn draw_prompt_overlays(buf: &mut Buffer, app: &mut App, theme: &Theme, area: Rect) {
+    if app.merge_flow.confirm {
+        draw_merge_prompt_overlay(buf, app, theme, area);
     } else if let Some(dlg) = app.set_branch_dialog.as_mut() {
         draw_prompt_dialog(
             buf,
@@ -257,36 +255,7 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
             },
         );
     } else if app.cleanup_flow.prompt_visible {
-        if app.is_user_action_in_flight(&UserActionKey::UnlinkedCleanup) {
-            let pr_num = app.cleanup_progress_pr_number.unwrap_or(0);
-            let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
-            draw_prompt_dialog(
-                buf,
-                theme,
-                area,
-                PromptDialogKind::KeyChoice {
-                    title: "Close Unlinked PR",
-                    body: &format!("{spinner} Closing PR #{pr_num}... Please wait."),
-                    options: &[],
-                },
-            );
-        } else {
-            let pr_num = app.cleanup_unlinked_target.as_ref().map_or(0, |t| t.2);
-            draw_prompt_dialog(
-                buf,
-                theme,
-                area,
-                PromptDialogKind::KeyChoice {
-                    title: "Close Unlinked PR",
-                    body: &format!("Close PR #{pr_num} and delete branch?"),
-                    options: &[
-                        ("[Enter]", "Close with reason"),
-                        ("[d]", "Close directly"),
-                        ("[Esc]", "Cancel"),
-                    ],
-                },
-            );
-        }
+        draw_cleanup_prompt_overlay(buf, app, theme, area);
     } else if app.prompt_flags.no_plan_visible {
         draw_prompt_dialog(
             buf,
@@ -341,86 +310,152 @@ pub fn draw_to_buffer(area: Rect, buf: &mut Buffer, app: &mut App, theme: &Theme
             },
         );
     } else if app.delete_flow.prompt_visible {
-        if app.delete_flow.in_progress {
-            let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
-            draw_prompt_dialog(
-                buf,
-                theme,
-                area,
-                PromptDialogKind::KeyChoice {
-                    title: "Delete Work Item",
-                    body: &format!("{spinner} Removing worktree, branches, and open PRs..."),
-                    options: &[],
-                },
-            );
-        } else {
-            // draw_prompt_dialog's KeyChoice variant renders the body as
-            // exactly one line. Long titles are elided so the dialog
-            // still fits the 60-column max width. The body always warns
-            // that uncommitted changes will be lost, because we no
-            // longer shell out to `git status --porcelain` on the UI
-            // thread to pre-detect dirty worktrees.
-            let raw_title = app
-                .delete_target_title
-                .as_deref()
-                .unwrap_or("this work item");
-            // 60 - len("Delete '' (uncommitted changes will be lost)?") - borders - padding
-            let short_title = truncate_str(raw_title, 24);
-            let body = format!("Delete '{short_title}' (uncommitted changes will be lost)?");
-            draw_prompt_dialog(
-                buf,
-                theme,
-                area,
-                PromptDialogKind::KeyChoice {
-                    title: "Delete Work Item",
-                    body: &body,
-                    options: &[
-                        ("[y]", "Delete (worktree, branch, PR)"),
-                        ("[Esc]", "Cancel"),
-                    ],
-                },
-            );
-        }
+        draw_delete_prompt_overlay(buf, app, theme, area);
     }
+}
 
-    // Alert dialog (renders above prompt dialogs, below global drawer and create dialog).
-    if let Some(ref msg) = app.alert_message {
+/// Render the merge strategy prompt. Shows a precheck/merge spinner
+/// when the background thread is in flight, or the strategy key
+/// options with an optional "live re-check will run" hint below.
+fn draw_merge_prompt_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+    if app.merge_flow.in_progress {
+        let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
+        // While the live merge precheck is in flight we show a
+        // "Refreshing remote state..." body so the user knows
+        // that workbridge is re-verifying both the local
+        // worktree AND the remote PR state (mergeable flag + CI
+        // rollup) before shelling out to `gh pr merge`. As soon
+        // as `poll_merge_precheck` swaps the helper slot's
+        // payload from `PrMergePrecheck` to `PrMerge`, the next
+        // render switches to the "Merging pull request..." body
+        // without re-laying out the dialog (same `KeyChoice`
+        // shape, same spinner).
+        let body = if app.is_merge_precheck_phase() {
+            format!("{spinner} Refreshing remote state... Please wait.")
+        } else {
+            format!("{spinner} Merging pull request... Please wait.")
+        };
         draw_prompt_dialog(
             buf,
             theme,
             area,
-            PromptDialogKind::Alert {
-                title: "Error",
-                body: msg,
+            PromptDialogKind::KeyChoice {
+                title: "Merge Strategy",
+                body: &body,
+                options: &[],
+            },
+        );
+    } else {
+        // Soft hint: if the cached repo state already hints that
+        // the live precheck may block (worktree dirty / unpushed
+        // / PR conflict / CI failing), append a dim reassurance
+        // line so the user knows the authoritative check is
+        // still ahead. Never refuses at the entry point based on
+        // stale cache - see `App::merge_confirm_hint` for the
+        // rationale.
+        let base = "Merge PR?";
+        let hint = app
+            .merge_wi_id
+            .as_ref()
+            .and_then(|wi_id| app.merge_confirm_hint(wi_id));
+        let body_owned = hint.map(|h| format!("{base}\n\n{h}"));
+        let body_str: &str = body_owned.as_deref().unwrap_or(base);
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::KeyChoice {
+                title: "Merge Strategy",
+                body: body_str,
+                options: &[
+                    ("[s]", "Squash (default)"),
+                    ("[m]", "Merge"),
+                    ("[p]", "Poll (mergequeue)"),
+                    ("[Esc]", "Cancel"),
+                ],
             },
         );
     }
+}
 
-    // First-run Ctrl+G harness picker modal (rendered above alerts so
-    // a transient error does not hide the picker, but below the global
-    // drawer - which cannot be open at the same time). The modal is
-    // opened by `App::handle_ctrl_g` when
-    // `config.defaults.global_assistant_harness` is unset, and
-    // dismissed by `App::finish_first_run_global_pick` or
-    // `App::cancel_first_run_global_pick`. See `docs/UI.md`
-    // "First-run Ctrl+G modal".
-    if let Some(ref modal) = app.first_run_global_harness_modal {
-        draw_first_run_global_harness_modal(buf, modal, theme, area);
+/// Render the unlinked-PR cleanup prompt: shows an in-progress
+/// spinner when the background thread is running, or the
+/// "Close PR and delete branch?" confirmation with key options.
+fn draw_cleanup_prompt_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+    if app.is_user_action_in_flight(&UserActionKey::UnlinkedCleanup) {
+        let pr_num = app.cleanup_progress_pr_number.unwrap_or(0);
+        let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::KeyChoice {
+                title: "Close Unlinked PR",
+                body: &format!("{spinner} Closing PR #{pr_num}... Please wait."),
+                options: &[],
+            },
+        );
+    } else {
+        let pr_num = app.cleanup_unlinked_target.as_ref().map_or(0, |t| t.2);
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::KeyChoice {
+                title: "Close Unlinked PR",
+                body: &format!("Close PR #{pr_num} and delete branch?"),
+                options: &[
+                    ("[Enter]", "Close with reason"),
+                    ("[d]", "Close directly"),
+                    ("[Esc]", "Cancel"),
+                ],
+            },
+        );
     }
+}
 
-    // Global assistant drawer (rendered on top, below create dialog).
-    if app.global_drawer.open {
-        draw_global_drawer(buf, app, theme, area);
+/// Render the work-item delete confirmation prompt. Shows an
+/// in-progress spinner when the background delete thread is running,
+/// or the "Delete '<title>'?" confirmation with a truncated title so
+/// long names do not blow past the 60-column max dialog width.
+fn draw_delete_prompt_overlay(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+    if app.delete_flow.in_progress {
+        let spinner = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::KeyChoice {
+                title: "Delete Work Item",
+                body: &format!("{spinner} Removing worktree, branches, and open PRs..."),
+                options: &[],
+            },
+        );
+    } else {
+        // draw_prompt_dialog's KeyChoice variant renders the body as
+        // exactly one line. Long titles are elided so the dialog
+        // still fits the 60-column max width. The body always warns
+        // that uncommitted changes will be lost, because we no
+        // longer shell out to `git status --porcelain` on the UI
+        // thread to pre-detect dirty worktrees.
+        let raw_title = app
+            .delete_target_title
+            .as_deref()
+            .unwrap_or("this work item");
+        let short_title = truncate_str(raw_title, 24);
+        let body = format!("Delete '{short_title}' (uncommitted changes will be lost)?");
+        draw_prompt_dialog(
+            buf,
+            theme,
+            area,
+            PromptDialogKind::KeyChoice {
+                title: "Delete Work Item",
+                body: &body,
+                options: &[
+                    ("[y]", "Delete (worktree, branch, PR)"),
+                    ("[Esc]", "Cancel"),
+                ],
+            },
+        );
     }
-
-    // Create dialog overlay (rendered on top of everything).
-    // Uses `&mut app.create_dialog` because the rat-widget `TextInput` /
-    // `TextArea` stateful widgets need `&mut State` to render.
-    if app.create_dialog.visible {
-        draw_create_dialog(buf, &mut app.create_dialog, theme, area);
-    }
-
-    // Top-right toast stack. Rendered LAST so it sits on top of
-    // every other overlay including the global drawer and settings.
-    draw_toasts(buf, &app.toasts, theme, area);
 }

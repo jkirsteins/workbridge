@@ -16,6 +16,7 @@ use super::{
     UserActionPayload, now_iso8601, run_cancellable,
 };
 use crate::agent_backend::AgentBackendKind;
+use crate::work_item::WorkItemId;
 use crate::work_item_backend::ActivityEntry;
 
 impl super::App {
@@ -52,46 +53,8 @@ impl super::App {
             return;
         };
 
-        // Resolve per-repo MCP servers up-front (UI thread) and convert
-        // them into `McpBridgeSpec` so the background harness sub-thread
-        // can pass them through to Codex via per-key `-c` overrides
-        // alongside the workbridge bridge. Computing here (rather than
-        // inside the thread) keeps `self.services.config` reads on the UI thread,
-        // matching how `begin_session_open` does it. HTTP entries are
-        // skipped: Codex's `mcp_servers.<name>` schema requires command
-        // + args. See `agent_backend::McpBridgeSpec`. R3-F-3: count the
-        // skipped HTTP entries so we can surface a toast (silent skip
-        // is a feature gap vs Claude, where HTTP entries are still
-        // visible via the `--mcp-config` JSON).
-        let (rebase_extra_bridges, http_skipped_for_rebase): (
-            Vec<crate::agent_backend::McpBridgeSpec>,
-            usize,
-        ) = self
-            .work_items
-            .iter()
-            .find(|w| w.id == wi_id)
-            .and_then(|w| w.repo_associations.first())
-            .map(|assoc| {
-                let repo_display = crate::config::collapse_home(&assoc.repo_path);
-                let entries = self.services.config.mcp_servers_for_repo(&repo_display);
-                let http_count = entries.iter().filter(|e| e.server_type == "http").count();
-                let bridges: Vec<crate::agent_backend::McpBridgeSpec> = entries
-                    .into_iter()
-                    .filter(|entry| entry.server_type != "http")
-                    .filter_map(|entry| {
-                        entry
-                            .command
-                            .as_ref()
-                            .map(|cmd| crate::agent_backend::McpBridgeSpec {
-                                name: entry.name.clone(),
-                                command: PathBuf::from(cmd),
-                                args: entry.args.clone(),
-                            })
-                    })
-                    .collect();
-                (bridges, http_count)
-            })
-            .unwrap_or_default();
+        let (rebase_extra_bridges, http_skipped_for_rebase) =
+            self.collect_repo_mcp_bridges_for_item(&wi_id);
         if agent_backend.kind() == AgentBackendKind::Codex && http_skipped_for_rebase > 0 {
             self.toasts.push(format!(
                 "Codex: {http_skipped_for_rebase} HTTP MCP server(s) skipped (Codex requires stdio)"
@@ -226,32 +189,7 @@ impl super::App {
             // compute cleanup. Silence dead-code hints.
             let _ = (&ws, &backend);
 
-            // === Post-'compute cleanup ===
-            //
-            // Drop the MCP server and remove the temp config file.
-            // Both are wrapped in `Option<>` so this runs uniformly
-            // regardless of which break arm exited the block: a
-            // pre-server failure leaves both `None` (no-op cleanup),
-            // a post-server pre-config failure drops the server but
-            // skips the rm, and a successful run drops both. The
-            // server MUST be alive while the harness child is
-            // running - that constraint is satisfied by the harness
-            // sub-thread spawning and waiting INSIDE the block, so
-            // by the time we reach this cleanup the harness has
-            // already exited or we have already broken with an
-            // early failure that did not reach the spawn.
-            if let Some(server) = gate_server.take() {
-                drop(server);
-            }
-            if let Some(path) = config_path.take()
-                && let Err(_e) = std::fs::remove_file(&path)
-            {
-                // Best-effort cleanup: the file is in `$TMPDIR` and
-                // the OS will clean it up eventually. Logging would
-                // be misleading because the typical "error" here is
-                // ENOENT after a normal harness run that already
-                // consumed the config.
-            }
+            cleanup_rebase_gate_compute_resources(gate_server.take(), config_path.take());
 
             // Convert the labeled-block result into either a
             // concrete `RebaseResult` (audit + send below) or a bare
@@ -262,149 +200,207 @@ impl super::App {
             // result through `tx`.
             let Some(result) = computed else { return };
 
-            // If the result is a Failure, clean up any in-progress
-            // rebase the harness may have left behind. The harness
-            // is instructed to `git rebase --abort` on give-up, but
-            // if it crashed, was killed, or hallucinated success
-            // while REBASE_HEAD still exists, the worktree is left
-            // mid-rebase with conflict markers and a locked index.
-            // Running `git rebase --abort` here is idempotent: if
-            // no rebase is in progress it exits non-zero with "No
-            // rebase in progress?" and does nothing. The abort goes
-            // through `run_cancellable` so it is also killable if
-            // the gate is torn down while the abort is in flight
-            // (the worktree is about to be removed anyway in that
-            // case, so a partial abort is harmless).
-            if matches!(&result, RebaseResult::Failure { .. }) {
-                let _ = run_cancellable(
-                    crate::worktree_service::git_command()
-                        .arg("-C")
-                        .arg(&worktree_path)
-                        .args(["rebase", "--abort"]),
-                    &child_pid,
-                    &cancelled,
-                );
-            }
+            run_rebase_failure_abort(&result, &worktree_path, &child_pid, &cancelled);
 
-            // Early-out on cancellation: skip the append entirely
-            // and do not send the result. This is a fast-path
-            // optimization - the structural guarantee that a
-            // cancelled gate cannot create an orphan active log
-            // comes from `append_activity_existing_only` below,
-            // NOT from this check. The check still matters because
-            // it avoids doing the backend work (and sending a
-            // result the dropped receiver would never read) when
-            // we already know the gate is gone.
+            // Early-out on cancellation: see the comment on
+            // `append_activity_existing_only` below for why this is
+            // only an optimization, not the structural guarantee.
             if cancelled.load(Ordering::SeqCst) {
                 return;
             }
 
-            // Build the activity log entry from the result and
-            // append it via the backend on THIS background thread.
-            // The append used to live in `poll_rebase_gate` (i.e. on
-            // the UI thread) which violated the absolute blocking-
-            // I/O invariant: a slow filesystem could freeze the TUI.
-            // Doing it here keeps the UI thread out of the file
-            // write entirely.
-            //
-            // CRITICAL: we call `append_activity_existing_only`, NOT
-            // `append_activity`. The former opens with
-            // `OpenOptions::create(false)` so a `backend.delete` +
-            // `archive_activity_log` that races the append cannot
-            // recreate an orphan active activity log for a deleted
-            // item. POSIX semantics: if the main thread renames
-            // active -> archive AFTER we open the fd but BEFORE we
-            // write, the write lands in the archived file because
-            // the fd still points at the same inode. If the rename
-            // happens before we open, the open returns `ENOENT` and
-            // the method returns `Ok(false)`, which we handle as
-            // "the item was deleted while we were finishing up - no
-            // audit trail to write, no error to surface". This is
-            // the load-bearing structural fix for the
-            // "cancellation must precede destruction" rule; the
-            // earlier cancellation check is now just an
-            // optimization on top of it. Any other error
-            // (permission, I/O) is captured into
-            // `activity_log_error` and surfaced via the result.
-            let activity_entry = match &result {
-                RebaseResult::Success {
-                    base_branch,
-                    conflicts_resolved,
-                    ..
-                } => ActivityEntry {
-                    timestamp: now_iso8601(),
-                    event_type: "rebase_completed".to_string(),
-                    payload: serde_json::json!({
-                        "base_branch": base_branch,
-                        "conflicts_resolved": conflicts_resolved,
-                        "source": "rebase_gate",
-                    }),
-                },
-                RebaseResult::Failure {
-                    base_branch,
-                    reason,
-                    conflicts_attempted,
-                    ..
-                } => ActivityEntry {
-                    timestamp: now_iso8601(),
-                    event_type: "rebase_failed".to_string(),
-                    payload: serde_json::json!({
-                        "base_branch": base_branch,
-                        "reason": reason,
-                        "conflicts_attempted": conflicts_attempted,
-                        "source": "rebase_gate",
-                    }),
-                },
-            };
-            let activity_log_error =
-                match backend.append_activity_existing_only(&wi_id_clone, &activity_entry) {
-                    // Appended successfully - either to the active log
-                    // or (under a concurrent archive rename) to the
-                    // now-archived file via the still-valid fd.
-                    Ok(true) => None,
-                    // Active log was missing when we tried to open it:
-                    // the work item was deleted and its log archived
-                    // between the cancellation check above and this
-                    // append. Do NOT surface this as an error - the
-                    // item is gone, so there is nothing to audit, and
-                    // the result send below is a silent no-op because
-                    // `drop_rebase_gate` already dropped the receiver.
-                    // Returning here also prevents sending a spurious
-                    // "activity log missing" suffix onto a status
-                    // message that no UI will ever see.
-                    Ok(false) => return,
-                    Err(e) => Some(e.to_string()),
-                };
-
-            // Re-attach the activity_log_error to the appropriate
-            // variant. The verbosity is intentional: keeping the
-            // field structural (rather than passing it via a side
-            // channel) means `poll_rebase_gate` cannot forget to
-            // surface it in the status message.
-            let result = match result {
-                RebaseResult::Success {
-                    base_branch,
-                    conflicts_resolved,
-                    ..
-                } => RebaseResult::Success {
-                    base_branch,
-                    conflicts_resolved,
-                    activity_log_error,
-                },
-                RebaseResult::Failure {
-                    base_branch,
-                    reason,
-                    conflicts_attempted,
-                    ..
-                } => RebaseResult::Failure {
-                    base_branch,
-                    reason,
-                    conflicts_attempted,
-                    activity_log_error,
-                },
+            let Some(result) =
+                append_rebase_audit_and_attach_error(backend.as_ref(), &wi_id_clone, result)
+            else {
+                return;
             };
 
             let _ = tx.send(RebaseGateMessage::Result(result));
         });
+    }
+
+    /// Resolve per-repo MCP servers for the work item's first repo
+    /// association and convert them into `McpBridgeSpec` entries so
+    /// the background harness sub-thread can pass them through to
+    /// Codex via per-key `-c` overrides alongside the workbridge
+    /// bridge. Computing here (rather than inside the thread) keeps
+    /// `self.services.config` reads on the UI thread, matching how
+    /// `begin_session_open` does it. HTTP entries are skipped: Codex's
+    /// `mcp_servers.<name>` schema requires command + args. Returns
+    /// `(bridges, http_skipped_count)` so the caller can emit a toast
+    /// for the silent-skip case (feature gap vs Claude, where HTTP
+    /// entries are still visible via the `--mcp-config` JSON).
+    fn collect_repo_mcp_bridges_for_item(
+        &self,
+        wi_id: &WorkItemId,
+    ) -> (Vec<crate::agent_backend::McpBridgeSpec>, usize) {
+        self.work_items
+            .iter()
+            .find(|w| w.id == *wi_id)
+            .and_then(|w| w.repo_associations.first())
+            .map(|assoc| {
+                let repo_display = crate::config::collapse_home(&assoc.repo_path);
+                let entries = self.services.config.mcp_servers_for_repo(&repo_display);
+                let http_count = entries.iter().filter(|e| e.server_type == "http").count();
+                let bridges: Vec<crate::agent_backend::McpBridgeSpec> = entries
+                    .into_iter()
+                    .filter(|entry| entry.server_type != "http")
+                    .filter_map(|entry| {
+                        entry
+                            .command
+                            .as_ref()
+                            .map(|cmd| crate::agent_backend::McpBridgeSpec {
+                                name: entry.name.clone(),
+                                command: PathBuf::from(cmd),
+                                args: entry.args.clone(),
+                            })
+                    })
+                    .collect();
+                (bridges, http_count)
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Build the rebase-gate activity log entry from `result`, append it
+/// via `backend.append_activity_existing_only` (so a concurrent
+/// `backend.delete` cannot resurrect an orphan active log), and
+/// re-attach the resulting `activity_log_error` into the appropriate
+/// `RebaseResult` variant. Returns `None` when the work item was
+/// deleted mid-run (the append observed a missing active log and the
+/// caller should skip the send too); otherwise returns the augmented
+/// result.
+///
+/// CRITICAL: the call goes to `append_activity_existing_only`, NOT
+/// `append_activity`. The former opens with
+/// `OpenOptions::create(false)` so a `backend.delete` +
+/// `archive_activity_log` that races the append cannot recreate an
+/// orphan active activity log for a deleted item. POSIX semantics:
+/// if the main thread renames active -> archive AFTER we open the
+/// fd but BEFORE we write, the write lands in the archived file
+/// because the fd still points at the same inode. If the rename
+/// happens before we open, the open returns ENOENT and the method
+/// returns `Ok(false)`, which this function propagates as `None`.
+/// This is the load-bearing structural fix for the "cancellation
+/// must precede destruction" rule.
+fn append_rebase_audit_and_attach_error(
+    backend: &dyn crate::work_item_backend::WorkItemBackend,
+    wi_id: &WorkItemId,
+    result: RebaseResult,
+) -> Option<RebaseResult> {
+    let activity_entry = match &result {
+        RebaseResult::Success {
+            base_branch,
+            conflicts_resolved,
+            ..
+        } => ActivityEntry {
+            timestamp: now_iso8601(),
+            event_type: "rebase_completed".to_string(),
+            payload: serde_json::json!({
+                "base_branch": base_branch,
+                "conflicts_resolved": conflicts_resolved,
+                "source": "rebase_gate",
+            }),
+        },
+        RebaseResult::Failure {
+            base_branch,
+            reason,
+            conflicts_attempted,
+            ..
+        } => ActivityEntry {
+            timestamp: now_iso8601(),
+            event_type: "rebase_failed".to_string(),
+            payload: serde_json::json!({
+                "base_branch": base_branch,
+                "reason": reason,
+                "conflicts_attempted": conflicts_attempted,
+                "source": "rebase_gate",
+            }),
+        },
+    };
+    let activity_log_error = match backend.append_activity_existing_only(wi_id, &activity_entry) {
+        Ok(true) => None,
+        Ok(false) => return None,
+        Err(e) => Some(e.to_string()),
+    };
+
+    // Re-attach the activity_log_error to the appropriate variant.
+    // The verbosity is intentional: keeping the field structural
+    // (rather than passing it via a side channel) means
+    // `poll_rebase_gate` cannot forget to surface it in the status
+    // message.
+    Some(match result {
+        RebaseResult::Success {
+            base_branch,
+            conflicts_resolved,
+            ..
+        } => RebaseResult::Success {
+            base_branch,
+            conflicts_resolved,
+            activity_log_error,
+        },
+        RebaseResult::Failure {
+            base_branch,
+            reason,
+            conflicts_attempted,
+            ..
+        } => RebaseResult::Failure {
+            base_branch,
+            reason,
+            conflicts_attempted,
+            activity_log_error,
+        },
+    })
+}
+
+/// Drop the rebase-gate MCP server and remove its temp config file.
+/// Both inputs are `Option<>` so this runs uniformly regardless of
+/// which break arm exited the compute block: a pre-server failure
+/// leaves both `None` (no-op cleanup), a post-server pre-config
+/// failure drops the server but skips the rm, and a successful run
+/// drops both. The server MUST be alive while the harness child is
+/// running - that constraint is satisfied by the harness sub-thread
+/// spawning and waiting INSIDE the compute block, so by the time we
+/// reach this cleanup the harness has already exited or we broke
+/// with an early failure that did not reach the spawn.
+fn cleanup_rebase_gate_compute_resources(
+    gate_server: Option<crate::mcp::McpSocketServer>,
+    config_path: Option<PathBuf>,
+) {
+    if let Some(server) = gate_server {
+        drop(server);
+    }
+    if let Some(path) = config_path
+        && let Err(_e) = std::fs::remove_file(&path)
+    {
+        // Best-effort cleanup: the file is in `$TMPDIR` and the OS
+        // will clean it up eventually. Logging would be misleading
+        // because the typical "error" here is ENOENT after a normal
+        // harness run that already consumed the config.
+    }
+}
+
+/// If the rebase gate returned a Failure, run `git rebase --abort`
+/// in the worktree to clean up any half-completed rebase the harness
+/// may have left behind. The abort is idempotent: if no rebase is in
+/// progress it exits non-zero with "No rebase in progress?" and does
+/// nothing. Routed through `run_cancellable` so it is also killable
+/// if the gate is torn down mid-abort (the worktree is about to be
+/// removed anyway, so a partial abort is harmless).
+fn run_rebase_failure_abort(
+    result: &RebaseResult,
+    worktree_path: &std::path::Path,
+    child_pid: &Arc<Mutex<Option<u32>>>,
+    cancelled: &AtomicBool,
+) {
+    if matches!(result, RebaseResult::Failure { .. }) {
+        let _ = run_cancellable(
+            crate::worktree_service::git_command()
+                .arg("-C")
+                .arg(worktree_path)
+                .args(["rebase", "--abort"]),
+            child_pid,
+            cancelled,
+        );
     }
 }

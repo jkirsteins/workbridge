@@ -72,118 +72,157 @@ impl super::App {
         let (tx, rx) = crossbeam_channel::bounded(1);
 
         std::thread::spawn(move || {
-            let mut warnings = Vec::new();
-
-            let pr_close_ok = if let Some((ref owner, ref repo)) = github_remote {
-                let owner_repo = format!("{owner}/{repo}");
-
-                // Post optional reason as a comment before closing.
-                if let Some(ref r) = reason_owned
-                    && !r.is_empty()
-                {
-                    match std::process::Command::new("gh")
-                        .args([
-                            "pr",
-                            "comment",
-                            &pr_number.to_string(),
-                            "--repo",
-                            &owner_repo,
-                            "--body",
-                            r.as_str(),
-                        ])
-                        .output()
-                    {
-                        Ok(output) if !output.status.success() => {
-                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                            warnings.push(format!("PR comment: {stderr}"));
-                        }
-                        Err(e) => warnings.push(format!("PR comment: {e}")),
-                        _ => {}
-                    }
-                }
-
-                // Close the PR.
-                let mut close_succeeded = false;
-                match std::process::Command::new("gh")
-                    .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
-                    .output()
-                {
-                    Ok(output) if !output.status.success() => {
-                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                        warnings.push(format!("PR close: {stderr}"));
-                    }
-                    Err(e) => warnings.push(format!("PR close: {e}")),
-                    _ => {
-                        close_succeeded = true;
-                    }
-                }
-                close_succeeded
-            } else {
-                // No GitHub remote - local-only cleanup is safe to proceed.
-                true
-            };
-
-            // Only proceed with destructive local operations (worktree removal,
-            // branch deletion) if the PR was successfully closed on GitHub.
-            // Otherwise the user would lose their local branch while the PR
-            // remains open, and any unpushed commits would be permanently lost.
-            if !pr_close_ok {
-                let _ = tx.send(CleanupResult {
-                    warnings,
-                    closed_pr_branches: Vec::new(),
-                });
-                return;
-            }
-
-            // Get a fresh worktree list so we don't rely on potentially stale
-            // cached repo_data (e.g., if the user switched branches since last fetch).
-            match ws.list_worktrees(&repo_path) {
-                Ok(fresh_worktrees) => {
-                    let wt_for_branch = fresh_worktrees
-                        .iter()
-                        .find(|wt| wt.branch.as_deref() == Some(branch.as_str()));
-
-                    match wt_for_branch {
-                        Some(wt) if wt.is_main => {
-                            // Branch is the main worktree's current branch; git forbids
-                            // deleting the checked-out branch. Skip silently - the PR
-                            // was closed, and the user can switch branches later.
-                        }
-                        Some(wt) => {
-                            // Remove the linked worktree first, then delete the branch.
-                            let wt_path = wt.path.clone();
-                            if let Err(e) = ws.remove_worktree(&repo_path, &wt_path, false, true) {
-                                warnings.push(format!("worktree: {e}"));
-                            }
-                            if let Err(e) = ws.delete_branch(&repo_path, &branch, true) {
-                                warnings.push(format!("branch: {e}"));
-                            }
-                        }
-                        None => {
-                            // No worktree for this branch - just delete the branch.
-                            if let Err(e) = ws.delete_branch(&repo_path, &branch, true) {
-                                warnings.push(format!("branch: {e}"));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warnings.push(format!(
-                        "list worktrees: {e}; skipping worktree/branch cleanup"
-                    ));
-                }
-            }
-
-            let _ = tx.send(CleanupResult {
-                warnings,
-                closed_pr_branches: Vec::new(),
-            });
+            Self::run_unlinked_cleanup_thread(
+                ws.as_ref(),
+                github_remote.as_ref(),
+                pr_number,
+                reason_owned.as_deref(),
+                &repo_path,
+                &branch,
+                &tx,
+            );
         });
 
         self.attach_user_action_payload(
             &UserActionKey::UnlinkedCleanup,
             UserActionPayload::UnlinkedCleanup { rx },
         );
+    }
+
+    /// Body of the background thread spawned by `spawn_unlinked_cleanup`.
+    /// Optionally posts a PR comment, closes the PR on GitHub, then
+    /// (on success) removes the local worktree and deletes the local
+    /// branch. Accumulated warnings and the final result are shipped
+    /// back through `tx`.
+    fn run_unlinked_cleanup_thread(
+        ws: &dyn crate::worktree_service::WorktreeService,
+        github_remote: Option<&(String, String)>,
+        pr_number: u64,
+        reason_owned: Option<&str>,
+        repo_path: &std::path::Path,
+        branch: &str,
+        tx: &crossbeam_channel::Sender<CleanupResult>,
+    ) {
+        let mut warnings = Vec::new();
+
+        let pr_close_ok =
+            Self::close_unlinked_pr(github_remote, pr_number, reason_owned, &mut warnings);
+
+        // Only proceed with destructive local operations (worktree removal,
+        // branch deletion) if the PR was successfully closed on GitHub.
+        // Otherwise the user would lose their local branch while the PR
+        // remains open, and any unpushed commits would be permanently lost.
+        if !pr_close_ok {
+            let _ = tx.send(CleanupResult {
+                warnings,
+                closed_pr_branches: Vec::new(),
+            });
+            return;
+        }
+
+        // Get a fresh worktree list so we don't rely on potentially stale
+        // cached repo_data (e.g., if the user switched branches since last fetch).
+        match ws.list_worktrees(repo_path) {
+            Ok(fresh_worktrees) => {
+                let wt_for_branch = fresh_worktrees
+                    .iter()
+                    .find(|wt| wt.branch.as_deref() == Some(branch));
+
+                match wt_for_branch {
+                    Some(wt) if wt.is_main => {
+                        // Branch is the main worktree's current branch; git forbids
+                        // deleting the checked-out branch. Skip silently - the PR
+                        // was closed, and the user can switch branches later.
+                    }
+                    Some(wt) => {
+                        // Remove the linked worktree first, then delete the branch.
+                        let wt_path = wt.path.clone();
+                        if let Err(e) = ws.remove_worktree(repo_path, &wt_path, false, true) {
+                            warnings.push(format!("worktree: {e}"));
+                        }
+                        if let Err(e) = ws.delete_branch(repo_path, branch, true) {
+                            warnings.push(format!("branch: {e}"));
+                        }
+                    }
+                    None => {
+                        // No worktree for this branch - just delete the branch.
+                        if let Err(e) = ws.delete_branch(repo_path, branch, true) {
+                            warnings.push(format!("branch: {e}"));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "list worktrees: {e}; skipping worktree/branch cleanup"
+                ));
+            }
+        }
+
+        let _ = tx.send(CleanupResult {
+            warnings,
+            closed_pr_branches: Vec::new(),
+        });
+    }
+
+    /// Post the (optional) cleanup reason as a PR comment and close the
+    /// PR on GitHub via `gh`. Returns whether the close command
+    /// succeeded; if there is no GitHub remote, treats local-only
+    /// cleanup as permitted. Any command failures are pushed to
+    /// `warnings` rather than propagated.
+    fn close_unlinked_pr(
+        github_remote: Option<&(String, String)>,
+        pr_number: u64,
+        reason_owned: Option<&str>,
+        warnings: &mut Vec<String>,
+    ) -> bool {
+        let Some((owner, repo)) = github_remote else {
+            // No GitHub remote - local-only cleanup is safe to proceed.
+            return true;
+        };
+        let owner_repo = format!("{owner}/{repo}");
+
+        // Post optional reason as a comment before closing.
+        if let Some(r) = reason_owned
+            && !r.is_empty()
+        {
+            match std::process::Command::new("gh")
+                .args([
+                    "pr",
+                    "comment",
+                    &pr_number.to_string(),
+                    "--repo",
+                    &owner_repo,
+                    "--body",
+                    r,
+                ])
+                .output()
+            {
+                Ok(output) if !output.status.success() => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    warnings.push(format!("PR comment: {stderr}"));
+                }
+                Err(e) => warnings.push(format!("PR comment: {e}")),
+                _ => {}
+            }
+        }
+
+        // Close the PR.
+        let mut close_succeeded = false;
+        match std::process::Command::new("gh")
+            .args(["pr", "close", &pr_number.to_string(), "--repo", &owner_repo])
+            .output()
+        {
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                warnings.push(format!("PR close: {stderr}"));
+            }
+            Err(e) => warnings.push(format!("PR close: {e}")),
+            _ => {
+                close_succeeded = true;
+            }
+        }
+        close_succeeded
     }
 
     /// Poll the async unlinked-item cleanup thread for a result. Called on each timer tick.

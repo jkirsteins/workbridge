@@ -347,6 +347,123 @@ fn abort_background_ops_for_work_item_drops_rebase_gate() {
     );
 }
 
+/// Backend whose `delete` implementation snapshots an external
+/// `AtomicBool` into a second `AtomicBool` at call time. Used by
+/// `delete_work_item_cancels_rebase_gate_before_backend_delete` to
+/// pin the cancellation-before-destruction ordering invariant.
+struct OrderingBackend {
+    records: std::sync::Mutex<Vec<crate::work_item_backend::WorkItemRecord>>,
+    cancelled_observer: Arc<AtomicBool>,
+    observed_cancelled_at_delete: Arc<AtomicBool>,
+    delete_call_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl WorkItemBackend for OrderingBackend {
+    fn list(
+        &self,
+    ) -> Result<crate::work_item_backend::ListResult, crate::work_item_backend::BackendError> {
+        Ok(crate::work_item_backend::ListResult {
+            records: self.records.lock().unwrap().clone(),
+            corrupt: Vec::new(),
+        })
+    }
+    fn read(
+        &self,
+        id: &WorkItemId,
+    ) -> Result<crate::work_item_backend::WorkItemRecord, crate::work_item_backend::BackendError>
+    {
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == *id)
+            .cloned()
+            .ok_or_else(|| crate::work_item_backend::BackendError::NotFound(id.clone()))
+    }
+    fn create(
+        &self,
+        _req: crate::work_item_backend::CreateWorkItem,
+    ) -> Result<crate::work_item_backend::WorkItemRecord, crate::work_item_backend::BackendError>
+    {
+        Err(crate::work_item_backend::BackendError::Validation(
+            "not used".into(),
+        ))
+    }
+    fn delete(&self, id: &WorkItemId) -> Result<(), crate::work_item_backend::BackendError> {
+        // Snapshot the cancellation flag at the exact moment
+        // `delete` is called. If the architectural fix is in
+        // place, `abort_background_ops_for_work_item` ran
+        // before this and the flag is `true`.
+        let observed = self.cancelled_observer.load(Ordering::SeqCst);
+        self.observed_cancelled_at_delete
+            .store(observed, Ordering::SeqCst);
+        self.delete_call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut records = self.records.lock().unwrap();
+        records.iter().position(|r| r.id == *id).map_or_else(
+            || Err(crate::work_item_backend::BackendError::NotFound(id.clone())),
+            |pos| {
+                records.remove(pos);
+                Ok(())
+            },
+        )
+    }
+    fn update_status(
+        &self,
+        _id: &WorkItemId,
+        _status: WorkItemStatus,
+    ) -> Result<(), crate::work_item_backend::BackendError> {
+        Ok(())
+    }
+    fn import(
+        &self,
+        _unlinked: &crate::work_item::UnlinkedPr,
+    ) -> Result<crate::work_item_backend::WorkItemRecord, crate::work_item_backend::BackendError>
+    {
+        Err(crate::work_item_backend::BackendError::Validation(
+            "not used".into(),
+        ))
+    }
+    fn import_review_request(
+        &self,
+        _rr: &crate::work_item::ReviewRequestedPr,
+    ) -> Result<crate::work_item_backend::WorkItemRecord, crate::work_item_backend::BackendError>
+    {
+        Err(crate::work_item_backend::BackendError::Validation(
+            "not used".into(),
+        ))
+    }
+    fn append_activity(
+        &self,
+        _id: &WorkItemId,
+        _entry: &crate::work_item_backend::ActivityEntry,
+    ) -> Result<(), crate::work_item_backend::BackendError> {
+        Ok(())
+    }
+    fn update_plan(
+        &self,
+        _id: &WorkItemId,
+        _plan: &str,
+    ) -> Result<(), crate::work_item_backend::BackendError> {
+        Ok(())
+    }
+    fn read_plan(
+        &self,
+        _id: &WorkItemId,
+    ) -> Result<Option<String>, crate::work_item_backend::BackendError> {
+        Ok(None)
+    }
+    fn set_done_at(
+        &self,
+        _id: &WorkItemId,
+        _done_at: Option<u64>,
+    ) -> Result<(), crate::work_item_backend::BackendError> {
+        Ok(())
+    }
+    fn activity_path_for(&self, _id: &WorkItemId) -> Option<PathBuf> {
+        None
+    }
+}
+
 #[test]
 fn delete_work_item_cancels_rebase_gate_before_backend_delete() {
     // The architectural rule "cancellation must precede
@@ -361,93 +478,7 @@ fn delete_work_item_cancels_rebase_gate_before_backend_delete() {
     // what it sees; the assertion below requires the flag to be
     // `true` at the time backend.delete ran.
     use crate::work_item::WorkItemKind;
-    use crate::work_item_backend::{
-        ActivityEntry, BackendError, CreateWorkItem, ListResult, WorkItemRecord,
-    };
-
-    struct OrderingBackend {
-        records: std::sync::Mutex<Vec<WorkItemRecord>>,
-        cancelled_observer: Arc<AtomicBool>,
-        observed_cancelled_at_delete: Arc<AtomicBool>,
-        delete_call_count: Arc<std::sync::atomic::AtomicUsize>,
-    }
-    impl WorkItemBackend for OrderingBackend {
-        fn list(&self) -> Result<ListResult, BackendError> {
-            Ok(ListResult {
-                records: self.records.lock().unwrap().clone(),
-                corrupt: Vec::new(),
-            })
-        }
-        fn read(&self, id: &WorkItemId) -> Result<WorkItemRecord, BackendError> {
-            self.records
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|r| r.id == *id)
-                .cloned()
-                .ok_or_else(|| BackendError::NotFound(id.clone()))
-        }
-        fn create(&self, _req: CreateWorkItem) -> Result<WorkItemRecord, BackendError> {
-            Err(BackendError::Validation("not used".into()))
-        }
-        fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
-            // Snapshot the cancellation flag at the exact moment
-            // `delete` is called. If the architectural fix is in
-            // place, `abort_background_ops_for_work_item` ran
-            // before this and the flag is `true`.
-            let observed = self.cancelled_observer.load(Ordering::SeqCst);
-            self.observed_cancelled_at_delete
-                .store(observed, Ordering::SeqCst);
-            self.delete_call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut records = self.records.lock().unwrap();
-            records.iter().position(|r| r.id == *id).map_or_else(
-                || Err(BackendError::NotFound(id.clone())),
-                |pos| {
-                    records.remove(pos);
-                    Ok(())
-                },
-            )
-        }
-        fn update_status(
-            &self,
-            _id: &WorkItemId,
-            _status: WorkItemStatus,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn import(
-            &self,
-            _unlinked: &crate::work_item::UnlinkedPr,
-        ) -> Result<WorkItemRecord, BackendError> {
-            Err(BackendError::Validation("not used".into()))
-        }
-        fn import_review_request(
-            &self,
-            _rr: &crate::work_item::ReviewRequestedPr,
-        ) -> Result<WorkItemRecord, BackendError> {
-            Err(BackendError::Validation("not used".into()))
-        }
-        fn append_activity(
-            &self,
-            _id: &WorkItemId,
-            _entry: &ActivityEntry,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
-            Ok(None)
-        }
-        fn set_done_at(&self, _id: &WorkItemId, _done_at: Option<u64>) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn activity_path_for(&self, _id: &WorkItemId) -> Option<PathBuf> {
-            None
-        }
-    }
+    use crate::work_item_backend::WorkItemRecord;
 
     let cancelled_observer = Arc::new(AtomicBool::new(false));
     let observed_cancelled_at_delete = Arc::new(AtomicBool::new(false));

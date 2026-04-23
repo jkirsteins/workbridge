@@ -42,45 +42,20 @@ macro_rules! impl_pr_merge_poll_method {
         $(#[$meta])*
         pub fn $method_name(&mut self) {
             // -- Phase 1: drain any in-flight results --
-            // Collect into locals before acting so we don't borrow `self`
-            // twice when calling into `apply_stage_change`, `end_activity`,
-            // etc.
-            let mut ready: Vec<PrMergePollResult> = Vec::new();
-            let mut to_remove: Vec<WorkItemId> = Vec::new();
-            for (wi_id, state) in &self.$polls_field {
-                match state.rx.try_recv() {
-                    Ok(r) => {
-                        ready.push(r);
-                        to_remove.push(wi_id.clone());
-                    }
-                    Err(crossbeam_channel::TryRecvError::Empty) => {}
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                        to_remove.push(wi_id.clone());
-                    }
-                }
-            }
-            for wi_id in &to_remove {
-                if let Some(state) = self.$polls_field.remove(wi_id) {
-                    self.activities.end(state.activity);
-                }
-            }
+            let ready = drain_pr_merge_poll_results(
+                &mut self.$polls_field,
+                &mut self.activities,
+            );
 
+            let kind_filter: Option<WorkItemKind> = $kind_filter;
             for result in ready {
-                // Actual-status guard: re-check the item is still
-                // eligible. The user may have retreated / deleted it
-                // between the spawn and the drain.
-                let kind_filter: Option<WorkItemKind> = $kind_filter;
-                let still_eligible = self.work_items.iter().any(|w| {
-                    w.id == result.wi_id
-                        && w.status == $source_stage
-                        && kind_filter
-                            .as_ref()
-                            .is_none_or(|k| w.kind == *k)
-                });
-                if !still_eligible {
-                    // Item moved away - drop the watch / error entries
-                    // so nothing lingers. Structural ownership via the
-                    // maps.
+                let handled = pr_merge_poll_still_eligible(
+                    &self.work_items,
+                    &result,
+                    $source_stage,
+                    kind_filter.as_ref(),
+                );
+                if !handled {
                     self.$watches_field.retain(|w| w.wi_id != result.wi_id);
                     self.$errors_field.remove(&result.wi_id);
                     continue;
@@ -103,56 +78,15 @@ macro_rules! impl_pr_merge_poll_method {
 
                 match result.pr_state.as_str() {
                     "MERGED" => {
-                        // Persist PR identity BEFORE the stage change
-                        // so the subsequent `reassemble_work_items`
-                        // (fired from inside `apply_stage_change`)
-                        // finds the snapshot and can synthesize a
-                        // `PrInfo { state: Merged }` via the assembly
-                        // fallback. That in turn makes
-                        // `status_derived = true` and gives the item a
-                        // stable merged-PR link in the UI even after
-                        // the next fetch cycle clears any transient
-                        // data.
-                        if let Some(identity) = &result.pr_identity
-                            && let Err(e) = self.services.backend.save_pr_identity(
-                                &result.wi_id,
-                                &result.repo_path,
-                                identity,
-                            )
-                        {
-                            self.shell.status_message =
-                                Some(format!("PR identity save error: {e}"));
-                        }
-
-                        let log_entry = ActivityEntry {
-                            timestamp: now_iso8601(),
-                            event_type: "pr_merged".to_string(),
-                            payload: serde_json::json!({
-                                "strategy": $strategy_tag,
-                                "branch": result.branch,
-                            }),
-                        };
-                        if let Err(e) =
-                            self.services.backend.append_activity(&result.wi_id, &log_entry)
-                        {
-                            self.shell.status_message =
-                                Some(format!("Activity log error: {e}"));
-                        }
-
-                        if $cleanup_worktree {
-                            self.cleanup_worktree_for_item(&result.wi_id);
-                        }
-
+                        self.finalize_pr_merge_poll_merged(
+                            &result,
+                            $strategy_tag,
+                            $source_stage,
+                            $merged_message,
+                            $cleanup_worktree,
+                        );
                         self.$watches_field.retain(|w| w.wi_id != result.wi_id);
                         self.$errors_field.remove(&result.wi_id);
-
-                        self.apply_stage_change(
-                            &result.wi_id,
-                            $source_stage,
-                            WorkItemStatus::Done,
-                            "pr_merge",
-                        );
-                        self.shell.status_message = Some($merged_message.into());
                     }
                     "CLOSED" => {
                         // A closed PR is NOT a merge - it must not
@@ -184,28 +118,10 @@ macro_rules! impl_pr_merge_poll_method {
 
             // -- Phase 2: spawn polls for any watch whose per-item
             // cooldown has elapsed and which has no in-flight poll. --
-            let cooldown = std::time::Duration::from_secs(30);
-            let now = crate::side_effects::clock::instant_now();
-            let mut to_spawn: Vec<(WorkItemId, Option<u64>, String, String, PathBuf)> =
-                Vec::new();
-            for watch in &self.$watches_field {
-                if self.$polls_field.contains_key(&watch.wi_id) {
-                    continue;
-                }
-                if let Some(last) = watch.last_polled
-                    && now.duration_since(last) < cooldown
-                {
-                    continue;
-                }
-                to_spawn.push((
-                    watch.wi_id.clone(),
-                    watch.pr_number,
-                    watch.owner_repo.clone(),
-                    watch.branch.clone(),
-                    watch.repo_path.clone(),
-                ));
-            }
-
+            let to_spawn = collect_due_pr_merge_watches(
+                &self.$watches_field,
+                &self.$polls_field,
+            );
             for (wi_id, pr_number, owner_repo, branch, repo_path) in to_spawn {
                 let rx = spawn_gh_pr_view_poll(
                     wi_id.clone(),
@@ -223,11 +139,164 @@ macro_rules! impl_pr_merge_poll_method {
                     .iter_mut()
                     .find(|w| w.wi_id == wi_id)
                 {
-                    w.last_polled = Some(now);
+                    w.last_polled = Some(crate::side_effects::clock::instant_now());
                 }
             }
         }
     };
+}
+
+use std::path::PathBuf;
+
+use crate::work_item::{WorkItemId, WorkItemKind, WorkItemStatus};
+use crate::work_item_backend::ActivityEntry;
+
+/// Tuple of fields captured from a `PrMergeWatch` at the moment
+/// `collect_due_pr_merge_watches` decides the watch is due for a
+/// new poll. The fields match the argv shape that
+/// `spawn_gh_pr_view_poll` takes.
+type PrMergeWatchSpawn = (WorkItemId, Option<u64>, String, String, PathBuf);
+
+/// Helper shared by `impl_pr_merge_poll_method!`: Phase 1 drain of an
+/// in-flight poll map. Removes every entry whose receiver has a ready
+/// value or is disconnected, ending the corresponding activity, and
+/// returns the successfully-received results.
+fn drain_pr_merge_poll_results(
+    polls: &mut std::collections::HashMap<WorkItemId, PrMergePollState>,
+    activities: &mut Activities,
+) -> Vec<PrMergePollResult> {
+    // Collect into locals before acting so we don't borrow `self`
+    // twice when calling into `apply_stage_change`, `end_activity`,
+    // etc.
+    let mut ready: Vec<PrMergePollResult> = Vec::new();
+    let mut to_remove: Vec<WorkItemId> = Vec::new();
+    for (wi_id, state) in polls.iter() {
+        match state.rx.try_recv() {
+            Ok(r) => {
+                ready.push(r);
+                to_remove.push(wi_id.clone());
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                to_remove.push(wi_id.clone());
+            }
+        }
+    }
+    for wi_id in &to_remove {
+        if let Some(state) = polls.remove(wi_id) {
+            activities.end(state.activity);
+        }
+    }
+    ready
+}
+
+/// Helper shared by `impl_pr_merge_poll_method!`: actual-status guard
+/// for a poll result. Re-checks the item is still in the expected
+/// source stage (and matches the optional kind filter). The user may
+/// have retreated / deleted the item between the spawn and the drain;
+/// in that case the caller drops the watch / error entries.
+fn pr_merge_poll_still_eligible(
+    work_items: &[crate::work_item::WorkItem],
+    result: &PrMergePollResult,
+    source_stage: WorkItemStatus,
+    kind_filter: Option<&WorkItemKind>,
+) -> bool {
+    work_items.iter().any(|w| {
+        w.id == result.wi_id && w.status == source_stage && kind_filter.is_none_or(|k| w.kind == *k)
+    })
+}
+
+/// Helper shared by `impl_pr_merge_poll_method!`: collect the watches
+/// whose per-item cooldown has elapsed and which have no in-flight
+/// poll, returning the tuples needed to spawn new polls.
+fn collect_due_pr_merge_watches(
+    watches: &[PrMergeWatch],
+    polls: &std::collections::HashMap<WorkItemId, PrMergePollState>,
+) -> Vec<PrMergeWatchSpawn> {
+    let cooldown = std::time::Duration::from_secs(30);
+    let now = crate::side_effects::clock::instant_now();
+    let mut to_spawn: Vec<PrMergeWatchSpawn> = Vec::new();
+    for watch in watches {
+        if polls.contains_key(&watch.wi_id) {
+            continue;
+        }
+        if let Some(last) = watch.last_polled
+            && now.duration_since(last) < cooldown
+        {
+            continue;
+        }
+        to_spawn.push((
+            watch.wi_id.clone(),
+            watch.pr_number,
+            watch.owner_repo.clone(),
+            watch.branch.clone(),
+            watch.repo_path.clone(),
+        ));
+    }
+    to_spawn
+}
+
+impl App {
+    /// Helper shared by `impl_pr_merge_poll_method!`: finalize a
+    /// `MERGED` poll result. Persists PR identity so the subsequent
+    /// reassembly can synthesize a Merged `PrInfo`, logs the merge to
+    /// the activity log, optionally tears down the worktree, and
+    /// advances the item to `Done`.
+    fn finalize_pr_merge_poll_merged(
+        &mut self,
+        result: &PrMergePollResult,
+        strategy_tag: &str,
+        source_stage: WorkItemStatus,
+        merged_message: &str,
+        cleanup_worktree: bool,
+    ) {
+        // Persist PR identity BEFORE the stage change
+        // so the subsequent `reassemble_work_items`
+        // (fired from inside `apply_stage_change`)
+        // finds the snapshot and can synthesize a
+        // `PrInfo { state: Merged }` via the assembly
+        // fallback. That in turn makes
+        // `status_derived = true` and gives the item a
+        // stable merged-PR link in the UI even after
+        // the next fetch cycle clears any transient
+        // data.
+        if let Some(identity) = &result.pr_identity
+            && let Err(e) =
+                self.services
+                    .backend
+                    .save_pr_identity(&result.wi_id, &result.repo_path, identity)
+        {
+            self.shell.status_message = Some(format!("PR identity save error: {e}"));
+        }
+
+        let log_entry = ActivityEntry {
+            timestamp: now_iso8601(),
+            event_type: "pr_merged".to_string(),
+            payload: serde_json::json!({
+                "strategy": strategy_tag,
+                "branch": result.branch,
+            }),
+        };
+        if let Err(e) = self
+            .services
+            .backend
+            .append_activity(&result.wi_id, &log_entry)
+        {
+            self.shell.status_message = Some(format!("Activity log error: {e}"));
+        }
+
+        if cleanup_worktree {
+            self.cleanup_worktree_for_item(&result.wi_id);
+        }
+
+        self.apply_stage_change(
+            &result.wi_id,
+            source_stage,
+            WorkItemStatus::Done,
+            "pr_merge",
+        );
+        self.shell.status_message = Some(merged_message.into());
+    }
 }
 
 /// Generate a `reconstruct_*_watches` method that rebuilds one PR-merge
@@ -332,11 +401,14 @@ mod mergequeue;
 mod metrics;
 mod orphan_cleanup;
 mod pr_creation;
+mod pr_creation_thread;
 mod pr_identity_backfill;
 mod pr_merge_and_review;
 mod rebase_gate_compute;
+mod rebase_gate_result;
 mod rebase_gate_spawn;
 mod review_gate;
+mod session_open_prep;
 mod session_spawn;
 mod sessions_core;
 mod settings_overlay;

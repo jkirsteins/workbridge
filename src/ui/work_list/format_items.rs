@@ -240,126 +240,16 @@ pub fn format_work_item_entry<'a>(
     let has_session = app.session_key_for(&wi.id).is_some();
     // Review gate is a transient substate where the item is still
     // `Implementing`/`Blocked` on the model but is running the async
-    // PR/CI/adversarial-review checks on a background thread. We surface
-    // it both in the spinner (same cyan braille as Claude working) and
-    // as an explicit `[RG]` badge alongside the state badge below, so
-    // the user can tell at a glance without opening the right panel.
+    // PR/CI/adversarial-review checks on a background thread.
     let at_review_gate = app.review_gates.contains_key(&wi.id);
     let is_working = app.agent_working.contains(&wi.id) || at_review_gate;
-    let (margin_text, margin_style): (String, ratatui_core::style::Style) = if is_working {
-        let frame = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
-        // On a highlighted row the list's bg is already Cyan, so a Cyan
-        // spinner fg is invisible. Match the selection caret/title styling
-        // (Black fg on Cyan bg, BOLD) so the spinner stays readable.
-        let style = if is_selected {
-            theme.style_tab_highlight()
-        } else {
-            theme.style_badge_session_working()
-        };
-        (format!("{frame} "), style)
-    } else if has_session {
-        ("\u{25CF} ".to_string(), theme.style_badge_session_idle())
-    } else if is_selected {
-        ("> ".to_string(), theme.style_tab_highlight())
-    } else {
-        ("  ".to_string(), ratatui_core::style::Style::default())
-    };
+    let (margin_text, margin_style) =
+        work_item_row_margin(app, theme, &wi.id, is_selected, is_working, has_session);
 
     // -- Line 1: title + badges --
 
     // Build the right-side badge string.
-    let mut right_parts: Vec<(String, ratatui_core::style::Style)> = Vec::new();
-
-    // PR badge: show first PR if any.
-    let first_pr = wi.repo_associations.iter().find_map(|a| a.pr.as_ref());
-    if let Some(pr) = first_pr {
-        let pr_text = format!("PR#{}", pr.number);
-        let pr_style = if pr.state == PrState::Merged {
-            theme.style_text_muted()
-        } else {
-            theme.style_badge_pr()
-        };
-        right_parts.push((pr_text, pr_style));
-
-        // CI badge.
-        match &pr.checks {
-            CheckStatus::Passing => {
-                right_parts.push((" ok".to_string(), theme.style_badge_ci_pass()));
-            }
-            CheckStatus::Failing => {
-                right_parts.push((" fail".to_string(), theme.style_badge_ci_fail()));
-            }
-            CheckStatus::Pending => {
-                right_parts.push((" ...".to_string(), theme.style_badge_ci_pending()));
-            }
-            CheckStatus::None | CheckStatus::Unknown => {}
-        }
-        if matches!(pr.mergeable, MergeableState::Conflicting) {
-            right_parts.push((" !merge".to_string(), theme.style_badge_merge_conflict()));
-        }
-    }
-
-    // Unclean-worktree chip. Rendered whenever ANY repo association has
-    // a derived `GitState` whose `dirty` flag is set. `git_state.dirty`
-    // is the union of modified-tracked-files and untracked-files (see
-    // `GitState` doc comment). The merge guard lives in
-    // `App::execute_merge` as a background
-    // `WorktreeService::list_worktrees` + `GithubClient::fetch_live_merge_state`
-    // precheck and distinguishes the variants via
-    // `MergeReadiness::classify`. The chip render here is a pure cache
-    // read and cannot shell out, honouring the "no blocking I/O on
-    // the UI thread" invariant.
-    //
-    // Ahead/behind state is rendered via the dedicated `!pushed` /
-    // `!pulled` chips below; `!cl` is exclusively for "uncommitted
-    // changes in the worktree" so a clean-but-diverged branch no
-    // longer flags as unclean.
-    let is_unclean = wi
-        .repo_associations
-        .iter()
-        .any(|a| a.git_state.as_ref().is_some_and(|gs| gs.dirty));
-    if is_unclean {
-        right_parts.push((" !cl".to_string(), theme.style_badge_worktree_unclean()));
-    }
-
-    // Needs-push chip: any repo association has unpushed commits.
-    // Rendered whenever `git_state.ahead > 0` for at least one
-    // association. Always derived from the same fetcher cache as
-    // `!cl`, so this is also a pure in-memory read.
-    let needs_push = wi
-        .repo_associations
-        .iter()
-        .any(|a| a.git_state.as_ref().is_some_and(|gs| gs.ahead > 0));
-    if needs_push {
-        right_parts.push((" !pushed".to_string(), theme.style_badge_pushed()));
-    }
-
-    // Needs-pull chip: any repo association is behind its upstream.
-    // Rendered whenever `git_state.behind > 0` for at least one
-    // association. Coexists with `!cl` and `!pushed` on a row that is
-    // dirty AND diverged in both directions.
-    let needs_pull = wi
-        .repo_associations
-        .iter()
-        .any(|a| a.git_state.as_ref().is_some_and(|gs| gs.behind > 0));
-    if needs_pull {
-        right_parts.push((" !pulled".to_string(), theme.style_badge_pulled()));
-    }
-
-    // Multi-repo indicator.
-    let repo_count = wi.repo_associations.len();
-    if repo_count > 1 {
-        right_parts.push((format!(" [{repo_count} repos]"), theme.style_text_muted()));
-    }
-
-    // Dim every right-side badge style in one pass when the work item has
-    // no live Claude PTY session attached. Doing it here, after the block
-    // that populates `right_parts` and before the width-budget loop that
-    // decides which badges to keep, avoids having to wrap each individual
-    // `push` site above and guarantees no badge escapes the rule.
-    for (_, style) in &mut right_parts {
-        *style = dim_badge_style(*style, has_session);
-    }
+    let right_parts = build_right_side_badges(wi, theme, has_session);
 
     // Stage badge + optional [RR] kind indicator + optional [RG]
     // review-gate substate + title. Done items omit the badge since the
@@ -412,36 +302,8 @@ pub fn format_work_item_entry<'a>(
         .saturating_sub(right_text.width())
         .saturating_sub(usize::from(!right_text.is_empty()));
 
-    // When selected, the List widget only sets bg (via style_tab_highlight_bg).
-    // We apply fg per-span here so title+badge get the original highlight look
-    // (Black + BOLD) while branch metadata uses the theme-owned
-    // `style_meta_selected` (paired with `tab_highlight_bg` inside Theme so
-    // the fg+bg pair cannot drift when the highlight bg is retuned).
-    let hl = theme.style_tab_highlight();
-    let (title_style, badge_style, right_badge_style, meta_style) = if is_selected {
-        // Dim the badge styles even on a selected row - "dim = no session"
-        // is the single unambiguous encoding and must not be masked by the
-        // highlight bar. Title style stays unchanged because title text
-        // colour is orthogonal to the badge rule.
-        (
-            hl,
-            dim_badge_style(hl, has_session),
-            dim_badge_style(hl, has_session),
-            theme.style_meta_selected(),
-        )
-    } else {
-        let ts = if wi.status == WorkItemStatus::Done {
-            theme.style_done_item()
-        } else {
-            theme.style_text()
-        };
-        (
-            ts,
-            dim_badge_style(theme.style_stage_badge(wi.status), has_session),
-            ratatui_core::style::Style::default(), // right badges have their own per-part styles
-            theme.style_text_muted(),
-        )
-    };
+    let (title_style, badge_style, right_badge_style, meta_style) =
+        work_item_row_styles(theme, wi.status, is_selected, has_session);
 
     // Wrap the title: first line shares space with badge + right badges,
     // continuation lines get the full panel width with no indent.
@@ -452,6 +314,144 @@ pub fn format_work_item_entry<'a>(
         content_width.saturating_sub(prefix.width() + first_title.width() + right_text.width());
     let pad_str: String = " ".repeat(padding);
 
+    let line1 = build_work_item_line1(WorkItemLine1Args {
+        wi,
+        theme,
+        has_session,
+        is_selected,
+        margin_text,
+        margin_style,
+        first_title,
+        title_style,
+        badge,
+        badge_style,
+        pad_str,
+        right_parts: &right_parts,
+        visible_badge_count,
+        right_badge_style,
+        gate_tag,
+    });
+
+    // -- Line 2+: metadata (only if the work item has meaningful context) --
+    let mut lines = vec![line1];
+    append_title_continuation_and_meta(
+        &mut lines,
+        wi,
+        &title_lines,
+        title_style,
+        meta_style,
+        content_width,
+    );
+
+    ListItem::new(lines)
+}
+
+/// Append the title-continuation lines, optional `#display_id`
+/// subtitle, and the branch + `[no wt]` metadata row to `lines`.
+/// Mirrors the historical 2-line work-item row shape:
+///
+/// - Has branch + worktree + PR: show branch (repo) with all badges
+/// - Has branch but no worktree: show branch (repo) [no wt]
+/// - Has no branch (pre-planning): show just repo name, no tags
+/// - Has no repo associations: append nothing (violates invariant 1
+///   but we render gracefully rather than panic).
+fn append_title_continuation_and_meta(
+    lines: &mut Vec<Line<'_>>,
+    wi: &crate::work_item::WorkItem,
+    title_lines: &[String],
+    title_style: ratatui_core::style::Style,
+    meta_style: ratatui_core::style::Style,
+    content_width: usize,
+) {
+    // Title continuation lines (indented to align with content after margin).
+    for title_cont in title_lines.iter().skip(1) {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(title_cont.clone(), title_style),
+        ]));
+    }
+
+    // Backend-provided display ID (e.g. `#workbridge-42`).
+    //
+    // Rendered as a dimmed subtitle line between the title and the
+    // branch line, styled with the same `meta_style` as the branch
+    // subtitle so selection highlighting flows consistently across
+    // both. Records created before this feature landed have
+    // `display_id == None` and skip this block entirely - they render
+    // exactly as before with no reserved blank line.
+    if let Some(display_id) = wi.display_id.as_deref() {
+        let id_text = format!("#{display_id}");
+        for wrapped in wrap_text(&id_text, content_width) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(wrapped, meta_style),
+            ]));
+        }
+    }
+
+    let first_assoc = wi.repo_associations.first();
+    let has_branch = first_assoc.is_some_and(|a| a.branch.is_some());
+    let has_worktree = first_assoc.is_some_and(|a| a.worktree_path.is_some());
+
+    if has_branch {
+        // Branch + [no wt] indicator. Repo is shown in the group header.
+        let branch_name = first_assoc.and_then(|a| a.branch.as_deref()).unwrap_or("");
+        let wt_indicator = if has_worktree { "" } else { " [no wt]" };
+
+        let meta_content = format!("{branch_name}{wt_indicator}");
+        for wrapped_line in wrap_text(&meta_content, content_width) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(wrapped_line, meta_style),
+            ]));
+        }
+    }
+    // No repo associations = no line 2 (invariant 1 violation, but render gracefully)
+}
+
+/// Inputs for `build_work_item_line1`. Bundled so the helper stays
+/// under the clippy `too_many_arguments` threshold.
+struct WorkItemLine1Args<'a> {
+    wi: &'a crate::work_item::WorkItem,
+    theme: &'a Theme,
+    has_session: bool,
+    is_selected: bool,
+    margin_text: String,
+    margin_style: ratatui_core::style::Style,
+    first_title: String,
+    title_style: ratatui_core::style::Style,
+    badge: &'static str,
+    badge_style: ratatui_core::style::Style,
+    pad_str: String,
+    right_parts: &'a [(String, ratatui_core::style::Style)],
+    visible_badge_count: usize,
+    right_badge_style: ratatui_core::style::Style,
+    gate_tag: &'static str,
+}
+
+/// Build the first (title + badge) line of a work-item row. Inserts
+/// the `[RR]` kind badge after the margin for review-request items,
+/// and the `[RG]` review-gate badge after the state badge for items
+/// currently at a review gate. Finally appends the visible right-hand
+/// badge chips (PR#N, CI status, !cl, !pushed, !pulled, multi-repo).
+fn build_work_item_line1(args: WorkItemLine1Args<'_>) -> Line<'static> {
+    let WorkItemLine1Args {
+        wi,
+        theme,
+        has_session,
+        is_selected,
+        margin_text,
+        margin_style,
+        first_title,
+        title_style,
+        badge,
+        badge_style,
+        pad_str,
+        right_parts,
+        visible_badge_count,
+        right_badge_style,
+        gate_tag,
+    } = args;
     let mut line1_spans = if wi.status == WorkItemStatus::Done {
         vec![
             Span::styled(margin_text, margin_style),
@@ -509,64 +509,163 @@ pub fn format_work_item_entry<'a>(
         };
         line1_spans.push(Span::styled(text.clone(), s));
     }
-    let line1 = Line::from(line1_spans);
+    Line::from(line1_spans)
+}
 
-    // -- Line 2+: metadata (only if the work item has meaningful context) --
-    //
-    // A work item can be in different states of completeness:
-    // - Has branch + worktree + PR: show branch (repo) with all badges
-    // - Has branch but no worktree: show branch (repo) [no wt]
-    // - Has no branch (pre-planning): show just repo name, no tags
-    // - Has no repo associations: show nothing (shouldn't happen per invariant 1)
-
-    let first_assoc = wi.repo_associations.first();
-    let has_branch = first_assoc.is_some_and(|a| a.branch.is_some());
-    let has_worktree = first_assoc.is_some_and(|a| a.worktree_path.is_some());
-
-    let mut lines = vec![line1];
-
-    // Title continuation lines (indented to align with content after margin).
-    for title_cont in title_lines.iter().skip(1) {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(title_cont.clone(), title_style),
-        ]));
+/// Derive the `(title, badge, right_badge, meta)` style tuple for a
+/// work-item row. When selected, the List widget only sets bg (via
+/// `style_tab_highlight_bg`) and this helper applies fg per-span so
+/// title+badge get the original highlight look (Black + BOLD) while
+/// branch metadata uses the theme-owned `style_meta_selected`. When
+/// not selected, Done items get the muted `style_done_item`; other
+/// statuses get the standard `style_text`. Badge styles are dimmed
+/// when the work item has no live harness session attached so
+/// "dim = no session" stays the single unambiguous encoding.
+fn work_item_row_styles(
+    theme: &Theme,
+    status: WorkItemStatus,
+    is_selected: bool,
+    has_session: bool,
+) -> (
+    ratatui_core::style::Style,
+    ratatui_core::style::Style,
+    ratatui_core::style::Style,
+    ratatui_core::style::Style,
+) {
+    if is_selected {
+        let hl = theme.style_tab_highlight();
+        (
+            hl,
+            dim_badge_style(hl, has_session),
+            dim_badge_style(hl, has_session),
+            theme.style_meta_selected(),
+        )
+    } else {
+        let ts = if status == WorkItemStatus::Done {
+            theme.style_done_item()
+        } else {
+            theme.style_text()
+        };
+        (
+            ts,
+            dim_badge_style(theme.style_stage_badge(status), has_session),
+            ratatui_core::style::Style::default(),
+            theme.style_text_muted(),
+        )
     }
+}
 
-    // Backend-provided display ID (e.g. `#workbridge-42`).
-    //
-    // Rendered as a dimmed subtitle line between the title and the
-    // branch line, styled with the same `meta_style` as the branch
-    // subtitle so selection highlighting flows consistently across
-    // both. Records created before this feature landed have
-    // `display_id == None` and skip this block entirely - they render
-    // exactly as before with no reserved blank line.
-    if let Some(display_id) = wi.display_id.as_deref() {
-        let id_text = format!("#{display_id}");
-        for wrapped in wrap_text(&id_text, content_width) {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(wrapped, meta_style),
-            ]));
+/// Build the 2-column left margin for a work-item row. Chooses
+/// between a spinner (when the agent is working or a review gate is
+/// running), a "live session" dot, the selection caret, or a blank
+/// pad based on session / selection state.
+fn work_item_row_margin(
+    app: &App,
+    theme: &Theme,
+    _wi_id: &crate::work_item::WorkItemId,
+    is_selected: bool,
+    is_working: bool,
+    has_session: bool,
+) -> (String, ratatui_core::style::Style) {
+    if is_working {
+        let frame = SPINNER_FRAMES[app.activities.spinner_tick % SPINNER_FRAMES.len()];
+        // On a highlighted row the list's bg is already Cyan, so a Cyan
+        // spinner fg is invisible. Match the selection caret/title styling
+        // (Black fg on Cyan bg, BOLD) so the spinner stays readable.
+        let style = if is_selected {
+            theme.style_tab_highlight()
+        } else {
+            theme.style_badge_session_working()
+        };
+        (format!("{frame} "), style)
+    } else if has_session {
+        ("\u{25CF} ".to_string(), theme.style_badge_session_idle())
+    } else if is_selected {
+        ("> ".to_string(), theme.style_tab_highlight())
+    } else {
+        ("  ".to_string(), ratatui_core::style::Style::default())
+    }
+}
+
+/// Build the right-hand badge chips rendered next to the title
+/// (PR#N, CI status, merge conflict, `!cl` / `!pushed` / `!pulled`
+/// git-state chips, and the multi-repo indicator). All styles are
+/// dimmed when the work item has no live harness session attached.
+fn build_right_side_badges(
+    wi: &crate::work_item::WorkItem,
+    theme: &Theme,
+    has_session: bool,
+) -> Vec<(String, ratatui_core::style::Style)> {
+    let mut right_parts: Vec<(String, ratatui_core::style::Style)> = Vec::new();
+
+    // PR badge: show first PR if any.
+    let first_pr = wi.repo_associations.iter().find_map(|a| a.pr.as_ref());
+    if let Some(pr) = first_pr {
+        let pr_text = format!("PR#{}", pr.number);
+        let pr_style = if pr.state == PrState::Merged {
+            theme.style_text_muted()
+        } else {
+            theme.style_badge_pr()
+        };
+        right_parts.push((pr_text, pr_style));
+
+        // CI badge.
+        match &pr.checks {
+            CheckStatus::Passing => {
+                right_parts.push((" ok".to_string(), theme.style_badge_ci_pass()));
+            }
+            CheckStatus::Failing => {
+                right_parts.push((" fail".to_string(), theme.style_badge_ci_fail()));
+            }
+            CheckStatus::Pending => {
+                right_parts.push((" ...".to_string(), theme.style_badge_ci_pending()));
+            }
+            CheckStatus::None | CheckStatus::Unknown => {}
+        }
+        if matches!(pr.mergeable, MergeableState::Conflicting) {
+            right_parts.push((" !merge".to_string(), theme.style_badge_merge_conflict()));
         }
     }
 
-    if has_branch {
-        // Branch + [no wt] indicator. Repo is shown in the group header.
-        let branch_name = first_assoc.and_then(|a| a.branch.as_deref()).unwrap_or("");
-        let wt_indicator = if has_worktree { "" } else { " [no wt]" };
-
-        let meta_content = format!("{branch_name}{wt_indicator}");
-        for wrapped_line in wrap_text(&meta_content, content_width) {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(wrapped_line, meta_style),
-            ]));
-        }
+    // Unclean-worktree chip. Rendered whenever ANY repo association has
+    // a derived `GitState` whose `dirty` flag is set. Ahead/behind
+    // state has its own dedicated chips below, so `!cl` is exclusively
+    // for "uncommitted changes in the worktree".
+    let is_unclean = wi
+        .repo_associations
+        .iter()
+        .any(|a| a.git_state.as_ref().is_some_and(|gs| gs.dirty));
+    if is_unclean {
+        right_parts.push((" !cl".to_string(), theme.style_badge_worktree_unclean()));
     }
-    // No repo associations = no line 2 (invariant 1 violation, but render gracefully)
 
-    ListItem::new(lines)
+    let needs_push = wi
+        .repo_associations
+        .iter()
+        .any(|a| a.git_state.as_ref().is_some_and(|gs| gs.ahead > 0));
+    if needs_push {
+        right_parts.push((" !pushed".to_string(), theme.style_badge_pushed()));
+    }
+
+    let needs_pull = wi
+        .repo_associations
+        .iter()
+        .any(|a| a.git_state.as_ref().is_some_and(|gs| gs.behind > 0));
+    if needs_pull {
+        right_parts.push((" !pulled".to_string(), theme.style_badge_pulled()));
+    }
+
+    let repo_count = wi.repo_associations.len();
+    if repo_count > 1 {
+        right_parts.push((format!(" [{repo_count} repos]"), theme.style_text_muted()));
+    }
+
+    // Dim every right-side badge style in one pass when the work item has
+    // no live Claude PTY session attached.
+    for (_, style) in &mut right_parts {
+        *style = dim_badge_style(*style, has_session);
+    }
+    right_parts
 }
 
 #[cfg(test)]

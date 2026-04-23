@@ -14,15 +14,16 @@ fn render_list_item_to_string(item: ratatui_widgets::list::ListItem<'_>, width: 
     use ratatui_core::buffer::Buffer;
     use ratatui_core::layout::Rect;
     use ratatui_core::widgets::Widget;
-    let height = item.height() as u16;
-    let area = Rect::new(0, 0, width as u16, height);
+    let height = u16::try_from(item.height()).expect("list item height fits in u16");
+    let width_u16 = u16::try_from(width).expect("test width fits in u16");
+    let area = Rect::new(0, 0, width_u16, height);
     let list = ratatui_widgets::list::List::new(vec![item]);
     let mut buf = Buffer::empty(area);
     list.render(area, &mut buf);
     let mut lines = Vec::new();
     for y in 0..height {
         let mut line = String::new();
-        for x in 0..width as u16 {
+        for x in 0..width_u16 {
             if let Some(cell) = buf.cell((x, y)) {
                 line.push_str(cell.symbol());
             }
@@ -47,8 +48,9 @@ fn render_list_item_to_buffer(
     use ratatui_core::buffer::Buffer;
     use ratatui_core::layout::Rect;
     use ratatui_core::widgets::StatefulWidget;
-    let height = item.height() as u16;
-    let area = Rect::new(0, 0, width as u16, height);
+    let height = u16::try_from(item.height()).expect("list item height fits in u16");
+    let width_u16 = u16::try_from(width).expect("test width fits in u16");
+    let area = Rect::new(0, 0, width_u16, height);
     let list = ratatui_widgets::list::List::new(vec![item])
         .highlight_style(Theme::default_theme().style_tab_highlight_bg());
     let mut buf = Buffer::empty(area);

@@ -121,10 +121,35 @@ impl super::App {
     /// 5. BACKLOGGED (repo) - Backlog work items, grouped by repo
     /// 6. DONE (repo) - Done work items, grouped by repo
     pub fn build_display_list(&mut self) {
-        let mut list = Vec::new();
-
         // When drilling down from board view, show only items matching
         // the drill-down stage. Otherwise show the full grouped list.
+        let list = if self.board_drill_stage.is_some() {
+            self.build_drill_down_list()
+        } else {
+            self.build_full_grouped_list()
+        };
+
+        // Reset scroll offset when the display list is rebuilt so stale
+        // offsets from a previous list shape (view mode toggle, drill-down,
+        // item deletion) do not carry over. ratatui will re-clamp on the
+        // next render frame based on the selected item.
+        self.list_scroll_offset.set(0);
+
+        self.display_list = list;
+
+        self.restore_selection_in_display_list();
+
+        // Keep board cursor in sync after reassembly.
+        self.sync_board_cursor();
+    }
+
+    /// Build the per-stage drill-down subset of the display list. Only
+    /// work-item rows are included, and only those matching the
+    /// currently-active `board_drill_stage` (with the usual "Blocked
+    /// rolls into Implementing" and "Mergequeue rolls into Review"
+    /// aggregation rules).
+    fn build_drill_down_list(&self) -> Vec<DisplayEntry> {
+        let mut list = Vec::new();
         if let Some(ref drill_stage) = self.board_drill_stage {
             for i in 0..self.work_items.len() {
                 let matches = if *drill_stage == WorkItemStatus::Implementing {
@@ -140,104 +165,107 @@ impl super::App {
                     list.push(DisplayEntry::WorkItemEntry(i));
                 }
             }
-        } else {
-            // REVIEW REQUESTS group (hidden if empty).
-            if !self.review_requested_prs.is_empty() {
-                list.push(DisplayEntry::GroupHeader {
-                    label: "REVIEW REQUESTS".to_string(),
-                    count: self.review_requested_prs.len(),
-                    kind: GroupHeaderKind::Normal,
-                });
-                // Sort direct-to-you rows to the top of the block so the
-                // most actionable reviews are always surfaced first. The
-                // sort key is the `is_direct_request` boolean (false < true
-                // but we negate below so direct comes first) and Rust's
-                // `sort_by_key` is stable, so the original `gh` order is
-                // preserved within each bucket. When the login is unknown
-                // (fetch has not yet reported one), every row classifies
-                // as team and the original order is preserved unchanged.
-                let login = self.current_user_login.as_deref();
-                let mut indices: Vec<usize> = (0..self.review_requested_prs.len()).collect();
-                indices.sort_by_key(|&i| {
-                    u8::from(!self.review_requested_prs[i].is_direct_request(login))
-                });
-                for i in indices {
-                    list.push(DisplayEntry::ReviewRequestItem(i));
-                }
+        }
+        list
+    }
+
+    /// Build the full grouped display list: review requests first,
+    /// then blocked / unlinked / active / backlogged / done groups,
+    /// each hidden when empty.
+    fn build_full_grouped_list(&self) -> Vec<DisplayEntry> {
+        let mut list = Vec::new();
+        // REVIEW REQUESTS group (hidden if empty).
+        if !self.review_requested_prs.is_empty() {
+            list.push(DisplayEntry::GroupHeader {
+                label: "REVIEW REQUESTS".to_string(),
+                count: self.review_requested_prs.len(),
+                kind: GroupHeaderKind::Normal,
+            });
+            // Sort direct-to-you rows to the top of the block so the
+            // most actionable reviews are always surfaced first. The
+            // sort key is the `is_direct_request` boolean (false < true
+            // but we negate below so direct comes first) and Rust's
+            // `sort_by_key` is stable, so the original `gh` order is
+            // preserved within each bucket. When the login is unknown
+            // (fetch has not yet reported one), every row classifies
+            // as team and the original order is preserved unchanged.
+            let login = self.current_user_login.as_deref();
+            let mut indices: Vec<usize> = (0..self.review_requested_prs.len()).collect();
+            indices
+                .sort_by_key(|&i| u8::from(!self.review_requested_prs[i].is_direct_request(login)));
+            for i in indices {
+                list.push(DisplayEntry::ReviewRequestItem(i));
             }
-
-            // Partition work items into blocked, active, backlogged, and done.
-            let mut blocked: Vec<usize> = Vec::new();
-            let mut active: Vec<usize> = Vec::new();
-            let mut backlogged: Vec<usize> = Vec::new();
-            let mut done: Vec<usize> = Vec::new();
-            for i in 0..self.work_items.len() {
-                if self.work_items[i].status == WorkItemStatus::Done {
-                    done.push(i);
-                } else if self.work_items[i].status == WorkItemStatus::Backlog {
-                    backlogged.push(i);
-                } else if self.work_items[i].status == WorkItemStatus::Blocked {
-                    blocked.push(i);
-                } else {
-                    active.push(i);
-                }
-            }
-
-            // BLOCKED group first (red, attention-grabbing).
-            Self::push_repo_groups(
-                &self.work_items,
-                &mut list,
-                "BLOCKED",
-                &blocked,
-                GroupHeaderKind::Blocked,
-            );
-
-            // UNLINKED group (hidden if empty).
-            if !self.unlinked_prs.is_empty() {
-                list.push(DisplayEntry::GroupHeader {
-                    label: "UNLINKED".to_string(),
-                    count: self.unlinked_prs.len(),
-                    kind: GroupHeaderKind::Normal,
-                });
-                for i in 0..self.unlinked_prs.len() {
-                    list.push(DisplayEntry::UnlinkedItem(i));
-                }
-            }
-
-            Self::push_repo_groups(
-                &self.work_items,
-                &mut list,
-                "ACTIVE",
-                &active,
-                GroupHeaderKind::Normal,
-            );
-            Self::push_repo_groups(
-                &self.work_items,
-                &mut list,
-                "BACKLOGGED",
-                &backlogged,
-                GroupHeaderKind::Normal,
-            );
-            Self::push_repo_groups(
-                &self.work_items,
-                &mut list,
-                "DONE",
-                &done,
-                GroupHeaderKind::Normal,
-            );
         }
 
-        // Reset scroll offset when the display list is rebuilt so stale
-        // offsets from a previous list shape (view mode toggle, drill-down,
-        // item deletion) do not carry over. ratatui will re-clamp on the
-        // next render frame based on the selected item.
-        self.list_scroll_offset.set(0);
+        // Partition work items into blocked, active, backlogged, and done.
+        let mut blocked: Vec<usize> = Vec::new();
+        let mut active: Vec<usize> = Vec::new();
+        let mut backlogged: Vec<usize> = Vec::new();
+        let mut done: Vec<usize> = Vec::new();
+        for i in 0..self.work_items.len() {
+            if self.work_items[i].status == WorkItemStatus::Done {
+                done.push(i);
+            } else if self.work_items[i].status == WorkItemStatus::Backlog {
+                backlogged.push(i);
+            } else if self.work_items[i].status == WorkItemStatus::Blocked {
+                blocked.push(i);
+            } else {
+                active.push(i);
+            }
+        }
 
-        self.display_list = list;
+        // BLOCKED group first (red, attention-grabbing).
+        Self::push_repo_groups(
+            &self.work_items,
+            &mut list,
+            "BLOCKED",
+            &blocked,
+            GroupHeaderKind::Blocked,
+        );
 
-        // Restore selection by identity (WorkItemId or unlinked branch name)
-        // so that selection survives reassembly even when display indices
-        // change due to non-deterministic backend ordering or item additions.
+        // UNLINKED group (hidden if empty).
+        if !self.unlinked_prs.is_empty() {
+            list.push(DisplayEntry::GroupHeader {
+                label: "UNLINKED".to_string(),
+                count: self.unlinked_prs.len(),
+                kind: GroupHeaderKind::Normal,
+            });
+            for i in 0..self.unlinked_prs.len() {
+                list.push(DisplayEntry::UnlinkedItem(i));
+            }
+        }
+
+        Self::push_repo_groups(
+            &self.work_items,
+            &mut list,
+            "ACTIVE",
+            &active,
+            GroupHeaderKind::Normal,
+        );
+        Self::push_repo_groups(
+            &self.work_items,
+            &mut list,
+            "BACKLOGGED",
+            &backlogged,
+            GroupHeaderKind::Normal,
+        );
+        Self::push_repo_groups(
+            &self.work_items,
+            &mut list,
+            "DONE",
+            &done,
+            GroupHeaderKind::Normal,
+        );
+        list
+    }
+
+    /// Restore selection by identity (`WorkItemId`, unlinked branch, or
+    /// review-request branch) so that selection survives reassembly
+    /// even when display indices change due to non-deterministic
+    /// backend ordering or item additions. Falls back to the first
+    /// selectable entry when the previously-selected target is gone.
+    fn restore_selection_in_display_list(&mut self) {
         let mut restored = false;
         if let Some(ref target_id) = self.selected_work_item {
             for (i, entry) in self.display_list.iter().enumerate() {
@@ -287,9 +315,6 @@ impl super::App {
             self.selected_review_request_branch = None;
             self.selected_item = self.display_list.iter().position(is_selectable);
         }
-
-        // Keep board cursor in sync after reassembly.
-        self.sync_board_cursor();
     }
 
     /// Sub-group work item indices by repo and emit group headers + entries.

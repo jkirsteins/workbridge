@@ -108,33 +108,8 @@ pub fn draw_settings_overlay(buf: &mut Buffer, app: &mut App, theme: &Theme, are
 }
 
 pub fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
-    // Build managed repo items.
-    let managed_repos = &app.active_repo_cache;
-    let mut managed_items: Vec<ListItem<'_>> = Vec::new();
-    for entry in managed_repos {
-        let source_label = match entry.source {
-            config::RepoSource::Explicit => "explicit",
-            config::RepoSource::Discovered => "discovered",
-        };
-        let marker = if entry.git_dir_present { "+" } else { "-" };
-        managed_items.push(
-            ListItem::new(format!(
-                " {marker} {} ({source_label})",
-                entry.path.display()
-            ))
-            .style(theme.style_text()),
-        );
-    }
-
-    // Build available repo items (discovered but not managed).
-    let available_entries = app.available_repos();
-    let mut available_items: Vec<ListItem<'_>> = Vec::new();
-    for entry in &available_entries {
-        let marker = if entry.git_dir_present { "+" } else { "-" };
-        available_items.push(
-            ListItem::new(format!(" {marker} {}", entry.path.display())).style(theme.style_text()),
-        );
-    }
+    let managed_items = build_managed_repo_items(app, theme);
+    let available_items = build_available_repo_items(app, theme);
 
     // Compute repos section height.
     let managed_count = managed_items.len();
@@ -180,17 +155,7 @@ pub fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area:
     Paragraph::new(source_text).render(sections[0], buf);
 
     // Section 1: Base directories.
-    let mut base_lines = vec![Line::styled("Base directories:", theme.style_heading())];
-    if app.services.config.base_dirs.is_empty() {
-        base_lines.push(Line::styled("  (none)", theme.style_text_muted()));
-    } else {
-        for dir in &app.services.config.base_dirs {
-            let expanded = config::expand_tilde(dir);
-            let marker = if expanded.is_dir() { "+" } else { "-" };
-            base_lines.push(Line::from(format!("  {marker} {dir}")));
-        }
-    }
-    Paragraph::new(Text::from(base_lines)).render(sections[1], buf);
+    render_base_dirs_section(buf, app, theme, sections[1]);
 
     // Section 2: Repos - horizontal split of Managed and Available lists.
     let repo_cols = Layout::default()
@@ -198,71 +163,30 @@ pub fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area:
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(sections[2]);
 
-    // Managed repos list (left).
-    let managed_border = if app.settings.list_focus == SettingsListFocus::Managed {
-        theme.style_border_focused()
-    } else {
-        theme.style_border_subtle()
-    };
-    let managed_title = format!(" Managed repos ({managed_count}) ");
-    let managed_block = Block::default()
-        .title(managed_title.as_str())
-        .title_style(theme.style_title())
-        .borders(Borders::ALL)
-        .border_style(managed_border);
-
-    if managed_items.is_empty() {
-        let empty =
-            Paragraph::new(Line::styled("  (none)", theme.style_text_muted())).block(managed_block);
-        empty.render(repo_cols[0], buf);
-    } else {
-        let list = List::new(managed_items)
-            .block(managed_block)
-            .highlight_style(theme.style_tab_highlight())
-            .highlight_symbol("> ");
-        let mut state = ListState::default();
-        if app.settings.list_focus == SettingsListFocus::Managed {
-            state.select(Some(
-                app.settings
-                    .repo_selected
-                    .min(managed_count.saturating_sub(1)),
-            ));
-        }
-        StatefulWidget::render(list, repo_cols[0], buf, &mut state);
-    }
-
-    // Available repos list (right).
-    let available_border = if app.settings.list_focus == SettingsListFocus::Available {
-        theme.style_border_focused()
-    } else {
-        theme.style_border_subtle()
-    };
-    let available_title = format!(" Available ({available_count}) ");
-    let available_block = Block::default()
-        .title(available_title.as_str())
-        .title_style(theme.style_title())
-        .borders(Borders::ALL)
-        .border_style(available_border);
-
-    if available_items.is_empty() {
-        let empty = Paragraph::new(Line::styled("  (none)", theme.style_text_muted()))
-            .block(available_block);
-        empty.render(repo_cols[1], buf);
-    } else {
-        let list = List::new(available_items)
-            .block(available_block)
-            .highlight_style(theme.style_tab_highlight())
-            .highlight_symbol("> ");
-        let mut state = ListState::default();
-        if app.settings.list_focus == SettingsListFocus::Available {
-            state.select(Some(
-                app.settings
-                    .available_selected
-                    .min(available_count.saturating_sub(1)),
-            ));
-        }
-        StatefulWidget::render(list, repo_cols[1], buf, &mut state);
-    }
+    render_settings_repo_list(
+        buf,
+        repo_cols[0],
+        theme,
+        SettingsRepoListArgs {
+            items: managed_items,
+            count: managed_count,
+            title_prefix: " Managed repos",
+            focused: app.settings.list_focus == SettingsListFocus::Managed,
+            selected: app.settings.repo_selected,
+        },
+    );
+    render_settings_repo_list(
+        buf,
+        repo_cols[1],
+        theme,
+        SettingsRepoListArgs {
+            items: available_items,
+            count: available_count,
+            title_prefix: " Available",
+            focused: app.settings.list_focus == SettingsListFocus::Available,
+            selected: app.settings.available_selected,
+        },
+    );
 
     // Section 4: Defaults.
     let defaults_text = Text::from(vec![
@@ -277,6 +201,118 @@ pub fn draw_settings_repos_tab(buf: &mut Buffer, app: &App, theme: &Theme, area:
         )),
     ]);
     Paragraph::new(defaults_text).render(sections[4], buf);
+}
+
+/// Build the `ListItem` vec for the "Managed repos" column of the
+/// settings repos tab. Each entry is prefixed with a `+`/`-` marker
+/// reflecting whether the git dir is present, plus the explicit vs.
+/// discovered source label.
+fn build_managed_repo_items<'a>(app: &App, theme: &Theme) -> Vec<ListItem<'a>> {
+    let managed_repos = &app.active_repo_cache;
+    let mut managed_items: Vec<ListItem<'a>> = Vec::new();
+    for entry in managed_repos {
+        let source_label = match entry.source {
+            config::RepoSource::Explicit => "explicit",
+            config::RepoSource::Discovered => "discovered",
+        };
+        let marker = if entry.git_dir_present { "+" } else { "-" };
+        managed_items.push(
+            ListItem::new(format!(
+                " {marker} {} ({source_label})",
+                entry.path.display()
+            ))
+            .style(theme.style_text()),
+        );
+    }
+    managed_items
+}
+
+/// Build the `ListItem` vec for the "Available" column: discovered
+/// repos that are not yet managed.
+fn build_available_repo_items<'a>(app: &App, theme: &Theme) -> Vec<ListItem<'a>> {
+    let available_entries = app.available_repos();
+    let mut available_items: Vec<ListItem<'a>> = Vec::new();
+    for entry in &available_entries {
+        let marker = if entry.git_dir_present { "+" } else { "-" };
+        available_items.push(
+            ListItem::new(format!(" {marker} {}", entry.path.display())).style(theme.style_text()),
+        );
+    }
+    available_items
+}
+
+/// Render the "Base directories" section: a heading line followed by
+/// either `(none)` or one line per configured base dir, with a `+`/`-`
+/// marker indicating whether the expanded path exists on disk.
+fn render_base_dirs_section(buf: &mut Buffer, app: &App, theme: &Theme, area: Rect) {
+    let mut base_lines = vec![Line::styled("Base directories:", theme.style_heading())];
+    if app.services.config.base_dirs.is_empty() {
+        base_lines.push(Line::styled("  (none)", theme.style_text_muted()));
+    } else {
+        for dir in &app.services.config.base_dirs {
+            let expanded = config::expand_tilde(dir);
+            let marker = if expanded.is_dir() { "+" } else { "-" };
+            base_lines.push(Line::from(format!("  {marker} {dir}")));
+        }
+    }
+    Paragraph::new(Text::from(base_lines)).render(area, buf);
+}
+
+/// Inputs for `render_settings_repo_list`. Each variant of the
+/// (Managed / Available) repo list populates this once before handing
+/// off to the renderer.
+struct SettingsRepoListArgs<'a> {
+    items: Vec<ListItem<'a>>,
+    count: usize,
+    title_prefix: &'a str,
+    focused: bool,
+    selected: usize,
+}
+
+/// Render one of the two repo lists (Managed / Available) that sit
+/// side-by-side in Section 2 of the Settings repos tab. Factored out
+/// of `draw_settings_repos_tab` so each list renders via the same
+/// block / empty-state / highlight-style path.
+fn render_settings_repo_list(
+    buf: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    args: SettingsRepoListArgs<'_>,
+) {
+    let SettingsRepoListArgs {
+        items,
+        count,
+        title_prefix,
+        focused,
+        selected,
+    } = args;
+    let border_style = if focused {
+        theme.style_border_focused()
+    } else {
+        theme.style_border_subtle()
+    };
+    let title = format!("{title_prefix} ({count}) ");
+    let block = Block::default()
+        .title(title.as_str())
+        .title_style(theme.style_title())
+        .borders(Borders::ALL)
+        .border_style(border_style);
+
+    if items.is_empty() {
+        Paragraph::new(Line::styled("  (none)", theme.style_text_muted()))
+            .block(block)
+            .render(area, buf);
+    } else {
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(theme.style_tab_highlight())
+            .highlight_symbol("> ");
+        let mut state = ListState::default();
+        if focused {
+            state.select(Some(selected.min(count.saturating_sub(1))));
+        }
+        StatefulWidget::render(list, area, buf, &mut state);
+    }
 }
 
 pub fn draw_settings_review_gate_tab(buf: &mut Buffer, app: &mut App, theme: &Theme, area: Rect) {

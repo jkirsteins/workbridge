@@ -2,8 +2,8 @@
 
 use super::{
     ActivityEntry, App, Arc, BackendError, Config, CreateWorkItem, DisplayEntry, FetchMessage,
-    PathBuf, RepoAssociationRecord, RepoEntry, RepoFetchResult, RepoSource, SettingsListFocus,
-    StubBackend, WorkItemBackend, WorkItemId, WorkItemStatus,
+    PathBuf, RepoEntry, RepoFetchResult, RepoSource, SettingsListFocus, StubBackend,
+    WorkItemBackend, WorkItemId, WorkItemStatus,
 };
 
 // The wall-clock-free bounded-receive helper lives in
@@ -122,123 +122,8 @@ fn managed_repo_root_returns_root_not_subdir() {
 #[test]
 fn import_and_delete_set_fetcher_repos_changed() {
     use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
-    use crate::work_item_backend::ListResult;
 
-    /// Test backend that supports import and delete.
-    struct TestBackend {
-        records: std::sync::Mutex<Vec<crate::work_item_backend::WorkItemRecord>>,
-    }
-
-    impl WorkItemBackend for TestBackend {
-        fn read(
-            &self,
-            id: &WorkItemId,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            self.records
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|r| r.id == *id)
-                .cloned()
-                .ok_or_else(|| BackendError::NotFound(id.clone()))
-        }
-        fn list(&self) -> Result<ListResult, BackendError> {
-            Ok(ListResult {
-                records: self.records.lock().unwrap().clone(),
-                corrupt: Vec::new(),
-            })
-        }
-        fn create(
-            &self,
-            _req: CreateWorkItem,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            Err(BackendError::Validation("not used".into()))
-        }
-        fn delete(&self, id: &WorkItemId) -> Result<(), BackendError> {
-            let mut records = self.records.lock().unwrap();
-            records.iter().position(|r| r.id == *id).map_or_else(
-                || Err(BackendError::NotFound(id.clone())),
-                |pos| {
-                    records.remove(pos);
-                    Ok(())
-                },
-            )
-        }
-        fn update_status(
-            &self,
-            _id: &WorkItemId,
-            _status: WorkItemStatus,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn import(
-            &self,
-            unlinked: &crate::work_item::UnlinkedPr,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            let record = crate::work_item_backend::WorkItemRecord {
-                display_id: None,
-                id: WorkItemId::LocalFile(PathBuf::from("/tmp/fake.json")),
-                title: unlinked.pr.title.clone(),
-                description: None,
-                status: WorkItemStatus::Implementing,
-                kind: crate::work_item::WorkItemKind::Own,
-                repo_associations: vec![RepoAssociationRecord {
-                    repo_path: unlinked.repo_path.clone(),
-                    branch: Some(unlinked.branch.clone()),
-                    pr_identity: None,
-                }],
-                plan: None,
-                done_at: None,
-            };
-            self.records.lock().unwrap().push(record.clone());
-            Ok(record)
-        }
-        fn import_review_request(
-            &self,
-            rr: &crate::work_item::ReviewRequestedPr,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            let record = crate::work_item_backend::WorkItemRecord {
-                display_id: None,
-                id: WorkItemId::LocalFile(PathBuf::from("/tmp/fake-rr.json")),
-                title: rr.pr.title.clone(),
-                status: WorkItemStatus::Review,
-                kind: crate::work_item::WorkItemKind::ReviewRequest,
-                repo_associations: vec![RepoAssociationRecord {
-                    repo_path: rr.repo_path.clone(),
-                    branch: Some(rr.branch.clone()),
-                    pr_identity: None,
-                }],
-                plan: None,
-                description: None,
-                done_at: None,
-            };
-            self.records.lock().unwrap().push(record.clone());
-            Ok(record)
-        }
-        fn append_activity(
-            &self,
-            _id: &WorkItemId,
-            _entry: &ActivityEntry,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
-            Ok(None)
-        }
-        fn set_done_at(&self, _id: &WorkItemId, _done_at: Option<u64>) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
-            None
-        }
-    }
-
-    let backend = TestBackend {
-        records: std::sync::Mutex::new(Vec::new()),
-    };
+    let backend = super::shared::ImportTestBackend::new();
     let mut app = App::with_config(Config::default(), Arc::new(backend));
 
     // Set up an unlinked PR to import.

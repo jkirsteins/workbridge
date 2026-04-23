@@ -1,12 +1,10 @@
-//! PR creation + merge-execution subsystem.
+//! Merge execution + live precheck subsystem.
 //!
-//! Drains the background PR-creation channel
-//! (`poll_pr_creation`), admits a merge action
-//! (`execute_merge`) through the `UserActionKey::PrMerge` guard,
-//! and exposes the small `is_merge_precheck_phase` /
-//! `merge_confirm_hint` predicates used by the merge modal
-//! renderer. The actual merge polling lives in
-//! `pr_merge_and_review`.
+//! Owns `execute_merge`, `spawn_merge_precheck`,
+//! `is_merge_precheck_phase`, and `merge_confirm_hint`. Extracted from
+//! `pr_creation.rs` so both files stay under the 700-line ceiling and
+//! so the merge-flow surface is reviewable independent of the
+//! unrelated PR-creation (gh pr create) subsystem.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,189 +12,11 @@ use std::time::Duration;
 
 use super::{
     MergePreCheckMessage, MergeReadiness, PR_MERGE_ALREADY_IN_PROGRESS, UserActionKey,
-    UserActionPayload, now_iso8601,
+    UserActionPayload,
 };
-use crate::work_item::{WorkItemId, WorkItemStatus};
-use crate::work_item_backend::ActivityEntry;
+use crate::work_item::WorkItemId;
 
 impl super::App {
-    /// Best-effort async PR creation when entering Review.
-    ///
-    /// Gathers the needed data, then spawns a background thread to run
-    /// the `gh` CLI commands. Results are polled by `poll_pr_creation()`
-    /// on each timer tick.
-    pub(super) fn spawn_pr_creation(&mut self, wi_id: &WorkItemId) {
-        // If a PR creation is already in-flight, queue this one instead of
-        // silently dropping it. The queue is drained in poll_pr_creation.
-        if self.is_user_action_in_flight(&UserActionKey::PrCreate) {
-            if !self.pr_create_pending.contains(wi_id) {
-                self.pr_create_pending.push_back(wi_id.clone());
-            }
-            return;
-        }
-
-        let Some(wi) = self.work_items.iter().find(|w| w.id == *wi_id) else {
-            return;
-        };
-        let Some(assoc) = wi.repo_associations.first() else {
-            return;
-        };
-        let branch = match assoc.branch.as_ref() {
-            Some(b) => b.clone(),
-            None => return,
-        };
-        let repo_path = assoc.repo_path.clone();
-        let title = wi.title.clone();
-        let wi_id = wi_id.clone();
-
-        // Read owner/repo from the cached fetcher result rather than shelling
-        // out via `worktree_service.github_remote(...)` on the UI thread. The
-        // fetcher populates `repo_data[path].github_remote` on every cycle;
-        // if no entry exists yet the first fetch hasn't completed and we
-        // surface that to the user instead of blocking.
-        //
-        // This check runs BEFORE try_begin_user_action so an early return
-        // (cache miss) cannot leave an orphaned helper entry - see the
-        // "desync guard" discussion in `docs/UI.md` "User action guard".
-        let Some((owner, repo_name)) = self
-            .repo_data
-            .get(&repo_path)
-            .and_then(|rd| rd.github_remote.clone())
-        else {
-            self.shell.status_message = Some(
-                "PR creation skipped: GitHub remote not yet cached (waiting for next fetch)".into(),
-            );
-            return;
-        };
-        let owner_repo = format!("{owner}/{repo_name}");
-
-        // Admit the action through the user-action guard. The early-return
-        // cache check above runs first so we never hold a helper slot
-        // across a rejected code path.
-        if self
-            .try_begin_user_action(
-                UserActionKey::PrCreate,
-                Duration::ZERO,
-                "Creating pull request...",
-            )
-            .is_none()
-        {
-            // Unreachable today because the is_user_action_in_flight
-            // check above already short-circuited the queueing path,
-            // but defense in depth: if a race ever sneaks through, push
-            // the request onto the pending queue rather than silently
-            // dropping it.
-            if !self.pr_create_pending.contains(&wi_id) {
-                self.pr_create_pending.push_back(wi_id);
-            }
-            return;
-        }
-
-        // Clone the Arc'd backend and worktree service so the background
-        // thread can run `read_plan` (filesystem) and `default_branch`
-        // (git subprocess) off the UI thread.
-        let backend = Arc::clone(&self.services.backend);
-        let ws = Arc::clone(&self.services.worktree_service);
-
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let helper_wi_id = wi_id.clone();
-
-        std::thread::spawn(move || {
-            super::pr_creation_thread::run_pr_creation_thread(
-                super::pr_creation_thread::PrCreationArgs {
-                    backend,
-                    ws,
-                    wi_id,
-                    title,
-                    branch,
-                    repo_path,
-                    owner_repo,
-                    tx,
-                },
-            );
-        });
-
-        self.attach_user_action_payload(
-            &UserActionKey::PrCreate,
-            UserActionPayload::PrCreate {
-                rx,
-                wi_id: helper_wi_id,
-            },
-        );
-    }
-
-    /// Poll the async PR creation thread for a result. Called on each timer tick.
-    pub fn poll_pr_creation(&mut self) {
-        let recv_result = {
-            let Some(UserActionPayload::PrCreate { rx, .. }) =
-                self.user_action_payload(&UserActionKey::PrCreate)
-            else {
-                return;
-            };
-            match rx.try_recv() {
-                Ok(r) => Ok(r),
-                Err(crossbeam_channel::TryRecvError::Empty) => return,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => Err(()),
-            }
-        };
-        let Ok(result) = recv_result else {
-            self.end_user_action(&UserActionKey::PrCreate);
-            self.shell.status_message =
-                Some("PR creation: background thread exited unexpectedly".into());
-            // Try next pending PR creation despite the failure.
-            // Skip items that were deleted or retreated from Review.
-            while let Some(next_id) = self.pr_create_pending.pop_front() {
-                if self
-                    .work_items
-                    .iter()
-                    .any(|w| w.id == next_id && w.status == WorkItemStatus::Review)
-                {
-                    self.spawn_pr_creation(&next_id);
-                    break;
-                }
-            }
-            return;
-        };
-
-        self.end_user_action(&UserActionKey::PrCreate);
-
-        // Log PR creation to activity log.
-        if let Some(ref url) = result.url {
-            let log_entry = ActivityEntry {
-                timestamp: now_iso8601(),
-                event_type: "pr_created".to_string(),
-                payload: serde_json::json!({ "url": url }),
-            };
-            if let Err(e) = self
-                .services
-                .backend
-                .append_activity(&result.wi_id, &log_entry)
-            {
-                self.shell.status_message = Some(format!("Activity log error: {e}"));
-            }
-        }
-
-        // Update status message.
-        if let Some(info) = result.info {
-            self.shell.status_message = Some(info);
-        } else if let Some(error) = result.error {
-            self.shell.status_message = Some(error);
-        }
-
-        // Drain the pending queue: spawn the next queued PR creation if any.
-        // Skip items that were deleted or retreated from Review while queued.
-        while let Some(next_id) = self.pr_create_pending.pop_front() {
-            if self
-                .work_items
-                .iter()
-                .any(|w| w.id == next_id && w.status == WorkItemStatus::Review)
-            {
-                self.spawn_pr_creation(&next_id);
-                break;
-            }
-        }
-    }
-
     /// Spawn an async PR merge for the given work item.
     ///
     /// `strategy` is either "squash" or "merge". If any prerequisite is

@@ -57,12 +57,13 @@ pub(super) fn make_work_item(
     repo_count: usize,
 ) -> WorkItem {
     let mut associations = Vec::new();
+    let mut pr_for_first = pr;
     for i in 0..repo_count.max(1) {
         associations.push(RepoAssociation {
             repo_path: PathBuf::from(format!("/repo/{id_suffix}/{i}")),
             branch: Some(format!("branch-{id_suffix}")),
             worktree_path: None,
-            pr: if i == 0 { pr.clone() } else { None },
+            pr: if i == 0 { pr_for_first.take() } else { None },
             issue: None,
             git_state: None,
             stale_worktree_path: None,

@@ -219,6 +219,7 @@ pub mod test_support {
             let contents = toml::to_string_pretty(config).map_err(ConfigError::Serialize)?;
             let mut guard = self.data.lock().unwrap();
             *guard = Some(contents);
+            drop(guard);
             Ok(())
         }
     }

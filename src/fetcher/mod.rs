@@ -183,7 +183,8 @@ mod tests {
             worktrees: vec![],
             github_remote: Some(("owner".to_string(), "repo".to_string())),
         });
-        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient::new());
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> =
+            Arc::new(MockGithubClient::new());
 
         let (rx, handle) = start(vec![PathBuf::from("/tmp/test-repo")], &ws, &gc, r"^(\d+)-");
 
@@ -216,33 +217,34 @@ mod tests {
             github_remote: Some(("owner".to_string(), "repo".to_string())),
         });
 
-        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient {
-            prs: vec![GithubPr {
-                number: 10,
-                title: "A PR".into(),
-                state: "OPEN".into(),
-                is_draft: false,
-                head_branch: "42-fix-bug".into(),
-                url: "https://github.com/owner/repo/pull/10".into(),
-                review_decision: String::new(),
-                status_check_rollup: String::new(),
-                head_repo_owner: None,
-                author: None,
-                mergeable: String::new(),
-                requested_reviewer_logins: Vec::new(),
-                requested_team_slugs: Vec::new(),
-            }],
-            issues: vec![GithubIssue {
-                number: 42,
-                title: "Fix the bug".into(),
-                state: "OPEN".into(),
-                labels: vec!["bug".into()],
-            }],
-            review_requested_prs: vec![],
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> =
+            Arc::new(MockGithubClient {
+                prs: vec![GithubPr {
+                    number: 10,
+                    title: "A PR".into(),
+                    state: "OPEN".into(),
+                    is_draft: false,
+                    head_branch: "42-fix-bug".into(),
+                    url: "https://github.com/owner/repo/pull/10".into(),
+                    review_decision: String::new(),
+                    status_check_rollup: String::new(),
+                    head_repo_owner: None,
+                    author: None,
+                    mergeable: String::new(),
+                    requested_reviewer_logins: Vec::new(),
+                    requested_team_slugs: Vec::new(),
+                }],
+                issues: vec![GithubIssue {
+                    number: 42,
+                    title: "Fix the bug".into(),
+                    state: "OPEN".into(),
+                    labels: vec!["bug".into()],
+                }],
+                review_requested_prs: vec![],
 
-            error: None,
-            live_pr_state: None,
-        });
+                error: None,
+                live_pr_state: None,
+            });
 
         let (rx, handle) = start(vec![PathBuf::from("/tmp/test-repo")], &ws, &gc, r"^(\d+)-");
 
@@ -283,7 +285,8 @@ mod tests {
     #[test]
     fn fetcher_stops_cleanly() {
         let ws: Arc<dyn WorktreeService + Send + Sync> = Arc::new(MockWorktreeService::new());
-        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient::new());
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> =
+            Arc::new(MockGithubClient::new());
 
         let (_rx, handle) = start(vec![PathBuf::from("/tmp/test-repo")], &ws, &gc, r"^(\d+)-");
 
@@ -303,7 +306,8 @@ mod tests {
             github_remote: None,
         });
 
-        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient::new());
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> =
+            Arc::new(MockGithubClient::new());
 
         let (rx, handle) = start(
             vec![PathBuf::from("/tmp/no-github-repo")],
@@ -347,19 +351,20 @@ mod tests {
             github_remote: Some(("owner".to_string(), "repo".to_string())),
         });
 
-        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient {
-            prs: vec![],
-            review_requested_prs: vec![],
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> =
+            Arc::new(MockGithubClient {
+                prs: vec![],
+                review_requested_prs: vec![],
 
-            issues: vec![GithubIssue {
-                number: 55,
-                title: "Backend-only issue".into(),
-                state: "OPEN".into(),
-                labels: vec![],
-            }],
-            error: None,
-            live_pr_state: None,
-        });
+                issues: vec![GithubIssue {
+                    number: 55,
+                    title: "Backend-only issue".into(),
+                    state: "OPEN".into(),
+                    labels: vec![],
+                }],
+                error: None,
+                live_pr_state: None,
+            });
 
         let repo_path = PathBuf::from("/tmp/test-extra-branches");
         let mut extra = std::collections::HashMap::new();
@@ -407,7 +412,8 @@ mod tests {
             worktrees: vec![],
             github_remote: Some(("owner".to_string(), "repo".to_string())),
         });
-        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient::new());
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> =
+            Arc::new(MockGithubClient::new());
 
         let (rx, handle) = start(vec![PathBuf::from("/tmp/test-repo")], &ws, &gc, r"^(\d+)-");
 
@@ -443,15 +449,16 @@ mod tests {
             worktrees: vec![],
             github_remote: Some(("owner".to_string(), "repo".to_string())),
         });
-        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> = Arc::new(MockGithubClient {
-            prs: vec![],
-            review_requested_prs: vec![],
-            issues: vec![],
-            error: Some(crate::github_client::GithubError::ApiError(
-                "simulated login failure".into(),
-            )),
-            live_pr_state: None,
-        });
+        let gc: Arc<dyn crate::github_client::GithubClient + Send + Sync> =
+            Arc::new(MockGithubClient {
+                prs: vec![],
+                review_requested_prs: vec![],
+                issues: vec![],
+                error: Some(crate::github_client::GithubError::ApiError(
+                    "simulated login failure".into(),
+                )),
+                live_pr_state: None,
+            });
 
         let (rx, handle) = start(vec![PathBuf::from("/tmp/test-repo")], &ws, &gc, r"^(\d+)-");
 

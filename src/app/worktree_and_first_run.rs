@@ -21,6 +21,21 @@ use crate::agent_backend::{
 };
 use crate::work_item::{WorkItemId, WorkItemStatus};
 
+/// Bundle of inputs that `build_situation_summary` and
+/// `pick_prompt_key` both need to examine. Lives outside `stage_system_prompt`
+/// so the two helpers share one parameter list.
+struct SystemPromptCtx<'a> {
+    status: WorkItemStatus,
+    worktree_display: &'a str,
+    branch_name: &'a str,
+    has_branch_commits: bool,
+    rework_reason: &'a str,
+    plan_text: &'a str,
+    pr_url: Option<&'a str>,
+    review_gate_findings: &'a str,
+    title: &'a str,
+}
+
 impl super::App {
     /// Handle a Ctrl+G keypress. If the config already has a chosen
     /// harness, toggle the drawer as before. Otherwise open the
@@ -446,50 +461,90 @@ impl super::App {
         // Build a situation summary that tells Claude where it is and what
         // state the work item is in.  Uses the worktree path (not the main
         // repo path) so Claude runs commands in the right directory.
-        let situation = match status {
-            WorkItemStatus::Backlog | WorkItemStatus::Done | WorkItemStatus::Mergequeue => {
-                return None;
-            }
-            WorkItemStatus::Planning => {
-                if has_branch_commits {
-                    format!(
-                        "Worktree: {worktree_display}. Branch: {branch_name}. \
-                         Existing implementation work found on this branch - \
-                         analyze it and create a plan."
-                    )
-                } else {
-                    format!(
-                        "Worktree: {worktree_display}. Branch: {branch_name}. \
-                         No plan exists yet - your job is to create one."
-                    )
-                }
-            }
-            WorkItemStatus::Implementing => {
-                if !rework_reason.is_empty() {
-                    format!(
-                        "Worktree: {worktree_display}. Branch: {branch_name}. \
-                         Rework requested (see reason below)."
-                    )
-                } else if plan_text.is_empty() {
-                    format!(
-                        "Worktree: {worktree_display}. Branch: {branch_name}. \
-                         No plan is available - you must block."
-                    )
-                } else {
-                    format!(
-                        "Worktree: {worktree_display}. Branch: {branch_name}. \
-                         An approved plan is available (see below)."
-                    )
-                }
-            }
-            WorkItemStatus::Blocked => {
+        let ctx = SystemPromptCtx {
+            status,
+            worktree_display: &worktree_display,
+            branch_name: &branch_name,
+            has_branch_commits,
+            rework_reason: &rework_reason,
+            plan_text,
+            pr_url: pr_url.as_deref(),
+            review_gate_findings: &review_gate_findings,
+            title: &title,
+        };
+        let situation = Self::build_situation_summary(&ctx)?;
+
+        // Backlog | Done already returned None above, so they are
+        // unreachable here - the match uses a cloned status value.
+        let prompt_key = Self::pick_prompt_key(&ctx);
+
+        let description_var = match &description {
+            Some(d) if !d.is_empty() => format!("\nUser-provided description: {d}"),
+            _ => String::new(),
+        };
+
+        let mut vars: HashMap<&str, &str> = HashMap::new();
+        vars.insert("title", &title);
+        vars.insert("description", &description_var);
+        vars.insert("situation", &situation);
+        vars.insert("plan", plan_text);
+        vars.insert("rework_reason", &rework_reason);
+        vars.insert("review_gate_findings", &review_gate_findings);
+
+        crate::prompts::render(prompt_key, &vars)
+    }
+
+    /// Build the per-status "situation" blurb that prefixes the
+    /// system prompt. Returns `None` for stages that should not spawn
+    /// a harness session (Backlog / Done / Mergequeue).
+    fn build_situation_summary(ctx: &SystemPromptCtx<'_>) -> Option<String> {
+        let SystemPromptCtx {
+            status,
+            worktree_display,
+            branch_name,
+            has_branch_commits,
+            rework_reason,
+            plan_text,
+            pr_url,
+            review_gate_findings,
+            ..
+        } = *ctx;
+        match status {
+            WorkItemStatus::Backlog | WorkItemStatus::Done | WorkItemStatus::Mergequeue => None,
+            WorkItemStatus::Planning => Some(if has_branch_commits {
                 format!(
                     "Worktree: {worktree_display}. Branch: {branch_name}. \
-                     Waiting for user input."
+                     Existing implementation work found on this branch - \
+                     analyze it and create a plan."
                 )
-            }
+            } else {
+                format!(
+                    "Worktree: {worktree_display}. Branch: {branch_name}. \
+                     No plan exists yet - your job is to create one."
+                )
+            }),
+            WorkItemStatus::Implementing => Some(if !rework_reason.is_empty() {
+                format!(
+                    "Worktree: {worktree_display}. Branch: {branch_name}. \
+                     Rework requested (see reason below)."
+                )
+            } else if plan_text.is_empty() {
+                format!(
+                    "Worktree: {worktree_display}. Branch: {branch_name}. \
+                     No plan is available - you must block."
+                )
+            } else {
+                format!(
+                    "Worktree: {worktree_display}. Branch: {branch_name}. \
+                     An approved plan is available (see below)."
+                )
+            }),
+            WorkItemStatus::Blocked => Some(format!(
+                "Worktree: {worktree_display}. Branch: {branch_name}. \
+                 Waiting for user input."
+            )),
             WorkItemStatus::Review => {
-                let pr_line = pr_url.as_ref().map_or_else(
+                let pr_line = pr_url.map_or_else(
                     || {
                         format!(
                             " Note: no pull request URL is available yet (it may still be creating). \
@@ -498,7 +553,7 @@ impl super::App {
                     },
                     |url| format!(" Pull request: {url}."),
                 );
-                if review_gate_findings.is_empty() {
+                Some(if review_gate_findings.is_empty() {
                     format!(
                         "Worktree: {worktree_display}. Branch: {branch_name}. \
                          Implementation is complete and ready for review.{pr_line}"
@@ -508,13 +563,27 @@ impl super::App {
                         "Worktree: {worktree_display}. Branch: {branch_name}. \
                          Implementation passed the review gate and is ready for review.{pr_line}"
                     )
-                }
+                })
             }
-        };
+        }
+    }
 
-        // Backlog | Done already returned None above, so they are
-        // unreachable here - the match uses a cloned status value.
-        let prompt_key = match status {
+    /// Pick the prompt key that selects which template
+    /// `crate::prompts::render` will instantiate. Only reachable for
+    /// stages that `build_situation_summary` accepted (Backlog / Done
+    /// / Mergequeue return `None` there and short-circuit before
+    /// reaching this helper).
+    fn pick_prompt_key(ctx: &SystemPromptCtx<'_>) -> &'static str {
+        let SystemPromptCtx {
+            status,
+            has_branch_commits,
+            title,
+            rework_reason,
+            plan_text,
+            review_gate_findings,
+            ..
+        } = *ctx;
+        match status {
             WorkItemStatus::Backlog | WorkItemStatus::Done | WorkItemStatus::Mergequeue => {
                 unreachable!()
             }
@@ -544,22 +613,7 @@ impl super::App {
                     "review_with_findings"
                 }
             }
-        };
-
-        let description_var = match &description {
-            Some(d) if !d.is_empty() => format!("\nUser-provided description: {d}"),
-            _ => String::new(),
-        };
-
-        let mut vars: HashMap<&str, &str> = HashMap::new();
-        vars.insert("title", &title);
-        vars.insert("description", &description_var);
-        vars.insert("situation", &situation);
-        vars.insert("plan", plan_text);
-        vars.insert("rework_reason", &rework_reason);
-        vars.insert("review_gate_findings", &review_gate_findings);
-
-        crate::prompts::render(prompt_key, &vars)
+        }
     }
 
     /// Check if `branch` in `repo_path` has commits ahead of the default

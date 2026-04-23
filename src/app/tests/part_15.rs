@@ -155,6 +155,7 @@ fn delete_calls_remove_worktree_and_delete_branch() {
         db_calls[0].2,
         "delete_branch force should be true (user chose to destroy the item)"
     );
+    drop(db_calls);
 }
 
 /// When `gh pr close` fails for an association with an open PR, the
@@ -164,27 +165,61 @@ fn delete_calls_remove_worktree_and_delete_branch() {
 /// PR close failure afterward, the user would be left with an open
 /// PR and no local branch to recover from - which is exactly the
 /// data-loss path `spawn_unlinked_cleanup` already guards against.
+/// Records calls and always fails. Mirrors the shape of the
+/// `RecordingWorktreeService` stub already used in this test module.
+struct FailingCloser {
+    calls: std::sync::Mutex<Vec<(String, String, u64)>>,
+}
+
+impl crate::pr_service::PullRequestCloser for FailingCloser {
+    fn close_pr(&self, owner: &str, repo: &str, pr_number: u64) -> Result<(), String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((owner.into(), repo.into(), pr_number));
+        Err("simulated gh auth error".into())
+    }
+}
+
+/// Build a `RepoFetchResult` for `/my/repo` containing a worktree at
+/// `.worktrees/feature-branch` and an OPEN PR #42 on that branch.
+/// Used by the PR-close-failure delete test to put the delete flow
+/// onto the PR-close path while still exposing the (worktree, branch)
+/// pair that must remain untouched when the close fails.
+fn pr_close_fail_repo_fetch_result() -> crate::work_item::RepoFetchResult {
+    crate::work_item::RepoFetchResult {
+        repo_path: PathBuf::from("/my/repo"),
+        github_remote: Some(("my-org".into(), "my-repo".into())),
+        worktrees: Ok(vec![crate::worktree_service::WorktreeInfo {
+            path: PathBuf::from("/my/repo/.worktrees/feature-branch"),
+            branch: Some("feature-branch".into()),
+            is_main: false,
+            ..crate::worktree_service::WorktreeInfo::default()
+        }]),
+        prs: Ok(vec![crate::github_client::GithubPr {
+            number: 42,
+            title: "Test PR".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            head_branch: "feature-branch".into(),
+            url: "https://example.com/pr/42".into(),
+            review_decision: String::new(),
+            status_check_rollup: String::new(),
+            head_repo_owner: None,
+            author: None,
+            mergeable: String::new(),
+            requested_reviewer_logins: Vec::new(),
+            requested_team_slugs: Vec::new(),
+        }]),
+        review_requested_prs: Ok(vec![]),
+        current_user_login: None,
+        issues: vec![],
+    }
+}
+
 #[test]
 fn delete_preserves_local_resources_when_pr_close_fails() {
     use crate::config::InMemoryConfigProvider;
-    use crate::pr_service::PullRequestCloser;
-
-    /// Records calls and always fails. Mirrors the shape of the
-    /// `RecordingWorktreeService` stub already used in this test
-    /// module.
-    struct FailingCloser {
-        calls: std::sync::Mutex<Vec<(String, String, u64)>>,
-    }
-
-    impl PullRequestCloser for FailingCloser {
-        fn close_pr(&self, owner: &str, repo: &str, pr_number: u64) -> Result<(), String> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((owner.into(), repo.into(), pr_number));
-            Err("simulated gh auth error".into())
-        }
-    }
 
     let recording_ws = Arc::new(ConfigurableWorktreeService::recording());
     let failing_closer = Arc::new(FailingCloser {
@@ -215,37 +250,8 @@ fn delete_preserves_local_resources_when_pr_close_fails() {
     // `head_branch == "feature-branch"` is what populates
     // DeleteCleanupInfo.open_pr_number and drives the PR-close path.
     assert_eq!(app.work_items.len(), 1);
-    app.repo_data.insert(
-        PathBuf::from("/my/repo"),
-        crate::work_item::RepoFetchResult {
-            repo_path: PathBuf::from("/my/repo"),
-            github_remote: Some(("my-org".into(), "my-repo".into())),
-            worktrees: Ok(vec![crate::worktree_service::WorktreeInfo {
-                path: PathBuf::from("/my/repo/.worktrees/feature-branch"),
-                branch: Some("feature-branch".into()),
-                is_main: false,
-                ..crate::worktree_service::WorktreeInfo::default()
-            }]),
-            prs: Ok(vec![crate::github_client::GithubPr {
-                number: 42,
-                title: "Test PR".into(),
-                state: "OPEN".into(),
-                is_draft: false,
-                head_branch: "feature-branch".into(),
-                url: "https://example.com/pr/42".into(),
-                review_decision: String::new(),
-                status_check_rollup: String::new(),
-                head_repo_owner: None,
-                author: None,
-                mergeable: String::new(),
-                requested_reviewer_logins: Vec::new(),
-                requested_team_slugs: Vec::new(),
-            }]),
-            review_requested_prs: Ok(vec![]),
-            current_user_login: None,
-            issues: vec![],
-        },
-    );
+    app.repo_data
+        .insert(PathBuf::from("/my/repo"), pr_close_fail_repo_fetch_result());
     app.build_display_list();
 
     // Select the work item and drive the delete flow.

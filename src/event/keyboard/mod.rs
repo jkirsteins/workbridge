@@ -89,49 +89,11 @@ pub fn handle_key_board(app: &mut App, key: KeyEvent) {
         }
         // Q/q/Ctrl+Q - quit with confirmation
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('q' | 'Q'))
-        | (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
-            if !app.has_any_session() || app.shell.confirm_quit {
-                app.shell.should_quit = true;
-            } else {
-                app.shell.confirm_quit = true;
-                app.shell.status_message =
-                    Some("Press Q again to quit and kill all sessions".into());
-                sync_layout(app);
-            }
-        }
+        | (KeyModifiers::CONTROL, KeyCode::Char('q')) => handle_quit_confirm(app),
         // Ctrl+N - quick-start a new session (creates Planning item, spawns Claude immediately)
-        (KeyModifiers::CONTROL, KeyCode::Char('n')) => match app.create_quickstart_work_item() {
-            Ok(()) => {
-                sync_layout(app);
-            }
-            Err(ref msg) if msg == "MULTIPLE_REPOS" => {
-                let active_repos: Vec<std::path::PathBuf> = app
-                    .active_repo_cache
-                    .iter()
-                    .filter(|r| r.git_dir_present)
-                    .map(|r| r.path.clone())
-                    .collect();
-                app.create_dialog.open_quickstart(&active_repos);
-                app.shell.status_message =
-                    Some("Multiple repos - select one and press Enter".into());
-            }
-            Err(msg) => {
-                app.shell.status_message = Some(msg);
-            }
-        },
+        (KeyModifiers::CONTROL, KeyCode::Char('n')) => handle_quickstart_new(app),
         // Ctrl+B - open the new backlog ticket creation dialog
-        (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
-            let active_repos: Vec<std::path::PathBuf> = app
-                .active_repo_cache
-                .iter()
-                .filter(|r| r.git_dir_present)
-                .map(|r| r.path.clone())
-                .collect();
-            let cwd_repo = std::env::current_dir()
-                .ok()
-                .and_then(|cwd| app.managed_repo_root(&cwd));
-            app.create_dialog.open(&active_repos, cwd_repo.as_ref());
-        }
+        (KeyModifiers::CONTROL, KeyCode::Char('b')) => handle_open_create_dialog(app),
         // Ctrl+D or Delete - open the delete confirmation modal.
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Delete) => {
             if app.selected_work_item_id().is_none() {
@@ -146,6 +108,58 @@ pub fn handle_key_board(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
+}
+
+/// Shared Q/q/Ctrl+Q handler: first press arms `confirm_quit` with a
+/// status-bar hint; second press or missing live session exits
+/// immediately.
+fn handle_quit_confirm(app: &mut App) {
+    if !app.has_any_session() || app.shell.confirm_quit {
+        app.shell.should_quit = true;
+    } else {
+        app.shell.confirm_quit = true;
+        app.shell.status_message = Some("Press Q again to quit and kill all sessions".into());
+        sync_layout(app);
+    }
+}
+
+/// Ctrl+N handler: try to quick-start a Planning item; on the
+/// `MULTIPLE_REPOS` sentinel open the create dialog in quickstart mode
+/// so the user can pick a repo.
+fn handle_quickstart_new(app: &mut App) {
+    match app.create_quickstart_work_item() {
+        Ok(()) => {
+            sync_layout(app);
+        }
+        Err(ref msg) if msg == "MULTIPLE_REPOS" => {
+            let active_repos: Vec<std::path::PathBuf> = app
+                .active_repo_cache
+                .iter()
+                .filter(|r| r.git_dir_present)
+                .map(|r| r.path.clone())
+                .collect();
+            app.create_dialog.open_quickstart(&active_repos);
+            app.shell.status_message = Some("Multiple repos - select one and press Enter".into());
+        }
+        Err(msg) => {
+            app.shell.status_message = Some(msg);
+        }
+    }
+}
+
+/// Ctrl+B handler: open the full backlog-ticket creation dialog,
+/// preselecting the cwd repo if it's managed.
+fn handle_open_create_dialog(app: &mut App) {
+    let active_repos: Vec<std::path::PathBuf> = app
+        .active_repo_cache
+        .iter()
+        .filter(|r| r.git_dir_present)
+        .map(|r| r.path.clone())
+        .collect();
+    let cwd_repo = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| app.managed_repo_root(&cwd));
+    app.create_dialog.open(&active_repos, cwd_repo.as_ref());
 }
 
 /// Key handling for the global metrics Dashboard view. Tab cycles to the
@@ -193,76 +207,14 @@ pub fn handle_key_left(app: &mut App, key: KeyEvent) {
     match (key.modifiers, key.code) {
         // Q/q (bare) or Ctrl+Q - quit with confirmation
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('q' | 'Q'))
-        | (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
-            if !app.has_any_session() {
-                // No live sessions to lose - quit immediately.
-                app.shell.should_quit = true;
-            } else if app.shell.confirm_quit {
-                app.shell.should_quit = true;
-            } else {
-                app.shell.confirm_quit = true;
-                app.shell.status_message =
-                    Some("Press Q again to quit and kill all sessions".into());
-                sync_layout(app);
-            }
-        }
+        | (KeyModifiers::CONTROL, KeyCode::Char('q')) => handle_quit_confirm(app),
         // Ctrl+N - quick-start a new session (creates Planning item, spawns Claude immediately)
-        (KeyModifiers::CONTROL, KeyCode::Char('n')) => match app.create_quickstart_work_item() {
-            Ok(()) => {
-                sync_layout(app);
-            }
-            Err(ref msg) if msg == "MULTIPLE_REPOS" => {
-                let active_repos: Vec<std::path::PathBuf> = app
-                    .active_repo_cache
-                    .iter()
-                    .filter(|r| r.git_dir_present)
-                    .map(|r| r.path.clone())
-                    .collect();
-                app.create_dialog.open_quickstart(&active_repos);
-                app.shell.status_message =
-                    Some("Multiple repos - select one and press Enter".into());
-            }
-            Err(msg) => {
-                app.shell.status_message = Some(msg);
-            }
-        },
+        (KeyModifiers::CONTROL, KeyCode::Char('n')) => handle_quickstart_new(app),
         // Ctrl+B - open the new backlog ticket creation dialog
-        (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
-            let active_repos: Vec<std::path::PathBuf> = app
-                .active_repo_cache
-                .iter()
-                .filter(|r| r.git_dir_present)
-                .map(|r| r.path.clone())
-                .collect();
-            let cwd_repo = std::env::current_dir()
-                .ok()
-                .and_then(|cwd| app.managed_repo_root(&cwd));
-            app.create_dialog.open(&active_repos, cwd_repo.as_ref());
-        }
+        (KeyModifiers::CONTROL, KeyCode::Char('b')) => handle_open_create_dialog(app),
         // Ctrl+D or Delete - delete work item or clean up unlinked item
         (KeyModifiers::CONTROL, KeyCode::Char('d')) | (_, KeyCode::Delete) => {
-            if app.selected_work_item_id().is_some() {
-                // Open the delete confirmation modal. Further keystrokes
-                // are routed to handle_delete_prompt via the intercept at
-                // the top of handle_key while delete_prompt_visible is
-                // true, so there is no per-step state machine here.
-                app.open_delete_prompt();
-                sync_layout(app);
-            } else if let Some(unlinked_idx) =
-                app.selected_item
-                    .and_then(|idx| match app.display_list.get(idx) {
-                        Some(crate::app::DisplayEntry::UnlinkedItem(i)) => Some(*i),
-                        _ => None,
-                    })
-            {
-                // Unlinked item selected: show cleanup confirmation prompt.
-                if let Some(ul) = app.unlinked_prs.get(unlinked_idx) {
-                    let pr_number = ul.pr.number;
-                    app.cleanup_unlinked_target =
-                        Some((ul.repo_path.clone(), ul.branch.clone(), pr_number));
-                    app.cleanup_flow.prompt_visible = true;
-                }
-            }
+            handle_left_delete_or_cleanup(app);
         }
         // Up arrow - previous item (skipping non-selectable entries)
         (_, KeyCode::Up) => {
@@ -283,35 +235,7 @@ pub fn handle_key_left(app: &mut App, key: KeyEvent) {
             }
         }
         // Enter - context-dependent action
-        (_, KeyCode::Enter) => {
-            let Some(idx) = app.selected_item else {
-                return;
-            };
-            let Some(entry) = app.display_list.get(idx).cloned() else {
-                return;
-            };
-            let had_status = app.has_visible_status_bar();
-            match entry {
-                DisplayEntry::WorkItemEntry(_) => {
-                    app.open_session_for_selected();
-                    // Status bar visibility may have changed - resize PTY.
-                    sync_layout(app);
-                }
-                DisplayEntry::UnlinkedItem(_) => {
-                    app.import_selected_unlinked();
-                    if app.has_visible_status_bar() != had_status {
-                        sync_layout(app);
-                    }
-                }
-                DisplayEntry::ReviewRequestItem(_) => {
-                    app.import_selected_review_request();
-                    if app.shell.status_message.is_some() != had_status {
-                        sync_layout(app);
-                    }
-                }
-                DisplayEntry::GroupHeader { .. } => {}
-            }
-        }
+        (_, KeyCode::Enter) => handle_left_enter(app),
         // Shift+Right - advance to next workflow stage
         (KeyModifiers::SHIFT, KeyCode::Right) => {
             let had_status = app.has_visible_status_bar();
@@ -410,6 +334,68 @@ pub fn handle_key_left(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Ctrl+D / Delete handler shared by `handle_key_left`: opens the
+/// delete confirmation modal for work items, or arms the
+/// unlinked-cleanup prompt when an unlinked-PR row is selected.
+fn handle_left_delete_or_cleanup(app: &mut App) {
+    if app.selected_work_item_id().is_some() {
+        // Open the delete confirmation modal. Further keystrokes
+        // are routed to handle_delete_prompt via the intercept at
+        // the top of handle_key while delete_prompt_visible is
+        // true, so there is no per-step state machine here.
+        app.open_delete_prompt();
+        sync_layout(app);
+    } else if let Some(unlinked_idx) =
+        app.selected_item
+            .and_then(|idx| match app.display_list.get(idx) {
+                Some(crate::app::DisplayEntry::UnlinkedItem(i)) => Some(*i),
+                _ => None,
+            })
+    {
+        // Unlinked item selected: show cleanup confirmation prompt.
+        if let Some(ul) = app.unlinked_prs.get(unlinked_idx) {
+            let pr_number = ul.pr.number;
+            app.cleanup_unlinked_target =
+                Some((ul.repo_path.clone(), ul.branch.clone(), pr_number));
+            app.cleanup_flow.prompt_visible = true;
+        }
+    }
+}
+
+/// Enter handler for the left panel. Dispatches to the appropriate
+/// action based on the selected display entry's variant: open session
+/// for work-items, import flows for unlinked and review-request rows,
+/// and no-op on group headers.
+fn handle_left_enter(app: &mut App) {
+    let Some(idx) = app.selected_item else {
+        return;
+    };
+    let Some(entry) = app.display_list.get(idx).cloned() else {
+        return;
+    };
+    let had_status = app.has_visible_status_bar();
+    match entry {
+        DisplayEntry::WorkItemEntry(_) => {
+            app.open_session_for_selected();
+            // Status bar visibility may have changed - resize PTY.
+            sync_layout(app);
+        }
+        DisplayEntry::UnlinkedItem(_) => {
+            app.import_selected_unlinked();
+            if app.has_visible_status_bar() != had_status {
+                sync_layout(app);
+            }
+        }
+        DisplayEntry::ReviewRequestItem(_) => {
+            app.import_selected_review_request();
+            if app.shell.status_message.is_some() != had_status {
+                sync_layout(app);
+            }
+        }
+        DisplayEntry::GroupHeader { .. } => {}
+    }
+}
+
 /// Key handling when right panel (PTY session) is focused.
 /// Most keys are forwarded to the PTY session as raw bytes.
 /// Ctrl+] returns focus to the left panel (standard "escape from session"
@@ -438,52 +424,8 @@ pub fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // Check if the active session/terminal is dead before forwarding keys.
-    // Flush any buffered PTY bytes before changing state.
-    //
-    // No Tab exemption is needed here: the right-panel tab cycler lives on
-    // the global `Ctrl+\` intercept in `handle_key()` above, which runs
-    // before this function is reached. Plain Tab is just a PTY byte now,
-    // so on a dead session it falls through to the standard "return to
-    // work items" escape-hatch like every other key.
-    match app.right_panel_tab {
-        RightPanelTab::ClaudeCode => {
-            if let Some(entry) = app.active_session_entry() {
-                if !entry.alive {
-                    app.flush_pty_buffers();
-                    app.shell.focus = FocusPanel::Left;
-                    app.shell.status_message =
-                        Some("Session has ended - returned to work items".into());
-                    sync_layout(app);
-                    return true;
-                }
-            } else {
-                // No session for this work item - return to left panel.
-                app.flush_pty_buffers();
-                app.shell.focus = FocusPanel::Left;
-                app.shell.status_message = None;
-                sync_layout(app);
-                return true;
-            }
-        }
-        RightPanelTab::Terminal => {
-            if let Some(entry) = app.active_terminal_entry() {
-                if !entry.alive {
-                    app.flush_pty_buffers();
-                    app.shell.focus = FocusPanel::Left;
-                    app.shell.status_message =
-                        Some("Terminal session has ended - returned to work items".into());
-                    sync_layout(app);
-                    return true;
-                }
-            } else {
-                // No terminal session yet - return to left panel.
-                app.flush_pty_buffers();
-                app.shell.focus = FocusPanel::Left;
-                app.shell.status_message = None;
-                sync_layout(app);
-                return true;
-            }
-        }
+    if handle_right_panel_dead_session(app) {
+        return true;
     }
 
     match key.code {
@@ -518,28 +460,7 @@ pub fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
             app.buffer_bytes_to_right_panel(b"\r");
         }
         // Forward regular characters.
-        KeyCode::Char(c) => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                // Ctrl+A = 0x01, Ctrl+B = 0x02, ..., Ctrl+Z = 0x1A
-                let byte = (c.to_ascii_lowercase() as u8)
-                    .wrapping_sub(b'a')
-                    .wrapping_add(1);
-                if byte <= 26 {
-                    app.buffer_bytes_to_right_panel(&[byte]);
-                }
-            } else if key.modifiers.contains(KeyModifiers::ALT) {
-                // Alt+<char> = ESC byte (0x1B) followed by the character.
-                let mut buf = [0u8; 5];
-                let s = c.encode_utf8(&mut buf);
-                let mut data = vec![0x1bu8];
-                data.extend_from_slice(s.as_bytes());
-                app.buffer_bytes_to_right_panel(&data);
-            } else {
-                let mut buf = [0u8; 4];
-                let s = c.encode_utf8(&mut buf);
-                app.buffer_bytes_to_right_panel(s.as_bytes());
-            }
-        }
+        KeyCode::Char(c) => forward_char_to_pty(app, c, key.modifiers),
         KeyCode::Backspace => {
             if key.modifiers.contains(KeyModifiers::ALT) {
                 // Alt+Backspace = ESC + DEL (0x1B 0x7F)
@@ -599,4 +520,84 @@ pub fn handle_key_right(app: &mut App, key: KeyEvent) -> bool {
     }
 
     false
+}
+
+/// If the active session or terminal is dead (or absent), flush any
+/// buffered PTY bytes, return focus to the left panel with an
+/// appropriate status message, and re-sync layout. Returns true if
+/// focus was bounced (so the caller should short-circuit).
+///
+/// No Tab exemption is needed here: the right-panel tab cycler lives on
+/// the global `Ctrl+\` intercept in `handle_key()` above, which runs
+/// before this function is reached. Plain Tab is just a PTY byte now,
+/// so on a dead session it falls through to the standard "return to
+/// work items" escape-hatch like every other key.
+fn handle_right_panel_dead_session(app: &mut App) -> bool {
+    match app.right_panel_tab {
+        RightPanelTab::ClaudeCode => {
+            if let Some(entry) = app.active_session_entry() {
+                if !entry.alive {
+                    app.flush_pty_buffers();
+                    app.shell.focus = FocusPanel::Left;
+                    app.shell.status_message =
+                        Some("Session has ended - returned to work items".into());
+                    sync_layout(app);
+                    return true;
+                }
+            } else {
+                // No session for this work item - return to left panel.
+                app.flush_pty_buffers();
+                app.shell.focus = FocusPanel::Left;
+                app.shell.status_message = None;
+                sync_layout(app);
+                return true;
+            }
+        }
+        RightPanelTab::Terminal => {
+            if let Some(entry) = app.active_terminal_entry() {
+                if !entry.alive {
+                    app.flush_pty_buffers();
+                    app.shell.focus = FocusPanel::Left;
+                    app.shell.status_message =
+                        Some("Terminal session has ended - returned to work items".into());
+                    sync_layout(app);
+                    return true;
+                }
+            } else {
+                // No terminal session yet - return to left panel.
+                app.flush_pty_buffers();
+                app.shell.focus = FocusPanel::Left;
+                app.shell.status_message = None;
+                sync_layout(app);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Encode a `KeyCode::Char` received on the right panel and forward it
+/// to the PTY. Ctrl maps to the 1-26 control bytes; Alt prefixes the
+/// character with ESC; unmodified characters are forwarded verbatim.
+fn forward_char_to_pty(app: &mut App, c: char, modifiers: KeyModifiers) {
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        // Ctrl+A = 0x01, Ctrl+B = 0x02, ..., Ctrl+Z = 0x1A
+        let byte = (c.to_ascii_lowercase() as u8)
+            .wrapping_sub(b'a')
+            .wrapping_add(1);
+        if byte <= 26 {
+            app.buffer_bytes_to_right_panel(&[byte]);
+        }
+    } else if modifiers.contains(KeyModifiers::ALT) {
+        // Alt+<char> = ESC byte (0x1B) followed by the character.
+        let mut buf = [0u8; 5];
+        let s = c.encode_utf8(&mut buf);
+        let mut data = vec![0x1bu8];
+        data.extend_from_slice(s.as_bytes());
+        app.buffer_bytes_to_right_panel(&data);
+    } else {
+        let mut buf = [0u8; 4];
+        let s = c.encode_utf8(&mut buf);
+        app.buffer_bytes_to_right_panel(s.as_bytes());
+    }
 }

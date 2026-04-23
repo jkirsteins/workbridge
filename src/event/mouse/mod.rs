@@ -274,71 +274,11 @@ pub fn handle_mouse_with_terminal_size(
         MouseTarget::GlobalDrawer {
             local_col,
             local_row,
-        } => match action {
-            MouseAction::Scroll { up: scroll_up } => {
-                handle_scroll_global(app, scroll_up, local_col, local_row)
-            }
-            MouseAction::SelectDown => {
-                // Check if child wants mouse events and we are NOT in scrollback.
-                if child_wants_mouse_global(app) {
-                    return false;
-                }
-                if let Some(entry) = app.global_drawer.session.as_mut() {
-                    entry.selection = Some(SelectionState {
-                        anchor: (local_row, local_col),
-                        current: (local_row, local_col),
-                        dragging: true,
-                    });
-                }
-                true
-            }
-            MouseAction::SelectDrag => {
-                if let Some(entry) = app.global_drawer.session.as_mut()
-                    && entry.selection.as_ref().is_some_and(|s| s.dragging)
-                {
-                    if let Some(sel) = entry.selection.as_mut() {
-                        sel.current = (local_row, local_col);
-                    }
-                    return true;
-                }
-                false
-            }
-            MouseAction::SelectUp => handle_selection_up_global(app, local_row, local_col),
-        },
+        } => handle_global_drawer_mouse(app, action, local_col, local_row),
         MouseTarget::RightPanel {
             local_col,
             local_row,
-        } => match action {
-            MouseAction::Scroll { up: scroll_up } => {
-                handle_scroll_right(app, scroll_up, local_col, local_row)
-            }
-            MouseAction::SelectDown => {
-                // Check if child wants mouse events and we are NOT in scrollback.
-                if child_wants_mouse_right(app) {
-                    return false;
-                }
-                if let Some(entry) = active_session_entry_mut_for_tab(app) {
-                    entry.selection = Some(SelectionState {
-                        anchor: (local_row, local_col),
-                        current: (local_row, local_col),
-                        dragging: true,
-                    });
-                }
-                true
-            }
-            MouseAction::SelectDrag => {
-                if let Some(entry) = active_session_entry_mut_for_tab(app)
-                    && entry.selection.as_ref().is_some_and(|s| s.dragging)
-                {
-                    if let Some(sel) = entry.selection.as_mut() {
-                        sel.current = (local_row, local_col);
-                    }
-                    return true;
-                }
-                false
-            }
-            MouseAction::SelectUp => handle_selection_up_right(app, local_row, local_col),
-        },
+        } => handle_right_panel_mouse(app, action, local_col, local_row),
         MouseTarget::WorkItemList => match action {
             MouseAction::Scroll { up: scroll_up } => handle_work_item_list_scroll(app, scroll_up),
             // `SelectDown` / `SelectUp` on the list body only matters
@@ -350,6 +290,91 @@ pub fn handle_mouse_with_terminal_size(
             MouseAction::SelectDown | MouseAction::SelectUp | MouseAction::SelectDrag => false,
         },
         MouseTarget::None => handle_chrome_click_fallback(app, mouse, action),
+    }
+}
+
+/// Dispatch a mouse action that landed inside the global-drawer PTY
+/// area. Splits the four actions (scroll / down / drag / up) across
+/// the drawer-specific helpers so the per-target selection /
+/// scrollback logic stays with the drawer.
+fn handle_global_drawer_mouse(
+    app: &mut App,
+    action: MouseAction,
+    local_col: u16,
+    local_row: u16,
+) -> bool {
+    match action {
+        MouseAction::Scroll { up: scroll_up } => {
+            handle_scroll_global(app, scroll_up, local_col, local_row)
+        }
+        MouseAction::SelectDown => {
+            // Check if child wants mouse events and we are NOT in scrollback.
+            if child_wants_mouse_global(app) {
+                return false;
+            }
+            if let Some(entry) = app.global_drawer.session.as_mut() {
+                entry.selection = Some(SelectionState {
+                    anchor: (local_row, local_col),
+                    current: (local_row, local_col),
+                    dragging: true,
+                });
+            }
+            true
+        }
+        MouseAction::SelectDrag => {
+            if let Some(entry) = app.global_drawer.session.as_mut()
+                && entry.selection.as_ref().is_some_and(|s| s.dragging)
+            {
+                if let Some(sel) = entry.selection.as_mut() {
+                    sel.current = (local_row, local_col);
+                }
+                return true;
+            }
+            false
+        }
+        MouseAction::SelectUp => handle_selection_up_global(app, local_row, local_col),
+    }
+}
+
+/// Dispatch a mouse action that landed inside the right-panel PTY
+/// area (the per-work-item agent session). Mirrors
+/// `handle_global_drawer_mouse` for the tab-selected active session.
+fn handle_right_panel_mouse(
+    app: &mut App,
+    action: MouseAction,
+    local_col: u16,
+    local_row: u16,
+) -> bool {
+    match action {
+        MouseAction::Scroll { up: scroll_up } => {
+            handle_scroll_right(app, scroll_up, local_col, local_row)
+        }
+        MouseAction::SelectDown => {
+            // Check if child wants mouse events and we are NOT in scrollback.
+            if child_wants_mouse_right(app) {
+                return false;
+            }
+            if let Some(entry) = active_session_entry_mut_for_tab(app) {
+                entry.selection = Some(SelectionState {
+                    anchor: (local_row, local_col),
+                    current: (local_row, local_col),
+                    dragging: true,
+                });
+            }
+            true
+        }
+        MouseAction::SelectDrag => {
+            if let Some(entry) = active_session_entry_mut_for_tab(app)
+                && entry.selection.as_ref().is_some_and(|s| s.dragging)
+            {
+                if let Some(sel) = entry.selection.as_mut() {
+                    sel.current = (local_row, local_col);
+                }
+                return true;
+            }
+            false
+        }
+        MouseAction::SelectUp => handle_selection_up_right(app, local_row, local_col),
     }
 }
 

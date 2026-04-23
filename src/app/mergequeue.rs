@@ -12,10 +12,10 @@
 use std::path::PathBuf;
 
 use super::{
-    CiCheck, PrMergePollResult, PrMergePollState, PrMergeWatch, now_iso8601, spawn_gh_pr_view_poll,
+    CiCheck, PrMergePollState, PrMergeWatch, collect_due_pr_merge_watches,
+    drain_pr_merge_poll_results, pr_merge_poll_still_eligible, spawn_gh_pr_view_poll,
 };
 use crate::work_item::{WorkItemId, WorkItemKind, WorkItemStatus};
-use crate::work_item_backend::ActivityEntry;
 
 impl super::App {
     /// Enter the Mergequeue state for a work item. The item must be in

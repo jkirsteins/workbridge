@@ -186,82 +186,15 @@ impl super::App {
         let (tx, rx) = crossbeam_channel::bounded(1);
 
         std::thread::spawn(move || {
-            let title = title_clone;
-            if ws.fetch_branch(&repo_path, &branch).is_err() {
-                let _ = tx.send(WorktreeCreateResult {
-                    wi_id: wi_id_clone,
-                    repo_path,
-                    branch: Some(branch.clone()),
-                    path: None,
-                    error: Some(format!(
-                        "Imported: {title} - could not fetch branch '{branch}' from origin. \
-                         Manual checkout required."
-                    )),
-                    open_session: false,
-                    branch_gone: false,
-                    reused: false,
-                    stale_worktree_path: None,
-                });
-                return;
-            }
-            let wt_target = Self::worktree_target_path(&repo_path, &branch, &wt_dir);
-            // Reuse an existing worktree only if it lives at the exact
-            // expected location (wt_target) and is NOT the main worktree.
-            // See `find_reusable_worktree` for rationale.
-            let reused_wt =
-                Self::find_reusable_worktree(ws.as_ref(), &repo_path, &branch, &wt_target);
-            let (wt_result, reused) = reused_wt.map_or_else(
-                || (ws.create_worktree(&repo_path, &branch, &wt_target), false),
-                |existing_wt| (Ok(existing_wt), true),
+            Self::run_import_worktree_thread(
+                ws.as_ref(),
+                wi_id_clone,
+                repo_path,
+                branch,
+                &title_clone,
+                &wt_dir,
+                &tx,
             );
-            match wt_result {
-                Ok(wt_info) => {
-                    let _ = tx.send(WorktreeCreateResult {
-                        wi_id: wi_id_clone,
-                        repo_path,
-                        branch: Some(branch),
-                        path: Some(wt_info.path),
-                        error: None,
-                        open_session: false,
-                        branch_gone: false,
-                        reused,
-                        stale_worktree_path: None,
-                    });
-                }
-                Err(crate::worktree_service::WorktreeError::BranchLockedToWorktree {
-                    ref locked_at,
-                    ..
-                }) => {
-                    let _ = tx.send(WorktreeCreateResult {
-                        wi_id: wi_id_clone,
-                        repo_path,
-                        branch: Some(branch),
-                        path: None,
-                        error: Some(format!(
-                            "Imported: {title} - branch is locked to a stale worktree at '{}'\n\
-                             (likely from an interrupted rebase).",
-                            locked_at.display(),
-                        )),
-                        open_session: false,
-                        branch_gone: false,
-                        reused: false,
-                        stale_worktree_path: Some(locked_at.clone()),
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(WorktreeCreateResult {
-                        wi_id: wi_id_clone,
-                        repo_path,
-                        branch: Some(branch),
-                        path: None,
-                        error: Some(format!("Imported: {title} (worktree not created: {e})")),
-                        open_session: false,
-                        branch_gone: false,
-                        reused: false,
-                        stale_worktree_path: None,
-                    });
-                }
-            }
         });
 
         self.attach_user_action_payload(
@@ -269,6 +202,94 @@ impl super::App {
             UserActionPayload::WorktreeCreate { rx, wi_id },
         );
         self.shell.status_message = Some(format!("Imported: {title} (creating worktree...)"));
+    }
+
+    /// Body of the background thread spawned by `spawn_import_worktree`.
+    /// Fetches the branch, resolves or creates a worktree, and reports
+    /// the outcome back through `tx`.
+    fn run_import_worktree_thread(
+        ws: &dyn crate::worktree_service::WorktreeService,
+        wi_id: WorkItemId,
+        repo_path: PathBuf,
+        branch: String,
+        title: &str,
+        wt_dir: &str,
+        tx: &crossbeam_channel::Sender<WorktreeCreateResult>,
+    ) {
+        if ws.fetch_branch(&repo_path, &branch).is_err() {
+            let _ = tx.send(WorktreeCreateResult {
+                wi_id,
+                repo_path,
+                branch: Some(branch.clone()),
+                path: None,
+                error: Some(format!(
+                    "Imported: {title} - could not fetch branch '{branch}' from origin. \
+                     Manual checkout required."
+                )),
+                open_session: false,
+                branch_gone: false,
+                reused: false,
+                stale_worktree_path: None,
+            });
+            return;
+        }
+        let wt_target = Self::worktree_target_path(&repo_path, &branch, wt_dir);
+        // Reuse an existing worktree only if it lives at the exact
+        // expected location (wt_target) and is NOT the main worktree.
+        // See `find_reusable_worktree` for rationale.
+        let reused_wt = Self::find_reusable_worktree(ws, &repo_path, &branch, &wt_target);
+        let (wt_result, reused) = reused_wt.map_or_else(
+            || (ws.create_worktree(&repo_path, &branch, &wt_target), false),
+            |existing_wt| (Ok(existing_wt), true),
+        );
+        match wt_result {
+            Ok(wt_info) => {
+                let _ = tx.send(WorktreeCreateResult {
+                    wi_id,
+                    repo_path,
+                    branch: Some(branch),
+                    path: Some(wt_info.path),
+                    error: None,
+                    open_session: false,
+                    branch_gone: false,
+                    reused,
+                    stale_worktree_path: None,
+                });
+            }
+            Err(crate::worktree_service::WorktreeError::BranchLockedToWorktree {
+                ref locked_at,
+                ..
+            }) => {
+                let _ = tx.send(WorktreeCreateResult {
+                    wi_id,
+                    repo_path,
+                    branch: Some(branch),
+                    path: None,
+                    error: Some(format!(
+                        "Imported: {title} - branch is locked to a stale worktree at '{}'\n\
+                         (likely from an interrupted rebase).",
+                        locked_at.display(),
+                    )),
+                    open_session: false,
+                    branch_gone: false,
+                    reused: false,
+                    stale_worktree_path: Some(locked_at.clone()),
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(WorktreeCreateResult {
+                    wi_id,
+                    repo_path,
+                    branch: Some(branch),
+                    path: None,
+                    error: Some(format!("Imported: {title} (worktree not created: {e})")),
+                    open_session: false,
+                    branch_gone: false,
+                    reused: false,
+                    stale_worktree_path: None,
+                });
+            }
+        }
     }
 
     /// Create a new work item with explicit parameters from the creation

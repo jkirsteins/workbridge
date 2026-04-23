@@ -157,85 +157,9 @@ impl super::App {
                 continue;
             }
 
-            // Blocked: the gate could not run against a real diff (no plan,
-            // empty diff, git failure, default branch unresolvable).
-            //
-            // How the outcome is applied depends on who initiated the gate:
-            //
-            // - `Mcp` / `Auto`: Claude (or the auto-trigger after an
-            //   Implementing session died) asked for Review. The rework
-            //   flow applies - kill and respawn the session with the
-            //   reason so the next Claude run sees the feedback.
-            //
-            // - `Tui`: The user pressed `l` (advance) on an Implementing
-            //   item that cannot satisfy the gate. On master the TUI path
-            //   just surfaced the reason in the status bar and left the
-            //   session running; killing it here would be a regression.
-            //   Only drop the gate state and set the status message.
-            //
-            // In all cases: if the work item was deleted while the gate
-            // was in flight, drop the gate state without touching session
-            // or `rework_reasons` - a rework_reasons entry with no owner
-            // would leak forever because nothing else ever clears it.
             if let Some(reason) = blocked_reason {
-                let origin = self
-                    .review_gates
-                    .get(&wi_id)
-                    .map_or(ReviewGateOrigin::Mcp, |g| g.origin);
-                self.drop_review_gate(&wi_id);
-
-                let wi_exists = self.work_items.iter().any(|w| w.id == wi_id);
-                if !wi_exists {
-                    // Work item deleted mid-gate. Nothing more to do -
-                    // the gate state is already dropped and no session
-                    // exists to act on.
-                    continue;
-                }
-
-                match origin {
-                    ReviewGateOrigin::Tui => {
-                        // Preserve master's non-destructive behaviour: the
-                        // user's session is still the primary workspace,
-                        // so just surface the reason.
-                        self.shell.status_message =
-                            Some(format!("Review gate failed to start: {reason}"));
-                        continue;
-                    }
-                    ReviewGateOrigin::Mcp | ReviewGateOrigin::Auto => {
-                        self.rework_reasons.insert(wi_id.clone(), reason.clone());
-                        self.shell.status_message =
-                            Some(format!("Review gate failed to start: {reason}"));
-
-                        // If Blocked, transition to Implementing so the
-                        // implementing_rework prompt (which has {rework_reason})
-                        // is used instead of the "blocked" prompt.
-                        let wi_status = self
-                            .work_items
-                            .iter()
-                            .find(|w| w.id == wi_id)
-                            .map(|w| w.status);
-                        if wi_status == Some(WorkItemStatus::Blocked) {
-                            let _ = self
-                                .services
-                                .backend
-                                .update_status(&wi_id, WorkItemStatus::Implementing);
-                            self.reassemble_work_items();
-                            self.build_display_list();
-                        }
-
-                        // Kill and respawn the session with the rework
-                        // prompt so Claude sees the rejection reason.
-                        if let Some(key) = self.session_key_for(&wi_id)
-                            && let Some(mut entry) = self.sessions.remove(&key)
-                            && let Some(ref mut session) = entry.session
-                        {
-                            session.kill();
-                        }
-                        self.cleanup_session_state_for(&wi_id);
-                        self.spawn_session(&wi_id);
-                        continue;
-                    }
-                }
+                self.handle_review_gate_blocked(&wi_id, &reason);
+                continue;
             }
 
             let Some(result) = result else { continue };
@@ -261,89 +185,160 @@ impl super::App {
             }
 
             if result.approved {
-                // Log approval and advance to Review.
-                let entry = ActivityEntry {
-                    timestamp: now_iso8601(),
-                    event_type: "review_gate".to_string(),
-                    payload: serde_json::json!({
-                        "result": "approved",
-                        "response": result.detail
-                    }),
-                };
-                if let Err(e) = self.services.backend.append_activity(&wi_id, &entry) {
-                    self.shell.status_message = Some(format!("Activity log error: {e}"));
-                }
-
-                // Store the gate's assessment so the Review session can present
-                // it to the user (consumed one-shot by stage_system_prompt).
-                self.review_gate_findings
-                    .insert(wi_id.clone(), result.detail.clone());
-
-                // Get the actual current status for apply_stage_change.
-                let current_status = self
-                    .work_items
-                    .iter()
-                    .find(|w| w.id == wi_id)
-                    .map_or(WorkItemStatus::Implementing, |w| w.status);
-
-                self.apply_stage_change(
-                    &wi_id,
-                    current_status,
-                    WorkItemStatus::Review,
-                    "review_gate",
-                );
+                self.handle_review_gate_approved(&wi_id, &result);
             } else {
-                // Log rejection and stay in current stage.
-                let entry = ActivityEntry {
-                    timestamp: now_iso8601(),
-                    event_type: "review_gate".to_string(),
-                    payload: serde_json::json!({
-                        "result": "rejected",
-                        "reason": result.detail
-                    }),
-                };
-                if let Err(e) = self.services.backend.append_activity(&wi_id, &entry) {
-                    self.shell.status_message = Some(format!("Activity log error: {e}"));
-                }
-                // Store the rejection reason so the next Claude session uses the
-                // implementing_rework prompt with specific feedback, rather than
-                // a generic implementing prompt.
-                self.rework_reasons
-                    .insert(wi_id.clone(), result.detail.clone());
-                self.shell.status_message =
-                    Some(format!("Review gate rejected: {}", result.detail));
-
-                // If Blocked, transition to Implementing so the implementing_rework
-                // prompt (which has {rework_reason}) is used instead of the "blocked"
-                // prompt (which has no rework_reason placeholder).
-                {
-                    let wi_status = self
-                        .work_items
-                        .iter()
-                        .find(|w| w.id == wi_id)
-                        .map(|w| w.status);
-                    if wi_status == Some(WorkItemStatus::Blocked) {
-                        let _ = self
-                            .services
-                            .backend
-                            .update_status(&wi_id, WorkItemStatus::Implementing);
-                        self.reassemble_work_items();
-                        self.build_display_list();
-                    }
-                }
-
-                // Kill the current session and respawn with the implementing_rework
-                // prompt that includes the rejection feedback.
-                if let Some(key) = self.session_key_for(&wi_id)
-                    && let Some(mut entry) = self.sessions.remove(&key)
-                    && let Some(ref mut session) = entry.session
-                {
-                    session.kill();
-                }
-                self.cleanup_session_state_for(&wi_id);
-                self.spawn_session(&wi_id);
+                self.handle_review_gate_rejected(&wi_id, &result);
             }
         }
+    }
+
+    /// Apply a `Blocked` gate outcome. The gate could not run against a
+    /// real diff (no plan, empty diff, git failure, default branch
+    /// unresolvable). How the outcome is applied depends on who
+    /// initiated the gate:
+    ///
+    /// - `Mcp` / `Auto`: Claude (or the auto-trigger after an
+    ///   Implementing session died) asked for Review. The rework flow
+    ///   applies - kill and respawn the session with the reason so the
+    ///   next Claude run sees the feedback.
+    /// - `Tui`: The user pressed `l` (advance) on an Implementing item
+    ///   that cannot satisfy the gate. Preserve master's non-destructive
+    ///   behaviour: surface the reason in the status bar and leave the
+    ///   session running.
+    ///
+    /// In all cases: if the work item was deleted while the gate was in
+    /// flight, drop the gate state without touching session or
+    /// `rework_reasons` - a `rework_reasons` entry with no owner would
+    /// leak forever because nothing else ever clears it.
+    fn handle_review_gate_blocked(&mut self, wi_id: &WorkItemId, reason: &str) {
+        let origin = self
+            .review_gates
+            .get(wi_id)
+            .map_or(ReviewGateOrigin::Mcp, |g| g.origin);
+        self.drop_review_gate(wi_id);
+
+        let wi_exists = self.work_items.iter().any(|w| w.id == *wi_id);
+        if !wi_exists {
+            // Work item deleted mid-gate. Nothing more to do -
+            // the gate state is already dropped and no session
+            // exists to act on.
+            return;
+        }
+
+        match origin {
+            ReviewGateOrigin::Tui => {
+                // Preserve master's non-destructive behaviour: the
+                // user's session is still the primary workspace,
+                // so just surface the reason.
+                self.shell.status_message = Some(format!("Review gate failed to start: {reason}"));
+            }
+            ReviewGateOrigin::Mcp | ReviewGateOrigin::Auto => {
+                self.rework_reasons
+                    .insert(wi_id.clone(), reason.to_string());
+                self.shell.status_message = Some(format!("Review gate failed to start: {reason}"));
+
+                self.ensure_implementing_if_blocked(wi_id);
+
+                // Kill and respawn the session with the rework
+                // prompt so Claude sees the rejection reason.
+                self.kill_and_respawn_session(wi_id);
+            }
+        }
+    }
+
+    /// Apply an `approved` gate outcome: log the activity, stash the
+    /// findings for the Review prompt, and advance the item to Review.
+    fn handle_review_gate_approved(&mut self, wi_id: &WorkItemId, result: &ReviewGateResult) {
+        // Log approval and advance to Review.
+        let entry = ActivityEntry {
+            timestamp: now_iso8601(),
+            event_type: "review_gate".to_string(),
+            payload: serde_json::json!({
+                "result": "approved",
+                "response": result.detail
+            }),
+        };
+        if let Err(e) = self.services.backend.append_activity(wi_id, &entry) {
+            self.shell.status_message = Some(format!("Activity log error: {e}"));
+        }
+
+        // Store the gate's assessment so the Review session can present
+        // it to the user (consumed one-shot by stage_system_prompt).
+        self.review_gate_findings
+            .insert(wi_id.clone(), result.detail.clone());
+
+        // Get the actual current status for apply_stage_change.
+        let current_status = self
+            .work_items
+            .iter()
+            .find(|w| w.id == *wi_id)
+            .map_or(WorkItemStatus::Implementing, |w| w.status);
+
+        self.apply_stage_change(wi_id, current_status, WorkItemStatus::Review, "review_gate");
+    }
+
+    /// Apply a `rejected` gate outcome: log the activity, stash the
+    /// rejection reason so the next Implementing session uses the
+    /// `implementing_rework` prompt, and kill-then-respawn the session.
+    fn handle_review_gate_rejected(&mut self, wi_id: &WorkItemId, result: &ReviewGateResult) {
+        // Log rejection and stay in current stage.
+        let entry = ActivityEntry {
+            timestamp: now_iso8601(),
+            event_type: "review_gate".to_string(),
+            payload: serde_json::json!({
+                "result": "rejected",
+                "reason": result.detail
+            }),
+        };
+        if let Err(e) = self.services.backend.append_activity(wi_id, &entry) {
+            self.shell.status_message = Some(format!("Activity log error: {e}"));
+        }
+        // Store the rejection reason so the next Claude session uses the
+        // implementing_rework prompt with specific feedback, rather than
+        // a generic implementing prompt.
+        self.rework_reasons
+            .insert(wi_id.clone(), result.detail.clone());
+        self.shell.status_message = Some(format!("Review gate rejected: {}", result.detail));
+
+        self.ensure_implementing_if_blocked(wi_id);
+
+        // Kill the current session and respawn with the implementing_rework
+        // prompt that includes the rejection feedback.
+        self.kill_and_respawn_session(wi_id);
+    }
+
+    /// If the work item is currently `Blocked`, flip it to
+    /// `Implementing` (so the `implementing_rework` prompt is used on
+    /// respawn instead of the `blocked` prompt, which has no
+    /// `rework_reason` placeholder).
+    fn ensure_implementing_if_blocked(&mut self, wi_id: &WorkItemId) {
+        let wi_status = self
+            .work_items
+            .iter()
+            .find(|w| w.id == *wi_id)
+            .map(|w| w.status);
+        if wi_status == Some(WorkItemStatus::Blocked) {
+            let _ = self
+                .services
+                .backend
+                .update_status(wi_id, WorkItemStatus::Implementing);
+            self.reassemble_work_items();
+            self.build_display_list();
+        }
+    }
+
+    /// Kill the current work-item session (if any) and respawn a fresh
+    /// one. Used by the rework flow so the respawn picks up the
+    /// freshly-written `rework_reasons` entry.
+    fn kill_and_respawn_session(&mut self, wi_id: &WorkItemId) {
+        if let Some(key) = self.session_key_for(wi_id)
+            && let Some(mut entry) = self.sessions.remove(&key)
+            && let Some(ref mut session) = entry.session
+        {
+            session.kill();
+        }
+        self.cleanup_session_state_for(wi_id);
+        self.spawn_session(wi_id);
     }
 
     /// Poll all async rebase gates for results. Called on each timer

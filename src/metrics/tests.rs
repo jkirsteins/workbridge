@@ -34,6 +34,18 @@ fn touch_work_item_json(dir: &Path, id: &str) {
     fs::write(dir.join(format!("{id}.json")), "{}").unwrap();
 }
 
+/// Return the current UNIX wall-clock time in seconds as `i64`, using
+/// `try_from` to convert the `u64` result so clippy's `cast_possible_wrap`
+/// lint is satisfied without an `as` cast. The conversion only fails for
+/// timestamps past year 2262, which is not a real concern for tests.
+fn now_secs_i64() -> i64 {
+    let secs = crate::side_effects::clock::system_now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_secs();
+    i64::try_from(secs).expect("timestamp fits in i64")
+}
+
 fn stage(secs: i64, from: &str, to: &str) -> String {
     format!(
         r#"{{"timestamp":"{secs}Z","event_type":"stage_change","payload":{{"from":"{from}","to":"{to}"}}}}"#
@@ -94,10 +106,7 @@ fn pr_merged_counted_independently_of_done() {
 #[test]
 fn stuck_review_item_detected() {
     let (_tmp, dir) = temp_dir("stuck-review");
-    let now = crate::side_effects::clock::system_now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     let entered_review = now - 5 * 86_400; // 5 days ago, threshold is 3
     let entered_backlog = entered_review - 86_400;
     let lines = [
@@ -118,10 +127,7 @@ fn stuck_review_item_detected() {
 #[test]
 fn fresh_review_item_is_not_stuck() {
     let (_tmp, dir) = temp_dir("fresh-review");
-    let now = crate::side_effects::clock::system_now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     let entered_review = now - 3600; // 1 hour ago
     let entered_backlog = entered_review - 3600;
     let lines = [
@@ -147,10 +153,7 @@ fn orphan_top_level_log_without_sibling_json_is_not_stuck() {
     // source of truth for liveness; an orphan top-level log is
     // classified as `Provenance::Archived`.
     let (_tmp, dir) = temp_dir("orphan-not-stuck");
-    let now = crate::side_effects::clock::system_now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     let entered_review = now - 5 * 86_400; // 5 days ago, well past 3-day threshold
     let entered_backlog = entered_review - 86_400;
     let lines = [
@@ -183,10 +186,7 @@ fn orphan_top_level_log_does_not_inflate_trailing_backlog() {
     // the item as currently in Backlog and add it to every day
     // from its entry through now, inflating current-backlog KPIs.
     let (_tmp, dir) = temp_dir("orphan-not-backlogged");
-    let now = crate::side_effects::clock::system_now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     let today_d = secs_to_day(now);
     let t_enter = (today_d - 10) * SECS_PER_DAY + 3600;
     // Planning -> Backlog with no subsequent transition: the naive
@@ -216,10 +216,7 @@ fn backlog_reconstruction_tracks_membership() {
     // Anchor the test to 10 days ago at 01:00 UTC so the timestamps
     // fall inside the aggregator's rolling 365-day window and are
     // offset from day boundaries (avoids alignment edge cases).
-    let now = crate::side_effects::clock::system_now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     let today_d = secs_to_day(now);
     let t_enter = (today_d - 10) * SECS_PER_DAY + 3600;
     let t_exit = t_enter + 2 * SECS_PER_DAY;
@@ -289,10 +286,7 @@ fn archived_in_review_item_is_not_stuck() {
     let archive = dir.join("archive");
     fs::create_dir_all(&archive).unwrap();
 
-    let now = crate::side_effects::clock::system_now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     // Same shape as `stuck_review_item_detected`: entered Review 5
     // days ago, well over the 3-day threshold. But the log lives in
     // archive/, so it must not be flagged.
@@ -324,10 +318,7 @@ fn archived_in_backlog_item_does_not_inflate_backlog_forever() {
     let archive = dir.join("archive");
     fs::create_dir_all(&archive).unwrap();
 
-    let now = crate::side_effects::clock::system_now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     let today_d = secs_to_day(now);
     let t_enter = (today_d - 10) * SECS_PER_DAY + 3600;
     // Only a Planning -> Backlog transition. Its last known state
@@ -391,10 +382,7 @@ fn backlog_boundary_events_land_on_the_correct_day() {
     // instant is the literal last second of `day` and half-open
     // interval membership is correct on both sides.
     let (_tmp, dir) = temp_dir("backlog-boundary");
-    let now = crate::side_effects::clock::system_now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     let today_d = secs_to_day(now);
     // Day D: exactly 5 days ago. Midnight of day D in UTC seconds.
     let day_d = today_d - 5;
@@ -480,10 +468,7 @@ fn freshly_created_backlog_item_counts_in_dashboard() {
         .unwrap();
 
     let snap = aggregate_from_activity_logs(&dir);
-    let now = crate::side_effects::clock::system_now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     let today = secs_to_day(now);
 
     assert_eq!(
@@ -536,10 +521,7 @@ fn freshly_created_non_backlog_item_does_not_inflate_backlog() {
         .unwrap();
 
     let snap = aggregate_from_activity_logs(&dir);
-    let now = crate::side_effects::clock::system_now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_secs_i64();
     let today = secs_to_day(now);
 
     assert_eq!(snap.created_per_day.get(&today).copied(), Some(1));

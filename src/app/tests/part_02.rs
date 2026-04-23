@@ -1,8 +1,8 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
 use super::{
-    ActivityEntry, App, Arc, BackendError, BackendType, Config, CreateWorkItem, DisplayEntry,
-    FetchMessage, PathBuf, RepoAssociationRecord, WorkItemBackend, WorkItemId, WorkItemStatus,
+    App, Arc, BackendType, Config, DisplayEntry, FetchMessage, PathBuf, RepoAssociationRecord,
+    WorkItemBackend, WorkItemId, WorkItemStatus,
 };
 
 /// F-2: Unmanaging a repo prunes stale fetch cache entries.
@@ -129,121 +129,62 @@ fn worktree_fetch_error_surfaces_in_status() {
 /// F-1: Selection survives reassembly when items reorder.
 /// After backend records change order, the same `WorkItemId` should
 /// remain selected even if its display index changes.
+/// Build a minimal `WorkItemRecord` under `/repo` for reorder / selection
+/// tests. Status defaults to `Backlog` and `kind` to `Own`.
+fn make_backlog_record(id: WorkItemId, title: &str) -> crate::work_item_backend::WorkItemRecord {
+    crate::work_item_backend::WorkItemRecord {
+        display_id: None,
+        id,
+        title: title.into(),
+        description: None,
+        status: WorkItemStatus::Backlog,
+        kind: crate::work_item::WorkItemKind::Own,
+        repo_associations: vec![RepoAssociationRecord {
+            repo_path: PathBuf::from("/repo"),
+            branch: None,
+            pr_identity: None,
+        }],
+        plan: None,
+        done_at: None,
+    }
+}
+
+/// Build the in-memory `WorkItem` mirror of the record produced by
+/// `make_backlog_record`. Used by `selection_survives_reassembly_when_items_reorder`
+/// to drive the post-reorder rebuild.
+fn make_backlog_work_item(id: WorkItemId, title: &str) -> crate::work_item::WorkItem {
+    crate::work_item::WorkItem {
+        display_id: None,
+        id,
+        backend_type: crate::work_item::BackendType::LocalFile,
+        kind: crate::work_item::WorkItemKind::Own,
+        title: title.into(),
+        description: None,
+        status: WorkItemStatus::Backlog,
+        status_derived: false,
+        repo_associations: vec![crate::work_item::RepoAssociation {
+            repo_path: PathBuf::from("/repo"),
+            branch: None,
+            worktree_path: None,
+            pr: None,
+            issue: None,
+            git_state: None,
+            stale_worktree_path: None,
+        }],
+        errors: vec![],
+    }
+}
+
 #[test]
 fn selection_survives_reassembly_when_items_reorder() {
-    use crate::work_item_backend::ListResult;
-
-    /// Backend that returns records in a controllable order.
-    struct OrderableBackend {
-        records: std::sync::Mutex<Vec<crate::work_item_backend::WorkItemRecord>>,
-    }
-
-    impl WorkItemBackend for OrderableBackend {
-        fn read(
-            &self,
-            id: &WorkItemId,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            self.records
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|r| r.id == *id)
-                .cloned()
-                .ok_or_else(|| BackendError::NotFound(id.clone()))
-        }
-        fn list(&self) -> Result<ListResult, BackendError> {
-            Ok(ListResult {
-                records: self.records.lock().unwrap().clone(),
-                corrupt: Vec::new(),
-            })
-        }
-        fn create(
-            &self,
-            _req: CreateWorkItem,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            Err(BackendError::Validation("not used".into()))
-        }
-        fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn update_status(
-            &self,
-            _id: &WorkItemId,
-            _status: WorkItemStatus,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn import(
-            &self,
-            _unlinked: &crate::work_item::UnlinkedPr,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            Err(BackendError::Validation("not used".into()))
-        }
-        fn import_review_request(
-            &self,
-            _rr: &crate::work_item::ReviewRequestedPr,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            Err(BackendError::Validation("not supported in test".into()))
-        }
-        fn append_activity(
-            &self,
-            _id: &WorkItemId,
-            _entry: &ActivityEntry,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
-            Ok(None)
-        }
-        fn set_done_at(&self, _id: &WorkItemId, _done_at: Option<u64>) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
-            None
-        }
-    }
-
     let id_a = WorkItemId::LocalFile(PathBuf::from("/data/aaa.json"));
     let id_b = WorkItemId::LocalFile(PathBuf::from("/data/bbb.json"));
 
-    let record_a = crate::work_item_backend::WorkItemRecord {
-        display_id: None,
-        id: id_a.clone(),
-        title: "Item A".into(),
-        description: None,
-        status: WorkItemStatus::Backlog,
-        kind: crate::work_item::WorkItemKind::Own,
-        repo_associations: vec![RepoAssociationRecord {
-            repo_path: PathBuf::from("/repo"),
-            branch: None,
-            pr_identity: None,
-        }],
-        plan: None,
-        done_at: None,
-    };
-    let record_b = crate::work_item_backend::WorkItemRecord {
-        display_id: None,
-        id: id_b.clone(),
-        title: "Item B".into(),
-        description: None,
-        status: WorkItemStatus::Backlog,
-        kind: crate::work_item::WorkItemKind::Own,
-        repo_associations: vec![RepoAssociationRecord {
-            repo_path: PathBuf::from("/repo"),
-            branch: None,
-            pr_identity: None,
-        }],
-        plan: None,
-        done_at: None,
-    };
+    let record_a = make_backlog_record(id_a.clone(), "Item A");
+    let record_b = make_backlog_record(id_b.clone(), "Item B");
 
     // Start with order A, B.
-    let backend = OrderableBackend {
-        records: std::sync::Mutex::new(vec![record_a, record_b]),
-    };
+    let backend = super::shared::ImportTestBackend::with_records(vec![record_a, record_b]);
     let mut app = App::with_config(Config::default(), Arc::new(backend));
 
     // Select Item B (the second Todo item).
@@ -262,46 +203,8 @@ fn selection_survives_reassembly_when_items_reorder() {
     // directly setting work_items in reversed order since we cannot
     // mutate the backend through the trait interface.
     app.work_items = vec![
-        crate::work_item::WorkItem {
-            display_id: None,
-            id: id_b.clone(),
-            backend_type: crate::work_item::BackendType::LocalFile,
-            kind: crate::work_item::WorkItemKind::Own,
-            title: "Item B".into(),
-            description: None,
-            status: WorkItemStatus::Backlog,
-            status_derived: false,
-            repo_associations: vec![crate::work_item::RepoAssociation {
-                repo_path: PathBuf::from("/repo"),
-                branch: None,
-                worktree_path: None,
-                pr: None,
-                issue: None,
-                git_state: None,
-                stale_worktree_path: None,
-            }],
-            errors: vec![],
-        },
-        crate::work_item::WorkItem {
-            display_id: None,
-            id: id_a,
-            backend_type: crate::work_item::BackendType::LocalFile,
-            kind: crate::work_item::WorkItemKind::Own,
-            title: "Item A".into(),
-            description: None,
-            status: WorkItemStatus::Backlog,
-            status_derived: false,
-            repo_associations: vec![crate::work_item::RepoAssociation {
-                repo_path: PathBuf::from("/repo"),
-                branch: None,
-                worktree_path: None,
-                pr: None,
-                issue: None,
-                git_state: None,
-                stale_worktree_path: None,
-            }],
-            errors: vec![],
-        },
+        make_backlog_work_item(id_b.clone(), "Item B"),
+        make_backlog_work_item(id_a, "Item A"),
     ];
     app.build_display_list();
 

@@ -80,118 +80,14 @@ impl super::App {
         let mut received_any = false;
         for msg in messages {
             match msg {
-                FetchMessage::FetchStarted => {
-                    // Show a spinner while GitHub data is being fetched.
-                    // Track how many repos are in-flight so the spinner
-                    // persists until all repos have reported back.
-                    //
-                    // If the Ctrl+R path has already admitted a
-                    // `GithubRefresh` action, reuse its activity - do NOT
-                    // start a second one. Otherwise (structural restart
-                    // path: manage/unmanage, quickstart create, delete
-                    // cleanup, etc.) own the spinner locally via
-                    // `activities.structural_fetch` so the single-spinner
-                    // invariant holds.
-                    self.activities.pending_fetch_count += 1;
-                    let helper_owns_it =
-                        self.is_user_action_in_flight(&UserActionKey::GithubRefresh);
-                    if !helper_owns_it && self.activities.structural_fetch.is_none() {
-                        let id = self.activities.start("Refreshing GitHub data");
-                        self.activities.structural_fetch = Some(id);
-                    }
-                }
+                FetchMessage::FetchStarted => self.on_fetch_started(),
                 FetchMessage::RepoData(result) => {
                     received_any = true;
-                    self.activities.pending_fetch_count =
-                        self.activities.pending_fetch_count.saturating_sub(1);
-                    // End both possible owners of the fetch spinner:
-                    // the Ctrl+R helper entry (if it started this
-                    // cycle) and the structural fallback (if the
-                    // restart path started it). Exactly one of them
-                    // actually holds an activity at any given time.
-                    if self.activities.pending_fetch_count == 0 {
-                        self.end_user_action(&UserActionKey::GithubRefresh);
-                        if let Some(id) = self.activities.structural_fetch.take() {
-                            self.activities.end(id);
-                        }
-                    }
-                    // Surface worktree errors in the status bar. One-time
-                    // per repo to avoid flooding on every fetch cycle.
-                    if let Err(ref e) = result.worktrees
-                        && self.worktree_errors_shown.insert(result.repo_path.clone())
-                    {
-                        self.shell.status_message = Some(format!(
-                            "Worktree error ({}): {e}",
-                            result.repo_path.display(),
-                        ));
-                    }
-                    // Surface GitHub errors in the status bar. One-time
-                    // messages for CliNotFound and AuthRequired so we
-                    // don't spam on every fetch cycle.
-                    if let Err(ref e) = result.prs {
-                        match e {
-                            GithubError::CliNotFound => {
-                                if !self.gh_status.cli_not_found_shown {
-                                    self.gh_status.cli_not_found_shown = true;
-                                    self.shell.status_message =
-                                        Some("gh CLI not found - GitHub features disabled".into());
-                                }
-                            }
-                            GithubError::AuthRequired => {
-                                if !self.gh_status.auth_required_shown {
-                                    self.gh_status.auth_required_shown = true;
-                                    self.shell.status_message =
-                                        Some("gh auth required - run 'gh auth login'".into());
-                                }
-                            }
-                            _ => {
-                                let msg = format!("GitHub: {e}");
-                                if self.shell.status_message.is_none() {
-                                    self.shell.status_message = Some(msg);
-                                } else {
-                                    self.pending_fetch_errors.push(msg);
-                                }
-                            }
-                        }
-                    }
-                    // Capture the authenticated user's login so review-
-                    // request row rendering can classify direct-to-you vs.
-                    // team. Never clobber a known login with None - a
-                    // transient `gh api user` failure should not erase a
-                    // value that was successfully resolved earlier in the
-                    // session.
-                    if let Some(login) = result.current_user_login.clone() {
-                        self.current_user_login = Some(login);
-                    }
-                    self.repo_data.insert(result.repo_path.clone(), *result);
-                    // Clear re-open suppression only after ALL repos have
-                    // reported back.  In multi-repo setups, clearing on every
-                    // single RepoData arrival lets an early repo's stale data
-                    // re-open items that were just reviewed in a later repo.
-                    if self.activities.pending_fetch_count == 0 {
-                        self.review_reopen_suppress.clear();
-                    }
+                    self.on_fetch_repo_data(*result);
                 }
                 FetchMessage::FetcherError { repo_path, error } => {
                     received_any = true;
-                    self.activities.pending_fetch_count =
-                        self.activities.pending_fetch_count.saturating_sub(1);
-                    if self.activities.pending_fetch_count == 0 {
-                        self.end_user_action(&UserActionKey::GithubRefresh);
-                        if let Some(id) = self.activities.structural_fetch.take() {
-                            self.activities.end(id);
-                        }
-                        // Clear re-open suppression when all repos have
-                        // reported back, even if they all failed.  This
-                        // mirrors the clear in the RepoData arm.
-                        self.review_reopen_suppress.clear();
-                    }
-                    let msg = format!("Fetch error ({}): {error}", repo_path.display());
-                    if self.shell.status_message.is_none() {
-                        self.shell.status_message = Some(msg);
-                    } else {
-                        self.pending_fetch_errors.push(msg);
-                    }
+                    self.on_fetcher_error(&repo_path, &error);
                 }
             }
         }
@@ -206,6 +102,137 @@ impl super::App {
             }
         }
         received_any
+    }
+
+    /// Handle the per-cycle `FetchStarted` sentinel - increments the
+    /// in-flight counter and, when no Ctrl+R user-action already owns
+    /// the spinner, starts a structural-fetch activity so the single-
+    /// spinner invariant holds.
+    fn on_fetch_started(&mut self) {
+        // Show a spinner while GitHub data is being fetched.
+        // Track how many repos are in-flight so the spinner
+        // persists until all repos have reported back.
+        //
+        // If the Ctrl+R path has already admitted a
+        // `GithubRefresh` action, reuse its activity - do NOT
+        // start a second one. Otherwise (structural restart
+        // path: manage/unmanage, quickstart create, delete
+        // cleanup, etc.) own the spinner locally via
+        // `activities.structural_fetch` so the single-spinner
+        // invariant holds.
+        self.activities.pending_fetch_count += 1;
+        let helper_owns_it = self.is_user_action_in_flight(&UserActionKey::GithubRefresh);
+        if !helper_owns_it && self.activities.structural_fetch.is_none() {
+            let id = self.activities.start("Refreshing GitHub data");
+            self.activities.structural_fetch = Some(id);
+        }
+    }
+
+    /// Handle a per-repo `RepoData` result - decrements the spinner
+    /// counter, surfaces worktree / GitHub errors, caches the
+    /// current-user login, inserts the result into `repo_data`, and
+    /// clears the review re-open suppression set once all repos have
+    /// reported back.
+    fn on_fetch_repo_data(&mut self, result: crate::work_item::RepoFetchResult) {
+        self.activities.pending_fetch_count = self.activities.pending_fetch_count.saturating_sub(1);
+        // End both possible owners of the fetch spinner:
+        // the Ctrl+R helper entry (if it started this
+        // cycle) and the structural fallback (if the
+        // restart path started it). Exactly one of them
+        // actually holds an activity at any given time.
+        if self.activities.pending_fetch_count == 0 {
+            self.end_user_action(&UserActionKey::GithubRefresh);
+            if let Some(id) = self.activities.structural_fetch.take() {
+                self.activities.end(id);
+            }
+        }
+        // Surface worktree errors in the status bar. One-time
+        // per repo to avoid flooding on every fetch cycle.
+        if let Err(ref e) = result.worktrees
+            && self.worktree_errors_shown.insert(result.repo_path.clone())
+        {
+            self.shell.status_message = Some(format!(
+                "Worktree error ({}): {e}",
+                result.repo_path.display(),
+            ));
+        }
+        // Surface GitHub errors in the status bar. One-time
+        // messages for CliNotFound and AuthRequired so we
+        // don't spam on every fetch cycle.
+        if let Err(ref e) = result.prs {
+            self.surface_github_fetch_error(e);
+        }
+        // Capture the authenticated user's login so review-
+        // request row rendering can classify direct-to-you vs.
+        // team. Never clobber a known login with None - a
+        // transient `gh api user` failure should not erase a
+        // value that was successfully resolved earlier in the
+        // session.
+        if let Some(login) = result.current_user_login.clone() {
+            self.current_user_login = Some(login);
+        }
+        self.repo_data.insert(result.repo_path.clone(), result);
+        // Clear re-open suppression only after ALL repos have
+        // reported back.  In multi-repo setups, clearing on every
+        // single RepoData arrival lets an early repo's stale data
+        // re-open items that were just reviewed in a later repo.
+        if self.activities.pending_fetch_count == 0 {
+            self.review_reopen_suppress.clear();
+        }
+    }
+
+    /// Surface a `GithubError` encountered during a fetch cycle. Shows
+    /// a one-time status message for `CliNotFound` / `AuthRequired`, or
+    /// queues a generic "GitHub: ..." message for all other variants.
+    fn surface_github_fetch_error(&mut self, e: &GithubError) {
+        match e {
+            GithubError::CliNotFound => {
+                if !self.gh_status.cli_not_found_shown {
+                    self.gh_status.cli_not_found_shown = true;
+                    self.shell.status_message =
+                        Some("gh CLI not found - GitHub features disabled".into());
+                }
+            }
+            GithubError::AuthRequired => {
+                if !self.gh_status.auth_required_shown {
+                    self.gh_status.auth_required_shown = true;
+                    self.shell.status_message =
+                        Some("gh auth required - run 'gh auth login'".into());
+                }
+            }
+            _ => {
+                let msg = format!("GitHub: {e}");
+                if self.shell.status_message.is_none() {
+                    self.shell.status_message = Some(msg);
+                } else {
+                    self.pending_fetch_errors.push(msg);
+                }
+            }
+        }
+    }
+
+    /// Handle a `FetcherError` for a specific repo - decrements the
+    /// spinner counter, clears the review re-open suppression set once
+    /// all repos have reported back, and queues or shows the error
+    /// message on the status bar.
+    fn on_fetcher_error(&mut self, repo_path: &std::path::Path, error: &str) {
+        self.activities.pending_fetch_count = self.activities.pending_fetch_count.saturating_sub(1);
+        if self.activities.pending_fetch_count == 0 {
+            self.end_user_action(&UserActionKey::GithubRefresh);
+            if let Some(id) = self.activities.structural_fetch.take() {
+                self.activities.end(id);
+            }
+            // Clear re-open suppression when all repos have
+            // reported back, even if they all failed.  This
+            // mirrors the clear in the RepoData arm.
+            self.review_reopen_suppress.clear();
+        }
+        let msg = format!("Fetch error ({}): {error}", repo_path.display());
+        if self.shell.status_message.is_none() {
+            self.shell.status_message = Some(msg);
+        } else {
+            self.pending_fetch_errors.push(msg);
+        }
     }
 
     /// Show the next pending fetch error if the status bar is free.
@@ -244,11 +271,11 @@ impl super::App {
             ));
         }
 
-        let issue_pattern = &self.services.config.defaults.branch_issue_pattern;
+        let issue_pattern = self.services.config.defaults.branch_issue_pattern.clone();
         let (items, unlinked, review_requested, mut reopen_ids) = assembly::reassemble(
             &list_result.records,
             &self.repo_data,
-            issue_pattern,
+            &issue_pattern,
             &self.services.config.defaults.worktree_dir,
         );
         self.work_items = items;
@@ -257,31 +284,7 @@ impl super::App {
 
         // Start the archival clock for items that became Done through PR merge
         // (derived status) but don't yet have a done_at timestamp.
-        if self.services.config.defaults.archive_after_days > 0 {
-            match crate::side_effects::clock::system_now().duration_since(std::time::UNIX_EPOCH) {
-                Ok(duration) => {
-                    let epoch = duration.as_secs();
-                    for record in &list_result.records {
-                        if record.status != WorkItemStatus::Done
-                            && record.done_at.is_none()
-                            && let Some(wi) = self.work_items.iter().find(|w| w.id == record.id)
-                            && wi.status == WorkItemStatus::Done
-                            && wi.status_derived
-                            && let Err(e) =
-                                self.services.backend.set_done_at(&record.id, Some(epoch))
-                        {
-                            self.shell.status_message =
-                                Some(format!("Failed to set archive timestamp: {e}"));
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.shell.status_message = Some(format!(
-                        "System clock error, skipping archive timestamps: {e}"
-                    ));
-                }
-            }
-        }
+        self.stamp_derived_done_items(&list_result.records);
 
         // Exclude items whose reviews were recently submitted. Stale
         // repo_data may still list them as review-requested until the
@@ -290,78 +293,14 @@ impl super::App {
 
         // Re-open Done ReviewRequest items that have been re-requested.
         if !reopen_ids.is_empty() {
-            for wi_id in &reopen_ids {
-                if let Err(e) = self
-                    .services
-                    .backend
-                    .update_status(wi_id, WorkItemStatus::Review)
-                {
-                    self.shell.status_message = Some(format!("Re-open error: {e}"));
-                    continue;
-                }
-                // Clear done_at so auto-archive won't delete the re-opened item.
-                if let Err(e) = self.services.backend.set_done_at(wi_id, None) {
-                    self.shell.status_message =
-                        Some(format!("Failed to clear archive timestamp on re-open: {e}"));
-                }
-                let entry = ActivityEntry {
-                    timestamp: now_iso8601(),
-                    event_type: "stage_change".to_string(),
-                    payload: serde_json::json!({
-                        "from": "Done",
-                        "to": "Review",
-                        "source": "review_re_requested"
-                    }),
-                };
-                let _ = self.services.backend.append_activity(wi_id, &entry);
-            }
-            // Reassemble again to pick up the status changes.
-            let Ok(list_result) = self.services.backend.list() else {
-                return;
-            };
-            let (items, unlinked, review_requested, _) = assembly::reassemble(
-                &list_result.records,
-                &self.repo_data,
-                issue_pattern,
-                &self.services.config.defaults.worktree_dir,
-            );
-            self.work_items = items;
-            self.unlinked_prs = unlinked;
-            self.review_requested_prs = review_requested;
-
-            let count = reopen_ids.len();
-            self.shell.status_message = Some(format!("{count} review request(s) re-opened"));
+            self.apply_review_reopen(&reopen_ids, &issue_pattern);
         }
 
         // Auto-archive: delete Done items that have exceeded the retention period.
         // This runs AFTER re-open detection so that re-opened items have their
         // done_at cleared and won't be incorrectly archived.
         // Skip entirely when archive is disabled (archive_after_days == 0).
-        if self.services.config.defaults.archive_after_days > 0 {
-            match self.services.backend.list() {
-                Ok(pre_archive_list) => {
-                    let pre_archive_count = pre_archive_list.records.len();
-                    let kept = self.auto_archive_done_items(pre_archive_list.records);
-                    if kept.len() < pre_archive_count {
-                        // Items were archived; reassemble to update display state.
-                        let pattern = &self.services.config.defaults.branch_issue_pattern;
-                        let (items, unlinked, review_requested, _) = assembly::reassemble(
-                            &kept,
-                            &self.repo_data,
-                            pattern,
-                            &self.services.config.defaults.worktree_dir,
-                        );
-                        self.work_items = items;
-                        self.unlinked_prs = unlinked;
-                        self.review_requested_prs = review_requested;
-                    }
-                }
-                Err(e) => {
-                    self.shell.status_message =
-                        Some(format!("Failed to list items for auto-archive: {e}"));
-                }
-            }
-        }
+        self.run_auto_archive();
 
         // Reconstruct mergequeue watches for items that are in Mergequeue
         // but don't have a watch (e.g., after app restart).
@@ -375,6 +314,117 @@ impl super::App {
         // background poll is the ONLY code path that can detect the
         // merge and advance the item to Done.
         self.reconstruct_review_request_merge_watches();
+    }
+
+    /// Stamp `done_at` on records whose derived status flipped to Done
+    /// since the last reassembly (typically a PR merge). Skips if
+    /// auto-archive is disabled.
+    fn stamp_derived_done_items(&mut self, records: &[crate::work_item_backend::WorkItemRecord]) {
+        if self.services.config.defaults.archive_after_days == 0 {
+            return;
+        }
+        match crate::side_effects::clock::system_now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => {
+                let epoch = duration.as_secs();
+                for record in records {
+                    if record.status != WorkItemStatus::Done
+                        && record.done_at.is_none()
+                        && let Some(wi) = self.work_items.iter().find(|w| w.id == record.id)
+                        && wi.status == WorkItemStatus::Done
+                        && wi.status_derived
+                        && let Err(e) = self.services.backend.set_done_at(&record.id, Some(epoch))
+                    {
+                        self.shell.status_message =
+                            Some(format!("Failed to set archive timestamp: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                self.shell.status_message = Some(format!(
+                    "System clock error, skipping archive timestamps: {e}"
+                ));
+            }
+        }
+    }
+
+    /// Re-open Done `ReviewRequest` items that have been re-requested.
+    /// Applies the status change and `done_at` clear to the backend, logs
+    /// a `stage_change` activity, and reassembles the work-item list to
+    /// pick up the new statuses.
+    fn apply_review_reopen(&mut self, reopen_ids: &[WorkItemId], issue_pattern: &str) {
+        for wi_id in reopen_ids {
+            if let Err(e) = self
+                .services
+                .backend
+                .update_status(wi_id, WorkItemStatus::Review)
+            {
+                self.shell.status_message = Some(format!("Re-open error: {e}"));
+                continue;
+            }
+            // Clear done_at so auto-archive won't delete the re-opened item.
+            if let Err(e) = self.services.backend.set_done_at(wi_id, None) {
+                self.shell.status_message =
+                    Some(format!("Failed to clear archive timestamp on re-open: {e}"));
+            }
+            let entry = ActivityEntry {
+                timestamp: now_iso8601(),
+                event_type: "stage_change".to_string(),
+                payload: serde_json::json!({
+                    "from": "Done",
+                    "to": "Review",
+                    "source": "review_re_requested"
+                }),
+            };
+            let _ = self.services.backend.append_activity(wi_id, &entry);
+        }
+        // Reassemble again to pick up the status changes.
+        let Ok(list_result) = self.services.backend.list() else {
+            return;
+        };
+        let (items, unlinked, review_requested, _) = assembly::reassemble(
+            &list_result.records,
+            &self.repo_data,
+            issue_pattern,
+            &self.services.config.defaults.worktree_dir,
+        );
+        self.work_items = items;
+        self.unlinked_prs = unlinked;
+        self.review_requested_prs = review_requested;
+
+        let count = reopen_ids.len();
+        self.shell.status_message = Some(format!("{count} review request(s) re-opened"));
+    }
+
+    /// Auto-archive: delete Done items that have exceeded the
+    /// retention period. Reassembles if any items were removed. Skips
+    /// entirely when archive is disabled (`archive_after_days == 0`).
+    fn run_auto_archive(&mut self) {
+        if self.services.config.defaults.archive_after_days == 0 {
+            return;
+        }
+        match self.services.backend.list() {
+            Ok(pre_archive_list) => {
+                let pre_archive_count = pre_archive_list.records.len();
+                let kept = self.auto_archive_done_items(pre_archive_list.records);
+                if kept.len() < pre_archive_count {
+                    // Items were archived; reassemble to update display state.
+                    let pattern = &self.services.config.defaults.branch_issue_pattern;
+                    let (items, unlinked, review_requested, _) = assembly::reassemble(
+                        &kept,
+                        &self.repo_data,
+                        pattern,
+                        &self.services.config.defaults.worktree_dir,
+                    );
+                    self.work_items = items;
+                    self.unlinked_prs = unlinked;
+                    self.review_requested_prs = review_requested;
+                }
+            }
+            Err(e) => {
+                self.shell.status_message =
+                    Some(format!("Failed to list items for auto-archive: {e}"));
+            }
+        }
     }
 
     /// Core work-item deletion. Removes the backend record, kills the
@@ -439,6 +489,63 @@ impl super::App {
         self.services.backend.delete(wi_id)?;
 
         // -- Phase 3: Kill session and clean up MCP --
+        self.kill_work_item_sessions(wi_id);
+
+        // -- Phase 4: (removed) Resource cleanup runs on a background
+        //    thread via `spawn_delete_cleanup`. Doing it synchronously
+        //    here would block the UI thread on `git worktree remove`,
+        //    `git branch -D`, and `gh pr close` - all forbidden by
+        //    `docs/UI.md` "Blocking I/O Prohibition".
+
+        // -- Phase 5: Cancel in-flight operations --
+        self.cancel_in_flight_ops_for_delete(wi_id, orphan_worktrees);
+
+        // -- Phase 6: In-memory state cleanup --
+        self.rework_reasons.remove(wi_id);
+        self.review_gate_findings.remove(wi_id);
+        self.review_reopen_suppress.remove(wi_id);
+        self.no_plan_prompt_queue.retain(|id| id != wi_id);
+        if self.no_plan_prompt_queue.is_empty() {
+            self.prompt_flags.no_plan_visible = false;
+        }
+        if self.rework_prompt_wi.as_ref() == Some(wi_id) {
+            self.rework_prompt_wi = None;
+            self.prompt_flags.rework_visible = false;
+        }
+        if self.merge_wi_id.as_ref() == Some(wi_id) {
+            self.merge_wi_id = None;
+            self.merge_flow.confirm = false;
+        }
+        self.drop_review_gate(wi_id);
+        // The rebase gate was already torn down in Phase 1 via
+        // `abort_background_ops_for_work_item`, BEFORE
+        // `backend.delete` ran, so no second call is needed here.
+        // Calling `drop_rebase_gate` again would be a no-op (the
+        // map entry is gone) but the redundancy would invite future
+        // confusion about the canonical cancellation point.
+        if self
+            .branch_gone_prompt
+            .as_ref()
+            .is_some_and(|(id, _)| id == wi_id)
+        {
+            self.branch_gone_prompt = None;
+        }
+        if self
+            .stale_worktree_prompt
+            .as_ref()
+            .is_some_and(|p| p.wi_id == *wi_id)
+        {
+            self.clear_stale_recovery();
+        }
+
+        Ok(())
+    }
+
+    /// Phase 3 of `delete_work_item_by_id`: kill the Claude and
+    /// terminal sessions for a work item, and schedule cleanup of any
+    /// session-spawn temp files the backend wrote (see
+    /// `docs/harness-contract.md` C4).
+    fn kill_work_item_sessions(&mut self, wi_id: &WorkItemId) {
         self.cleanup_session_state_for(wi_id);
         if let Some(key) = self.session_key_for(wi_id)
             && let Some(mut entry) = self.sessions.remove(&key)
@@ -464,14 +571,18 @@ impl super::App {
         {
             session.kill();
         }
+    }
 
-        // -- Phase 4: (removed) Resource cleanup runs on a background
-        //    thread via `spawn_delete_cleanup`. Doing it synchronously
-        //    here would block the UI thread on `git worktree remove`,
-        //    `git branch -D`, and `gh pr close` - all forbidden by
-        //    `docs/UI.md` "Blocking I/O Prohibition".
-
-        // -- Phase 5: Cancel in-flight operations --
+    /// Phase 5 of `delete_work_item_by_id`: cancel in-flight user
+    /// actions (worktree create, PR create, merge, review submit) and
+    /// mergequeue polls tied to this work item. Captures any orphan
+    /// worktree produced by a finished-but-undrained worktree-create
+    /// thread so the caller can schedule background cleanup.
+    fn cancel_in_flight_ops_for_delete(
+        &mut self,
+        wi_id: &WorkItemId,
+        orphan_worktrees: &mut Vec<OrphanWorktree>,
+    ) {
         if self.user_action_work_item(&UserActionKey::WorktreeCreate) == Some(wi_id) {
             // Drain the helper payload's receiver. If the thread has
             // finished, capture the (non-reused) worktree path so the
@@ -533,45 +644,5 @@ impl super::App {
         if let Some(state) = self.mergequeue_polls.remove(wi_id) {
             self.activities.end(state.activity);
         }
-
-        // -- Phase 6: In-memory state cleanup --
-        self.rework_reasons.remove(wi_id);
-        self.review_gate_findings.remove(wi_id);
-        self.review_reopen_suppress.remove(wi_id);
-        self.no_plan_prompt_queue.retain(|id| id != wi_id);
-        if self.no_plan_prompt_queue.is_empty() {
-            self.prompt_flags.no_plan_visible = false;
-        }
-        if self.rework_prompt_wi.as_ref() == Some(wi_id) {
-            self.rework_prompt_wi = None;
-            self.prompt_flags.rework_visible = false;
-        }
-        if self.merge_wi_id.as_ref() == Some(wi_id) {
-            self.merge_wi_id = None;
-            self.merge_flow.confirm = false;
-        }
-        self.drop_review_gate(wi_id);
-        // The rebase gate was already torn down in Phase 1 via
-        // `abort_background_ops_for_work_item`, BEFORE
-        // `backend.delete` ran, so no second call is needed here.
-        // Calling `drop_rebase_gate` again would be a no-op (the
-        // map entry is gone) but the redundancy would invite future
-        // confusion about the canonical cancellation point.
-        if self
-            .branch_gone_prompt
-            .as_ref()
-            .is_some_and(|(id, _)| id == wi_id)
-        {
-            self.branch_gone_prompt = None;
-        }
-        if self
-            .stale_worktree_prompt
-            .as_ref()
-            .is_some_and(|p| p.wi_id == *wi_id)
-        {
-            self.clear_stale_recovery();
-        }
-
-        Ok(())
     }
 }

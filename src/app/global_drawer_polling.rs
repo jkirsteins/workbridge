@@ -10,14 +10,248 @@
 //! paths in `docs/harness-contract.md`.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::{GlobalSessionOpenPending, GlobalSessionPrepResult};
 use crate::agent_backend::{self, AgentBackend, SpawnConfig, WORK_ITEM_ALLOWED_TOOLS};
-use crate::mcp::McpSocketServer;
+use crate::mcp::{McpEvent, McpSocketServer};
 use crate::session::Session;
 use crate::work_item::{SessionEntry, WorkItemStatus};
+
+/// Inputs captured on the UI thread for the global-assistant
+/// preparation worker. Kept as a struct so `run_global_session_prep_worker`
+/// has a stable call shape as the prep pipeline evolves.
+struct GlobalSessionPrepArgs {
+    agent_backend: Arc<dyn AgentBackend>,
+    mcp_context_shared: Arc<Mutex<String>>,
+    mcp_tx: crossbeam_channel::Sender<McpEvent>,
+    pane_cols: u16,
+    pane_rows: u16,
+    worker_config_path: PathBuf,
+    worker_cancelled: Arc<AtomicBool>,
+    system_prompt: Option<String>,
+}
+
+/// Phases B-E of `run_global_session_prep_worker`: resolve the
+/// current-exe path, build the MCP config bytes + bridge spec, write
+/// the per-call tempfile at `worker_config_path`, and
+/// `create_dir_all` the scratch cwd. Honours cancellation between
+/// each phase; on cancellation drops `mcp_server` (so its Drop impl
+/// stops the accept loop / removes the socket) and returns `None`.
+/// On a hard error, ships the error through `tx` and returns `None`
+/// - the caller should bail without sending anything further.
+fn prepare_global_session_filesystem(
+    mcp_server: &McpSocketServer,
+    worker_config_path: &std::path::Path,
+    worker_cancelled: &AtomicBool,
+    tx: &crossbeam_channel::Sender<GlobalSessionPrepResult>,
+) -> Option<(crate::agent_backend::McpBridgeSpec, PathBuf)> {
+    // Phase B: resolve exe path and build MCP config bytes.
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = tx.send(GlobalSessionPrepResult {
+                mcp_server: None,
+                session: None,
+                error: Some(format!(
+                    "Global assistant: cannot resolve executable path: {e}"
+                )),
+            });
+            return None;
+        }
+    };
+    let mcp_config = crate::mcp::build_mcp_config(&exe, &mcp_server.socket_path, &[]);
+    let global_bridge = crate::agent_backend::McpBridgeSpec {
+        name: "workbridge".to_string(),
+        command: exe,
+        args: vec![
+            "--mcp-bridge".to_string(),
+            "--socket".to_string(),
+            mcp_server.socket_path.to_string_lossy().into_owned(),
+        ],
+    };
+
+    // Phase C: write the temp `--mcp-config` file at the
+    // path the UI thread already committed to. The path is
+    // tracked in `GlobalSessionOpenPending::config_path`, so
+    // `teardown_global_session` can clean it up via
+    // `spawn_agent_file_cleanup` if the drawer closes
+    // mid-flight - the worker itself never needs to remove
+    // the file on a cancellation path. Last cancellation
+    // check right before the write; covers the common case
+    // where the user toggles the drawer while the worker
+    // is between Phase A and Phase C.
+    if worker_cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    if let Err(e) = std::fs::write(worker_config_path, &mcp_config) {
+        let _ = tx.send(GlobalSessionPrepResult {
+            mcp_server: None,
+            session: None,
+            error: Some(format!("Global assistant MCP config error: {e}")),
+        });
+        return None;
+    }
+
+    // Phase D: ensure the scratch cwd exists. We deliberately
+    // avoid `$HOME` here: Claude Code's workspace trust
+    // dialog persists its acceptance per-project in
+    // `~/.claude.json`, but the home directory does not
+    // reliably persist that acceptance, so using `$HOME` as
+    // the cwd produces the trust prompt on every single
+    // Ctrl+G. Every non-home project path Claude Code sees
+    // DOES persist trust correctly, so a stable
+    // workbridge-owned scratch directory sidesteps the
+    // problem entirely without workbridge ever reading or
+    // writing `~/.claude.json`. On macOS `$TMPDIR` is
+    // per-user and stable across reboots. `create_dir_all`
+    // is idempotent and handles the case where the OS tmp
+    // cleaner has wiped the directory since the last spawn.
+    if worker_cancelled.load(Ordering::Acquire) {
+        // The main thread's cleanup may have already run
+        // (and found a non-existent file) before we wrote
+        // the config. Remove it here so the file is not
+        // orphaned.
+        let _ = std::fs::remove_file(worker_config_path);
+        return None;
+    }
+    let scratch = crate::side_effects::paths::temp_dir().join("workbridge-global-assistant-cwd");
+    if let Err(e) = std::fs::create_dir_all(&scratch) {
+        let _ = tx.send(GlobalSessionPrepResult {
+            mcp_server: None,
+            session: None,
+            error: Some(format!("Global assistant scratch dir error: {e}")),
+        });
+        return None;
+    }
+    Some((global_bridge, scratch))
+}
+
+/// Body of the background thread spawned by `spawn_global_session`.
+/// Runs the blocking socket bind, tempfile write, scratch-dir create,
+/// and PTY fork+exec, then ships the resulting handles back to the UI
+/// thread through `tx`. Every phase honours `worker_cancelled` so a
+/// rapid Ctrl+G toggle does not leak socket files / tempfiles / PTYs.
+fn run_global_session_prep_worker(
+    prep: GlobalSessionPrepArgs,
+    tx: &crossbeam_channel::Sender<GlobalSessionPrepResult>,
+) {
+    let GlobalSessionPrepArgs {
+        agent_backend,
+        mcp_context_shared,
+        mcp_tx,
+        pane_cols,
+        pane_rows,
+        worker_config_path,
+        worker_cancelled,
+        system_prompt,
+    } = prep;
+
+    // Cancellation check before any blocking operation. If
+    // the main thread cancelled this spawn already (rapid
+    // Ctrl+G toggle, shutdown), bail out before the socket
+    // bind so no socket file is ever created.
+    if worker_cancelled.load(Ordering::Acquire) {
+        return;
+    }
+
+    // Phase A: start the global MCP socket server. Socket
+    // bind + stale-file remove + accept-loop thread spawn
+    // all live here.
+    let socket_path = crate::mcp::socket_path_for_session();
+    let mcp_server = match McpSocketServer::start_global(socket_path, mcp_context_shared, mcp_tx) {
+        Ok(server) => server,
+        Err(e) => {
+            let _ = tx.send(GlobalSessionPrepResult {
+                mcp_server: None,
+                session: None,
+                error: Some(format!("Global assistant MCP error: {e}")),
+            });
+            return;
+        }
+    };
+
+    if worker_cancelled.load(Ordering::Acquire) {
+        // Drop the server we just started (its Drop impl
+        // stops the accept loop and removes the socket
+        // file) and exit without writing the tempfile.
+        drop(mcp_server);
+        return;
+    }
+
+    // Phases B-E: resolve exe path, write the MCP config file, and
+    // ensure the scratch cwd exists. Honours cancellation between
+    // each phase.
+    let Some((global_bridge, scratch)) =
+        prepare_global_session_filesystem(&mcp_server, &worker_config_path, &worker_cancelled, tx)
+    else {
+        drop(mcp_server);
+        return;
+    };
+
+    // Phase E: build argv via the pluggable backend.
+    // `stage: Implementing` is used solely so the C8
+    // planning-reminder hook is NOT installed (Planning is
+    // the only stage that triggers the reminder); the global
+    // assistant has no stage concept. `auto_start_message:
+    // None` because the global assistant waits for the first
+    // user keystroke before doing anything.
+    let cfg = SpawnConfig {
+        stage: WorkItemStatus::Implementing,
+        system_prompt: system_prompt.as_deref(),
+        mcp_config_path: Some(&worker_config_path),
+        mcp_bridge: Some(&global_bridge),
+        // Global assistant has no per-repo context, so no
+        // user-configured per-repo MCP servers to forward.
+        extra_bridges: &[],
+        allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
+        auto_start_message: None,
+        read_only: false,
+    };
+    let cmd = agent_backend.build_command(&cfg);
+    let cmd_refs: Vec<&str> = cmd.iter().map(std::string::String::as_str).collect();
+
+    // Phase F: spawn the PTY session. The fork+exec is
+    // normally sub-millisecond but still blocks on process
+    // creation, so it runs here rather than on the UI
+    // thread. Last cancellation check: skip the fork+exec
+    // if the drawer was closed while we were in Phase C/D.
+    if worker_cancelled.load(Ordering::Acquire) {
+        let _ = std::fs::remove_file(&worker_config_path);
+        drop(mcp_server);
+        return;
+    }
+    let session = match Session::spawn(pane_cols, pane_rows, Some(&scratch), &cmd_refs) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tx.send(GlobalSessionPrepResult {
+                mcp_server: Some(mcp_server),
+                session: None,
+                error: Some(format!("Global assistant spawn error: {e}")),
+            });
+            return;
+        }
+    };
+
+    let result = GlobalSessionPrepResult {
+        mcp_server: Some(mcp_server),
+        session: Some(session),
+        error: None,
+    };
+
+    // Hand the result back to the UI thread. If the
+    // receiver has been dropped (drawer closed mid-flight),
+    // the main thread's `teardown_global_session` already
+    // scheduled a `spawn_agent_file_cleanup` for the shared
+    // `config_path`, so the worker does not need to clean
+    // up the tempfile itself. The `McpSocketServer` and
+    // `Session` handles inside `result` run their own Drop
+    // impls on scope exit, which stop the accept loop,
+    // remove the socket file, and force-kill the child
+    // process group respectively.
+    let _ = tx.send(result);
+}
 
 impl super::App {
     /// Spawn the global assistant agent session.
@@ -128,183 +362,18 @@ impl super::App {
 
         let (tx, rx) = crossbeam_channel::bounded(1);
 
+        let prep = GlobalSessionPrepArgs {
+            agent_backend,
+            mcp_context_shared,
+            mcp_tx,
+            pane_cols,
+            pane_rows,
+            worker_config_path,
+            worker_cancelled,
+            system_prompt,
+        };
         std::thread::spawn(move || {
-            // Cancellation check before any blocking operation. If
-            // the main thread cancelled this spawn already (rapid
-            // Ctrl+G toggle, shutdown), bail out before the socket
-            // bind so no socket file is ever created.
-            if worker_cancelled.load(Ordering::Acquire) {
-                return;
-            }
-
-            // Phase A: start the global MCP socket server. Socket
-            // bind + stale-file remove + accept-loop thread spawn
-            // all live here.
-            let socket_path = crate::mcp::socket_path_for_session();
-            let mcp_server =
-                match McpSocketServer::start_global(socket_path, mcp_context_shared, mcp_tx) {
-                    Ok(server) => server,
-                    Err(e) => {
-                        let _ = tx.send(GlobalSessionPrepResult {
-                            mcp_server: None,
-                            session: None,
-                            error: Some(format!("Global assistant MCP error: {e}")),
-                        });
-                        return;
-                    }
-                };
-
-            if worker_cancelled.load(Ordering::Acquire) {
-                // Drop the server we just started (its Drop impl
-                // stops the accept loop and removes the socket
-                // file) and exit without writing the tempfile.
-                drop(mcp_server);
-                return;
-            }
-
-            // Phase B: resolve exe path and build MCP config bytes.
-            let exe = match std::env::current_exe() {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx.send(GlobalSessionPrepResult {
-                        mcp_server: Some(mcp_server),
-                        session: None,
-                        error: Some(format!(
-                            "Global assistant: cannot resolve executable path: {e}"
-                        )),
-                    });
-                    return;
-                }
-            };
-            let mcp_config = crate::mcp::build_mcp_config(&exe, &mcp_server.socket_path, &[]);
-            let global_bridge = crate::agent_backend::McpBridgeSpec {
-                name: "workbridge".to_string(),
-                command: exe,
-                args: vec![
-                    "--mcp-bridge".to_string(),
-                    "--socket".to_string(),
-                    mcp_server.socket_path.to_string_lossy().into_owned(),
-                ],
-            };
-
-            // Phase C: write the temp `--mcp-config` file at the
-            // path the UI thread already committed to. The path is
-            // tracked in `GlobalSessionOpenPending::config_path`, so
-            // `teardown_global_session` can clean it up via
-            // `spawn_agent_file_cleanup` if the drawer closes
-            // mid-flight - the worker itself never needs to remove
-            // the file on a cancellation path. Last cancellation
-            // check right before the write; covers the common case
-            // where the user toggles the drawer while the worker
-            // is between Phase A and Phase C.
-            if worker_cancelled.load(Ordering::Acquire) {
-                drop(mcp_server);
-                return;
-            }
-            if let Err(e) = std::fs::write(&worker_config_path, &mcp_config) {
-                let _ = tx.send(GlobalSessionPrepResult {
-                    mcp_server: Some(mcp_server),
-                    session: None,
-                    error: Some(format!("Global assistant MCP config error: {e}")),
-                });
-                return;
-            }
-
-            // Phase D: ensure the scratch cwd exists. We deliberately
-            // avoid `$HOME` here: Claude Code's workspace trust
-            // dialog persists its acceptance per-project in
-            // `~/.claude.json`, but the home directory does not
-            // reliably persist that acceptance, so using `$HOME` as
-            // the cwd produces the trust prompt on every single
-            // Ctrl+G. Every non-home project path Claude Code sees
-            // DOES persist trust correctly, so a stable
-            // workbridge-owned scratch directory sidesteps the
-            // problem entirely without workbridge ever reading or
-            // writing `~/.claude.json`. On macOS `$TMPDIR` is
-            // per-user and stable across reboots. `create_dir_all`
-            // is idempotent and handles the case where the OS tmp
-            // cleaner has wiped the directory since the last spawn.
-            if worker_cancelled.load(Ordering::Acquire) {
-                // The main thread's cleanup may have already run
-                // (and found a non-existent file) before we wrote
-                // the config. Remove it here so the file is not
-                // orphaned.
-                let _ = std::fs::remove_file(&worker_config_path);
-                drop(mcp_server);
-                return;
-            }
-            let scratch =
-                crate::side_effects::paths::temp_dir().join("workbridge-global-assistant-cwd");
-            if let Err(e) = std::fs::create_dir_all(&scratch) {
-                let _ = tx.send(GlobalSessionPrepResult {
-                    mcp_server: Some(mcp_server),
-                    session: None,
-                    error: Some(format!("Global assistant scratch dir error: {e}")),
-                });
-                return;
-            }
-
-            // Phase E: build argv via the pluggable backend.
-            // `stage: Implementing` is used solely so the C8
-            // planning-reminder hook is NOT installed (Planning is
-            // the only stage that triggers the reminder); the global
-            // assistant has no stage concept. `auto_start_message:
-            // None` because the global assistant waits for the first
-            // user keystroke before doing anything.
-            let cfg = SpawnConfig {
-                stage: WorkItemStatus::Implementing,
-                system_prompt: system_prompt.as_deref(),
-                mcp_config_path: Some(&worker_config_path),
-                mcp_bridge: Some(&global_bridge),
-                // Global assistant has no per-repo context, so no
-                // user-configured per-repo MCP servers to forward.
-                extra_bridges: &[],
-                allowed_tools: WORK_ITEM_ALLOWED_TOOLS,
-                auto_start_message: None,
-                read_only: false,
-            };
-            let cmd = agent_backend.build_command(&cfg);
-            let cmd_refs: Vec<&str> = cmd.iter().map(std::string::String::as_str).collect();
-
-            // Phase F: spawn the PTY session. The fork+exec is
-            // normally sub-millisecond but still blocks on process
-            // creation, so it runs here rather than on the UI
-            // thread. Last cancellation check: skip the fork+exec
-            // if the drawer was closed while we were in Phase C/D.
-            if worker_cancelled.load(Ordering::Acquire) {
-                let _ = std::fs::remove_file(&worker_config_path);
-                drop(mcp_server);
-                return;
-            }
-            let session = match Session::spawn(pane_cols, pane_rows, Some(&scratch), &cmd_refs) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.send(GlobalSessionPrepResult {
-                        mcp_server: Some(mcp_server),
-                        session: None,
-                        error: Some(format!("Global assistant spawn error: {e}")),
-                    });
-                    return;
-                }
-            };
-
-            let result = GlobalSessionPrepResult {
-                mcp_server: Some(mcp_server),
-                session: Some(session),
-                error: None,
-            };
-
-            // Hand the result back to the UI thread. If the
-            // receiver has been dropped (drawer closed mid-flight),
-            // the main thread's `teardown_global_session` already
-            // scheduled a `spawn_agent_file_cleanup` for the shared
-            // `config_path`, so the worker does not need to clean
-            // up the tempfile itself. The `McpSocketServer` and
-            // `Session` handles inside `result` run their own Drop
-            // impls on scope exit, which stop the accept loop,
-            // remove the socket file, and force-kill the child
-            // process group respectively.
-            let _ = tx.send(result);
+            run_global_session_prep_worker(prep, &tx);
         });
 
         let activity = self.activities.start("Opening global assistant...");

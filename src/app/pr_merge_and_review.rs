@@ -249,94 +249,117 @@ impl super::App {
                 ref strategy,
                 ref pr_identity,
             } => {
-                // Persist PR identity to backend so it survives reassembly.
-                if let Some(identity) = pr_identity
-                    && let Err(e) = self.services.backend.save_pr_identity(
-                        &result.wi_id,
-                        &result.repo_path,
-                        identity,
-                    )
-                {
-                    self.shell.status_message = Some(format!("PR identity save error: {e}"));
-                }
-
-                // Log merge to activity log (always - the merge happened on GitHub).
-                let log_entry = ActivityEntry {
-                    timestamp: now_iso8601(),
-                    event_type: "pr_merged".to_string(),
-                    payload: serde_json::json!({
-                        "strategy": strategy,
-                        "branch": result.branch
-                    }),
-                };
-                if let Err(e) = self
-                    .services
-                    .backend
-                    .append_activity(&result.wi_id, &log_entry)
-                {
-                    self.shell.status_message = Some(format!("Activity log error: {e}"));
-                }
-
-                if actual_status.as_ref() != Some(&WorkItemStatus::Review) {
-                    // Item was moved away from Review while merge was in-flight.
-                    // The merge already happened on GitHub, but we do not change
-                    // the local status or delete the worktree.
-                    self.shell.status_message = Some(
-                        "PR merged on GitHub, but item status was changed - not advancing to Done"
-                            .to_string(),
-                    );
-                    return;
-                }
-
-                // Clean up worktree directory.
-                self.cleanup_worktree_for_item(&result.wi_id);
-
-                // Advance to Done.
-                self.apply_stage_change(
-                    &result.wi_id,
-                    WorkItemStatus::Review,
-                    WorkItemStatus::Done,
-                    "pr_merge",
-                );
-                self.shell.status_message =
-                    Some(format!("PR merged ({strategy}) and moved to [DN]"));
+                self.handle_pr_merge_merged(&result, strategy, pr_identity.as_ref(), actual_status);
             }
             PrMergeOutcome::Conflict { ref stderr } => {
-                if actual_status.as_ref() != Some(&WorkItemStatus::Review) {
-                    return;
-                }
-                // Log conflict to activity log.
-                let conflict_entry = ActivityEntry {
-                    timestamp: now_iso8601(),
-                    event_type: "merge_conflict".to_string(),
-                    payload: serde_json::json!({
-                        "branch": result.branch,
-                        "stderr": stderr.trim()
-                    }),
-                };
-                if let Err(e) = self
-                    .services
-                    .backend
-                    .append_activity(&result.wi_id, &conflict_entry)
-                {
-                    self.shell.status_message = Some(format!("Activity log error: {e}"));
-                }
-                let reason = "Merge failed due to conflicts. Rebase onto the base branch and resolve all conflicts.".to_string();
-                self.rework_reasons.insert(result.wi_id.clone(), reason);
-                self.apply_stage_change(
-                    &result.wi_id,
-                    WorkItemStatus::Review,
-                    WorkItemStatus::Implementing,
-                    "merge_conflict",
-                );
-                self.alert_message = Some(
-                    "Merge conflict detected - moved back to [IM] for rebase/resolve".to_string(),
-                );
+                self.handle_pr_merge_conflict(&result, stderr, actual_status);
             }
             PrMergeOutcome::Failed { ref error } => {
                 self.alert_message = Some(error.clone());
             }
         }
+    }
+
+    /// Finalize a successful PR merge: persist PR identity, log the
+    /// merge activity, and (if the item is still in Review) clean up
+    /// the worktree and advance to Done.
+    fn handle_pr_merge_merged(
+        &mut self,
+        result: &crate::app::PrMergeResult,
+        strategy: &str,
+        pr_identity: Option<&crate::work_item_backend::PrIdentityRecord>,
+        actual_status: Option<WorkItemStatus>,
+    ) {
+        // Persist PR identity to backend so it survives reassembly.
+        if let Some(identity) = pr_identity
+            && let Err(e) =
+                self.services
+                    .backend
+                    .save_pr_identity(&result.wi_id, &result.repo_path, identity)
+        {
+            self.shell.status_message = Some(format!("PR identity save error: {e}"));
+        }
+
+        // Log merge to activity log (always - the merge happened on GitHub).
+        let log_entry = ActivityEntry {
+            timestamp: now_iso8601(),
+            event_type: "pr_merged".to_string(),
+            payload: serde_json::json!({
+                "strategy": strategy,
+                "branch": result.branch
+            }),
+        };
+        if let Err(e) = self
+            .services
+            .backend
+            .append_activity(&result.wi_id, &log_entry)
+        {
+            self.shell.status_message = Some(format!("Activity log error: {e}"));
+        }
+
+        if actual_status.as_ref() != Some(&WorkItemStatus::Review) {
+            // Item was moved away from Review while merge was in-flight.
+            // The merge already happened on GitHub, but we do not change
+            // the local status or delete the worktree.
+            self.shell.status_message = Some(
+                "PR merged on GitHub, but item status was changed - not advancing to Done"
+                    .to_string(),
+            );
+            return;
+        }
+
+        // Clean up worktree directory.
+        self.cleanup_worktree_for_item(&result.wi_id);
+
+        // Advance to Done.
+        self.apply_stage_change(
+            &result.wi_id,
+            WorkItemStatus::Review,
+            WorkItemStatus::Done,
+            "pr_merge",
+        );
+        self.shell.status_message = Some(format!("PR merged ({strategy}) and moved to [DN]"));
+    }
+
+    /// Handle a merge-conflict outcome: log the conflict, stash a
+    /// rework reason, and bounce the item back to Implementing.
+    fn handle_pr_merge_conflict(
+        &mut self,
+        result: &crate::app::PrMergeResult,
+        stderr: &str,
+        actual_status: Option<WorkItemStatus>,
+    ) {
+        if actual_status.as_ref() != Some(&WorkItemStatus::Review) {
+            return;
+        }
+        // Log conflict to activity log.
+        let conflict_entry = ActivityEntry {
+            timestamp: now_iso8601(),
+            event_type: "merge_conflict".to_string(),
+            payload: serde_json::json!({
+                "branch": result.branch,
+                "stderr": stderr.trim()
+            }),
+        };
+        if let Err(e) = self
+            .services
+            .backend
+            .append_activity(&result.wi_id, &conflict_entry)
+        {
+            self.shell.status_message = Some(format!("Activity log error: {e}"));
+        }
+        let reason =
+            "Merge failed due to conflicts. Rebase onto the base branch and resolve all conflicts."
+                .to_string();
+        self.rework_reasons.insert(result.wi_id.clone(), reason);
+        self.apply_stage_change(
+            &result.wi_id,
+            WorkItemStatus::Review,
+            WorkItemStatus::Implementing,
+            "merge_conflict",
+        );
+        self.alert_message =
+            Some("Merge conflict detected - moved back to [IM] for rebase/resolve".to_string());
     }
 
     /// Spawn a background thread to submit a PR review (approve or

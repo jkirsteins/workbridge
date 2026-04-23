@@ -6,6 +6,93 @@ use super::{
     install_cached_repo_with_cleanliness, push_selected_review_item,
 };
 
+/// Worktree mock that reports a single clean live worktree for the
+/// (branch, repo) pair it was constructed with. Used by the helper
+/// below to stand in for a live `WorktreeService` when the test
+/// exclusively exercises the github-precheck path.
+struct CleanWorktreeMock {
+    branch: String,
+    repo: PathBuf,
+}
+impl WorktreeService for CleanWorktreeMock {
+    fn list_worktrees(
+        &self,
+        repo_path: &std::path::Path,
+    ) -> Result<Vec<crate::worktree_service::WorktreeInfo>, crate::worktree_service::WorktreeError>
+    {
+        assert_eq!(repo_path, self.repo);
+        Ok(vec![crate::worktree_service::WorktreeInfo {
+            path: self.repo.join(".worktrees").join(&self.branch),
+            branch: Some(self.branch.clone()),
+            is_main: false,
+            has_commits_ahead: Some(false),
+            dirty: Some(false),
+            untracked: Some(false),
+            unpushed: Some(0),
+            behind_remote: Some(0),
+        }])
+    }
+    fn create_worktree(
+        &self,
+        _: &std::path::Path,
+        _: &str,
+        _: &std::path::Path,
+    ) -> Result<crate::worktree_service::WorktreeInfo, crate::worktree_service::WorktreeError> {
+        Err(crate::worktree_service::WorktreeError::GitError(
+            "not used".into(),
+        ))
+    }
+    fn remove_worktree(
+        &self,
+        _: &std::path::Path,
+        _: &std::path::Path,
+        _: bool,
+        _: bool,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+    fn delete_branch(
+        &self,
+        _: &std::path::Path,
+        _: &str,
+        _: bool,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+    fn default_branch(
+        &self,
+        _: &std::path::Path,
+    ) -> Result<String, crate::worktree_service::WorktreeError> {
+        Ok("main".to_string())
+    }
+    fn github_remote(
+        &self,
+        _: &std::path::Path,
+    ) -> Result<Option<(String, String)>, crate::worktree_service::WorktreeError> {
+        Ok(None)
+    }
+    fn fetch_branch(
+        &self,
+        _: &std::path::Path,
+        _: &str,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+    fn create_branch(
+        &self,
+        _: &std::path::Path,
+        _: &str,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+    fn prune_worktrees(
+        &self,
+        _: &std::path::Path,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+}
+
 /// Helper to build an `App` with both a clean-worktree stub and a
 /// configurable `MockGithubClient` driving the
 /// `fetch_live_merge_state` return. Used by the remote-precheck
@@ -13,73 +100,6 @@ use super::{
 pub fn install_live_pr_precheck_app(spec: LivePrPrecheckSpec<'_>) -> (App, WorkItemId) {
     use crate::config::InMemoryConfigProvider;
     use crate::github_client::MockGithubClient;
-    use crate::worktree_service::{WorktreeError, WorktreeInfo};
-
-    struct CleanWorktreeMock {
-        branch: String,
-        repo: PathBuf,
-    }
-    impl WorktreeService for CleanWorktreeMock {
-        fn list_worktrees(
-            &self,
-            repo_path: &std::path::Path,
-        ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
-            assert_eq!(repo_path, self.repo);
-            Ok(vec![WorktreeInfo {
-                path: self.repo.join(".worktrees").join(&self.branch),
-                branch: Some(self.branch.clone()),
-                is_main: false,
-                has_commits_ahead: Some(false),
-                dirty: Some(false),
-                untracked: Some(false),
-                unpushed: Some(0),
-                behind_remote: Some(0),
-            }])
-        }
-        fn create_worktree(
-            &self,
-            _: &std::path::Path,
-            _: &str,
-            _: &std::path::Path,
-        ) -> Result<WorktreeInfo, WorktreeError> {
-            Err(WorktreeError::GitError("not used".into()))
-        }
-        fn remove_worktree(
-            &self,
-            _: &std::path::Path,
-            _: &std::path::Path,
-            _: bool,
-            _: bool,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-        fn delete_branch(
-            &self,
-            _: &std::path::Path,
-            _: &str,
-            _: bool,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-        fn default_branch(&self, _: &std::path::Path) -> Result<String, WorktreeError> {
-            Ok("main".to_string())
-        }
-        fn github_remote(
-            &self,
-            _: &std::path::Path,
-        ) -> Result<Option<(String, String)>, WorktreeError> {
-            Ok(None)
-        }
-        fn fetch_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-        fn create_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-        fn prune_worktrees(&self, _: &std::path::Path) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-    }
 
     let LivePrPrecheckSpec {
         live_pr_state,
@@ -338,74 +358,97 @@ fn execute_merge_through_live_precheck_surfaces_remote_error() {
 /// block with the LOCAL wording ("Uncommitted changes..."), not the
 /// remote wording. Drives the actual precheck thread so the
 /// classifier's priority order is verified end-to-end.
+/// Worktree mock that reports a single DIRTY live worktree for a
+/// given (repo, branch). Mirrors `CleanWorktreeMock` but flips the
+/// `dirty` signal so the precheck classifier rates LOCAL dirty higher
+/// than the remote-conflict signal it also sees.
+struct DirtyWorktreeMock {
+    branch: String,
+    repo: PathBuf,
+}
+impl WorktreeService for DirtyWorktreeMock {
+    fn list_worktrees(
+        &self,
+        _: &std::path::Path,
+    ) -> Result<Vec<crate::worktree_service::WorktreeInfo>, crate::worktree_service::WorktreeError>
+    {
+        Ok(vec![crate::worktree_service::WorktreeInfo {
+            path: self.repo.join(".worktrees").join(&self.branch),
+            branch: Some(self.branch.clone()),
+            is_main: false,
+            has_commits_ahead: Some(false),
+            dirty: Some(true),
+            untracked: Some(false),
+            unpushed: Some(0),
+            behind_remote: Some(0),
+        }])
+    }
+    fn create_worktree(
+        &self,
+        _: &std::path::Path,
+        _: &str,
+        _: &std::path::Path,
+    ) -> Result<crate::worktree_service::WorktreeInfo, crate::worktree_service::WorktreeError> {
+        Err(crate::worktree_service::WorktreeError::GitError(
+            "not used".into(),
+        ))
+    }
+    fn remove_worktree(
+        &self,
+        _: &std::path::Path,
+        _: &std::path::Path,
+        _: bool,
+        _: bool,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+    fn delete_branch(
+        &self,
+        _: &std::path::Path,
+        _: &str,
+        _: bool,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+    fn default_branch(
+        &self,
+        _: &std::path::Path,
+    ) -> Result<String, crate::worktree_service::WorktreeError> {
+        Ok("main".to_string())
+    }
+    fn github_remote(
+        &self,
+        _: &std::path::Path,
+    ) -> Result<Option<(String, String)>, crate::worktree_service::WorktreeError> {
+        Ok(None)
+    }
+    fn fetch_branch(
+        &self,
+        _: &std::path::Path,
+        _: &str,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+    fn create_branch(
+        &self,
+        _: &std::path::Path,
+        _: &str,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+    fn prune_worktrees(
+        &self,
+        _: &std::path::Path,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+}
+
 #[test]
 fn execute_merge_through_live_precheck_dirty_wins_over_pr_conflict() {
     use crate::config::InMemoryConfigProvider;
     use crate::github_client::{LivePrState, MockGithubClient};
     use crate::work_item::{CheckStatus, MergeableState};
-    use crate::worktree_service::{WorktreeError, WorktreeInfo};
-
-    struct DirtyWorktreeMock {
-        branch: String,
-        repo: PathBuf,
-    }
-    impl WorktreeService for DirtyWorktreeMock {
-        fn list_worktrees(&self, _: &std::path::Path) -> Result<Vec<WorktreeInfo>, WorktreeError> {
-            Ok(vec![WorktreeInfo {
-                path: self.repo.join(".worktrees").join(&self.branch),
-                branch: Some(self.branch.clone()),
-                is_main: false,
-                has_commits_ahead: Some(false),
-                dirty: Some(true),
-                untracked: Some(false),
-                unpushed: Some(0),
-                behind_remote: Some(0),
-            }])
-        }
-        fn create_worktree(
-            &self,
-            _: &std::path::Path,
-            _: &str,
-            _: &std::path::Path,
-        ) -> Result<WorktreeInfo, WorktreeError> {
-            Err(WorktreeError::GitError("not used".into()))
-        }
-        fn remove_worktree(
-            &self,
-            _: &std::path::Path,
-            _: &std::path::Path,
-            _: bool,
-            _: bool,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-        fn delete_branch(
-            &self,
-            _: &std::path::Path,
-            _: &str,
-            _: bool,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-        fn default_branch(&self, _: &std::path::Path) -> Result<String, WorktreeError> {
-            Ok("main".to_string())
-        }
-        fn github_remote(
-            &self,
-            _: &std::path::Path,
-        ) -> Result<Option<(String, String)>, WorktreeError> {
-            Ok(None)
-        }
-        fn fetch_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-        fn create_branch(&self, _: &std::path::Path, _: &str) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-        fn prune_worktrees(&self, _: &std::path::Path) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-    }
 
     let repo = PathBuf::from("/tmp/exec-merge-dirty-over-conflict");
     let branch = "feature/dirty-over-conflict".to_string();

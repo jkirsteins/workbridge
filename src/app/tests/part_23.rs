@@ -84,6 +84,7 @@ fn poll_review_request_merges_merged_advances_to_done_and_clears_watch() {
             .any(|(id, _, pr)| *id == rec_id && pr.number == 42),
         "pr_identity must be persisted"
     );
+    drop(saved);
 
     // The stage_change activity entry carries source=="pr_merge"
     // (the merge-gate invariant).
@@ -113,6 +114,7 @@ fn poll_review_request_merges_merged_advances_to_done_and_clears_watch() {
         Some("external_review_merge"),
         "strategy must differentiate reviewer-side merges"
     );
+    drop(activities);
 }
 
 /// After a merged poll, reassembling with the same backend should

@@ -1,10 +1,9 @@
 //! Subset of app tests; see `src/app/tests/mod.rs` for shared setup.
 
 use super::{
-    ActivityEntry, App, Arc, BackendError, BackendType, Config, CreateWorkItem, DisplayEntry,
-    Duration, PathBuf, RepoAssociationRecord, StaleWorktreePrompt, StubBackend,
-    StubWorktreeService, UserActionKey, UserActionPayload, WorkItemBackend, WorkItemId,
-    WorkItemStatus, WorktreeCreateResult, WorktreeService, drain_worktree_creation,
+    App, Arc, BackendType, Config, DisplayEntry, Duration, PathBuf, StaleWorktreePrompt,
+    StubBackend, StubWorktreeService, UserActionKey, UserActionPayload, WorkItemId, WorkItemStatus,
+    WorktreeCreateResult, WorktreeService, drain_worktree_creation,
 };
 
 /// F-1 regression: importing a PR whose branch cannot be fetched from
@@ -14,207 +13,9 @@ use super::{
 #[test]
 fn import_skips_worktree_when_fetch_fails() {
     use crate::work_item::{CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision};
-    use crate::work_item_backend::ListResult;
-    use crate::worktree_service::{WorktreeError, WorktreeInfo};
 
-    /// Mock worktree service where `fetch_branch` always fails
-    /// (simulates fork PR or branch not on origin).
-    struct FailFetchWorktreeService {
-        created: std::sync::Mutex<Vec<(PathBuf, String, PathBuf)>>,
-    }
-
-    impl WorktreeService for FailFetchWorktreeService {
-        fn list_worktrees(
-            &self,
-            _repo_path: &std::path::Path,
-        ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
-            Ok(Vec::new())
-        }
-
-        fn create_worktree(
-            &self,
-            repo_path: &std::path::Path,
-            branch: &str,
-            target_dir: &std::path::Path,
-        ) -> Result<WorktreeInfo, WorktreeError> {
-            self.created.lock().unwrap().push((
-                repo_path.to_path_buf(),
-                branch.to_string(),
-                target_dir.to_path_buf(),
-            ));
-            Ok(WorktreeInfo {
-                path: target_dir.to_path_buf(),
-                branch: Some(branch.to_string()),
-                is_main: false,
-                has_commits_ahead: Some(false),
-                ..WorktreeInfo::default()
-            })
-        }
-
-        fn remove_worktree(
-            &self,
-            _repo_path: &std::path::Path,
-            _worktree_path: &std::path::Path,
-            _delete_branch: bool,
-            _force: bool,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-
-        fn delete_branch(
-            &self,
-            _repo_path: &std::path::Path,
-            _branch: &str,
-            _force: bool,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-
-        fn default_branch(&self, _repo_path: &std::path::Path) -> Result<String, WorktreeError> {
-            Ok("main".to_string())
-        }
-
-        fn github_remote(
-            &self,
-            _repo_path: &std::path::Path,
-        ) -> Result<Option<(String, String)>, WorktreeError> {
-            Ok(None)
-        }
-
-        fn fetch_branch(
-            &self,
-            _repo_path: &std::path::Path,
-            _branch: &str,
-        ) -> Result<(), WorktreeError> {
-            Err(WorktreeError::GitError(
-                "fatal: couldn't find remote ref fork-branch".into(),
-            ))
-        }
-
-        fn create_branch(
-            &self,
-            _repo_path: &std::path::Path,
-            _branch: &str,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-
-        fn prune_worktrees(&self, _repo_path: &std::path::Path) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-    }
-
-    /// Test backend that supports import.
-    struct TestBackend {
-        records: std::sync::Mutex<Vec<crate::work_item_backend::WorkItemRecord>>,
-    }
-
-    impl WorkItemBackend for TestBackend {
-        fn read(
-            &self,
-            id: &WorkItemId,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            self.records
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|r| r.id == *id)
-                .cloned()
-                .ok_or_else(|| BackendError::NotFound(id.clone()))
-        }
-        fn list(&self) -> Result<ListResult, BackendError> {
-            Ok(ListResult {
-                records: self.records.lock().unwrap().clone(),
-                corrupt: Vec::new(),
-            })
-        }
-        fn create(
-            &self,
-            _req: CreateWorkItem,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            Err(BackendError::Validation("not used".into()))
-        }
-        fn delete(&self, _id: &WorkItemId) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn update_status(
-            &self,
-            _id: &WorkItemId,
-            _status: WorkItemStatus,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn import(
-            &self,
-            unlinked: &crate::work_item::UnlinkedPr,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            let record = crate::work_item_backend::WorkItemRecord {
-                display_id: None,
-                id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported.json")),
-                title: unlinked.pr.title.clone(),
-                description: None,
-                status: WorkItemStatus::Implementing,
-                kind: crate::work_item::WorkItemKind::Own,
-                repo_associations: vec![RepoAssociationRecord {
-                    repo_path: unlinked.repo_path.clone(),
-                    branch: Some(unlinked.branch.clone()),
-                    pr_identity: None,
-                }],
-                plan: None,
-                done_at: None,
-            };
-            self.records.lock().unwrap().push(record.clone());
-            Ok(record)
-        }
-        fn import_review_request(
-            &self,
-            rr: &crate::work_item::ReviewRequestedPr,
-        ) -> Result<crate::work_item_backend::WorkItemRecord, BackendError> {
-            let record = crate::work_item_backend::WorkItemRecord {
-                display_id: None,
-                id: WorkItemId::LocalFile(PathBuf::from("/tmp/imported-rr.json")),
-                title: rr.pr.title.clone(),
-                status: WorkItemStatus::Review,
-                kind: crate::work_item::WorkItemKind::ReviewRequest,
-                repo_associations: vec![RepoAssociationRecord {
-                    repo_path: rr.repo_path.clone(),
-                    branch: Some(rr.branch.clone()),
-                    pr_identity: None,
-                }],
-                plan: None,
-                description: None,
-                done_at: None,
-            };
-            self.records.lock().unwrap().push(record.clone());
-            Ok(record)
-        }
-        fn append_activity(
-            &self,
-            _id: &WorkItemId,
-            _entry: &ActivityEntry,
-        ) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn update_plan(&self, _id: &WorkItemId, _plan: &str) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn read_plan(&self, _id: &WorkItemId) -> Result<Option<String>, BackendError> {
-            Ok(None)
-        }
-        fn set_done_at(&self, _id: &WorkItemId, _done_at: Option<u64>) -> Result<(), BackendError> {
-            Ok(())
-        }
-        fn activity_path_for(&self, _id: &WorkItemId) -> Option<std::path::PathBuf> {
-            None
-        }
-    }
-
-    let mock_ws = Arc::new(FailFetchWorktreeService {
-        created: std::sync::Mutex::new(Vec::new()),
-    });
-    let backend = TestBackend {
-        records: std::sync::Mutex::new(Vec::new()),
-    };
+    let mock_ws = super::shared::ImportMockWorktreeService::new_failing_fetch();
+    let backend = super::shared::ImportTestBackend::new();
     let mut app = App::with_config_and_worktree_service(
         Config::default(),
         Arc::new(backend),
@@ -261,6 +62,7 @@ fn import_skips_worktree_when_fetch_fails() {
         "import should NOT create a worktree when fetch fails, but {} were created",
         created.len(),
     );
+    drop(created);
 
     // Verify the backend record WAS created (import succeeded).
     assert!(
@@ -310,75 +112,86 @@ fn worktree_target_path_uses_config_worktree_dir() {
 /// the target branch. Any other match is rejected so the caller falls
 /// through to `create_worktree` (which surfaces git's "already checked
 /// out" error for truly conflicting cases).
-#[test]
-fn find_reusable_worktree_enforces_all_guards() {
-    use crate::worktree_service::{WorktreeError, WorktreeInfo};
-
-    struct ListOnlyMock {
-        entries: Vec<WorktreeInfo>,
+/// Mock whose only useful method is `list_worktrees`. Returns a canned
+/// entry list; every other trait method is a no-op stub so
+/// `find_reusable_worktree` - which only calls `list_worktrees` - can
+/// exercise its guard logic in isolation.
+struct ListOnlyMock {
+    entries: Vec<crate::worktree_service::WorktreeInfo>,
+}
+impl WorktreeService for ListOnlyMock {
+    fn list_worktrees(
+        &self,
+        _repo_path: &std::path::Path,
+    ) -> Result<Vec<crate::worktree_service::WorktreeInfo>, crate::worktree_service::WorktreeError>
+    {
+        Ok(self.entries.clone())
     }
-    impl WorktreeService for ListOnlyMock {
-        fn list_worktrees(
-            &self,
-            _repo_path: &std::path::Path,
-        ) -> Result<Vec<WorktreeInfo>, WorktreeError> {
-            Ok(self.entries.clone())
-        }
-        fn create_worktree(
-            &self,
-            _repo_path: &std::path::Path,
-            _branch: &str,
-            _target_dir: &std::path::Path,
-        ) -> Result<WorktreeInfo, WorktreeError> {
-            Err(WorktreeError::GitError("not used".into()))
-        }
-        fn remove_worktree(
-            &self,
-            _repo_path: &std::path::Path,
-            _worktree_path: &std::path::Path,
-            _delete_branch: bool,
-            _force: bool,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-        fn delete_branch(
-            &self,
-            _repo_path: &std::path::Path,
-            _branch: &str,
-            _force: bool,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-        fn default_branch(&self, _repo_path: &std::path::Path) -> Result<String, WorktreeError> {
-            Ok("main".into())
-        }
-        fn github_remote(
-            &self,
-            _repo_path: &std::path::Path,
-        ) -> Result<Option<(String, String)>, WorktreeError> {
-            Ok(None)
-        }
-        fn fetch_branch(
-            &self,
-            _repo_path: &std::path::Path,
-            _branch: &str,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-        fn create_branch(
-            &self,
-            _repo_path: &std::path::Path,
-            _branch: &str,
-        ) -> Result<(), WorktreeError> {
-            Ok(())
-        }
-        fn prune_worktrees(&self, _repo_path: &std::path::Path) -> Result<(), WorktreeError> {
-            Ok(())
-        }
+    fn create_worktree(
+        &self,
+        _repo_path: &std::path::Path,
+        _branch: &str,
+        _target_dir: &std::path::Path,
+    ) -> Result<crate::worktree_service::WorktreeInfo, crate::worktree_service::WorktreeError> {
+        Err(crate::worktree_service::WorktreeError::GitError(
+            "not used".into(),
+        ))
     }
+    fn remove_worktree(
+        &self,
+        _repo_path: &std::path::Path,
+        _worktree_path: &std::path::Path,
+        _delete_branch: bool,
+        _force: bool,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+    fn delete_branch(
+        &self,
+        _repo_path: &std::path::Path,
+        _branch: &str,
+        _force: bool,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+    fn default_branch(
+        &self,
+        _repo_path: &std::path::Path,
+    ) -> Result<String, crate::worktree_service::WorktreeError> {
+        Ok("main".into())
+    }
+    fn github_remote(
+        &self,
+        _repo_path: &std::path::Path,
+    ) -> Result<Option<(String, String)>, crate::worktree_service::WorktreeError> {
+        Ok(None)
+    }
+    fn fetch_branch(
+        &self,
+        _repo_path: &std::path::Path,
+        _branch: &str,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+    fn create_branch(
+        &self,
+        _repo_path: &std::path::Path,
+        _branch: &str,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+    fn prune_worktrees(
+        &self,
+        _repo_path: &std::path::Path,
+    ) -> Result<(), crate::worktree_service::WorktreeError> {
+        Ok(())
+    }
+}
 
-    // find_reusable_worktree canonicalizes both paths, so they must
-    // exist on disk. Use a temp dir with a fresh subdirectory per case.
+/// Prepare a temp repo with two worktree target paths on disk, matching
+/// the canonicalization requirements of `find_reusable_worktree`.
+/// Returns `(tmp_guard, repo_path, wt_target, other_target)`.
+fn setup_reuse_repo() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
     let repo = root.join("repo");
@@ -387,42 +200,43 @@ fn find_reusable_worktree_enforces_all_guards() {
     std::fs::create_dir_all(&wt_target).unwrap();
     let other_target = repo.join(".worktrees").join("feature-x-alt");
     std::fs::create_dir_all(&other_target).unwrap();
+    (tmp, repo, wt_target, other_target)
+}
+
+fn reuse_mock_with(path: PathBuf, branch: &str, is_main: bool) -> ListOnlyMock {
+    ListOnlyMock {
+        entries: vec![crate::worktree_service::WorktreeInfo {
+            path,
+            branch: Some(branch.into()),
+            is_main,
+            ..crate::worktree_service::WorktreeInfo::default()
+        }],
+    }
+}
+
+/// `find_reusable_worktree` must only accept worktrees that live at the
+/// exact expected target path, are not the main worktree, and are on
+/// the target branch. Any other match is rejected so the caller falls
+/// through to `create_worktree` (which surfaces git's "already checked
+/// out" error for truly conflicting cases).
+#[test]
+fn find_reusable_worktree_enforces_all_guards() {
+    let (_tmp, repo, wt_target, other_target) = setup_reuse_repo();
 
     // Case 1: exact match at wt_target, not main, branch matches -> accept.
-    let mock = ListOnlyMock {
-        entries: vec![WorktreeInfo {
-            path: wt_target.clone(),
-            branch: Some("feature-x".into()),
-            is_main: false,
-            ..WorktreeInfo::default()
-        }],
-    };
+    let mock = reuse_mock_with(wt_target.clone(), "feature-x", false);
     let found = App::find_reusable_worktree(&mock, &repo, "feature-x", &wt_target);
     assert!(found.is_some(), "valid reuse should be accepted");
 
     // Case 2: is_main=true must be rejected even if path and branch match.
-    let mock = ListOnlyMock {
-        entries: vec![WorktreeInfo {
-            path: wt_target.clone(),
-            branch: Some("feature-x".into()),
-            is_main: true,
-            ..WorktreeInfo::default()
-        }],
-    };
+    let mock = reuse_mock_with(wt_target.clone(), "feature-x", true);
     assert!(
         App::find_reusable_worktree(&mock, &repo, "feature-x", &wt_target).is_none(),
         "main worktree must never be reused as a work-item worktree",
     );
 
     // Case 3: branch mismatch must be rejected.
-    let mock = ListOnlyMock {
-        entries: vec![WorktreeInfo {
-            path: wt_target.clone(),
-            branch: Some("other-branch".into()),
-            is_main: false,
-            ..WorktreeInfo::default()
-        }],
-    };
+    let mock = reuse_mock_with(wt_target.clone(), "other-branch", false);
     assert!(
         App::find_reusable_worktree(&mock, &repo, "feature-x", &wt_target).is_none(),
         "branch mismatch must not be reused",
@@ -430,14 +244,7 @@ fn find_reusable_worktree_enforces_all_guards() {
 
     // Case 4: path mismatch (worktree at a different location than the
     // expected .worktrees/<branch>) must be rejected.
-    let mock = ListOnlyMock {
-        entries: vec![WorktreeInfo {
-            path: other_target,
-            branch: Some("feature-x".into()),
-            is_main: false,
-            ..WorktreeInfo::default()
-        }],
-    };
+    let mock = reuse_mock_with(other_target, "feature-x", false);
     assert!(
         App::find_reusable_worktree(&mock, &repo, "feature-x", &wt_target).is_none(),
         "worktree at unexpected location must not be silently adopted",
@@ -453,14 +260,7 @@ fn find_reusable_worktree_enforces_all_guards() {
     // Case 6: wt_target does not exist on disk -> None (canonicalization
     // fails; the caller will fall through to create_worktree).
     let missing_target = repo.join(".worktrees").join("never-existed");
-    let mock = ListOnlyMock {
-        entries: vec![WorktreeInfo {
-            path: wt_target,
-            branch: Some("feature-x".into()),
-            is_main: false,
-            ..WorktreeInfo::default()
-        }],
-    };
+    let mock = reuse_mock_with(wt_target, "feature-x", false);
     assert!(
         App::find_reusable_worktree(&mock, &repo, "feature-x", &missing_target).is_none(),
         "non-existent target path must not match anything",

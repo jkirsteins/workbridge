@@ -64,389 +64,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
-    // When the first-run global-harness modal is visible, intercept
-    // keys before the usual dispatch so c/x/esc route to the modal
-    // and do not trigger work-item or drawer handlers below. This must
-    // come before `global_drawer_open` because the modal is shown as
-    // a precondition to the drawer opening for the first time.
-    if app.first_run_global_harness_modal.is_some() {
-        handle_first_run_global_harness_modal(app, key);
-        return true;
-    }
-
-    // When the global assistant drawer is open, route all keys to it.
-    if app.global_drawer.open {
-        return handle_global_drawer_key(app, key);
-    }
-
-    // When the create dialog is open, route all keys to it.
-    if app.create_dialog.visible {
-        handle_create_dialog(app, key);
-        return true;
-    }
-
-    // When an alert dialog is shown, Enter or Esc dismisses it.
-    // This must be checked before other prompts since alerts overlay everything.
-    if app.alert_message.is_some() {
-        if let (_, KeyCode::Enter | KeyCode::Esc) = (key.modifiers, key.code) {
-            app.alert_message = None;
-        }
-        return true;
-    }
-
-    // "Set branch name" recovery modal. Must come before any handler
-    // that might interpret `d`, `q`, Enter, or arrow keys so the user
-    // cannot accidentally delete, quit, or advance a work item while
-    // trying to type a branch name. The dialog is mutually exclusive
-    // with every other prompt below (it is only opened from
-    // `spawn_session` / `advance_stage`, both of which refuse to run
-    // while a conflicting modal is up), so we do not need to worry
-    // about it stacking on top of another dialog.
-    if app.set_branch_dialog.is_some() {
-        handle_set_branch_dialog(app, key);
-        return true;
-    }
-
-    // When the rework reason prompt is visible, route keys to it.
-    if app.prompt_flags.rework_visible {
-        handle_rework_prompt(app, key);
-        return true;
-    }
-
-    // When the cleanup reason text input is active, route keys to it.
-    // This must be checked before cleanup_prompt_visible because both flags
-    // are true during text input.
-    if app.cleanup_flow.reason_input_active {
-        handle_cleanup_reason_input(app, key);
-        return true;
-    }
-
-    // When the cleanup is in progress (background thread running), swallow
-    // most keys - the dialog shows a spinner and cannot be interacted with.
-    // Handle Q/Ctrl+Q directly here so the user can force-quit if a subprocess
-    // hangs, rather than falling through to cleanup_prompt_visible which would
-    // swallow the key in its catch-all arm.
-    if app.is_user_action_in_flight(&UserActionKey::UnlinkedCleanup) {
-        if matches!(
-            (key.modifiers, key.code),
-            (
-                KeyModifiers::NONE | KeyModifiers::SHIFT,
-                KeyCode::Char('q' | 'Q')
-            ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
-        ) {
-            if !app.has_any_session() || app.shell.confirm_quit {
-                app.shell.should_quit = true;
-            } else {
-                app.shell.confirm_quit = true;
-                app.shell.status_message =
-                    Some("Press Q again to quit and kill all sessions".into());
-                sync_layout(app);
-            }
-        }
-        return true;
-    }
-
-    // When the unlinked cleanup confirmation prompt is visible, route keys.
-    if app.cleanup_flow.prompt_visible {
-        handle_cleanup_prompt(app, key);
-        return true;
-    }
-
-    // When the no-plan prompt is visible, route keys to it.
-    if app.prompt_flags.no_plan_visible {
-        handle_no_plan_prompt(app, key);
-        return true;
-    }
-
-    // Branch-gone dialog: user can delete the work item or dismiss.
-    if app.branch_gone_prompt.is_some() {
-        match (key.modifiers, key.code) {
-            (_, KeyCode::Char('d')) => {
-                // The outer `if app.branch_gone_prompt.is_some()`
-                // guard guarantees `take()` yields `Some`, but an
-                // `if let` here avoids a restriction-lint `unwrap()`
-                // and degrades to a no-op on the impossible None
-                // path rather than panicking the whole TUI.
-                let Some((wi_id, _)) = app.branch_gone_prompt.take() else {
-                    return true;
-                };
-                // Target the work item by identity rather than going
-                // through selected_work_item_id(), which in Board view
-                // reads from board_cursor rather than selected_item. The
-                // modal still renders a "Delete '<title>'?" confirmation
-                // so a mis-click on [d] in the branch-gone dialog does
-                // not destroy the work item without a second keypress.
-                // `open_delete_prompt_for` looks up the target by id and
-                // surfaces "Work item not found" if the item vanished
-                // between the prompt appearing and this keypress, so no
-                // outer existence check is needed.
-                app.open_delete_prompt_for(wi_id);
-            }
-            (_, KeyCode::Esc) => {
-                app.branch_gone_prompt = None;
-            }
-            _ => {}
-        }
-        return true;
-    }
-
-    // Stale-worktree recovery dialog: user can force-remove + retry, or dismiss.
-    if app.stale_worktree_prompt.is_some() {
-        // While recovery is in progress, swallow all keys (modal spinner).
-        // Q/Ctrl+Q still triggers force-quit so a hung recovery never traps
-        // the user.
-        if app.prompt_flags.stale_recovery_in_progress {
-            if matches!(
-                (key.modifiers, key.code),
-                (
-                    KeyModifiers::NONE | KeyModifiers::SHIFT,
-                    KeyCode::Char('q' | 'Q')
-                ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
-            ) {
-                if !app.has_any_session() || app.shell.confirm_quit {
-                    app.shell.should_quit = true;
-                } else {
-                    app.shell.confirm_quit = true;
-                    app.shell.status_message =
-                        Some("Press Q again to quit and kill all sessions".into());
-                    sync_layout(app);
-                }
-            }
-            return true;
-        }
-        match (key.modifiers, key.code) {
-            (_, KeyCode::Enter) => {
-                // Same guard-pattern as the branch-gone dialog above:
-                // the outer `is_some()` makes `take() == Some(_)`
-                // structurally, but an `if let` avoids a
-                // restriction-lint `unwrap()` and is a no-op on the
-                // impossible None path.
-                if let Some(prompt) = app.stale_worktree_prompt.take() {
-                    app.spawn_stale_worktree_recovery(prompt);
-                }
-            }
-            (_, KeyCode::Esc) => {
-                app.stale_worktree_prompt = None;
-            }
-            _ => {}
-        }
-        return true;
-    }
-
-    // In-progress guard: while the delete background thread is running,
-    // swallow all keys (including Claude session input) so the modal
-    // cannot be dismissed and the PTY panel cannot receive keystrokes.
-    // Q/Ctrl+Q still triggers force-quit so a hung delete never traps
-    // the user. Must come before delete_prompt_visible because both
-    // flags are true during in-progress.
-    if app.delete_flow.in_progress {
-        if matches!(
-            (key.modifiers, key.code),
-            (
-                KeyModifiers::NONE | KeyModifiers::SHIFT,
-                KeyCode::Char('q' | 'Q')
-            ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
-        ) {
-            if !app.has_any_session() || app.shell.confirm_quit {
-                app.shell.should_quit = true;
-            } else {
-                app.shell.confirm_quit = true;
-                app.shell.status_message =
-                    Some("Press Q again to quit and kill all sessions".into());
-                sync_layout(app);
-            }
-        }
-        return true;
-    }
-
-    // Delete confirmation modal: route keys to it while the prompt is
-    // visible but the background thread has not yet started.
-    if app.delete_flow.prompt_visible {
-        handle_delete_prompt(app, key);
-        return true;
-    }
-
-    // When a merge is in progress (background thread running), swallow
-    // most keys - the dialog shows a spinner and cannot be interacted with.
-    if app.merge_flow.in_progress {
-        if matches!(
-            (key.modifiers, key.code),
-            (
-                KeyModifiers::NONE | KeyModifiers::SHIFT,
-                KeyCode::Char('q' | 'Q')
-            ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
-        ) {
-            if !app.has_any_session() || app.shell.confirm_quit {
-                app.shell.should_quit = true;
-            } else {
-                app.shell.confirm_quit = true;
-                app.shell.status_message =
-                    Some("Press Q again to quit and kill all sessions".into());
-                sync_layout(app);
-            }
-        }
-        return true;
-    }
-
-    // When the merge strategy prompt is visible, handle it.
-    if app.merge_flow.confirm {
-        handle_merge_prompt(app, key);
-        return true;
-    }
-
-    // When the settings overlay is open, handle overlay-specific keys.
-    if app.settings.visible {
-        match (key.modifiers, key.code) {
-            (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) | (_, KeyCode::Esc)
-                if !app.settings.review_skill_editing =>
-            {
-                app.settings.close();
-            }
-            (_, KeyCode::Tab) if !app.settings.review_skill_editing => {
-                app.settings.tab = match app.settings.tab {
-                    SettingsTab::Repos => SettingsTab::ReviewGate,
-                    SettingsTab::ReviewGate => SettingsTab::Keybindings,
-                    SettingsTab::Keybindings => SettingsTab::Repos,
-                };
-                // Reset editing state when leaving ReviewGate tab.
-                app.settings.review_skill_editing = false;
-                app.settings.review_skill_input.clear();
-            }
-            (_, KeyCode::Left) if app.settings.tab == SettingsTab::Repos => {
-                app.settings.list_focus = SettingsListFocus::Managed;
-            }
-            (_, KeyCode::Right) if app.settings.tab == SettingsTab::Repos => {
-                app.settings.list_focus = SettingsListFocus::Available;
-            }
-            // ReviewGate tab: editing mode routes keys to the text input.
-            (_, KeyCode::Esc)
-                if app.settings.tab == SettingsTab::ReviewGate
-                    && app.settings.review_skill_editing =>
-            {
-                app.settings.review_skill_editing = false;
-                app.settings.review_skill_input.clear();
-            }
-            (_, KeyCode::Enter)
-                if app.settings.tab == SettingsTab::ReviewGate
-                    && app.settings.review_skill_editing =>
-            {
-                let new_value = app.settings.review_skill_input.text().trim().to_string();
-                let old_value = app.services.config.defaults.review_skill.clone();
-                app.services
-                    .config
-                    .defaults
-                    .review_skill
-                    .clone_from(&new_value);
-                if let Err(e) = app.services.config_provider.save(&app.services.config) {
-                    // Rollback on save failure.
-                    app.services.config.defaults.review_skill = old_value;
-                    app.shell.status_message = Some(format!("Error saving config: {e}"));
-                } else {
-                    app.shell.status_message = Some(format!("Review skill set to: {new_value}"));
-                }
-                app.settings.review_skill_editing = false;
-                app.settings.review_skill_input.clear();
-            }
-            (_, KeyCode::Enter) if app.settings.tab == SettingsTab::ReviewGate => {
-                // Start editing with the current config value.
-                let current = app.services.config.defaults.review_skill.clone();
-                app.settings.review_skill_input.set_text(&current);
-                app.settings.review_skill_editing = true;
-            }
-            (_, KeyCode::Char(c))
-                if app.settings.tab == SettingsTab::ReviewGate
-                    && app.settings.review_skill_editing
-                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                app.settings.review_skill_input.insert_char(c);
-            }
-            (_, KeyCode::Backspace)
-                if app.settings.tab == SettingsTab::ReviewGate
-                    && app.settings.review_skill_editing =>
-            {
-                app.settings.review_skill_input.delete_prev_char();
-            }
-            (_, KeyCode::Delete)
-                if app.settings.tab == SettingsTab::ReviewGate
-                    && app.settings.review_skill_editing =>
-            {
-                app.settings.review_skill_input.delete_next_char();
-            }
-            (_, KeyCode::Left)
-                if app.settings.tab == SettingsTab::ReviewGate
-                    && app.settings.review_skill_editing =>
-            {
-                app.settings.review_skill_input.move_left(false);
-            }
-            (_, KeyCode::Right)
-                if app.settings.tab == SettingsTab::ReviewGate
-                    && app.settings.review_skill_editing =>
-            {
-                app.settings.review_skill_input.move_right(false);
-            }
-            (_, KeyCode::Home)
-                if app.settings.tab == SettingsTab::ReviewGate
-                    && app.settings.review_skill_editing =>
-            {
-                app.settings.review_skill_input.move_to_line_start(false);
-            }
-            (_, KeyCode::End)
-                if app.settings.tab == SettingsTab::ReviewGate
-                    && app.settings.review_skill_editing =>
-            {
-                app.settings.review_skill_input.move_to_line_end(false);
-            }
-            (_, KeyCode::Up) => match app.settings.tab {
-                SettingsTab::Repos => match app.settings.list_focus {
-                    SettingsListFocus::Managed => {
-                        app.settings.repo_selected = app.settings.repo_selected.saturating_sub(1);
-                    }
-                    SettingsListFocus::Available => {
-                        app.settings.available_selected =
-                            app.settings.available_selected.saturating_sub(1);
-                    }
-                },
-                SettingsTab::ReviewGate => {}
-                SettingsTab::Keybindings => {
-                    app.settings.keybindings_scroll =
-                        app.settings.keybindings_scroll.saturating_sub(1);
-                }
-            },
-            (_, KeyCode::Down) => match app.settings.tab {
-                SettingsTab::Repos => match app.settings.list_focus {
-                    SettingsListFocus::Managed => {
-                        let max = app.total_repos().saturating_sub(1);
-                        if app.settings.repo_selected < max {
-                            app.settings.repo_selected += 1;
-                        }
-                    }
-                    SettingsListFocus::Available => {
-                        let max = app.available_repos().len().saturating_sub(1);
-                        if app.settings.available_selected < max {
-                            app.settings.available_selected += 1;
-                        }
-                    }
-                },
-                SettingsTab::ReviewGate => {}
-                SettingsTab::Keybindings => {
-                    app.settings.keybindings_scroll += 1;
-                }
-            },
-            (_, KeyCode::Enter)
-                if app.settings.tab == SettingsTab::Repos
-                    && app.settings.list_focus == SettingsListFocus::Managed =>
-            {
-                app.unmanage_selected_repo();
-            }
-            (_, KeyCode::Enter)
-                if app.settings.tab == SettingsTab::Repos
-                    && app.settings.list_focus == SettingsListFocus::Available =>
-            {
-                app.manage_selected_repo();
-            }
-            _ => {}
-        }
-        return true;
+    if let Some(result) = route_modal_key(app, key) {
+        return result;
     }
 
     // Any key other than the expected confirmation clears pending confirmations.
@@ -609,6 +228,374 @@ fn handle_first_run_global_harness_modal(app: &mut App, key: KeyEvent) {
             // modal (`alert_message` handling above).
         }
         _ => {}
+    }
+}
+
+/// Route a keypress through every modal / dialog / in-progress gate
+/// in priority order. Returns `Some(state_changed)` when the key was
+/// consumed by a modal (so `handle_key` should short-circuit), or
+/// `None` when no modal claimed the key and the outer dispatcher
+/// should continue with the normal focus-based routing.
+fn route_modal_key(app: &mut App, key: KeyEvent) -> Option<bool> {
+    // When the first-run global-harness modal is visible, intercept
+    // keys before the usual dispatch so c/x/esc route to the modal
+    // and do not trigger work-item or drawer handlers below. This must
+    // come before `global_drawer_open` because the modal is shown as
+    // a precondition to the drawer opening for the first time.
+    if app.first_run_global_harness_modal.is_some() {
+        handle_first_run_global_harness_modal(app, key);
+        return Some(true);
+    }
+
+    // When the global assistant drawer is open, route all keys to it.
+    if app.global_drawer.open {
+        return Some(handle_global_drawer_key(app, key));
+    }
+
+    // When the create dialog is open, route all keys to it.
+    if app.create_dialog.visible {
+        handle_create_dialog(app, key);
+        return Some(true);
+    }
+
+    // When an alert dialog is shown, Enter or Esc dismisses it.
+    // This must be checked before other prompts since alerts overlay everything.
+    if app.alert_message.is_some() {
+        if let (_, KeyCode::Enter | KeyCode::Esc) = (key.modifiers, key.code) {
+            app.alert_message = None;
+        }
+        return Some(true);
+    }
+
+    // "Set branch name" recovery modal. Must come before any handler
+    // that might interpret `d`, `q`, Enter, or arrow keys so the user
+    // cannot accidentally delete, quit, or advance a work item while
+    // trying to type a branch name. The dialog is mutually exclusive
+    // with every other prompt below (it is only opened from
+    // `spawn_session` / `advance_stage`, both of which refuse to run
+    // while a conflicting modal is up), so we do not need to worry
+    // about it stacking on top of another dialog.
+    if app.set_branch_dialog.is_some() {
+        handle_set_branch_dialog(app, key);
+        return Some(true);
+    }
+
+    // When the rework reason prompt is visible, route keys to it.
+    if app.prompt_flags.rework_visible {
+        handle_rework_prompt(app, key);
+        return Some(true);
+    }
+
+    // When the cleanup reason text input is active, route keys to it.
+    // This must be checked before cleanup_prompt_visible because both flags
+    // are true during text input.
+    if app.cleanup_flow.reason_input_active {
+        handle_cleanup_reason_input(app, key);
+        return Some(true);
+    }
+
+    // When the cleanup is in progress (background thread running), swallow
+    // most keys - the dialog shows a spinner and cannot be interacted with.
+    // Handle Q/Ctrl+Q directly here so the user can force-quit if a subprocess
+    // hangs, rather than falling through to cleanup_prompt_visible which would
+    // swallow the key in its catch-all arm.
+    if app.is_user_action_in_flight(&UserActionKey::UnlinkedCleanup) {
+        handle_in_progress_quit_only(app, key);
+        return Some(true);
+    }
+
+    // When the unlinked cleanup confirmation prompt is visible, route keys.
+    if app.cleanup_flow.prompt_visible {
+        handle_cleanup_prompt(app, key);
+        return Some(true);
+    }
+
+    // When the no-plan prompt is visible, route keys to it.
+    if app.prompt_flags.no_plan_visible {
+        handle_no_plan_prompt(app, key);
+        return Some(true);
+    }
+
+    // Branch-gone dialog: user can delete the work item or dismiss.
+    if app.branch_gone_prompt.is_some() {
+        handle_branch_gone_prompt(app, key);
+        return Some(true);
+    }
+
+    // Stale-worktree recovery dialog: user can force-remove + retry, or dismiss.
+    if app.stale_worktree_prompt.is_some() {
+        handle_stale_worktree_prompt(app, key);
+        return Some(true);
+    }
+
+    // In-progress guard: while the delete background thread is running,
+    // swallow all keys (including Claude session input) so the modal
+    // cannot be dismissed and the PTY panel cannot receive keystrokes.
+    // Q/Ctrl+Q still triggers force-quit so a hung delete never traps
+    // the user. Must come before delete_prompt_visible because both
+    // flags are true during in-progress.
+    if app.delete_flow.in_progress {
+        handle_in_progress_quit_only(app, key);
+        return Some(true);
+    }
+
+    // Delete confirmation modal: route keys to it while the prompt is
+    // visible but the background thread has not yet started.
+    if app.delete_flow.prompt_visible {
+        handle_delete_prompt(app, key);
+        return Some(true);
+    }
+
+    // When a merge is in progress (background thread running), swallow
+    // most keys - the dialog shows a spinner and cannot be interacted with.
+    if app.merge_flow.in_progress {
+        handle_in_progress_quit_only(app, key);
+        return Some(true);
+    }
+
+    // When the merge strategy prompt is visible, handle it.
+    if app.merge_flow.confirm {
+        handle_merge_prompt(app, key);
+        return Some(true);
+    }
+
+    // When the settings overlay is open, handle overlay-specific keys.
+    if app.settings.visible {
+        handle_settings_key(app, key);
+        return Some(true);
+    }
+
+    None
+}
+
+/// Handle a keypress while the branch-gone prompt is visible: `d`
+/// opens the delete modal for the affected work item, Esc dismisses
+/// the prompt, all other keys are swallowed.
+fn handle_branch_gone_prompt(app: &mut App, key: KeyEvent) {
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Char('d')) => {
+            // The outer `is_some()` guard guarantees `take()` yields
+            // `Some`, but an `if let` here avoids a restriction-lint
+            // `unwrap()` and degrades to a no-op on the impossible
+            // None path rather than panicking the whole TUI.
+            let Some((wi_id, _)) = app.branch_gone_prompt.take() else {
+                return;
+            };
+            // Target the work item by identity rather than going
+            // through selected_work_item_id(), which in Board view
+            // reads from board_cursor rather than selected_item. The
+            // modal still renders a "Delete '<title>'?" confirmation
+            // so a mis-click on [d] in the branch-gone dialog does
+            // not destroy the work item without a second keypress.
+            // `open_delete_prompt_for` looks up the target by id and
+            // surfaces "Work item not found" if the item vanished
+            // between the prompt appearing and this keypress, so no
+            // outer existence check is needed.
+            app.open_delete_prompt_for(wi_id);
+        }
+        (_, KeyCode::Esc) => {
+            app.branch_gone_prompt = None;
+        }
+        _ => {}
+    }
+}
+
+/// Handle a keypress while the stale-worktree recovery prompt is
+/// visible. During in-progress recovery only Q/Ctrl+Q is honoured (so
+/// a hung recovery can still be force-quit); otherwise Enter triggers
+/// the recovery spawn and Esc dismisses the prompt.
+fn handle_stale_worktree_prompt(app: &mut App, key: KeyEvent) {
+    if app.prompt_flags.stale_recovery_in_progress {
+        handle_in_progress_quit_only(app, key);
+        return;
+    }
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Enter) => {
+            // Same guard-pattern as `handle_branch_gone_prompt`: the
+            // outer `is_some()` makes `take() == Some(_)` structurally,
+            // but an `if let` avoids a restriction-lint `unwrap()` and
+            // is a no-op on the impossible None path.
+            if let Some(prompt) = app.stale_worktree_prompt.take() {
+                app.spawn_stale_worktree_recovery(prompt);
+            }
+        }
+        (_, KeyCode::Esc) => {
+            app.stale_worktree_prompt = None;
+        }
+        _ => {}
+    }
+}
+
+/// Handle a keypress while a background operation (cleanup, delete,
+/// merge, stale-worktree recovery) is in progress. Swallows all keys
+/// except Q/Ctrl+Q, which still triggers the standard
+/// quit-with-confirmation flow so a hung subprocess never traps the
+/// user.
+fn handle_in_progress_quit_only(app: &mut App, key: KeyEvent) {
+    if matches!(
+        (key.modifiers, key.code),
+        (
+            KeyModifiers::NONE | KeyModifiers::SHIFT,
+            KeyCode::Char('q' | 'Q')
+        ) | (KeyModifiers::CONTROL, KeyCode::Char('q'))
+    ) {
+        if !app.has_any_session() || app.shell.confirm_quit {
+            app.shell.should_quit = true;
+        } else {
+            app.shell.confirm_quit = true;
+            app.shell.status_message = Some("Press Q again to quit and kill all sessions".into());
+            sync_layout(app);
+        }
+    }
+}
+
+/// Route a keypress to the settings overlay. Handles tab cycling,
+/// list navigation, repo management, and the review-gate text-input
+/// edit mode. Extracted from `handle_key` so the main dispatcher
+/// stays under the `too_many_lines` clippy threshold.
+fn handle_settings_key(app: &mut App, key: KeyEvent) {
+    match (key.modifiers, key.code) {
+        (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char('?')) | (_, KeyCode::Esc)
+            if !app.settings.review_skill_editing =>
+        {
+            app.settings.close();
+        }
+        (_, KeyCode::Tab) if !app.settings.review_skill_editing => {
+            app.settings.tab = match app.settings.tab {
+                SettingsTab::Repos => SettingsTab::ReviewGate,
+                SettingsTab::ReviewGate => SettingsTab::Keybindings,
+                SettingsTab::Keybindings => SettingsTab::Repos,
+            };
+            // Reset editing state when leaving ReviewGate tab.
+            app.settings.review_skill_editing = false;
+            app.settings.review_skill_input.clear();
+        }
+        (_, KeyCode::Left) if app.settings.tab == SettingsTab::Repos => {
+            app.settings.list_focus = SettingsListFocus::Managed;
+        }
+        (_, KeyCode::Right) if app.settings.tab == SettingsTab::Repos => {
+            app.settings.list_focus = SettingsListFocus::Available;
+        }
+        _ if app.settings.tab == SettingsTab::ReviewGate && app.settings.review_skill_editing => {
+            handle_settings_review_gate_edit(app, key);
+        }
+        (_, KeyCode::Enter) if app.settings.tab == SettingsTab::ReviewGate => {
+            // Start editing with the current config value.
+            let current = app.services.config.defaults.review_skill.clone();
+            app.settings.review_skill_input.set_text(&current);
+            app.settings.review_skill_editing = true;
+        }
+        (_, KeyCode::Up) => handle_settings_up(app),
+        (_, KeyCode::Down) => handle_settings_down(app),
+        (_, KeyCode::Enter)
+            if app.settings.tab == SettingsTab::Repos
+                && app.settings.list_focus == SettingsListFocus::Managed =>
+        {
+            app.unmanage_selected_repo();
+        }
+        (_, KeyCode::Enter)
+            if app.settings.tab == SettingsTab::Repos
+                && app.settings.list_focus == SettingsListFocus::Available =>
+        {
+            app.manage_selected_repo();
+        }
+        _ => {}
+    }
+}
+
+/// Route a keypress to the review-gate review-skill text input while
+/// `review_skill_editing` is active.
+fn handle_settings_review_gate_edit(app: &mut App, key: KeyEvent) {
+    match (key.modifiers, key.code) {
+        (_, KeyCode::Esc) => {
+            app.settings.review_skill_editing = false;
+            app.settings.review_skill_input.clear();
+        }
+        (_, KeyCode::Enter) => {
+            let new_value = app.settings.review_skill_input.text().trim().to_string();
+            let old_value = app.services.config.defaults.review_skill.clone();
+            app.services
+                .config
+                .defaults
+                .review_skill
+                .clone_from(&new_value);
+            if let Err(e) = app.services.config_provider.save(&app.services.config) {
+                // Rollback on save failure.
+                app.services.config.defaults.review_skill = old_value;
+                app.shell.status_message = Some(format!("Error saving config: {e}"));
+            } else {
+                app.shell.status_message = Some(format!("Review skill set to: {new_value}"));
+            }
+            app.settings.review_skill_editing = false;
+            app.settings.review_skill_input.clear();
+        }
+        (_, KeyCode::Char(c)) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.settings.review_skill_input.insert_char(c);
+        }
+        (_, KeyCode::Backspace) => {
+            app.settings.review_skill_input.delete_prev_char();
+        }
+        (_, KeyCode::Delete) => {
+            app.settings.review_skill_input.delete_next_char();
+        }
+        (_, KeyCode::Left) => {
+            app.settings.review_skill_input.move_left(false);
+        }
+        (_, KeyCode::Right) => {
+            app.settings.review_skill_input.move_right(false);
+        }
+        (_, KeyCode::Home) => {
+            app.settings.review_skill_input.move_to_line_start(false);
+        }
+        (_, KeyCode::End) => {
+            app.settings.review_skill_input.move_to_line_end(false);
+        }
+        _ => {}
+    }
+}
+
+/// Up-arrow behaviour inside the settings overlay: scrolls the list
+/// or keybindings help, depending on the active tab.
+const fn handle_settings_up(app: &mut App) {
+    match app.settings.tab {
+        SettingsTab::Repos => match app.settings.list_focus {
+            SettingsListFocus::Managed => {
+                app.settings.repo_selected = app.settings.repo_selected.saturating_sub(1);
+            }
+            SettingsListFocus::Available => {
+                app.settings.available_selected = app.settings.available_selected.saturating_sub(1);
+            }
+        },
+        SettingsTab::ReviewGate => {}
+        SettingsTab::Keybindings => {
+            app.settings.keybindings_scroll = app.settings.keybindings_scroll.saturating_sub(1);
+        }
+    }
+}
+
+/// Down-arrow behaviour inside the settings overlay. Clamps to the
+/// last valid index in each list and advances the keybindings scroll
+/// offset.
+fn handle_settings_down(app: &mut App) {
+    match app.settings.tab {
+        SettingsTab::Repos => match app.settings.list_focus {
+            SettingsListFocus::Managed => {
+                let max = app.total_repos().saturating_sub(1);
+                if app.settings.repo_selected < max {
+                    app.settings.repo_selected += 1;
+                }
+            }
+            SettingsListFocus::Available => {
+                let max = app.available_repos().len().saturating_sub(1);
+                if app.settings.available_selected < max {
+                    app.settings.available_selected += 1;
+                }
+            }
+        },
+        SettingsTab::ReviewGate => {}
+        SettingsTab::Keybindings => {
+            app.settings.keybindings_scroll += 1;
+        }
     }
 }
 
