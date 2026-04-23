@@ -514,7 +514,7 @@ claude
 ```
 
 Source: `ClaudeCodeBackend::build_command` in
-the `agent_backend` module (`src/agent_backend/`), called via `App::build_agent_cmd`
+the `agent_backend` module (`src/agent_backend/`), called via `App::build_agent_cmd_with`
 from `App::finish_session_open`. Cwd: the work
 item's worktree path. The positional prompt MUST precede
 `--mcp-config`; see the regression test

@@ -373,7 +373,14 @@ pub struct ReviewGateVerdict {
 ///    table for anything non-obvious, and refresh the "Known Spawn
 ///    Sites" table if any spawn paths changed.
 /// 4. Promote the `#[cfg(test)]` variant to a real variant and wire
-///    `App::agent_backend` to select it based on config.
+///    the adapter into selection: per-work-item via `harness_choice`
+///    / `App::backend_for_work_item`, and globally via
+///    `config.defaults.global_assistant_harness` /
+///    `App::global_assistant_harness_kind`. The
+///    `App::services::agent_backend` field is NOT the resolver for
+///    any spawn path (see `docs/harness-contract.md` "Trait
+///    Implementation"); it only exists for test stubs and non-spawn
+///    helpers.
 pub trait AgentBackend: Send + Sync {
     /// Discriminant for logging and parity checks.
     fn kind(&self) -> AgentBackendKind;
