@@ -110,7 +110,7 @@ renderer. The registry stores `ClickTarget` values in two variants:
   clipboard.
 
 Keeping row clicks and copy clicks in separate variants means
-`short_display` / `fire_chrome_copy` never have to handle a row-click
+`short_display` / `ClickTracking::fire_copy` never have to handle a row-click
 payload, and `ClickKind` stays `Copy` / chrome-only.
 
 **Modality note.** Copy clicks fire through the priority check even
@@ -237,7 +237,7 @@ on success it reads `Copied: <short-value>`, on failure (both OSC 52
 and `arboard` returned an error) it reads `Copy failed: <short-value>`.
 Lying about the clipboard state is the worst UX failure mode for this
 feature - a user who believes the copy succeeded will paste stale
-content and only notice long after. `App::fire_chrome_copy`
+content and only notice long after. `ClickTracking::fire_copy`
 branches on the bool returned by `side_effects::clipboard::copy`.
 
 Implementation:
@@ -263,7 +263,7 @@ Implementation:
   the `MouseTarget::None` arm so labels drawn outside all PTY areas
   remain reachable.
 - `handle_chrome_click_fallback` arms a pending click on `Down(Left)`,
-  cancels on any `Drag(Left)`, and fires `App::fire_chrome_copy` on
+  cancels on any `Drag(Left)`, and fires `ClickTracking::fire_copy` on
   a matching `Up(Left)`. The drag-cancel check runs unconditionally
   at the top of `handle_mouse` so a drag over a PTY pane still
   invalidates an in-flight click-to-copy gesture that started on a

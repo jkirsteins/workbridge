@@ -8,8 +8,8 @@
 //! `App` holds `toasts: Toasts` and sibling subsystems talk to it
 //! through `&mut Toasts`. Field-borrow splitting at the tick / event
 //! dispatcher lets `Toasts` be borrowed disjointly from the rest of the
-//! app state so, for example, `ClickTracking::fire_chrome_copy` can
-//! both inspect the click registry and push a toast in the same call.
+//! app state so, for example, `ClickTracking::fire_copy` can both
+//! inspect the click registry and push a toast in the same call.
 
 use std::time::Duration;
 
@@ -38,9 +38,9 @@ impl Toasts {
     /// Show a transient top-right toast for ~2 seconds. Newest toasts
     /// stack at the top of the column. Multiple calls in quick
     /// succession produce a visible stack; each auto-dismisses
-    /// independently. Called from `ClickTracking::fire_chrome_copy`
-    /// and any other handler that wants to surface a short
-    /// confirmation without hijacking the status bar.
+    /// independently. Called from `ClickTracking::fire_copy` and any
+    /// other handler that wants to surface a short confirmation
+    /// without hijacking the status bar.
     pub fn push(&mut self, text: String) {
         self.entries.push(Toast {
             text,

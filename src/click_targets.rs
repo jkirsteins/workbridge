@@ -23,8 +23,8 @@ use ratatui_core::layout::Rect;
 /// This enum is deliberately chrome-copy-only. The structural "row
 /// click" kind lives as a separate variant on `ClickTarget` so the
 /// type system prevents a row-click payload from reaching code paths
-/// (like `short_display` / `fire_chrome_copy`) that only make sense
-/// for copyable labels.
+/// (like `short_display` / `ClickTracking::fire_copy`) that only make
+/// sense for copyable labels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClickKind {
     /// The pull request URL value in the work item detail view.
