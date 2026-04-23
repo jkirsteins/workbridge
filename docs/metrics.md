@@ -17,7 +17,7 @@ getting stuck?", "is my backlog growing or shrinking?".
 
 All metrics derive from the **per-work-item activity log** that
 `LocalFileBackend` already appends to on every stage transition, PR
-event, and review action (see `src/work_item_backend.rs` -
+event, and review action (see the `work_item_backend` module -
 `ActivityEntry`, `append_activity`). The aggregator reads the raw
 `activity-*.jsonl` files directly from disk via
 `metrics::aggregate_from_activity_logs`; the backend trait
@@ -77,7 +77,7 @@ the first log line.
 
 ## Snapshot shape
 
-`src/metrics.rs` exposes `MetricsSnapshot`, a self-contained value
+The `metrics` module exposes `MetricsSnapshot`, a self-contained value
 returned by `aggregate_from_activity_logs(data_dir)`:
 
 - `created_per_day: BTreeMap<DayNumber, u32>` - first-seen day for
@@ -233,7 +233,7 @@ One-line text header above the grid:
 
 Every chart panel has labels overlaid on the bottom border showing
 day offsets at 0% / 33% / 66% / 100% of the chart width. Rendered by
-`draw_bottom_axis_labels` (`src/ui.rs`), which writes directly to
+`draw_bottom_axis_labels` (in the `ui::dashboard` module), which writes directly to
 the bottom border row of the block after the chart has rendered. The
 labels update automatically when the window changes.
 

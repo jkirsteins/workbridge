@@ -215,7 +215,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{base64_decode, copy, osc52_sequence};
 
     #[test]
     fn osc52_sequence_shape() {

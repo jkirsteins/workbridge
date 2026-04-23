@@ -25,10 +25,9 @@ use crate::{event, fetcher, github_client, layout, ui, worktree_service};
 /// implementations produce. The `From` impls below satisfy the trait
 /// bounds that `PollCrossterm`, `PollTimers`, and `PollRendered` require.
 ///
-/// An aspirational `Message(AppMessage)` variant was removed when
-/// Phase 3 of the hygiene campaign eliminated dead `#[allow(dead_code)]`
-/// attributes; re-add it (and its dispatcher arm) in the same commit
-/// as the first real producer when inter-component messaging lands.
+/// An aspirational `Message(AppMessage)` variant was removed during a
+/// dead-code cleanup; re-add it (and its dispatcher arm) in the same
+/// commit as the first real producer when inter-component messaging lands.
 #[derive(Debug)]
 pub enum AppEvent {
     /// Terminal events (keyboard, mouse, resize) from crossterm.
@@ -144,13 +143,13 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
         let bottom_rows = u16::from(state.has_visible_status_bar())
             + u16::from(state.selected_work_item_context().is_some());
         let pl = layout::compute(size.width, size.height, bottom_rows);
-        state.pane_cols = pl.pane_cols;
-        state.pane_rows = pl.pane_rows;
+        state.shell.pane_cols = pl.pane_cols;
+        state.shell.pane_rows = pl.pane_rows;
 
         // Compute global drawer PTY dimensions via shared helper.
         let dl = layout::compute_drawer(size.width, size.height);
-        state.global_pane_cols = dl.pane_cols;
-        state.global_pane_rows = dl.pane_rows;
+        state.global_drawer.pane_cols = dl.pane_cols;
+        state.global_drawer.pane_rows = dl.pane_rows;
     }
 
     // Initial reassembly + display list build (already done in App::new,
@@ -170,10 +169,10 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
     if !active_repos.is_empty() {
         let (rx, handle) = fetcher::start_with_extra_branches(
             active_repos,
-            Arc::clone(&ctx.worktree_service),
-            Arc::clone(&ctx.github_client),
-            state.config.defaults.branch_issue_pattern.clone(),
-            extra_branches,
+            &ctx.worktree_service,
+            &ctx.github_client,
+            &state.services.config.defaults.branch_issue_pattern,
+            &extra_branches,
         );
         state.fetch_rx = Some(rx);
         state.fetcher_handle = Some(handle);
@@ -190,8 +189,9 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
     // on the Disconnected branch.
     let backfill_requests = state.collect_backfill_requests();
     if !backfill_requests.is_empty() {
-        state.pr_identity_backfill_activity =
-            Some(state.start_activity("Backfilling merged PR identities..."));
+        let activity = state
+            .activities
+            .start("Backfilling merged PR identities...");
         let gc = Arc::clone(&ctx.github_client);
         let (tx, rx) = crossbeam_channel::unbounded();
         std::thread::spawn(move || {
@@ -230,7 +230,7 @@ pub fn app_init(state: &mut App, ctx: &mut Global) -> Result<(), AppError> {
                 }
             }
         });
-        state.pr_identity_backfill_rx = Some(rx);
+        state.pr_identity_backfill.install(rx, activity);
     }
 
     Ok(())
@@ -265,52 +265,7 @@ pub fn app_event(
     ctx: &mut Global,
 ) -> Result<Control<AppEvent>, AppError> {
     match evt {
-        AppEvent::Crossterm(ct_event) => {
-            match ct_event {
-                ct::event::Event::Key(key) => {
-                    if !event::handle_key(state, *key) {
-                        return Ok(Control::Continue);
-                    }
-                }
-                ct::event::Event::Resize(cols, rows) => {
-                    event::handle_resize(state, *cols, *rows);
-                }
-                ct::event::Event::Mouse(mouse_event) => {
-                    if !event::handle_mouse(state, *mouse_event) {
-                        // Mouse event did not modify state (e.g. motion,
-                        // click, or scroll that wasn't forwarded). Skip
-                        // re-render.
-                        return Ok(Control::Continue);
-                    }
-                }
-                ct::event::Event::Paste(data) => {
-                    if !event::handle_paste(state, data) {
-                        return Ok(Control::Continue);
-                    }
-                }
-                _ => {
-                    return Ok(Control::Continue);
-                }
-            }
-            // Check if the app wants to quit after handling the key event.
-            if state.should_quit && !state.shutting_down {
-                // Initiate graceful shutdown.
-                state.send_sigterm_all();
-                state.cleanup_all_mcp();
-                state.shutting_down = true;
-                state.shutdown_started = Some(crate::side_effects::clock::instant_now());
-                state.should_quit = false;
-                state.status_message =
-                    Some("Waiting for sessions (force quit in 10s, or press Q)".into());
-                if state.all_dead() {
-                    return Ok(Control::Quit);
-                }
-            } else if state.should_quit && state.shutting_down {
-                // Force quit during shutdown (Q pressed).
-                return Ok(Control::Quit);
-            }
-            Ok(Control::Changed)
-        }
+        AppEvent::Crossterm(ct_event) => Ok(handle_crossterm_event(state, ct_event)),
         AppEvent::Timer(timeout) => {
             // The render tick fires at ~120fps (8ms).  Heavy background
             // work only runs every BACKGROUND_TICK_DIVISOR-th tick to
@@ -329,217 +284,15 @@ pub fn app_event(
             let is_background_tick = timeout.counter % BACKGROUND_TICK_DIVISOR == 0;
 
             if is_background_tick {
-                // Advance spinner for activity indicator animation.
-                // Tick when status-bar activities exist, when any work
-                // item has Claude actively working (the list/board
-                // spinner needs it), or when any modal in-progress flag
-                // is set (the modal spinner needs it). Without the
-                // modal-flag branch the delete/merge/cleanup modal
-                // spinners would freeze as soon as no status-bar
-                // activity or Claude session is running.
-                let modal_in_progress = state.delete_in_progress
-                    || state.merge_in_progress
-                    || state.is_user_action_in_flight(&crate::app::UserActionKey::UnlinkedCleanup);
-                if !state.activities.is_empty()
-                    || !state.agent_working.is_empty()
-                    || modal_in_progress
-                {
-                    state.spinner_tick = state.spinner_tick.wrapping_add(1);
-                }
-
-                // Drop expired click-to-copy toasts. Cheap in-memory
-                // retain; runs every tick so the stack auto-clears
-                // ~2 seconds after the most recent copy.
-                state.prune_toasts();
-
-                // Expire the `kk` double-press window. The hint toast
-                // auto-dismisses via `prune_toasts`, but the armed
-                // flag itself lives in `App::last_k_press` and must
-                // time out independently so a stale arm from a
-                // minute-ago press does not combine with a fresh `k`
-                // to kill a session the user did not intend to kill.
-                state.prune_k_press();
-
-                // Poll MCP status updates BEFORE liveness check so that a
-                // review gate verdict arriving in the same tick as session
-                // exit is processed before check_liveness clears the gate
-                // from review_gates.
-                state.poll_mcp_status_updates();
-
-                // Liveness check on all sessions.
-                state.check_liveness();
-
-                // Drain fetch results and reassemble if new data arrived.
-                if state.drain_fetch_results() {
-                    // Re-apply evictions so stale in-flight fetches don't
-                    // resurrect recently-closed PRs in the unlinked list.
-                    if !state.cleanup_evicted_branches.is_empty() {
-                        state.apply_cleanup_evictions();
-                        state.cleanup_evicted_branches.clear();
-                    }
-                    state.reassemble_work_items();
-                    state.build_display_list();
-                    state.global_mcp_context_dirty = true;
-                }
-
-                // Drain PR identity backfill results (one-time startup
-                // migration).
-                if state.drain_pr_identity_backfill() {
-                    state.reassemble_work_items();
-                    state.build_display_list();
-                    state.global_mcp_context_dirty = true;
-                }
-
-                // Refresh dynamic context for the global MCP server only
-                // when underlying data has changed, avoiding redundant
-                // JSON serialization on every tick.
-                if state.global_mcp_context_dirty && state.global_mcp_server.is_some() {
-                    state.refresh_global_mcp_context();
-                    state.global_mcp_context_dirty = false;
-                }
-
-                // Poll async operations. Capture status bar visibility
-                // before and after so we can sync layout if an activity
-                // started or ended.
-                let had_status = state.has_visible_status_bar();
-
-                // Poll async review gate result.
-                state.poll_review_gate();
-
-                // Poll async rebase gate result. Sits next to
-                // poll_review_gate because the two run on the same
-                // tick cadence and the rebase gate's right-pane
-                // takeover (`src/ui.rs`) reads from `app.rebase_gates`
-                // produced by this poll.
-                state.poll_rebase_gate();
-
-                // Poll async PR creation result.
-                state.poll_pr_creation();
-
-                // Poll async live working-tree precheck. Runs at the
-                // same ~200ms cadence as `poll_pr_merge`; on Ready it
-                // hands off to the actual merge thread, on Blocked it
-                // surfaces the live worktree blocker as an alert. See
-                // `App::poll_merge_precheck`.
-                state.poll_merge_precheck();
-
-                // Poll async PR merge result.
-                state.poll_pr_merge();
-
-                // Poll async review submission result.
-                state.poll_review_submission();
-
-                // Poll mergequeue items for externally merged PRs.
-                state.poll_mergequeue();
-
-                // Poll ReviewRequest items in Review for externally
-                // merged PRs. Same 30s cadence as `poll_mergequeue`;
-                // this is the only path that can observe a merged
-                // review-request PR (see `App::poll_review_request_merges`
-                // for the RCA).
-                state.poll_review_request_merges();
-
-                // Poll async worktree creation result.
-                state.poll_worktree_creation();
-
-                // Poll async session-open plan reads. Must run AFTER
-                // poll_worktree_creation so a just-created worktree can
-                // kick off its plan read on the same tick and see its
-                // result on the next one. Every blocking step (plan
-                // read, MCP socket bind, backend side-car writes, temp
-                // `--mcp-config` write) runs on a background thread -
-                // see `App::begin_session_open` and `docs/UI.md`
-                // "Blocking I/O Prohibition".
-                state.poll_session_opens();
-
-                // Phase 2: drain PTY spawn results from the
-                // background threads started by `finish_session_open`.
-                // The fork+exec runs off the UI thread so
-                // `Session::spawn` never blocks the event loop.
-                state.poll_session_spawns();
-
-                // Drain the global assistant preparation worker.
-                // Every blocking step (MCP socket bind, temp config
-                // write, scratch dir create, PTY fork+exec) runs on
-                // a background thread spawned by
-                // `spawn_global_session`; this poll moves the result
-                // into the durable `App::global_*` fields. See
-                // `docs/UI.md` "Blocking I/O Prohibition".
-                state.poll_global_session_open();
-
-                // Poll async unlinked-item cleanup result.
-                state.poll_unlinked_cleanup();
-
-                // Poll async MCP-triggered delete cleanup result.
-                state.poll_delete_cleanup();
-
-                // Drain completion messages from fire-and-forget orphan
-                // worktree cleanups (delete-during-create races): ends
-                // each spawn's status-bar activity and surfaces any
-                // warnings.
-                state.poll_orphan_cleanup_finished();
-
-                // Drain any fresh metrics snapshots from the background
-                // aggregator. Non-blocking; reads only the in-memory
-                // crossbeam channel.
-                state.poll_metrics_snapshot();
-
-                // Surface queued fetch errors.
-                state.drain_pending_fetch_errors();
-
-                // If status bar visibility changed (activity started/
-                // ended), resync layout so pane dimensions match the
-                // actual display area.
-                if state.has_visible_status_bar() != had_status {
-                    event::sync_layout(state);
-                }
-
-                // Check for external signals (SIGTERM, SIGINT).
-                if ctx.signal_received.swap(false, Ordering::Relaxed) {
-                    if state.shutting_down {
-                        // Second signal during shutdown - force kill and
-                        // exit.
-                        state.force_kill_all();
-                        return Ok(Control::Quit);
-                    }
-                    // First signal - initiate graceful shutdown.
-                    state.send_sigterm_all();
-                    state.cleanup_all_mcp();
-                    state.shutting_down = true;
-                    state.shutdown_started = Some(crate::side_effects::clock::instant_now());
-                    state.status_message =
-                        Some("Waiting for sessions (force quit in 10s, or press Q)".into());
-                    if state.all_dead() {
-                        return Ok(Control::Quit);
-                    }
-                }
-
-                // Shutdown deadline checks.
-                if state.shutting_down {
-                    if state.all_dead() {
-                        return Ok(Control::Quit);
-                    }
-                    if state.should_quit {
-                        return Ok(Control::Quit);
-                    }
-                    if let Some(started) = state.shutdown_started {
-                        let elapsed = crate::side_effects::clock::elapsed_since(started);
-                        if elapsed >= Duration::from_secs(10) {
-                            state.force_kill_all();
-                            return Ok(Control::Quit);
-                        }
-                        let remaining = 10u64.saturating_sub(elapsed.as_secs());
-                        state.status_message = Some(format!(
-                            "Waiting for sessions (force quit in {remaining}s, or press Q)"
-                        ));
-                    }
+                if let Some(control) = run_background_tick(state, ctx) {
+                    return Ok(control);
                 }
 
                 // Restart the background fetcher if repo management
                 // changed.
-                if state.fetcher_repos_changed {
-                    state.fetcher_repos_changed = false;
-                    state.fetcher_disconnected = false;
+                if state.fetcher_flags.repos_changed {
+                    state.fetcher_flags.repos_changed = false;
+                    state.fetcher_flags.disconnected = false;
                     // Stop the old fetcher. `handle.stop()` only flips
                     // an atomic flag - it does NOT kill an in-flight
                     // `gh` subprocess. Any thread mid-network-I/O will
@@ -555,12 +308,12 @@ pub fn app_event(
                     // cycles on a different repo set. `reset_fetch_state`
                     // groups the three invariants that must always move
                     // together here - drop `fetch_rx`, zero
-                    // `pending_fetch_count`, and end any owner of the
+                    // `activities.pending_fetch_count`, and end any owner of the
                     // current spinner (either the `GithubRefresh` helper
-                    // entry or the `structural_fetch_activity` fallback).
+                    // entry or the `activities.structural_fetch` fallback).
                     // Without this reset, a counted-but-unpaired
                     // `FetchStarted` from the old channel would strand
-                    // `pending_fetch_count > 0` forever, which the
+                    // `activities.pending_fetch_count > 0` forever, which the
                     // Ctrl+R hard gate in `src/event.rs` would then read
                     // as "a fetch cycle is still running" and
                     // permanently lock out the user.
@@ -581,10 +334,10 @@ pub fn app_event(
                         let new_extra = state.extra_branches_from_backend();
                         let (rx, handle) = fetcher::start_with_extra_branches(
                             new_repos,
-                            Arc::clone(&ctx.worktree_service),
-                            Arc::clone(&ctx.github_client),
-                            state.config.defaults.branch_issue_pattern.clone(),
-                            new_extra,
+                            &ctx.worktree_service,
+                            &ctx.github_client,
+                            &state.services.config.defaults.branch_issue_pattern,
+                            &new_extra,
                         );
                         state.fetch_rx = Some(rx);
                         state.fetcher_handle = Some(handle);
@@ -598,6 +351,280 @@ pub fn app_event(
     }
 }
 
+/// Dispatch a single crossterm event (key / resize / mouse / paste /
+/// focus) to the appropriate handler. Returns `Control::Continue` when
+/// the event did not modify state (so `run_tui` skips re-rendering),
+/// `Control::Changed` on state change, or `Control::Quit` when the
+/// post-key quit path elected to exit.
+fn handle_crossterm_event(state: &mut App, ct_event: &ct::event::Event) -> Control<AppEvent> {
+    match ct_event {
+        ct::event::Event::Key(key) => {
+            if !event::handle_key(state, *key) {
+                return Control::Continue;
+            }
+        }
+        ct::event::Event::Resize(cols, rows) => {
+            event::handle_resize(state, *cols, *rows);
+        }
+        ct::event::Event::Mouse(mouse_event) => {
+            if !event::handle_mouse(state, *mouse_event) {
+                // Mouse event did not modify state (e.g. motion,
+                // click, or scroll that wasn't forwarded). Skip
+                // re-render.
+                return Control::Continue;
+            }
+        }
+        ct::event::Event::Paste(data) => {
+            if !event::handle_paste(state, data) {
+                return Control::Continue;
+            }
+        }
+        _ => {
+            return Control::Continue;
+        }
+    }
+    // Check if the app wants to quit after handling the key event.
+    if state.shell.should_quit && !state.shell.shutting_down {
+        // Initiate graceful shutdown.
+        state.send_sigterm_all();
+        state.cleanup_all_mcp();
+        state.shell.shutting_down = true;
+        state.shell.shutdown_started = Some(crate::side_effects::clock::instant_now());
+        state.shell.should_quit = false;
+        state.shell.status_message =
+            Some("Waiting for sessions (force quit in 10s, or press Q)".into());
+        if state.all_dead() {
+            return Control::Quit;
+        }
+    } else if state.shell.should_quit && state.shell.shutting_down {
+        // Force quit during shutdown (Q pressed).
+        return Control::Quit;
+    }
+    Control::Changed
+}
+
+/// Run every background-tick poller in order. Ordering matters
+/// (`poll_mcp_status_updates` must precede `check_liveness`,
+/// `poll_worktree_creation` must precede `poll_session_opens`, etc.);
+/// each call's doc comment explains its position. See
+/// `docs/UI.md` "Blocking I/O Prohibition" for why none of these are
+/// allowed to block.
+fn run_background_polls(state: &mut App) {
+    // Poll async review gate result.
+    state.poll_review_gate();
+
+    // Poll async rebase gate result. Sits next to
+    // poll_review_gate because the two run on the same
+    // tick cadence and the rebase gate's right-pane
+    // takeover (`src/ui.rs`) reads from `app.rebase_gates`
+    // produced by this poll.
+    state.poll_rebase_gate();
+
+    // Poll async PR creation result.
+    state.poll_pr_creation();
+
+    // Poll async live working-tree precheck. Runs at the
+    // same ~200ms cadence as `poll_pr_merge`; on Ready it
+    // hands off to the actual merge thread, on Blocked it
+    // surfaces the live worktree blocker as an alert. See
+    // `App::poll_merge_precheck`.
+    state.poll_merge_precheck();
+
+    // Poll async PR merge result.
+    state.poll_pr_merge();
+
+    // Poll async review submission result.
+    state.poll_review_submission();
+
+    // Poll mergequeue items for externally merged PRs.
+    state.poll_mergequeue();
+
+    // Poll ReviewRequest items in Review for externally
+    // merged PRs. Same 30s cadence as `poll_mergequeue`;
+    // this is the only path that can observe a merged
+    // review-request PR (see `App::poll_review_request_merges`
+    // for the RCA).
+    state.poll_review_request_merges();
+
+    // Poll async worktree creation result.
+    state.poll_worktree_creation();
+
+    // Poll async session-open plan reads. Must run AFTER
+    // poll_worktree_creation so a just-created worktree can
+    // kick off its plan read on the same tick and see its
+    // result on the next one. Every blocking step (plan
+    // read, MCP socket bind, backend side-car writes, temp
+    // `--mcp-config` write) runs on a background thread -
+    // see `App::begin_session_open` and `docs/UI.md`
+    // "Blocking I/O Prohibition".
+    state.poll_session_opens();
+
+    // Phase 2: drain PTY spawn results from the
+    // background threads started by `finish_session_open`.
+    // The fork+exec runs off the UI thread so
+    // `Session::spawn` never blocks the event loop.
+    state.poll_session_spawns();
+
+    // Drain the global assistant preparation worker.
+    // Every blocking step (MCP socket bind, temp config
+    // write, scratch dir create, PTY fork+exec) runs on
+    // a background thread spawned by
+    // `spawn_global_session`; this poll moves the result
+    // into the durable `App::global_*` fields. See
+    // `docs/UI.md` "Blocking I/O Prohibition".
+    state.poll_global_session_open();
+
+    // Poll async unlinked-item cleanup result.
+    state.poll_unlinked_cleanup();
+
+    // Poll async MCP-triggered delete cleanup result.
+    state.poll_delete_cleanup();
+
+    // Drain completion messages from fire-and-forget orphan
+    // worktree cleanups (delete-during-create races): ends
+    // each spawn's status-bar activity and surfaces any
+    // warnings.
+    state.poll_orphan_cleanup_finished();
+
+    // Drain any fresh metrics snapshots from the background
+    // aggregator. Non-blocking; reads only the in-memory
+    // crossbeam channel.
+    state.poll_metrics_snapshot();
+
+    // Surface queued fetch errors.
+    state.drain_pending_fetch_errors();
+}
+
+/// Run the per-background-tick housekeeping that sits between two
+/// render ticks: spinner advance, toast pruning, liveness probing,
+/// fetch-result drain, PR-identity backfill drain, global-MCP context
+/// refresh, async-poller sweep, external signal dispatch, and
+/// shutdown-deadline enforcement. Returns `Some(Control::Quit)` when
+/// the tick elected to exit and `None` otherwise.
+fn run_background_tick(state: &mut App, ctx: &Global) -> Option<Control<AppEvent>> {
+    // Advance spinner for activity indicator animation.
+    // Tick when status-bar activities exist, when any work
+    // item has Claude actively working (the list/board
+    // spinner needs it), or when any modal in-progress flag
+    // is set (the modal spinner needs it). Without the
+    // modal-flag branch the delete/merge/cleanup modal
+    // spinners would freeze as soon as no status-bar
+    // activity or Claude session is running.
+    let modal_in_progress = state.delete_flow.in_progress
+        || state.merge_flow.in_progress
+        || state.is_user_action_in_flight(&crate::app::UserActionKey::UnlinkedCleanup);
+    if !state.activities.is_empty() || !state.agent_working.is_empty() || modal_in_progress {
+        state.activities.advance_spinner();
+    }
+
+    // Drop expired click-to-copy toasts. Cheap in-memory
+    // retain; runs every tick so the stack auto-clears
+    // ~2 seconds after the most recent copy.
+    state.toasts.prune();
+
+    // Expire the `kk` double-press window. The hint toast
+    // auto-dismisses via `Toasts::prune`, but the armed
+    // flag itself lives in `App::last_k_press` and must
+    // time out independently so a stale arm from a
+    // minute-ago press does not combine with a fresh `k`
+    // to kill a session the user did not intend to kill.
+    state.prune_k_press();
+
+    // Poll MCP status updates BEFORE liveness check so that a
+    // review gate verdict arriving in the same tick as session
+    // exit is processed before check_liveness clears the gate
+    // from review_gates.
+    state.poll_mcp_status_updates();
+
+    // Liveness check on all sessions.
+    state.check_liveness();
+
+    // Drain fetch results and reassemble if new data arrived.
+    if state.drain_fetch_results() {
+        // Re-apply evictions so stale in-flight fetches don't
+        // resurrect recently-closed PRs in the unlinked list.
+        if !state.cleanup_evicted_branches.is_empty() {
+            state.apply_cleanup_evictions();
+            state.cleanup_evicted_branches.clear();
+        }
+        state.reassemble_work_items();
+        state.build_display_list();
+        state.global_drawer.mcp_context_dirty = true;
+    }
+
+    // Drain PR identity backfill results (one-time startup
+    // migration).
+    if state.drain_pr_identity_backfill() {
+        state.reassemble_work_items();
+        state.build_display_list();
+        state.global_drawer.mcp_context_dirty = true;
+    }
+
+    // Refresh dynamic context for the global MCP server only
+    // when underlying data has changed, avoiding redundant
+    // JSON serialization on every tick.
+    if state.global_drawer.mcp_context_dirty && state.global_drawer.mcp_server.is_some() {
+        state.refresh_global_mcp_context();
+        state.global_drawer.mcp_context_dirty = false;
+    }
+
+    // Poll async operations. Capture status bar visibility
+    // before and after so we can sync layout if an activity
+    // started or ended.
+    let had_status = state.has_visible_status_bar();
+
+    run_background_polls(state);
+
+    // If status bar visibility changed (activity started/
+    // ended), resync layout so pane dimensions match the
+    // actual display area.
+    if state.has_visible_status_bar() != had_status {
+        event::sync_layout(state);
+    }
+
+    // Check for external signals (SIGTERM, SIGINT).
+    if ctx.signal_received.swap(false, Ordering::Relaxed) {
+        if state.shell.shutting_down {
+            // Second signal during shutdown - force kill and
+            // exit.
+            state.force_kill_all();
+            return Some(Control::Quit);
+        }
+        // First signal - initiate graceful shutdown.
+        state.send_sigterm_all();
+        state.cleanup_all_mcp();
+        state.shell.shutting_down = true;
+        state.shell.shutdown_started = Some(crate::side_effects::clock::instant_now());
+        state.shell.status_message =
+            Some("Waiting for sessions (force quit in 10s, or press Q)".into());
+        if state.all_dead() {
+            return Some(Control::Quit);
+        }
+    }
+
+    // Shutdown deadline checks.
+    if state.shell.shutting_down {
+        if state.all_dead() {
+            return Some(Control::Quit);
+        }
+        if state.shell.should_quit {
+            return Some(Control::Quit);
+        }
+        if let Some(started) = state.shell.shutdown_started {
+            let elapsed = crate::side_effects::clock::elapsed_since(started);
+            if elapsed >= Duration::from_secs(10) {
+                state.force_kill_all();
+                return Some(Control::Quit);
+            }
+            let remaining = 10u64.saturating_sub(elapsed.as_secs());
+            state.shell.status_message = Some(format!(
+                "Waiting for sessions (force quit in {remaining}s, or press Q)"
+            ));
+        }
+    }
+    None
+}
+
 /// Error callback. Re-raises I/O errors (terminal/poll failures should
 /// exit cleanly). Non-fatal errors are downgraded to status messages.
 pub fn app_error(
@@ -608,14 +635,14 @@ pub fn app_error(
     if let AppError::Io(_) = err {
         Err(err)
     } else {
-        state.status_message = Some(format!("Error: {err}"));
+        state.shell.status_message = Some(format!("Error: {err}"));
         Ok(Control::Changed)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{App, AppError, Global, SalsaAppContext, Theme, app_error};
 
     /// F-1: `app_error` re-raises I/O errors instead of swallowing them.
     /// Terminal and poll failures must propagate so rat-salsa exits
@@ -654,6 +681,7 @@ mod tests {
         );
         assert!(
             state
+                .shell
                 .status_message
                 .as_deref()
                 .unwrap_or("")

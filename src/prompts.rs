@@ -72,7 +72,9 @@ fn render_template(template: &str, vars: &HashMap<&str, &str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashMap;
+
+    use super::{PROMPTS_JSON, PromptEntry, render};
 
     #[test]
     fn render_planning_prompt() {

@@ -69,10 +69,9 @@ dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
 
-# Carpet-bombs at warn: promoted to error via CI's -D warnings. These
-# were flipped in Phase 3 of the hygiene campaign after the mechanical
-# findings were cleaned up. `priority = -1` lets individual
-# `allow`/`deny` lines below override a group-level warn.
+# Carpet-bombs at warn: promoted to error via CI's -D warnings.
+# `priority = -1` lets individual `allow`/`deny` lines below override
+# a group-level warn.
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 
@@ -82,9 +81,8 @@ unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 
-# Close the source-level allow loophole so Phase 3's cleanup does not
-# regress through "just add #[allow]" pressure. Every suppression now
-# has to live in this file with a rationale.
+# Close the source-level allow loophole. Every suppression has to live
+# in this file with a rationale rather than in an ad-hoc `#[allow]`.
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 
@@ -95,31 +93,35 @@ print_stdout = "allow"
 print_stderr = "allow"
 exit = "allow"
 
-# Design-doc noise allows (per the hygiene campaign design doc Phase 1
-# block list). Each has been judged pure noise for this crate's style.
+# Noise allows. Each has been judged pure noise for this crate's style.
 module_name_repetitions = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-too_many_lines = "allow"   # File-size budget is the real enforcement.
 similar_names = "allow"    # False-positive-heavy in TUI / event code.
 
-# TUI cast allows: the ratatui geometry surface is u16 width/height;
-# almost every cast the lint flags is u16<->u32<->usize arithmetic on
-# those inputs, which is safe for realistic terminal sizes.
-cast_possible_truncation = "allow"
-cast_possible_wrap = "allow"
-cast_sign_loss = "allow"
-cast_lossless = "allow"
-cast_precision_loss = "allow"
+# Doc-coverage lints: deny so new functions must document their error
+# and panic conditions.
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
 
-# Phase-4-deferred structural lints: all sites are in src/app.rs and
-# the cleanup requires the decomposition that Phase 4 will do. These
-# allow entries flip back to warn in the Phase 4 PR that finishes the
-# split.
-needless_pass_by_value = "allow"
-significant_drop_tightening = "allow"
-struct_excessive_bools = "allow"
-unused_self = "allow"
+# Function size: deny so overly-long functions have to be decomposed
+# (same philosophy as the 700-line file budget, one level down).
+too_many_lines = "deny"
+
+# Cast lints: deny so every cast between integer widths is deliberate.
+# Legitimate casts of u16 ratatui geometry to larger widths are always
+# safe and can use `u32::from(...)` / `usize::from(...)` instead of `as`.
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+cast_lossless = "deny"
+cast_precision_loss = "deny"
+
+# Structural lints: deny so unnecessary owned pass-by-value, premature
+# drop tightening, boolean-bag structs, and unused-self methods are all
+# surfaced as review friction rather than silently accumulating.
+needless_pass_by_value = "deny"
+significant_drop_tightening = "deny"
+struct_excessive_bools = "deny"
+unused_self = "deny"
 
 [lints.rustdoc]
 # No existing crate-level docs to break; safe to deny from day one.

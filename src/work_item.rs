@@ -282,8 +282,7 @@ pub struct PrInfo {
 /// Derived issue information attached to a repo association.
 /// Populated by assembly. Title used for work item title derivation;
 /// labels surface in the context bar. An open/closed state field was
-/// removed when Phase 3 of the hygiene campaign eliminated dead
-/// `#[allow(dead_code)]` attributes - no renderer ever consumed it.
+/// removed during a dead-code cleanup - no renderer ever consumed it.
 /// Re-add when issue state display lands.
 #[derive(Clone, Debug)]
 pub struct IssueInfo {
@@ -296,8 +295,7 @@ pub struct IssueInfo {
 /// (a Todo item can have errors). Each error is surfaced as a badge or
 /// detail in the UI.
 ///
-/// Aspirational variants were removed when Phase 3 of the hygiene
-/// campaign eliminated dead `#[allow(dead_code)]` attributes:
+/// Aspirational variants were removed during a dead-code cleanup:
 ///
 /// - `DetachedHead` - assembly does not produce it; detached worktrees
 ///   have no branch and therefore cannot match a work item.
@@ -499,7 +497,12 @@ impl Drop for FetcherHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::PathBuf;
+
+    use super::{
+        CheckStatus, MergeableState, PrInfo, PrState, ReviewDecision, ReviewRequestedPr,
+        WorkItemStatus,
+    };
 
     #[test]
     fn next_stage_progression() {

@@ -67,6 +67,15 @@ pub fn sleep(dur: Duration) {
     std::thread::sleep(dur);
 }
 
+/// Mock `sleep` used under `cfg(test)`. Advances the thread-local
+/// mock clock offset instead of actually blocking.
+///
+/// # Panics
+///
+/// Panics when a single thread exceeds `MOCK_SLEEP_SAFETY_CAP` calls
+/// into this function, which the mock uses as a canary for polling
+/// loops that would otherwise livelock a test because real wall-clock
+/// time never advances.
 #[cfg(test)]
 pub fn sleep(dur: Duration) {
     // Per-thread safety cap. `cargo test` runs tests in parallel

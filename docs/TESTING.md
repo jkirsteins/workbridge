@@ -48,17 +48,17 @@ Tests must not leave side effects on the host system. This includes:
 - Writing to the system clipboard (via `arboard`, OSC 52, `NSPasteboard`,
   or any other path)
 - Writing raw terminal escape sequences to stdout / stderr outside
-  `src/side_effects/`
+  the `side_effects` module tree
 - Reading wall-clock time or sleeping via `Instant::now`, `SystemTime::now`,
   `thread::sleep`, `std::thread::sleep`, `Instant::elapsed()`,
   `Receiver::recv_timeout` / `recv_deadline`, `Condvar::wait_timeout(_while)`,
-  or `Thread::park_timeout` outside `src/side_effects/clock.rs`
+  or `Thread::park_timeout` outside the `side_effects::clock` module
 - Using notification, audio, or visual system APIs
 
 ## Side-effect gating module
 
 All code paths that reach the host system outside `std::env::temp_dir()`
-live in `src/side_effects/`. That module is the ONLY place in the crate
+live in the `side_effects` module tree. That module is the ONLY place in the crate
 allowed to call `arboard::`, `directories::ProjectDirs` / `BaseDirs` /
 `UserDirs`, `std::env::home_dir`, `std::env::temp_dir`, read wall-clock
 time, sleep the current thread, or write raw terminal escape sequences
@@ -72,7 +72,7 @@ data directory")`) that tests already exercise through
 `InMemoryConfigProvider` and `LocalFileBackend::with_dir`.
 
 The pre-commit hook (`hooks/pre-commit`) enforces the boundary
-structurally: a staged `.rs` file outside `src/side_effects/` that
+structurally: a staged `.rs` file outside the `side_effects` module tree that
 references any of the gated symbols is rejected at commit time. See
 the P0 rule in `CLAUDE.md` "Severity overrides" for the review policy.
 
@@ -121,10 +121,10 @@ wrappers, tests must NOT read the wall-clock via:
   the shared generic helper that polls `try_recv` on a mock-clock
   driven timer. It works with both `std::sync::mpsc::Receiver` and
   `crossbeam_channel::Receiver` via the `PollableReceiver` trait
-  impls in `src/side_effects/clock.rs`. Adding a new channel kind
+  impls in the `side_effects::clock` module. Adding a new channel kind
   only requires another trait impl.
 
-The pre-commit hook rejects staged Rust files outside `src/side_effects/`
+The pre-commit hook rejects staged Rust files outside the `side_effects` module tree
 that call any of these APIs directly (`.elapsed(`, `recv_timeout(`,
 `recv_deadline(`, `wait_timeout(`, `park_timeout(` are all on the
 forbidden list alongside `Instant::now`, `SystemTime::now`, and
@@ -135,7 +135,7 @@ through a sleep path, call
 If you genuinely need a new host-visible side effect (for example, a
 new notification API), the add path is:
 
-1. Add the call inside `src/side_effects/` behind `#[cfg(not(test))]`,
+1. Add the call inside the `side_effects` module tree behind `#[cfg(not(test))]`,
    returning a no-op / `None` / `false` under `cfg(test)`.
 2. Expose a narrow wrapper from `side_effects::` and route callers
    through it.
@@ -145,11 +145,11 @@ new notification API), the add path is:
 Pre-authorized bounded exceptions that live outside the module and are
 documented here rather than routed through the gate:
 
-- `src/session.rs` spawns short-lived `sleep 60` / `sleep 0` child
+- `Session::spawn` covers short-lived `sleep 60` / `sleep 0` child
   processes for PTY lifecycle smoke tests. These subprocesses are
   reaped by the test itself and do not outlive it.
-- `src/mcp.rs` binds a UUID-suffixed Unix socket under the process temp
-  dir for the socket-server smoke test. The UUID makes the path
+- The `mcp` module binds a UUID-suffixed Unix socket under the process
+  temp dir for the socket-server smoke test. The UUID makes the path
   collision-free and the socket is unlinked during test teardown.
 
 ## Never use `git config` in tests
@@ -193,8 +193,8 @@ cargo test --features integration
 The pre-push hook runs `cargo test --all-features` which includes
 integration tests. This ensures they pass before code reaches the remote.
 
-Integration tests live in `src/worktree_service.rs` in the
-`integration_tests` module. Unit tests (like `parse_porcelain` tests that
+Integration tests live in the `worktree_service::integration_tests`
+submodule. Unit tests (like `parse_porcelain` tests that
 don't touch the filesystem) remain in the regular `tests` module and run
 on every `cargo test`.
 
@@ -238,7 +238,7 @@ on pushes to `master` with the following parallel jobs:
 - `machete` - `cargo machete` (unused dependency scan)
 - `typos` - `crate-ci/typos` action with `typos.toml`
 - `msrv` - `cargo check --all-features` pinned to the rust-version in `Cargo.toml` (1.88)
-- `budget` - `./hooks/budget-check.sh` enforcing `ci/file-size-budgets.toml`
+- `budget` - `./hooks/budget-check.sh` enforcing the uniform 700-line ceiling on every tracked `src/**/*.rs` file
 - `ratatui-builtin` - `./hooks/ratatui-builtin-check.sh` (warn-only heuristic)
 
 The `test` job uses `--all-features` deliberately so the merge gate exercises

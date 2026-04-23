@@ -61,23 +61,24 @@ by CI's `-D warnings`) rather than `forbid` because the crate has
 two legitimate unsafe surfaces that cannot be rewritten in safe
 Rust:
 
-- `src/session.rs` - PTY FFI (`libc::openpty`, `libc::dup`,
+- The `session` module - PTY FFI (`libc::openpty`, `libc::dup`,
   `libc::fcntl`, `libc::read`/`libc::write`, raw-fd construction)
   for the embedded terminal backend. Covered by unit and integration
   tests. The module opts out via a single file-level
   `#![expect(unsafe_code, reason = "...")]` attribute at the top of
-  `src/session.rs` (the entire file is the FFI boundary). The
+  the module (the entire module is the FFI boundary). The
   file-level `#![expect]` suppresses the `unsafe_code` lint across
   the whole module; it does NOT relieve the per-block SAFETY comment
   requirement described below. Every `unsafe { ... }` block still
   needs its own preceding SAFETY comment, and reviewers must flag
   any new block that lacks one even when the file-level attribute
   would otherwise silence the lint.
-- `src/app.rs` - two `libc::killpg(pid, SIGKILL)` blocks: one in the
-  rebase-gate drop path (`impl Drop for RebaseGateState`) and one in
-  the subprocess cancellation helper (`run_cancellable`). Each
-  enclosing function opts out via `#[expect(unsafe_code, reason =
-  "...")]` attached to the function, not to the unsafe block itself.
+- The `app` module tree - two `libc::killpg(pid, SIGKILL)` blocks:
+  one in the rebase-gate drop path (`impl Drop for RebaseGateState`)
+  and one in the subprocess cancellation helper (`run_cancellable`).
+  Each enclosing function opts out via `#[expect(unsafe_code, reason
+  = "...")]` attached to the function, not to the unsafe block
+  itself.
 
 Note that the opt-out uses `#[expect]`, NOT `#[allow]`, because
 `clippy::allow_attributes` is denied crate-wide so that no
@@ -179,25 +180,22 @@ code. The existing `cargo deny` call in `hooks/pre-commit` and the
 top-of-hook unset in `hooks/pre-push` are the reference patterns;
 copy whichever fits the surrounding structure.
 
-### File-size budgets
+### File-size budget
 
-`ci/file-size-budgets.toml` declares a maximum line count per source
-file. `hooks/budget-check.sh` enforces it (locally via pre-commit and
-in CI via the `budget` job). If you legitimately need a file to grow
-past its budget, bump the entry in the budget file as part of your
-PR and explain the growth in the commit message. The budget exists
-to prevent silent module bloat, not to ban growth - it wants the
-growth to be an explicit, reviewable decision.
+`hooks/budget-check.sh` enforces a uniform 700-line ceiling on every
+tracked `src/**/*.rs` file (at any nesting depth). It runs locally
+via pre-commit and in CI via the `budget` job. The ceiling has no
+per-file exception mechanism by design - there is no config file to
+bump, no annotation to add, no flag to flip. The only legitimate
+response to an over-budget file is to decompose it into logical
+submodules.
 
-**Implicit 700-line ceiling for new top-level source files.** Tracked
-top-level `src/*.rs` files WITHOUT an explicit entry in the budget
-table are subject to an implicit 700-line ceiling. Under the ceiling
-passes silently; over the ceiling fails with a message asking the
-contributor to either shrink the file or add an explicit entry with
-a larger budget and rationale in the commit message. Nested files
-(e.g. `src/side_effects/*.rs`) are intentionally out of scope; the
-ceiling only enforces that newly-extracted top-level modules cannot
-grow silently past the point where they warrant explicit review.
+The uniform ceiling exists because prior experience with a per-file
+budget config showed the exception list grew without bound, the
+largest file kept growing past every "temporary" bump, and review
+quality degraded. A hard ceiling with no escape hatch forces the
+structural fix. See the `[ABSOLUTE]` rule in CLAUDE.md that bans
+reintroducing any size-exception mechanism.
 
 ## Error Handling
 

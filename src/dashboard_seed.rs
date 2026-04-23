@@ -51,186 +51,21 @@ pub fn seed_dashboard(target_dir: &Path) -> Result<(), Box<dyn Error>> {
 
     let now = crate::side_effects::clock::system_now()
         .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs() as i64;
+        .as_secs()
+        .cast_signed();
     let day = 86_400_i64;
 
     let mut written_items = 0usize;
     let mut written_archive = 0usize;
 
-    // ---- Active items: normal flow, Done in 1-5 days, in last 7 days ----
-    for i in 0..6 {
-        let started = now - (i + 1) * day;
-        let done = started + (1 + i % 4) * day;
-        write_item(
-            target_dir,
-            &format!("active-normal-{i:02}"),
-            WorkItemStatus::Done,
-            &[
-                stage_event(
-                    started,
-                    WorkItemStatus::Backlog,
-                    WorkItemStatus::Implementing,
-                ),
-                stage_event(done, WorkItemStatus::Implementing, WorkItemStatus::Done),
-            ],
-            true,
-        )?;
-        written_items += 1;
-    }
-
-    // ---- Active items: long cycle (20-30 days) for p90 KPI ----
-    for i in 0..3 {
-        let started = now - (35 + i * 5) * day;
-        let done = started + (20 + i * 5) * day;
-        write_item(
-            target_dir,
-            &format!("active-long-{i:02}"),
-            WorkItemStatus::Done,
-            &[
-                stage_event(
-                    started,
-                    WorkItemStatus::Backlog,
-                    WorkItemStatus::Implementing,
-                ),
-                stage_event(done, WorkItemStatus::Implementing, WorkItemStatus::Done),
-            ],
-            true,
-        )?;
-        written_items += 1;
-    }
-
-    // ---- Stuck Review items (>3 days in Review) ----
-    for i in 0..2 {
-        let started = now - (10 + i) * day;
-        let entered_review = now - (5 + i) * day;
-        write_item(
-            target_dir,
-            &format!("stuck-review-{i:02}"),
-            WorkItemStatus::Review,
-            &[
-                stage_event(
-                    started,
-                    WorkItemStatus::Backlog,
-                    WorkItemStatus::Implementing,
-                ),
-                stage_event(
-                    entered_review,
-                    WorkItemStatus::Implementing,
-                    WorkItemStatus::Review,
-                ),
-            ],
-            true,
-        )?;
-        written_items += 1;
-    }
-
-    // ---- Stuck Blocked items (>1 day in Blocked) ----
-    for i in 0..2 {
-        let started = now - (8 + i) * day;
-        let entered_blocked = now - (2 + i) * day;
-        write_item(
-            target_dir,
-            &format!("stuck-blocked-{i:02}"),
-            WorkItemStatus::Blocked,
-            &[
-                stage_event(
-                    started,
-                    WorkItemStatus::Backlog,
-                    WorkItemStatus::Implementing,
-                ),
-                stage_event(
-                    entered_blocked,
-                    WorkItemStatus::Implementing,
-                    WorkItemStatus::Blocked,
-                ),
-            ],
-            true,
-        )?;
-        written_items += 1;
-    }
-
-    // ---- Drift: pr_merged event present, but item never reached Done ----
-    for i in 0..2 {
-        let started = now - (12 + i * 3) * day;
-        let merged = started + (3 + i) * day;
-        write_item(
-            target_dir,
-            &format!("drift-merged-not-done-{i:02}"),
-            WorkItemStatus::Implementing,
-            &[
-                stage_event(
-                    started,
-                    WorkItemStatus::Backlog,
-                    WorkItemStatus::Implementing,
-                ),
-                pr_merged_event(merged),
-            ],
-            true,
-        )?;
-        written_items += 1;
-    }
-
-    // ---- Drift: Done state reached, but no pr_merged event ----
-    for i in 0..2 {
-        let started = now - (15 + i * 2) * day;
-        let done = started + (4 + i) * day;
-        write_item(
-            target_dir,
-            &format!("drift-done-not-merged-{i:02}"),
-            WorkItemStatus::Done,
-            &[
-                stage_event(
-                    started,
-                    WorkItemStatus::Backlog,
-                    WorkItemStatus::Implementing,
-                ),
-                stage_event(done, WorkItemStatus::Implementing, WorkItemStatus::Done),
-            ],
-            true,
-        )?;
-        written_items += 1;
-    }
-
-    // ---- Items still in Backlog (current backlog size > 0) ----
-    for i in 0..5 {
-        let started = now - (3 + i) * day;
-        write_item(
-            target_dir,
-            &format!("active-backlog-{i:02}"),
-            WorkItemStatus::Backlog,
-            &[stage_event(
-                started,
-                WorkItemStatus::Planning,
-                WorkItemStatus::Backlog,
-            )],
-            true,
-        )?;
-        written_items += 1;
-    }
-
-    // ---- Archived items: full lifecycle preserved in archive/ ----
-    // These prove the retention fix: their JSON files are gone but the
-    // activity logs survive in `archive/`, so the dashboard can still
-    // count them in historical windows.
-    for i in 0..15 {
-        let started = now - (40 + i * 20) * day;
-        let done = started + (3 + i % 7) * day;
-        let id = format!("archived-{i:02}");
-        write_archive_only(
-            &archive_dir,
-            &id,
-            &[
-                stage_event(
-                    started,
-                    WorkItemStatus::Backlog,
-                    WorkItemStatus::Implementing,
-                ),
-                pr_merged_event(done - 60),
-                stage_event(done, WorkItemStatus::Implementing, WorkItemStatus::Done),
-            ],
-        )?;
-        written_archive += 1;
-    }
+    written_items += seed_active_normal_items(target_dir, now, day)?;
+    written_items += seed_active_long_items(target_dir, now, day)?;
+    written_items += seed_stuck_review_items(target_dir, now, day)?;
+    written_items += seed_stuck_blocked_items(target_dir, now, day)?;
+    written_items += seed_drift_merged_not_done(target_dir, now, day)?;
+    written_items += seed_drift_done_not_merged(target_dir, now, day)?;
+    written_items += seed_backlog_items(target_dir, now, day)?;
+    written_archive += seed_archived_items(&archive_dir, now, day)?;
 
     eprintln!(
         "workbridge: seeded {written_items} active items and {written_archive} archived activity logs into {}",
@@ -357,6 +192,213 @@ fn write_archive_only(
 ) -> Result<(), Box<dyn Error>> {
     let activity_path = archive_dir.join(format!("activity-{id}.jsonl"));
     write_activity_log(&activity_path, entries)
+}
+
+/// Active items: normal flow, Done in 1-5 days, in last 7 days.
+fn seed_active_normal_items(
+    target_dir: &Path,
+    now: i64,
+    day: i64,
+) -> Result<usize, Box<dyn Error>> {
+    for i in 0..6 {
+        let started = now - (i + 1) * day;
+        let done = started + (1 + i % 4) * day;
+        write_item(
+            target_dir,
+            &format!("active-normal-{i:02}"),
+            WorkItemStatus::Done,
+            &[
+                stage_event(
+                    started,
+                    WorkItemStatus::Backlog,
+                    WorkItemStatus::Implementing,
+                ),
+                stage_event(done, WorkItemStatus::Implementing, WorkItemStatus::Done),
+            ],
+            true,
+        )?;
+    }
+    Ok(6)
+}
+
+/// Active items: long cycle (20-30 days) for p90 KPI.
+fn seed_active_long_items(target_dir: &Path, now: i64, day: i64) -> Result<usize, Box<dyn Error>> {
+    for i in 0..3 {
+        let started = now - (35 + i * 5) * day;
+        let done = started + (20 + i * 5) * day;
+        write_item(
+            target_dir,
+            &format!("active-long-{i:02}"),
+            WorkItemStatus::Done,
+            &[
+                stage_event(
+                    started,
+                    WorkItemStatus::Backlog,
+                    WorkItemStatus::Implementing,
+                ),
+                stage_event(done, WorkItemStatus::Implementing, WorkItemStatus::Done),
+            ],
+            true,
+        )?;
+    }
+    Ok(3)
+}
+
+/// Stuck Review items (>3 days in Review).
+fn seed_stuck_review_items(target_dir: &Path, now: i64, day: i64) -> Result<usize, Box<dyn Error>> {
+    for i in 0..2 {
+        let started = now - (10 + i) * day;
+        let entered_review = now - (5 + i) * day;
+        write_item(
+            target_dir,
+            &format!("stuck-review-{i:02}"),
+            WorkItemStatus::Review,
+            &[
+                stage_event(
+                    started,
+                    WorkItemStatus::Backlog,
+                    WorkItemStatus::Implementing,
+                ),
+                stage_event(
+                    entered_review,
+                    WorkItemStatus::Implementing,
+                    WorkItemStatus::Review,
+                ),
+            ],
+            true,
+        )?;
+    }
+    Ok(2)
+}
+
+/// Stuck Blocked items (>1 day in Blocked).
+fn seed_stuck_blocked_items(
+    target_dir: &Path,
+    now: i64,
+    day: i64,
+) -> Result<usize, Box<dyn Error>> {
+    for i in 0..2 {
+        let started = now - (8 + i) * day;
+        let entered_blocked = now - (2 + i) * day;
+        write_item(
+            target_dir,
+            &format!("stuck-blocked-{i:02}"),
+            WorkItemStatus::Blocked,
+            &[
+                stage_event(
+                    started,
+                    WorkItemStatus::Backlog,
+                    WorkItemStatus::Implementing,
+                ),
+                stage_event(
+                    entered_blocked,
+                    WorkItemStatus::Implementing,
+                    WorkItemStatus::Blocked,
+                ),
+            ],
+            true,
+        )?;
+    }
+    Ok(2)
+}
+
+/// Drift: `pr_merged` event present, but item never reached Done.
+fn seed_drift_merged_not_done(
+    target_dir: &Path,
+    now: i64,
+    day: i64,
+) -> Result<usize, Box<dyn Error>> {
+    for i in 0..2 {
+        let started = now - (12 + i * 3) * day;
+        let merged = started + (3 + i) * day;
+        write_item(
+            target_dir,
+            &format!("drift-merged-not-done-{i:02}"),
+            WorkItemStatus::Implementing,
+            &[
+                stage_event(
+                    started,
+                    WorkItemStatus::Backlog,
+                    WorkItemStatus::Implementing,
+                ),
+                pr_merged_event(merged),
+            ],
+            true,
+        )?;
+    }
+    Ok(2)
+}
+
+/// Drift: Done state reached, but no `pr_merged` event.
+fn seed_drift_done_not_merged(
+    target_dir: &Path,
+    now: i64,
+    day: i64,
+) -> Result<usize, Box<dyn Error>> {
+    for i in 0..2 {
+        let started = now - (15 + i * 2) * day;
+        let done = started + (4 + i) * day;
+        write_item(
+            target_dir,
+            &format!("drift-done-not-merged-{i:02}"),
+            WorkItemStatus::Done,
+            &[
+                stage_event(
+                    started,
+                    WorkItemStatus::Backlog,
+                    WorkItemStatus::Implementing,
+                ),
+                stage_event(done, WorkItemStatus::Implementing, WorkItemStatus::Done),
+            ],
+            true,
+        )?;
+    }
+    Ok(2)
+}
+
+/// Items still in Backlog (current backlog size > 0).
+fn seed_backlog_items(target_dir: &Path, now: i64, day: i64) -> Result<usize, Box<dyn Error>> {
+    for i in 0..5 {
+        let started = now - (3 + i) * day;
+        write_item(
+            target_dir,
+            &format!("active-backlog-{i:02}"),
+            WorkItemStatus::Backlog,
+            &[stage_event(
+                started,
+                WorkItemStatus::Planning,
+                WorkItemStatus::Backlog,
+            )],
+            true,
+        )?;
+    }
+    Ok(5)
+}
+
+/// Archived items: full lifecycle preserved in archive/.
+/// These prove the retention fix: their JSON files are gone but the
+/// activity logs survive in `archive/`, so the dashboard can still
+/// count them in historical windows.
+fn seed_archived_items(archive_dir: &Path, now: i64, day: i64) -> Result<usize, Box<dyn Error>> {
+    for i in 0..15 {
+        let started = now - (40 + i * 20) * day;
+        let done = started + (3 + i % 7) * day;
+        let id = format!("archived-{i:02}");
+        write_archive_only(
+            archive_dir,
+            &id,
+            &[
+                stage_event(
+                    started,
+                    WorkItemStatus::Backlog,
+                    WorkItemStatus::Implementing,
+                ),
+                pr_merged_event(done - 60),
+                stage_event(done, WorkItemStatus::Implementing, WorkItemStatus::Done),
+            ],
+        )?;
+    }
+    Ok(15)
 }
 
 fn write_activity_log(path: &Path, entries: &[ActivityEntry]) -> Result<(), Box<dyn Error>> {

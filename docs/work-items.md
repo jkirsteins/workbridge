@@ -167,20 +167,28 @@ Stage restrictions for ReviewRequest items:
   poller (`App::poll_mergequeue` /
   `App::reconstruct_mergequeue_watches`) are generated from a single
   pair of macros (`impl_pr_merge_poll_method!` +
-  `impl_pr_merge_reconstruct_method!` in `src/app.rs`) so the
+  `impl_pr_merge_reconstruct_method!` in the `app` module) so the
   subprocess path, the 30 s cooldown, the Phase 1 drain, the
   still-eligible guard, the `pr_number` backfill, and the merge-gate
   dispatch cannot drift between the two stages. Per-stage deltas
   (source stage, kind filter, strategy tag, status messages, whether
-  the merged branch runs `cleanup_worktree_for_item`) are passed as
-  macro arguments. When the PR is detected as merged, the item
-  auto-transitions to Done through the merge-gate invariant (`source
-  == "pr_merge"`) and the merged PR's identity is persisted to
-  `pr_identity` so the assembly fallback keeps the merged-PR link
-  visible afterwards. The coding agent review session is killed by the
-  transition (same behavior as every other Review -> Done transition in
-  the codebase); the worktree is left on disk and cleaned up later by
-  auto-archive (default 7 days) or immediately by the user with Ctrl+D.
+  the merged branch schedules `spawn_post_merge_worktree_cleanup`) are
+  passed as macro arguments. When the PR is detected as merged, the
+  item auto-transitions to Done through the merge-gate invariant
+  (`source == "pr_merge"`) and the merged PR's identity is persisted
+  to `pr_identity` so the assembly fallback keeps the merged-PR link
+  visible afterwards. The coding agent review session is killed by
+  the transition (same behavior as every other Review -> Done
+  transition in the codebase). The Mergequeue poller (author-side
+  merges) schedules `spawn_post_merge_worktree_cleanup`, which
+  dispatches the worktree + branch cleanup to a background thread
+  per-association and reports completion through the shared
+  orphan-cleanup channel - no git subprocess runs on the UI thread.
+  The ReviewRequest poller (reviewer-side merges of someone else's
+  PR) intentionally does NOT schedule cleanup: the author may still
+  be iterating locally, so the worktree is left on disk and cleaned
+  up later by auto-archive (default 7 days) or immediately by the
+  user with Ctrl+D.
   A closed-without-merge PR is NOT auto-closed (it would bypass the
   merge-gate invariant) - a warning is surfaced instead and the user
   can Ctrl+D to clean up. `gh pr view` failures are stored in the
@@ -431,7 +439,7 @@ There are two session types:
   Claude Code (reference) and Codex. See `docs/harness-contract.md` for
   the full contract
   (clauses C1..C13, reference payloads RP1..RP5) and
-  `src/agent_backend.rs` for the reference implementation.
+  `crate::agent_backend::claude_code::ClaudeCodeBackend` for the reference implementation.
 - **Terminal session** - a shell (`$SHELL`, falling back to `/bin/sh`) launched
   in the worktree directory. Spawned lazily when the user switches to the
   Terminal tab in the right panel. Available whenever the work item has a

@@ -23,9 +23,9 @@ the application:
   events to periodic work (liveness, fetch drain, signal checks, shutdown)
 - **error**: surfaces errors in the status bar
 
-The callbacks live in `src/salsa.rs`. The `Global` struct holds the
-`SalsaAppContext`, theme, and signal flag. The `App` struct (in
-`src/app.rs`) holds all mutable application state.
+The callbacks live in the `salsa` module. The `Global` struct holds the
+`SalsaAppContext`, theme, and signal flag. The `App` struct (in the
+`app` module tree) holds all mutable application state.
 
 ### Control Flow
 
@@ -45,7 +45,7 @@ mapping, as well as drag-and-drop, "Paste" context menu items, and OSC
 52 injection; workbridge never sees the modifier+key chord itself,
 only the resulting `Event::Paste` payload.
 
-`event::handle_paste` (`src/event.rs`) decides where the payload lands
+`event::handle_paste` decides where the payload lands
 based on modal state:
 
 1. If the app is `shutting_down`, the paste is dropped (returns
@@ -81,8 +81,8 @@ stale-worktree / cleanup confirmation prompts, in-progress spinners,
 alert messages) is a silent no-op: the paste is dropped and no leak
 reaches the PTY.
 
-Returning `true` from `handle_paste` triggers a re-render (see
-`src/salsa.rs` paste arm); returning `false` skips it.
+Returning `true` from `handle_paste` triggers a re-render (see the
+paste arm in the `salsa` module); returning `false` skips it.
 
 Adding or modifying a TUI text input without wiring it into
 `route_paste_to_modal_input`, or removing paste support from an
@@ -110,7 +110,7 @@ renderer. The registry stores `ClickTarget` values in two variants:
   clipboard.
 
 Keeping row clicks and copy clicks in separate variants means
-`short_display` / `fire_chrome_copy` never have to handle a row-click
+`short_display` / `ClickTracking::fire_copy` never have to handle a row-click
 payload, and `ClickKind` stays `Copy` / chrome-only.
 
 **Modality note.** Copy clicks fire through the priority check even
@@ -207,7 +207,7 @@ has enabled mouse reporting (e.g., vim, htop), mouse events are
 forwarded to the PTY as before. Exception: in local scrollback mode,
 selection is always available since the PTY is not receiving events.
 
-Clipboard writes go through `src/clipboard.rs::copy`, which attempts
+Clipboard writes go through `side_effects::clipboard::copy`, which attempts
 BOTH an OSC 52 escape sequence (written directly to stdout) and
 `arboard`. OSC 52 makes the copy work over SSH and inside tmux
 (tmux users must have `set -g set-clipboard on` in their tmux.conf);
@@ -237,8 +237,8 @@ on success it reads `Copied: <short-value>`, on failure (both OSC 52
 and `arboard` returned an error) it reads `Copy failed: <short-value>`.
 Lying about the clipboard state is the worst UX failure mode for this
 feature - a user who believes the copy succeeded will paste stale
-content and only notice long after. `fire_chrome_copy` in `src/app.rs`
-branches on the bool returned by `clipboard::copy`.
+content and only notice long after. `ClickTracking::fire_copy`
+branches on the bool returned by `side_effects::clipboard::copy`.
 
 Implementation:
 
@@ -263,7 +263,7 @@ Implementation:
   the `MouseTarget::None` arm so labels drawn outside all PTY areas
   remain reachable.
 - `handle_chrome_click_fallback` arms a pending click on `Down(Left)`,
-  cancels on any `Drag(Left)`, and fires `App::fire_chrome_copy` on
+  cancels on any `Drag(Left)`, and fires `ClickTracking::fire_copy` on
   a matching `Up(Left)`. The drag-cancel check runs unconditionally
   at the top of `handle_mouse` so a drag over a PTY pane still
   invalidates an in-flight click-to-copy gesture that started on a
@@ -303,8 +303,8 @@ Pattern for background I/O:
    ~200ms via the background-work throttle) to pick up results without
    blocking.
 
-See `spawn_import_worktree()` and `poll_worktree_creation()` in
-`src/app.rs` as reference implementations.
+See `App::spawn_import_worktree` and `App::poll_worktree_creation`
+as reference implementations.
 
 #### Prefer cached values over trait shell-outs
 
@@ -320,7 +320,7 @@ read from the cache**. Concretely:
 
 - `(owner, repo)` - read from
   `self.repo_data[repo_path].github_remote` (populated by
-  `src/fetcher.rs::fetcher_loop`). If the cache is empty (first fetch
+  `fetcher::fetcher_loop`). If the cache is empty (first fetch
   in flight), surface that to the user via `alert_message` / a status
   bar message rather than blocking.
 - Worktree / branch metadata - read from
@@ -462,7 +462,7 @@ The sender detects cancellation when `tx.send()` returns `Err`
 (receiver dropped). Long-running poll loops should include a timeout
 to prevent indefinite thread leaks.
 
-See `spawn_review_gate()` and `poll_review_gate()` in `src/app.rs`.
+See `App::spawn_review_gate` and `App::poll_review_gate`.
 
 Examples of operations that MUST be async:
 - `git fetch`, `git worktree add`, `git clone`
@@ -548,8 +548,9 @@ and board views but not inside open dialogs or overlays.
   mutating config. Subsequent Ctrl+G presses use the persisted value
   directly. The same field is settable non-interactively via
   `workbridge config set global-assistant-harness <name>`. See
-  `docs/harness-contract.md` Change Log 2026-04-16 for the rationale
-  and the Codex reference payloads.
+  `docs/harness-contract.md` "Reference Payloads (Codex)" for the argv
+  details and CLAUDE.md's `[ABSOLUTE]` silent-fallback rule for the
+  rationale.
 
 ## Focus Model
 
@@ -738,9 +739,9 @@ There are two overlay patterns depending on complexity.
 ### Full Dialog (complex forms, multi-field input)
 
 Use for dialogs with multiple fields, validation, or complex focus.
-See `src/create_dialog.rs` as the reference implementation.
+See the `create_dialog` module as the reference implementation.
 
-1. Create a dialog struct in `src/<dialog_name>.rs` with:
+1. Create a dialog struct in a new module (e.g. `<dialog_name>`) with:
    - `visible: bool`
    - Input state fields (`rat_widget::text_input::TextInputState` for
      single-line text, `rat_widget::textarea::TextAreaState` for
@@ -748,9 +749,9 @@ See `src/create_dialog.rs` as the reference implementation.
    - Focus tracking enum
    - `open()`, `close()`, `handle_key()` methods
 
-2. Add the dialog field to `App` in `src/app.rs`
+2. Add the dialog field to the `App` struct (in the `app` module tree)
 
-3. In `src/event.rs`, add an intercept block near the top of `handle_key`:
+3. In the `event` module tree, add an intercept block near the top of `handle_key`:
    ```rust
    if app.<dialog>.visible {
        handle_<dialog>_key(app, key);
@@ -758,7 +759,7 @@ See `src/create_dialog.rs` as the reference implementation.
    }
    ```
 
-4. In `src/ui.rs`, add rendering at the end of `draw_to_buffer()` (after
+4. In the `ui` module tree, add rendering at the end of `draw_to_buffer` (after
    prompt dialogs, before or after global drawer as appropriate):
    ```rust
    if app.<dialog>.visible {
@@ -845,7 +846,7 @@ that path ended in a dead-end `"Set a branch name to start working"`
 status message with no way to recover short of editing JSON by hand.
 
 The modal reuses `PromptDialogKind::TextInput` and rat-widget's
-`TextInputState` (see `src/ui.rs` and `src/create_dialog.rs`). State lives on
+`TextInputState` (see the `ui` module and the `create_dialog` module). State lives on
 `App::set_branch_dialog: Option<SetBranchDialog>` and carries a
 `PendingBranchAction` so the dialog knows what to re-drive after the
 branch is persisted. Behaviour:
@@ -860,7 +861,7 @@ branch is persisted. Behaviour:
   user can retry.
 - **Esc**: dismisses the dialog without touching the backend.
 
-The key intercept in `src/event.rs` sits near the top of `handle_key`,
+The key intercept in the `event` module sits near the top of `handle_key`,
 above the general work-item keybindings, so `d` / `q` / `Enter` are
 treated as branch-name input rather than delete / quit / advance while
 the dialog is visible.
@@ -1001,9 +1002,9 @@ Key semantics:
   matching `poll_*`) and the explicit retreat / delete cancel paths
   (which call `end_user_action` idempotently).
 - **Structural fetcher restarts do not go through the helper.** The
-  `fetcher_repos_changed` flag is set by ~11 structural sites in
-  `src/app.rs` when the managed-repo set changes; `salsa.rs` honours
-  the flag by stopping the old fetcher and starting a new one. Only
+  `fetcher_repos_changed` flag is set by ~11 structural sites across
+  the `app` module tree when the managed-repo set changes; the `salsa`
+  module honours the flag by stopping the old fetcher and starting a new one. Only
   the explicit Ctrl+R press goes through `UserActionKey::GithubRefresh`
   - everything else is "repo set changed", not "user wants fresh
   data", and must not be debounced.
@@ -1017,7 +1018,7 @@ Key semantics:
   The Ctrl+R event handler admits the helper entry, sets
   `fetcher_repos_changed = true`, and returns. On the next salsa tick
   the restart block calls `end_user_action(&GithubRefresh)` BEFORE
-  stopping the old fetcher (`src/salsa.rs`), so the helper entry
+  stopping the old fetcher (in the `salsa` module), so the helper entry
   exists only for the few milliseconds between the keypress and the
   restart. The practical consequence is that spam protection between
   two rapid Ctrl+R presses comes from the 500 ms **debounce**
@@ -1031,7 +1032,7 @@ Key semantics:
   fetch-spinner activity regardless of whether the refresh was
   user-initiated or triggered by a repo-set change.
 - **Handoff at structural restart.** The restart block in
-  `src/salsa.rs` calls `end_user_action(&GithubRefresh)` BEFORE
+  the `salsa` module calls `end_user_action(&GithubRefresh)` BEFORE
   stopping the old fetcher so a structural restart mid-Ctrl+R never
   leaves the helper with a stale entry pointing at a dead fetcher.
 - **Modal-owned spinners hide the status-bar activity.** Both the
@@ -1107,8 +1108,8 @@ Reference implementations:
   global admission slot by design.
 - `spawn_unlinked_cleanup` / `poll_unlinked_cleanup`.
 - `spawn_delete_cleanup` / `poll_delete_cleanup`.
-- `drain_fetch_results` / `src/event.rs` Ctrl+R handler /
-  `src/salsa.rs` restart block.
+- `drain_fetch_results` / the `event::handle_key` Ctrl+R handler /
+  the `salsa` module restart block.
 
 ## Rendering
 
@@ -1193,8 +1194,8 @@ user's eye lands on near-ready work first. Within a single stage,
 items keep the deterministic backend path order as a stable-sort
 tiebreaker, so single-stage repos render in exactly the same order
 as before. The sort is implemented by
-`WorkItemStatus::active_group_rank` in `src/work_item.rs` and applied
-in `push_repo_groups` in `src/app.rs`. This rule does not apply to
+`WorkItemStatus::active_group_rank` (in the `work_item` module) and applied
+in `App::push_repo_groups`. This rule does not apply to
 the `BLOCKED`, `BACKLOGGED`, or `DONE` groups, whose items all share
 a single status by construction and therefore sort as a no-op.
 
@@ -1301,7 +1302,7 @@ Work items are shown as a flat list with stage badges:
 - [BK] Blocked, [RV] Review, [MQ] Mergequeue, [DN] Done
 
 Each entry is rendered as a multi-line `ListItem` by
-`format_work_item_entry` in `src/ui.rs`:
+`format_work_item_entry` (in the `ui::work_list` module):
 
 1. **Title line** - stage badge, wrapped title, optional right-side PR
    / CI / error badges.
@@ -1344,9 +1345,9 @@ item state lives in `App.rebase_gates: HashMap<WorkItemId,
 RebaseGateState>` per the structural-ownership rule, mirroring
 `review_gates`. The right pane is taken over by a spinner + progress
 text view while a rebase is in flight (the rebase-gate render block
-lives in `src/ui.rs` immediately before the review-gate block and
-takes precedence over it). On completion, `poll_rebase_gate` drops
-the gate via `drop_rebase_gate` (which ends the status-bar activity,
+lives in the `ui::output_pane` module immediately before the review-gate block and
+takes precedence over it). On completion, `App::poll_rebase_gate` drops
+the gate via `App::drop_rebase_gate` (which ends the status-bar activity,
 clears the user-action guard slot when the slot is owned by the
 work item being dropped, AND `libc::killpg`s the harness's process
 group via the `child_pid` slot if it is still alive) and surfaces
@@ -1394,8 +1395,8 @@ manually.
 
 Three chips report the local git state of a work item's worktree.
 All three are pure cache reads off `RepoAssociation.git_state`
-(populated by the background fetcher in `src/assembly.rs` /
-`src/worktree_service.rs`) and therefore safe to render on the UI
+(populated by the background fetcher in the `assembly` and
+`worktree_service` modules) and therefore safe to render on the UI
 thread:
 
 - `!cl` - the worktree has uncommitted changes (`git_state.dirty`).
@@ -1421,7 +1422,7 @@ whose PR also has conflicts and failing CI renders
 remain distinguishable. The chip labels (not the colors) distinguish
 push-direction from pull-direction, while `!cl` stays visually
 distinct from both divergence chips. All chips are rendered
-alongside `!cl` in `format_work_item_entry` (`src/ui.rs`).
+alongside `!cl` in `format_work_item_entry` (in the `ui::work_list` module).
 
 **Hard-block summary.** Four of the five chips double as merge
 pre-condition warnings - they signal states that will hard-block a
@@ -1481,8 +1482,8 @@ Implementing column with a [BK] prefix. Mergequeue items appear in the
 Review column with a [MQ] prefix. PR badges and CI status are shown on
 board items. Long titles wrap (not truncate).
 
-The `BoardLayout` struct (in `src/layout.rs`) and `compute_board()`
-function calculate 4 equal-width columns from the terminal width.
+The `BoardLayout` struct (in the `layout` module) and `layout::compute_board`
+calculate 4 equal-width columns from the terminal width.
 The focused column's border uses `style_board_column_focused()`;
 other columns use `style_board_column_unfocused()`.
 
@@ -1562,7 +1563,7 @@ Tab switching:
   work item has no worktree. Still fires even when the current tab's
   session has ended - the on-screen `Press Ctrl+\\ to switch back to
   {harness display name}.` hint (shown on the dead-terminal
-  placeholder in `src/ui.rs`, where `{harness display name}` is the
+  placeholder rendered by the `ui::output_pane` module, where `{harness display name}` is the
   value returned by `App::agent_backend_display_name()` - one of
   `Claude Code`, `Codex`, or the neutral `Session` placeholder) and
   the symmetric dead-agent case both rely on this.
@@ -1725,7 +1726,7 @@ overlay.
 
 ## Theme
 
-The `Theme` struct in `src/theme.rs` centralizes all colors. It uses
+The `Theme` struct (in the `theme` module) centralizes all colors. It uses
 ANSI-safe colors (Reset for text against terminal background, absolute
 colors only when the Theme controls both foreground and background).
 
@@ -1778,7 +1779,7 @@ row (state badge, `[RR]` kind tag, `[RG]` gate tag, `PR#N` chip, CI
 chips, and trailing state chips like `!cl` / `!pushed` / `!pulled` /
 `!merge` / `[N repos]`) is rendered with `Modifier::DIM` and a
 `Color::DarkGray` foreground via the `dim_badge_style` helper in
-`src/ui.rs`. This is the style-level companion to `dim_background` and
+the `ui::common` module. This is the style-level companion to `dim_background` and
 makes the work item(s) with an attached session visually pop when the
 user scans the list or the board. The left-margin session indicator
 (spinner / bullet / caret) is the co-signal and is not itself dimmed;

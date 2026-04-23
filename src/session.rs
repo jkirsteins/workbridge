@@ -137,7 +137,7 @@ impl Session {
                     // stdio setup (dup2 + close). Stdin is guaranteed to
                     // point to the slave PTY at this point. The argument 0
                     // means "don't steal from another session".
-                    if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                    if libc::ioctl(0, libc::c_ulong::from(libc::TIOCSCTTY), 0) < 0 {
                         return Err(io::Error::last_os_error());
                     }
                     Ok(())
@@ -169,7 +169,9 @@ impl Session {
                 match n.cmp(&0) {
                     std::cmp::Ordering::Greater => match parser_clone.lock() {
                         Ok(mut parser) => {
-                            parser.process(&buf[..n as usize]);
+                            // Greater-than-zero arm: n > 0 so usize conversion is safe.
+                            let len = usize::try_from(n).unwrap_or(0);
+                            parser.process(&buf[..len]);
                         }
                         Err(_poisoned) => {
                             // Mutex is poisoned (another thread panicked
@@ -233,7 +235,8 @@ impl Session {
                     "write to PTY returned 0",
                 ));
             }
-            offset += n as usize;
+            // n is known positive here (negative -> early return, zero -> early return).
+            offset += usize::try_from(n).unwrap_or(0);
         }
         Ok(())
     }
@@ -287,7 +290,7 @@ impl Session {
         let Some(ref child) = self.child else {
             return;
         };
-        let pid = child.id() as libc::pid_t;
+        let pid = child.id().cast_signed();
         unsafe {
             libc::killpg(pid, libc::SIGTERM);
         }
@@ -301,7 +304,7 @@ impl Session {
         let Some(mut child) = self.child.take() else {
             return;
         };
-        let pid = child.id() as libc::pid_t;
+        let pid = child.id().cast_signed();
         unsafe {
             libc::killpg(pid, libc::SIGKILL);
         }
@@ -318,7 +321,7 @@ impl Session {
             return;
         };
 
-        let pid = child.id() as libc::pid_t;
+        let pid = child.id().cast_signed();
 
         // SIGTERM the entire process group for graceful shutdown.
         unsafe {
@@ -428,7 +431,7 @@ fn set_winsize(fd: std::os::fd::RawFd, cols: u16, rows: u16) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::Session;
 
     #[test]
     fn kill_is_idempotent() {

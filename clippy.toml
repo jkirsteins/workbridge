@@ -1,7 +1,7 @@
-# clippy.toml - Phase 1 baseline.
+# clippy.toml
 #
 # Only pins MSRV for now so clippy's MSRV-aware lints match the
 # toolchain declared in Cargo.toml's rust-version field. Additional
-# knobs (disallowed-methods, threshold tuning) are evaluated in
-# Phase 3 during clippy cleanup.
+# knobs (disallowed-methods, threshold tuning) can be added here if
+# needed.
 msrv = "1.88"

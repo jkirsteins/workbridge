@@ -13,16 +13,13 @@
 #
 # Called from BOTH `hooks/pre-commit` and `.github/workflows/ci.yml`
 # so the `-A` flag set lives in exactly one place. Adding a new
-# test-only carve-out, or flipping a Phase-4 structural lint back
-# to warn, is a one-line edit here instead of four coordinated edits
-# across the hook, CI, CONTRIBUTING.md, and the calibration doc.
+# test-only carve-out, or flipping a structural lint back to warn,
+# is a one-line edit here instead of coordinated edits across the
+# hook, CI, and CONTRIBUTING.md.
 #
 # `--bins` (no `--lib`) because workbridge has no library target
 # today. If a library target is ever added, change to `--lib --bins`
 # here and this is the only place the change needs to land.
-#
-# See docs/hygiene-campaign/phase-3-calibration.md for the full
-# rationale behind the two-invocation pattern.
 
 set -euo pipefail
 

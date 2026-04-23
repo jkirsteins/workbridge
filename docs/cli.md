@@ -7,8 +7,9 @@ changed exit-code or stdout/stderr contract) must land together with an update
 to this file. See CLAUDE.md "Review Policy" for the corresponding severity
 override.
 
-The source of truth for behavior is `src/main.rs::handle_cli` and its
-delegates. This doc mirrors that dispatch tree.
+The source of truth for behavior is the `handle_cli` entry point and
+its per-subcommand delegates in the `cli` module. This doc mirrors that
+dispatch tree.
 
 ## Overview
 
